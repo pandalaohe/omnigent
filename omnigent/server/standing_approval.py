@@ -18,6 +18,7 @@ from cachetools import TTLCache
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN, current_workspace_id
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native._native_session_labels import displaced_claude_candidate_label
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
@@ -273,6 +274,12 @@ class StandingApprovalService:
                 )
             except (ValueError, AttributeError):
                 prepared = False
+            if (
+                not root.archived
+                and displaced_claude_candidate_label(root.id) in predecessor.labels
+            ):
+                # A displaced candidate may still be running without a receipt.
+                prepared = True
         receipt = self.store.get_succession(predecessor_id, root.id) if predecessor_id else None
         if predecessor_id and (prepared or receipt is not None):
             if predecessor is None:

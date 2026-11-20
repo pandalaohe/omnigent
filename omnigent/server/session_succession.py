@@ -40,6 +40,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.native._native_session_labels import (
     CLAUDE_TRANSFER_INTENT_LABEL,
+    displaced_claude_candidate_label,
     parse_claude_transfer_intent,
     replacement_session_labels,
 )
@@ -161,18 +162,19 @@ def _ended_claude_transfer(conversation: Conversation) -> dict[str, Any] | None:
     return None
 
 
-def claude_transfer_lease_ended(
+def expired_claude_transfer_status(
     conversation: Conversation, target: str, clear_attempt_id: str | None, terminal_id: str
-) -> bool:
-    """Recognize the expired attempt before a replay can reach the runner."""
-    if terminal_id != _CLAUDE_TERMINAL or clear_attempt_id is None:
-        return False
-    intent = _ended_claude_transfer(conversation)
-    return bool(
-        intent
-        and intent["target"] == target
-        and (intent.get("clear_attempt_id") or intent["id"]) == clear_attempt_id
-    )
+) -> int | None:
+    """Keep expired targets off the ordinary runner transfer path."""
+    if terminal_id != _CLAUDE_TERMINAL:
+        return None
+    attempt = conversation.labels.get(displaced_claude_candidate_label(target))
+    if attempt is None:
+        intent = _ended_claude_transfer(conversation)
+        if intent is None or intent["target"] != target:
+            return None
+        attempt = intent.get("clear_attempt_id") or intent["id"]
+    return 410 if clear_attempt_id == attempt else 409
 
 
 def claude_transfer_pending(conversation: Conversation) -> bool:
@@ -441,7 +443,8 @@ async def prepare_claude_clear_candidate(
         if intent is None:
             return True
         await expire_claude_transfer(store, old)
-        if (intent.get("clear_attempt_id") or intent["id"]) == clear_attempt_id:
+        expired_attempt = intent.get("clear_attempt_id") or intent["id"]
+        if expired_attempt == clear_attempt_id:
             return False
         raw_prepared = old.labels.get(ROTATION_SUCCESSOR_LABEL_KEY, "")
         try:
@@ -453,14 +456,14 @@ async def prepare_claude_clear_candidate(
             and prepared.get("revision") == old.archive_revision
             and prepared.get("id") == intent["target"]
         ):
-            # Change only the source's preparation. The store will create this
-            # candidate on demand, reusing the same id if the request is retried.
+            # Record the displaced candidate in the same write as its replacement.
             replaced = await asyncio.to_thread(
                 store.compare_and_set_label,
                 old_id,
                 ROTATION_SUCCESSOR_LABEL_KEY,
                 raw_prepared,
                 json.dumps({**prepared, "id": uuid4().hex}),
+                updates={displaced_claude_candidate_label(intent["target"]): expired_attempt},
             )
             if not replaced:
                 raise OmnigentError("Successor preparation changed", code=ErrorCode.CONFLICT)
@@ -686,13 +689,13 @@ async def transfer_requested_claude_terminal(
                     await expire_claude_transfer(store, latest)
             return 410, placement_conflict
 
-        ended = _ended_claude_transfer(old)
-        if ended is not None and ended["target"] == new_id:
-            if recover_intent_id is not None or claude_transfer_lease_ended(
-                old, new_id, clear_attempt_id, _CLAUDE_TERMINAL
-            ):
+        expired_status = expired_claude_transfer_status(
+            old, new_id, clear_attempt_id, _CLAUDE_TERMINAL
+        )
+        if expired_status is not None:
+            if recover_intent_id is not None or expired_status == 410:
                 return await expired()
-            return 409, placement_conflict
+            return expired_status, placement_conflict
         try:
             if transfer is not None and (
                 transfer["target"] != new_id

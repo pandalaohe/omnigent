@@ -10,6 +10,11 @@ from omnigent.stores import conversation_store
 CLAUDE_TRANSFER_INTENT_LABEL = "omnigent.auto_rotation_state.claude_transfer"
 
 
+def displaced_claude_candidate_label(target_id: str) -> str:
+    """Source label retaining the expired attempt for a replaced candidate."""
+    return f"omnigent.auto_rotation_state.displaced_claude_candidate.{target_id}"
+
+
 def parse_claude_transfer_intent(raw: str) -> dict[str, Any] | None:
     """Read the server's recorded transfer identity from a session snapshot."""
     try:

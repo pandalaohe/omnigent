@@ -1409,7 +1409,9 @@ async def test_claude_transfer_rechecks_deadline_after_acquiring_scheduled_send_
 @pytest.mark.parametrize("old_transfer_moved", [False, True], ids=["empty", "live"])
 async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_rotates(
     client: httpx.AsyncClient,
+    succession_app: FastAPI,
     store: SqlAlchemyConversationStore,
+    db_uri: str,
     runner: _FakeRunnerClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1423,8 +1425,18 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     )
     from tests.server.helpers import create_test_agent
 
+    approvals = succession_app.state.standing_approval_service
+    if old_transfer_moved:
+        approvals.prefs_store = SqlAlchemyUserPreferencesStore(db_uri)
+        approvals.prefs_store.patch_namespace(
+            RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["install"]}
+        )
     agent = await create_test_agent(client, "fresh-clear")
     old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
+    if old_transfer_moved:
+        source = store.get_conversation(old)
+        assert source is not None and approvals.resolve(source)["kinds"] == ["install"]
+        approvals.change(source, "revoke", ["install"], "user-item")
     clock = 1000
     monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
@@ -1467,11 +1479,13 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
                 panes[new] = panes.pop(old)
             raise httpx.ReadTimeout("transfer reply lost")
         target = kwargs["json"]["target_session_id"]
-        assert target != new and target not in panes
+        assert target not in panes
         panes[target] = panes.pop(old)
         return httpx.Response(200, json=panes[target])
 
     transfer = AsyncMock(side_effect=runner_post)
+    resource_runner = AsyncMock(return_value=runner)
+    monkeypatch.setattr(sessions_facade, "_get_runner_client_for_resource_access", resource_runner)
     monkeypatch.setattr(runner, "get", get_terminal, raising=False)
     monkeypatch.setattr(runner, "post", transfer)
     first = await client.post(
@@ -1489,6 +1503,14 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     successor = store.get_conversation(new)
     assert successor is not None
     probed_sessions.clear()
+
+    def assert_install_revoked() -> None:
+        approval = approvals.resolve(successor)
+        assert approval["kinds"] == []
+        assert approval["events"][-1]["op"] == "revoke"
+
+    if old_transfer_moved:
+        assert_install_revoked()
 
     def assert_expired_candidate_not_reused() -> None:
         current = store.get_conversation(new)
@@ -1539,15 +1561,40 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     assert store.get_succession(old, new) is None
     transfer.assert_awaited_once()
 
-    wrong_attempt = await client.post(
-        path, json={"target_session_id": new}, params={"clear_attempt_id": "different-attempt"}
-    )
-    assert wrong_attempt.status_code == 409, wrong_attempt.text
-    transfer.assert_awaited_once()
     mutations.clear()
     attempts.clear()
     transfer_replies.clear()
 
+    checked_replacement: str | None = None
+
+    async def check_after_prepare(response: httpx.Response) -> None:
+        nonlocal checked_replacement
+        if response.request.url.path != f"/v1/sessions/{old}/successor":
+            return
+        await response.aread()
+        assert response.status_code == 200, response.text
+        checked_replacement = response.json()["id"]
+        assert checked_replacement != new
+        if old_transfer_moved:
+            assert_install_revoked()
+        else:
+            assert panes == {old: source_pane}
+            # Exercise the old target while the runner is healthy and before
+            # the legitimate transfer starts. Keep these probes out of its log.
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=succession_app), base_url="http://test"
+            ) as replay_client:
+                for attempt, status in [(expired_attempt, 410), ("different-attempt", 409)]:
+                    replay = await replay_client.post(
+                        path, json={"target_session_id": new}, params={"clear_attempt_id": attempt}
+                    )
+                    assert replay.status_code == status, replay.text
+            transfer.assert_awaited_once()
+            resource_runner.assert_not_awaited()
+            assert not probed_sessions
+            assert panes == {old: source_pane}
+
+    client.event_hooks["response"].append(check_after_prepare)
     runner_recovered = True
     monkeypatch.setattr(sessions_facade, "_registered_runner_id", lambda _router, raw, **_: raw)
     monkeypatch.setattr(forwarder, "_post_clear_recovery_notice", AsyncMock())
@@ -1558,7 +1605,7 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     fresh = await forwarder._maybe_rotate_session_on_clear(
         client=client, session_id=old, bridge_dir=bridge, state=final
     )
-    assert fresh and fresh != new
+    assert fresh and fresh == checked_replacement and fresh != new
     assert len(attempts) == 1 and attempts[0] and attempts[0] != expired_attempt
     assert transfer_replies == [200]
     assert mutations == [
@@ -1570,6 +1617,8 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     ]
     assert read_active_session_id(bridge) == fresh
     assert store.get_succession(old, fresh) is not None
+    if old_transfer_moved:
+        assert_install_revoked()
     assert_expired_candidate_not_reused()
     assert panes[fresh] == source_pane and old not in panes
     assert panes.get(new) == (original_pane if old_transfer_moved else None)

@@ -127,7 +127,7 @@ from omnigent.server.schemas import (
     SessionResourcePaginatedList,
 )
 from omnigent.server.session_succession import (
-    claude_transfer_lease_ended,
+    expired_claude_transfer_status,
     is_requested_claude_transfer,
     transfer_requested_claude_terminal,
 )
@@ -2222,8 +2222,13 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         # A replay must not wait behind the original runner RPC, even if the
         # source has since prepared a different successor.
-        if claude_transfer_lease_ended(conv, target_session_id, clear_attempt_id, terminal_id):
+        expired_status = expired_claude_transfer_status(
+            conv, target_session_id, clear_attempt_id, terminal_id
+        )
+        if expired_status == 410:
             raise HTTPException(410, "The terminal handover expired")
+        if expired_status == 409:
+            raise OmnigentError("The terminal handover expired", code=ErrorCode.CONFLICT)
         requested_rotation = is_requested_claude_transfer(conv, target, terminal_id)
         if requested_rotation:
             state = request.app.state
