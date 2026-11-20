@@ -6308,6 +6308,7 @@ async def _auto_create_codex_terminal(
         )
     pick_to_reset: str | None = None
     model_reset_notice: str | None = None
+    model_unlisted_notice: str | None = None
     # Validate an explicit pick against the launch's model list. A Default launch on
     # codex's own login pins the account default, so a ``model =`` line copied from the
     # shared config never governs it. Profile shapes resolve their default when built.
@@ -6359,6 +6360,24 @@ async def _auto_create_codex_terminal(
                     pick,
                     session_id,
                     extra={"session_id": session_id},
+                )
+            elif reachable is None and _codex_launch.profile is None:
+                # A list can lag what the provider serves and never shows router pins, so
+                # launch the explicit pick as requested; the provider's answer decides.
+                offered = ", ".join(
+                    str(row.get("id") or row.get("model") or "") for row in _launch_models.rows
+                )
+                _logger.warning(
+                    "codex-native: model pick %r for session %s is not in the launch's "
+                    "model list (it offers: %s); launching it as requested",
+                    pick,
+                    session_id,
+                    offered,
+                    extra={"session_id": session_id},
+                )
+                model_unlisted_notice = (
+                    f"{pick} isn't in this host's Codex model list; launched as requested. "
+                    "If the provider rejects it, this turn fails."
                 )
             elif reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
@@ -7078,6 +7097,13 @@ async def _auto_create_codex_terminal(
             server_client=server_client,
             code="codex_native_model_unavailable",
             notice=model_reset_notice,
+        )
+    if model_unlisted_notice is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="codex_native_model_unlisted",
+            notice=model_unlisted_notice,
         )
 
     # A prompt a previous launch blocked for routing but never got to replay

@@ -8793,6 +8793,20 @@ _CODEX_MODEL_CARD = {
         "on the host, then start a new session."
     ),
 }
+# A provider's rejection of an id the host's Codex list does not show, forwarded as turn text.
+_CODEX_MODEL_NOT_FOUND_DETAIL = (
+    'unexpected status 404 Not Found: {"error":{"message":"The model `gpt-unlisted-example` '
+    'does not exist or you do not have access to it.","type":"invalid_request_error",'
+    '"param":null,"code":"model_not_found"}}'
+)
+_CODEX_MODEL_NOT_FOUND_CARD = {
+    "title": "Model unavailable",
+    "cause": _CODEX_MODEL_NOT_FOUND_DETAIL,
+    "remediation": (
+        "Choose a different model with the model picker or /model, or check that the "
+        "provider is configured and your account can access this model."
+    ),
+}
 
 
 _CODEX_COMPACTION_MODELS = {
@@ -8918,6 +8932,14 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
             {},
         ),
         (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False, {}),
+        (
+            _CODEX_MODEL_NOT_FOUND_DETAIL,
+            None,
+            _CODEX_MODEL_NOT_FOUND_CARD,
+            "codex-native-ui",
+            False,
+            {},
+        ),
         (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False, {}),
         (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True, {}),
         (
