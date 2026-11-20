@@ -403,6 +403,10 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 _CLAUDE_FORWARDER_BRIDGE_DIRS: weakref.WeakKeyDictionary[asyncio.Task[object], Path] = (
     weakref.WeakKeyDictionary()
 )
+# Subagent router each Claude forwarder's pane calls; a pane transfer moves it.
+_CLAUDE_FORWARDER_ROUTERS: weakref.WeakKeyDictionary[asyncio.Task[object], SubagentRouter] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None:
@@ -414,8 +418,8 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
     superseded conversation (terminal re-create, stop, CLI release, delete)
     would cancel the successor's forwarder or close the subagent router the
     pane's hooks call. Re-registering attaches an eviction callback for the new
-    key; the old key's callback no-ops. The router moves to the new ID, so the
-    pane's spawns route as it, and the forwarder's ``finally`` still closes it.
+    key; the old key's callback no-ops. The pane's own router moves to the new
+    ID, so its spawns route as it, and the forwarder's ``finally`` still closes it.
 
     :param old_session_id: Session the task was registered under, e.g. ``"conv_old"``.
     :param new_session_id: Session that now owns the pane, e.g. ``"conv_new"``.
@@ -427,14 +431,15 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
     if task is None:
         return
     _register_auto_forwarder_task(new_session_id, task)
-    from omnigent.runner.subagent_routing import move_session_router
+    router = _CLAUDE_FORWARDER_ROUTERS.get(task)
+    if router is not None:
+        from omnigent.runner.subagent_routing import move_session_router
 
-    move_session_router(old_session_id, new_session_id)
+        move_session_router(router, new_session_id)
 
 
-# Bridge dir each in-flight Claude launch picked, until its forwarder tails it.
-# A launch that fails first leaves its claim; it only steers another session's
-# pick to a fresh cleared dir.
+# Bridge dir each in-flight Claude launch picked, until its forwarder tails it;
+# :func:`_launch_claude` drops it when the launch fails or is cancelled first.
 _CLAUDE_BRIDGE_LAUNCH_CLAIMS: dict[Path, str] = {}
 
 
@@ -11314,6 +11319,8 @@ async def _auto_create_claude_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _CLAUDE_FORWARDER_BRIDGE_DIRS[_forwarder_task] = bridge_dir
+    if _subagent_router is not None:
+        _CLAUDE_FORWARDER_ROUTERS[_forwarder_task] = _subagent_router
     if _CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(bridge_dir) == session_id:
         del _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir]
     _logger.info(
@@ -12115,23 +12122,30 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """
     if ctx.server_client is None:
         raise ValueError("claude-native launch requires a bound server_client")
-    view = await _auto_create_claude_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
-        server_client=ctx.server_client,
-        event_dispatcher=ctx.event_dispatcher,
-        bundle_dir=ctx.bundle_dir,
-        agent_name=ctx.agent_name,
-        agent_spec=ctx.agent_spec,
-        skills_filter=ctx.skills_filter,
-        session_init=ctx.session_init,
-        auth_token_factory=ctx.auth_token_factory,
-        resolve_launch_config=ctx.resolve_launch_config,
-        record_launch_config=ctx.record_launch_config,
-        global_instructions=ctx.global_instructions,
-        rebind_bridge=ctx.rebind_bridge,
-    )
+    try:
+        view = await _auto_create_claude_terminal(
+            ctx.session_id,
+            ctx.resource_registry,
+            ctx.publish_event,
+            server_client=ctx.server_client,
+            event_dispatcher=ctx.event_dispatcher,
+            bundle_dir=ctx.bundle_dir,
+            agent_name=ctx.agent_name,
+            agent_spec=ctx.agent_spec,
+            skills_filter=ctx.skills_filter,
+            session_init=ctx.session_init,
+            auth_token_factory=ctx.auth_token_factory,
+            resolve_launch_config=ctx.resolve_launch_config,
+            record_launch_config=ctx.record_launch_config,
+            global_instructions=ctx.global_instructions,
+            rebind_bridge=ctx.rebind_bridge,
+        )
+    except BaseException:
+        # No forwarder tails the picked dir, so its claim must not steer other launches.
+        for bridge_dir, owner in list(_CLAUDE_BRIDGE_LAUNCH_CLAIMS.items()):
+            if owner == ctx.session_id:
+                del _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir]
+        raise
     _start_claude_relay_after_launch(ctx)
     return view
 

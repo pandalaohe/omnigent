@@ -1487,28 +1487,30 @@ def ensure_session_router_quietly(
         return None
 
 
-def move_session_router(session_id: str, successor_session_id: str) -> None:
-    """Hand *session_id*'s router to the successor that now owns its pane.
+def move_session_router(router: SubagentRouter, successor_session_id: str) -> None:
+    """Hand a pane's *router* to the successor that now owns the pane.
 
     A native ``/clear`` moves the pane, whose hooks still call this router, to
     a successor. The endpoint then routes the pane's spawns as the successor,
-    teardown addressed to *session_id* cannot reach it, and a relaunch of
-    *session_id* starts its own. If the successor already has a router, the
-    moved one stays unregistered until the launch holding its handle closes it
-    through :func:`shutdown_session_router`.
+    teardown addressed to the previous owner cannot reach it, and a relaunch
+    of that owner starts its own. If the successor already has a router, the
+    moved one stays unregistered, as does one moved again later, until the
+    launch holding its handle closes it through :func:`shutdown_session_router`.
 
-    :param session_id: Session the pane moved away from.
+    :param router: Handle the pane's launch started.
     :param successor_session_id: Session that now owns the pane.
     """
     with _lifecycle_lock:
-        router = _session_routers.pop(session_id, None)
-        if router is None:
+        if _session_routers.get(router.session_id) is router:
+            del _session_routers[router.session_id]
+            if successor_session_id in _session_routers:
+                router.detached = True
+            else:
+                _session_routers[successor_session_id] = router
+        elif not router.detached:
+            # A teardown already took it out of the index and is closing it.
             return
         router.session_id = successor_session_id
-        if successor_session_id in _session_routers:
-            router.detached = True
-        else:
-            _session_routers[successor_session_id] = router
         for bridge_dir in tuple(router.advertised_dirs):
             try:
                 advertised = json.loads((bridge_dir / ADVERTISEMENT_FILE).read_text("utf-8"))

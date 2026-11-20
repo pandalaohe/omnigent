@@ -45,7 +45,12 @@ class _RecordingClient:
 @pytest.fixture(autouse=True)
 def _cleanup_routers() -> Any:  # type: ignore[explicit-any]
     yield
-    for session_id in ("conv_native_launch", "conv_native_successor", "conv_sdk_launch"):
+    for session_id in (
+        "conv_native_launch",
+        "conv_native_successor",
+        "conv_native_third",
+        "conv_sdk_launch",
+    ):
         subagent_routing.shutdown_session_router(session_id)
 
 
@@ -178,9 +183,14 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
 async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_teardown(
     tmp_path: Path, successor_has_router: bool
 ) -> None:
-    """A /clear successor's spawns relay as it; the old session relaunches with its own router."""
+    """A /clear successor's spawns relay as it; the old session relaunches with its own router.
+
+    A second transfer moves the pane's own router, even when the first left it
+    beside a router the successor already had.
+    """
     session_id = "conv_native_launch"
     successor_id = "conv_native_successor"
+    third_id = "conv_native_third"
     pane_dir = tmp_path / "pane"
     relaunch_dir = tmp_path / "relaunch"
     client = _RecordingClient()
@@ -206,7 +216,7 @@ async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_t
         if successor_has_router
         else None
     )
-    subagent_routing.move_session_router(session_id, successor_id)
+    subagent_routing.move_session_router(pane_router, successor_id)
     assert session_id not in subagent_routing._session_routers
     assert subagent_routing._session_routers.get(successor_id) is (successor_router or pane_router)
 
@@ -218,6 +228,22 @@ async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_t
     assert await asyncio.to_thread(request_decision, pane_endpoint, successor_id, body)
     assert await asyncio.to_thread(request_decision, pane_endpoint, session_id, body) is None
     assert client.paths == [subagent_routing.SERVER_ROUTE_PATH.format(session_id=successor_id)]
+
+    # The pane moves on: its own router follows; the successor's keeps serving it.
+    subagent_routing.move_session_router(pane_router, third_id)
+    pane_endpoint = read_router_endpoint(pane_dir)
+    assert pane_endpoint is not None and pane_endpoint.session_id == third_id
+    assert await asyncio.to_thread(request_decision, pane_endpoint, third_id, body)
+    assert await asyncio.to_thread(request_decision, pane_endpoint, successor_id, body) is None
+    assert client.paths[1:] == [subagent_routing.SERVER_ROUTE_PATH.format(session_id=third_id)]
+    assert subagent_routing._session_routers.get(successor_id) is successor_router
+    assert subagent_routing._session_routers.get(third_id) is (
+        None if successor_has_router else pane_router
+    )
+    if successor_router is not None:
+        assert successor_router.session_id == successor_id
+        successor_endpoint = read_router_endpoint(tmp_path / "successor")
+        assert successor_endpoint is not None and successor_endpoint.session_id == successor_id
 
     # Old-session delete and CLI release hold no handle.
     subagent_routing.shutdown_session_router(session_id)
@@ -233,6 +259,7 @@ async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_t
     assert not relaunched._closed
     assert subagent_routing._session_routers.get(session_id) is relaunched
     assert subagent_routing._session_routers.get(successor_id) is successor_router
+    assert third_id not in subagent_routing._session_routers
     assert successor_router is None or not successor_router._closed
 
 

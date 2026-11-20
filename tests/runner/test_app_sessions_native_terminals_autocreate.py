@@ -5086,6 +5086,133 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == expected_bridge_id
 
 
+@pytest.mark.asyncio
+async def test_a_cancelled_claude_launch_leaves_no_claim_on_a_successors_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A launch cancelled before its forwarder starts drops its bridge claim.
+
+    After a runner restart a retired session and its successor can both name one
+    cleared dir. The retired session's launch claims it and is cancelled during
+    its label write. The successor then still resumes in that dir with its own
+    local Claude session id, also over an abandoned claim of its own.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    retired_id = "b3e788af0ecd4516439ee859b8c74536"
+    successor_id = "c4f899b01fde5627540ff96ac9d85647"
+    successor_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
+    shared_bridge_id = f"{retired_id}-cleared"
+    shared_dir = bridge_dir_for_bridge_id(shared_bridge_id)
+    claude_native_bridge.prepare_bridge_dir(
+        successor_id, bridge_id=shared_bridge_id, workspace=tmp_path / "workspace"
+    )
+    claude_native_bridge.write_claude_session_id(shared_dir, successor_claude_sid)
+
+    resumed: list[tuple[str, Path]] = []
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> Any:
+        del client, session_id, workspace, resume_copy
+        resumed.append((external_session_id, bridge_dir))
+        from omnigent.harnesses.claude_native.main import ClaudeResumeTranscriptResolution
+
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"fixture"}}\n')
+        return ClaudeResumeTranscriptResolution(transcript, reused_local=False, synthesized=True)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _capture_forwarder(**kwargs: Any) -> None:
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _capture_forwarder,
+    )
+
+    class _SharedBridgeServerClient(NullServerClient):
+        """Both sessions name the shared dir; the retired session's label write hangs."""
+
+        def __init__(self) -> None:
+            self.retired_label_write = asyncio.Event()
+            self.label_writes: list[tuple[str, str]] = []
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            del url, kwargs
+            payload = {"labels": {BRIDGE_ID_LABEL_KEY: shared_bridge_id}}
+
+            class _Response(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return payload
+
+            return _Response()
+
+        async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            body = kwargs.get("json")
+            labels = body.get("labels") if isinstance(body, dict) else None
+            if isinstance(labels, dict) and BRIDGE_ID_LABEL_KEY in labels:
+                self.label_writes.append((url, labels[BRIDGE_ID_LABEL_KEY]))
+                if retired_id in url:
+                    self.retired_label_write.set()
+                    await asyncio.Event().wait()
+            return await super().patch(url, **kwargs)
+
+    client = _SharedBridgeServerClient()
+    captured: dict[str, Any] = {}
+
+    def _context(session_id: str) -> NativeLaunchContext:
+        return NativeLaunchContext(
+            session_id=session_id,
+            resource_registry=_RecordingClaudeRegistry(captured),
+            publish_event=lambda _sid, _evt: None,
+            server_client=client,  # type: ignore[arg-type]
+        )
+
+    retired_launch = asyncio.create_task(orchestration._launch_claude(_context(retired_id)))
+    try:
+        await asyncio.wait_for(client.retired_label_write.wait(), timeout=30)
+        assert orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(shared_dir) == retired_id
+        retired_launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await retired_launch
+        assert shared_dir not in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS
+        # An abandoned claim of the successor's own does not move it either.
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[shared_dir] = successor_id
+        await orchestration._launch_claude(_context(successor_id))
+        await orchestration._AUTO_FORWARDER_TASKS[successor_id]
+    finally:
+        retired_launch.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(shared_dir, None)
+
+    assert forwarder_kwargs["session_id"] == successor_id
+    assert forwarder_kwargs["bridge_dir"] == shared_dir
+    assert resumed == [(successor_claude_sid, shared_dir)]
+    args = captured["spec"].args
+    assert args[args.index("--resume") + 1] == successor_claude_sid
+    assert claude_native_bridge.read_active_session_id(shared_dir) == successor_id
+    assert [bridge_id for url, bridge_id in client.label_writes if successor_id in url] == [
+        shared_bridge_id
+    ]
+
+
 _RELAUNCHED_SESSION_ID = "6fe4feaa4dc772577c234c9f48c30dda"
 _SOURCE_BRIDGE_ID = "971d4249f0c874d2718c0ea35ed53ef5"
 
@@ -6951,6 +7078,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    after_launch: Callable[[], None] | None = None,
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
 
@@ -6959,6 +7087,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
         cost-control field, which is the shape a sub-agent child of a routed
         parent is created with.
+    :param after_launch: Called once the launch returns, before its routers stop.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
@@ -7039,6 +7168,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
             lambda _sid, _evt: None,
             server_client=fake_client,
         )
+        if after_launch is not None:
+            after_launch()
     finally:
         from omnigent.runner import subagent_routing, turn_routing
 
@@ -7107,12 +7238,31 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
 async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.runner import subagent_routing
+
+    session_id = "4a1c9b1d1f0e4c5da0a1b2c3d4e5f602"
+    pane_routers: list[tuple[object, object]] = []
+
+    def _record_pane_router() -> None:
+        forwarder = orchestration._AUTO_FORWARDER_TASKS[session_id]
+        pane_routers.append(
+            (
+                orchestration._CLAUDE_FORWARDER_ROUTERS.get(forwarder),
+                subagent_routing._session_routers.get(session_id),
+            )
+        )
+
     spec = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
-        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
+        session_id=session_id,
         routed=True,
+        after_launch=_record_pane_router,
     )
+
+    # A pane transfer moves the router recorded with its forwarder: this launch's own.
+    [(pane_router, launched_router)] = pane_routers
+    assert pane_router is not None and pane_router is launched_router
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
