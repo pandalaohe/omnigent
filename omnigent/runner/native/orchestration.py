@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
@@ -387,6 +388,44 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
             )
 
     task.add_done_callback(_evict)
+
+
+# Bridge dir each live Claude forwarder tails, independent of its registry key.
+_CLAUDE_FORWARDER_BRIDGE_DIRS: weakref.WeakKeyDictionary[asyncio.Task[object], Path] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None:
+    """
+    Move a forwarder registration onto the session that now owns its pane.
+
+    A native ``/clear`` moves the pane to a fresh conversation while the same
+    forwarder keeps mirroring it. Without the move, a teardown addressed to the
+    superseded conversation (terminal re-create, stop, CLI release) would
+    cancel the successor's forwarder. Re-registering attaches an eviction
+    callback for the new key; the old key's callback no-ops.
+
+    :param old_session_id: Session the task was registered under, e.g. ``"conv_old"``.
+    :param new_session_id: Session that now owns the pane, e.g. ``"conv_new"``.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        return
+    task = _AUTO_FORWARDER_TASKS.pop(old_session_id, None)
+    if task is None:
+        return
+    _register_auto_forwarder_task(new_session_id, task)
+
+
+def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) -> bool:
+    """Return whether another session's live Claude forwarder tails *bridge_dir*."""
+    return any(
+        owner != session_id
+        and not task.done()
+        and _CLAUDE_FORWARDER_BRIDGE_DIRS.get(task) == bridge_dir
+        for owner, task in _AUTO_FORWARDER_TASKS.items()
+    )
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -10228,6 +10267,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        bridge_dir_for_bridge_id,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -10271,6 +10311,9 @@ async def _auto_create_claude_terminal(
         current_bridge_id = current_labels.get(BRIDGE_ID_LABEL_KEY)
         if isinstance(current_bridge_id, str) and current_bridge_id:
             bridge_id = current_bridge_id
+    if _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
+        # The pane and its forwarder moved to a successor; never wipe or share its bridge.
+        bridge_id = f"{session_id}-cleared"
     rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
@@ -11226,6 +11269,7 @@ async def _auto_create_claude_terminal(
         name=f"claude-forwarder-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
+    _CLAUDE_FORWARDER_BRIDGE_DIRS[_forwarder_task] = bridge_dir
     _logger.info(
         "Auto-created claude terminal + forwarder for session %s; "
         "forwarder_task=%s elapsed_ms=%.0f",

@@ -866,11 +866,48 @@ async def test_claude_fallback_bundle_follows_transferred_terminal(
 
 
 @pytest.mark.asyncio
+async def test_claude_forwarder_registration_follows_transferred_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A /clear successor owns the pane's forwarder before any other task can run."""
+    from omnigent.runner.native import orchestration
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    orchestration._register_auto_forwarder_task("conv_old", forwarder)
+    owner_at_first_yield: list[asyncio.Task[object] | None] = []
+
+    async def _status_link(_link: str) -> None:
+        owner_at_first_yield.append(orchestration._AUTO_FORWARDER_TASKS.get("conv_new"))
+
+    monkeypatch.setattr(instance, "set_conversation_link", _status_link)
+    try:
+        assert await registry.transfer_terminal("conv_old", "conv_new", "terminal_claude_main")
+        assert owner_at_first_yield == [forwarder]
+        assert "conv_old" not in orchestration._AUTO_FORWARDER_TASKS
+        # Old-session teardown (pane rebuild, stop, CLI release) cannot reach it.
+        assert await orchestration._cancel_auto_forwarder_task("conv_old")
+        assert not forwarder.done()
+        assert await orchestration._cancel_auto_forwarder_task("conv_new")
+        assert forwarder.cancelled()
+    finally:
+        forwarder.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_old", None)
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_new", None)
+
+
+@pytest.mark.asyncio
 async def test_non_claude_transfer_does_not_move_fallback_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    transfers: list[tuple[str, str]] = []
+    registry.set_claude_terminal_transfer_listener(lambda *ids: transfers.append(ids))
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     source_bundle = registry.claude_skill_bundle_dir("source")
     terminal_registry._by_conversation.setdefault("source", {})[("codex", "main")] = instance
@@ -888,6 +925,7 @@ async def test_non_claude_transfer_does_not_move_fallback_bundle(
     monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
     moved = await registry.transfer_terminal("source", "target", "terminal_codex_main")
     assert moved is not None
+    assert transfers == []
 
     await registry.cleanup_session("source")
     assert not source_bundle.exists()

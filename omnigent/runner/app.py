@@ -169,6 +169,7 @@ from omnigent.runner.native import (
     _is_spec_local_native_python_tool,
     _launch_native_terminal,
     _publish_terminal_pending,
+    _rekey_auto_forwarder_task,
     _required_runner_env,
     _resolve_native_spawn_env,
     _resolved_spec_workdir,
@@ -3423,6 +3424,8 @@ def create_runner_app(
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
+    # The Claude transcript forwarder follows its pane onto a /clear successor.
+    resource_registry.set_claude_terminal_transfer_listener(_rekey_auto_forwarder_task)
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
