@@ -186,6 +186,33 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkey
     assert late_mirror.matched.pending_id == pending_id
 
 
+def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(pending_inputs, "_session_busy_check", None)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+    check = pending_inputs._session_busy_check
+    assert check is not None
+    session_id = "f" * 32
+    try:
+        for status, busy in (("waiting", True), ("running", True), ("idle", False)):
+            orchestration._session_status_cache[session_id] = status
+            assert check(session_id) is busy
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+
+
 def _confirm_paste(session_id: str, pending_id: str) -> None:
     attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
         "delivery_attempt_id"

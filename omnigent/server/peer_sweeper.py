@@ -809,7 +809,8 @@ class PeerSweeper:
                 for match in matches
             ):
                 break
-            if not native_attempt or len(matches) < limit:
+            # Page past failed rows and quotes until a short page ends the search.
+            if len(matches) < limit:
                 matches = []
                 break
             limit *= 2

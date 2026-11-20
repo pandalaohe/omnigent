@@ -1064,6 +1064,61 @@ async def test_runner_lost_peer_copy_is_resent_not_taken_as_delivered(db_uri: st
     assert _row(store, record.id).state == "delivered"
 
 
+async def test_mirror_behind_many_failed_peer_copies_settles_delivered(db_uri: str) -> None:
+    """Failed rows of repeatedly lost copies cannot hide the real echo from the search."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    receiver = conv_store.create_conversation(title="Receiver")
+    record = SessionPeerMessage(
+        id=uuid.uuid4().hex,
+        sender_session_id=uuid.uuid4().hex,
+        receiver_session_id=receiver.id,
+        ref="ref-many-lost",
+        text="body",
+        state="delivering",
+        created_at=1000,
+        expires_at=2000,
+    )
+    store = _FakePeerStore()
+    store.seed(record)
+    deliver = _DeliverScript()
+    sweeper = PeerSweeper(
+        peer_store=store,
+        conversation_store=conv_store,
+        permission_store=None,
+        true_state=_TrueStateScript(),
+        deliver=deliver,
+        post_event_impl=_PostEventScript(),
+    )
+    envelope = _envelope(record)
+    for index in range(6):
+        conv_store.append(
+            receiver.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"lost_{index}",
+                    status="failed",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": envelope}]
+                    ),
+                )
+            ],
+        )
+    conv_store.append(
+        receiver.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_mirror",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": envelope}]),
+            )
+        ],
+    )
+    await sweeper._reconcile_one(dataclasses.replace(record), 1000)
+    assert _row(store, record.id).state == "delivered"
+    assert deliver.calls == []
+
+
 async def test_held_records_do_not_use_up_the_reconcile_page(harness: _Harness) -> None:
     """Held copies never expire, so the pass reaches the records behind them."""
     harness.sweeper._batch_limit = 2
