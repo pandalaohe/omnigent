@@ -312,6 +312,8 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
+# Minimum spacing of repaint requests for a busy Claude pane whose input box is hidden.
+_CLAUDE_BUSY_REPAINT_INTERVAL_S = 5.0
 
 # How long a message refused by a launcher sign-in may wait, including the time the server
 # already had it queued. Must stay inside the server's pending-input lifetime, so a refusal
@@ -8002,12 +8004,15 @@ def create_runner_app(
         )
         return bridge_dir_for_bridge_id(bridge_id)
 
+    busy_pane_repaints: dict[Path, float] = {}
+
     def _claude_input_blocked(bridge_dir: Path) -> bool:
         from omnigent.harnesses.claude_native.bridge import (
             claude_pane_has_accepted_input,
             claude_pane_ready,
             has_pending_user_prompt,
             has_running_turn,
+            input_box_reads_clear,
         )
 
         if has_pending_user_prompt(bridge_dir):
@@ -8015,9 +8020,16 @@ def create_runner_app(
         # Claude Code keeps its input box open mid-turn and queues what is typed
         # there. Only a busy pane without a usable box keeps the message queued,
         # so its wait never spends the delivery's readiness budget.
-        return has_running_turn(
+        if not has_running_turn(
             bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
-        ) and not claude_pane_ready(bridge_dir)
+        ) or claude_pane_ready(bridge_dir):
+            return False
+        # Output printed over the box hides it until Claude Code repaints.
+        now = time.monotonic()
+        if now - busy_pane_repaints.get(bridge_dir, -math.inf) >= _CLAUDE_BUSY_REPAINT_INTERVAL_S:
+            busy_pane_repaints[bridge_dir] = now
+            input_box_reads_clear(bridge_dir, repaint=True)
+        return True
 
     async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
         """Return the bridge whose question, approval or unusable busy pane owns input."""
