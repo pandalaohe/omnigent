@@ -29,6 +29,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.handover_notes import annotate_handover_note
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -206,10 +207,11 @@ def register_items_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
         page = await asyncio.to_thread(
             conversation_store.list_items,
             session_id,
@@ -218,7 +220,7 @@ def register_items_routes(
             before=before,
             order=order,
         )
-        data = [m.to_api_dict() for m in page.data]
+        data = [annotate_handover_note(item, conv).to_api_dict() for item in page.data]
         return PaginatedList(
             data=data,
             first_id=page.first_id,
@@ -336,10 +338,11 @@ def register_items_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
 
         matches = await asyncio.to_thread(
             conversation_store.search_visible_items_literal,
@@ -350,7 +353,7 @@ def register_items_routes(
         has_more = len(matches) > limit
         visible = matches[:limit]
         return PaginatedList(
-            data=[item.to_api_dict() for item in visible],
+            data=[annotate_handover_note(item, conv).to_api_dict() for item in visible],
             first_id=visible[0].id if visible else None,
             last_id=visible[-1].id if visible else None,
             has_more=has_more,
@@ -372,10 +375,11 @@ def register_items_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
 
         older_page, newer_page = await asyncio.gather(
             asyncio.to_thread(
@@ -416,7 +420,7 @@ def register_items_routes(
 
         items = [*reversed(older_page.data), anchor_page.data[0], *newer_page.data]
         return SessionItemsWindow(
-            data=[item.to_api_dict() for item in items],
+            data=[annotate_handover_note(item, conv).to_api_dict() for item in items],
             anchor_id=anchor_id,
             first_id=items[0].id if items else None,
             last_id=items[-1].id if items else None,

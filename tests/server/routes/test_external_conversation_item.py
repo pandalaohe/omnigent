@@ -49,6 +49,7 @@ async def test_external_marker_is_untrusted_through_http_and_reload(client, batc
                     {"type": "input_text" if role == "user" else "output_text", "text": "retry"}
                 ],
                 "auto_retry": {"chain_id": "a" * 32, "input_id": "b" * 32, "attempt": 1, "of": 3},
+                "is_handover_note": True,
             },
         },
     }
@@ -61,6 +62,7 @@ async def test_external_marker_is_untrusted_through_http_and_reload(client, batc
     [message] = [item for item in reloaded.json()["data"] if item["type"] == "message"]
     assert message["role"] == role
     assert "auto_retry" not in message
+    assert "is_handover_note" not in message
 
 
 def test_native_message_stream_id_survives_snapshot_serialization() -> None:

@@ -9,6 +9,7 @@ Only a top-level session with a supported rotation harness may call it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,10 +22,11 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
-from omnigent.entities import ErrorData
+from omnigent.db.utils import generate_task_id
+from omnigent.entities import ErrorData, MessageData, NewConversationItem
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
+from omnigent.server.auto_rotation import FAILED_ATTEMPT_LABEL_KEY, INJECTED_REVISION_LABEL_KEY
 from omnigent.server.routes import sessions as sessions_facade
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -142,6 +144,7 @@ async def test_handover_records_item_and_labels(
     assert len(messages) == 1
     assert messages[0].id == body["item_id"]
     assert messages[0].data.role == "assistant"
+    assert messages[0].data.is_handover_note is True
     assert messages[0].data.content == [{"type": "output_text", "text": "Continue the migration."}]
 
     row = store.get_conversation(session_id)
@@ -155,13 +158,82 @@ async def test_handover_records_item_and_labels(
         "This session will continue in a new session when the current turn ends."
     )
 
-    published_item_ids = [
-        event.get("item", {}).get("id")
+    published_items = {
+        event["item"]["id"]: event["item"]
         for session, event in published
         if session == session_id and event.get("type") == "response.output_item.done"
-    ]
-    assert body["item_id"] in published_item_ids
-    assert notices[0].id in published_item_ids
+    }
+    note_event = published_items[body["item_id"]]
+    assert note_event["is_handover_note"] is True
+    assert note_event["content"] == messages[0].data.content
+    assert notices[0].id in published_items
+
+
+async def test_handover_marker_survives_history_copy(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    session_id = _create(store)
+    text = "Continue  here.\n\n  Keep the indentation."
+    response = await client.post(f"/v1/sessions/{session_id}/handover", json={"handover": text})
+    assert response.status_code == 200, response.text
+    original = _handover_messages(store, session_id)[0]
+
+    # Copy up to the note, excluding the subsequent rotation notice.
+    fork = store.fork_conversation(session_id, up_to_response_id=original.response_id)
+    for history_id in (session_id, fork.id):
+        response = await client.get(f"/v1/sessions/{history_id}/items")
+        assert response.status_code == 200, response.text
+        messages = response.json()["data"]
+        assert len(messages) == (1 if history_id == fork.id else 2)
+        note = messages[0]
+        assert (note["id"] == original.id) == (history_id == session_id)
+        assert note["is_handover_note"] is True
+        assert note["content"] == [{"type": "output_text", "text": text}]
+
+
+@pytest.mark.parametrize("attempt", [None, "initial", "0:previous-attempt"])
+async def test_history_marks_only_legacy_notes_with_a_matching_original_id(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    attempt: str | None,
+) -> None:
+    session_id = _create(store)
+    if attempt == "0:previous-attempt":
+        store.set_labels(session_id, {FAILED_ATTEMPT_LABEL_KEY: attempt})
+    text = "Remember the exact text."
+    message = MessageData(
+        role="assistant", agent="example-agent", content=[{"type": "output_text", "text": text}]
+    )
+    legacy_text = f"{text}\0{attempt}" if attempt else text
+    stable_id = hashlib.sha256(
+        f"session_handover:{session_id}:{legacy_text}".encode()
+    ).hexdigest()[:32]
+    reply, note = store.append(
+        session_id,
+        [
+            NewConversationItem(type="message", response_id=generate_task_id(), data=message),
+            NewConversationItem(
+                type="message", response_id=generate_task_id(), data=message, stable_id=stable_id
+            ),
+        ],
+    )
+
+    response = await client.get(f"/v1/sessions/{session_id}/items")
+    assert response.status_code == 200, response.text
+    messages = {item["id"]: item for item in response.json()["data"]}
+    assert messages[note.id]["is_handover_note"] is True
+    assert "is_handover_note" not in messages[reply.id]
+    assert messages[note.id]["content"] == messages[reply.id]["content"]
+    assert not _handover_messages(store, session_id)[0].data.is_handover_note
+
+    if attempt is None:
+        fork = store.fork_conversation(session_id, up_to_response_id=note.response_id)
+        response = await client.get(f"/v1/sessions/{fork.id}/items")
+        assert response.status_code == 200, response.text
+        copied = response.json()["data"]
+        assert len(copied) == 2
+        assert all("is_handover_note" not in item for item in copied)
 
 
 async def test_handover_rotate_false_records_only_the_note(

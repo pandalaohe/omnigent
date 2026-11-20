@@ -371,6 +371,7 @@ export interface MessageDone {
   content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
+  isHandoverNote?: boolean;
   /** Native live-preview stream finalized by this item. */
   messageId?: string;
   /** Harness label for the message, when the harness reports one (Codex). */

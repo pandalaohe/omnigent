@@ -7635,6 +7635,12 @@
             "title": "Interrupted",
             "type": "boolean"
           },
+          "is_handover_note": {
+            "default": false,
+            "description": "`True` for a server-authored session handover.",
+            "title": "Is Handover Note",
+            "type": "boolean"
+          },
           "is_meta": {
             "default": false,
             "description": "`True` for durable context that must be replayed to agents but hidden from user-facing transcripts, e.g. injected skill instructions. Defaults to `False` and is omitted from serialized payloads in that case.",
@@ -13765,6 +13771,12 @@
             "default": false,
             "description": "`True` for a partial assistant response from an interrupted turn; omitted when `False`.",
             "title": "Interrupted",
+            "type": "boolean"
+          },
+          "is_handover_note": {
+            "default": false,
+            "description": "`True` for a server-authored session handover.",
+            "title": "Is Handover Note",
             "type": "boolean"
           },
           "is_meta": {

@@ -24,6 +24,7 @@ import type {
   AnyBlock,
   ElicitationBlock,
   ErrorBlock,
+  HandoverNoteBlock,
   MessageContentBlock,
   NativeToolBlock,
   RoutingDecisionBlock,
@@ -266,6 +267,8 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | { kind: "handover_note"; itemId: string; responseId: string; text: string }
+  | { kind: "rotation_notice"; itemId: string; message: string }
   | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
@@ -280,6 +283,16 @@ export type Bubble =
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
+
+type HandoverRowBlock =
+  HandoverNoteBlock | (ErrorBlock & { code: "session_rotation"; level: "info" });
+
+function isHandoverRowBlock(block: AnyBlock): block is HandoverRowBlock {
+  return (
+    block.type === "handover_note" ||
+    (block.type === "error" && block.code === "session_rotation" && block.level === "info")
+  );
+}
 
 /**
  * Cross-call reuse cache for `buildBubbles`.
@@ -305,8 +318,8 @@ const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "re
  *     ``-1`` when there were no bubbles.
  * :param lastBubbleCount: how many bubbles that region produced — 1 normally,
  *     more when a deferred routing chip widened the region back to the chip
- *     (the pair, plus any bubble rendered between them). Reuse drops exactly
- *     this many bubbles before re-walking the region.
+ *     (the pair, plus any bubble rendered between them), or a reply has
+ *     standalone handover notes. Reuse drops this many bubbles before rewalking.
  * :param supersededChips: block indexes the cached walk dropped as superseded
  *     create-time chips. A chip is only KNOWN superseded once the turn that
  *     repeats it arrives, which is usually after the chip's own bubble was
@@ -364,6 +377,7 @@ export function createBubbleCache(): BubbleCache {
 function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
+    if (isHandoverRowBlock(b)) continue;
     if (
       b.type === "user_message" ||
       isTerminalCommandInput(b) ||
@@ -734,8 +748,8 @@ function reusablePrefix(
       return null;
     }
   }
-  // Drop every bubble the re-walked region produced — normally just the last
-  // one, but a user message and its deferred routing chip come as a pair.
+  // Drop every bubble the rewalked region produced, including standalone
+  // handover notes or a deferred routing chip.
   const dropped = Math.min(cache.lastBubbleCount, cache.bubbles.length);
   const prefix = cache.bubbles.slice(0, cache.bubbles.length - dropped);
   // A reused assistant bubble whose response is still the active one
@@ -1005,6 +1019,14 @@ function walkBubbles(
       continue;
     }
 
+    if (isHandoverRowBlock(b)) {
+      lastBubbleStart = i;
+      lastBubbleCount = 1;
+      bubbles.push(handoverRowBubble(b, i));
+      i += 1;
+      continue;
+    }
+
     if (b.type === "routing_decision") {
       // The create-time pick the first turn immediately repeats — the turn
       // chip stands for both, so this one renders nothing.
@@ -1056,6 +1078,7 @@ function walkBubbles(
     // A question/plan card is the user's own answer point, so it takes a
     // bubble of its own even under the turn's response id.
     const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
+    const handoverRows: Bubble[] = [];
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -1079,6 +1102,12 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (isHandoverRowBlock(cur)) {
+        // Render handover rows after this reply without affecting turn grouping.
+        handoverRows.push(handoverRowBubble(cur, i));
+        i += 1;
+        continue;
+      }
       if (isSubagentActivityBlock(cur)) {
         // A notice stays in its turn's bubble until committed work from another
         // response follows it, then opens that response's bubble: a native fold
@@ -1111,6 +1140,11 @@ function walkBubbles(
     // A group of only tool_results renders nothing itself — skip it so
     // an orphan late output doesn't paint an empty assistant bubble.
     if (groupBlocks.length > 0 && groupBlocks.every((bk) => bk.type === "tool_result")) {
+      if (handoverRows.length > 0) {
+        lastBubbleStart = groupStart;
+        lastBubbleCount = handoverRows.length;
+        bubbles.push(...handoverRows);
+      }
       continue;
     }
     const lifecycle =
@@ -1150,7 +1184,8 @@ function walkBubbles(
     }
 
     lastBubbleStart = groupStart;
-    lastBubbleCount = 1;
+    // Rewalk both the reply and its notes on an append to that same reply.
+    lastBubbleCount = 1 + handoverRows.length;
     // A notice is stamped when the sub-agent reported, not when this turn worked.
     const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
     const workedForS = turnWorkedForS(workBlocks);
@@ -1204,10 +1239,27 @@ function walkBubbles(
         ? { defaultExpanded: true }
         : {}),
     });
+    bubbles.push(...handoverRows);
     expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
+}
+
+function handoverRowBubble(block: HandoverRowBlock, index: number): Bubble {
+  if (block.type === "error") {
+    return {
+      kind: "rotation_notice",
+      itemId: block.ctx.itemId ?? `rotation_notice_${index}`,
+      message: block.message,
+    };
+  }
+  return {
+    kind: "handover_note",
+    itemId: block.ctx.itemId ?? `handover_note_${index}`,
+    responseId: block.ctx.responseId,
+    text: block.text,
+  };
 }
 
 /** Build the standalone chip bubble for a routing-decision block. */
@@ -1543,7 +1595,7 @@ function workBesideNotice(
 ): AnyBlock | undefined {
   for (let k = index + step; k >= floor && k < blocks.length; k += step) {
     const b = blocks[k]!;
-    if (isNoticeTransparent(b)) continue;
+    if (isNoticeTransparent(b) || isHandoverRowBlock(b)) continue;
     if (
       !isAssistantSideBlock(b) ||
       isStandaloneSentinelBlock(b) ||
@@ -1586,6 +1638,7 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
     b.type !== "compaction_loading" &&
+    !isHandoverRowBlock(b) &&
     // routing_decision is a standalone top-level chip, not an assistant item.
     b.type !== "routing_decision" &&
     b.type !== "response_start" &&
@@ -1617,7 +1670,7 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
     const previous = blocks[previousIndex]!;
     if (isNonRenderingBlock(previous)) return null;
-    if (isSubagentActivityBlock(previous)) continue;
+    if (isSubagentActivityBlock(previous) || isHandoverRowBlock(previous)) continue;
     if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
     return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
       ? user.ctx.responseId
@@ -2057,6 +2110,12 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "routing_decision" && b.kind === "routing_decision") {
     // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
+  }
+  if (a.kind === "handover_note" && b.kind === "handover_note") {
+    return a.itemId === b.itemId && a.responseId === b.responseId && a.text === b.text;
+  }
+  if (a.kind === "rotation_notice" && b.kind === "rotation_notice") {
+    return a.itemId === b.itemId && a.message === b.message;
   }
   if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
     return a.itemId === b.itemId && a.data === b.data;

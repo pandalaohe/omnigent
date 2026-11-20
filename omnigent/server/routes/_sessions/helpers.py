@@ -4404,6 +4404,7 @@ def _publish_external_conversation_item(
         item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "assistant"
+        and not item.data.is_handover_note
     ):
         inflight_text.retire_native_previews(session_id)
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
@@ -4768,8 +4769,12 @@ def _parse_external_conversation_item(
             code=ErrorCode.INVALID_INPUT,
         )
     if item_type == "message":
-        # Automation labels are derived from verified admission receipts at persistence.
-        item_data = {key: value for key, value in item_data.items() if key != "auto_retry"}
+        # Admission receipts and the handover route own these markers.
+        item_data = {
+            key: value
+            for key, value in item_data.items()
+            if key not in {"auto_retry", "is_handover_note"}
+        }
     response_id = body.data.get("response_id")
     if response_id is None:
         response_id = generate_task_id()

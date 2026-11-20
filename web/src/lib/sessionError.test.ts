@@ -34,6 +34,12 @@ describe("latestActivityIsError", () => {
     expect(latestActivityIsError([{ ...error, level: "info" }])).toBe(false);
   });
 
+  it("does not treat a handover note as a new reply or an API error", () => {
+    const note = { type: "handover_note", ctx, text: "API Error: see the previous turn" } as const;
+    expect(latestActivityIsError([note])).toBeUndefined();
+    expect(latestActivityIsError([error, note])).toBe(true);
+  });
+
   it("distinguishes runner disconnects from genuine faults and host recovery", () => {
     const disconnected = { ...error, code: "runner_disconnected" };
     expect(latestActivityErrorState([disconnected], false)).toBe("disconnected");

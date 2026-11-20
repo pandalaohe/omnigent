@@ -73,7 +73,11 @@ class ImportItemInput(BaseModel):
         try:
             payload = self.data
             if self.type == "message":
-                payload = {key: value for key, value in payload.items() if key != "auto_retry"}
+                payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"auto_retry", "is_handover_note"}
+                }
             data = parse_item_data(self.type, payload)
             return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
         except (TypeError, ValueError) as exc:

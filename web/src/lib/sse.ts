@@ -1494,6 +1494,9 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
+      ...(rec.role === "assistant" && rec.is_handover_note === true
+        ? { isHandoverNote: true }
+        : {}),
       ...(messageId !== undefined ? { messageId } : {}),
       ...(phase !== undefined ? { phase } : {}),
     } satisfies MessageDone;

@@ -1832,6 +1832,59 @@ describe("buildBubbles — session-driven trailing tool spinner", () => {
     expect(toolState(bubbles)).toBe("input-available");
   });
 
+  it("settles a pre-handover tool when same-turn narration resumes and folds in its late result", () => {
+    const beforeResult: AnyBlock[] = [
+      ...danglingToolTurn,
+      {
+        type: "handover_note",
+        ctx: ctx({ itemId: "note", responseId: "resp_note" }),
+        text: "Continue here.",
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "narration", responseId: "resp_1" }),
+        fullText: "Continuing after the tool.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const cache = createBubbleCache();
+    const before = buildBubbles(beforeResult, null, cache, [], true);
+    expect(before).toMatchObject([
+      {
+        kind: "assistant",
+        items: [
+          { kind: "tool", state: "no-output", output: null },
+          { kind: "text", text: "Continuing after the tool." },
+        ],
+      },
+      { kind: "handover_note", itemId: "note" },
+    ]);
+
+    const withResult: AnyBlock[] = [
+      ...beforeResult,
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "late result",
+      },
+    ];
+    const after = buildBubbles(withResult, null, cache, [], true);
+    expect(after).toMatchObject([
+      {
+        kind: "assistant",
+        items: [
+          { kind: "tool", state: "output-available", output: "late result" },
+          { kind: "text", text: "Continuing after the tool." },
+        ],
+      },
+      { kind: "handover_note", itemId: "note" },
+    ]);
+    expect(after).toEqual(buildBubbles(withResult, null, undefined, [], true));
+  });
+
   it("does not spin when the session is idle (dangling tool resolves to no-output)", () => {
     // The idle edge can land before the tool's result block — the tool must
     // settle, not spin forever. This is the property the never-spin tests pin,
@@ -4318,19 +4371,55 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
     expect(assistants(bubbles)[0]!.responseId).toBe("codex_t1");
   });
 
-  it("merges a same-turn continuation across a real response-id change", () => {
-    // Codex's step-wise (goal/plan) turns publish a distinct response id
-    // per step while the items carry the thread id — one user turn, so
-    // one bubble (and eventually ONE "Worked for" fold, not one per
-    // step).
-    const bubbles = buildBubbles(
-      [textDone("m1", "codex_step1", "step one"), textDone("m2", "codex_step2", "step two")],
-      null,
-    );
-    expect(assistants(bubbles)).toHaveLength(1);
-    // Lifecycle tracks the LATEST step id.
-    expect(assistants(bubbles)[0]!.responseId).toBe("codex_step2");
-  });
+  it.each([false, true])(
+    "merges a same-turn continuation across step IDs (handover=%s)",
+    (handover) => {
+      // Codex's step-wise (goal/plan) turns publish a distinct response id
+      // per step while the items carry the thread id — one user turn, so
+      // one bubble (and eventually ONE "Worked for" fold, not one per
+      // step).
+      const events: StreamEvent[] = [
+        {
+          type: "tool_call",
+          name: "Read",
+          arguments: {},
+          callId: "call_1",
+          status: "completed",
+          agentName: "test",
+          itemId: "tool_1",
+          responseId: "codex_step1",
+        },
+      ];
+      if (handover) {
+        events.push({
+          type: "message_done",
+          itemId: "note",
+          responseId: "resp_note",
+          content: [{ type: "output_text", text: "Continue here." }],
+          isHandoverNote: true,
+        });
+      }
+      events.push({
+        type: "message_done",
+        itemId: "m2",
+        responseId: "codex_step2",
+        content: [{ type: "output_text", text: "step two" }],
+      });
+      const bubbles = buildBubbles(new BlockStream().reduceSync(events), null);
+      expect(assistants(bubbles)).toHaveLength(1);
+      // Lifecycle tracks the LATEST step id.
+      expect(assistants(bubbles)[0]).toMatchObject({
+        responseId: "codex_step2",
+        items: [
+          { kind: "tool", itemId: "tool_1" },
+          { kind: "text", text: "step two" },
+        ],
+      });
+      expect(bubbles.map((bubble) => bubble.kind)).toEqual(
+        handover ? ["assistant", "handover_note"] : ["assistant"],
+      );
+    },
+  );
 
   it("splits turns at a real user message", () => {
     const bubbles = buildBubbles(

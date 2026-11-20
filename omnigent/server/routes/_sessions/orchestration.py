@@ -184,6 +184,7 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
 from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.handover_notes import annotate_handover_note
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.managed_hosts import (
@@ -3154,7 +3155,7 @@ def _build_session_response(
         effective_cwd=effective_placement.cwd,
         effective_git_branch=effective_placement.git_branch,
         reasoning_effort=conv.reasoning_effort,
-        items=items,
+        items=[annotate_handover_note(item, conv) for item in items],
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
         kind=conv.kind,
