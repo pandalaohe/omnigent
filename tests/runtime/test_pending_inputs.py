@@ -686,11 +686,37 @@ def test_interrupted_flag_survives_nonheld_resolve_and_restore() -> None:
     assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
 
 
-@pytest.mark.parametrize("persist_landed", [True, False])
-def test_ttl_leaves_a_held_entry_to_its_persist(
-    monkeypatch: pytest.MonkeyPatch, persist_landed: bool
+def test_interrupted_flag_survives_ttl_eviction_of_held_restore(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The TTL never settles an entry a persist holds; the persist's outcome decides."""
+    """A TTL-evicted held interrupted entry stays hidden when reconstructed."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    cancelled = pending_inputs.record("conv_ttl_restore", [_text_block("cancelled")])
+    pending_inputs.mark_interrupted("conv_ttl_restore", [cancelled])
+    held = pending_inputs.resolve_matching_text("conv_ttl_restore", "cancelled", hold=True)
+    assert held.matched is not None and held.matched.interrupted is True
+
+    clock["t"] += pending_inputs._TTL_S + 0.1
+    assert pending_inputs.snapshot_for("conv_ttl_restore") == []
+
+    pending_inputs.restore("conv_ttl_restore", held.matched)
+
+    assert pending_inputs.snapshot_for("conv_ttl_restore") == []
+    assert pending_inputs.has_pending("conv_ttl_restore") is False
+    later = pending_inputs.record("conv_ttl_restore", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_ttl_restore", "later")
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert matched.skipped == []
+    assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "failed"])
+def test_ttl_eviction_of_a_held_entry_leaves_its_record_to_the_persist(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Expiry during a persist writes no same-text record; the persist's outcome decides."""
     clock = {"t": 1000.0}
     monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
 
@@ -699,20 +725,21 @@ def test_ttl_leaves_a_held_entry_to_its_persist(
     assert held.matched is not None and held.matched.pending_id == first
 
     clock["t"] += pending_inputs._TTL_S + 0.1
-    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_ttl_hold")] == [
-        first
-    ]
+    assert pending_inputs.snapshot_for("conv_ttl_hold") == []
     assert not pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it")
 
-    if persist_landed:
-        pending_inputs.release("conv_ttl_hold", held.matched, delivery_confirmed=True)
-    else:
+    if outcome == "failed":
         pending_inputs.restore("conv_ttl_hold", held.matched)
-    assert pending_inputs.snapshot_for("conv_ttl_hold") == []
+    else:
+        pending_inputs.release(
+            "conv_ttl_hold", held.matched, delivery_confirmed=outcome == "confirmed"
+        )
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_ttl_hold")] == (
+        [first] if outcome == "failed" else []
+    )
     # Only an entry that settled without its own echo blocks a same-text successor.
-    assert (
-        pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it")
-        is not persist_landed
+    assert pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it") is (
+        outcome == "unconfirmed"
     )
 
 

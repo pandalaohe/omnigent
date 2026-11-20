@@ -406,20 +406,19 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     entries = _pending.get(conversation_id)
     if entries is None:
         return
-    # Runner-owned entries are settled through the undelivered path. A held
-    # entry belongs to a persist in progress, which settles it either way.
+    # Runner-owned entries are settled through the undelivered path.
     stale = [
         pid
         for pid, entry in entries.items()
-        if not entry.held
-        and (
+        if (
             entry.last_runner_renewal is None
             or (entry.interrupted and entry.runner_claim_id is None)
         )
         and now - entry.created_at > _TTL_S
     ]
     for pid in stale:
-        _settle_locked(conversation_id, entries, pid)
+        # A held entry's persist writes its same-text record (see release).
+        _settle_locked(conversation_id, entries, pid, delivery_confirmed=entries[pid].held)
 
 
 def make_pending_id(conversation_id: str, stable_id: str | None = None) -> str:
@@ -1118,14 +1117,20 @@ def _settle_locked(
 ) -> None:
     entry = entries.pop(pending_id, None)
     if entry is not None and not delivery_confirmed:
-        bare_text = _bare_text(_content_text(entry.content))
-        if bare_text:
-            key = (conversation_id, bare_text)
-            previous = _unconfirmed_input_texts.get(key, source_less_successors)
-            # An earlier unresolved settlement can only narrow the fallback.
-            _unconfirmed_input_texts[key] = previous & source_less_successors
+        _record_unconfirmed_locked(conversation_id, entry.content, source_less_successors)
     if not entries:
         _pending.pop(conversation_id, None)
+
+
+def _record_unconfirmed_locked(
+    conversation_id: str, content: list[dict[str, Any]], source_less_successors: frozenset[str]
+) -> None:
+    bare_text = _bare_text(_content_text(content))
+    if bare_text:
+        key = (conversation_id, bare_text)
+        previous = _unconfirmed_input_texts.get(key, source_less_successors)
+        # An earlier unresolved settlement can only narrow the fallback.
+        _unconfirmed_input_texts[key] = previous & source_less_successors
 
 
 def release(
@@ -1138,8 +1143,8 @@ def release(
     """
     Drop a held entry whose persist landed.
 
-    Idempotent: an entry already gone (evicted by the TTL, or drained without
-    ``hold``) is a no-op.
+    An entry the TTL evicted meanwhile is gone already; its same-text record,
+    which the eviction left to this call, is still written when unconfirmed.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param drained: The entry returned by :func:`resolve_oldest` or
@@ -1151,7 +1156,7 @@ def release(
     """
     with _lock:
         entries = _pending.get(conversation_id)
-        if entries is not None:
+        if entries is not None and drained.pending_id in entries:
             _settle_locked(
                 conversation_id,
                 entries,
@@ -1159,6 +1164,8 @@ def release(
                 delivery_confirmed=delivery_confirmed,
                 source_less_successors=source_less_successors,
             )
+        elif not delivery_confirmed:
+            _record_unconfirmed_locked(conversation_id, drained.content, source_less_successors)
 
 
 def matches_unconfirmed_input_text(

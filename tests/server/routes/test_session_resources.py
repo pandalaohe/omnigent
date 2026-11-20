@@ -7459,10 +7459,10 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("append_fails", [False, True], ids=["landed", "failed"])
-async def test_ttl_during_a_paused_append_leaves_the_entry_to_that_persist(
+async def test_ttl_during_a_paused_append_leaves_the_record_to_that_persist(
     monkeypatch: pytest.MonkeyPatch, append_fails: bool
 ) -> None:
-    """Expiry waits for the persist holding an entry; only an unlanded echo leaves a record."""
+    """Expiry during an append writes no same-text record; a failed append re-queues the entry."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
@@ -7471,7 +7471,7 @@ async def test_ttl_during_a_paused_append_leaves_the_entry_to_that_persist(
     monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
     pending_inputs.reset_for_tests()
     store = _BlockingStore(fail_first_append=append_fails)
-    sid = "7b1e0f3c2d4a4b5c8e9f0a1b2c3d4e5f"
+    sid = "64a784c3aa907d1774f44313546947c6"
     conv = store.get_conversation(sid)
     assert conv is not None
     pending_id = pending_inputs.record(
@@ -7492,7 +7492,7 @@ async def test_ttl_during_a_paused_append_leaves_the_entry_to_that_persist(
         )
         await asyncio.to_thread(store.first_append_started.wait, 5)
         clock["t"] += pending_inputs._TTL_S + 1
-        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [pending_id]
+        assert pending_inputs.snapshot_for(sid) == []
         assert not pending_inputs.matches_unconfirmed_input_text(sid, "ship it")
         store.release_first_append.set()
         if append_fails:
@@ -7500,8 +7500,10 @@ async def test_ttl_during_a_paused_append_leaves_the_entry_to_that_persist(
                 await persist
         else:
             await persist
-        assert pending_inputs.snapshot_for(sid) == []
-        assert pending_inputs.matches_unconfirmed_input_text(sid, "ship it") is append_fails
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [pending_id] if append_fails else []
+        )
+        assert not pending_inputs.matches_unconfirmed_input_text(sid, "ship it")
     finally:
         store.release_first_append.set()
         pending_inputs.reset_for_tests()
