@@ -820,7 +820,7 @@ async def test_claude_transfer_uses_replacement_runner_without_original_exit_rep
 
     async def lookup(session_id: str, router: Any, *, conversation: Any = None) -> Any:
         row = conversation if conversation is not None else store.get_conversation(session_id)
-        assert row is not None
+        assert row is not None and isinstance(row.runner_id, str)
         if row.runner_id == RUNNER_ID and not original_online:
             pytest.fail("A fresh handover probed the superseded runner")
         return runners.for_runner(row.runner_id)
