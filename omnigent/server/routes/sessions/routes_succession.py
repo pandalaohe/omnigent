@@ -34,10 +34,13 @@ from omnigent.server.auto_rotation import (
     ATTEMPT_LABEL_KEY,
     DRAFT_LABEL_KEY,
     FAILED_ATTEMPT_LABEL_KEY,
+    FRESH_ROUND_LABEL_KEY,
     INJECTED_ATTEMPT_LABEL_KEY,
     INJECTED_REVISION_LABEL_KEY,
+    NOTICED_COUNT_LABEL_KEY,
     _label_int,
     attempt_failed,
+    auto_rotation_for,
     rotation_attempt,
     rotation_injected,
 )
@@ -408,14 +411,6 @@ def register_succession_routes(
         deferred = None
         status = None
         if body.auto:
-            from dataclasses import replace
-
-            from omnigent.server.auto_rotation import (
-                FRESH_ROUND_LABEL_KEY,
-                NOTICED_COUNT_LABEL_KEY,
-                auto_rotation_for,
-            )
-            from omnigent.stores.conversation_store import LabelGroupChange
 
             def auto_change(labels: dict[str, str]) -> LabelGroupChange:
                 nonlocal rotate, deferred, status
@@ -469,8 +464,6 @@ def register_succession_routes(
                 conversation_store.mutate_label_group, session_id, "omnigent.", auto_change
             )
         elif rotate:
-            # The auto branch's local import makes ``replace`` local to this handler.
-            from dataclasses import replace
 
             def manual_change(labels: dict[str, str]) -> LabelGroupChange:
                 # Decided on current labels, serialized with the runner's claim and receipts.
@@ -520,8 +513,6 @@ def register_succession_routes(
             )
             if persisted_notice and not persisted_notice[0].deduplicated:
                 _publish_external_conversation_item(session_id, persisted_notice[0])
-
-            from omnigent.server.auto_rotation import auto_rotation_for
 
             latest = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if latest is not None:

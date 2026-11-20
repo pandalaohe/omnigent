@@ -801,7 +801,8 @@ async def test_manual_request_is_tracked_with_auto_rotation_on_or_off(
     client, store, handover_app, switch
 ):
     """Off, nothing retries; the tracker still reports a request that did not run."""
-    session_id = _create(store)
+    # Auto-rotation eligibility reads the resolved harness, not the wrapper label.
+    session_id = store.create_conversation(harness_override="claude-native").id
     store.set_labels(session_id, {"omnigent.auto_rotation": switch})
     response = await client.post(
         f"/v1/sessions/{session_id}/handover", json={"handover": "Continue.", "rotate": True}
