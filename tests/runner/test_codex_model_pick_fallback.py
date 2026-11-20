@@ -692,7 +692,7 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("notice_post", ["hangs", "raises"])
+@pytest.mark.parametrize("notice_post", ["hangs", "raises", "cleanup-stuck"])
 async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
     notice_post: str,
     codex_launch_harness: _LaunchHarness,
@@ -762,7 +762,7 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
         assert len(failures) == 1
         assert failures[0].exc_info is not None
         assert isinstance(failures[0].exc_info[1], ValueError)
-    else:
+    elif notice_post == "hangs":
         assert failures == []
         stopping = asyncio.create_task(runner_native._cancel_auto_forwarder_task(_SESSION_ID))
         await asyncio.wait_for(notice_cancelled.wait(), timeout=5)
@@ -772,6 +772,22 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
         assert await asyncio.wait_for(stopping, timeout=5)
         await harness.server_client.aclose()  # the runner closes its client after teardown
         assert client_closed_at_cleanup == [False]
+    else:
+        # A cleanup that outlives its share still lets teardown beat the caller's cancel wait.
+        assert failures == []
+        monkeypatch.setattr(runner_native, "_AUTO_FORWARDER_CANCEL_TIMEOUT_S", 0.6)
+        (notice_task,) = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"codex-thread-ready-{_SESSION_ID}"
+        ]
+        assert await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
+        assert notice_cancelled.is_set()
+        assert any("thread-ready hook" in record.getMessage() for record in caplog.records)
+        assert not notice_task.done()  # its cleanup still owns the request
+        notice_cleanup_release.set()
+        await asyncio.wait({notice_task}, timeout=5)
+        assert notice_task.cancelled()
 
 
 @pytest.mark.asyncio

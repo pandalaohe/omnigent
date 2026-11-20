@@ -7349,17 +7349,26 @@ def _log_codex_thread_ready_failure(task: asyncio.Task[None]) -> None:
         _logger.warning("Codex thread-ready hook %s failed", task.get_name(), exc_info=exc)
 
 
-async def _wait_codex_thread_ready_exit(task: asyncio.Task[None] | None) -> None:
-    """Let a cancelled thread-ready hook finish its request cleanup before teardown returns."""
+async def _wait_codex_thread_ready_exit(
+    task: asyncio.Task[None] | None, cancelled_at: float
+) -> None:
+    """Let a cancelled thread-ready hook finish its request cleanup before teardown returns.
+
+    The wait gets a third of the caller's forwarder cancel budget, counted from the
+    hook's cancel: the closes it overlaps spend it first, and the rest of the budget
+    stays with the forwarder's own cleanup.
+    """
     if task is None:
         return
+    budget = _AUTO_FORWARDER_CANCEL_TIMEOUT_S / 3
+    remaining = max(cancelled_at + budget - time.monotonic(), 0.0)
     # asyncio.wait never raises the task's outcome; its done callback logs a failure.
-    _done, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
+    _done, pending = await asyncio.wait({task}, timeout=remaining)
     if pending:
         _logger.warning(
-            "Cancelled Codex thread-ready hook %s did not finish within %.0fs",
+            "Cancelled Codex thread-ready hook %s did not finish within %.1fs",
             task.get_name(),
-            _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
+            budget,
         )
 
 
@@ -7780,6 +7789,7 @@ async def _codex_discover_thread_and_forward(
         cancelled = True
         raise
     finally:
+        thread_ready_cancelled_at = time.monotonic()
         if thread_ready_task is not None:
             thread_ready_task.cancel()  # no-op once the hook finished
         # Tear down the listener and the per-session app-server whenever
@@ -7823,7 +7833,9 @@ async def _codex_discover_thread_and_forward(
                 try:
                     await _shutdown_session_turn_router_async(session_id, turn_router)
                 finally:
-                    await _wait_codex_thread_ready_exit(thread_ready_task)
+                    await _wait_codex_thread_ready_exit(
+                        thread_ready_task, thread_ready_cancelled_at
+                    )
 
 
 async def _codex_forward_known_thread(
