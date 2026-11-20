@@ -650,7 +650,7 @@ async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
             receipt.id, conversation_store=store, runner_router=None, peer_message_store=None
         )
         assert result.phase == "done"
-        store.set_runner_id(old, None)
+        assert store.clear_runner_id(old).runner_id is None
         assert (await old_wake(timer_text)).json()["timer_delivery"] == "dropped"
         assert (await old_wake(child_text)).json() == {"queued": False}
         tasks.create_task(deliver(before))  # Concurrent recovery of the same saved answer.
