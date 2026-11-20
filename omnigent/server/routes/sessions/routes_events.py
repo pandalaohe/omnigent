@@ -375,6 +375,7 @@ from omnigent.server.session_live_state import handoff_count, last_liveness_stam
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.session_succession import (
+    claude_transfer_attempt_lock,
     claude_transfer_expired,
     claude_transfer_fenced,
     claude_transfer_lock,
@@ -1897,7 +1898,7 @@ def register_events_routes(
             return session_id
         if claude_transfer_pending(addressed) and _has_bound_runner_authority(request, addressed):
             # Wait for an active transfer to decide who owns the runner inbox.
-            async with claude_transfer_lock(session_id):
+            async with claude_transfer_attempt_lock(session_id):
                 addressed = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
                 )

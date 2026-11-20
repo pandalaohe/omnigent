@@ -78,6 +78,10 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     post_session_succession,
 )
+from omnigent.native._native_session_labels import (
+    CLAUDE_TRANSFER_INTENT_LABEL,
+    parse_claude_transfer_intent,
+)
 from omnigent.native._native_supersession import (
     post_clear_supersession as _post_clear_supersession,
 )
@@ -5186,6 +5190,10 @@ class _ClearSuccessorRefused(RuntimeError):
     """The clear landed, but the server refused to prepare its successor."""
 
 
+class _ClearTransferExpired(RuntimeError):
+    """The server ended the handover and kept both sessions in place."""
+
+
 _CLEAR_REFUSAL_REASONS = {
     "not_top_level": "Only a top-level session can rotate.",
     "source_changed": "Source session changed.",
@@ -5293,6 +5301,9 @@ async def _maybe_rotate_session_on_clear(
             )
     except asyncio.CancelledError:
         raise
+    except _ClearTransferExpired:
+        # The server owns the expiry notice. Consume the checkpoint here.
+        pass
     except Exception as exc:
         pending = _read_hook_state(bridge_dir)
         detail = (
@@ -5393,9 +5404,16 @@ async def _create_clear_replacement_session(
     labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
     from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
 
-    requested_rotation = ROTATE_REQUESTED_LABEL_KEY in labels
     new_session_id = checkpoint.pending_clear_new_id
-    if new_session_id is not None and not checkpoint.pending_clear_transferred:
+    raw_intent = labels.get(CLAUDE_TRANSFER_INTENT_LABEL)
+    intent = parse_claude_transfer_intent(raw_intent) if isinstance(raw_intent, str) else None
+    has_recorded_transfer = intent is not None and intent["target"] == new_session_id
+    requested_rotation = has_recorded_transfer or ROTATE_REQUESTED_LABEL_KEY in labels
+    if (
+        new_session_id is not None
+        and not checkpoint.pending_clear_transferred
+        and not has_recorded_transfer
+    ):
         candidate = await _fetch_session_snapshot(client, new_session_id)
         candidate_labels = candidate.get("labels")
         if (
@@ -5448,6 +5466,8 @@ async def _create_clear_replacement_session(
             json={"target_session_id": new_session_id},
             timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
         )
+        if response.status_code == 410:
+            raise _ClearTransferExpired
         response.raise_for_status()
 
     async def owners() -> tuple[bool, bool]:
@@ -5463,38 +5483,45 @@ async def _create_clear_replacement_session(
 
     transferred = checkpoint.pending_clear_transferred
     try:
-        bridge_response = await client.patch(
-            f"/v1/sessions/{url_component(new_session_id)}",
-            json={"labels": {BRIDGE_ID_LABEL_KEY: read_bridge_id(bridge_dir) or old_session_id}},
-        )
-        bridge_response.raise_for_status()
-        if checkpoint.pending_clear_new_id and not transferred:
-            source_present, target_present = await owners()
-            transferred = target_present and not source_present
-        if isinstance(runner_id, str) and runner_id:
-            try:
-                bind_resp = await client.patch(
-                    f"/v1/sessions/{url_component(new_session_id)}",
-                    json={"runner_id": runner_id},
-                    timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
-                )
-                bind_resp.raise_for_status()
-            except httpx.TimeoutException:
-                try:
-                    candidate = await _fetch_session_snapshot(client, new_session_id)
-                except (httpx.HTTPError, RuntimeError) as exc:
-                    # Keep the durable candidate: a missing read is not a failed bind.
-                    raise RuntimeError(
-                        "Successor binding is unconfirmed; retry reconciliation"
-                    ) from exc
-                if candidate.get("archived") or candidate.get("runner_id") != runner_id:
-                    raise
-                _logger.info(
-                    "Successor bind timed out but server confirms runner; session=%s",
-                    new_session_id,
-                )
-        if not transferred or requested_rotation:
+        if has_recorded_transfer:
+            # This candidate was already prepared before the original POST.
+            # Ask the server for its outcome before changing the target again.
             await transfer()
+        else:
+            bridge_response = await client.patch(
+                f"/v1/sessions/{url_component(new_session_id)}",
+                json={
+                    "labels": {BRIDGE_ID_LABEL_KEY: read_bridge_id(bridge_dir) or old_session_id}
+                },
+            )
+            bridge_response.raise_for_status()
+            if checkpoint.pending_clear_new_id and not transferred:
+                source_present, target_present = await owners()
+                transferred = target_present and not source_present
+            if isinstance(runner_id, str) and runner_id:
+                try:
+                    bind_resp = await client.patch(
+                        f"/v1/sessions/{url_component(new_session_id)}",
+                        json={"runner_id": runner_id},
+                        timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
+                    )
+                    bind_resp.raise_for_status()
+                except httpx.TimeoutException:
+                    try:
+                        candidate = await _fetch_session_snapshot(client, new_session_id)
+                    except (httpx.HTTPError, RuntimeError) as exc:
+                        # Keep the durable candidate: a missing read is not a failed bind.
+                        raise RuntimeError(
+                            "Successor binding is unconfirmed; retry reconciliation"
+                        ) from exc
+                    if candidate.get("archived") or candidate.get("runner_id") != runner_id:
+                        raise
+                    _logger.info(
+                        "Successor bind timed out but server confirms runner; session=%s",
+                        new_session_id,
+                    )
+            if not transferred or requested_rotation:
+                await transfer()
     except httpx.HTTPError as exc:
         source_present, target_present = await owners()
         if requested_rotation:

@@ -127,6 +127,7 @@ from omnigent.server.schemas import (
     SessionResourcePaginatedList,
 )
 from omnigent.server.session_succession import (
+    claude_transfer_lease_ended,
     is_requested_claude_transfer,
     transfer_requested_claude_terminal,
 )
@@ -2220,6 +2221,9 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         requested_rotation = is_requested_claude_transfer(conv, target, terminal_id)
         if requested_rotation:
+            # A replay after expiry must not wait behind the original runner RPC.
+            if claude_transfer_lease_ended(conv, target_session_id):
+                raise HTTPException(410, "The terminal handover expired")
             state = request.app.state
             try:
                 # The caller may disappear when the pane changes hands. The
@@ -2236,7 +2240,7 @@ def register_resources_routes(
                         runner_exit_reports=getattr(state, "runner_exit_reports", None),
                     )
                 )
-            except (httpx.HTTPError, ConnectionError) as exc:
+            except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
                 raise HTTPException(502, "Claude terminal transfer is unconfirmed") from exc
         else:
             status, payload = await _proxy_post_to_runner(
@@ -2245,6 +2249,8 @@ def register_resources_routes(
                 {"target_session_id": target_session_id},
                 conv,
             )
+        if requested_rotation and status == 410:
+            raise HTTPException(410, "The terminal handover expired")
         if status == 404:
             error = payload.get("error", {})
             raise OmnigentError(
