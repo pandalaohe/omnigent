@@ -75,6 +75,49 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("keeps an in-flight reply and its tools in the active response when a handover arrives", () => {
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "test-agent",
+        itemId: "tool_1",
+        responseId: "resp_1",
+      },
+      { type: "text_delta", delta: "Still " },
+      {
+        type: "message_done",
+        itemId: "note",
+        responseId: "resp_note",
+        content: [{ type: "output_text", text: "Continue here." }],
+        isHandoverNote: true,
+      },
+      {
+        type: "tool_result",
+        callId: "call_1",
+        output: "Tool output",
+        itemId: "result_1",
+        responseId: "resp_1",
+      },
+      { type: "text_delta", delta: "working." },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    expect(blocks.filter((block) => block.type === "handover_note")).toMatchObject([
+      { ctx: { responseId: "resp_note", itemId: "note" }, text: "Continue here." },
+    ]);
+    expect(blocks.filter((block) => block.type === "text_done")).toMatchObject([
+      { ctx: { responseId: "resp_1" }, fullText: "Still working." },
+    ]);
+    expect(blocks.filter((block) => block.type === "tool_result")).toMatchObject([
+      { ctx: { responseId: "resp_1" }, callId: "call_1", output: "Tool output" },
+    ]);
+  });
+
   it("does not adopt lifecycle notice ids as the parent stream identity", () => {
     const blocks = reduce([
       {

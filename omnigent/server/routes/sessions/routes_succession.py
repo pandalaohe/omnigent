@@ -42,6 +42,7 @@ from omnigent.server.auto_rotation import (
     rotation_injected,
 )
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
+from omnigent.server.handover_notes import handover_stable_id
 from omnigent.server.managed_hosts import managed_repo_labels, read_managed_repo_workspaces
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
@@ -150,11 +151,6 @@ def _successor_labels(
     if tier is not None:
         retained.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
     return retained
-
-
-def _handover_stable_id(session_id: str, text: str) -> str:
-    """Return the dedupe id for one handover note on one session."""
-    return hashlib.sha256(f"session_handover:{session_id}:{text}".encode()).hexdigest()[:32]
 
 
 def _rotate_notice_stable_id(handover_item_id: str) -> str:
@@ -379,9 +375,10 @@ def register_succession_routes(
             data=MessageData(
                 role="assistant",
                 agent=agent_name,
+                is_handover_note=True,
                 content=[{"type": "output_text", "text": text}],
             ),
-            stable_id=_handover_stable_id(
+            stable_id=handover_stable_id(
                 session_id,
                 text + "\0" + conversation.labels.get(FAILED_ATTEMPT_LABEL_KEY, "initial")
                 if body.auto

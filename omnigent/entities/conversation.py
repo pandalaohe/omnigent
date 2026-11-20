@@ -416,6 +416,7 @@ class MessageData(BaseModel):
         replayed to agents but hidden from user-facing transcripts,
         e.g. injected skill instructions. Defaults to ``False``
         and is omitted from serialized payloads in that case.
+    :param is_handover_note: ``True`` for a server-authored session handover.
     :param interrupted: ``True`` when an assistant message is a
         durable partial response from an interrupted external-native
         turn, e.g. Codex ``turn/completed`` with status
@@ -440,6 +441,7 @@ class MessageData(BaseModel):
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
+    is_handover_note: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     # Peer inputs remain context after restart, never an executable recovery trigger.

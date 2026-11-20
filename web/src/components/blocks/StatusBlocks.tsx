@@ -1008,6 +1008,38 @@ export function CompactionMarker() {
   );
 }
 
+export function HandoverNote({
+  text,
+  itemId,
+  responseId,
+}: {
+  text: string;
+  itemId: string;
+  responseId: string;
+}) {
+  const flashing = useChatStore((s) => s.flashItemId === itemId || s.flashItemId === responseId);
+  return (
+    <Collapsible
+      data-message-id={responseId}
+      className={cn("group/handover min-w-0", flashing && "animate-message-highlight rounded-lg")}
+    >
+      <CollapsibleTrigger
+        data-message-id={itemId}
+        className="mobile-touch-target flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-sm text-muted-foreground hover:text-foreground"
+      >
+        <ChevronRightIcon
+          aria-hidden="true"
+          className="size-3 shrink-0 group-data-[state=open]/handover:rotate-90"
+        />
+        Handover note
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-1 ml-2 border-l py-1 pl-3 text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">
+        {text}
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 /**
  * One-line notice standing in for an approval card whose prompt hit the
  * timeout deadline with the turn stop on. The card hides itself

@@ -37,6 +37,8 @@ export interface MessageItem extends BaseItem {
   user_authored?: boolean;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
+  /** Server-authored session handover note. */
+  is_handover_note?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
   interrupted?: boolean;
   /** Native live-preview stream finalized by this persisted assistant message. */

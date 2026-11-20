@@ -83,6 +83,7 @@ export function latestActivityErrorWindow(
       case "retry":
       case "compaction_loading":
       case "compaction":
+      case "handover_note":
         break;
       default: {
         const exhaustive: never = block;

@@ -4055,6 +4055,7 @@ class SessionMessageItem(_SessionItemCommon):
         user messages.
     :param is_meta: ``True`` for durable context hidden from user-facing
         transcripts; omitted when ``False``.
+    :param is_handover_note: ``True`` for a server-authored session handover.
     :param user_authored: ``True`` for confirmed or conservatively
         preserved user input; omitted when ``False``.
     :param subagent_return_id: Native task id of an explicitly completed
@@ -4074,6 +4075,7 @@ class SessionMessageItem(_SessionItemCommon):
     content: list[SessionContentBlock]
     model: str | None = None
     is_meta: bool = False
+    is_handover_note: bool = False
     user_authored: bool = False
     subagent_return_id: str | None = None
     peer_message_id: str | None = None

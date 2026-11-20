@@ -17,6 +17,7 @@ import {
   type ElicitationBlock,
   type ErrorBlock,
   type FileBlock,
+  type HandoverNoteBlock,
   type NativeToolBlock,
   type PolicyDeniedBlock,
   type ReasoningBlock,
@@ -703,6 +704,15 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
 
     // ── Message done ────────────────────────────────
     case "message_done": {
+      const text = outputTextFromMessageContent(event.content);
+      if (event.isHandoverNote) {
+        yield {
+          type: "handover_note",
+          ctx: ctx(state, event.itemId || null, event.responseId || null),
+          text,
+        } satisfies HandoverNoteBlock;
+        return;
+      }
       const isResponseSwitch = !!event.responseId && event.responseId !== state.responseId;
       const hadOpenText = state.inText;
       // Snapshot accumulated text BEFORE closeText resets state.fullText —
@@ -712,7 +722,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // either empty or carries the previous turn's id, so isResponseSwitch
       // spuriously fires for an in-fact same-response message_done.
       const accumulatedFromDeltas = state.fullText;
-      const text = outputTextFromMessageContent(event.content);
       // A switch whose content equals the closing deltas is that same message
       // (see the dedup below), so it keeps the event's item id and phase.
       const closesSameMessage = !isResponseSwitch || text === accumulatedFromDeltas;

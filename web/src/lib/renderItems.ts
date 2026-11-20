@@ -266,6 +266,7 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | { kind: "handover_note"; itemId: string; responseId: string; text: string }
   | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
@@ -364,6 +365,7 @@ export function createBubbleCache(): BubbleCache {
 function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
+    if (b.type === "handover_note") continue;
     if (
       b.type === "user_message" ||
       isTerminalCommandInput(b) ||
@@ -1005,6 +1007,19 @@ function walkBubbles(
       continue;
     }
 
+    if (b.type === "handover_note") {
+      lastBubbleStart = i;
+      lastBubbleCount = 1;
+      bubbles.push({
+        kind: "handover_note",
+        itemId: b.ctx.itemId ?? `handover_note_${i}`,
+        responseId: b.ctx.responseId,
+        text: b.text,
+      });
+      i += 1;
+      continue;
+    }
+
     if (b.type === "routing_decision") {
       // The create-time pick the first turn immediately repeats — the turn
       // chip stands for both, so this one renders nothing.
@@ -1068,6 +1083,7 @@ function walkBubbles(
         isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
+        cur.type === "handover_note" ||
         cur.type === "routing_decision"
       )
         break;
@@ -2057,6 +2073,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "routing_decision" && b.kind === "routing_decision") {
     // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
+  }
+  if (a.kind === "handover_note" && b.kind === "handover_note") {
+    return a.itemId === b.itemId && a.responseId === b.responseId && a.text === b.text;
   }
   if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
     return a.itemId === b.itemId && a.data === b.data;

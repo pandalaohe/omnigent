@@ -4404,6 +4404,7 @@ def _publish_external_conversation_item(
         item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "assistant"
+        and not item.data.is_handover_note
     ):
         inflight_text.retire_native_previews(session_id)
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())

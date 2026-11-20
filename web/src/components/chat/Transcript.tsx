@@ -1120,6 +1120,7 @@ export function VirtualBubbleList({
     const index = bubblesRef.current.findIndex(
       (b) =>
         (b.kind === "user" && b.itemId === itemId) ||
+        (b.kind === "handover_note" && (b.itemId === itemId || b.responseId === itemId)) ||
         (b.kind === "assistant" && b.responseId === itemId),
     );
     if (index < 0) return false;

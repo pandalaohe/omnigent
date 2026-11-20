@@ -2,14 +2,18 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { WorkingIndicatorRow } from "@/components/chat/chatBubbleParts";
+import { bubbleKey, WorkingIndicatorRow } from "@/components/chat/chatBubbleParts";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "@/shell/TerminalFirstContext";
 import type { ElicitationBlock } from "@/lib/blocks";
-import type { Bubble } from "@/lib/renderItems";
+import { BlockStream } from "@/lib/blockStream";
+import type { MessageItem } from "@/lib/conversationItems";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { buildBubbles, type Bubble } from "@/lib/renderItems";
+import { parseEvent } from "@/lib/sse";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type { Conversation } from "@/hooks/useConversations";
 import { type ConversationsInfiniteData, mergeItemsIntoPages } from "@/lib/sessionListCache";
@@ -970,6 +974,56 @@ describe("BubbleView dispatch", () => {
   it("renders a completed compaction marker in the transcript", () => {
     render(<BubbleView bubble={{ kind: "compaction", itemId: "cmp_done" }} />);
     expect(screen.getByText("Conversation compacted")).toBeInTheDocument();
+  });
+
+  it.each(["live", "history"])("folds the handover note from %s until expanded", (source) => {
+    const text = "Continue  here.\n\n  Keep the indentation.";
+    const note: MessageItem = {
+      id: "note",
+      type: "message",
+      role: "assistant",
+      response_id: "resp_note",
+      status: "completed",
+      content: [{ type: "output_text", text }],
+      is_handover_note: true,
+    };
+    const reply: MessageItem = {
+      ...note,
+      id: "reply",
+      response_id: "resp_reply",
+      content: [{ type: "output_text", text: "Ordinary assistant reply" }],
+      is_handover_note: undefined,
+    };
+    const items = [reply, note];
+    const blocks =
+      source === "history"
+        ? itemsToBlocks(items)
+        : new BlockStream().reduceSync(
+            items.map((item) => parseEvent("response.output_item.done", { item })!),
+          );
+    render(
+      <>
+        {buildBubbles(blocks, null).map((bubble) => (
+          <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+        ))}
+      </>,
+    );
+
+    expect(screen.getByText("Ordinary assistant reply")).toBeVisible();
+    const trigger = screen.getByRole("button", { name: "Handover note" });
+    expect(trigger).toHaveAttribute("data-message-id", note.id);
+    expect(trigger.closest(`[data-message-id="${note.response_id}"]`)).toBeInTheDocument();
+    const noteText = () => screen.queryByText(text, { normalizer: (value) => value });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(noteText()).not.toBeInTheDocument();
+
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(noteText()).toBeVisible();
+
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(noteText()).not.toBeInTheDocument();
   });
 
   it("accepts createdAtS timestamp for timer calculation", () => {

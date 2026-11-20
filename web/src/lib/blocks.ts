@@ -398,6 +398,12 @@ export interface TextChunk {
   text: string;
 }
 
+export interface HandoverNoteBlock {
+  type: "handover_note";
+  ctx: BlockContext;
+  text: string;
+}
+
 /** Complete text from a text-streaming section. */
 export interface TextDone {
   type: "text_done";
@@ -791,6 +797,7 @@ export type AnyBlock =
   | SlashCommandBlock
   | RoutingDecisionBlock
   | TerminalCommandBlock
+  | HandoverNoteBlock
   | TextChunk
   | TextDone
   | ReasoningStartBlock

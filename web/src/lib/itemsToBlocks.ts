@@ -20,6 +20,7 @@ import {
   type CompactionBlock,
   type ElicitationBlock,
   type ErrorBlock,
+  type HandoverNoteBlock,
   type NativeToolBlock,
   type ReasoningBlock,
   type RoutingDecisionBlock,
@@ -541,12 +542,15 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
   };
 }
 
-function assistantMessageToBlock(item: MessageItem): TextDone {
+function assistantMessageToBlock(item: MessageItem): TextDone | HandoverNoteBlock {
   const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
     .join("");
+  if (item.is_handover_note === true) {
+    return { type: "handover_note", ctx: ctxFor(item), text };
+  }
   return {
     type: "text_done",
     ctx: ctxFor(item),
