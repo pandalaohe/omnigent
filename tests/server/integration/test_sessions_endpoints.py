@@ -4628,17 +4628,22 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    pid = pending_inputs.record(session["id"], [{"type": "input_text", "text": "hi there"}])
+    web_id = "a" * 32
+    pid = pending_inputs.record(
+        session["id"], [{"type": "input_text", "text": "hi there"}], stable_id=web_id
+    )
     try:
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={
                 "type": "external_conversation_item",
                 "data": {
+                    "source_id": "native-record-1",
                     "item_type": "message",
                     "item_data": {
                         "role": "user",
                         "content": [{"type": "input_text", "text": "hi there"}],
+                        "web_stable_id": "b" * 32,
                     },
                     "response_id": "native_turn_1",
                 },
@@ -4650,6 +4655,13 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
         assert len(consumed) == 1, f"expected one consumed event, got {published}"
         # The drained entry's id is echoed so the client drops that bubble by id.
         assert consumed[0]["data"]["cleared_pending_id"] == pid
+        mirror_id = consumed[0]["data"]["item_id"]
+        assert mirror_id != web_id
+        assert consumed[0]["data"]["data"]["web_stable_id"] == web_id
+        items = await client.get(f"/v1/sessions/{session['id']}/items")
+        assert items.status_code == 200, items.text
+        [mirror] = [item for item in items.json()["data"] if item["id"] == mirror_id]
+        assert mirror["web_stable_id"] == web_id
         # And the entry is gone from the index.
         assert pending_inputs.snapshot_for(session["id"]) == []
     finally:

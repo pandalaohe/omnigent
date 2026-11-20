@@ -123,6 +123,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from cachetools import TTLCache
+
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
@@ -291,6 +293,7 @@ class MatchedDrain:
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
     match_method: str | None = None
+    shared_text: bool = False
 
 
 @dataclass
@@ -358,6 +361,18 @@ class _Entry:
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
+
+
+@dataclass(frozen=True)
+class _UnconfirmedReceipt:
+    stable_id: str
+    text: str
+    attachments: int
+
+
+_unconfirmed_receipts: WorkspaceScopedCache[tuple[str, str], _UnconfirmedReceipt | None] = (
+    WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
+)
 _lock = threading.Lock()
 
 
@@ -1071,6 +1086,48 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
             _pending.pop(conversation_id, None)
 
 
+def retain_unconfirmed_receipt(conversation_id: str, drained: DrainedInput) -> None:
+    """Keep a claimed input eligible for a late echo without putting it back in the queue."""
+    raw_text = _content_text(drained.content)
+    bare_text = _bare_text(raw_text)
+    if not bare_text or not drained.stable_id or drained.uncertain or drained.interrupted:
+        return
+    receipt = _UnconfirmedReceipt(
+        drained.stable_id, _collapse_whitespace(raw_text), _attachment_count(drained.content)
+    )
+    key = (conversation_id, bare_text)
+    with _lock:
+        _unconfirmed_receipts[key] = (
+            receipt if _unconfirmed_receipts.get(key, receipt) == receipt else None
+        )
+
+
+def unconfirmed_receipt(conversation_id: str, text: str) -> str | None:
+    """Read an exact late match; an empty value marks ambiguous ownership."""
+    key = (conversation_id, _bare_text(text))
+    with _lock:
+        if key not in _unconfirmed_receipts:
+            return None
+        receipt = _unconfirmed_receipts.get(key)
+    if receipt is not None and receipt.text in (
+        _collapse_whitespace(text),
+        _collapse_whitespace(_strip_generated_markers(text, receipt.attachments)),
+    ):
+        return receipt.stable_id
+    return ""
+
+
+def forget_unconfirmed_receipt(
+    conversation_id: str, text: str, *, ambiguous: bool = False
+) -> None:
+    """Consume a committed late match, or fence it if another input could own the echo."""
+    key = (conversation_id, _bare_text(text))
+    if ambiguous:
+        _unconfirmed_receipts[key] = None
+    else:
+        _unconfirmed_receipts.pop(key, None)
+
+
 def resolve_matching_text(
     conversation_id: str,
     text: str,
@@ -1168,6 +1225,19 @@ def resolve_matching_text(
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
+        # Look across match tiers. A literal attachment marker or a command's
+        # injected prefix can also explain an otherwise exact mirror.
+        bare_needle = _bare_text(text) if not shell_command else exact_needle
+        shared_text = any(
+            index != match_index
+            and (
+                texts[index] == bare_needle
+                if shell_command
+                else _bare_text(_content_text(entry.content)) == bare_needle
+                or _matches_injected_prefix(entry, exact_needle)
+            )
+            for index, (_pid, entry) in enumerate(ordered)
+        )
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
@@ -1207,6 +1277,7 @@ def resolve_matching_text(
             match_method=match_method,
             skipped=lost,
             uncertain=uncertain,
+            shared_text=shared_text,
         )
 
 
@@ -1427,6 +1498,14 @@ def _attachment_count(content: list[dict[str, Any]]) -> int:
     )
 
 
+def _bare_text(text: str) -> str:
+    while True:
+        stripped, removed = _ONE_LEADING_ATTACHMENT_MARKER_RE.subn("", text, count=1)
+        if not removed:
+            return _collapse_whitespace(text)
+        text = stripped
+
+
 def _strip_generated_markers(text: str, count: int) -> str:
     """
     Drop up to ``count`` generated attachment marker lines from the front of a mirror.
@@ -1480,3 +1559,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _unconfirmed_receipts.clear()

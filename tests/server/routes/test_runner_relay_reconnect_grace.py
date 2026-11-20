@@ -402,7 +402,16 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
     ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "original")
     pending_inputs.mark_interrupted(session_id, [pending_id])
+    collector = await start_session_stream_collector(session_id)
     try:
+        status = {
+            "type": "session.status",
+            "status": "failed",
+            "response_id": "resp_terminal",
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+            "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
+        }
         failure = {
             "type": "response.failed",
             "response": {"id": "resp_terminal"},
@@ -414,7 +423,12 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             base_url="http://runner",
             transport=httpx.MockTransport(
                 lambda _: httpx.Response(
-                    200, text=f"data: {json.dumps(failure)}\n\ndata: [DONE]\n\n"
+                    200,
+                    text=(
+                        f"data: {json.dumps(status)}\n\n"
+                        f"data: {json.dumps(failure)}\n\n"
+                        "data: [DONE]\n\n"
+                    ),
                 )
             ),
         ) as client:
@@ -427,6 +441,70 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             for item in store.list_items(session_id).data
             if item.type == "error"
         ] == ["native_input_delivery_uncertain"]
+        attempts: dict[str, str] = {}
+        while len(attempts) < 2:
+            event = await collector.next_event()
+            if event["type"] in {"session.status", "response.error"} and event.get("error"):
+                attempts[event["type"]] = event["error"]["delivery_attempt_id"]
+        assert attempts == {"session.status": attempt_id, "response.error": attempt_id}
+    finally:
+        await collector.stop()
+        pending_inputs.resolve(session_id, pending_id)
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.parametrize("runner_managed", [False, True])
+@pytest.mark.asyncio
+async def test_early_native_refusal_keeps_its_reason_in_history(db_uri, runner_managed):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    stable_id = "a" * 32
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "read the latest report"}],
+        stable_id=stable_id,
+        runner_managed=runner_managed,
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    failure = {
+        "type": "response.failed",
+        "source": "harness",
+        **identity,
+        "response": {
+            "status": "failed",
+            "error": {
+                "code": "runner_error",
+                "message": "The terminal rejected the input while initializing.",
+                "undelivered": True,
+            },
+        },
+    }
+    running = {"type": "session.status", "status": "running"}
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200,
+                    text=(
+                        f"data: {json.dumps(failure)}\n\n"
+                        f"data: {json.dumps(running)}\n\n"
+                        "data: [DONE]\n\n"
+                    ),
+                )
+            ),
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=3
+            )
+        assert orchestration._session_status_cache[session_id] == "running"
+        user, error = store.list_items(session_id, order="asc").data
+        assert user.id == stable_id and user.status == "failed"
+        assert error.type == "error" and error.response_id == user.response_id
+        assert error.data.model_dump()["message"] == failure["response"]["error"]["message"]
+        assert error.data.model_dump()["delivery_attempt_id"] == identity["delivery_attempt_id"]
     finally:
         pending_inputs.resolve(session_id, pending_id)
         orchestration._session_status_cache.pop(session_id, None)

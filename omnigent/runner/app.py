@@ -6207,6 +6207,7 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
+        input_identity: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -6234,6 +6235,18 @@ def create_runner_app(
             # response's own terminal error; the id lets it recognise this edge
             # as the same failure instead of adding a second card.
             event["response_id"] = response_id
+        identities = input_attributes(input_identity)
+        if "delivery_attempt_id" in identities:
+            event.update(identities)
+            if error is not None and source_error is not None:
+                event["error"] = {
+                    **error,
+                    **{
+                        key: source_error[key]
+                        for key in ("undelivered", "title", "cause", "remediation")
+                        if key in source_error
+                    },
+                }
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -7513,6 +7526,7 @@ def create_runner_app(
         owner_response_id: str | None = None,
         sign_in_hold: bool = False,
         cancelled: bool = False,
+        input_identity: Mapping[str, object] | None = None,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -7591,6 +7605,7 @@ def create_runner_app(
                     error=normalized_error,
                     source_error=error,
                     response_id=owner_response_id,
+                    input_identity=input_identity,
                 )
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
@@ -9793,17 +9808,18 @@ def create_runner_app(
                     extra={"session_id": conv},
                 )
                 error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+                identity = _input_identity(msg_body)
                 if not handed_off[0]:
-                    identity = _input_identity(msg_body)
                     if identity:
+                        error["undelivered"] = True
                         _publish_event(
                             conv,
                             _response_failed_payload(
-                                {**error, "undelivered": True},
+                                error,
                                 input_identity=identity,
                             ),
                         )
-                _on_proxy_stream_end(conv, error=error)
+                _on_proxy_stream_end(conv, error=error, input_identity=identity)
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes
@@ -10369,7 +10385,9 @@ def create_runner_app(
                         input_identity=identity,
                     ),
                 )
-            _on_proxy_stream_end(conv, error=error)
+            _on_proxy_stream_end(
+                conv, error={**error, "undelivered": True}, input_identity=identity
+            )
 
     async def _drain_streaming_response(
         response: StreamingResponse,
@@ -10850,6 +10868,7 @@ def create_runner_app(
                 _on_proxy_stream_end(
                     conv_id,
                     error=_error,
+                    input_identity=turn_input_identity,
                 )
                 yield _response_failed_event(
                     _error,
@@ -11050,6 +11069,7 @@ def create_runner_app(
                     owner_response_id=_response_id,
                     sign_in_hold=holding,
                     cancelled=cancelled,
+                    input_identity=turn_input_identity,
                 )
                 return lifecycle_event
 
@@ -11103,6 +11123,7 @@ def create_runner_app(
                         _on_proxy_stream_end(
                             conv_id,
                             error=_rejection,
+                            input_identity=turn_input_identity,
                         )
                         yield _response_failed_event(
                             _rejection,
@@ -11424,6 +11445,7 @@ def create_runner_app(
                                                     "type": _err_type,
                                                 },
                                                 owner_response_id=_response_id,
+                                                input_identity=turn_input_identity,
                                             )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type},
@@ -11638,7 +11660,12 @@ def create_runner_app(
                     input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _overflow_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=_error,
+                    owner_response_id=_response_id,
+                    input_identity=turn_input_identity,
+                )
                 yield _response_failed_event(
                     _error,
                     source="llm",
@@ -11724,7 +11751,12 @@ def create_runner_app(
                     input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _http_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=_error,
+                    owner_response_id=_response_id,
+                    input_identity=turn_input_identity,
+                )
                 yield _response_failed_event(
                     _error,
                     source="harness",

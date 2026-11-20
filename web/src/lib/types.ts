@@ -126,6 +126,8 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  delivery_attempt_id?: string;
+  input_stable_id?: string;
   /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
   level?: "error" | "info" | "warning";
   /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */

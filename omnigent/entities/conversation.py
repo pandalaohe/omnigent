@@ -452,6 +452,8 @@ class MessageData(BaseModel):
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # The web send proved delivered by this native transcript item.
+    web_stable_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -608,6 +610,8 @@ class ErrorData(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    delivery_attempt_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    input_stable_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("code", "message")
     @classmethod
@@ -1045,6 +1049,15 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
+        # Only the server can establish this link, after matching pending input.
+        if isinstance(self.data, MessageData) and self.data.web_stable_id is not None:
+            self.data = self.data.model_copy(update={"web_stable_id": None})
+        if isinstance(self.data, ErrorData) and (
+            self.data.delivery_attempt_id is not None or self.data.input_stable_id is not None
+        ):
+            self.data = self.data.model_copy(
+                update={"delivery_attempt_id": None, "input_stable_id": None}
+            )
         if self.stable_id is not None and not re.fullmatch(r"[0-9a-f]{32}", self.stable_id):
             raise ValueError("stable_id must be a 32-char lowercase hex string")
         return self
@@ -1081,9 +1094,13 @@ class ConversationItem(BaseModel):
         """Compare vendor data, allowing stored uploads only with a known source ID."""
         if self.type != incoming.type:
             return False
-        if self.data == incoming.data:
-            return True
         old, new = self.data, incoming.data
+        if isinstance(old, MessageData) and old.web_stable_id is not None:
+            old = old.model_copy(update={"web_stable_id": None})
+        if isinstance(new, MessageData) and new.web_stable_id is not None:
+            new = new.model_copy(update={"web_stable_id": None})
+        if old == new:
+            return True
         if not (
             exact_source
             and isinstance(old, MessageData)
