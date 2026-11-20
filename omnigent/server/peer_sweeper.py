@@ -46,6 +46,7 @@ from starlette.requests import Request
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation, ErrorData, MessageData
+from omnigent.runtime import pending_inputs
 from omnigent.sdk_peer_delivery import sdk_attempt, sdk_attempt_reason
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
@@ -798,6 +799,10 @@ class PeerSweeper:
                 ("delivering",),
                 expected_reason=record.reason if native_attempt else None,
             )
+            return
+        if pending_inputs.holds_peer_message(record.receiver_session_id, record.id):
+            # The receiver's runner still holds this copy and delivers it once
+            # the terminal can take it; a resend would paste it twice.
             return
         if native_attempt:
             assert attempt_id is not None

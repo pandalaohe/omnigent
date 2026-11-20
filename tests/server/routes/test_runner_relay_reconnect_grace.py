@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
@@ -140,6 +141,52 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["confirmed-running", "confirmed-idle", "unconfirmed-running"])
+async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkeypatch, case):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr(
+        pending_inputs,
+        "_session_busy_check",
+        lambda conversation_id: conversation_id == session_id and case.endswith("running"),
+    )
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    if case.startswith("confirmed"):
+        orchestration._record_native_input_lifecycle(
+            session_id,
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_paste"},
+                "pending_id": pending_id,
+                "delivery_attempt_id": attempt_id,
+            },
+        )
+    # Claude absorbs the queued paste only after a 25-minute step.
+    for now in range(60, 1501, 60):
+        await orchestration._reconcile_runner_input_leases(
+            store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+        )
+    if case != "confirmed-running":
+        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+        (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
+        assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+        return
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
+    assert not store.list_items(session_id).data
+    late_mirror = pending_inputs.resolve_matching_text(session_id, "steer")
+    assert late_mirror.matched is not None
+    assert late_mirror.matched.pending_id == pending_id
+
+
+@pytest.mark.asyncio
 async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_uri, monkeypatch):
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(harness_override="claude-native")
@@ -192,6 +239,82 @@ async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_
         runner_forward.assert_not_awaited()
     finally:
         pending_inputs.resolve(conv.id, pending_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_capable", [True, False])
+async def test_buffered_peer_copy_stays_claimable_while_the_runner_holds_it(
+    db_uri, monkeypatch, claim_capable
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="claude-native")
+    peer_id = "c" * 32
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    real_forward = orchestration._forward_native_terminal_message
+    headers = {"X-Omnigent-Pending-Input-Claim": "1"} if claim_capable else {}
+    runner = httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(202, json={"status": "buffered"}, headers=headers)
+        ),
+    )
+
+    async def forward(_client, session_id, conversation, body, *, input_delivery, **_kwargs):
+        return await real_forward(
+            runner, session_id, conversation, body, input_delivery=input_delivery
+        )
+
+    monkeypatch.setattr(orchestration, "_forward_native_terminal_message", forward)
+    try:
+        with pytest.raises(HTTPException, match="buffered"):
+            await orchestration._dispatch_session_event_to_runner_impl(
+                conv.id,
+                conv,
+                SessionEventInput(
+                    type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "peer report"}],
+                        "peer_message_id": peer_id,
+                    },
+                ),
+                store,
+                AsyncMock(),
+                agent_name=None,
+                file_store=None,
+                artifact_store=None,
+                native_terminal_ready=True,
+            )
+        assert pending_inputs.holds_peer_message(conv.id, peer_id) is claim_capable
+        if not claim_capable:
+            assert pending_inputs.snapshot_for(conv.id) == []
+            return
+        (entry,) = pending_inputs.snapshot_for(conv.id)
+        pending_id = entry["pending_id"]
+        attempt_id = pending_inputs.delivery_attributes_for(conv.id, pending_id)[
+            "delivery_attempt_id"
+        ]
+        for now in range(60, 1201, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                conv.id,
+                {"active_pending_ids": [], "queued_pending_ids": [pending_id]},
+                set(),
+            )
+        assert pending_inputs.claim_runner_input(
+            conv.id, pending_id, "drained", expected_attempt_id=attempt_id
+        )
+        assert not store.list_items(conv.id).data
+    finally:
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(conv.id):
+            pending_inputs.resolve(conv.id, pending_id)
 
 
 @pytest.mark.asyncio

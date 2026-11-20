@@ -2468,6 +2468,7 @@ async def test_readiness_deadline_bounds_executor_lock_wait(
         "matching-hook",
         "no-receipt",
         "foreign-queued",
+        "other-session-queued",
         "foreign-hook",
         "stale-hook",
         "tmux-unavailable",
@@ -2522,19 +2523,21 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
             elif outcome == "transcript-only" and not receipt_written and now >= 2.0:
                 write_transcript_receipt()
             elif (
-                outcome in {"queued-mid-turn", "foreign-queued"}
+                outcome in {"queued-mid-turn", "foreign-queued", "other-session-queued"}
                 and not receipt_written
                 and now >= 2.0
             ):
                 # Claude Code records a prompt submitted mid-turn as queued, not as a user record.
                 receipt_written = True
-                queued = content if outcome == "queued-mid-turn" else "<task-notification>"
+                queued = "<task-notification>" if outcome == "foreign-queued" else content
                 transcript.write_text(
                     json.dumps(
                         {
                             "type": "queue-operation",
                             "operation": "enqueue",
-                            "sessionId": native_id,
+                            "sessionId": (
+                                "other-session" if outcome == "other-session-queued" else native_id
+                            ),
                             "content": queued,
                         }
                     )

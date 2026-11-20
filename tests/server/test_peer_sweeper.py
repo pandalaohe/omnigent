@@ -25,6 +25,7 @@ from omnigent.entities.conversation import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.runtime import pending_inputs
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -780,6 +781,31 @@ async def test_uncertain_delivery_reconciles_to_pending_without_marker(
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
     assert harness.post_event.calls == []
+
+
+async def test_uncertain_delivery_waits_while_the_receivers_runner_holds_its_copy(
+    harness: _Harness,
+) -> None:
+    """A copy the receiver's runner still holds is delivered from there, never resent."""
+    record = harness.seed_record(state="pending")
+    harness.deliver.sequences["receiver"] = [("uncertain", "not_ready"), ("delivered", None)]
+    await harness.sweeper._tick()
+    pending_id = pending_inputs.record(
+        "receiver",
+        [{"type": "input_text", "text": "held peer copy"}],
+        runner_managed=True,
+        peer_message_id=record.id,
+    )
+    try:
+        harness._now += 130
+        await harness.sweeper._tick()
+        assert _row(harness.store, record.id).state == "delivering"
+        assert len(harness.deliver.calls) == 1
+    finally:
+        pending_inputs.resolve("receiver", pending_id)
+    # The runner gave its copy up without delivering it: resend.
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
 
 
 @pytest.mark.parametrize("reason", [None, f"native_attempt:{'a' * 32}"])
