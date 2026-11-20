@@ -1021,7 +1021,7 @@ function PendingSendIndicator({ sinceMs }: { sinceMs?: number }) {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [sinceMs]);
-  const text = chatText[navigator.language.split("-")[0] === "zh" ? "zh" : "en"];
+  // Interface copy is English only; these labels never follow the device locale.
   const seconds = Math.max(0, Math.floor((now - (sinceMs ?? now)) / 1000));
   const elapsed = [Math.floor(seconds / 60), seconds % 60]
     .map((value) => String(value).padStart(2, "0"))
@@ -1032,7 +1032,9 @@ function PendingSendIndicator({ sinceMs }: { sinceMs?: number }) {
       data-testid="message-still-sending"
     >
       <Loader2Icon size={12} className="animate-spin" aria-hidden />
-      {sinceMs === undefined ? text.stillSending : text.sending.replace("{elapsed}", elapsed)}
+      {sinceMs === undefined
+        ? chatText.stillSending
+        : chatText.sending.replace("{elapsed}", elapsed)}
     </div>
   );
 }
