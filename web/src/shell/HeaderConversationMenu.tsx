@@ -107,7 +107,7 @@ import { useChatStore } from "@/store/chatStore";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { menuRow, type MobileMenuPinId, type PinnableMenuRow } from "@/lib/mobileMenuPins";
-import { toggleMobileMenuPin, useMobileMenuPins } from "@/lib/mobileAssistantPreferences";
+import { toggleMobileMenuPin, useMobileMenuPins } from "@/lib/mobileMenuPinPreferences";
 import { MobileMenuPinToggle, withPinControl } from "./MobileMenuPinToggle";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";

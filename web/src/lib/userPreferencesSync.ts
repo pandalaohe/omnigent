@@ -21,7 +21,8 @@ export type UserPreferenceNamespace =
   | "sidebar_layout"
   | "sound_alerts"
   | "worktree_defaults"
-  | "voice_input";
+  | "voice_input"
+  | "mobile_menu_pins";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -114,6 +115,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
       storageKey: "omnigent:sidebar-layout",
       eventName: "omnigent:sidebar-layout-changed",
     },
+    mobile_menu_pins: {
+      storageKey: "omnigent:mobile-menu-pins",
+      eventName: "omnigent:mobile-menu-pins-changed",
+    },
     sound_alerts: {
       storageKey: "omnigent:sound-alerts",
       eventName: "omnigent:sound-alerts-changed",
@@ -157,13 +162,6 @@ interface PendingPatch {
   serialized: string;
   delayMs: number;
   attempt: number;
-  fieldPatch?: FieldPatch;
-}
-
-/** A save that carries one field of a namespace; the Server merges the rest. */
-interface FieldPatch {
-  /** The namespace object as the Server will hold it once this save lands. */
-  merged: Record<string, unknown>;
 }
 const patchesAfterFlight = new Map<UserPreferenceNamespace, PendingPatch>();
 const inFlightPatches = new Map<UserPreferenceNamespace, number>();
@@ -285,7 +283,6 @@ function mobileSyncValue(value: unknown): unknown | null {
     terminalKeysPreset?: unknown;
     terminalKeyboard?: unknown;
     chatActionsRevision?: unknown;
-    pinnedMenuItems?: unknown;
   };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
     return null;
@@ -312,7 +309,6 @@ function mobileSyncValue(value: unknown): unknown | null {
     ...(raw.chatActionsRevision !== undefined
       ? { chatActionsRevision: raw.chatActionsRevision }
       : {}),
-    ...(Array.isArray(raw.pinnedMenuItems) ? { pinnedMenuItems: raw.pinnedMenuItems } : {}),
   });
 }
 
@@ -647,7 +643,6 @@ function schedulePatch(
   serialized: string,
   delayMs: number,
   attempt: number,
-  fieldPatch?: FieldPatch,
 ): void {
   const generation = syncGeneration;
   const fetcher = preferenceFetcher;
@@ -659,13 +654,7 @@ function schedulePatch(
       pendingTimers.delete(namespace);
       if (!isCurrentPreferenceGeneration(generation)) return;
       if (inFlightPatches.has(namespace)) {
-        patchesAfterFlight.set(namespace, {
-          syncValue,
-          serialized,
-          delayMs: 0,
-          attempt,
-          ...(fieldPatch ? { fieldPatch } : {}),
-        });
+        patchesAfterFlight.set(namespace, { syncValue, serialized, delayMs: 0, attempt });
         return;
       }
       if (lastAcknowledged.get(namespace) === serialized && !readDirtyNamespaces().has(namespace)) {
@@ -684,10 +673,6 @@ function schedulePatch(
           if (response?.status === 422) {
             const body = await response.json().catch(() => null);
             if (!isCurrentPreferenceGeneration(generation)) return;
-            if (fieldPatch) {
-              discardRejectedNamespace(namespace, body?.detail);
-              return;
-            }
             settlePatchWaiters(
               namespace,
               serialized,
@@ -719,22 +704,14 @@ function schedulePatch(
             return;
           }
           if (!response?.ok) throw new Error("preference patch failed");
+          lastAcknowledged.set(namespace, serialized);
+          lastServerValues.set(namespace, syncValue);
           settlePatchWaiters(namespace, serialized);
           window.dispatchEvent(
             new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
               detail: { namespace },
             }),
           );
-          if (fieldPatch) {
-            // The namespace now holds this field merged into what the Server
-            // already had; the local object's other fields were never sent.
-            lastServerValues.set(namespace, fieldPatch.merged);
-            lastAcknowledged.set(namespace, serializedNamespaceValue(namespace, fieldPatch.merged));
-            clearDirty(namespace);
-            return;
-          }
-          lastAcknowledged.set(namespace, serialized);
-          lastServerValues.set(namespace, syncValue);
           const current = latestNamespaceValue(namespace);
           const currentSerialized = serializedNamespaceValue(namespace, current);
           if (currentSerialized === serialized) {
@@ -749,23 +726,7 @@ function schedulePatch(
             });
           }
         } catch {
-          if (isCurrentPreferenceGeneration(generation) && fieldPatch) {
-            if (attempt < 3 && !patchesAfterFlight.has(namespace)) {
-              patchesAfterFlight.set(namespace, {
-                syncValue,
-                serialized,
-                delayMs: 1000 * 2 ** attempt,
-                attempt: attempt + 1,
-                fieldPatch,
-              });
-            } else {
-              settlePatchWaiters(
-                namespace,
-                serialized,
-                new Error("Couldn't save settings. Check your connection and retry."),
-              );
-            }
-          } else if (isCurrentPreferenceGeneration(generation)) {
+          if (isCurrentPreferenceGeneration(generation)) {
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
             if (currentSerialized !== serialized) {
@@ -797,14 +758,7 @@ function schedulePatch(
             const next = patchesAfterFlight.get(namespace);
             if (next) {
               patchesAfterFlight.delete(namespace);
-              schedulePatch(
-                namespace,
-                next.syncValue,
-                next.serialized,
-                next.delayMs,
-                next.attempt,
-                next.fieldPatch,
-              );
+              schedulePatch(namespace, next.syncValue, next.serialized, next.delayMs, next.attempt);
             }
           }
         }
@@ -813,50 +767,17 @@ function schedulePatch(
   );
 }
 
-function canQueuePreferencePatch(): boolean {
-  return !(
+export function queueUserPreferencePatch(
+  namespace: UserPreferenceNamespace,
+  value: unknown | null,
+): void {
+  if (
     typeof window === "undefined" ||
     applyingServerPreferences ||
     !serverSupportsPreferences ||
     !preferenceConnectionIsCurrent() ||
     preferenceFetcher === null
-  );
-}
-
-/**
- * Queue a save that owns one field of a namespace object.
- *
- * The Server shallow-merges a namespace object (`{**existing, **value}`), so a
- * writer that owns one field sends only that field: the sibling fields keep
- * whatever the account holds instead of being rewritten from this device's
- * cache. Used for the phone menu pins, which share `mobile_assistant` with the
- * terminal layout.
- */
-export function queueUserPreferenceFieldPatch(
-  namespace: UserPreferenceNamespace,
-  field: string,
-  value: unknown,
-): void {
-  if (!canQueuePreferencePatch()) return;
-  const syncValue = { [field]: value };
-  const serialized = `field:${field}:${JSON.stringify(value)}`;
-  if (lastAcknowledged.get(namespace) === serialized && !readDirtyNamespaces().has(namespace)) {
-    return;
-  }
-  const serverValue = lastServerValues.get(namespace);
-  const merged =
-    serverValue && typeof serverValue === "object" && !Array.isArray(serverValue)
-      ? { ...(serverValue as Record<string, unknown>), [field]: value }
-      : { ...syncValue };
-  markDirty(namespace, syncValue);
-  schedulePatch(namespace, syncValue, serialized, 250, 0, { merged });
-}
-
-export function queueUserPreferencePatch(
-  namespace: UserPreferenceNamespace,
-  value: unknown | null,
-): void {
-  if (!canQueuePreferencePatch()) {
+  ) {
     return;
   }
   const syncValue = normalizedSyncValue(namespace, value);

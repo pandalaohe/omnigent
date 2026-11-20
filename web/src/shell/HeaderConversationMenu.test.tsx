@@ -19,9 +19,9 @@ import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { menuRow } from "@/lib/mobileMenuPins";
 import {
-  MOBILE_ASSISTANT_STORAGE_KEY,
-  readMobileAssistantPreferences,
-} from "@/lib/mobileAssistantPreferences";
+  MOBILE_MENU_PINS_STORAGE_KEY,
+  readMobileMenuPinsPreferences,
+} from "@/lib/mobileMenuPinPreferences";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { useChatStore } from "@/store/chatStore";
@@ -244,9 +244,13 @@ const shellsRailRow = menuRow("shells", "Shells", () => (
 /** Store a pin choice the way another device would have left it. */
 function storePins(pinnedMenuItems: string[]) {
   localStorage.setItem(
-    MOBILE_ASSISTANT_STORAGE_KEY,
-    JSON.stringify({ version: 2, enabled: true, buttons: [], pinnedMenuItems }),
+    MOBILE_MENU_PINS_STORAGE_KEY,
+    JSON.stringify({ version: 1, pinnedMenuItems }),
   );
+}
+
+function storedPins() {
+  return readMobileMenuPinsPreferences().pinnedMenuItems;
 }
 
 function menuItemLabels() {
@@ -1109,13 +1113,13 @@ describe("HeaderConversationMenu", () => {
     expect(menuItemLabels().slice(0, 4)).toEqual(["Files", "Add nested agent", "Pin", "Share"]);
     expect(screen.getAllByRole("menuitem", { name: /^Files/ })).toHaveLength(1);
     expect(screen.getByTestId("pin-menu-item-files")).toHaveAttribute("aria-label", "Unpin Files");
-    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["files"]);
+    expect(storedPins()).toEqual(["files"]);
 
     // Unpinning from the pinned group returns the row to its own place.
     fireEvent.click(screen.getByTestId("pin-menu-item-files"));
     expect(menuItemLabels().slice(0, 3)).toEqual(["Add nested agent", "Pin", "Share"]);
     expect(menuItemLabels().slice(-4, -3)).toEqual(["Files"]);
-    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual([]);
+    expect(storedPins()).toEqual([]);
   });
 
   it("keeps the order the rows were pinned in", () => {
@@ -1182,7 +1186,7 @@ describe("HeaderConversationMenu", () => {
 
     fireEvent.click(screen.getByTestId("pin-menu-item-session-pin"));
     expect(menuItemLabels().slice(0, 3)).toEqual(["Pin", "Add nested agent", "Share"]);
-    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["session-pin"]);
+    expect(storedPins()).toEqual(["session-pin"]);
   });
 
   it("keeps the 44 px pin control inside its own row", () => {

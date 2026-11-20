@@ -72,11 +72,6 @@ export function normalizeMobileMenuPins(value: unknown): MobileMenuPinId[] | und
   return [...seen];
 }
 
-/** The pins a surface renders: the stored choice, else the stock one. */
-export function resolveMobileMenuPins(value: unknown): MobileMenuPinId[] {
-  return normalizeMobileMenuPins(value) ?? [...DEFAULT_MOBILE_MENU_PINS];
-}
-
 /** Pin order, then toggle `id` in or out of it. */
 export function toggledMobileMenuPins(
   pins: readonly MobileMenuPinId[],

@@ -158,6 +158,7 @@ UserPreferenceNamespace = Literal[
     "builtin_agent_prompts",
     "voice_input",
     "model_provider_aliases",
+    "mobile_menu_pins",
 ]
 
 

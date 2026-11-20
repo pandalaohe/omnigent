@@ -4,7 +4,6 @@ import {
   DEFAULT_MOBILE_MENU_PINS,
   MOBILE_MENU_PIN_IDS,
   normalizeMobileMenuPins,
-  resolveMobileMenuPins,
   toggledMobileMenuPins,
 } from "./mobileMenuPins";
 
@@ -21,8 +20,6 @@ describe("mobileMenuPins", () => {
     expect(normalizeMobileMenuPins(undefined)).toBeUndefined();
     expect(normalizeMobileMenuPins("shells")).toBeUndefined();
     expect(normalizeMobileMenuPins([])).toEqual([]);
-    expect(resolveMobileMenuPins(undefined)).toEqual([...DEFAULT_MOBILE_MENU_PINS]);
-    expect(resolveMobileMenuPins([])).toEqual([]);
   });
 
   it("pins Shells out of the box", () => {
