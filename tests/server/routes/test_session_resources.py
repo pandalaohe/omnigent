@@ -859,6 +859,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
                 "pending_id": body["pending_id"],
+                "pending_input_claim_required": True,
                 "delivery_attempt_id": forwarded["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
                 "usage_admission": None,
@@ -1589,7 +1590,7 @@ async def test_create_terminal_proxies_to_runner(
         assert taken is not None
         assert taken.prefix == (
             "[System: shell] The user opened bash · s1 in this session. "
-            "You can read it, not type into it or close it.\n\n"
+            "Agent access: read_write.\n\n"
         )
     else:
         assert taken is None
