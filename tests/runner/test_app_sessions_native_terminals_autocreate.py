@@ -5393,6 +5393,124 @@ async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
 
 
 @pytest.mark.asyncio
+async def test_a_moved_claude_forwarder_without_routers_leaves_its_old_sessions_new_routers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A forwarder launched without routers closes none when it stops after a move.
+
+    The pane moved to a successor and the old session relaunched with routers of
+    its own. The successor's release cancels the moved forwarder; its cleanup must
+    leave the old session's routers, advertisement and endpoint working.
+    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint, request_decision
+    from omnigent.runner import subagent_routing, turn_routing
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    forwarding = asyncio.Event()
+
+    async def _running_forwarder(**kwargs: Any) -> None:
+        del kwargs
+        forwarding.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _running_forwarder,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    old_id = _RELAUNCHED_SESSION_ID
+    successor_id = "c4f899b01fde5627540ff96ac9d85647"
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=old_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            workspace=str(workspace),
+            labels={BRIDGE_ID_LABEL_KEY: old_id},
+        ),
+    )
+
+    class _RecordingRelayClient:
+        """Records the session each relay names; the server is down."""
+
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        async def post(self, path: str, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.paths.append(path)
+            raise RuntimeError("server down")
+
+    relay_client = _RecordingRelayClient()
+    relaunch_dir = tmp_path / "relaunch"
+    async with httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"labels": {BRIDGE_ID_LABEL_KEY: old_id}}, request=request
+            )
+        ),
+    ) as client:
+        await orchestration._auto_create_claude_terminal(
+            old_id,
+            _LiveClaudeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=client,
+            session_init=envelope,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+        )
+    forwarder = orchestration._AUTO_FORWARDER_TASKS[old_id]
+    try:
+        await asyncio.wait_for(forwarding.wait(), timeout=30)
+        assert forwarder not in orchestration._CLAUDE_FORWARDER_ROUTERS
+        orchestration._rekey_auto_forwarder_task(old_id, successor_id)
+        subagent_router = subagent_routing.ensure_session_router(
+            old_id,
+            bridge_dir=relaunch_dir,
+            server_client=relay_client,  # type: ignore[arg-type]
+        )
+        turn_router = turn_routing.ensure_session_turn_router(
+            old_id,
+            bridge_dir=relaunch_dir,
+            server_client=relay_client,  # type: ignore[arg-type]
+            harness="claude-native",
+        )
+        assert turn_router is not None
+        # The successor's CLI release cancels the moved forwarder first.
+        assert await orchestration._cancel_auto_forwarder_task(successor_id)
+        assert forwarder.cancelled()
+        assert subagent_routing._session_routers.get(old_id) is subagent_router
+        assert not subagent_router._closed
+        assert turn_routing._session_routers.get(old_id) is turn_router
+        assert not turn_router._closed
+        endpoint = read_router_endpoint(relaunch_dir)
+        assert endpoint is not None and endpoint.url == subagent_router.url
+        body = {"harness": "claude-native", "task_name": "review"}
+        assert await asyncio.to_thread(request_decision, endpoint, old_id, body)
+        assert relay_client.paths == [subagent_routing.SERVER_ROUTE_PATH.format(session_id=old_id)]
+    finally:
+        forwarder.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop(old_id, None)
+        orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
+        subagent_routing.shutdown_session_router(old_id)
+        turn_routing.shutdown_session_turn_router(old_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("materialized_bundle", [False, True])
 async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cleanup(
     tmp_path: Path,

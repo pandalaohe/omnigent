@@ -11317,8 +11317,12 @@ async def _auto_create_claude_terminal(
                 event_dispatcher=event_dispatcher,
             )
         finally:
-            await _shutdown_session_router_async(session_id, _subagent_router)
-            await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
+            # A ``None`` handle would close whichever router ``session_id`` has now,
+            # e.g. one its relaunch installed after this pane moved to a successor.
+            if _subagent_router is not None:
+                await _shutdown_session_router_async(session_id, _subagent_router)
+            if _claude_turn_router is not None:
+                await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
