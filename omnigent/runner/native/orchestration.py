@@ -205,6 +205,10 @@ def _publish_tmux_target_for_bridge(
 # garbage-collected mid-run, and the handle for cancelling a session's previous
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
+# Current registry key of each forwarder task; a rekey replaces it.
+_AUTO_FORWARDER_TASK_KEYS: weakref.WeakKeyDictionary[asyncio.Task[object], str] = (
+    weakref.WeakKeyDictionary()
+)
 
 # Include the child's 10-second termination grace and forced-exit cleanup.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
@@ -355,11 +359,15 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     if incumbent is not None and incumbent is not task:
         incumbent.cancel()
     _AUTO_FORWARDER_TASKS[session_id] = task
+    _AUTO_FORWARDER_TASK_KEYS[task] = session_id
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
+        if _AUTO_FORWARDER_TASK_KEYS.get(done_task, session_id) != session_id:
+            # Rekeyed onto a successor: that key's callback logs the exit.
+            return
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
         # retrieves the failure (no "Task exception was never retrieved").
@@ -402,9 +410,11 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
 
     A native ``/clear`` moves the pane to a fresh conversation while the same
     forwarder keeps mirroring it. Without the move, a teardown addressed to the
-    superseded conversation (terminal re-create, stop, CLI release) would
-    cancel the successor's forwarder. Re-registering attaches an eviction
-    callback for the new key; the old key's callback no-ops.
+    superseded conversation (terminal re-create, stop, CLI release, delete)
+    would cancel the successor's forwarder or close the subagent router the
+    pane's hooks call. Re-registering attaches an eviction callback for the new
+    key; the old key's callback no-ops. The router is detached from the old ID,
+    and the forwarder's ``finally`` still closes it.
 
     :param old_session_id: Session the task was registered under, e.g. ``"conv_old"``.
     :param new_session_id: Session that now owns the pane, e.g. ``"conv_new"``.
@@ -416,6 +426,9 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
     if task is None:
         return
     _register_auto_forwarder_task(new_session_id, task)
+    from omnigent.runner.subagent_routing import detach_session_router
+
+    detach_session_router(old_session_id)
 
 
 def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) -> bool:
@@ -426,6 +439,26 @@ def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) ->
         and _CLAUDE_FORWARDER_BRIDGE_DIRS.get(task) == bridge_dir
         for owner, task in _AUTO_FORWARDER_TASKS.items()
     )
+
+
+def _untailed_cleared_bridge_id(session_id: str) -> str:
+    """
+    Return a cleared bridge id for *session_id* that no other live forwarder tails.
+
+    A session resumed on ``{id}-cleared`` and cleared again hands that dir to
+    its new successor, so the plain marker can already be someone else's.
+
+    :param session_id: Superseded session id, e.g. ``"conv_old"``.
+    :returns: ``"conv_old-cleared"``, else the first free ``"conv_old-cleared-<n>"``.
+    """
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+    bridge_id = f"{session_id}-cleared"
+    suffix = 1
+    while _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
+        suffix += 1
+        bridge_id = f"{session_id}-cleared-{suffix}"
+    return bridge_id
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -10313,7 +10346,7 @@ async def _auto_create_claude_terminal(
             bridge_id = current_bridge_id
     if _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
         # The pane and its forwarder moved to a successor; never wipe or share its bridge.
-        bridge_id = f"{session_id}-cleared"
+        bridge_id = _untailed_cleared_bridge_id(session_id)
     rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id

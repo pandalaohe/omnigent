@@ -867,9 +867,14 @@ async def test_claude_fallback_bundle_follows_transferred_terminal(
 
 @pytest.mark.asyncio
 async def test_claude_forwarder_registration_follows_transferred_pane(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A /clear successor owns the pane's forwarder before any other task can run."""
+    """A /clear successor owns the pane's forwarder before any other task can run.
+
+    The pane's subagent router leaves the old session's reach with it, and the
+    forwarder's exit is logged once, under the successor.
+    """
+    from omnigent.runner import subagent_routing
     from omnigent.runner.native import orchestration
 
     terminal_registry = TerminalRegistry()
@@ -877,6 +882,9 @@ async def test_claude_forwarder_registration_follows_transferred_pane(
     registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
+    router = subagent_routing.ensure_session_router(
+        "conv_old", bridge_dir=tmp_path / "bridge", server_client=Mock()
+    )
     forwarder = asyncio.create_task(asyncio.Event().wait())
     orchestration._register_auto_forwarder_task("conv_old", forwarder)
     owner_at_first_yield: list[asyncio.Task[object] | None] = []
@@ -889,15 +897,31 @@ async def test_claude_forwarder_registration_follows_transferred_pane(
         assert await registry.transfer_terminal("conv_old", "conv_new", "terminal_claude_main")
         assert owner_at_first_yield == [forwarder]
         assert "conv_old" not in orchestration._AUTO_FORWARDER_TASKS
-        # Old-session teardown (pane rebuild, stop, CLI release) cannot reach it.
+        # Old-session teardown (pane rebuild, stop, CLI release, delete) cannot reach it.
         assert await orchestration._cancel_auto_forwarder_task("conv_old")
+        subagent_routing.shutdown_session_router("conv_old")
         assert not forwarder.done()
-        assert await orchestration._cancel_auto_forwarder_task("conv_new")
+        assert not router._closed
+        assert "conv_old" not in subagent_routing._session_routers
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            assert await orchestration._cancel_auto_forwarder_task("conv_new")
+            await asyncio.sleep(0)
         assert forwarder.cancelled()
+        obituaries = [
+            getattr(record, "session_id", None)
+            for record in caplog.records
+            if record.name == "omnigent.runner.app"
+            and "Transcript forwarder task" in record.getMessage()
+        ]
+        assert obituaries == ["conv_new"]
+        # The forwarder's own handle-scoped teardown still closes the router.
+        subagent_routing.shutdown_session_router("conv_old", router)
+        assert router._closed
     finally:
         forwarder.cancel()
         orchestration._AUTO_FORWARDER_TASKS.pop("conv_old", None)
         orchestration._AUTO_FORWARDER_TASKS.pop("conv_new", None)
+        subagent_routing.shutdown_session_router("conv_old", router)
 
 
 @pytest.mark.asyncio

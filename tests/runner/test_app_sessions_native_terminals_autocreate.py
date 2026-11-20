@@ -4897,10 +4897,12 @@ async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("successor_tails_stale_label", [False, True])
+@pytest.mark.parametrize("second_successor_tails_cleared_dir", [False, True])
 async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     successor_tails_stale_label: bool,
+    second_successor_tails_cleared_dir: bool,
 ) -> None:
     """
     A session re-keyed to "{id}-cleared" by /clear resumes in its OWN dir.
@@ -4912,6 +4914,8 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     natural ``D(session_id)`` (the new session's live dir, which would
     double-mirror the transcript and trip the executor guard). A label not yet
     re-keyed gets the same dir while the successor's live forwarder tails it.
+    A session resumed in its cleared dir and cleared again left that dir to a
+    second successor, so it moves on to ``{session_id}-cleared-2``.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4934,6 +4938,22 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         claude_native_bridge.record_hook_event(natural_dir, {"hook_event_name": "Stop"})
         orchestration._register_auto_forwarder_task(successor_id, successor_forwarder)
         orchestration._CLAUDE_FORWARDER_BRIDGE_DIRS[successor_forwarder] = natural_dir
+    second_successor_id = "d5a9ac12e0ef6738651aa07bd0ea9758"
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(f"{old_id}-cleared")
+    second_successor_forwarder = asyncio.create_task(asyncio.Event().wait())
+    if second_successor_tails_cleared_dir:
+        claude_native_bridge.prepare_bridge_dir(
+            second_successor_id, bridge_id=f"{old_id}-cleared", workspace=tmp_path
+        )
+        claude_native_bridge.record_hook_event(cleared_dir, {"hook_event_name": "Stop"})
+        orchestration._register_auto_forwarder_task(
+            second_successor_id, second_successor_forwarder
+        )
+        orchestration._CLAUDE_FORWARDER_BRIDGE_DIRS[second_successor_forwarder] = cleared_dir
+    expected_bridge_id = (
+        f"{old_id}-cleared-2" if second_successor_tails_cleared_dir else f"{old_id}-cleared"
+    )
+    expected_dir = claude_native_bridge.bridge_dir_for_bridge_id(expected_bridge_id)
 
     class _FakeInstance:
         """Minimal live terminal instance for the tmux-target publish."""
@@ -5013,23 +5033,33 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         assert (
             orchestration._AUTO_FORWARDER_TASKS.get(successor_id) is successor_forwarder
         ) == successor_tails_stale_label
+        assert not second_successor_forwarder.done()
+        assert (
+            orchestration._AUTO_FORWARDER_TASKS.get(second_successor_id)
+            is second_successor_forwarder
+        ) == second_successor_tails_cleared_dir
     finally:
         successor_forwarder.cancel()
+        second_successor_forwarder.cancel()
         orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
+        orchestration._AUTO_FORWARDER_TASKS.pop(second_successor_id, None)
 
-    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(f"{old_id}-cleared")
     assert forwarder_kwargs["session_id"] == old_id
-    assert forwarder_kwargs["bridge_dir"] == cleared_dir
+    assert forwarder_kwargs["bridge_dir"] == expected_dir
     # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
-    assert cleared_dir.exists()
+    assert expected_dir.exists()
     assert natural_dir.exists() == successor_tails_stale_label
     if successor_tails_stale_label:
         assert claude_native_bridge.read_active_session_id(natural_dir) == successor_id
         assert (natural_dir / "hooks.jsonl").exists()
+    if second_successor_tails_cleared_dir:
+        assert claude_native_bridge.read_active_session_id(cleared_dir) == second_successor_id
+        assert (cleared_dir / "hooks.jsonl").exists()
+        assert not (cleared_dir / "tmux.json").exists()
     # tmux.json (what the executor reads to inject) must land in the SAME dir the
     # executor + forwarder use — the cleared dir — NOT the natural session_id dir.
     # Hardcoding session_id there was the "tmux target not advertised yet" bug.
-    assert (cleared_dir / "tmux.json").exists()
+    assert (expected_dir / "tmux.json").exists()
     assert not (natural_dir / "tmux.json").exists()
 
     import json as _json
@@ -5037,7 +5067,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
     assert len(patch_requests) == 1
     patch_body = _json.loads(patch_requests[0].content)
-    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == f"{old_id}-cleared"
+    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == expected_bridge_id
 
 
 _RELAUNCHED_SESSION_ID = "6fe4feaa4dc772577c234c9f48c30dda"

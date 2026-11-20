@@ -163,6 +163,45 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
     assert session_id not in subagent_routing._session_routers
 
 
+async def test_a_detached_router_outlives_old_session_teardown_until_its_launch_closes_it(
+    tmp_path: Path,
+) -> None:
+    """A /clear successor keeps the pane's router; the old session relaunches with its own."""
+    session_id = "conv_native_launch"
+    pane_dir = tmp_path / "pane"
+    relaunch_dir = tmp_path / "relaunch"
+
+    def _launch(bridge_dir: Path) -> subagent_routing.SubagentRouter | None:
+        return _start_subagent_router_for_native_session(
+            session_id,
+            bridge_dir=bridge_dir,
+            harness="claude-native",
+            server_client=_DeadClient(),  # type: ignore[arg-type]
+            routing_enabled=True,
+            auto_harness=False,
+        ).router
+
+    pane_router = _launch(pane_dir)
+    assert pane_router is not None
+    subagent_routing.detach_session_router(session_id)
+
+    # Old-session delete and CLI release hold no handle.
+    subagent_routing.shutdown_session_router(session_id)
+    assert not pane_router._closed
+    pane_endpoint = read_router_endpoint(pane_dir)
+    assert pane_endpoint is not None and pane_endpoint.url == pane_router.url
+
+    relaunched = _launch(relaunch_dir)
+    assert relaunched is not None and relaunched is not pane_router
+
+    # The pane's forwarder stops: its handle-scoped teardown closes only its router.
+    subagent_routing.shutdown_session_router(session_id, pane_router)
+    assert pane_router._closed
+    assert read_router_endpoint(pane_dir) is None
+    assert not relaunched._closed
+    assert subagent_routing._session_routers.get(session_id) is relaunched
+
+
 @pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
 async def test_a_routed_claude_sdk_launch_installs_the_router(
     routing_class: SessionRoutingClass,

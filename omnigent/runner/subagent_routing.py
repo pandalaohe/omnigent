@@ -1049,6 +1049,8 @@ class SubagentRouter:
     :param url: Base URL the hook scripts POST to.
     :param token: Bearer token hook scripts present.
     :param httpd: The backing HTTP server.
+    :param detached: Whether :func:`detach_session_router` unregistered it
+        while its handle holder still owns it.
     """
 
     bridge_dir: Path
@@ -1056,6 +1058,7 @@ class SubagentRouter:
     token: str
     httpd: ThreadingHTTPServer
     advertised_dirs: set[Path] = field(default_factory=set)
+    detached: bool = False
     _closed: bool = False
 
     def advertise(self, bridge_dir: Path, session_id: str | None = None) -> Path:
@@ -1472,6 +1475,23 @@ def ensure_session_router_quietly(
         return None
 
 
+def detach_session_router(session_id: str) -> None:
+    """Unregister *session_id*'s router without closing it.
+
+    A native ``/clear`` hands the pane, whose hooks still call this router,
+    to a successor. Detached, it is out of reach of teardown addressed to
+    *session_id*, and a relaunch of *session_id* starts its own endpoint;
+    the launch holding the handle closes it through
+    :func:`shutdown_session_router`.
+
+    :param session_id: Session the pane moved away from.
+    """
+    with _lifecycle_lock:
+        router = _session_routers.pop(session_id, None)
+        if router is not None:
+            router.detached = True
+
+
 def shutdown_session_router(session_id: str, router: SubagentRouter | None = None) -> None:
     """Stop the router serving *session_id* and forget its state.
 
@@ -1484,15 +1504,19 @@ def shutdown_session_router(session_id: str, router: SubagentRouter | None = Non
         is identity-scoped: a delayed teardown from a previous launch of
         the same session must not close the router a re-create has since
         installed, which would leave routing silently dead behind a
-        still-valid advertisement. ``None`` tears down whatever is
-        registered (session-delete paths that hold no handle).
+        still-valid advertisement. A detached handle is closed: nothing
+        else can reach it. ``None`` tears down whatever is registered
+        (session-delete paths that hold no handle).
     """
     with _lifecycle_lock:
         current = _session_routers.get(session_id)
         if router is not None and current is not router:
-            return
-        _session_routers.pop(session_id, None)
-        _relayed.pop(session_id, None)
+            if not router.detached:
+                return
+            current = router
+        else:
+            _session_routers.pop(session_id, None)
+            _relayed.pop(session_id, None)
     if current is None:
         return
     router = current
