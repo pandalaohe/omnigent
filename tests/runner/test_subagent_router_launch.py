@@ -263,6 +263,66 @@ async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_t
     assert successor_router is None or not successor_router._closed
 
 
+@pytest.mark.parametrize("detached", [False, True])
+async def test_a_transfer_racing_a_router_teardown_leaves_it_closed_and_unindexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, detached: bool
+) -> None:
+    """A move that lands after a handle teardown accepted the router never revives it.
+
+    An indexed handle already taken out of the index is left as is. A detached
+    one is retargeted, and the close that follows still removes its advertisement.
+    """
+    session_id = "conv_native_launch"
+    successor_id = "conv_native_successor"
+    third_id = "conv_native_third"
+    pane_dir = tmp_path / "pane"
+    pane_router = _start_subagent_router_for_native_session(
+        session_id,
+        bridge_dir=pane_dir,
+        harness="claude-native",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
+        auto_harness=False,
+    ).router
+    assert pane_router is not None
+    successor_router = None
+    if detached:
+        successor_router = subagent_routing.ensure_session_router(
+            successor_id,
+            bridge_dir=tmp_path / "successor",
+            server_client=_DeadClient(),  # type: ignore[arg-type]
+        )
+        subagent_routing.move_session_router(pane_router, successor_id)
+        assert pane_router.detached
+    owner = pane_router.session_id
+    close = pane_router.close
+    during_close: list[tuple[str, str | None, bool]] = []
+
+    def _close_after_a_transfer() -> None:
+        # Runs after the teardown released the lifecycle lock, as a transfer could.
+        subagent_routing.move_session_router(pane_router, third_id)
+        endpoint = read_router_endpoint(pane_dir)
+        during_close.append(
+            (
+                pane_router.session_id,
+                endpoint.session_id if endpoint is not None else None,
+                third_id in subagent_routing._session_routers,
+            )
+        )
+        close()
+
+    monkeypatch.setattr(pane_router, "close", _close_after_a_transfer)
+    subagent_routing.shutdown_session_router(session_id, pane_router)
+
+    expected_owner = third_id if detached else owner
+    assert during_close == [(expected_owner, expected_owner, False)]
+    assert pane_router._closed
+    assert read_router_endpoint(pane_dir) is None
+    assert third_id not in subagent_routing._session_routers
+    assert subagent_routing._session_routers.get(successor_id) is successor_router
+    assert successor_router is None or not successor_router._closed
+
+
 @pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
 async def test_a_routed_claude_sdk_launch_installs_the_router(
     routing_class: SessionRoutingClass,

@@ -438,14 +438,18 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
         move_session_router(router, new_session_id)
 
 
-# Bridge dir each in-flight Claude launch picked, until its forwarder tails it;
-# :func:`_launch_claude` drops it when the launch fails or is cancelled first.
-_CLAUDE_BRIDGE_LAUNCH_CLAIMS: dict[Path, str] = {}
+# Bridge dir and session of each in-flight Claude launch, keyed by its task (each
+# launch runs in its own), until its forwarder tails the dir; :func:`_launch_claude`
+# drops it when that launch fails or is cancelled first.
+_CLAUDE_BRIDGE_LAUNCH_CLAIMS: dict[object, tuple[Path, str]] = {}
 
 
 def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) -> bool:
     """Return whether another session's live forwarder or in-flight launch uses *bridge_dir*."""
-    if _CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(bridge_dir, session_id) != session_id:
+    if any(
+        claimed == bridge_dir and owner != session_id
+        for claimed, owner in _CLAUDE_BRIDGE_LAUNCH_CLAIMS.values()
+    ):
         return True
     return any(
         owner != session_id
@@ -10362,7 +10366,10 @@ async def _auto_create_claude_terminal(
         # The pane and its forwarder moved to a successor; never wipe or share its bridge.
         bridge_id = _untailed_cleared_bridge_id(session_id)
     # Claimed before the next await, so a concurrent launch picks around it.
-    _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir_for_bridge_id(bridge_id)] = session_id
+    _CLAUDE_BRIDGE_LAUNCH_CLAIMS[asyncio.current_task()] = (
+        bridge_dir_for_bridge_id(bridge_id),
+        session_id,
+    )
     rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
@@ -11321,8 +11328,7 @@ async def _auto_create_claude_terminal(
     _CLAUDE_FORWARDER_BRIDGE_DIRS[_forwarder_task] = bridge_dir
     if _subagent_router is not None:
         _CLAUDE_FORWARDER_ROUTERS[_forwarder_task] = _subagent_router
-    if _CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(bridge_dir) == session_id:
-        del _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir]
+    _CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(asyncio.current_task(), None)
     _logger.info(
         "Auto-created claude terminal + forwarder for session %s; "
         "forwarder_task=%s elapsed_ms=%.0f",
@@ -12141,10 +12147,8 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
             rebind_bridge=ctx.rebind_bridge,
         )
     except BaseException:
-        # No forwarder tails the picked dir, so its claim must not steer other launches.
-        for bridge_dir, owner in list(_CLAUDE_BRIDGE_LAUNCH_CLAIMS.items()):
-            if owner == ctx.session_id:
-                del _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir]
+        # No forwarder tails this launch's dir; another launch keeps its own claim.
+        _CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(asyncio.current_task(), None)
         raise
     _start_claude_relay_after_launch(ctx)
     return view

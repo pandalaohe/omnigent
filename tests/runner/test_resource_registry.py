@@ -980,6 +980,51 @@ async def test_claude_forwarder_registration_follows_transferred_pane(
 
 
 @pytest.mark.asyncio
+async def test_claude_pane_without_a_router_leaves_other_routers_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routing-off pane's transfer rekeys its forwarder and moves no router.
+
+    A router indexed under the previous owner is not the pane's, so it keeps its
+    index entry, session and advertisement.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.runner import subagent_routing
+    from omnigent.runner.native import orchestration
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
+    other_router = subagent_routing.ensure_session_router(
+        "conv_old", bridge_dir=tmp_path / "other", server_client=Mock()
+    )
+    # Launched with routing off: no router is recorded with the forwarder.
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    orchestration._register_auto_forwarder_task("conv_old", forwarder)
+
+    async def _no_status_link(_link: str) -> None:
+        pass
+
+    monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
+    try:
+        assert await registry.transfer_terminal("conv_old", "conv_new", "terminal_claude_main")
+        assert orchestration._AUTO_FORWARDER_TASKS.get("conv_new") is forwarder
+        assert "conv_old" not in orchestration._AUTO_FORWARDER_TASKS
+        assert subagent_routing._session_routers.get("conv_old") is other_router
+        assert other_router.session_id == "conv_old"
+        assert "conv_new" not in subagent_routing._session_routers
+        endpoint = read_router_endpoint(tmp_path / "other")
+        assert endpoint is not None and endpoint.session_id == "conv_old"
+    finally:
+        forwarder.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_old", None)
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_new", None)
+        subagent_routing.shutdown_session_router("conv_old", other_router)
+
+
+@pytest.mark.asyncio
 async def test_non_claude_transfer_does_not_move_fallback_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

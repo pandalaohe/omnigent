@@ -4943,6 +4943,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     second_successor_id = "d5a9ac12e0ef6738651aa07bd0ea9758"
     cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(f"{old_id}-cleared")
     second_successor_forwarder = asyncio.create_task(asyncio.Event().wait())
+    second_successor_launch = object()
     if cleared_dir_owner is not None:
         claude_native_bridge.prepare_bridge_dir(
             second_successor_id, bridge_id=f"{old_id}-cleared", workspace=tmp_path
@@ -4955,7 +4956,10 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         orchestration._CLAUDE_FORWARDER_BRIDGE_DIRS[second_successor_forwarder] = cleared_dir
     if cleared_dir_owner == "launch":
         # Mid-relaunch: picked and prepared, its forwarder not registered yet.
-        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[cleared_dir] = second_successor_id
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[second_successor_launch] = (
+            cleared_dir,
+            second_successor_id,
+        )
     expected_bridge_id = f"{old_id}-cleared-2" if cleared_dir_owner else f"{old_id}-cleared"
     expected_dir = claude_native_bridge.bridge_dir_for_bridge_id(expected_bridge_id)
 
@@ -5004,7 +5008,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             )
 
     recorded_requests: list[httpx.Request] = []
-    claims_during_label_write: list[str | None] = []
+    claims_during_label_write: list[list[str]] = []
     label = old_id if successor_tails_stale_label else f"{old_id}-cleared"
 
     def _handle(req: httpx.Request) -> httpx.Response:
@@ -5012,7 +5016,11 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         recorded_requests.append(req)
         if req.method == "PATCH":
             claims_during_label_write.append(
-                orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(expected_dir)
+                [
+                    owner
+                    for claimed, owner in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.values()
+                    if claimed == expected_dir
+                ]
             )
         return httpx.Response(
             200,
@@ -5048,9 +5056,12 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             is second_successor_forwarder
         ) == (cleared_dir_owner == "forwarder")
         # Claimed across the label write; released once its forwarder tails the dir.
-        assert claims_during_label_write == [old_id]
-        assert expected_dir not in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS
-        assert (cleared_dir in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS) == (
+        assert claims_during_label_write == [[old_id]]
+        assert all(
+            claimed != expected_dir
+            for claimed, _owner in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.values()
+        )
+        assert (second_successor_launch in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS) == (
             cleared_dir_owner == "launch"
         )
     finally:
@@ -5058,7 +5069,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         second_successor_forwarder.cancel()
         orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
         orchestration._AUTO_FORWARDER_TASKS.pop(second_successor_id, None)
-        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(cleared_dir, None)
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(second_successor_launch, None)
 
     assert forwarder_kwargs["session_id"] == old_id
     assert forwarder_kwargs["bridge_dir"] == expected_dir
@@ -5087,16 +5098,19 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("overlapping_relaunch", [False, True])
 async def test_a_cancelled_claude_launch_leaves_no_claim_on_a_successors_bridge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlapping_relaunch: bool
 ) -> None:
     """
-    A launch cancelled before its forwarder starts drops its bridge claim.
+    A launch cancelled before its forwarder starts drops its own bridge claim.
 
     After a runner restart a retired session and its successor can both name one
     cleared dir. The retired session's launch claims it and is cancelled during
     its label write. The successor then still resumes in that dir with its own
-    local Claude session id, also over an abandoned claim of its own.
+    local Claude session id, also over an abandoned claim of its own. A second
+    launch of the retired session that overlaps the first (a resource reset drops
+    the ensure lock) keeps its claim when the first exits.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -5151,7 +5165,7 @@ async def test_a_cancelled_claude_launch_leaves_no_claim_on_a_successors_bridge(
         """Both sessions name the shared dir; the retired session's label write hangs."""
 
         def __init__(self) -> None:
-            self.retired_label_write = asyncio.Event()
+            self.retired_label_writes: asyncio.Queue[str] = asyncio.Queue()
             self.label_writes: list[tuple[str, str]] = []
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
@@ -5170,7 +5184,7 @@ async def test_a_cancelled_claude_launch_leaves_no_claim_on_a_successors_bridge(
             if isinstance(labels, dict) and BRIDGE_ID_LABEL_KEY in labels:
                 self.label_writes.append((url, labels[BRIDGE_ID_LABEL_KEY]))
                 if retired_id in url:
-                    self.retired_label_write.set()
+                    self.retired_label_writes.put_nowait(url)
                     await asyncio.Event().wait()
             return await super().patch(url, **kwargs)
 
@@ -5185,22 +5199,45 @@ async def test_a_cancelled_claude_launch_leaves_no_claim_on_a_successors_bridge(
             server_client=client,  # type: ignore[arg-type]
         )
 
-    retired_launch = asyncio.create_task(orchestration._launch_claude(_context(retired_id)))
+    def _shared_dir_claims() -> list[str]:
+        return [
+            owner
+            for claimed, owner in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.values()
+            if claimed == shared_dir
+        ]
+
+    retired_launches = [asyncio.create_task(orchestration._launch_claude(_context(retired_id)))]
+    abandoned_launch = object()
     try:
-        await asyncio.wait_for(client.retired_label_write.wait(), timeout=30)
-        assert orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(shared_dir) == retired_id
-        retired_launch.cancel()
+        await asyncio.wait_for(client.retired_label_writes.get(), timeout=30)
+        if overlapping_relaunch:
+            retired_launches.append(
+                asyncio.create_task(orchestration._launch_claude(_context(retired_id)))
+            )
+            await asyncio.wait_for(client.retired_label_writes.get(), timeout=30)
+        assert _shared_dir_claims() == [retired_id] * len(retired_launches)
+        retired_launches[0].cancel()
         with pytest.raises(asyncio.CancelledError):
-            await retired_launch
-        assert shared_dir not in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS
+            await retired_launches[0]
+        if overlapping_relaunch:
+            # The overlapping launch keeps its claim, so the successor still picks around it.
+            assert _shared_dir_claims() == [retired_id]
+            assert orchestration._claude_bridge_tailed_by_other_session(shared_dir, successor_id)
+            retired_launches[1].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await retired_launches[1]
+        assert _shared_dir_claims() == []
         # An abandoned claim of the successor's own does not move it either.
-        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[shared_dir] = successor_id
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[abandoned_launch] = (shared_dir, successor_id)
         await orchestration._launch_claude(_context(successor_id))
         await orchestration._AUTO_FORWARDER_TASKS[successor_id]
+        # The successor's launch released only its own claim.
+        assert _shared_dir_claims() == [successor_id]
     finally:
-        retired_launch.cancel()
+        for retired_launch in retired_launches:
+            retired_launch.cancel()
         orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
-        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(shared_dir, None)
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(abandoned_launch, None)
 
     assert forwarder_kwargs["session_id"] == successor_id
     assert forwarder_kwargs["bridge_dir"] == shared_dir
