@@ -35,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
     cancellable_injection,
+    claude_pane_has_accepted_input,
     claude_pane_ready,
     has_pending_user_prompt,
     has_running_turn,
@@ -363,6 +364,16 @@ class ClaudeNativeExecutor(Executor):
         self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
+        if wanted_model_arg is not None and await asyncio.to_thread(self._pane_turn_running):
+            # Claude Code queues a slash command typed into a running turn, so its
+            # confirmation never shows. The steer joins that turn on its model anyway;
+            # the next idle turn applies the switch.
+            _logger.info(
+                "claude-native: deferring /model %s while a turn runs",
+                wanted_model_arg,
+                extra={"session_id": self._request_session_id},
+            )
+            wanted_model_arg = None
         if wanted_model_arg is not None:
             # The switch also updates Claude's global default. Keep its
             # confirmation Enter inside the same lock as the message.
@@ -391,6 +402,16 @@ class ClaudeNativeExecutor(Executor):
             prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
             await claim_execution()
         await self._inject_prompt(text, notices)
+
+    def _pane_turn_running(self) -> bool:
+        """
+        Read a running turn as the runner's input gate does.
+
+        An unreadable status counts as busy once this pane has taken input.
+        """
+        return has_running_turn(
+            self._bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(self._bridge_dir)
+        )
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
         """
