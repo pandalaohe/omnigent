@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { HistoryTab } from "./HistoryTab";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const notices = vi.hoisted(() => ({ undo: undefined as undefined | (() => void) }));
 vi.mock("sonner", () => ({
@@ -16,6 +17,47 @@ afterEach(() => {
   cleanup();
   Object.assign(window, { omnigentDesktop: undefined });
 });
+it("pages history within a day, searches all visits, and removes the whole day", async () => {
+  const visitedAt = Date.now();
+  const history = Array.from({ length: 45 }, (_, index) => ({
+    url: `https://example.test/history/${index + 1}`,
+    title: `Visit ${index + 1}`,
+    visitedAt,
+  }));
+  const call = vi.fn(async ({ action }: { action: string }) =>
+    action === "remove-history" ? { ok: true, removed: history } : { ok: true, history },
+  );
+  Object.assign(window, {
+    omnigentDesktop: {
+      browserPlaces: call,
+      browserPlacesFeatures: ["remove-history"],
+      onBrowserPlaceChosen: () => () => {},
+    },
+  });
+  render(
+    <MemoryRouter>
+      <HistoryTab />
+    </MemoryRouter>,
+  );
+  const returnToFirstPage = await expectSettingsPages(
+    "Browser history pages",
+    (number) => `Visit ${number}`,
+  );
+  returnToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search history" }), {
+    target: { value: "Visit 44" },
+  });
+  expect(screen.getByText("Visit 44")).toBeInTheDocument();
+  expect(screen.queryByText("Visit 45")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Remove day" }));
+  await waitFor(() =>
+    expect(call).toHaveBeenCalledWith({
+      action: "remove-history",
+      urls: history.map((row) => row.url),
+    }),
+  );
+});
+
 it("commits a row removal before Undo and restores the returned rows", async () => {
   const row = { url: "https://example.test/", title: "Example", visitedAt: Date.now() };
   let rows = [row];

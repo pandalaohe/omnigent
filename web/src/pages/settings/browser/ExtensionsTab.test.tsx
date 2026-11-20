@@ -1,12 +1,42 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { ExtensionsTab } from "./ExtensionsTab";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 // Radix menus use pointer events; Enter also opens them with accessible focus.
 afterEach(() => {
   cleanup();
   Object.assign(window, { omnigentDesktop: undefined });
 });
+it("pages installed extensions and searches the whole list", async () => {
+  const extensions = Array.from({ length: 45 }, (_, index) => ({
+    id: `extension-${index + 1}`,
+    name: `Extension ${index + 1}`,
+    version: "1",
+    enabled: true,
+  }));
+  Object.assign(window, {
+    omnigentDesktop: {
+      kind: "electron",
+      getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: true }),
+      setBrowserLoginSetting: vi.fn(),
+      clearBrowserLogin: vi.fn(),
+      browserExtensionsList: vi.fn().mockResolvedValue({ ok: true, extensions }),
+    },
+  });
+  render(<ExtensionsTab />);
+  const returnToFirstPage = await expectSettingsPages(
+    "Extension pages",
+    (number) => `Extension ${number}`,
+  );
+  returnToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search extensions" }), {
+    target: { value: "Extension 44" },
+  });
+  expect(screen.getByText("Extension 44")).toBeInTheDocument();
+  expect(screen.queryByText("Extension 45")).not.toBeInTheDocument();
+});
+
 it("gates extension execution on sign-ins, shortens IDs and confirms removal", async () => {
   let rows = [
     { id: "package", runtimeId: "a".repeat(32), name: "Bitwarden", version: "1", enabled: true },

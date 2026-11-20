@@ -1,18 +1,73 @@
 import { useEffect, useState } from "react";
 import { PlugIcon } from "lucide-react";
+import { SettingsPager } from "@/components/SettingsPager";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
+import {
+  useMcpRegistryCatalog,
+  useMcpRegistryPage,
+  useRegistrySignIn,
+} from "@/hooks/useMcpRegistry";
+import { useSettingsPageCursor } from "@/hooks/useSettingsPageCursor";
+import { useViewerId } from "@/hooks/useViewerId";
 import { withBasePath } from "@/lib/basePath";
+import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
+const MCP_PAGE_CURSOR_PARAM = "mcp_page_after";
+
 export function McpRegistryConnections() {
-  const { services, error, loading, refresh } = useMcpRegistryCatalog();
-  const callbackFailed = [...new URLSearchParams(window.location.search)].some(
-    ([key, value]) => key.startsWith("mcp-") && value === "error",
+  const viewerId = useViewerId();
+  const scope = JSON.stringify([
+    getOmnigentServerIdentity(),
+    getOmnigentHostGeneration(),
+    viewerId,
+  ]);
+  return <McpRegistryConnectionsPage key={scope} scope={scope} enabled={viewerId !== null} />;
+}
+
+function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled: boolean }) {
+  const [callback] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const outcomes = [...params].filter(
+      ([key, status]) => key.startsWith("mcp-") && (status === "connected" || status === "error"),
+    );
+    return { outcomes, cursors: params.getAll(MCP_PAGE_CURSOR_PARAM) };
+  });
+  const { cursor, cursors, page, next, previous } = useSettingsPageCursor(
+    callback.outcomes.length &&
+      callback.cursors.every((value) => value.length > 0 && value.length <= 64)
+      ? callback.cursors
+      : [],
   );
+  useEffect(() => {
+    // Let the resolved viewer restore the page before removing the one-time callback.
+    if (!enabled || !callback.outcomes.length) return;
+    const url = new URL(window.location.href);
+    for (const [key, status] of callback.outcomes) url.searchParams.delete(key, status);
+    url.searchParams.delete(MCP_PAGE_CURSOR_PARAM);
+    if (url.href !== window.location.href) {
+      window.history.replaceState(window.history.state, "", url);
+    }
+  }, [callback, enabled]);
+  const returnParams = new URLSearchParams();
+  for (const after of cursors) returnParams.append(MCP_PAGE_CURSOR_PARAM, after);
+  const returnTo = window.location.pathname + (cursors.length ? `?${returnParams}` : "");
+  const { data, error, isPending, isFetching, refetch } = useMcpRegistryPage(
+    scope,
+    enabled,
+    cursor,
+  );
+  const services = data?.data ?? [];
+  const nextCursor = data?.next_cursor;
+  useEffect(() => {
+    if (page > 0 && data?.data.length === 0 && !isFetching) {
+      previous();
+    }
+  }, [page, data, isFetching, previous]);
+  const callbackFailed = callback.outcomes.some(([, status]) => status === "error");
   return (
     <div className="space-y-4">
       <div>
@@ -29,33 +84,47 @@ export function McpRegistryConnections() {
       )}
       {error && (
         <p role="alert" className="text-sm text-destructive">
-          {error}
+          {error.message}{" "}
+          <Button type="button" variant="outline" size="sm" onClick={() => void refetch()}>
+            Retry
+          </Button>
         </p>
       )}
       {services.map((service) => (
         <ServiceConnection
           key={service.id}
           service={service}
+          returnTo={returnTo}
           onChanged={async () => {
-            await refresh();
+            await refetch();
           }}
         />
       ))}
-      {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
-      {!loading && !services.length && !error && (
+      {isPending && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
+      {!isPending && page === 0 && !services.length && !error && (
         <p className="text-sm text-muted-foreground">
           No managed services are available for your account.
         </p>
       )}
+      <SettingsPager
+        label="Managed MCP service pages"
+        page={page}
+        hasNext={Boolean(nextCursor)}
+        busy={isFetching}
+        onPrevious={previous}
+        onNext={() => next(nextCursor)}
+      />
     </div>
   );
 }
 
 function ServiceConnection({
   service,
+  returnTo,
   onChanged,
 }: {
   service: RegistryService;
+  returnTo: string;
   onChanged: () => Promise<void>;
 }) {
   const [token, setToken] = useState("");
@@ -94,17 +163,19 @@ function ServiceConnection({
           </Button>
         )}
         {service.auth === "oauth" && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => {
-              window.location.href = withBasePath(
-                `/v1/connections/${service.connect_provider}/connect?return_to=${encodeURIComponent(window.location.pathname)}`,
-              );
-            }}
-          >
-            {service.connected ? "Reconnect" : "Connect"}
+          <Button asChild size="sm" variant="outline" disabled={busy}>
+            <a
+              aria-disabled={busy || undefined}
+              href={
+                busy
+                  ? undefined
+                  : withBasePath(
+                      `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
+                    )
+              }
+            >
+              {service.connected ? "Reconnect" : "Connect"}
+            </a>
           </Button>
         )}
         {(service.auth === "github" || service.auth === "databricks") && (

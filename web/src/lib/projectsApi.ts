@@ -165,6 +165,14 @@ export async function listProjects(options?: {
   return body.data;
 }
 
+export async function listArchivedProjectPage(limit: number, after?: string, signal?: AbortSignal) {
+  const params = new URLSearchParams({ archived: "only", limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/projects?${params}`, { signal });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectListResponse & { last_id: string | null; has_more: boolean };
+}
+
 export async function previewProjectArchive(id: string): Promise<ProjectArchivePreview> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/archive-preview`);
   if (!res.ok) throw await apiErrorFromResponse(res);

@@ -1,8 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { BookmarksTab } from "./BookmarksTab";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const notices = vi.hoisted(() => ({
   undo: undefined as undefined | (() => void),
@@ -23,6 +24,34 @@ afterEach(() => {
   notices.undo = undefined;
   notices.messages = [];
 });
+it("pages bookmarks and searches the complete saved list", async () => {
+  const bookmarks = Array.from({ length: 45 }, (_, index) => ({
+    url: `https://example.test/bookmarks/${index + 1}`,
+    title: `Bookmark ${index + 1}`,
+  }));
+  Object.assign(window, {
+    omnigentDesktop: {
+      browserPlaces: vi.fn().mockResolvedValue({ ok: true, bookmarks }),
+      onBrowserPlaceChosen: () => () => {},
+    },
+  });
+  render(
+    <MemoryRouter>
+      <BookmarksTab />
+    </MemoryRouter>,
+  );
+  const returnToFirstPage = await expectSettingsPages(
+    "Bookmark pages",
+    (number) => `Bookmark ${number}`,
+  );
+  returnToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search bookmarks" }), {
+    target: { value: "Bookmark 44" },
+  });
+  expect(screen.getByText("Bookmark 44")).toBeInTheDocument();
+  expect(screen.queryByText("Bookmark 45")).not.toBeInTheDocument();
+});
+
 it.each([true, false])(
   "deletes immediately and undoes with explicit old-shell position fallback (%s)",
   async (modern) => {
@@ -70,6 +99,58 @@ it.each([true, false])(
       );
   },
 );
+it("keeps a page-three bookmark draft saveable through a matching search and paging", async () => {
+  let bookmarks = Array.from({ length: 45 }, (_, index) => ({
+    url: `https://example.test/bookmarks/${index + 1}`,
+    title: `Bookmark ${index + 1}`,
+  }));
+  const call = vi.fn(
+    async ({ action, url, title }: { action: string; url?: string; title?: string }) => {
+      if (action === "update") {
+        bookmarks = bookmarks.map((row) => (row.url === url ? { ...row, title: title! } : row));
+        return { ok: true };
+      }
+      return { ok: true, bookmarks };
+    },
+  );
+  Object.assign(window, {
+    omnigentDesktop: { browserPlaces: call, onBrowserPlaceChosen: () => () => {} },
+  });
+  render(
+    <MemoryRouter>
+      <BookmarksTab />
+    </MemoryRouter>,
+  );
+  await expectSettingsPages("Bookmark pages", (number) => `Bookmark ${number}`);
+  const row = screen
+    .getByRole("button", { name: /Bookmark 44/ })
+    .closest<HTMLDivElement>(".group")!;
+  fireEvent.click(within(row).getByRole("button", { name: "Edit bookmark" }));
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Updated bookmark" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Search bookmarks" }), {
+    target: { value: "example.test" },
+  });
+
+  expect(screen.getByText("Page 1")).toBeInTheDocument();
+  expect(screen.getAllByText(/^Bookmark \d+$/)).toHaveLength(20);
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeVisible();
+  expect(screen.getByLabelText("Name")).toHaveValue("Updated bookmark");
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByText("Page 2")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save bookmark" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Save bookmark" })).not.toBeInTheDocument(),
+  );
+  expect(call).toHaveBeenCalledWith({
+    action: "update",
+    url: "https://example.test/bookmarks/44",
+    title: "Updated bookmark",
+  });
+  expect(screen.getAllByText(/^Bookmark \d+$/)).toHaveLength(20);
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByText("Updated bookmark")).toBeInTheDocument();
+});
+
 it("validates URL and duplicates and preserves Name/URL edits until Save", async () => {
   const call = vi.fn(async () => ({
     ok: true,

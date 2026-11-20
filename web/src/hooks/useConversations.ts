@@ -37,6 +37,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
+import { SETTINGS_PAGE_SIZE as ARCHIVED_PAGE_SIZE } from "@/lib/settingsPagination";
 import {
   filtersFromConversationQueryKey,
   findCachedListRow,
@@ -141,6 +142,8 @@ export function retryListFetch(failureCount: number, error: unknown): boolean {
   );
 }
 
+export { ARCHIVED_PAGE_SIZE };
+
 /**
  * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
  *
@@ -152,7 +155,6 @@ export function retryListFetch(failureCount: number, error: unknown): boolean {
  * invalidate this key explicitly instead.
  */
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
-export const ARCHIVED_PAGE_SIZE = 20;
 
 export async function invalidateProjectArchiveQueries(queryClient: QueryClient): Promise<void> {
   await Promise.all(
