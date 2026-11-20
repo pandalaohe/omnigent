@@ -1177,7 +1177,11 @@ def register_resource_routes(
                 content={
                     "error": {
                         "code": "invalid_input",
-                        "message": "A target session and valid terminal instance are required",
+                        "message": (
+                            "'target_session_id' is required"
+                            if not isinstance(target_session_id, str) or not target_session_id
+                            else "'expected_instance_id' must be a non-empty string"
+                        ),
                     }
                 },
             )

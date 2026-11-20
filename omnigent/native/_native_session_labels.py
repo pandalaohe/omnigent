@@ -1,27 +1,9 @@
-"""Session labels used during native rotation."""
+"""Client-writable labels carried across a native session rotation."""
 
-import json
 from collections.abc import Mapping
-from typing import Any
 
 from omnigent.server.permission_tiers import is_permission_label_key
 from omnigent.stores import conversation_store
-
-CLAUDE_TRANSFER_INTENT_LABEL = "omnigent.auto_rotation_state.claude_transfer"
-
-
-def displaced_claude_candidate_label(target_id: str) -> str:
-    """Source label retaining the expired attempt for a replaced candidate."""
-    return f"omnigent.auto_rotation_state.displaced_claude_candidate.{target_id}"
-
-
-def parse_claude_transfer_intent(raw: str) -> dict[str, Any] | None:
-    """Read the server's recorded transfer identity from a session snapshot."""
-    try:
-        intent = json.loads(raw) if raw else None
-    except ValueError:
-        return None
-    return intent if isinstance(intent, dict) and "target" in intent and "id" in intent else None
 
 
 def replacement_session_labels(labels: Mapping[str, str]) -> dict[str, str]:

@@ -967,26 +967,12 @@ async def _deliver_with_retry(
             if card_answer_wake is None:
                 delivered = await post(session_id)
             else:
-                from omnigent.server.session_succession import (
-                    claude_transfer_lock,
-                    expire_claude_transfer,
-                    released_succession_target,
-                )
+                from omnigent.server.session_succession import released_claude_answer_target
 
-                async with claude_transfer_lock(session_id):
-                    current = await asyncio.to_thread(
-                        conversation_store.get_conversation, session_id
-                    )
-                    if current is not None:
-                        await expire_claude_transfer(conversation_store, current)
-                    target = await asyncio.to_thread(
-                        released_succession_target,
-                        conversation_store,
-                        session_id,
-                        require_receipt=True,
-                        requested_only=True,
-                    )
-                    delivered = target is not None and await post(target)
+                target = await asyncio.to_thread(
+                    released_claude_answer_target, conversation_store, session_id
+                )
+                delivered = target is not None and await post(target)
         except _NativeDeliveryUncertain:
             await _persist_answer_delivery_notice(
                 session_id, text, conversation_store, status="delivery_uncertain"
@@ -14171,9 +14157,9 @@ async def _post_system_message(
             session_id,
         )
         return False
-    from omnigent.server.session_succession import claude_transfer_fenced
+    from omnigent.server.session_succession import committed_claude_transfer
 
-    if claude_transfer_fenced(conv):
+    if card_answer_wake is not None and committed_claude_transfer(conv):
         return False
     if card_answer_wake is not None and not _can_wake_for_card_answer(conv):
         return False

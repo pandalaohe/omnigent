@@ -47,7 +47,7 @@ from omnigent.server.permission_tiers import (
 )
 from omnigent.server.routes import sessions as sessions_facade
 from omnigent.server.routes._sessions import orchestration
-from omnigent.server.routes.sessions import routes_events, routes_hooks
+from omnigent.server.routes.sessions import routes_hooks
 from omnigent.server.schemas import ElicitationResult
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -471,20 +471,19 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
 
     terminal = {
         "id": "terminal_claude_main",
-        "metadata": {"running": True, "instance_id": "instance-one"},
-    }
-    store.set_labels(
-        old,
-        {
-            succession_module._CLAUDE_TRANSFER_RESULT_LABEL: json.dumps(
-                {
-                    "target": uuid4().hex if stale_field == "target" else new,
-                    "terminal": _transfer_test_terminal("previous")
-                    if stale_field == "instance"
-                    else terminal,
-                }
-            )
+        "metadata": {
+            "running": True,
+            "instance_id": "instance-one",
+            "title": "Example terminal " * 20,
         },
+    }
+    record = succession_module._ClaudeTransferRecord(new, RUNNER_ID, "instance-one")
+    store.set_labels(old, {succession_module._CLAUDE_TRANSFER_RECORD: record.encode()})
+    await succession_module._save_claude_transfer_result(
+        store,
+        old,
+        uuid4().hex if stale_field == "target" else new,
+        _transfer_test_terminal("previous") if stale_field == "instance" else terminal,
     )
     owner: str | None = old
     current_terminal = terminal
@@ -542,10 +541,7 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
     assert receipt is not None
     source = store.get_conversation(old)
     assert source is not None and source.labels[SUCCEEDED_BY_LABEL_KEY] == new
-    assert json.loads(source.labels[succession_module._CLAUDE_TRANSFER_RESULT_LABEL]) == {
-        "target": new,
-        "terminal": terminal,
-    }
+    assert succession_module._claude_transfer_result(source, new) == terminal
     assert receipt.moved_ids == ([child] if child is not None else [])
     if child is not None:
         moved = store.get_conversation(child)
@@ -625,189 +621,6 @@ def _wake_event(text: str, *, is_meta: bool = False) -> dict[str, Any]:
     }
 
 
-async def test_claude_send_admitted_before_transfer_cannot_rebuild_the_old_pane(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    old, new, path = await _prepare_claude_transfer(client, store)
-    terminal = _transfer_test_terminal("original")
-    looked_up = asyncio.Event()
-    resume_send = asyncio.Event()
-    at_dispatch_fence = asyncio.Event()
-    pane_moved = asyncio.Event()
-    commit_allowed = asyncio.Event()
-    original_lookup = routes_events._get_runner_client
-    original_lock = routes_events.claude_transfer_lock
-    original_post = runner.post
-
-    async def lookup(session_id: str, *args: Any, **kwargs: Any) -> Any:
-        selected = await original_lookup(session_id, *args, **kwargs)
-        if session_id == old:
-            looked_up.set()
-            await resume_send.wait()
-        return selected
-
-    def observe_lock(session_id: str) -> asyncio.Lock:
-        if session_id == old:
-            at_dispatch_fence.set()
-        return original_lock(session_id)
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        owner = new if pane_moved.is_set() else old
-        return _terminal_probe(url, terminal if f"/sessions/{owner}/" in url else None)
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        if not url.endswith("/transfer"):
-            return await original_post(url, **kwargs)
-        pane_moved.set()
-        await commit_allowed.wait()
-        return httpx.Response(200, json=terminal)
-
-    monkeypatch.setattr(routes_events, "_get_runner_client", lookup)
-    monkeypatch.setattr(routes_events, "claude_transfer_lock", observe_lock)
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", post)
-    ensure = AsyncMock()
-    launch = AsyncMock()
-    monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ensure)
-    monkeypatch.setattr(sessions_facade, "_launch_runner_on_host", launch)
-
-    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
-        send = tasks.create_task(
-            client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
-        )
-        await looked_up.wait()
-        transfer = tasks.create_task(client.post(path, json={"target_session_id": new}))
-        await pane_moved.wait()
-        try:
-            assert store.get_succession(old, new) is None
-            resume_send.set()
-            await at_dispatch_fence.wait()
-            fenced = await send
-            assert fenced.status_code == 409 and not transfer.done()
-            ensure.assert_not_awaited()
-        finally:
-            commit_allowed.set()
-
-    assert transfer.result().status_code == 200, transfer.result().text
-    assert send.result().status_code == 409, send.result().text
-    ensure.assert_not_awaited()
-    launch.assert_not_awaited()
-    assert not any(url == f"/v1/sessions/{old}/events" for url, _ in runner.posts)
-
-
-@pytest.mark.parametrize("source_present", [True, False])
-async def test_claude_transfer_recovers_after_disconnect_before_the_move(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    wake: AsyncMock,
-    monkeypatch: pytest.MonkeyPatch,
-    source_present: bool,
-) -> None:
-    old, new, path = await _prepare_claude_transfer(client, store)
-    terminal = _transfer_test_terminal("original")
-    owner: str | None = old
-    original_post = runner.post
-    attempts = 0
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        return _terminal_probe(url, terminal if f"/sessions/{owner}/" in url else None)
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        nonlocal attempts, owner
-        if not url.endswith("/transfer"):
-            return await original_post(url, **kwargs)
-        attempts += 1
-        if attempts == 1:
-            raise httpx.ReadTimeout("disconnected before move")
-        if owner is None:
-            return httpx.Response(404, json={"error": {"message": "Pane exited"}})
-        owner = new
-        return httpx.Response(200, json=terminal)
-
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", post)
-    result = await client.post(path, json={"target_session_id": new})
-    assert result.status_code == 502, result.text
-    assert store.get_succession(old, new) is None
-    source = store.get_conversation(old)
-    assert source is not None and succession_module.claude_transfer_pending(source)
-    if not source_present:
-        owner = None
-
-    await succession_module.resume_successions_for_runner(
-        RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
-    )
-    assert attempts == 2
-    source = store.get_conversation(old)
-    assert source is not None and not succession_module.claude_transfer_pending(source)
-    receipt = store.get_succession(old, new)
-    if source_present:
-        assert owner == new and receipt is not None and receipt.phase == "done"
-        wake.assert_awaited_once()
-    else:
-        assert receipt is None and not source.archived
-        wake.assert_not_awaited()
-
-
-@pytest.mark.parametrize("placement", ["archived", "split", "unbound"])
-async def test_claude_transfer_reconciles_on_original_runner_after_placement_changes(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-    placement: str,
-) -> None:
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    old, new, path = await _prepare_claude_transfer(client, store)
-    pane = _transfer_test_terminal("original")
-    probes: list[str] = []
-    transfers: list[str] = []
-    original_post = runner.post
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        probes.append(url)
-        return _terminal_probe(url, pane if f"/sessions/{old}/" in url else None)
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        if not url.endswith("/transfer"):
-            return await original_post(url, **kwargs)
-        transfers.append(url)
-        assert transfers == [path]
-        raise httpx.ReadTimeout("disconnected before move")
-
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", post)
-    first = await client.post(path, json={"target_session_id": new})
-    assert first.status_code == 502
-    source = store.get_conversation(old)
-    assert source is not None and succession_module.claude_transfer_pending(source)
-    assert store.get_succession(old, new) is None
-
-    if placement == "archived":
-        store.update_conversation(new, archived=True)
-    elif placement == "split":
-        store.replace_runner_id(old, RUNNER_ID_B)
-        store.replace_runner_id(new, uuid4().hex)
-    else:
-        store.clear_runner_id(old)
-        store.clear_runner_id(new)
-    probes.clear()
-    await succession_module.resume_successions_for_runner(
-        RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
-    )
-
-    source = store.get_conversation(old)
-    assert source is not None and not source.archived
-    assert not succession_module.claude_transfer_pending(source)
-    assert store.get_succession(old, new) is None
-    assert {url.split("/")[3] for url in probes} == {old, new}
-    assert transfers == [path]
-
-
 async def test_claude_transfer_recovers_forward_after_successor_uses_pane_and_source_unbinds(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
@@ -882,14 +695,12 @@ async def test_claude_transfer_recovers_forward_after_successor_uses_pane_and_so
     wake.assert_awaited_once()
 
 
-@pytest.mark.parametrize("trigger", ["replacement_connect", "ordinary_input"])
-async def test_old_claude_input_converges_after_reported_original_runner_exit(
+async def test_runner_exit_clears_transfer_record_without_fencing_old_claude_input(
     client: httpx.AsyncClient,
     succession_app: FastAPI,
     store: SqlAlchemyConversationStore,
     runners: _FakeRunnerPool,
     monkeypatch: pytest.MonkeyPatch,
-    trigger: str,
 ) -> None:
     from tests.server.helpers import create_test_agent
 
@@ -927,15 +738,6 @@ async def test_old_claude_input_converges_after_reported_original_runner_exit(
             json={"session_init_protocol_version": 2, "terminal_ready": True},
         )
 
-    async def replacement_connected() -> None:
-        await succession_module.resume_successions_for_runner(
-            RUNNER_ID_B,
-            conversation_store=store,
-            runner_router=None,
-            peer_message_store=None,
-            runner_exit_reports=exit_reports,
-        )
-
     monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
     monkeypatch.setattr(original, "get", get_terminal, raising=False)
     transfer = AsyncMock(side_effect=fail_transfer)
@@ -951,777 +753,45 @@ async def test_old_claude_input_converges_after_reported_original_runner_exit(
     assert first.status_code == 502, first.text
     original_online = False
     store.replace_runner_id(old, RUNNER_ID_B)
-    await replacement_connected()
-    assert offline_lookups == [old]
-    blocked = await client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
-    assert blocked.status_code == 409, blocked.text
-    dispatch.assert_not_awaited()
-
-    exit_reports.record(RUNNER_ID, "runner process exited", None, had_connected=True)
-    if trigger == "replacement_connect":
-        await replacement_connected()
-        source = store.get_conversation(old)
-        assert source is not None and not succession_module.claude_transfer_pending(source)
+    source = store.get_conversation(old)
+    assert source is not None and succession_module._CLAUDE_TRANSFER_RECORD in source.labels
     accepted = await client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
     assert accepted.status_code == 202, accepted.text
-    source = store.get_conversation(old)
-    assert source is not None and not succession_module.claude_transfer_pending(source)
-    assert store.get_succession(old, new) is None
-    transfer.assert_awaited_once()
-    dispatch.assert_awaited_once()
-    assert dispatch.await_args is not None
-    assert dispatch.await_args.args[0] == old and dispatch.await_args.args[4] is replacement
-
-
-async def test_old_claude_input_recovers_transfer_after_all_retries_timeout(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tests.server.helpers import create_test_agent
-
-    agent = await create_test_agent(client, "stalled-transfer")
-    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.0,) * 5)
-    pane = _transfer_test_terminal("original")
-    transfer_attempts = 0
-    runner_accepts_requests = False
-    original_post = runner.post
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        if f"/sessions/{old}/" in url:
-            return _terminal_probe(url, pane)
-        return _terminal_probe(
-            url, _transfer_test_terminal("occupied") if runner_accepts_requests else None
-        )
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        nonlocal transfer_attempts
-        if url == "/v1/sessions":
-            assert kwargs["json"]["session_id"] == old
-            return httpx.Response(
-                201,
-                request=httpx.Request("POST", url),
-                json={"session_init_protocol_version": 2, "terminal_ready": True},
-            )
-        if not url.endswith("/transfer"):
-            return await original_post(url, **kwargs)
-        transfer_attempts += 1
-        if not runner_accepts_requests:
-            raise httpx.ReadTimeout("transfer timed out before move")
-        return httpx.Response(409, json={"error": {"message": "Target owns a pane"}})
-
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", post)
-    dispatch = AsyncMock(
-        return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
+    timer = await client.post(
+        f"/v1/sessions/{old}/events",
+        json=_wake_event("[System: timer timer_one fired]", is_meta=True),
     )
-    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
-    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
-    first = await client.post(path, json={"target_session_id": new})
-    assert first.status_code == 502
-    pending_retry = succession_module._claude_transfer_retries.get(old)
-    if pending_retry is not None:
-        await asyncio.wait_for(pending_retry, timeout=5)
-    assert transfer_attempts == 6
-    source = store.get_conversation(old)
-    assert source is not None and succession_module.claude_transfer_pending(source)
-    dispatch.assert_not_awaited()
-
-    runner_accepts_requests = True
-    response = await client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
-    assert response.status_code == 202, response.text
-    assert transfer_attempts == 7
-    source = store.get_conversation(old)
-    assert source is not None and not succession_module.claude_transfer_pending(source)
-    assert store.get_succession(old, new) is None
-    dispatch.assert_awaited_once()
-    assert dispatch.await_args is not None and dispatch.await_args.args[0] == old
-
-
-@pytest.mark.parametrize("failure", ["disconnected", "server_restart", "archived_target"])
-async def test_unconfirmed_claude_transfer_expires_without_moving_the_pane(
-    client: httpx.AsyncClient,
-    succession_app: FastAPI,
-    store: SqlAlchemyConversationStore,
-    db_uri: str,
-    runners: _FakeRunnerPool,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    from tests.server.helpers import create_test_agent
-
-    agent = await create_test_agent(client, "transfer-expiry")
-    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
-    clock = 1000
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    token = "example-replacement-runner-token"
-    replacement_id = token_bound_runner_id(token)
-    original = runners.for_runner(RUNNER_ID)
-    replacement = runners.for_runner(replacement_id)
-    original_online = True
-    owner = old
-    pane = _transfer_test_terminal("original")
-
-    async def lookup(session_id: str, router: Any, *, conversation: Any = None) -> Any:
-        row = conversation if conversation is not None else store.get_conversation(session_id)
-        if row is None or row.runner_id is None:
-            return None
-        if row.runner_id == RUNNER_ID and not original_online:
-            return None
-        return runners.for_runner(row.runner_id)
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
-
-    async def fail_transfer(url: str, **kwargs: Any) -> httpx.Response:
-        assert url == path
-        raise httpx.ReadTimeout("transfer timed out before move")
-
-    async def initialize_replacement(url: str, **kwargs: Any) -> httpx.Response:
-        assert url == "/v1/sessions" and kwargs["json"]["session_id"] == old
-        return httpx.Response(
-            201,
-            request=httpx.Request("POST", url),
-            json={"session_init_protocol_version": 2, "terminal_ready": True},
-        )
-
-    transfer = AsyncMock(side_effect=fail_transfer)
-    dispatch = AsyncMock(
-        return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
-    )
-    monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
-    monkeypatch.setattr(original, "get", get_terminal, raising=False)
-    monkeypatch.setattr(original, "post", transfer)
-    monkeypatch.setattr(replacement, "post", initialize_replacement)
-    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
-    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
-
-    attempt = {"clear_attempt_id": "clear-with-unconfirmed-transfer"}
-    first = await client.post(path, json={"target_session_id": new}, params=attempt)
-    assert first.status_code == 502, first.text
-    label = succession_module._CLAUDE_TRANSFER_LABEL
-    source = store.get_conversation(old)
-    assert source is not None and json.loads(source.labels[label])["expires_at"] == 1900
-    assert succession_app.state.runner_exit_reports.get(RUNNER_ID) is None
-    store.replace_runner_id(old, replacement_id)
-    if failure == "archived_target":
-        store.update_conversation(new, archived=True)
-        owner = new  # The timed-out operation finishes while the target is archived.
-        await succession_module.resume_successions_for_runner(
-            RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
-        )
-    else:
-        original_online = False
-    previous_successor = store.get_conversation(new)
-
-    clock += 899
-    if failure == "server_restart":
-        # Restart the process-local driver using the same database and no exit report.
-        expiration = succession_module._claude_transfer_expirations.pop(old)
-        expiration.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await expiration
-        await succession_module.resume_unfinished_successions(
-            conversation_store=SqlAlchemyConversationStore(db_uri),
-            runner_router=None,
-            peer_message_store=None,
-        )
-    events = f"/v1/sessions/{old}/events"
-
-    async def fire_timer() -> httpx.Response:
-        return await client.post(
-            events,
-            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
-            json=_wake_event("[System: timer timer_one fired]", is_meta=True),
-        )
-
-    async def deliver_answer() -> bool | None:
-        return await orchestration._deliver_with_retry(
-            old,
-            "[System: question answered #question]",
-            conversation_store=store,
-            runner_router=None,
-            persist_failure=False,
-            card_answer_wake=orchestration._CardAnswerWake(None, QUESTION_ID),
-        )
-
-    answer_delivery = AsyncMock(return_value=True)
-    monkeypatch.setattr(orchestration, "_post_system_message", answer_delivery)
-    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
-    blocked = await client.post(events, json=_wake_event("Continue here"))
-    assert blocked.status_code == 409, blocked.text
-    assert (await fire_timer()).json()["timer_delivery"] == "held"
-    assert await deliver_answer() is False
-    answer_delivery.assert_not_awaited()
-    dispatch.assert_not_awaited()
-    code = "session_succession_expired"
-    assert not _succession_notices(store, old, code=code)
-
-    clock += 1
-    if failure == "server_restart":
-        expiration = succession_module._claude_transfer_expirations[old]
-        await asyncio.wait_for(expiration, timeout=5)
-        assert len(_succession_notices(store, old, code=code)) == 1
-    accepted = await client.post(events, json=_wake_event("Continue here"))
-    assert accepted.status_code == 202, accepted.text
-    dispatch.assert_awaited_once()
-    assert dispatch.await_args is not None and dispatch.await_args.args[0] == old
-    assert dispatch.await_args.args[4] is replacement
-    timer = await fire_timer()
     assert timer.status_code == 202 and "timer_delivery" not in timer.json(), timer.text
-    assert [call.args[0] for call in dispatch.await_args_list] == [old, old]
-    assert await deliver_answer() is True
-    answer_delivery.assert_awaited_once()
-    assert answer_delivery.await_args is not None and answer_delivery.await_args.args[0] == old
-    source = store.get_conversation(old)
-    assert source is not None and not source.archived
-    assert json.loads(source.labels[label])["abandoned"] is True
-    assert store.get_succession(old, new) is None
-    assert store.get_conversation(new) == previous_successor
-    assert owner == (new if failure == "archived_target" else old)
+    answer = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", answer)
+    delivered = await orchestration._deliver_with_retry(
+        old,
+        "[System: question answered #question]",
+        conversation_store=store,
+        runner_router=None,
+        persist_failure=False,
+        card_answer_wake=orchestration._CardAnswerWake(None, QUESTION_ID),
+    )
+    assert delivered is True
+    answer.assert_awaited_once()
+    assert answer.await_args is not None and answer.await_args.args[0] == old
+    assert not offline_lookups
 
-    await succession_module.resume_unfinished_successions(
-        conversation_store=SqlAlchemyConversationStore(db_uri),
+    exit_reports.record(RUNNER_ID, "runner process exited", None, had_connected=True)
+    await succession_module.resume_successions_for_runner(
+        RUNNER_ID,
+        conversation_store=store,
         runner_router=None,
         peer_message_store=None,
+        runner_exit_reports=exit_reports,
     )
-    if failure != "archived_target":
-        stale_retry = await client.post(path, json={"target_session_id": new}, params=attempt)
-        assert stale_retry.status_code == 410, stale_retry.text
-    transfer.assert_awaited_once()
-    (notice,) = _succession_notices(store, old, code=code)
-    assert notice.data.message == (
-        f"The handover to session {new} was not confirmed in time. "
-        "This session continues. The successor session was left as is."
-    )
-
-
-@pytest.mark.parametrize("hung_stage", ["target_probe", "transfer_reply", "scheduled_send_lock"])
-async def test_claude_transfer_deadline_releases_input_timer_and_card_while_transfer_waits(
-    client: httpx.AsyncClient,
-    succession_app: FastAPI,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-    hung_stage: str,
-) -> None:
-    from omnigent.runner import app as runner_app
-    from omnigent.runner import tool_dispatch
-    from tests.server.helpers import create_test_agent
-
-    agent = await create_test_agent(client, "hung-transfer")
-    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
-    clock = 1000
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    waits_for_scheduled_send = hung_stage == "scheduled_send_lock"
-    lease_seconds = 4 if waits_for_scheduled_send else 900
-    deadline = 1000 + lease_seconds + int(waits_for_scheduled_send)
-    monkeypatch.setattr(succession_module, "_CLAUDE_TRANSFER_LEASE_S", lease_seconds)
-    transfer_entered, release_transfer, timer_held = (asyncio.Event() for _ in range(3))
-    scheduled_send_lock = succession_module.scheduled_send_lock
-    held_lock = scheduled_send_lock(old)
-
-    def observe_scheduled_send_wait(session_id: str) -> asyncio.Lock:
-        if session_id == old:
-            transfer_entered.set()
-        return scheduled_send_lock(session_id)
-
-    if waits_for_scheduled_send:
-        monkeypatch.setattr(succession_module, "scheduled_send_lock", observe_scheduled_send_wait)
-    pane = _transfer_test_terminal("original")
-    owner = old
-    timer_id = "timer_transfer_lease"
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        if hung_stage == "target_probe" and f"/sessions/{new}/" in url:
-            transfer_entered.set()
-            await release_transfer.wait()
-        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        nonlocal clock, owner
-        if url == "/v1/sessions":
-            return httpx.Response(
-                201,
-                request=httpx.Request("POST", url),
-                json={"session_init_protocol_version": 2, "terminal_ready": True},
-            )
-        assert url == path and hung_stage != "target_probe"
-        owner = new
-        if waits_for_scheduled_send:
-            clock += 1  # Confirmation renews the lease past the original deadline.
-        else:
-            transfer_entered.set()
-            await release_transfer.wait()  # The runner has not sent response headers.
-        return httpx.Response(200, json=pane)
-
-    async def record_timer_reply(response: httpx.Response) -> None:
-        if response.request.url.path.endswith("/events"):
-            await response.aread()
-            if response.json().get("timer_delivery") == "held":
-                timer_held.set()
-
-    dispatch = AsyncMock(
-        return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
-    )
-    answer_delivery = AsyncMock(return_value=True)
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", post)
-    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
-    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
-    monkeypatch.setattr(orchestration, "_post_system_message", answer_delivery)
-    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
-    monkeypatch.setattr(routes_hooks, "_CARD_RETRY_INTERVAL_S", 0.01)
-    verdict = {"action": "accept", "content": {"Proceed?": "Yes"}}
-    payload = {"qid": "qlease", "questions": [{"question": "Proceed?"}]}
-    text = routes_hooks._render_card_verdict(
-        "question", payload, ElicitationResult.model_validate(verdict)
-    )
-    now = int(time.time())
-    card = DetachedCard(
-        elicitation_id=QUESTION_ID,
-        session_id=old,
-        kind="question",
-        state="answered",
-        mirror=False,
-        params={},
-        payload=payload,
-        grant_key=None,
-        verdict=verdict,
-        delivery_text=text,
-        created_at=now,
-        expires_at=now + 60,
-    )
-    store.add_detached_card(card)
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=succession_app),
-        base_url="http://test",
-        event_hooks={"response": [record_timer_reply]},
-    ) as timer_client:
-        async with asyncio.timeout(8), asyncio.TaskGroup() as tasks:
-            if waits_for_scheduled_send:
-                await held_lock.acquire()
-            transfer = tasks.create_task(client.post(path, json={"target_session_id": new}))
-            try:
-                await transfer_entered.wait()
-                if waits_for_scheduled_send:
-                    source = store.get_conversation(old)
-                    assert source is not None
-                    intent = json.loads(source.labels[succession_module._CLAUDE_TRANSFER_LABEL])
-                    assert intent["expires_at"] == deadline
-                clock = deadline - 1
-                timer = tasks.create_task(
-                    tool_dispatch._timer_loop(
-                        timer_id=timer_id,
-                        conversation_id=old,
-                        seconds=0,
-                        repeat=False,
-                        note=None,
-                        server_client=timer_client,
-                    )
-                )
-                runner_app.register_timer(old, timer_id, timer)
-                await timer_held.wait()
-                assert runner_app._session_timers[old][timer_id] is timer and not timer.done()
-                dispatch.assert_not_awaited()
-
-                clock = deadline
-                events = f"/v1/sessions/{old}/events"
-                sent = await client.post(events, json=_wake_event("Continue here"))
-                assert sent.status_code == 202, sent.text
-                await routes_hooks._deliver_card_verdict(
-                    card, text, granted=False, conversation_store=store, runner_router=None
-                )
-                await timer
-                if waits_for_scheduled_send:
-                    # The HTTP request itself must time out without this lock being released.
-                    assert (await transfer).status_code == 410
-                    assert held_lock.locked()
-                else:
-                    assert not transfer.done()
-                assert not release_transfer.is_set()
-                assert timer_id not in runner_app._session_timers.get(old, {})
-                assert [call.args[0] for call in dispatch.await_args_list] == [old, old]
-                delivered_text = [
-                    call.args[2].data["content"][0]["text"] for call in dispatch.await_args_list
-                ]
-                assert f"[System: timer {timer_id} fired]" in delivered_text
-                answer_delivery.assert_awaited_once()
-                assert answer_delivery.await_args is not None
-                assert answer_delivery.await_args.args[:2] == (old, text)
-            finally:
-                if waits_for_scheduled_send:
-                    held_lock.release()
-                release_transfer.set()
-
-    assert transfer.result().status_code == 410
-    assert store.get_succession(old, new) is None
-    assert owner == (old if hung_stage == "target_probe" else new)
-
-
-async def test_claude_transfer_rechecks_deadline_after_acquiring_scheduled_send_lock(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    old, new, path = await _prepare_claude_transfer(client, store)
-    clock = 1000
-    terminal = _transfer_test_terminal("original")
-    runner_post = AsyncMock(return_value=httpx.Response(200, json=terminal))
-    scheduled_send_lock = succession_module.scheduled_send_lock
-    held_lock = scheduled_send_lock(new)
-    waiting = asyncio.Event()
-
-    def observe_scheduled_send_wait(session_id: str) -> asyncio.Lock:
-        if session_id == new:
-            waiting.set()
-        return scheduled_send_lock(session_id)
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        return _terminal_probe(url, terminal if f"/sessions/{old}/" in url else None)
-
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", runner_post)
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    monkeypatch.setattr(succession_module, "scheduled_send_lock", observe_scheduled_send_wait)
-    # No other ingress or expiry task clears the intent before the move gets the lock.
-    monkeypatch.setattr(succession_module, "_schedule_transfer_expiration", lambda *_: None)
-
-    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
-        async with held_lock:
-            transfer = tasks.create_task(client.post(path, json={"target_session_id": new}))
-            await waiting.wait()
-            source = store.get_conversation(old)
-            assert source is not None and succession_module.claude_transfer_pending(source)
-            intent = json.loads(source.labels[succession_module._CLAUDE_TRANSFER_LABEL])
-            clock = intent["expires_at"]
-
-    assert transfer.result().status_code == 410
-    assert store.get_succession(old, new) is None
-    runner_post.assert_awaited_once()
-
-
-@pytest.mark.parametrize("old_transfer_moved", [False, True], ids=["empty", "live"])
-async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_rotates(
-    client: httpx.AsyncClient,
-    succession_app: FastAPI,
-    store: SqlAlchemyConversationStore,
-    db_uri: str,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    old_transfer_moved: bool,
-) -> None:
-    from omnigent.harnesses.claude_native import forwarder
-    from omnigent.harnesses.claude_native.bridge import (
-        prepare_bridge_dir,
-        read_active_session_id,
-        record_hook_event,
-    )
-    from tests.server.helpers import create_test_agent
-
-    approvals = succession_app.state.standing_approval_service
-    if old_transfer_moved:
-        approvals.prefs_store = SqlAlchemyUserPreferencesStore(db_uri)
-        approvals.prefs_store.patch_namespace(
-            RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["install"]}
-        )
-    agent = await create_test_agent(client, "fresh-clear")
-    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
-    if old_transfer_moved:
-        source = store.get_conversation(old)
-        assert source is not None and approvals.resolve(source)["kinds"] == ["install"]
-        approvals.change(source, "revoke", ["install"], "user-item")
-    clock = 1000
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
-    bridge = prepare_bridge_dir(old, bridge_id="example-bridge", workspace=tmp_path)
-    record_hook_event(bridge, {"hook_event_name": "SessionStart", "source": "clear"})
-    expired_attempt = "original-clear-attempt"
-    state = forwarder.HookForwardState(
-        event_cursor=0,
-        pending_clear_old_id=old,
-        pending_clear_new_id=new,
-        clear_rotation_attempt=expired_attempt,
-    )
-    await forwarder._write_hook_state_async(bridge, state)
-    original_pane = _transfer_test_terminal("original")
-    panes = {old: original_pane}
-    target_visible = False
-    runner_recovered = False
-    probed_sessions: list[str] = []
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        session_id = url.split("/")[3]
-        probed_sessions.append(session_id)
-        return _terminal_probe(
-            url, panes.get(session_id) if session_id == old or target_visible else None
-        )
-
-    async def runner_post(url: str, **kwargs: Any) -> httpx.Response:
-        if url == "/v1/sessions":
-            assert kwargs["json"]["session_id"] != new
-            return httpx.Response(
-                201,
-                request=httpx.Request("POST", url),
-                json={"session_init_protocol_version": 2, "terminal_ready": True},
-            )
-        assert url == path
-        if not runner_recovered:
-            if old_transfer_moved:
-                panes[new] = panes.pop(old)
-            raise httpx.ReadTimeout("transfer reply lost")
-        target = kwargs["json"]["target_session_id"]
-        assert target not in panes
-        panes[target] = panes.pop(old)
-        return httpx.Response(200, json=panes[target])
-
-    transfer = AsyncMock(side_effect=runner_post)
-    resource_runner = AsyncMock(return_value=runner)
-    monkeypatch.setattr(sessions_facade, "_get_runner_client_for_resource_access", resource_runner)
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", transfer)
-    first = await client.post(
-        path, json={"target_session_id": new}, params={"clear_attempt_id": expired_attempt}
-    )
-    assert first.status_code == 502, first.text
-    assert panes == {new if old_transfer_moved else old: original_pane}
-    clock = 1900
-    target_visible = True
-    await succession_module.resume_unfinished_successions(
-        conversation_store=store, runner_router=None, peer_message_store=None
-    )
-    source_pane = _transfer_test_terminal("second") if old_transfer_moved else original_pane
-    panes[old] = source_pane
-    successor = store.get_conversation(new)
-    assert successor is not None
-    probed_sessions.clear()
-
-    def assert_install_revoked() -> None:
-        approval = approvals.resolve(successor)
-        assert approval["kinds"] == []
-        assert approval["events"][-1]["op"] == "revoke"
-
-    if old_transfer_moved:
-        assert_install_revoked()
-
-    def assert_expired_candidate_not_reused() -> None:
-        current = store.get_conversation(new)
-        assert current is not None
-        # Relay readiness for the fresh binding stamps every session on this runner.
-        assert (current.runner_id, current.host_id) == (successor.runner_id, successor.host_id)
-        assert current.labels == successor.labels
-        assert current.archived == successor.archived
-        assert new not in probed_sessions
-
-    mutations: list[tuple[str, str]] = []
-    attempts: list[str | None] = []
-    transfer_replies: list[int] = []
-
-    async def record_request(request: httpx.Request) -> None:
-        if request.method != "GET":
-            mutations.append((request.method, request.url.path))
-        if request.url.path == path:
-            attempts.append(request.url.params.get("clear_attempt_id"))
-
-    async def record_response(response: httpx.Response) -> None:
-        if response.request.url.path == path:
-            transfer_replies.append(response.status_code)
-
-    client.event_hooks["request"].append(record_request)
-    client.event_hooks["response"].append(record_response)
-    assert (
-        await forwarder._maybe_rotate_session_on_clear(
-            client=client, session_id=old, bridge_dir=bridge, state=state
-        )
-        is None
-    )
-    final = forwarder._read_hook_state(bridge)
-    assert final is not None and final.pending_clear_new_id is None
-    assert final.pending_clear_old_id is None and final.event_cursor > state.event_cursor
-    assert (
-        await forwarder._maybe_rotate_session_on_clear(
-            client=client, session_id=old, bridge_dir=bridge, state=final
-        )
-        is None
-    )
-    assert mutations == [("POST", path)]
-    assert attempts == [expired_attempt] and transfer_replies == [410]
-    assert read_active_session_id(bridge) == old
-    assert panes[old] == source_pane
-    assert panes.get(new) == (original_pane if old_transfer_moved else None)
-    assert_expired_candidate_not_reused()
-    assert store.get_succession(old, new) is None
-    transfer.assert_awaited_once()
-
-    mutations.clear()
-    attempts.clear()
-    transfer_replies.clear()
-
-    checked_replacement: str | None = None
-
-    async def check_after_prepare(response: httpx.Response) -> None:
-        nonlocal checked_replacement
-        if response.request.url.path != f"/v1/sessions/{old}/successor":
-            return
-        await response.aread()
-        assert response.status_code == 200, response.text
-        checked_replacement = response.json()["id"]
-        assert checked_replacement != new
-        if old_transfer_moved:
-            assert_install_revoked()
-        else:
-            assert panes == {old: source_pane}
-            # Exercise the old target while the runner is healthy and before
-            # the legitimate transfer starts. Keep these probes out of its log.
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=succession_app), base_url="http://test"
-            ) as replay_client:
-                for attempt, status in [(expired_attempt, 410), ("different-attempt", 409)]:
-                    replay = await replay_client.post(
-                        path, json={"target_session_id": new}, params={"clear_attempt_id": attempt}
-                    )
-                    assert replay.status_code == status, replay.text
-            transfer.assert_awaited_once()
-            resource_runner.assert_not_awaited()
-            assert not probed_sessions
-            assert panes == {old: source_pane}
-
-    client.event_hooks["response"].append(check_after_prepare)
-    runner_recovered = True
-    monkeypatch.setattr(sessions_facade, "_registered_runner_id", lambda _router, raw, **_: raw)
-    monkeypatch.setattr(forwarder, "_post_clear_recovery_notice", AsyncMock())
-    record_hook_event(
-        bridge,
-        {"hook_event_name": "SessionStart", "source": "clear", "session_id": "fresh-claude-id"},
-    )
-    fresh = await forwarder._maybe_rotate_session_on_clear(
-        client=client, session_id=old, bridge_dir=bridge, state=final
-    )
-    assert fresh and fresh == checked_replacement and fresh != new
-    assert len(attempts) == 1 and attempts[0] and attempts[0] != expired_attempt
-    assert transfer_replies == [200]
-    assert mutations == [
-        ("POST", f"/v1/sessions/{old}/successor"),
-        ("PATCH", f"/v1/sessions/{fresh}"),
-        ("PATCH", f"/v1/sessions/{fresh}"),
-        ("POST", path),
-        ("PATCH", f"/v1/sessions/{old}"),
-    ]
-    assert read_active_session_id(bridge) == fresh
-    assert store.get_succession(old, fresh) is not None
-    if old_transfer_moved:
-        assert_install_revoked()
-    assert_expired_candidate_not_reused()
-    assert panes[fresh] == source_pane and old not in panes
-    assert panes.get(new) == (original_pane if old_transfer_moved else None)
-
-
-async def test_claude_transfer_expiry_notice_deduplicates_after_restart_before_abandonment(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    db_uri: str,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    old, new, path = await _prepare_claude_transfer(client, store)
-    clock = 1000
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    pane = _transfer_test_terminal("original")
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        return _terminal_probe(url, pane if f"/sessions/{old}/" in url else None)
-
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(
-        runner, "post", AsyncMock(side_effect=httpx.ReadTimeout("transfer timed out"))
-    )
-    first = await client.post(path, json={"target_session_id": new})
-    assert first.status_code == 502, first.text
-    expiration = succession_module._claude_transfer_expirations.pop(old)
-    expiration.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await expiration
-
-    clock = 1900
     source = store.get_conversation(old)
-    assert source is not None
-    label = succession_module._CLAUDE_TRANSFER_LABEL
-    monkeypatch.setattr(store, "mutate_label_group", Mock(side_effect=asyncio.CancelledError))
-    async with succession_module.claude_transfer_lock(old):
-        with pytest.raises(asyncio.CancelledError):
-            await succession_module.expire_claude_transfer(store, source)
-    interrupted = store.get_conversation(old)
-    assert interrupted is not None and interrupted.labels[label] == source.labels[label]
-    code = "session_succession_expired"
-    (notice,) = _succession_notices(store, old, code=code)
-
-    restarted = SqlAlchemyConversationStore(db_uri)
-    await succession_module.resume_unfinished_successions(
-        conversation_store=restarted, runner_router=None, peer_message_store=None
-    )
-    recovered = restarted.get_conversation(old)
-    assert recovered is not None and json.loads(recovered.labels[label])["abandoned"] is True
-    assert [item.id for item in _succession_notices(restarted, old, code=code)] == [notice.id]
-
-
-async def test_claude_transfer_lease_renews_only_on_new_runner_confirmation(
-    client: httpx.AsyncClient,
-    store: SqlAlchemyConversationStore,
-    runner: _FakeRunnerClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    old, new, path = await _prepare_claude_transfer(client, store)
-    clock = 1000
-    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
-    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    owner = old
-    can_move = False
-    pane = _transfer_test_terminal("original")
-
-    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
-        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
-
-    async def post(url: str, **kwargs: Any) -> httpx.Response:
-        nonlocal owner
-        assert url == path
-        if not can_move:
-            raise httpx.ReadTimeout("transfer timed out before move")
-        owner = new
-        return httpx.Response(200, json=pane)
-
-    async def attempt_at(timestamp: int) -> int:
-        nonlocal clock
-        clock = timestamp
-        response = await client.post(path, json={"target_session_id": new})
-        assert response.status_code == 502, response.text
-        source = store.get_conversation(old)
-        assert source is not None
-        return json.loads(source.labels[succession_module._CLAUDE_TRANSFER_LABEL])["expires_at"]
-
-    transfer = AsyncMock(side_effect=post)
-    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
-    monkeypatch.setattr(runner, "post", transfer)
-    commit = AsyncMock(side_effect=ConnectionError("receipt could not be written"))
-    monkeypatch.setattr(succession_module, "_commit_claude_transfer", commit)
-
-    assert await attempt_at(1000) == 1900
-    assert await attempt_at(1200) == 1900
-    commit.assert_not_awaited()
-    can_move = True
-    assert await attempt_at(1500) == 2400
-    assert owner == new
-    assert await attempt_at(2000) == 2400
-    assert transfer.await_count == 3  # The last attempt saw the same confirmation.
-    assert commit.await_count == 2
+    assert source is not None and succession_module._CLAUDE_TRANSFER_RECORD not in source.labels
+    assert not offline_lookups
+    assert store.get_succession(old, new) is None
+    transfer.assert_awaited_once()
+    assert [call.args[0] for call in dispatch.await_args_list] == [old, old]
+    assert all(call.args[4] is replacement for call in dispatch.await_args_list)
 
 
 async def test_claude_transfer_background_recovers_receipt_after_commit_readback_failure(
@@ -1790,7 +860,7 @@ async def test_claude_transfer_background_recovers_receipt_after_commit_readback
     wake.assert_awaited_once()
 
 
-async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failure(
+async def test_claude_transfer_replay_drives_receipt_after_record_cleanup_failure(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
@@ -1801,7 +871,7 @@ async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failur
     terminal = _transfer_test_terminal("original")
     owner = old
     original_post = runner.post
-    clear = succession_module._clear_transfer_intent
+    clear = SqlAlchemyConversationStore.compare_and_set_label
     schedule = succession_module._schedule_retry
 
     async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
@@ -1817,9 +887,15 @@ async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failur
 
     monkeypatch.setattr(runner, "get", get_terminal, raising=False)
     monkeypatch.setattr(runner, "post", post)
-    monkeypatch.setattr(
-        succession_module, "_clear_transfer_intent", AsyncMock(side_effect=ConnectionError)
-    )
+
+    def fail_cleanup(
+        db: SqlAlchemyConversationStore, session_id: str, key: str, *args: Any, **kwargs: Any
+    ) -> bool:
+        if session_id == old and key == succession_module._CLAUDE_TRANSFER_RECORD:
+            raise ConnectionError("transfer record cleanup failed")
+        return clear(db, session_id, key, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "compare_and_set_label", fail_cleanup)
     # Simulate the process losing its in-memory driver after persisting the receipt.
     monkeypatch.setattr(succession_module, "_schedule_retry", Mock())
     result = await client.post(path, json={"target_session_id": new})
@@ -1827,7 +903,7 @@ async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failur
     receipt = store.get_succession(old, new)
     assert receipt is not None and receipt.phase == "moved"
     source = store.get_conversation(old)
-    assert source is not None and succession_module._CLAUDE_TRANSFER_LABEL in source.labels
+    assert source is not None and succession_module._CLAUDE_TRANSFER_RECORD in source.labels
 
     armed: list[asyncio.Task[None]] = []
 
@@ -1835,7 +911,7 @@ async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failur
         schedule(receipt_id, **kwargs)
         armed.append(succession_module._retry_tasks[receipt_id])
 
-    monkeypatch.setattr(succession_module, "_clear_transfer_intent", clear)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "compare_and_set_label", clear)
     monkeypatch.setattr(succession_module, "_schedule_retry", capture_schedule)
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.0,))
     result = await client.post(path, json={"target_session_id": new})
@@ -1917,7 +993,7 @@ async def test_ordinary_succession_forwards_sends_before_the_opening(
     assert [call.args[0] for call in dispatch.await_args_list] == [new, new]
 
 
-async def test_rejected_claude_transfer_leaves_child_wake_owed_until_rollback(
+async def test_unconfirmed_claude_transfer_leaves_child_wake_on_the_source(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runners: _FakeRunnerPool,
@@ -1932,13 +1008,6 @@ async def test_rejected_claude_transfer_leaves_child_wake_owed_until_rollback(
     original_post = runner.post
     transfer_entered = asyncio.Event()
     reject_transfer = asyncio.Event()
-    wake_waiting = asyncio.Event()
-    original_lock = routes_events.claude_transfer_attempt_lock
-
-    def observe_lock(session_id: str) -> asyncio.Lock:
-        if session_id == old:
-            wake_waiting.set()
-        return original_lock(session_id)
 
     async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
         instance = "original" if f"/sessions/{old}/" in url else "target-own-pane"
@@ -1956,32 +1025,28 @@ async def test_rejected_claude_transfer_leaves_child_wake_owed_until_rollback(
     )
     monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
     monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
-    monkeypatch.setattr(routes_events, "claude_transfer_attempt_lock", observe_lock)
     monkeypatch.setattr(runner, "get", get_terminal, raising=False)
     monkeypatch.setattr(runner, "post", post)
     client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = token
     async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
         transfer = tasks.create_task(client.post(path, json={"target_session_id": new}))
         await transfer_entered.wait()
-        wake = tasks.create_task(
-            subagent_work._deliver_subagent_wake_post(
+        try:
+            assert await subagent_work._deliver_subagent_wake_post(
                 client, old, "[System: sub-agent worker finished]", created_by=None
             )
-        )
-        await wake_waiting.wait()
-        assert not wake.done()
-        dispatch.assert_not_awaited()
-        reject_transfer.set()
-
-    assert transfer.result().status_code == 409, transfer.result().text
-    assert wake.result() is True
-    assert store.get_succession(old, new) is None
+            assert not transfer.done()
+            dispatch.assert_awaited_once()
+            assert dispatch.await_args is not None and dispatch.await_args.args[0] == old
+        finally:
+            reject_transfer.set()
+    assert transfer.result().status_code == 409
     source = store.get_conversation(old)
-    assert source is not None and not succession_module.claude_transfer_pending(source)
-    assert [call.args[0] for call in dispatch.await_args_list] == [old]
+    assert source is not None and succession_module._CLAUDE_TRANSFER_RECORD not in source.labels
+    assert store.get_succession(old, new) is None
 
 
-async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
+async def test_committed_claude_handover_releases_child_and_delivers_saved_answers_once(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runners: _FakeRunnerPool,
@@ -2002,15 +1067,6 @@ async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
     assert response.status_code == 200, response.text
     new = response.json()["id"]
     store.set_runner_id(new, runner_id)
-    store.set_labels(
-        old,
-        {
-            succession_module._CLAUDE_TRANSFER_LABEL: json.dumps(
-                {"target": new, "id": "prepared-transfer", "expires_at": int(time.time()) + 900}
-            )
-        },
-    )
-
     dispatch = AsyncMock(return_value=True)
     launch = AsyncMock()
     monkeypatch.setattr(orchestration, "_post_system_message", dispatch)
@@ -2072,8 +1128,14 @@ async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
 
     timer_text = "[System: timer timer_one fired]"
     child_text = "[System: sub-agent worker finished]"
-    assert (await old_wake(timer_text)).json()["timer_delivery"] == "held"
-    await old_wake(child_text, status=503)
+    await succession_module._save_claude_transfer_result(
+        store, old, new, _transfer_test_terminal("original")
+    )
+    await succession_module.commit_succession_move(
+        store, old, new, uuid4().hex, reverse_of=False, allow_empty=True
+    )
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.phase == "moved"
     before = save_answer(QUESTION_ID)
     pending_elicitations.record_publish(old, _question_event())
     waiting = asyncio.Event()
@@ -2094,19 +1156,6 @@ async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
         tasks.create_task(deliver(before))
         await waiting.wait()
         dispatch.assert_not_awaited()
-        store.set_labels(
-            old,
-            {
-                succession_module._CLAUDE_TRANSFER_RESULT_LABEL: json.dumps(
-                    {"target": new, "terminal": _transfer_test_terminal("original")}
-                )
-            },
-        )
-        source = store.get_conversation(old)
-        assert source is not None
-        receipt = await succession_module._commit_claude_transfer(
-            store, old, new, source.labels[succession_module._CLAUDE_TRANSFER_LABEL]
-        )
         moved = store.get_conversation(child)
         assert moved is not None and moved.parent_conversation_id == new
         assert (await old_wake(timer_text)).json()["timer_delivery"] == "held"

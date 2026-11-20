@@ -127,7 +127,6 @@ from omnigent.server.schemas import (
     SessionResourcePaginatedList,
 )
 from omnigent.server.session_succession import (
-    expired_claude_transfer_status,
     is_requested_claude_transfer,
     transfer_requested_claude_terminal,
 )
@@ -2172,7 +2171,6 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         terminal_id: str,
-        clear_attempt_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     ) -> Any:
         """
         Move a terminal resource to another session without closing it.
@@ -2220,21 +2218,12 @@ def register_resources_routes(
             )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
-        # A replay must not wait behind the original runner RPC, even if the
-        # source has since prepared a different successor.
-        expired_status = expired_claude_transfer_status(
-            conv, target_session_id, clear_attempt_id, terminal_id
-        )
-        if expired_status == 410:
-            raise HTTPException(410, "The terminal handover expired")
-        if expired_status == 409:
-            raise OmnigentError("The terminal handover expired", code=ErrorCode.CONFLICT)
         requested_rotation = is_requested_claude_transfer(conv, target, terminal_id)
         if requested_rotation:
             state = request.app.state
             try:
                 # The caller may disappear when the pane changes hands. The
-                # server owns the move from the first write of its intent.
+                # server owns the move from the moment the request is accepted.
                 status, payload = await asyncio.shield(
                     transfer_requested_claude_terminal(
                         session_id,
@@ -2245,10 +2234,9 @@ def register_resources_routes(
                         scheduled_task_store=getattr(state, "scheduled_task_store", None),
                         archive_cleanup=getattr(state, "archive_close_coordinator", None),
                         runner_exit_reports=getattr(state, "runner_exit_reports", None),
-                        clear_attempt_id=clear_attempt_id,
                     )
                 )
-            except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+            except (httpx.HTTPError, ConnectionError) as exc:
                 raise HTTPException(502, "Claude terminal transfer is unconfirmed") from exc
         else:
             status, payload = await _proxy_post_to_runner(
@@ -2257,8 +2245,6 @@ def register_resources_routes(
                 {"target_session_id": target_session_id},
                 conv,
             )
-        if requested_rotation and status == 410:
-            raise HTTPException(410, "The terminal handover expired")
         if status == 404:
             error = payload.get("error", {})
             raise OmnigentError(
@@ -2283,9 +2269,7 @@ def register_resources_routes(
             )
 
         # A prepared successor already inherits the source placement.
-        if requested_rotation:
-            return payload
-        if conv.host_id is not None:
+        if not requested_rotation and conv.host_id is not None:
             await asyncio.to_thread(
                 conversation_store.set_host_id,
                 target_session_id,
@@ -2295,7 +2279,7 @@ def register_resources_routes(
                 # The replacement keeps the old row's working tree.
                 worktree=conv.worktree,
             )
-        elif conv.worktree is not None:
+        elif not requested_rotation and conv.worktree is not None:
             # A host-less child row (no bind to carry) still keeps the
             # worktree, so a later bind launches in the same working tree.
             await asyncio.to_thread(
