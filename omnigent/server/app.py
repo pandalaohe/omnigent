@@ -2425,6 +2425,7 @@ def create_app(
                 peer_message_store=peer_message_store,
                 scheduled_task_store=scheduled_task_store,
                 archive_cleanup=archive_close_coordinator,
+                runner_exit_reports=runner_exit_reports,
             ),
             name="succession-startup-resume",
         )
@@ -2953,6 +2954,7 @@ def create_app(
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
     app.state.peer_message_store = peer_message_store
+    app.state.runner_exit_reports = runner_exit_reports
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator
@@ -5954,6 +5956,24 @@ def create_app(
             create_if_missing=not accounts_mode,
         )
 
+    def _schedule_succession_resume(runner_id: str) -> None:
+        from omnigent.server.session_succession import resume_successions_for_runner
+
+        task = asyncio.create_task(
+            resume_successions_for_runner(
+                runner_id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=peer_message_store,
+                scheduled_task_store=scheduled_task_store,
+                archive_cleanup=archive_close_coordinator,
+                runner_exit_reports=runner_exit_reports,
+            ),
+            name=f"succession-resume-{runner_id}",
+        )
+        _succession_resume_tasks.add(task)
+        task.add_done_callback(_succession_resume_tasks.discard)
+
     async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -5984,6 +6004,7 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
+        _schedule_succession_resume(runner_id)
         # Host connection evidence survives tunnel moves between replicas. Older
         # hosts fall back to this replica's observed liveness.
         runner_ran = (
@@ -6456,24 +6477,7 @@ def create_app(
         # A succession whose successor was waiting for this runner (the
         # ``target_not_ready`` gate) resumes now. Detached so the connect
         # handshake never waits on a store scan.
-        from omnigent.server.session_succession import resume_successions_for_runner
-
-        async def _resume_successions_for_runner() -> None:
-            await resume_successions_for_runner(
-                runner_id,
-                conversation_store=conversation_store,
-                runner_router=runner_router,
-                peer_message_store=peer_message_store,
-                scheduled_task_store=scheduled_task_store,
-                archive_cleanup=archive_close_coordinator,
-            )
-
-        _succession_task = asyncio.create_task(
-            _resume_successions_for_runner(),
-            name=f"succession-resume-{runner_id}",
-        )
-        _succession_resume_tasks.add(_succession_task)
-        _succession_task.add_done_callback(_succession_resume_tasks.discard)
+        _schedule_succession_resume(runner_id)
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None

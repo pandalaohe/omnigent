@@ -1005,6 +1005,7 @@ def _publish_and_persist_resource_event(
     resource: dict[str, Any] | None = None,
     *,
     instance_id: str | None = None,
+    stable_id: str | None = None,
 ) -> None:
     """Publish an SSE event and persist it as a conversation item.
 
@@ -1020,6 +1021,7 @@ def _publish_and_persist_resource_event(
     :param resource_type: Kind of resource, e.g. ``"terminal"``.
     :param conversation_store: Store for persisting the item.
     :param resource: Full resource dict for created events.
+    :param stable_id: Persist before publishing and skip replays when supplied.
     """
     from omnigent.entities.conversation import ResourceEventData
 
@@ -1033,11 +1035,10 @@ def _publish_and_persist_resource_event(
         if instance_id is not None:
             sse_payload["instance_id"] = instance_id
 
-    session_stream.publish(session_id, sse_payload)
-
     item = NewConversationItem(
         type="resource_event",
         response_id=session_id,
+        stable_id=stable_id,
         data=ResourceEventData(
             event_type=event_type,
             resource_id=resource_id,
@@ -1045,6 +1046,13 @@ def _publish_and_persist_resource_event(
             resource=resource,
         ),
     )
+    if stable_id is not None:
+        (persisted,) = conversation_store.append(session_id, [item])
+        if not persisted.deduplicated:
+            session_stream.publish(session_id, sse_payload)
+        return
+
+    session_stream.publish(session_id, sse_payload)
     try:
         conversation_store.append(session_id, [item])
     except (AttributeError, TypeError, ValueError, RuntimeError):

@@ -871,7 +871,7 @@ class _NativeDeliveryUncertain(RuntimeError):
 
 @dataclass
 class _CardAnswerWake:
-    app_state: State
+    app_state: State | None
     elicitation_id: str
     attempted: bool = False
 
@@ -930,18 +930,50 @@ async def _deliver_with_retry(
         options["image_ids"] = image_ids
     if card_answer_wake is not None:
         options["card_answer_wake"] = card_answer_wake
+
+    async def post(target_id: str) -> bool:
+        target_options = options.copy()
+        if (
+            target_id == session_id
+            and card_answer_wake is not None
+            and card_answer_wake.app_state is None
+        ):
+            target_options.pop("card_answer_wake", None)
+        if target_id != session_id and image_ids:
+            from omnigent.runtime import get_file_store
+            from omnigent.server.session_succession import copy_succession_file
+
+            file_store = get_file_store()
+            if file_store is None:
+                return False
+            target_options["image_ids"] = await asyncio.to_thread(
+                lambda: [
+                    copy_succession_file(file_store, file_id, session_id, target_id)
+                    for file_id in image_ids
+                ]
+            )
+        return await _post_system_message(
+            target_id,
+            text,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            confirm_delivery=True,
+            **target_options,
+        )
+
     started = time.monotonic()
     attempt = 0
     while True:
         try:
-            delivered = await _post_system_message(
-                session_id,
-                text,
-                conversation_store=conversation_store,
-                runner_router=runner_router,
-                confirm_delivery=True,
-                **options,
-            )
+            if card_answer_wake is None:
+                delivered = await post(session_id)
+            else:
+                from omnigent.server.session_succession import released_claude_answer_target
+
+                target = await asyncio.to_thread(
+                    released_claude_answer_target, conversation_store, session_id
+                )
+                delivered = target is not None and await post(target)
         except _NativeDeliveryUncertain:
             await _persist_answer_delivery_notice(
                 session_id, text, conversation_store, status="delivery_uncertain"
@@ -14126,11 +14158,20 @@ async def _post_system_message(
             session_id,
         )
         return False
+    from omnigent.server.session_succession import committed_claude_transfer
+
+    if card_answer_wake is not None and committed_claude_transfer(conv):
+        return False
     if card_answer_wake is not None and not _can_wake_for_card_answer(conv):
         return False
     runner_client = await _get_runner_client(session_id, runner_router)
     initialize_woken_runner = card_answer_wake is not None and card_answer_wake.attempted
-    if runner_client is None and card_answer_wake is not None and not card_answer_wake.attempted:
+    if (
+        runner_client is None
+        and card_answer_wake is not None
+        and card_answer_wake.app_state is not None
+        and not card_answer_wake.attempted
+    ):
         app_state = card_answer_wake.app_state
         host_registry = getattr(app_state, "host_registry", None)
         if (
