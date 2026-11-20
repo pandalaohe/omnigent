@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CompactMembership } from "@/components/CompactMembership";
@@ -131,11 +133,17 @@ function ApiKeysPanel({ scope }: { scope: string }) {
   }
 
   const labels: Record<string, string> = { usage: text.usage, tasks: text.tasks };
-  const keys =
-    data?.keys.filter((key) => key.name.toLowerCase().includes(query.trim().toLowerCase())) ?? [];
-  const readOnly =
-    data?.read_only.filter((key) => key.name.toLowerCase().includes(query.trim().toLowerCase())) ??
-    [];
+  const filter = query.trim().toLowerCase();
+  const matchingKeys = useMemo(
+    () =>
+      [...(data?.keys ?? []), ...(data?.read_only ?? [])].filter((key) =>
+        key.name.toLowerCase().includes(filter),
+      ),
+    [data, filter],
+  );
+  const { pageRows, ...pager } = usePagedRows(matchingKeys, { resetKey: filter });
+  const keys = pageRows.filter((key) => "id" in key);
+  const readOnly = pageRows.filter((key) => "source" in key);
   const title = value
     ? "API key ready"
     : action?.kind === "create"
@@ -169,11 +177,11 @@ function ApiKeysPanel({ scope }: { scope: string }) {
             onChange={(event) => setQuery(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Showing {keys.length + readOnly.length} of {data.keys.length + data.read_only.length}
+            Showing {pageRows.length} of {data.keys.length + data.read_only.length}
           </p>
         </>
       )}
-      <div className="max-h-96 space-y-3 overflow-auto">
+      <div className="space-y-3">
         {keys.map((key) => (
           <div key={key.id} className="space-y-2 rounded-lg border border-border p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -245,6 +253,7 @@ function ApiKeysPanel({ scope }: { scope: string }) {
           </div>
         ))}
       </div>
+      <SettingsPager label="API key pages" {...pager} />
       <Dialog
         open={action !== null}
         onOpenChange={(isOpen) => {

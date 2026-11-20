@@ -1,12 +1,37 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { expectSettingsPages } from "@/test/settingsPaging";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { McpRegistryConnections, McpRegistryPicker } from "./McpRegistry";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
+import type * as Host from "@/lib/host";
 
 vi.mock("@/lib/mcpRegistry", () => ({
   registryRequest: vi.fn(),
   authorizeRegistryService: vi.fn(),
 }));
+
+const scope = vi.hoisted(() => ({
+  viewer: "viewer" as string | null,
+  server: "one",
+  generation: 1,
+}));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => scope.viewer }));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof Host>()),
+  getOmnigentServerIdentity: () => scope.server,
+  getOmnigentHostGeneration: () => scope.generation,
+}));
+
+function renderConnections(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
+  return render(<McpRegistryConnections />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 const service = {
   id: "tracker",
@@ -20,14 +45,86 @@ const service = {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  Object.assign(scope, { viewer: "viewer", server: "one", generation: 1 });
 });
 
 describe("MCP account connections", () => {
+  it("waits for viewer identity and drops the cached page on a server switch", async () => {
+    scope.viewer = null;
+    vi.mocked(registryRequest).mockImplementation(async (path) => ({
+      data: [
+        {
+          ...service,
+          title: path?.includes("after") ? "Server one later" : `Server ${scope.server}`,
+        },
+      ],
+      next_cursor: scope.server === "one" && !path?.includes("after") ? "server-one-cursor" : null,
+    }));
+    const { rerender } = renderConnections(
+      new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } }),
+    );
+    fireEvent.focus(window);
+    expect(registryRequest).not.toHaveBeenCalled();
+    scope.viewer = "viewer";
+    rerender(<McpRegistryConnections />);
+    await screen.findByText("Server one");
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText("Server one later");
+
+    scope.server = "two";
+    scope.generation += 1;
+    rerender(<McpRegistryConnections />);
+    expect(screen.queryByText("Server one later")).not.toBeInTheDocument();
+    expect(screen.queryByText("Server one")).not.toBeInTheDocument();
+    await screen.findByText("Server two");
+    expect(vi.mocked(registryRequest).mock.calls.map(([url]) => url)).toEqual([
+      "?limit=20",
+      "?limit=20&after=server-one-cursor",
+      "?limit=20",
+    ]);
+  });
+
+  it("requests one bounded page at a time and can go back", async () => {
+    const services = Array.from({ length: 45 }, (_, index) => ({
+      ...service,
+      id: `service-${index + 1}`,
+      title: `Service ${index + 1}`,
+      auth: "none",
+    }));
+    const requests: string[] = [];
+    vi.mocked(registryRequest).mockImplementation(async (path) => {
+      requests.push(path!);
+      const after = new URLSearchParams(path).get("after");
+      const start = after ? services.findIndex((row) => row.id === after) + 1 : 0;
+      const end = start + 20;
+      return {
+        data: services.slice(start, end),
+        next_cursor: services[end] ? services[end - 1].id : null,
+      };
+    });
+    renderConnections();
+    await screen.findByText("Service 1");
+    expect(requests).toEqual(["?limit=20"]);
+    await expectSettingsPages("Managed MCP service pages", (number) => `Service ${number}`);
+    expect(requests).toEqual([
+      "?limit=20",
+      "?limit=20&after=service-20",
+      "?limit=20&after=service-40",
+    ]);
+    fireEvent.focus(window);
+    await waitFor(() => expect(requests.slice(3)).toEqual(["?limit=20&after=service-40"]));
+    const pager = within(screen.getByRole("navigation", { name: "Managed MCP service pages" }));
+    await waitFor(() => expect(pager.getByRole("button", { name: "Previous" })).toBeEnabled());
+    fireEvent.click(pager.getByRole("button", { name: "Previous" }));
+    await screen.findByText("Service 21");
+    expect(screen.queryByText("Service 41")).not.toBeInTheDocument();
+  });
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {
       vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, auth }] });
-      render(<McpRegistryConnections />);
+      renderConnections();
       expect(
         await screen.findByRole("link", { name: "Manage account in Sandbox Integrations" }),
       ).toHaveAttribute("href", "/settings/integrations");
@@ -40,7 +137,7 @@ describe("MCP account connections", () => {
       .mockResolvedValueOnce({ connected: true })
       .mockResolvedValueOnce({ data: [{ ...service, connected: true }] })
       .mockResolvedValueOnce({ tools: ["read_ticket"] });
-    render(<McpRegistryConnections />);
+    renderConnections();
     fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
     const input = screen.getByLabelText("Token for Work tracker");
     expect(input.getAttribute("type")).toBe("password");
@@ -65,7 +162,7 @@ describe("MCP account connections", () => {
     vi.mocked(registryRequest)
       .mockResolvedValueOnce({ data: [{ ...service, connected: true }] })
       .mockRejectedValueOnce(new Error("Reconnect your account"));
-    render(<McpRegistryConnections />);
+    renderConnections();
     fireEvent.click(await screen.findByRole("button", { name: "Test connection" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Reconnect your account");
     await waitFor(() =>

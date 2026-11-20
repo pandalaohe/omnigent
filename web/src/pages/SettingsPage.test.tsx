@@ -40,6 +40,7 @@ import {
 import { readWidenWorkspaceForContent } from "@/lib/workspacePanelPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
+import { expectSettingsPages } from "@/test/settingsPaging";
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
   usageContextLevelKey,
@@ -129,6 +130,7 @@ vi.mock("@/lib/accountsApi", () => ({
   changePassword: vi.fn(),
 }));
 vi.mock("@/lib/identity", () => ({
+  WRONG_REPLICA_CODE: "wrong_replica",
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
@@ -188,6 +190,7 @@ vi.mock("@/hooks/useConversations", async () => {
       data: { projects: mocks.projectNames, hostIds: mocks.hostIds, agentNames: mocks.agentNames },
     }),
     useProjects: () => ({ data: [] }),
+    useDeleteProject: () => ({ mutate: vi.fn(), isPending: false }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
@@ -354,7 +357,7 @@ function FullLocationProbe() {
 function renderPage(path = "/settings", navigation?: ReactNode) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const Embed = mocks.isEmbedded ? EmbeddedProvider : Fragment;
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Embed>
@@ -367,6 +370,7 @@ function renderPage(path = "/settings", navigation?: ReactNode) {
       </TooltipProvider>
     </QueryClientProvider>,
   );
+  return { ...view, queryClient };
 }
 
 function LegacyChildNavigation() {
@@ -2602,6 +2606,52 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("archived-page-previous"));
     expect(screen.getByText("First page chat")).toBeInTheDocument();
     expect(screen.queryByText("Second page chat")).toBeNull();
+  });
+
+  it("pages archived projects and recovers from an empty page or a deleted cursor", async () => {
+    let projects = Array.from({ length: 45 }, (_, index) => ({
+      id: `project-${index + 1}`,
+      name: `Archived project ${index + 1}`,
+      archived_at: 1,
+    }));
+    const requests: string[] = [];
+    mocks.authenticatedFetch.mockImplementation(async (url: string) => {
+      requests.push(url);
+      const after = new URL(url, "https://example.test").searchParams.get("after");
+      const start = after ? projects.findIndex((project) => project.id === after) + 1 : 0;
+      if (after && start === 0) {
+        return new Response(
+          JSON.stringify({ error: { code: "invalid_input", message: "Unknown cursor" } }),
+          { status: 400 },
+        );
+      }
+      const data = projects.slice(start, start + 20);
+      return new Response(
+        JSON.stringify({ data, last_id: data.at(-1)?.id, has_more: start + 20 < projects.length }),
+      );
+    });
+    const { queryClient } = renderPage("/settings/archived?tab=projects");
+    await screen.findByText("Archived project 1");
+    expect(requests.filter((url) => url.startsWith("/v1/projects"))).toEqual([
+      "/v1/projects?archived=only&limit=20",
+    ]);
+    await expectSettingsPages("Archived project pages", (number) => `Archived project ${number}`);
+    expect(requests.filter((url) => url.startsWith("/v1/projects"))).toEqual([
+      "/v1/projects?archived=only&limit=20",
+      "/v1/projects?archived=only&limit=20&after=project-20",
+      "/v1/projects?archived=only&limit=20&after=project-40",
+    ]);
+    projects = projects.slice(0, 40);
+    await act(() => queryClient.invalidateQueries({ queryKey: ["projects"] }));
+    await screen.findByText("Archived project 21");
+    expect(screen.getByText("Page 2")).toBeInTheDocument();
+    projects = projects.filter((project) => project.id !== "project-20");
+    await act(() => queryClient.invalidateQueries({ queryKey: ["projects"] }));
+    await screen.findByText("Page 1");
+    await screen.findByText("Archived project 21");
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("Archived project 22")).toBeInTheDocument();
+    expect(requests.at(-1)).toBe("/v1/projects?archived=only&limit=20&after=project-21");
   });
 
   it("returns to page one when an archive filter changes", () => {

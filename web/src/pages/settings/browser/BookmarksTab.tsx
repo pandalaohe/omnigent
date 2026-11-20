@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { CopyIcon, PencilIcon, TrashIcon } from "lucide-react";
 import { toast } from "sonner";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { BrowserPlace } from "@/lib/browserPlacesBridge";
@@ -23,11 +25,19 @@ export function BookmarksTab() {
   const [query, setQuery] = useState(""),
     [edit, setEdit] = useState<{ row?: BrowserPlace; title: string; url: string } | null>(null);
   const inplace = places.has("update-in-place");
-  const filtered = places.bookmarks.filter(
-    (row) =>
-      edit?.row?.url === row.url ||
-      `${row.title} ${row.url}`.toLowerCase().includes(query.toLowerCase()),
+  const { bookmarks } = places;
+  const filter = query.toLowerCase();
+  const matching = useMemo(
+    () => bookmarks.filter((row) => `${row.title} ${row.url}`.toLowerCase().includes(filter)),
+    [bookmarks, filter],
   );
+  const editingUrl = edit?.row?.url;
+  const filtered = useMemo(() => {
+    if (!editingUrl || matching.some((row) => row.url === editingUrl)) return matching;
+    const editing = bookmarks.find((row) => row.url === editingUrl);
+    return editing ? [editing, ...matching] : matching;
+  }, [matching, bookmarks, editingUrl]);
+  const { pageRows, ...pager } = usePagedRows(filtered, { resetKey: filter });
   let error = "";
   let url = "";
   if (edit) {
@@ -129,10 +139,10 @@ export function BookmarksTab() {
       </div>
       {edit && !edit.row && editor()}
       <p className="text-xs text-muted-foreground">
-        Showing {filtered.length} of {places.bookmarks.length}
+        Showing {pageRows.length} of {places.bookmarks.length}
       </p>
-      <div className="max-h-96 overflow-auto">
-        {filtered.map((row) =>
+      <div>
+        {pageRows.map((row) =>
           edit?.row?.url === row.url ? (
             <div key={row.url}>{editor()}</div>
           ) : (
@@ -177,6 +187,7 @@ export function BookmarksTab() {
           ),
         )}
       </div>
+      <SettingsPager label="Bookmark pages" {...pager} />
       {!filtered.length && (
         <p className="py-6 text-sm text-muted-foreground">
           {query ? `No pages match “${query}”` : "No bookmarks yet. Add a page to keep it here."}

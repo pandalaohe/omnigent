@@ -4,6 +4,8 @@ import { PinIcon, PinOffIcon, PlusIcon } from "lucide-react";
 
 import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
 import { CompactMembership } from "@/components/CompactMembership";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { SECTION_ORDER, useAgentRegistry, type SectionId } from "@/hooks/useAgentRegistry";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
@@ -234,18 +236,24 @@ export function AgentsSettings({
   const visibleBuiltinAgents = memberBuiltinAgents.filter(
     (agent) => !isSdkAgent(agent) && matches(agent.display_name, agent.description, agent.harness),
   );
-  const builtinSections = SECTION_ORDER.filter((section) => section !== "yours")
-    .map((section) => ({
-      section,
-      agents: visibleBuiltinAgents.filter((agent) => sectionForBuiltin(agent) === section),
-    }))
-    .filter((group) => group.agents.length > 0);
   const visibleInstalledAgents = installedAgents.filter((agent) =>
     matches(agent.display_name, agent.description, agent.harness),
   );
   const visibleCustomAgents = customAgentRows.filter((agent) =>
     matches(agent.name, agent.description, agent.harness),
   );
+  const soloAgents = visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) <= 1);
+  const teamAgents = [
+    ...visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) > 1),
+    ...SECTION_ORDER.filter((section) => section !== "yours").flatMap((section) =>
+      visibleBuiltinAgents.filter((agent) => sectionForBuiltin(agent) === section),
+    ),
+  ];
+  const { pageRows: installedPage, ...installedPager } = usePagedRows(visibleInstalledAgents, {
+    resetKey: query,
+  });
+  const { pageRows: soloPage, ...soloPager } = usePagedRows(soloAgents, { resetKey: query });
+  const { pageRows: teamPage, ...teamPager } = usePagedRows(teamAgents, { resetKey: query });
 
   async function refresh() {
     await Promise.all([
@@ -261,6 +269,9 @@ export function AgentsSettings({
   const visibleSessionAgents = sessionAgents.filter((agent) =>
     matches(agent.display_name, agent.description, agent.harness),
   );
+  const { pageRows: sessionPage, ...sessionPager } = usePagedRows(visibleSessionAgents, {
+    resetKey: query,
+  });
 
   async function importAgent(agent: AvailableAgent) {
     if (!agent.sessionId || busy) return;
@@ -405,10 +416,10 @@ export function AgentsSettings({
               <div>
                 <h2 className="mb-2 text-sm text-muted-foreground">Saved configurations</h2>
                 <p className="text-xs text-muted-foreground">
-                  Showing {visibleInstalledAgents.length} of {installedAgents.length}
+                  Showing {installedPage.length} of {installedAgents.length}
                 </p>
-                <div className="max-h-96 overflow-auto">
-                  {visibleInstalledAgents.map((agent) => (
+                <div>
+                  {installedPage.map((agent) => (
                     <div
                       key={agent.id}
                       className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
@@ -438,6 +449,7 @@ export function AgentsSettings({
                     </div>
                   ))}
                 </div>
+                <SettingsPager label="Saved configuration pages" {...installedPager} />
               </div>
             )}
         {catalog.isLoading && (
@@ -457,35 +469,23 @@ export function AgentsSettings({
           <p className="py-4 text-sm text-muted-foreground">No custom agents yet.</p>
         )}
         <p className="text-xs text-muted-foreground">
-          Showing {visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) <= 1).length}{" "}
-          of {customAgentRows.filter((agent) => (agent.members?.length ?? 0) <= 1).length}
+          Showing {soloPage.length} of{" "}
+          {customAgentRows.filter((agent) => (agent.members?.length ?? 0) <= 1).length}
         </p>
-        <div className="max-h-96 overflow-auto">
-          {visibleCustomAgents
-            .filter((agent) => (agent.members?.length ?? 0) <= 1)
-            .map(renderCustomAgent)}
-        </div>
+        <div>{soloPage.map(renderCustomAgent)}</div>
+        <SettingsPager label="Custom agent pages" {...soloPager} />
       </section>
       <div>
         <h2 className="mb-2 text-sm text-muted-foreground">Team agents</h2>
         <p className="text-xs text-muted-foreground">
-          Showing{" "}
-          {visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) > 1).length +
-            visibleBuiltinAgents.length}{" "}
-          of{" "}
+          Showing {teamPage.length} of{" "}
           {customAgentRows.filter((agent) => (agent.members?.length ?? 0) > 1).length +
             memberBuiltinAgents.filter((agent) => !isSdkAgent(agent)).length}
         </p>
-        <div className="max-h-96 overflow-auto">
-          {visibleCustomAgents
-            .filter((agent) => (agent.members?.length ?? 0) > 1)
-            .map(renderCustomAgent)}
-          {!available.isLoading &&
-            !available.error &&
-            visibleBuiltinAgents.length === 0 &&
-            !visibleCustomAgents.some((agent) => (agent.members?.length ?? 0) > 1) && (
-              <p className="text-sm text-muted-foreground">No team agents.</p>
-            )}
+        <div>
+          {!available.isLoading && !available.error && teamAgents.length === 0 && (
+            <p className="text-sm text-muted-foreground">No team agents.</p>
+          )}
           {available.isLoading && (
             <p role="status" className="text-sm text-muted-foreground">
               Loading agents…
@@ -496,78 +496,76 @@ export function AgentsSettings({
               {errorText(available.error)}
             </p>
           )}
-          {builtinSections.map(({ section, agents }) => (
-            <div key={section}>
-              {agents.map((agent) => {
-                const memberControls = isMemberBuiltin(agent);
-                return (
-                  <div
-                    key={agent.id}
-                    className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm">
-                        <AgentNameTag
-                          agentId={agent.id}
-                          name={registryItemFor(agent)?.label ?? agent.display_name}
-                          harness={agent.harness ?? null}
-                        />
-                      </div>
-                      {memberControls && (
-                        <div className="truncate text-xs text-muted-foreground">
-                          {builtinSubtitle(agent)}
-                        </div>
-                      )}
+          {teamPage.map((agent) => {
+            if (!("display_name" in agent)) return renderCustomAgent(agent);
+            const memberControls = isMemberBuiltin(agent);
+            return (
+              <div
+                key={agent.id}
+                className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm">
+                    <AgentNameTag
+                      agentId={agent.id}
+                      name={registryItemFor(agent)?.label ?? agent.display_name}
+                      harness={agent.harness ?? null}
+                    />
+                  </div>
+                  {memberControls && (
+                    <div className="truncate text-xs text-muted-foreground">
+                      {builtinSubtitle(agent)}
                     </div>
-                    {memberControls && !isSdkAgent(agent) && (
-                      <PinToggle
-                        agentId={agent.id}
-                        name={agent.display_name}
-                        pinned={pinnedIdSet.has(agent.id)}
-                        canPin={!atPinLimit}
-                        ready={pinsReady}
-                        onToggle={togglePin}
-                      />
-                    )}
+                  )}
+                </div>
+                {memberControls && !isSdkAgent(agent) && (
+                  <PinToggle
+                    agentId={agent.id}
+                    name={agent.display_name}
+                    pinned={pinnedIdSet.has(agent.id)}
+                    canPin={!atPinLimit}
+                    ready={pinsReady}
+                    onToggle={togglePin}
+                  />
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
+                  aria-label={`Edit badge for ${agent.display_name}`}
+                >
+                  Edit badge
+                </Button>
+                {memberControls && (
+                  <>
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
-                      aria-label={`Edit badge for ${agent.display_name}`}
+                      aria-label={`View ${agent.display_name}`}
+                      disabled={duplicatingId !== null}
+                      onClick={() => {
+                        setError(null);
+                        setViewing(agent);
+                      }}
                     >
-                      Edit badge
+                      View
                     </Button>
-                    {memberControls && (
-                      <>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          aria-label={`View ${agent.display_name}`}
-                          disabled={duplicatingId !== null}
-                          onClick={() => {
-                            setError(null);
-                            setViewing(agent);
-                          }}
-                        >
-                          View
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          aria-label={`Duplicate ${agent.display_name}`}
-                          disabled={duplicatingId !== null}
-                          onClick={() => void duplicateBuiltin(agent)}
-                        >
-                          Duplicate
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Duplicate ${agent.display_name}`}
+                      disabled={duplicatingId !== null}
+                      onClick={() => void duplicateBuiltin(agent)}
+                    >
+                      Duplicate
+                    </Button>
+                  </>
+                )}
+              </div>
+            );
+          })}
         </div>
+        <SettingsPager label="Team agent pages" {...teamPager} />
       </div>
       {query !== "" &&
         visibleBuiltinAgents.length === 0 &&
@@ -584,10 +582,10 @@ export function AgentsSettings({
             Import from existing sessions
           </summary>
           <p className="text-xs text-muted-foreground">
-            Showing {visibleSessionAgents.length} of {sessionAgents.length}
+            Showing {sessionPage.length} of {sessionAgents.length}
           </p>
-          <div className="max-h-96 overflow-auto">
-            {visibleSessionAgents.map((agent) => (
+          <div>
+            {sessionPage.map((agent) => (
               <div key={agent.id} className="mt-2 flex items-center gap-2 border-b py-2">
                 <span className="min-w-0 flex-1 truncate">
                   <AgentNameTag
@@ -607,6 +605,7 @@ export function AgentsSettings({
               </div>
             ))}
           </div>
+          <SettingsPager label="Import from sessions pages" {...sessionPager} />
         </details>
       )}
       {error && !deleting && !viewing && (

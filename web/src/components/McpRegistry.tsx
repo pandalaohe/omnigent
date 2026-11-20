@@ -1,15 +1,45 @@
 import { useEffect, useState } from "react";
 import { PlugIcon } from "lucide-react";
+import { SettingsPager } from "@/components/SettingsPager";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
+import {
+  useMcpRegistryCatalog,
+  useMcpRegistryPage,
+  useRegistrySignIn,
+} from "@/hooks/useMcpRegistry";
+import { useSettingsPageCursor } from "@/hooks/useSettingsPageCursor";
+import { useViewerId } from "@/hooks/useViewerId";
 import { withBasePath } from "@/lib/basePath";
+import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
 export function McpRegistryConnections() {
-  const { services, error, loading, refresh } = useMcpRegistryCatalog();
+  const viewerId = useViewerId();
+  const scope = JSON.stringify([
+    getOmnigentServerIdentity(),
+    getOmnigentHostGeneration(),
+    viewerId,
+  ]);
+  return <McpRegistryConnectionsPage key={scope} scope={scope} enabled={viewerId !== null} />;
+}
+
+function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled: boolean }) {
+  const { cursor, page, next, previous } = useSettingsPageCursor();
+  const { data, error, isPending, isFetching, refetch } = useMcpRegistryPage(
+    scope,
+    enabled,
+    cursor,
+  );
+  const services = data?.data ?? [];
+  const nextCursor = data?.next_cursor;
+  useEffect(() => {
+    if (page > 0 && data?.data.length === 0 && !isFetching) {
+      previous();
+    }
+  }, [page, data, isFetching, previous]);
   const callbackFailed = [...new URLSearchParams(window.location.search)].some(
     ([key, value]) => key.startsWith("mcp-") && value === "error",
   );
@@ -29,7 +59,10 @@ export function McpRegistryConnections() {
       )}
       {error && (
         <p role="alert" className="text-sm text-destructive">
-          {error}
+          {error.message}{" "}
+          <Button type="button" variant="outline" size="sm" onClick={() => void refetch()}>
+            Retry
+          </Button>
         </p>
       )}
       {services.map((service) => (
@@ -37,16 +70,24 @@ export function McpRegistryConnections() {
           key={service.id}
           service={service}
           onChanged={async () => {
-            await refresh();
+            await refetch();
           }}
         />
       ))}
-      {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
-      {!loading && !services.length && !error && (
+      {isPending && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
+      {!isPending && page === 0 && !services.length && !error && (
         <p className="text-sm text-muted-foreground">
           No managed services are available for your account.
         </p>
       )}
+      <SettingsPager
+        label="Managed MCP service pages"
+        page={page}
+        hasNext={Boolean(nextCursor)}
+        busy={isFetching}
+        onPrevious={previous}
+        onNext={() => next(nextCursor)}
+      />
     </div>
   );
 }

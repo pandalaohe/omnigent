@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Segmented } from "@/components/ui/segmented";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { browserAccessBridge, browserSettingsBridge, type BrowserAccess } from "@/lib/nativeBridge";
 import { BrowserGroup, UpdateReason } from "./browserSettingsParts";
 import { OpenLinksInAppControl } from "./OpenLinksInAppControl";
@@ -23,16 +25,24 @@ export function AccessTab() {
     [message, setMessage] = useState(""),
     [servers, setServers] = useState<{ origin: string; current: boolean; entries: string[] }[]>([]);
   const [serverQuery, setServerQuery] = useState("");
-  const visibleServers = servers
-    .map((server) => ({
-      ...server,
-      entries: server.entries.filter((entry) =>
-        `${server.origin} ${entry}`.toLowerCase().includes(serverQuery.trim().toLowerCase()),
+  const filter = serverQuery.trim().toLowerCase();
+  const visibleEntries = useMemo(
+    () =>
+      servers.flatMap(({ origin, current, entries }) =>
+        entries
+          .filter((entry) => `${origin} ${entry}`.toLowerCase().includes(filter))
+          .map((entry) => ({ origin, current, entry })),
       ),
-    }))
-    .filter((server) => server.entries.length > 0);
+    [servers, filter],
+  );
+  const { pageRows, ...pager } = usePagedRows(visibleEntries, { resetKey: filter });
+  const pageServers = new Map<string, { current: boolean; entries: string[] }>();
+  for (const { origin, current, entry } of pageRows) {
+    const group = pageServers.get(origin);
+    if (group) group.entries.push(entry);
+    else pageServers.set(origin, { current, entries: [entry] });
+  }
   const totalEntries = servers.reduce((count, server) => count + server.entries.length, 0);
-  const visibleEntries = visibleServers.reduce((count, server) => count + server.entries.length, 0);
   useEffect(() => {
     void bridge
       ?.get()
@@ -237,13 +247,13 @@ export function AccessTab() {
               onChange={(event) => setServerQuery(event.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Showing {visibleEntries} of {totalEntries}
+              Showing {pageRows.length} of {totalEntries}
             </p>
-            <div className="max-h-96 overflow-auto">
-              {visibleServers.map((server) => (
-                <div key={server.origin} className="mb-4">
+            <div>
+              {[...pageServers].map(([origin, server]) => (
+                <div key={origin} className="mb-4">
                   <h3 className="mb-2 break-all text-sm font-medium">
-                    {server.origin}{" "}
+                    {origin}{" "}
                     {server.current && (
                       <span className="rounded bg-muted px-2 py-1 text-xs">This server</span>
                     )}
@@ -258,7 +268,7 @@ export function AccessTab() {
                         variant="outline"
                         size="sm"
                         disabled={busy}
-                        onClick={() => void forget(server.origin, entry)}
+                        onClick={() => void forget(origin, entry)}
                       >
                         Forget
                       </Button>
@@ -267,6 +277,7 @@ export function AccessTab() {
                 </div>
               ))}
             </div>
+            <SettingsPager label="Remembered address pages" {...pager} />
           </>
         )}
       </BrowserGroup>

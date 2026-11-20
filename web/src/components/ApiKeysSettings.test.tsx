@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiKeysSettings } from "./ApiKeysSettings";
 import { apiKeysRequest } from "@/lib/apiKeysApi";
 import { settingsNavGroups } from "@/shell/settingsNav";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const identity = vi.hoisted(() => ({ user: "owner", server: "server", generation: 1 }));
 
@@ -35,6 +36,32 @@ beforeEach(() => {
 });
 
 describe("API key settings", () => {
+  it("shares a 20-row page between editable and read-only keys and searches both", async () => {
+    const keys = Array.from({ length: 35 }, (_, index) => ({
+      ...key,
+      id: `key-${index + 1}`,
+      name: `Key ${index + 1}`,
+    }));
+    const read_only = Array.from({ length: 10 }, (_, index) => ({
+      name: `Key ${index + 36}`,
+      source: "config",
+      scopes: ["usage"],
+      last_used_at: null,
+    }));
+    request.mockResolvedValue({ ...list, keys, read_only });
+    render(<ApiKeysSettings />);
+    const returnToFirstPage = await expectSettingsPages(
+      "API key pages",
+      (number) => `Key ${number}`,
+    );
+    returnToFirstPage();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search API keys" }), {
+      target: { value: "Key 39" },
+    });
+    expect(screen.getByText("Key 39")).toBeInTheDocument();
+    expect(screen.queryByText("Key 45")).not.toBeInTheDocument();
+  });
+
   it.each([
     ["create", "user"],
     ["create", "server"],

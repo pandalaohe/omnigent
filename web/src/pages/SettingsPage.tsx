@@ -52,7 +52,12 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PickerShell } from "@/components/PickerShell";
 import { SelectionList } from "@/components/SelectionList";
 import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
-import { listProjects, type Project } from "@/lib/projectsApi";
+import { listArchivedProjectPage, listProjects, type Project } from "@/lib/projectsApi";
+import { SettingsPager } from "@/components/SettingsPager";
+import { SETTINGS_PAGE_SIZE } from "@/lib/settingsPagination";
+import { useSettingsPageCursor } from "@/hooks/useSettingsPageCursor";
+import { ApiError } from "@/lib/sessionsApi";
+import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useComments } from "@/hooks/useComments";
 import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
@@ -3724,18 +3729,42 @@ function ArchiveTabs({ active }: { active: "sessions" | "projects" }) {
   );
 }
 
+const ARCHIVED_PROJECT_PAGE_KEY = ["projects", "archived-page"] as const;
+
 function ArchivedProjectsPane() {
   const queryClient = useQueryClient();
+  const { cursor, page, next, previous, restart } = useSettingsPageCursor();
   const {
-    data: allProjects,
+    data,
     isLoading,
     isError,
+    error: loadError,
+    isFetching,
     refetch,
   } = useQuery({
-    queryKey: ["projects", "with-archived"],
-    queryFn: () => listProjects({ includeArchived: true }),
+    queryKey: [...ARCHIVED_PROJECT_PAGE_KEY, cursor],
+    queryFn: ({ signal }) => listArchivedProjectPage(SETTINGS_PAGE_SIZE, cursor, signal),
+    retry: (count, cause) => count < 3 && isRetryableRequestError(cause),
   });
-  const archivedProjects = (allProjects ?? []).filter((project) => !!project.archived_at);
+  const archivedProjects = data?.data ?? [];
+  const nextCursor = data?.has_more ? data.last_id : null;
+  const lostCursor =
+    page > 0 &&
+    loadError instanceof ApiError &&
+    loadError.status === 400 &&
+    loadError.code === "invalid_input";
+  useEffect(() => {
+    if (isFetching) return;
+    if (lostCursor) {
+      void queryClient.invalidateQueries({
+        queryKey: ARCHIVED_PROJECT_PAGE_KEY,
+        refetchType: "none",
+      });
+      restart();
+    } else if (page > 0 && data?.data.length === 0) {
+      previous();
+    }
+  }, [page, data, isFetching, lostCursor, previous, queryClient, restart]);
   const del = useDeleteProject();
   const [deleting, setDeleting] = useState<Project | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -3760,7 +3789,7 @@ function ArchivedProjectsPane() {
       <div className="mx-auto max-w-4xl px-4 py-5 md:px-8">
         <h1 className="mb-4 text-lg font-semibold">Archived projects</h1>
         {isLoading && <p className="text-sm text-muted-foreground">Loading projects…</p>}
-        {isError && (
+        {isError && !lostCursor && (
           <p role="alert" className="text-sm text-destructive">
             Couldn’t load projects.{" "}
             <Button type="button" size="sm" variant="outline" onClick={() => void refetch()}>
@@ -3773,7 +3802,7 @@ function ArchivedProjectsPane() {
             {error}
           </p>
         )}
-        {!isLoading && !isError && archivedProjects.length === 0 && (
+        {!isLoading && !isError && page === 0 && archivedProjects.length === 0 && (
           <p className="text-sm text-muted-foreground">No archived projects.</p>
         )}
         <ul className="divide-y rounded-lg border">
@@ -3815,6 +3844,14 @@ function ArchivedProjectsPane() {
             </li>
           ))}
         </ul>
+        <SettingsPager
+          label="Archived project pages"
+          page={page}
+          hasNext={Boolean(nextCursor)}
+          busy={isFetching}
+          onPrevious={previous}
+          onNext={() => next(nextCursor)}
+        />
       </div>
       <Dialog
         open={deleting !== null}
@@ -4219,39 +4256,15 @@ function ArchivedListPane({
               />
             ))}
           </ul>
-          {(pageNumber > 1 || listQuery.data?.has_more) && (
-            <nav
-              className="flex items-center justify-center gap-3 border-t p-2"
-              aria-label="Archived session pages"
-            >
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-testid="archived-page-previous"
-                disabled={pageNumber === 1 || listQuery.isFetching}
-                onClick={goToPreviousPage}
-              >
-                Previous
-              </Button>
-              <span
-                className="min-w-14 text-center text-sm text-muted-foreground"
-                aria-live="polite"
-              >
-                Page {pageNumber}
-              </span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-testid="archived-page-next"
-                disabled={!listQuery.data?.has_more || listQuery.isFetching}
-                onClick={goToNextPage}
-              >
-                Next
-              </Button>
-            </nav>
-          )}
+          <SettingsPager
+            label="Archived session pages"
+            page={pageNumber - 1}
+            hasNext={Boolean(listQuery.data?.has_more)}
+            busy={listQuery.isFetching}
+            testIdPrefix="archived-page"
+            onPrevious={goToPreviousPage}
+            onNext={goToNextPage}
+          />
         </>
       )}
       <details className="border-t px-2 py-3">

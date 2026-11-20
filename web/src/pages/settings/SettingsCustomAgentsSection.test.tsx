@@ -7,6 +7,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import type { AgentConfig } from "@/lib/agentsApi";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const flags = vi.hoisted(() => ({
   feature: true,
@@ -158,25 +159,87 @@ afterEach(() => {
 });
 
 describe("Custom agents settings", () => {
-  it("loads later server agents when the first page contains only hidden built-ins", async () => {
-    const builtins = Array.from({ length: 50 }, (_, index) => ({
-      ...polly,
-      id: `builtin-${index}`,
-    }));
+  it("restarts only the scope whose cursor was deleted", async () => {
+    let deleted = false;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const { searchParams } = new URL(String(input), "http://localhost");
+      const after = searchParams.get("after");
+      if (searchParams.get("scope") !== "user") {
+        return response(
+          after ? page([agent("server-two")]) : page([agent("server-one")], true, "server-one"),
+        );
+      }
+      if (after) {
+        deleted = true;
+        return response({ error: { code: "stale_cursor", message: "Cursor was deleted" } }, 400);
+      }
+      return response(page([agent(deleted ? "user-rebuilt" : "user-one")], true, "user-one"));
+    });
+    mount();
+    const serverPager = within(
+      await screen.findByRole("navigation", { name: "Server agent pages" }),
+    );
+    fireEvent.click(serverPager.getByRole("button", { name: "Next" }));
+    await screen.findByRole("link", { name: /server-two/ });
+    const userPager = within(await screen.findByRole("navigation", { name: "Your agent pages" }));
+    fireEvent.click(userPager.getByRole("button", { name: "Next" }));
+    await screen.findByRole("link", { name: "user-rebuilt" });
+    expect(
+      within(screen.getByRole("navigation", { name: "Your agent pages" })).getByText("Page 1"),
+    ).toBeInTheDocument();
+    expect(serverPager.getByText("Page 2")).toBeInTheDocument();
+  });
+
+  it("loads a bounded window per scope and keeps the two pages independent", async () => {
+    const fixture = (label: string) =>
+      Array.from({ length: 45 }, (_, index) =>
+        agent(`${label}-${index + 1}`, `${label} ${index + 1}`),
+      );
+    const server = fixture("Server agent");
+    const user = fixture("Owned agent");
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const { searchParams } = new URL(String(input), "http://localhost");
+      expect(searchParams.get("limit")).toBe("20");
+      const dataset = searchParams.get("scope") === "user" ? user : server;
+      const after = searchParams.get("after");
+      const start = after ? dataset.findIndex((row) => row.id === after) + 1 : 0;
+      const data = dataset.slice(start, start + 20);
+      return response(page(data, start + 20 < dataset.length, data.at(-1)?.id));
+    });
+    mount();
+    await expectSettingsPages("Your agent pages", (number) => `Owned agent ${number}`);
+    expect(screen.getByRole("link", { name: /Server agent 1 description/ })).toBeVisible();
+    await expectSettingsPages("Server agent pages", (number) => `Server agent ${number}`);
+    expect(screen.getByRole("link", { name: "Owned agent 45" })).toBeVisible();
+    const pager = within(screen.getByRole("navigation", { name: "Your agent pages" }));
+    fireEvent.click(pager.getByRole("button", { name: "Previous" }));
+    expect(await screen.findByRole("link", { name: "Owned agent 21" })).toBeVisible();
+    expect(screen.getByRole("link", { name: /Server agent 45 description/ })).toBeVisible();
+  });
+
+  it("uses has_more and the cursor through an empty page followed by a short page", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
       if (url.searchParams.get("scope") === "user") return response(page([]));
-      return response(
-        url.searchParams.has("after")
-          ? page([agent("later-server", "Later server agent")])
-          : page(builtins, true, "builtin-49"),
-      );
+      const after = url.searchParams.get("after");
+      if (!after) return response(page([], true, "hidden-id"));
+      if (after === "hidden-id")
+        return response(page([agent("visible-id", "Later server agent")], true, "short-id"));
+      return response(page([agent("last-id", "Last server agent")]));
     });
     mount();
-    fireEvent.click(await screen.findByRole("button", { name: "Load more server agents" }));
+    const pager = within(await screen.findByRole("navigation", { name: "Server agent pages" }));
+    fireEvent.click(pager.getByRole("button", { name: "Next" }));
     expect(await screen.findByRole("link", { name: /Later server agent/ })).toBeVisible();
+    fireEvent.click(pager.getByRole("button", { name: "Next" }));
+    expect(await screen.findByRole("link", { name: /Last server agent/ })).toBeVisible();
+    expect(pager.getByRole("button", { name: "Next" })).toBeDisabled();
     expect(authenticatedFetch).toHaveBeenCalledWith(
-      expect.stringContaining("after=builtin-49"),
+      "/v1/agents?limit=20&after=hidden-id",
+      expect.anything(),
+    );
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/agents?limit=20&after=short-id",
       expect.anything(),
     );
   });
@@ -259,7 +322,7 @@ describe("Custom agents settings", () => {
       ),
     ).toBeVisible();
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("button", { name: /Load more/ })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: /agent pages/ })).toBeNull();
   });
 
   it("retries a failed detail request without fetching lists", async () => {
@@ -320,8 +383,10 @@ describe("Custom agents settings", () => {
     });
     expect(screen.queryByRole("link", { name: /Shared reviewer description/ })).toBeNull();
     expect(screen.getAllByRole("link", { name: "research" })).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "Load more agents" }));
+    const pager = within(screen.getByRole("navigation", { name: "Your agent pages" }));
+    fireEvent.click(pager.getByRole("button", { name: "Next" }));
     expect(await screen.findByRole("link", { name: "research-later" })).toBeVisible();
+    expect(screen.queryByRole("link", { name: "research" })).toBeNull();
     fireEvent.change(screen.getByRole("searchbox", { name: "Search configurations" }), {
       target: { value: "shared" },
     });

@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { BookmarksTab } from "./BookmarksTab";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const notices = vi.hoisted(() => ({
   undo: undefined as undefined | (() => void),
@@ -23,6 +24,34 @@ afterEach(() => {
   notices.undo = undefined;
   notices.messages = [];
 });
+it("pages bookmarks and searches the complete saved list", async () => {
+  const bookmarks = Array.from({ length: 45 }, (_, index) => ({
+    url: `https://example.test/bookmarks/${index + 1}`,
+    title: `Bookmark ${index + 1}`,
+  }));
+  Object.assign(window, {
+    omnigentDesktop: {
+      browserPlaces: vi.fn().mockResolvedValue({ ok: true, bookmarks }),
+      onBrowserPlaceChosen: () => () => {},
+    },
+  });
+  render(
+    <MemoryRouter>
+      <BookmarksTab />
+    </MemoryRouter>,
+  );
+  const returnToFirstPage = await expectSettingsPages(
+    "Bookmark pages",
+    (number) => `Bookmark ${number}`,
+  );
+  returnToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search bookmarks" }), {
+    target: { value: "Bookmark 44" },
+  });
+  expect(screen.getByText("Bookmark 44")).toBeInTheDocument();
+  expect(screen.queryByText("Bookmark 45")).not.toBeInTheDocument();
+});
+
 it.each([true, false])(
   "deletes immediately and undoes with explicit old-shell position fallback (%s)",
   async (modern) => {
