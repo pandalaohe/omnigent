@@ -326,16 +326,7 @@ interface SessionResponseWire {
    * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
-  last_task_error?: {
-    code: string;
-    message: string;
-    agent_name?: string;
-    title?: string;
-    cause?: string;
-    remediation?: string;
-    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
-    item_id?: string;
-  } | null;
+  last_task_error?: Session["lastTaskError"];
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no

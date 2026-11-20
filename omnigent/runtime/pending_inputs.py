@@ -123,6 +123,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from cachetools import TTLCache
+
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
@@ -291,6 +293,8 @@ class MatchedDrain:
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
     match_method: str | None = None
+    shared_text: bool = False
+    same_text_successors: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -358,6 +362,13 @@ class _Entry:
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
+
+
+# The value lists already-queued successors eligible for legacy source-less
+# matching. An empty set blocks text-only attribution for every successor.
+_unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] = (
+    WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
+)
 _lock = threading.Lock()
 
 
@@ -387,9 +398,7 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
         and now - entry.created_at > _TTL_S
     ]
     for pid in stale:
-        entries.pop(pid, None)
-    if not entries:
-        _pending.pop(conversation_id, None)
+        _settle_locked(conversation_id, entries, pid)
 
 
 def make_pending_id(conversation_id: str, stable_id: str | None = None) -> str:
@@ -470,7 +479,7 @@ def record(
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
-        _evict_beyond_cap(entries)
+        _evict_beyond_cap(conversation_id, entries)
     return pending_id
 
 
@@ -582,7 +591,7 @@ def set_injected_prefix(conversation_id: str, pending_id: str, prefix: str) -> b
         return True
 
 
-def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
+def _evict_beyond_cap(conversation_id: str, entries: dict[str, _Entry]) -> None:
     """
     Drop the oldest unheld entries until at most the cap remain unheld.
 
@@ -593,6 +602,7 @@ def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
     rollback that puts it back. They are a transient overlay of at most one
     persist's drain, so the queue never exceeds twice the cap.
 
+    :param conversation_id: Session whose queue is capped.
     :param entries: One conversation's ``{pending_id: entry}`` map.
     """
     unheld = [
@@ -604,7 +614,7 @@ def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
     if excess <= 0:
         return
     for pending_id in unheld[:excess]:
-        entries.pop(pending_id, None)
+        _settle_locked(conversation_id, entries, pending_id)
 
 
 def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None:
@@ -803,6 +813,8 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`, e.g.
         ``"pending_a1b2c3"``.
+    :param hold: Keep the entry held for a subsequent settlement. An immediate
+        removal records its text as unconfirmed.
     :returns: The dropped entry, or ``None`` when no entry had that id.
     """
     with _lock:
@@ -810,15 +822,15 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         if entries is None:
             return None
         entry = entries.get(pending_id)
-        if entry is not None and hold:
+        if entry is None:
+            return None
+        if hold:
             if entry.held:
                 return None
             entry.held = True
         else:
-            entries.pop(pending_id, None)
-        if not entries:
-            _pending.pop(conversation_id, None)
-        return _drained_input(entry) if entry is not None else None
+            _settle_locked(conversation_id, entries, pending_id)
+        return _drained_input(entry)
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
@@ -868,9 +880,7 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
         if hold:
             entry.held = True
         else:
-            entries.pop(oldest_id)
-            if not entries:
-                _pending.pop(conversation_id, None)
+            _settle_locked(conversation_id, entries, oldest_id)
         return _drained_input(entry)
 
 
@@ -951,9 +961,7 @@ def resolve_oldest_for_mirrored_text(
         if hold:
             entry.held = True
         else:
-            entries.pop(oldest_id)
-            if not entries:
-                _pending.pop(conversation_id, None)
+            _settle_locked(conversation_id, entries, oldest_id)
         return _drained_input(entry)
 
 
@@ -1051,7 +1059,33 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
 
-def release(conversation_id: str, drained: DrainedInput) -> None:
+def _settle_locked(
+    conversation_id: str,
+    entries: dict[str, _Entry],
+    pending_id: str,
+    *,
+    delivery_confirmed: bool = False,
+    source_less_successors: frozenset[str] = frozenset(),
+) -> None:
+    entry = entries.pop(pending_id, None)
+    if entry is not None and not delivery_confirmed:
+        bare_text = _bare_text(_content_text(entry.content))
+        if bare_text:
+            key = (conversation_id, bare_text)
+            previous = _unconfirmed_input_texts.get(key, source_less_successors)
+            # An earlier unresolved settlement can only narrow the fallback.
+            _unconfirmed_input_texts[key] = previous & source_less_successors
+    if not entries:
+        _pending.pop(conversation_id, None)
+
+
+def release(
+    conversation_id: str,
+    drained: DrainedInput,
+    *,
+    delivery_confirmed: bool = False,
+    source_less_successors: frozenset[str] = frozenset(),
+) -> None:
     """
     Drop a held entry whose persist landed.
 
@@ -1061,14 +1095,30 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param drained: The entry returned by :func:`resolve_oldest` or
         :func:`resolve_matching_text` with ``hold=True``.
+    :param delivery_confirmed: Whether the settlement identified this entry's
+        own echo. Otherwise, its text alone cannot identify a later send.
+    :param source_less_successors: Same-text successors already queued when
+        a source-less echo was persisted under this entry's stable id.
     """
     with _lock:
         entries = _pending.get(conversation_id)
-        if entries is None:
-            return
-        entries.pop(drained.pending_id, None)
-        if not entries:
-            _pending.pop(conversation_id, None)
+        if entries is not None:
+            _settle_locked(
+                conversation_id,
+                entries,
+                drained.pending_id,
+                delivery_confirmed=delivery_confirmed,
+                source_less_successors=source_less_successors,
+            )
+
+
+def matches_unconfirmed_input_text(
+    conversation_id: str, text: str, *, source_less_pending_id: str | None = None
+) -> bool:
+    """Text alone can rule out a reliable match, but cannot establish delivery."""
+    with _lock:
+        successors = _unconfirmed_input_texts.get((conversation_id, _bare_text(text)))
+        return successors is not None and source_less_pending_id not in successors
 
 
 def resolve_matching_text(
@@ -1168,6 +1218,20 @@ def resolve_matching_text(
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
+        # Look across match tiers. A literal attachment marker or a command's
+        # injected prefix can also explain an otherwise exact mirror.
+        bare_needle = _bare_text(text) if not shell_command else exact_needle
+        shared_matches = [
+            index
+            for index, (_pid, entry) in enumerate(ordered)
+            if index != match_index
+            and (
+                texts[index] == bare_needle
+                if shell_command
+                else _bare_text(_content_text(entry.content)) == bare_needle
+                or _matches_injected_prefix(entry, exact_needle)
+            )
+        ]
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
@@ -1182,13 +1246,25 @@ def resolve_matching_text(
             ][:_MAX_ENTRIES_PER_CONVERSATION]
         )
         matched_id, matched_entry = ordered[match_index]
+        # A legacy source-less match can advance FIFO only when all other
+        # possible matches are still-live exact-text successors.
+        same_text_successors = (
+            frozenset(ordered[index][0] for index in shared_matches)
+            if match_method == "normalized_text"
+            and not shell_command
+            and all(
+                index > match_index
+                and texts[index] == exact_needle
+                and not (ordered[index][1].uncertain or interrupted[index])
+                for index in shared_matches
+            )
+            else frozenset()
+        )
         for pending_id, entry in [*skipped_entries, (matched_id, matched_entry)]:
             if hold:
                 entry.held = True
             else:
-                entries.pop(pending_id, None)
-        if not entries:
-            _pending.pop(conversation_id, None)
+                _settle_locked(conversation_id, entries, pending_id)
         # An entry a positional drain may have settled, or that the person
         # cancelled with Stop, is drained without an undelivered record.
         lost: list[DrainedInput] = []
@@ -1207,6 +1283,8 @@ def resolve_matching_text(
             match_method=match_method,
             skipped=lost,
             uncertain=uncertain,
+            shared_text=bool(shared_matches),
+            same_text_successors=same_text_successors,
         )
 
 
@@ -1427,6 +1505,14 @@ def _attachment_count(content: list[dict[str, Any]]) -> int:
     )
 
 
+def _bare_text(text: str) -> str:
+    while True:
+        stripped, removed = _ONE_LEADING_ATTACHMENT_MARKER_RE.subn("", text, count=1)
+        if not removed:
+            return _collapse_whitespace(text)
+        text = stripped
+
+
 def _strip_generated_markers(text: str, count: int) -> str:
     """
     Drop up to ``count`` generated attachment marker lines from the front of a mirror.
@@ -1480,3 +1566,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _unconfirmed_input_texts.clear()

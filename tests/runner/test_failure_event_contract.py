@@ -67,6 +67,14 @@ async def _assert_failure_on_both_streams(
                 assert failed[0][key] == message_fields[key]
         failures.append(failed[0])
     assert failures[0] == failures[1]
+    if "delivery_attempt_id" in message_fields:
+        [status] = [
+            event
+            for event in queued
+            if event["type"] == "session.status" and event["status"] == "failed"
+        ]
+        assert status["delivery_attempt_id"] == failures[0]["delivery_attempt_id"]
+        assert status["error"]["undelivered"] is True
     return failures[0]["error"]
 
 

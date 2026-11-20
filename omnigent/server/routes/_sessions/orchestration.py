@@ -5462,6 +5462,8 @@ async def _persist_external_conversation_item_unlocked(
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
     match_method: str | None = None
+    delivery_confirmed = False
+    source_less_successors: frozenset[str] = frozenset()
     # Every drain below holds its entries in place (``hold=True``): they keep
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
@@ -5572,6 +5574,19 @@ async def _persist_external_conversation_item_unlocked(
             raise
         if drained is not None:
             cleared_pending_id = drained.pending_id
+            prior_unconfirmed = pending_inputs.matches_unconfirmed_input_text(session_id, text)
+            clean_exact_match = match_method == "normalized_text" and not (
+                drained.uncertain or drained.interrupted
+            )
+            delivery_confirmed = match_method == "input_id" or (
+                match_method != "fifo_fallback"
+                and not (
+                    matched.shared_text
+                    or drained.uncertain
+                    or drained.interrupted
+                    or prior_unconfirmed
+                )
+            )
             if match_method == "injected_prefix_text":
                 item = item.model_copy(
                     update={"data": item.data.model_copy(update={"content": drained.content})}
@@ -5592,8 +5607,35 @@ async def _persist_external_conversation_item_unlocked(
                 drained.stable_id is not None
                 and item.stable_id is None
                 and item.idempotency_key is None
+                and (
+                    not prior_unconfirmed
+                    or match_method == "input_id"
+                    or (
+                        clean_exact_match
+                        and not pending_inputs.matches_unconfirmed_input_text(
+                            session_id, text, source_less_pending_id=drained.pending_id
+                        )
+                    )
+                )
             ):
                 item = item.model_copy(update={"stable_id": drained.stable_id})
+                # Keep the legacy source-less ids for co-queued same-text
+                # echoes without making the match proof for tagged echoes.
+                if clean_exact_match:
+                    source_less_successors = matched.same_text_successors
+            if (
+                drained.stable_id is not None
+                and item.stable_id != drained.stable_id
+                and item.idempotency_key is not None
+                and delivery_confirmed
+                and match_method in ("normalized_text", "attachment_normalized_text")
+                and isinstance(item.data, MessageData)
+            ):
+                item = item.model_copy(
+                    update={
+                        "data": item.data.model_copy(update={"web_stable_id": drained.stable_id})
+                    }
+                )
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
@@ -5618,12 +5660,16 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             original_held.append(drained)
             cleared_pending_id = drained.pending_id
+            delivery_confirmed = not (
+                drained.uncertain or drained.interrupted or matched.shared_text
+            )
         held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
             original_held.append(drained)
             cleared_pending_id = drained.pending_id
+            delivery_confirmed = not (drained.uncertain or drained.interrupted)
     if drained is not None:
         item = item.model_copy(
             update={
@@ -5667,11 +5713,19 @@ async def _persist_external_conversation_item_unlocked(
         _restore_drained_inputs(session_id, original_held, None)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id, True
-    # Landed: the drained entries are settled (uncertain ones leave without a
-    # record — their mirror may already have been attributed by position);
-    # older messages a slash command jumped over are still on their way and
-    # go back into play.
-    _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
+    # Skipped entries settled without their own echo. Entries merely held
+    # during a command match go back into play.
+    for entry in (*skipped_pending, *uncertain_pending):
+        pending_inputs.release(session_id, entry, delivery_confirmed=False)
+    if drained is not None:
+        pending_inputs.release(
+            session_id,
+            drained,
+            delivery_confirmed=delivery_confirmed,
+            source_less_successors=(
+                source_less_successors if persisted.id == drained.stable_id else frozenset()
+            ),
+        )
     _restore_drained_inputs(session_id, held_older, None)
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
@@ -5889,6 +5943,24 @@ def _native_input_reason_code(event: Mapping[str, Any]) -> str:
     return "unknown_lifecycle"
 
 
+def _native_delivery_error_identity(event: Mapping[str, Any]) -> dict[str, str]:
+    """Expose attempt correlation only for failures about handing input to the harness."""
+    if _native_input_reason_code(event) not in {
+        "native_input_delivery_uncertain",
+        "native_input_claim_refused",
+    } and not _failed_event_undelivered(event):
+        return {}
+    identity = input_attributes(event)
+    attempt = identity.get("delivery_attempt_id")
+    if not isinstance(attempt, str):
+        return {}
+    stable_id = identity.get("input_stable_id")
+    return {
+        "delivery_attempt_id": attempt,
+        **({"input_stable_id": stable_id} if isinstance(stable_id, str) else {}),
+    }
+
+
 def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) -> None:
     """Retain an identity-linked runner lifecycle edge on its queued web input."""
     event_type = event.get("type")
@@ -6036,14 +6108,17 @@ async def _settle_undelivered_native_input(
         )
         if isinstance(stable_id, str) and await defer_annotation(stable_id):
             return False
-    drained = pending_inputs.resolve(
-        session_id, matched_pending_id, hold=delivery_error is not None
-    )
+    drained = pending_inputs.resolve(session_id, matched_pending_id, hold=True)
     if drained is None:
         return False
+    # A restored automatic retry keeps its completed transcript row and retry marker.
+    restored_auto_retry = (
+        drained.auto_retry is not None and not uncertain and delivery_error is None
+    )
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
+        status="completed" if restored_auto_retry else "failed",
         data=MessageData(
             role="user",
             content=drained.content,
@@ -6062,16 +6137,21 @@ async def _settle_undelivered_native_input(
         annotation = delivery_error is not None and await defer_annotation(drained.stable_id)
         items = [] if annotation else [item]
         if delivery_error is not None:
-            items.append(
-                NewConversationItem(
-                    type="error",
-                    response_id=item.response_id,
-                    data=delivery_error,
-                    stable_id=_runner_input_error_id(
-                        session_id, drained.pending_id, drained.delivery_attempt_id, uncertain
-                    ),
-                )
+            delivery_item = NewConversationItem(
+                type="error",
+                response_id=item.response_id,
+                data=delivery_error,
+                stable_id=_runner_input_error_id(
+                    session_id, drained.pending_id, drained.delivery_attempt_id, uncertain
+                ),
             )
+            delivery_error = delivery_error.model_copy(
+                update={
+                    "delivery_attempt_id": drained.delivery_attempt_id,
+                    "input_stable_id": drained.stable_id,
+                }
+            )
+            items.append(delivery_item.model_copy(update={"data": delivery_error}))
         persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
     except Exception:  # noqa: BLE001 — the error item that follows still records the failure
         _logger.exception(
@@ -6096,9 +6176,9 @@ async def _settle_undelivered_native_input(
                 else "pending_id_and_delivery_attempt_id"
             ),
         )
+    pending_inputs.release(session_id, drained, delivery_confirmed=False)
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
     if delivery_error is not None:
-        pending_inputs.release(session_id, drained)
         _publish_error_event(session_id, delivery_error)
     return True
 
@@ -6250,20 +6330,6 @@ def _restore_drained_inputs(
     for entry in reversed([*skipped, drained]):
         if entry is not None:
             pending_inputs.restore(session_id, entry)
-
-
-def _release_drained_inputs(
-    session_id: str, entries: list[pending_inputs.DrainedInput | None]
-) -> None:
-    """
-    Drop a mirror's drained pending entries once their persist landed.
-
-    :param session_id: Conversation the entries belong to.
-    :param entries: The matched entry and any skipped ones; ``None`` is skipped.
-    """
-    for entry in entries:
-        if entry is not None:
-            pending_inputs.release(session_id, entry)
 
 
 def _build_skipped_native_items(
@@ -12708,7 +12774,9 @@ async def _relay_runner_stream_once(
                             # instead of ending the turn silently.
                             raw_err = event.get("error")
                             status_error = (
-                                ErrorDetail.model_validate(raw_err)
+                                ErrorDetail.model_validate(
+                                    {**raw_err, **_native_delivery_error_identity(event)}
+                                )
                                 if isinstance(raw_err, dict)
                                 else None
                             )
@@ -12994,7 +13062,12 @@ async def _relay_runner_stream_once(
                             "response.cancelled": "cancelled",
                         }.get(evt_type, "completed")
 
-                    error_item = _error_item_from_sse(event, response_id=current_response_id)
+                    delivery_identity = _native_delivery_error_identity(event)
+                    error_item = _error_item_from_sse(
+                        event,
+                        response_id=current_response_id,
+                        fallback_response_id=generate_task_id() if delivery_identity else None,
+                    )
                     pending_id = event.get("pending_id")
                     attempt_id = event.get("delivery_attempt_id")
                     reason_code = (
@@ -13032,7 +13105,6 @@ async def _relay_runner_stream_once(
                                 error_item.data
                                 if error_item is not None
                                 and isinstance(error_item.data, ErrorData)
-                                and not (uncertain or claim_refused)
                                 else None
                             ),
                         )
@@ -13050,15 +13122,36 @@ async def _relay_runner_stream_once(
                         await _settle_undelivered_native_input(
                             conversation_store,
                             session_id,
-                            current_response_id,
+                            error_item.response_id
+                            if error_item is not None
+                            else current_response_id,
                             event.get("input_stable_id"),
                             reason_code=reason_code,
                             pending_id=event.get("pending_id"),
                             delivery_attempt_id=event.get("delivery_attempt_id"),
                         )
+                    if delivery_identity:
+                        for envelope in (event, event.get("response")):
+                            if isinstance(envelope, dict) and isinstance(
+                                raw_error := envelope.get("error"), dict
+                            ):
+                                raw_error.update(delivery_identity)
                     if error_item is not None:
                         raw_input_stable_id = event.get("input_stable_id")
-                        if (
+                        if delivery_identity and isinstance(error_item.data, ErrorData):
+                            error_item = error_item.model_copy(
+                                update={
+                                    "data": error_item.data.model_copy(update=delivery_identity),
+                                    "stable_id": _runner_input_error_id(
+                                        session_id,
+                                        pending_id if isinstance(pending_id, str) else "",
+                                        delivery_identity["delivery_attempt_id"],
+                                        uncertain and isinstance(pending_id, str),
+                                    ),
+                                }
+                            )
+                            await _relay_persist(conversation_store, session_id, error_item)
+                        elif (
                             isinstance(error_item.data, ErrorData)
                             and _failed_event_undelivered(event)
                             and isinstance(raw_input_stable_id, str)

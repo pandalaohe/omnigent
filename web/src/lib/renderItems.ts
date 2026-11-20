@@ -72,6 +72,7 @@ export interface RenderErrorDetails {
   title?: string;
   cause?: string;
   remediation?: string;
+  deliveryAttemptId?: string;
 }
 
 export interface RelatedRenderError extends RenderErrorDetails {
@@ -632,12 +633,15 @@ function errorDetails(block: ErrorBlock): RelatedRenderError {
     ...(block.title ? { title: block.title } : {}),
     ...(block.cause ? { cause: block.cause } : {}),
     ...(block.remediation ? { remediation: block.remediation } : {}),
+    ...(block.deliveryAttemptId ? { deliveryAttemptId: block.deliveryAttemptId } : {}),
   };
 }
 
 /** Errors are related only when the transcript gives them the same causal identity. */
 function errorsShareCausalBoundary(first: ErrorBlock, next: ErrorBlock): boolean {
   return (
+    !first.deliveryAttemptId &&
+    !next.deliveryAttemptId &&
     !isAnonymousRid(first.ctx.responseId) &&
     first.ctx.responseId === next.ctx.responseId &&
     first.ctx.turn === next.ctx.turn &&
