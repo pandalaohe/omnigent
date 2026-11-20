@@ -969,10 +969,16 @@ async def _deliver_with_retry(
             else:
                 from omnigent.server.session_succession import (
                     claude_transfer_lock,
+                    expire_claude_transfer,
                     released_succession_target,
                 )
 
                 async with claude_transfer_lock(session_id):
+                    current = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if current is not None:
+                        await expire_claude_transfer(conversation_store, current)
                     target = await asyncio.to_thread(
                         released_succession_target,
                         conversation_store,

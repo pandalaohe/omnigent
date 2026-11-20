@@ -347,10 +347,12 @@ def _question_event() -> dict[str, Any]:
     }
 
 
-def _succession_notices(store: SqlAlchemyConversationStore, session_id: str) -> list[Any]:
+def _succession_notices(
+    store: SqlAlchemyConversationStore, session_id: str, *, code: str = "session_succession"
+) -> list[Any]:
     """All persisted succession notices on a session."""
     page = store.list_items(session_id, limit=200, order="desc", type="error")
-    return [item for item in page.data if getattr(item.data, "code", None) == "session_succession"]
+    return [item for item in page.data if getattr(item.data, "code", None) == code]
 
 
 @pytest.mark.parametrize(
@@ -737,47 +739,36 @@ async def test_claude_transfer_recovers_after_disconnect_before_the_move(
         wake.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    ("placement", "late_move"),
-    [("archived", False), ("archived", True), ("split", False), ("unbound", False)],
-)
+@pytest.mark.parametrize("placement", ["archived", "split", "unbound"])
 async def test_claude_transfer_reconciles_on_original_runner_after_placement_changes(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
     monkeypatch: pytest.MonkeyPatch,
     placement: str,
-    late_move: bool,
 ) -> None:
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
     old, new, path = await _prepare_claude_transfer(client, store)
     pane = _transfer_test_terminal("original")
-    owner = old
     probes: list[str] = []
     transfers: list[str] = []
     original_post = runner.post
 
     async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
         probes.append(url)
-        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
+        return _terminal_probe(url, pane if f"/sessions/{old}/" in url else None)
 
     async def post(url: str, **kwargs: Any) -> httpx.Response:
-        nonlocal owner
         if not url.endswith("/transfer"):
             return await original_post(url, **kwargs)
         transfers.append(url)
-        if len(transfers) == 1:
-            assert owner == old
-            raise httpx.ReadTimeout("disconnected before move")
-        assert owner == new and f"/sessions/{new}/" in url
-        assert kwargs["json"] == {"target_session_id": old, "expected_instance_id": "original"}
-        owner = old
-        return httpx.Response(200, json=pane)
+        assert transfers == [path]
+        raise httpx.ReadTimeout("disconnected before move")
 
     monkeypatch.setattr(runner, "get", get_terminal, raising=False)
     monkeypatch.setattr(runner, "post", post)
     first = await client.post(path, json={"target_session_id": new})
-    assert first.status_code == 502 and owner == old
+    assert first.status_code == 502
     source = store.get_conversation(old)
     assert source is not None and succession_module.claude_transfer_pending(source)
     assert store.get_succession(old, new) is None
@@ -790,8 +781,6 @@ async def test_claude_transfer_reconciles_on_original_runner_after_placement_cha
     else:
         store.clear_runner_id(old)
         store.clear_runner_id(new)
-    if late_move:
-        owner = new  # The abandoned request completed before reconciliation.
     probes.clear()
     await succession_module.resume_successions_for_runner(
         RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
@@ -802,8 +791,7 @@ async def test_claude_transfer_reconciles_on_original_runner_after_placement_cha
     assert not succession_module.claude_transfer_pending(source)
     assert store.get_succession(old, new) is None
     assert {url.split("/")[3] for url in probes} == {old, new}
-    assert len(transfers) == 1 + int(late_move)
-    assert owner == old
+    assert transfers == [path]
 
 
 async def test_claude_transfer_recovers_forward_after_successor_uses_pane_and_source_unbinds(
@@ -1038,6 +1026,215 @@ async def test_old_claude_input_recovers_transfer_after_all_retries_timeout(
     assert dispatch.await_args is not None and dispatch.await_args.args[0] == old
 
 
+@pytest.mark.parametrize("failure", ["disconnected", "server_restart", "archived_target"])
+async def test_unconfirmed_claude_transfer_expires_without_moving_the_pane(
+    client: httpx.AsyncClient,
+    succession_app: FastAPI,
+    store: SqlAlchemyConversationStore,
+    db_uri: str,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client, "transfer-expiry")
+    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
+    clock = 1000
+    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    token = "example-replacement-runner-token"
+    replacement_id = token_bound_runner_id(token)
+    original = runners.for_runner(RUNNER_ID)
+    replacement = runners.for_runner(replacement_id)
+    original_online = True
+    owner = old
+    pane = _transfer_test_terminal("original")
+
+    async def lookup(session_id: str, router: Any, *, conversation: Any = None) -> Any:
+        row = conversation if conversation is not None else store.get_conversation(session_id)
+        if row is None or row.runner_id is None:
+            return None
+        if row.runner_id == RUNNER_ID and not original_online:
+            return None
+        return runners.for_runner(row.runner_id)
+
+    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
+        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
+
+    async def fail_transfer(url: str, **kwargs: Any) -> httpx.Response:
+        assert url == path
+        raise httpx.ReadTimeout("transfer timed out before move")
+
+    async def initialize_replacement(url: str, **kwargs: Any) -> httpx.Response:
+        assert url == "/v1/sessions" and kwargs["json"]["session_id"] == old
+        return httpx.Response(
+            201,
+            request=httpx.Request("POST", url),
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+        )
+
+    transfer = AsyncMock(side_effect=fail_transfer)
+    dispatch = AsyncMock(
+        return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
+    )
+    monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
+    monkeypatch.setattr(original, "get", get_terminal, raising=False)
+    monkeypatch.setattr(original, "post", transfer)
+    monkeypatch.setattr(replacement, "post", initialize_replacement)
+    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
+
+    first = await client.post(path, json={"target_session_id": new})
+    assert first.status_code == 502, first.text
+    label = succession_module._CLAUDE_TRANSFER_LABEL
+    source = store.get_conversation(old)
+    assert source is not None and json.loads(source.labels[label])["expires_at"] == 1900
+    assert succession_app.state.runner_exit_reports.get(RUNNER_ID) is None
+    store.replace_runner_id(old, replacement_id)
+    if failure == "archived_target":
+        store.update_conversation(new, archived=True)
+        owner = new  # The timed-out operation finishes while the target is archived.
+        await succession_module.resume_successions_for_runner(
+            RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+    else:
+        original_online = False
+    previous_successor = store.get_conversation(new)
+
+    clock += 899
+    if failure == "server_restart":
+        # Restart the process-local driver using the same database and no exit report.
+        expiration = succession_module._claude_transfer_expirations.pop(old)
+        expiration.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await expiration
+        await succession_module.resume_unfinished_successions(
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            runner_router=None,
+            peer_message_store=None,
+        )
+    events = f"/v1/sessions/{old}/events"
+
+    async def fire_timer() -> httpx.Response:
+        return await client.post(
+            events,
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json=_wake_event("[System: timer timer_one fired]", is_meta=True),
+        )
+
+    async def deliver_answer() -> bool | None:
+        return await orchestration._deliver_with_retry(
+            old,
+            "[System: question answered #question]",
+            conversation_store=store,
+            runner_router=None,
+            persist_failure=False,
+            card_answer_wake=orchestration._CardAnswerWake(None, QUESTION_ID),
+        )
+
+    answer_delivery = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", answer_delivery)
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+    blocked = await client.post(events, json=_wake_event("Continue here"))
+    assert blocked.status_code == 409, blocked.text
+    assert (await fire_timer()).json()["timer_delivery"] == "held"
+    assert await deliver_answer() is False
+    answer_delivery.assert_not_awaited()
+    dispatch.assert_not_awaited()
+    code = "session_succession_expired"
+    assert not _succession_notices(store, old, code=code)
+
+    clock += 1
+    if failure == "server_restart":
+        expiration = succession_module._claude_transfer_expirations[old]
+        await asyncio.wait_for(expiration, timeout=5)
+        assert len(_succession_notices(store, old, code=code)) == 1
+    accepted = await client.post(events, json=_wake_event("Continue here"))
+    assert accepted.status_code == 202, accepted.text
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args is not None and dispatch.await_args.args[0] == old
+    assert dispatch.await_args.args[4] is replacement
+    timer = await fire_timer()
+    assert timer.status_code == 202 and "timer_delivery" not in timer.json(), timer.text
+    assert [call.args[0] for call in dispatch.await_args_list] == [old, old]
+    assert await deliver_answer() is True
+    answer_delivery.assert_awaited_once()
+    assert answer_delivery.await_args is not None and answer_delivery.await_args.args[0] == old
+    source = store.get_conversation(old)
+    assert source is not None and not source.archived
+    assert json.loads(source.labels[label])["abandoned"] is True
+    assert store.get_succession(old, new) is None
+    assert store.get_conversation(new) == previous_successor
+    assert owner == (new if failure == "archived_target" else old)
+
+    await succession_module.resume_unfinished_successions(
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        runner_router=None,
+        peer_message_store=None,
+    )
+    if failure != "archived_target":
+        stale_retry = await client.post(path, json={"target_session_id": new})
+        assert stale_retry.status_code == 409, stale_retry.text
+    transfer.assert_awaited_once()
+    (notice,) = _succession_notices(store, old, code=code)
+    assert notice.data.message == (
+        f"The handover to session {new} was not confirmed in time. "
+        "This session continues. The successor session was left as is."
+    )
+
+
+async def test_claude_transfer_lease_renews_only_on_new_runner_confirmation(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old, new, path = await _prepare_claude_transfer(client, store)
+    clock = 1000
+    monkeypatch.setattr(succession_module, "now_epoch", lambda: clock)
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    owner = old
+    can_move = False
+    pane = _transfer_test_terminal("original")
+
+    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
+        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
+
+    async def post(url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal owner
+        assert url == path
+        if not can_move:
+            raise httpx.ReadTimeout("transfer timed out before move")
+        owner = new
+        return httpx.Response(200, json=pane)
+
+    async def attempt_at(timestamp: int) -> int:
+        nonlocal clock
+        clock = timestamp
+        response = await client.post(path, json={"target_session_id": new})
+        assert response.status_code == 502, response.text
+        source = store.get_conversation(old)
+        assert source is not None
+        return json.loads(source.labels[succession_module._CLAUDE_TRANSFER_LABEL])["expires_at"]
+
+    transfer = AsyncMock(side_effect=post)
+    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
+    monkeypatch.setattr(runner, "post", transfer)
+    commit = AsyncMock(side_effect=ConnectionError("receipt could not be written"))
+    monkeypatch.setattr(succession_module, "_commit_claude_transfer", commit)
+
+    assert await attempt_at(1000) == 1900
+    assert await attempt_at(1200) == 1900
+    commit.assert_not_awaited()
+    can_move = True
+    assert await attempt_at(1500) == 2400
+    assert owner == new
+    assert await attempt_at(2000) == 2400
+    assert transfer.await_count == 3  # The last attempt saw the same confirmation.
+    assert commit.await_count == 2
+
+
 async def test_claude_transfer_replay_drives_receipt_after_intent_cleanup_failure(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
@@ -1250,7 +1447,14 @@ async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
     assert response.status_code == 200, response.text
     new = response.json()["id"]
     store.set_runner_id(new, runner_id)
-    store.set_labels(old, {succession_module._CLAUDE_TRANSFER_LABEL: "prepared-transfer"})
+    store.set_labels(
+        old,
+        {
+            succession_module._CLAUDE_TRANSFER_LABEL: json.dumps(
+                {"target": new, "id": "prepared-transfer", "expires_at": int(time.time()) + 900}
+            )
+        },
+    )
 
     dispatch = AsyncMock(return_value=True)
     launch = AsyncMock()

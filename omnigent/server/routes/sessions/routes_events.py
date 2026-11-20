@@ -375,10 +375,12 @@ from omnigent.server.session_live_state import handoff_count, last_liveness_stam
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.session_succession import (
+    claude_transfer_expired,
     claude_transfer_fenced,
     claude_transfer_lock,
     claude_transfer_pending,
     copy_succession_file,
+    expire_claude_transfer,
     is_requested_claude_transfer,
     recover_claude_transfer_on_input,
     released_succession_target,
@@ -2226,7 +2228,13 @@ def register_events_routes(
             if current is None:
                 raise _session_not_found()
             conv = current
-        pending_transfer = claude_transfer_pending(conv)
+        if claude_transfer_expired(conv):
+            async with claude_transfer_lock(session_id):
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if current is None:
+                    raise _session_not_found()
+                await expire_claude_transfer(conversation_store, current)
+                conv = current
         observation = body.type.startswith("external_") or body.type in {
             _SUBAGENT_STATUS_TYPE,
             SDK_PEER_RECEIPT_EVENT,
@@ -2235,8 +2243,12 @@ def register_events_routes(
         async def claude_wake_ack(current: Conversation) -> dict[str, bool | str | None] | None:
             if not claude_transfer_fenced(current):
                 return None
+            pending = claude_transfer_pending(current)
+            successor = current.labels.get(SUCCEEDED_BY_LABEL_KEY)
+            if not pending and successor is None:
+                return None  # The lease expired while admitting this wake.
             if _is_subagent_wake(body) and _has_bound_runner_authority(request, current):
-                if claude_transfer_pending(current):
+                if pending:
                     raise OmnigentError(
                         "Claude terminal transfer is unconfirmed",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2246,7 +2258,6 @@ def register_events_routes(
                 content = body.data.get("content")
                 text = _message_text(content) if isinstance(content, list) else None
                 if text is not None and text.startswith(_TIMER_WAKE_PREFIX):
-                    successor = current.labels.get(SUCCEEDED_BY_LABEL_KEY)
                     receipt = (
                         await asyncio.to_thread(
                             conversation_store.get_succession, session_id, successor
@@ -2255,16 +2266,14 @@ def register_events_routes(
                         else None
                     )
                     # Keep the firing registered until rekey inventories and cancels it.
-                    held = claude_transfer_pending(current) or (
-                        receipt is not None and receipt.phase == "moved"
-                    )
+                    held = pending or (receipt is not None and receipt.phase == "moved")
                     return {"queued": False, "timer_delivery": "held" if held else "dropped"}
             return None
 
         wake_ack = await claude_wake_ack(conv)
         if wake_ack is not None:
             return wake_ack
-        if pending_transfer and not observation:
+        if not observation and claude_transfer_pending(conv):
             raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
         if body.type == "message":
             for key in (
@@ -5251,6 +5260,8 @@ def register_events_routes(
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is None:
                 raise _session_not_found()
+            if claude_transfer_expired(current):
+                await expire_claude_transfer(conversation_store, current)
             wake_ack = await claude_wake_ack(current)
             if wake_ack is not None:
                 return wake_ack
