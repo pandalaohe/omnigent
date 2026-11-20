@@ -249,6 +249,7 @@ class _CapturingResourceRegistry:
         resource_role: str | None = None,
         origin: str = "harness",
         elevated: bool = False,
+        agent_tier: str | None = None,
     ) -> SessionResourceView:
         """Capture an auxiliary terminal launch."""
         result = await self._launch(
@@ -264,6 +265,7 @@ class _CapturingResourceRegistry:
         )
         result.metadata["origin"] = origin
         result.metadata["elevated"] = elevated
+        result.metadata["agent_tier"] = agent_tier
         return result
 
     async def _launch(
