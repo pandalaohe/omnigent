@@ -154,11 +154,8 @@ class AutoRotationNotices:
                         self._store.set_labels(session_id, {DRAFT_LABEL_KEY: "true"})
                         conv = replace(conv, labels=conv.labels | {DRAFT_LABEL_KEY: "true"})
                 status = self._status(conv)
-                if (
-                    status.enabled
-                    and status.eligible
-                    and not conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
-                ):
+                # The switch only decides retry or report, so off requests are rebuilt too.
+                if status.eligible and not conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
                     if not attempt_failed(conv):
                         self.track(session_id, revision)
 

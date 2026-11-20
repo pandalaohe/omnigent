@@ -462,8 +462,9 @@ async def test_busy_session_gets_one_validated_rotation_prompt(db_uri, change):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restarted", [False, True])
 @pytest.mark.parametrize("draft", [False, True])
-async def test_switched_off_request_is_reported_without_runner_calls(db_uri, draft):
+async def test_switched_off_request_is_reported_without_runner_calls(db_uri, draft, restarted):
     """With auto-rotation off nothing retries, so a request that did not run is reported once."""
     store = SqlAlchemyConversationStore(db_uri)
     conv = due_session(store, enabled="off")
@@ -478,9 +479,16 @@ async def test_switched_off_request_is_reported_without_runner_calls(db_uri, dra
         base_url="http://runner",
     ) as client:
         notices = service(store, client, [], ["idle"], [{}])
-        notices.track(conv.id, "0")
-        for _ in range(6):
-            await notices.tick()
+        if restarted:
+            # A server restart rebuilds the tracker from the persisted request labels.
+            await notices.start(SimpleNamespace())
+        else:
+            notices.track(conv.id, "0")
+        try:
+            for _ in range(6):
+                await notices.tick()
+        finally:
+            await notices.shutdown()
     assert calls == []
     errors = store.list_items(conv.id, type="error").data
     assert len(errors) == 1
