@@ -699,7 +699,7 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The notice post runs beside forwarding; a failure is logged, a pending post is cancelled."""
+    """The notice post runs beside forwarding; failures are logged, teardown awaits its exit."""
     caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
     harness = codex_launch_harness
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
@@ -708,6 +708,8 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
     forwarding = asyncio.Event()
     notice_started = asyncio.Event()
     notice_cancelled = asyncio.Event()
+    notice_cleanup_release = asyncio.Event()
+    client_closed_at_cleanup: list[bool] = []
 
     async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
         return thread_id
@@ -724,6 +726,8 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             notice_cancelled.set()
+            await notice_cleanup_release.wait()  # e.g. auth cleanup awaiting its worker
+            client_closed_at_cleanup.append(harness.server_client.is_closed)
             raise
 
     def record_binding(request: httpx.Request) -> httpx.Response:
@@ -760,8 +764,14 @@ async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
         assert isinstance(failures[0].exc_info[1], ValueError)
     else:
         assert failures == []
-        assert await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
+        stopping = asyncio.create_task(runner_native._cancel_auto_forwarder_task(_SESSION_ID))
         await asyncio.wait_for(notice_cancelled.wait(), timeout=5)
+        _done, pending = await asyncio.wait({stopping}, timeout=0.5)
+        assert pending == {stopping}  # teardown waits for the notice's cleanup
+        notice_cleanup_release.set()
+        assert await asyncio.wait_for(stopping, timeout=5)
+        await harness.server_client.aclose()  # the runner closes its client after teardown
+        assert client_closed_at_cleanup == [False]
 
 
 @pytest.mark.asyncio

@@ -7349,6 +7349,20 @@ def _log_codex_thread_ready_failure(task: asyncio.Task[None]) -> None:
         _logger.warning("Codex thread-ready hook %s failed", task.get_name(), exc_info=exc)
 
 
+async def _wait_codex_thread_ready_exit(task: asyncio.Task[None] | None) -> None:
+    """Let a cancelled thread-ready hook finish its request cleanup before teardown returns."""
+    if task is None:
+        return
+    # asyncio.wait never raises the task's outcome; its done callback logs a failure.
+    _done, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
+    if pending:
+        _logger.warning(
+            "Cancelled Codex thread-ready hook %s did not finish within %.0fs",
+            task.get_name(),
+            _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
+        )
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -7426,7 +7440,7 @@ async def _codex_discover_thread_and_forward(
     :param on_thread_ready: Run as a background task once the thread is
         adopted, its bridge state published and its server binding sent, e.g.
         to post a launch notice only a usable session should show. Never
-        called when no thread starts; cancelled when forwarding ends.
+        called when no thread starts; cancelled and awaited when forwarding ends.
     """
     from omnigent.harnesses.codex_native.app_server import apply_codex_thread_permissions
     from omnigent.harnesses.codex_native.bridge import (
@@ -7806,7 +7820,10 @@ async def _codex_discover_thread_and_forward(
             try:
                 await _shutdown_session_router_async(session_id, subagent_router)
             finally:
-                await _shutdown_session_turn_router_async(session_id, turn_router)
+                try:
+                    await _shutdown_session_turn_router_async(session_id, turn_router)
+                finally:
+                    await _wait_codex_thread_ready_exit(thread_ready_task)
 
 
 async def _codex_forward_known_thread(
