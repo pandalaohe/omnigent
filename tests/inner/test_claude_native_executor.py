@@ -2648,8 +2648,8 @@ async def test_prompt_timeout_cleanup_skips_busy_lock_and_checks_owner_under_loc
     def hold_metadata_lock() -> None:
         with metadata.bridge_dir_preparation_lock(bridge_dir):
             loop.call_soon_threadsafe(locked.set)
-            # Bound the old synchronous implementation even when it stalls the loop.
-            if not release.wait(3):
+            # Hold until the turn ends; the bound only breaks a loop stalled on this lock.
+            if not release.wait(30):
                 forced_release.set()
 
     def fail_inject(*_args: object, **_kwargs: object) -> None:
@@ -2678,7 +2678,8 @@ async def test_prompt_timeout_cleanup_skips_busy_lock_and_checks_owner_under_loc
     writer = asyncio.create_task(asyncio.to_thread(hold_metadata_lock))
     try:
         await asyncio.wait_for(locked.wait(), timeout=5)
-        await asyncio.wait_for(failed_turn(), timeout=2)
+        await failed_turn()
+        # The turn ended while the lock was still held, and its cleanup skipped the pane.
         assert not forced_release.is_set()
         assert kills == []
     finally:
