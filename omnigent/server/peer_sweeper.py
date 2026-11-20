@@ -46,6 +46,7 @@ from starlette.requests import Request
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation, ErrorData, MessageData
+from omnigent.runtime import pending_inputs
 from omnigent.sdk_peer_delivery import sdk_attempt, sdk_attempt_reason
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
@@ -709,21 +710,42 @@ class PeerSweeper:
         duplicate resend of a delivery that actually succeeded; it ages
         into a later tick's pass once the grace elapses.
         """
-        try:
-            records = await asyncio.to_thread(
-                self._store.list_due, ("delivering",), self._batch_limit
-            )
-        except Exception:
-            _logger.exception("Peer sweeper failed to list delivering records")
-            return
-        for record in records:
-            age_from = record.updated_at if record.updated_at is not None else record.created_at
-            if now - age_from < _RECONCILE_GRACE_S and _native_attempt_id(record.reason) is None:
-                continue
+        limit = self._batch_limit
+        seen: set[str] = set()
+        held = 0
+        while True:
             try:
-                await self._reconcile_one(record, now, age_from=age_from)
+                records = await asyncio.to_thread(self._store.list_due, ("delivering",), limit)
             except Exception:
-                _logger.exception("Peer sweeper reconciliation failed for record %s", record.id)
+                _logger.exception("Peer sweeper failed to list delivering records")
+                return
+            for record in records:
+                if record.id in seen:
+                    continue
+                seen.add(record.id)
+                if pending_inputs.holds_peer_message(record.receiver_session_id, record.id):
+                    # The receiver's runner still holds this copy and delivers it
+                    # once the terminal can take it; a resend would paste it twice.
+                    held += 1
+                    continue
+                age_from = (
+                    record.updated_at if record.updated_at is not None else record.created_at
+                )
+                if (
+                    now - age_from < _RECONCILE_GRACE_S
+                    and _native_attempt_id(record.reason) is None
+                ):
+                    continue
+                try:
+                    await self._reconcile_one(record, now, age_from=age_from)
+                except Exception:
+                    _logger.exception(
+                        "Peer sweeper reconciliation failed for record %s", record.id
+                    )
+            # Held records never expire, so they must not use up the page.
+            if len(records) < limit or limit >= self._batch_limit + held:
+                return
+            limit = self._batch_limit + held
 
     async def _reconcile_one(
         self, record: SessionPeerMessage, now: int, *, age_from: int | None = None
@@ -774,8 +796,10 @@ class PeerSweeper:
             if any(
                 _is_record_marker(match, record.id)
                 and (
-                    not native_attempt
-                    or (
+                    # A copy the runner lost is stored as a failed row; it is no receipt.
+                    getattr(match, "status", None) != "failed"
+                    if not native_attempt
+                    else (
                         isinstance(match.response_id, str)
                         and match.response_id.startswith(
                             ("codex_", "pi-consumed-user-", "agy-consumed-user-")
@@ -785,7 +809,8 @@ class PeerSweeper:
                 for match in matches
             ):
                 break
-            if not native_attempt or len(matches) < limit:
+            # Page past failed rows and quotes until a short page ends the search.
+            if len(matches) < limit:
                 matches = []
                 break
             limit *= 2

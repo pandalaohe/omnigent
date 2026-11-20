@@ -712,6 +712,37 @@ def test_interrupted_flag_survives_ttl_eviction_of_held_restore(
     assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
 
 
+@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "failed"])
+def test_ttl_eviction_of_a_held_entry_leaves_its_record_to_the_persist(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Expiry during a persist writes no same-text record; the persist's outcome decides."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    first = pending_inputs.record("conv_ttl_hold", [_text_block("ship it")], stable_id="a" * 32)
+    held = pending_inputs.resolve_matching_text("conv_ttl_hold", "ship it", hold=True)
+    assert held.matched is not None and held.matched.pending_id == first
+
+    clock["t"] += pending_inputs._TTL_S + 0.1
+    assert pending_inputs.snapshot_for("conv_ttl_hold") == []
+    assert not pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it")
+
+    if outcome == "failed":
+        pending_inputs.restore("conv_ttl_hold", held.matched)
+    else:
+        pending_inputs.release(
+            "conv_ttl_hold", held.matched, delivery_confirmed=outcome == "confirmed"
+        )
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_ttl_hold")] == (
+        [first] if outcome == "failed" else []
+    )
+    # Only an entry that settled without its own echo blocks a same-text successor.
+    assert pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it") is (
+        outcome == "unconfirmed"
+    )
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("matched", [False, True])
 def test_title_preference_survives_drain_and_restore(enabled: bool, matched: bool) -> None:

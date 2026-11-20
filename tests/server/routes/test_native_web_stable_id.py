@@ -130,6 +130,7 @@ async def test_mirror_without_an_exact_link_names_no_web_send(
     assert "web_stable_id" not in receipts[-1]["data"]
 
 
+@pytest.mark.parametrize("attached", [False, True], ids=["text", "attached"])
 @pytest.mark.parametrize(
     "second_source_id", [None, "tagged-echo"], ids=["co-queued-source-less", "tagged-second"]
 )
@@ -138,24 +139,29 @@ async def test_same_text_mirrors_keep_legacy_ids_only_for_co_queued_source_less_
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     second_source_id: str | None,
+    attached: bool,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Native")
     publish = Mock()
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
-    content = [{"type": "input_text", "text": "ship it"}]
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": "ship it"}]
+    mirror_text = "ship it"
+    if attached:
+        content.insert(0, {"type": "input_image", "file_id": "file_x", "filename": "x.png"})
+        mirror_text = "[Attached: /tmp/x.png]\n\nship it"
     pending_inputs.record(conv.id, content, stable_id=_WEB_ID)
     pending_inputs.record(conv.id, content, stable_id=_OTHER_WEB_ID)
 
     try:
         first_id, replay = await _persist_external_conversation_item(
-            conv.id, conv, _mirror("ship it", source_id=None), store
+            conv.id, conv, _mirror(mirror_text, source_id=None), store
         )
         assert first_id == _WEB_ID and not replay
         assert pending_inputs.matches_unconfirmed_input_text(conv.id, "ship it")
 
         second_id, replay = await _persist_external_conversation_item(
-            conv.id, conv, _mirror("ship it", source_id=second_source_id), store
+            conv.id, conv, _mirror(mirror_text, source_id=second_source_id), store
         )
         assert second_id != first_id and not replay
         assert (second_id == _OTHER_WEB_ID) is (second_source_id is None)
@@ -381,7 +387,7 @@ async def test_settlement_remembers_text_unless_delivery_is_confirmed(
             pending_inputs.resolve(conv.id, pending["pending_id"])
 
 
-@pytest.mark.parametrize(
+_COMMAND_MIRRORS = pytest.mark.parametrize(
     ("text", "item_type", "item_data"),
     [
         (
@@ -398,6 +404,49 @@ async def test_settlement_remembers_text_unless_delivery_is_confirmed(
     ],
     ids=["slash", "shell"],
 )
+
+
+def _command_mirror(item_type: str, item_data: dict[str, Any]) -> SessionEventInput:
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": item_type,
+            "item_data": item_data,
+            "response_id": "resp_command",
+            "source_id": "command-echo",
+        },
+    )
+
+
+@_COMMAND_MIRRORS
+@pytest.mark.asyncio
+async def test_command_resend_after_stop_leaves_its_echo_ambiguous(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    item_type: str,
+    item_data: dict[str, Any],
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    stopped = pending_inputs.record(conv.id, [{"type": "input_text", "text": text}])
+    pending_inputs.mark_interrupted(conv.id, [stopped])
+    resend = pending_inputs.record(conv.id, [{"type": "input_text", "text": text}])
+    try:
+        item_id, replay = await _persist_external_conversation_item(
+            conv.id, conv, _command_mirror(item_type, item_data), store
+        )
+        assert item_id and not replay
+        # The live resend takes the mirror, which may still be the stopped send's echo.
+        assert pending_inputs.resolve(conv.id, resend) is None
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, text)
+    finally:
+        pending_inputs.resolve(conv.id, stopped)
+        pending_inputs.resolve(conv.id, resend)
+
+
+@_COMMAND_MIRRORS
 @pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
 @pytest.mark.asyncio
 async def test_command_mirror_remembers_text_when_delivery_is_uncertain(

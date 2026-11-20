@@ -119,7 +119,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -270,6 +270,7 @@ class DrainedInput:
     last_runner_renewal: float | None = None
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
+    peer_message_id: str | None = None
 
 
 @dataclass
@@ -355,6 +356,7 @@ class _Entry:
     admission_id: str | None = None
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
+    peer_message_id: str | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -370,6 +372,23 @@ _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] 
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
 )
 _lock = threading.Lock()
+
+# Optional check the server wires to its cached session status; called under
+# :data:`_lock`, so it must be cheap and non-blocking.
+_session_busy_check: Callable[[str], bool] | None = None
+
+
+def set_session_busy_check(check: Callable[[str], bool] | None) -> None:
+    """
+    Register (or clear) the check that reports a session mid-turn.
+
+    :param check: Callback invoked as ``check(conversation_id)``; ``True``
+        means the session still has a turn in flight, so a pasted message the
+        runner confirmed may still be absorbed at the turn's next step. Pass
+        ``None`` to clear.
+    """
+    global _session_busy_check
+    _session_busy_check = check
 
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
@@ -398,7 +417,8 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
         and now - entry.created_at > _TTL_S
     ]
     for pid in stale:
-        _settle_locked(conversation_id, entries, pid)
+        # A held entry's persist writes its same-text record (see release).
+        _settle_locked(conversation_id, entries, pid, delivery_confirmed=entries[pid].held)
 
 
 def make_pending_id(conversation_id: str, stable_id: str | None = None) -> str:
@@ -422,6 +442,7 @@ def record(
     injected_prefix: str | None = None,
     auto_retry: AutoRetryMetadata | None = None,
     runner_managed: bool = False,
+    peer_message_id: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -476,6 +497,7 @@ def record(
             injected_prefix=injected_prefix,
             auto_retry=auto_retry,
             last_runner_renewal=_now() if runner_managed else None,
+            peer_message_id=peer_message_id,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -537,6 +559,17 @@ def runner_input_is_claimed(conversation_id: str, pending_id: str) -> bool:
         return entry is not None and entry.runner_claim_id is not None
 
 
+def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
+    """Whether a live queued entry still carries this peer message to its runner."""
+    with _lock:
+        return any(
+            entry.peer_message_id == peer_message_id
+            and not entry.interrupted
+            and (entry.held or entry.last_runner_renewal is not None)
+            for entry in _pending.get(conversation_id, {}).values()
+        )
+
+
 def renew_runner_inputs(
     conversation_id: str, held_ids: set[str], active_ids: set[str]
 ) -> dict[str, int | None]:
@@ -564,6 +597,20 @@ def renew_runner_inputs(
                 entry.input_enqueued_at_ms if pending_id in active_ids else None
             )
             sending[pending_id] = entry.sending_since_ms
+        busy_check = _session_busy_check
+        if busy_check is not None and busy_check(conversation_id):
+            # A running turn absorbs a confirmed paste at its next step, which
+            # can outlast the claim lease; its mirror settles it.
+            for entry in entries.values():
+                if (
+                    entry.runner_claim_id is not None
+                    and entry.last_delivery_stage == "native_turn_completed"
+                    and not entry.held
+                    and not entry.interrupted
+                    and entry.last_runner_renewal is not None
+                    and now - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
+                ):
+                    entry.last_runner_renewal = now
     return sending
 
 
@@ -1049,6 +1096,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         last_runner_renewal=drained.last_runner_renewal,
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
+        peer_message_id=drained.peer_message_id,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1069,14 +1117,20 @@ def _settle_locked(
 ) -> None:
     entry = entries.pop(pending_id, None)
     if entry is not None and not delivery_confirmed:
-        bare_text = _bare_text(_content_text(entry.content))
-        if bare_text:
-            key = (conversation_id, bare_text)
-            previous = _unconfirmed_input_texts.get(key, source_less_successors)
-            # An earlier unresolved settlement can only narrow the fallback.
-            _unconfirmed_input_texts[key] = previous & source_less_successors
+        _record_unconfirmed_locked(conversation_id, entry.content, source_less_successors)
     if not entries:
         _pending.pop(conversation_id, None)
+
+
+def _record_unconfirmed_locked(
+    conversation_id: str, content: list[dict[str, Any]], source_less_successors: frozenset[str]
+) -> None:
+    bare_text = _bare_text(_content_text(content))
+    if bare_text:
+        key = (conversation_id, bare_text)
+        previous = _unconfirmed_input_texts.get(key, source_less_successors)
+        # An earlier unresolved settlement can only narrow the fallback.
+        _unconfirmed_input_texts[key] = previous & source_less_successors
 
 
 def release(
@@ -1089,8 +1143,8 @@ def release(
     """
     Drop a held entry whose persist landed.
 
-    Idempotent: an entry already gone (evicted by the TTL, or drained without
-    ``hold``) is a no-op.
+    An entry the TTL evicted meanwhile is gone already; its same-text record,
+    which the eviction left to this call, is still written when unconfirmed.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param drained: The entry returned by :func:`resolve_oldest` or
@@ -1102,7 +1156,7 @@ def release(
     """
     with _lock:
         entries = _pending.get(conversation_id)
-        if entries is not None:
+        if entries is not None and drained.pending_id in entries:
             _settle_locked(
                 conversation_id,
                 entries,
@@ -1110,6 +1164,8 @@ def release(
                 delivery_confirmed=delivery_confirmed,
                 source_less_successors=source_less_successors,
             )
+        elif not delivery_confirmed:
+            _record_unconfirmed_locked(conversation_id, drained.content, source_less_successors)
 
 
 def matches_unconfirmed_input_text(
@@ -1203,9 +1259,9 @@ def resolve_matching_text(
             match_index = _prefer_live(candidates, interrupted)
             if match_index is not None:
                 match_method = "injected_prefix_text"
+        marker_matches: list[int] = []
         if match_index is None:
             match_method = "attachment_normalized_text"
-            marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = 0 if shell_command else _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
@@ -1250,11 +1306,15 @@ def resolve_matching_text(
         # possible matches are still-live exact-text successors.
         same_text_successors = (
             frozenset(ordered[index][0] for index in shared_matches)
-            if match_method == "normalized_text"
+            if match_method in ("normalized_text", "attachment_normalized_text")
             and not shell_command
             and all(
                 index > match_index
-                and texts[index] == exact_needle
+                and (
+                    texts[index] == exact_needle
+                    if match_method == "normalized_text"
+                    else index in marker_matches
+                )
                 and not (ordered[index][1].uncertain or interrupted[index])
                 for index in shared_matches
             )
@@ -1383,6 +1443,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         admission_id=entry.admission_id,
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
+        peer_message_id=entry.peer_message_id,
     )
 
 

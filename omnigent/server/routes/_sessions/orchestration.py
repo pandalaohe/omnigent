@@ -869,6 +869,10 @@ class _NativeDeliveryUncertain(RuntimeError):
     """The runner may still deliver this input, so it must not be replayed."""
 
 
+class _NativePeerBuffered(HTTPException):
+    """A claim-capable runner holds this peer message until its terminal can take it."""
+
+
 @dataclass
 class _CardAnswerWake:
     app_state: State | None
@@ -5575,9 +5579,10 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             prior_unconfirmed = pending_inputs.matches_unconfirmed_input_text(session_id, text)
-            clean_exact_match = match_method == "normalized_text" and not (
-                drained.uncertain or drained.interrupted
-            )
+            clean_exact_match = match_method in (
+                "normalized_text",
+                "attachment_normalized_text",
+            ) and not (drained.uncertain or drained.interrupted)
             delivery_confirmed = match_method == "input_id" or (
                 match_method != "fifo_fallback"
                 and not (
@@ -5665,11 +5670,17 @@ async def _persist_external_conversation_item_unlocked(
             )
         held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
-        drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
+        matched = pending_inputs.resolve_matching_text(
+            session_id, shell_command, hold=True, shell_command=True
+        )
+        drained = matched.matched
         if drained is not None:
             original_held.append(drained)
             cleared_pending_id = drained.pending_id
-            delivery_confirmed = not (drained.uncertain or drained.interrupted)
+            # A same-command entry still queued means the mirror may be its echo.
+            delivery_confirmed = not (
+                drained.uncertain or drained.interrupted or matched.shared_text
+            )
     if drained is not None:
         item = item.model_copy(
             update={
@@ -9620,6 +9631,18 @@ async def _forward_native_terminal_message(
             if isinstance(accepted, dict) and accepted.get("status") == "buffered":
                 # Keep the durable peer record until the CLI transcript proves
                 # acceptance; a process-local buffer can vanish on restart.
+                if (
+                    supports_claim
+                    and event.get("pending_input_claim_required") is True
+                    and isinstance(runner_pending_id, str)
+                ):
+                    # A Claude runner holds this copy and will claim it later;
+                    # its heartbeat keeps the queued entry alive until then.
+                    pending_inputs.mark_delivery_stage(
+                        session_id, runner_pending_id, "forward_accepted"
+                    )
+                    pending_inputs.enable_runner_lease(session_id, runner_pending_id)
+                    raise _NativePeerBuffered(status_code=502, detail="Peer message is buffered")
                 raise HTTPException(status_code=502, detail="Peer message is buffered")
     if confirm and not any(
         frame.get("type") == "response.completed" for frame in _native_runner_response_events(resp)
@@ -11503,6 +11526,11 @@ async def _dispatch_session_event_to_runner_impl(
                     auto_retry=(
                         guard.metadata if (guard := active_retry_dispatch()) is not None else None
                     ),
+                    peer_message_id=(
+                        peer_message_id
+                        if isinstance(peer_message_id := body.data.get("peer_message_id"), str)
+                        else None
+                    ),
                 )
                 if queues_message
                 else None
@@ -11711,7 +11739,7 @@ async def _dispatch_session_event_to_runner_impl(
                 forwarded
                 or claimed
                 or lost_confirmation
-                or isinstance(exc, _NativeDeliveryUncertain)
+                or isinstance(exc, (_NativeDeliveryUncertain, _NativePeerBuffered))
             )
             log_input_event(
                 _logger,

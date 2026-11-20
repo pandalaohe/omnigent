@@ -99,6 +99,92 @@ async def test_native_peer_buffer_is_uncertain_until_transcript_acceptance(
         await orchestration._forward_native_terminal_message(runner, receiver.id, receiver, body)
 
 
+async def test_claim_capable_buffered_peer_stays_uncertain_through_delivery(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import SessionEventInput
+
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    peer_content = [{"type": "input_text", "text": "peer request"}]
+    web_content = [{"type": "input_text", "text": "web follow-up"}]
+    peer_pending = pending_inputs.record(receiver.id, peer_content, peer_message_id="a" * 32)
+    web_pending = pending_inputs.record(receiver.id, web_content)
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                202, json={"status": "buffered"}, headers={"X-Omnigent-Pending-Input-Claim": "1"}
+            )
+        ),
+    ) as runner:
+        try:
+            with pytest.raises(HTTPException, match="buffered") as raised:
+                await orchestration._forward_native_terminal_message(
+                    runner,
+                    receiver.id,
+                    receiver,
+                    SessionEventInput(
+                        type="message",
+                        data={
+                            "role": "user",
+                            "content": peer_content,
+                            "peer_message_id": "a" * 32,
+                        },
+                    ),
+                    input_delivery=pending_inputs.delivery_attributes_for(
+                        receiver.id, peer_pending
+                    ),
+                )
+            assert pending_inputs.runner_lease_remaining(receiver.id, peer_pending) is not None
+            # The peer layer still sees an unconfirmed delivery and keeps the record.
+            fake.error = raised.value
+            result = await peer_env["app"].state.peer_send(
+                sender=sender,
+                receiver_id=receiver.id,
+                text=f"buffered-{uuid.uuid4().hex}",
+                correlation_id=None,
+            )
+            assert result["disposition"] == "queued", result
+            assert result["reason"] == "uncertain"
+            stored = peer_env["peer_store"].get(result["peer_id"])
+            assert stored is not None and stored.state == "delivering"
+            # A plain web input on the same runner keeps the ordinary accepted path.
+            assert await orchestration._forward_native_terminal_message(
+                runner,
+                receiver.id,
+                receiver,
+                SessionEventInput(type="message", data={"role": "user", "content": web_content}),
+                input_delivery=pending_inputs.delivery_attributes_for(receiver.id, web_pending),
+            )
+            # A system input that waits for confirmation still reports it unconfirmed.
+            with pytest.raises(orchestration._NativeDeliveryUncertain):
+                await orchestration._forward_native_terminal_message(
+                    runner,
+                    receiver.id,
+                    receiver,
+                    SessionEventInput(
+                        type="message",
+                        data={
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "[System: note]"}],
+                            "confirm_delivery": True,
+                        },
+                    ),
+                )
+        finally:
+            fake.error = None
+            pending_inputs.resolve(receiver.id, peer_pending)
+            pending_inputs.resolve(receiver.id, web_pending)
+
+
 def _build_peer_app(
     *,
     conversation_store: SqlAlchemyConversationStore,
