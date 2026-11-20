@@ -107,6 +107,53 @@ describe("AutoRotationChip", () => {
     expect(screen.queryByTestId("auto-rotation-chip-trigger")).toBeNull();
   });
 
+  it.each([
+    [
+      "requested",
+      "Rotation requested: this session moves to a new session once the current turn ends and the session is idle.",
+    ],
+    [
+      "failed",
+      "This session could not continue in a new session automatically. Type /clear to continue.",
+    ],
+    [
+      "unconfirmed",
+      "Rotation unconfirmed. An injection attempt was recorded and will not be retried automatically. Inspect the terminal before typing /clear.",
+    ],
+    [
+      "draft_may_remain",
+      "Rotation unconfirmed; draft may remain. Inspect and clear the terminal input before pressing Enter.",
+    ],
+  ] as const)(
+    "shows the %s request state instead of promising a new session",
+    async (state, text) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: state }),
+      });
+
+      mountChip();
+      fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+
+      expect(screen.getByText(text)).toBeInTheDocument();
+      expect(screen.queryByText("Continues in a new session when this turn ends.")).toBeNull();
+    },
+  );
+
+  it("shows no request notice when the server reports none, even with the request label", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: null }),
+    });
+
+    mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+
+    expect(screen.getByText("Compactions: 1 of 4")).toBeInTheDocument();
+    expect(screen.queryByText("Continues in a new session when this turn ends.")).toBeNull();
+    expect(screen.queryByText(/^Rotation requested/)).toBeNull();
+  });
+
   it("displays status summary, approximate note, pending notice, and round-trips session overrides", async () => {
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,

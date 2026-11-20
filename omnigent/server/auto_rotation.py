@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from omnigent.server.schemas import AutoRotationStatus
+from omnigent.server.schemas import AutoRotationStatus, RotationRequestState
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.user_preferences_store import SESSION_COLLAB_NAMESPACE, _parse_collab_settings
 from omnigent.stores.conversation_store import (
@@ -69,6 +69,18 @@ def rotation_injected(conv: Conversation) -> bool:
     )
 
 
+def rotation_request_state(conv: Conversation) -> RotationRequestState | None:
+    """Describe the current request; failures read as the server's failure notice does."""
+    current = conv.labels.get(ROTATE_REQUESTED_LABEL_KEY) == str(conv.archive_revision)
+    if not current or conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
+        return None
+    if not attempt_failed(conv):
+        return "requested"
+    if conv.labels.get(DRAFT_LABEL_KEY):
+        return "draft_may_remain"
+    return "unconfirmed" if rotation_injected(conv) else "failed"
+
+
 def _label_int(value: str | None, minimum: int = 0, maximum: int | None = None) -> int | None:
     if value is None or not value.isascii() or not value.isdecimal():
         return None
@@ -104,6 +116,7 @@ def auto_rotation_for(
         sources=dict.fromkeys(AUTO_ROTATION_LABEL_KEYS, "default"),
         approximate=[],
         rotation_pending=bool(conv.labels.get(ROTATE_REQUESTED_LABEL_KEY)),
+        rotation_request=rotation_request_state(conv),
     )
     try:
         harness = _resolve_harness(conv)

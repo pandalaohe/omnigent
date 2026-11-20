@@ -11,10 +11,14 @@ from omnigent.entities import CompactionData, NewConversationItem
 from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.auto_rotation import (
+    ATTEMPT_LABEL_KEY,
     AUTO_ROTATION_LABEL_KEYS,
     AUTO_ROTATION_STATE_PREFIX,
+    DRAFT_LABEL_KEY,
+    FAILED_ATTEMPT_LABEL_KEY,
     FRESH_ROUND_LABEL_KEY,
     INFERRED_COMPACTIONS_LABEL_KEY,
+    INJECTED_ATTEMPT_LABEL_KEY,
     NOTICED_COUNT_LABEL_KEY,
     auto_rotation_for,
     record_auto_rotation_usage,
@@ -552,6 +556,47 @@ def test_approximation_and_unknown_usage(db_uri, harness, expected):
     assert "compactions" in status.approximate
     if harness == "codex-native":
         assert status.approximate == ["compactions"]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("none", None),
+        ("requested", "requested"),
+        ("other_revision", None),
+        ("superseded", None),
+        ("earlier_attempt_failed", "requested"),
+        ("failed", "failed"),
+        ("unconfirmed", "unconfirmed"),
+        ("draft_may_remain", "draft_may_remain"),
+    ],
+)
+def test_rotation_request_reports_the_current_request_like_its_notice(db_uri, case, expected):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="claude-native")
+    revision = str(conv.archive_revision)
+    attempt = f"{revision}:a1"
+    requested = {ROTATE_REQUESTED_LABEL_KEY: revision, ATTEMPT_LABEL_KEY: "a1"}
+    failed = {**requested, FAILED_ATTEMPT_LABEL_KEY: attempt}
+    labels = {
+        "none": {},
+        "requested": requested,
+        "other_revision": {**requested, ROTATE_REQUESTED_LABEL_KEY: f"{revision}1"},
+        "superseded": {**requested, SUCCEEDED_BY_LABEL_KEY: "successor"},
+        "earlier_attempt_failed": {**requested, FAILED_ATTEMPT_LABEL_KEY: f"{revision}:a0"},
+        "failed": failed,
+        "unconfirmed": {**failed, INJECTED_ATTEMPT_LABEL_KEY: attempt},
+        "draft_may_remain": {
+            **failed,
+            INJECTED_ATTEMPT_LABEL_KEY: attempt,
+            DRAFT_LABEL_KEY: "true",
+        },
+    }[case]
+    if labels:
+        store.set_labels(conv.id, labels)
+    status = auto_rotation_for(store.get_conversation(conv.id), store)
+    assert status.rotation_request == expected
+    assert status.rotation_pending is (ROTATE_REQUESTED_LABEL_KEY in labels)
 
 
 def test_stats_and_fork_successor_labels(db_uri):

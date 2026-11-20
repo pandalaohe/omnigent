@@ -1443,7 +1443,7 @@ describe("ErrorBanner — warning level", () => {
     ],
     [
       "unconfirmed",
-      "Rotation unconfirmed. The command was already injected and will not be retried automatically. Inspect the terminal before typing /clear.",
+      "Rotation unconfirmed. An injection attempt was recorded and will not be retried automatically. Inspect the terminal before typing /clear.",
     ],
   ])(
     "shows S3's %s session_rotation_failed message by default instead of fixed /clear guidance",

@@ -63,6 +63,9 @@ class AutoRotationPatch(BaseModel):
     remaining_pct: Annotated[int, Field(ge=1, le=90)] | Literal["default"] = "default"
 
 
+RotationRequestState = Literal["requested", "failed", "unconfirmed", "draft_may_remain"]
+
+
 class AutoRotationStatus(BaseModel):
     """Resolved settings and the latest context round of one session."""
 
@@ -79,6 +82,8 @@ class AutoRotationStatus(BaseModel):
     approximate: list[Literal["usage", "compaction_point", "compactions"]]
     due: bool = False
     rotation_pending: bool = False
+    #: The current request as the session should describe it; ``None`` without one.
+    rotation_request: RotationRequestState | None = None
 
 
 McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
