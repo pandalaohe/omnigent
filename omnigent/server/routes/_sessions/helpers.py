@@ -237,6 +237,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY,
+    _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY,
     _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
@@ -6836,6 +6838,12 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id or ""),
+            _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY: _truncate_label(
+                error.delivery_attempt_id or ""
+            ),
+            _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY: _truncate_label(
+                error.input_stable_id or ""
+            ),
         }
         if error is not None
         else {
@@ -6847,6 +6855,8 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -6882,7 +6892,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
 
     :param labels: Conversation labels, usually after closed-status projection.
     :returns: ``{"code": "...", "message": "..."}`` plus any recorded structured
-        field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
+        field (including delivery attempt and send IDs for native inputs),
         or ``None`` when either required value is absent/cleared.
     """
     raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
@@ -6898,6 +6908,8 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
             ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
             ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
             ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
+            ("delivery_attempt_id", _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY),
+            ("input_stable_id", _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY),
         ):
             value = labels.get(label)
             if value:

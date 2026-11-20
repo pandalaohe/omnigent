@@ -168,10 +168,19 @@ async def test_forwarder_cannot_set_web_stable_id(
     assert data.web_stable_id == expected
 
 
-@pytest.mark.parametrize("overlapping_attachment_send", [False, True])
+@pytest.mark.parametrize(
+    ("overlapping_attachment_send", "mirror_text"),
+    [
+        pytest.param(False, "ship it", id="manual-same-text-empty-queue"),
+        pytest.param(True, "[Attached file: /tmp/first.txt]\n\nship it", id="overlapping-send"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_claimed_uncertain_attempt_keeps_identity_for_a_late_echo(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, overlapping_attachment_send: bool
+async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    overlapping_attachment_send: bool,
+    mirror_text: str,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Native")
@@ -206,18 +215,22 @@ async def test_claimed_uncertain_attempt_keeps_identity_for_a_late_echo(
                 stable_id=_OTHER_WEB_ID,
             )
         item_id, replay = await _persist_external_conversation_item(
-            conv.id, conv, _mirror("[Attached file: /tmp/first.txt]\n\nship it"), store
+            conv.id, conv, _mirror(mirror_text, source_id="independent-terminal-record"), store
         )
-        assert item_id and not replay
+        assert item_id and item_id != _WEB_ID and not replay
         [error] = [item for item in store.list_items(conv.id).data if item.type == "error"]
         assert error.data.model_dump()["delivery_attempt_id"] == attempt_id
         assert error.data.model_dump()["input_stable_id"] == _WEB_ID
         mirror = store.get_item(conv.id, item_id)
         assert mirror is not None
-        assert mirror.to_api_dict().get("web_stable_id") == (
-            None if overlapping_attachment_send else _WEB_ID
-        )
+        assert "web_stable_id" not in mirror.to_api_dict()
         live = [call.args[1] for call in publish.call_args_list]
+        [mirror_consumed] = [
+            frame["data"]
+            for frame in live
+            if frame["type"] == "session.input.consumed" and frame["data"]["item_id"] == item_id
+        ]
+        assert "web_stable_id" not in mirror_consumed["data"]
         assert any(
             frame["type"] == "session.input.consumed"
             and frame["data"]["item_id"] == _WEB_ID
@@ -232,4 +245,3 @@ async def test_claimed_uncertain_attempt_keeps_identity_for_a_late_echo(
     finally:
         for pending in pending_inputs.snapshot_for(conv.id):
             pending_inputs.resolve(conv.id, pending["pending_id"])
-        pending_inputs.forget_unconfirmed_receipt(conv.id, "ship it")

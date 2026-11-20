@@ -402,6 +402,10 @@ _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
 # different runner attempt surfaces its own startup failure instead of hiding
 # behind this stale cause. Empty when unknown (treated as the current runner's).
 _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+_LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY: str = (
+    "omnigent.last_task_error_delivery_attempt_id"
+)
+_LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY: str = "omnigent.last_task_error_input_stable_id"
 
 
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN

@@ -5440,8 +5440,6 @@ async def _persist_external_conversation_item_unlocked(
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
     original_held: list[pending_inputs.DrainedInput] = []
-    late_receipt_text: str | None = None
-    late_receipt_ambiguous = False
     if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
@@ -5449,14 +5447,6 @@ async def _persist_external_conversation_item_unlocked(
         # Skipped older entries are persisted as undelivered. A miss falls back
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
-        late_receipt = (
-            pending_inputs.unconfirmed_receipt(session_id, text)
-            if item.idempotency_key is not None
-            else None
-        )
-        if late_receipt:
-            late_receipt_text = text
-            late_receipt_ambiguous = True
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         if item.data.auto_retry is not None:
             pending_id = pending_inputs.pending_id_for_stable_id(
@@ -5576,9 +5566,9 @@ async def _persist_external_conversation_item_unlocked(
                 drained.stable_id is not None
                 and item.stable_id != drained.stable_id
                 and item.idempotency_key is not None
-                and late_receipt is None
                 and not (matched.shared_text or drained.uncertain or drained.interrupted)
                 and match_method in ("normalized_text", "attachment_normalized_text")
+                and not pending_inputs.matches_unconfirmed_input_text(session_id, text)
                 and isinstance(item.data, MessageData)
             ):
                 item = item.model_copy(
@@ -5594,17 +5584,6 @@ async def _persist_external_conversation_item_unlocked(
             item = item.model_copy(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
-        if (
-            late_receipt
-            and drained is None
-            and not agent_message_candidate
-            and not pending_inputs.has_pending(session_id)
-            and isinstance(item.data, MessageData)
-        ):
-            item = item.model_copy(
-                update={"data": item.data.model_copy(update={"web_stable_id": late_receipt})}
-            )
-            late_receipt_ambiguous = False
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
         # A command typed in the web composer was queued as plain text but comes back
         # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
@@ -5676,10 +5655,6 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
-    if late_receipt_text is not None:
-        pending_inputs.forget_unconfirmed_receipt(
-            session_id, late_receipt_text, ambiguous=late_receipt_ambiguous
-        )
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
@@ -6066,10 +6041,14 @@ async def _settle_undelivered_native_input(
     )
     if drained is None:
         return False
+    # A restored automatic retry keeps its completed transcript row and retry marker.
+    restored_auto_retry = (
+        drained.auto_retry is not None and not uncertain and delivery_error is None
+    )
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        status="failed",
+        status="completed" if restored_auto_retry else "failed",
         data=MessageData(
             role="user",
             content=drained.content,
@@ -6130,7 +6109,7 @@ async def _settle_undelivered_native_input(
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
     if delivery_error is not None:
         if uncertain and not annotation:
-            pending_inputs.retain_unconfirmed_receipt(session_id, drained)
+            pending_inputs.remember_unconfirmed_input_text(session_id, drained)
         pending_inputs.release(session_id, drained)
         _publish_error_event(session_id, delivery_error)
     return True

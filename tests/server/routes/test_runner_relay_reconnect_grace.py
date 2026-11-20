@@ -393,9 +393,13 @@ async def test_confirmed_forward_treats_tunnel_replacement_before_enqueue_as_uns
 @pytest.mark.asyncio
 async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
     store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation().id
+    session_id = store.create_conversation(agent_id="b" * 32).id
+    input_stable_id = "a" * 32
     pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "in flight"}], runner_managed=True
+        session_id,
+        [{"type": "input_text", "text": "in flight"}],
+        stable_id=input_stable_id,
+        runner_managed=True,
     )
     attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
         "delivery_attempt_id"
@@ -410,6 +414,7 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             "response_id": "resp_terminal",
             "pending_id": pending_id,
             "delivery_attempt_id": attempt_id,
+            "input_stable_id": input_stable_id,
             "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
         }
         failure = {
@@ -417,6 +422,7 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             "response": {"id": "resp_terminal"},
             "pending_id": pending_id,
             "delivery_attempt_id": attempt_id,
+            "input_stable_id": input_stable_id,
             "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
         }
         async with httpx.AsyncClient(
@@ -447,6 +453,13 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             if event["type"] in {"session.status", "response.error"} and event.get("error"):
                 attempts[event["type"]] = event["error"]["delivery_attempt_id"]
         assert attempts == {"session.status": attempt_id, "response.error": attempt_id}
+        snapshot = await orchestration._get_session_snapshot(
+            store, session_id, include_items=False
+        )
+        assert snapshot.status == "failed"
+        assert snapshot.last_task_error is not None
+        assert snapshot.last_task_error["delivery_attempt_id"] == attempt_id
+        assert snapshot.last_task_error["input_stable_id"] == input_stable_id
     finally:
         await collector.stop()
         pending_inputs.resolve(session_id, pending_id)

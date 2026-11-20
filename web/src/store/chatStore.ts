@@ -4226,6 +4226,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
+      const deliveryProof = confirmedWebSendIds(items);
+      const confirmedIds = new Set(deliveryProof);
       pageSet((state) => {
         // Rebind hydration resets the cursor to the fresh window's top while
         // keeping scrolled-up blocks, so an older page can overlap — dedupe.
@@ -4233,8 +4235,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        const retained = withoutDeliveredSendFailureCards(state.blocks, confirmedIds, []);
         return {
-          blocks: reconcileDeliveryCards([...unique, ...state.blocks]),
+          ...retractDeliveredSendDraft(state, confirmedIds, "consumed"),
+          blocks: reconcileDeliveryCards([...unique, ...retained], deliveryProof),
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -5755,8 +5759,10 @@ async function bindStream(
       const uniquePendingElicitations = pendingElicitationBlocks.filter(
         (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
       );
-      // Synthesize a visible error block when the session failed and no error
-      // block was already produced by itemsToBlocks. The `response.error` SSE
+      // A failed snapshot can supply an error outside the loaded window.
+      // Delivery errors have an attempt ID, so merge them with any matching
+      // history or live card. Other snapshot errors only fill a missing card.
+      // The `response.error` SSE
       // event is transient (published to the in-memory session stream which
       // has no replay), so clients that connect after the task has already
       // failed never receive it. `last_task_error` on the snapshot is the
@@ -5771,12 +5777,11 @@ async function bindStream(
       // branches that used to live here served the transcript LRU's revisit
       // path, which no longer exists — a revisit finds a live entry and never
       // re-binds.)
-      const allBlocks = reconcileDeliveryCards([
+      const allBlocks = [
         ...unique,
         ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
-      ]);
-      const hasErrorBlock = allBlocks.some((b) => b.type === "error");
+      ];
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
@@ -5822,15 +5827,23 @@ async function bindStream(
           ...unknownToServer,
         ].filter((p) => p.stableId === undefined || !committedIds.has(p.stableId));
       }
+      const snapshotError = session.lastTaskError;
+      const hasSnapshotError = allBlocks.some(
+        (block) =>
+          block.type === "error" &&
+          (!snapshotError?.delivery_attempt_id ||
+            block.deliveryAttemptId === snapshotError.delivery_attempt_id),
+      );
       const syntheticError: ErrorBlock | null =
-        session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
+        session.status === "failed" && snapshotError != null && !hasSnapshotError
           ? {
               type: "error",
               ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: session.lastTaskError.message,
+              message: snapshotError.message,
               source: "",
-              code: session.lastTaskError.code,
-              ...structuredErrorFields(session.lastTaskError, session.lastTaskError.agent_name),
+              code: snapshotError.code,
+              ...structuredErrorFields(snapshotError, snapshotError.agent_name),
+              ...(snapshotError.delivery_attempt_id ? { fromSessionStatus: true } : {}),
             }
           : null;
       return {
@@ -5839,7 +5852,7 @@ async function bindStream(
         ...(state.failedInputs !== stateBeforeFetch.failedInputs
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
-        blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+        blocks: reconcileDeliveryCards(syntheticError ? [...allBlocks, syntheticError] : allBlocks),
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }

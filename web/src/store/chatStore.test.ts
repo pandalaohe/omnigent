@@ -3180,32 +3180,57 @@ describe("chatStore — switchTo", () => {
     );
   });
 
-  it("confirms an older delivery card with the receipt already in the current page", async () => {
+  it("merges an older durable delivery card with the failed snapshot on cold open", async () => {
+    const id = "conv_older_delivery";
+    const failure = {
+      code: "native_input_delivery_uncertain",
+      message: "May have arrived",
+      delivery_attempt_id: "older-attempt",
+      input_stable_id: "send-on-current-page",
+    };
     const deliveryError: ConversationItem = {
       type: "error",
       id: "older-delivery-error",
       response_id: "delivery-turn",
       status: "completed",
       source: "execution",
-      code: "native_input_delivery_uncertain",
-      message: "May have arrived",
-      delivery_attempt_id: "older-attempt",
-      input_stable_id: "send-on-current-page",
+      ...failure,
     };
     const currentItems = Array.from({ length: INITIAL_WINDOW_ITEMS - 1 }, (_, index) =>
       userMessage(`current_${index}`, `message ${index}`),
     );
-    seedSession("conv_older_delivery", [
+    seedSession(id, [
       deliveryError,
       ...currentItems,
       { ...userMessage("delivery_receipt", "arrived"), web_stable_id: "send-on-current-page" },
     ]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "failed",
+          created_at: 0,
+          last_task_error: failure,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
 
-    await useChatStore.getState().switchTo("conv_older_delivery");
+    const cards = () => useChatStore.getState().blocks.filter((block) => block.type === "error");
+    await useChatStore.getState().switchTo(id);
+    expect(cards()).toMatchObject([
+      { ctx: { itemId: null }, deliveryAttemptId: "older-attempt", title: "Message delivered" },
+    ]);
     await useChatStore.getState().loadMoreHistory();
 
-    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toMatchObject([
-      { deliveryAttemptId: "older-attempt", title: "Message delivered", level: "info" },
+    expect(cards()).toMatchObject([
+      {
+        ctx: { itemId: deliveryError.id },
+        deliveryAttemptId: "older-attempt",
+        title: "Message delivered",
+        level: "info",
+      },
     ]);
   });
 
@@ -8499,6 +8524,30 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     expect(errorCards()).toEqual([]);
     expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "ship it" });
+  });
+
+  it("keeps the restored draft and unconfirmed delivery card after identical terminal input", async () => {
+    const stableId = await failNativeSend("ship it");
+    takeFailedSendDraft("conv_existing", false);
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_existing",
+      status: "failed",
+      error: {
+        code: "native_input_delivery_uncertain",
+        message: "May have arrived",
+        delivery_attempt_id: "unconfirmed-attempt",
+        input_stable_id: stableId,
+      },
+    });
+
+    commitMirror("independent-terminal-record", "ship it");
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+    expect(useChatStore.getState().pendingRetryStableId).toBe(stableId);
+    expect(errorCards()).toMatchObject([
+      { deliveryAttemptId: "unconfirmed-attempt", title: "Message delivery is unconfirmed" },
+    ]);
   });
 
   it("flips a restored draft to delivered and stops the stable-id reuse", () => {
@@ -19457,6 +19506,55 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(state.pendingRetryStableId).toBeNull();
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, stableId]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("retracts a restored draft when scrollback finds the only receipt for its lost POST", async () => {
+    const id = "conv_draft_scrollback";
+    const before = userMessage("scrollback_start", "before the gap");
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
+        return Promise.reject(new TypeError("Load failed"));
+      }
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      isNativeTerminalSession: true,
+      blocks: itemsToBlocks([before]),
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    await useChatStore.getState().send("ship it", "agent_xyz");
+    const stableId = takeFailedSendDraft(id, false)!.stableId!;
+    expect(getState().pendingUserMessages).toEqual([]);
+
+    // No consumed event reaches the stream. Reconnect shows a full window
+    // of newer items, leaving the echoed send reachable only by scrollback.
+    const mirror = { ...userMessage("scrollback_mirror", "ship it"), web_stable_id: stableId };
+    const gap = Array.from({ length: 120 }, (_, index) => gapUser("scrollback_gap", index));
+    seedSessionItems(id, [before, mirror, ...gap]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(getState().hasMoreHistory).toBe(true);
+    expect(getState().blocks.some((block) => block.ctx.itemId === mirror.id)).toBe(false);
+    expect(getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(getState().blocks.some((block) => block.ctx.itemId === mirror.id)).toBe(true);
+    expect(getState().restoredSendDraft).toMatchObject({ stableId, delivered: true });
+    expect(getState().pendingRetryStableId).toBeNull();
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");

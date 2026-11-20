@@ -557,6 +557,8 @@ export interface Session {
     remediation?: string;
     /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
     item_id?: string;
+    delivery_attempt_id?: string;
+    input_stable_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on

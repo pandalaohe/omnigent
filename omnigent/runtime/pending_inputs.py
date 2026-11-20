@@ -363,15 +363,8 @@ class _Entry:
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 
 
-@dataclass(frozen=True)
-class _UnconfirmedReceipt:
-    stable_id: str
-    text: str
-    attachments: int
-
-
-_unconfirmed_receipts: WorkspaceScopedCache[tuple[str, str], _UnconfirmedReceipt | None] = (
-    WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
+_unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], bool] = WorkspaceScopedCache(
+    lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now)
 )
 _lock = threading.Lock()
 
@@ -1086,46 +1079,19 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
             _pending.pop(conversation_id, None)
 
 
-def retain_unconfirmed_receipt(conversation_id: str, drained: DrainedInput) -> None:
-    """Keep a claimed input eligible for a late echo without putting it back in the queue."""
-    raw_text = _content_text(drained.content)
-    bare_text = _bare_text(raw_text)
+def remember_unconfirmed_input_text(conversation_id: str, drained: DrainedInput) -> None:
+    """Mark an identical later pending match ambiguous while this echo could still arrive."""
+    bare_text = _bare_text(_content_text(drained.content))
     if not bare_text or not drained.stable_id or drained.uncertain or drained.interrupted:
         return
-    receipt = _UnconfirmedReceipt(
-        drained.stable_id, _collapse_whitespace(raw_text), _attachment_count(drained.content)
-    )
-    key = (conversation_id, bare_text)
     with _lock:
-        _unconfirmed_receipts[key] = (
-            receipt if _unconfirmed_receipts.get(key, receipt) == receipt else None
-        )
+        _unconfirmed_input_texts[conversation_id, bare_text] = True
 
 
-def unconfirmed_receipt(conversation_id: str, text: str) -> str | None:
-    """Read an exact late match; an empty value marks ambiguous ownership."""
-    key = (conversation_id, _bare_text(text))
+def matches_unconfirmed_input_text(conversation_id: str, text: str) -> bool:
+    """Text alone can rule out a reliable match, but cannot establish delivery."""
     with _lock:
-        if key not in _unconfirmed_receipts:
-            return None
-        receipt = _unconfirmed_receipts.get(key)
-    if receipt is not None and receipt.text in (
-        _collapse_whitespace(text),
-        _collapse_whitespace(_strip_generated_markers(text, receipt.attachments)),
-    ):
-        return receipt.stable_id
-    return ""
-
-
-def forget_unconfirmed_receipt(
-    conversation_id: str, text: str, *, ambiguous: bool = False
-) -> None:
-    """Consume a committed late match, or fence it if another input could own the echo."""
-    key = (conversation_id, _bare_text(text))
-    if ambiguous:
-        _unconfirmed_receipts[key] = None
-    else:
-        _unconfirmed_receipts.pop(key, None)
+        return (conversation_id, _bare_text(text)) in _unconfirmed_input_texts
 
 
 def resolve_matching_text(
@@ -1559,4 +1525,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
-        _unconfirmed_receipts.clear()
+        _unconfirmed_input_texts.clear()
