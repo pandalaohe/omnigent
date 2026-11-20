@@ -2220,6 +2220,7 @@ def register_events_routes(
                 peer_message_store=getattr(state, "peer_message_store", None),
                 scheduled_task_store=getattr(state, "scheduled_task_store", None),
                 archive_cleanup=getattr(state, "archive_close_coordinator", None),
+                runner_exit_reports=runner_exit_reports,
             )
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is None:

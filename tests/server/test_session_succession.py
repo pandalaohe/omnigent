@@ -806,6 +806,171 @@ async def test_claude_transfer_reconciles_on_original_runner_after_placement_cha
     assert owner == old
 
 
+async def test_claude_transfer_recovers_forward_after_successor_uses_pane_and_source_unbinds(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client, "live-successor")
+    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    pane = _transfer_test_terminal("original")
+    owner = old
+    terminal_visible = True
+    transfers: list[str] = []
+    pane_inputs: list[tuple[str, str]] = []
+    original_post = runner.post
+
+    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
+        if not terminal_visible:
+            raise httpx.ReadTimeout("could not confirm the pane after the lost reply")
+        return _terminal_probe(url, pane if f"/sessions/{owner}/" in url else None)
+
+    async def post(url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal owner, terminal_visible
+        if url == "/v1/sessions":
+            assert kwargs["json"]["session_id"] == new
+            return httpx.Response(
+                201,
+                request=httpx.Request("POST", url),
+                json={"session_init_protocol_version": 2, "terminal_ready": True},
+            )
+        if url.endswith("/transfer"):
+            transfers.append(url)
+            assert transfers == [path]  # An active successor keeps the pane.
+            owner = new
+            terminal_visible = False
+            raise httpx.ReadTimeout("reply lost after moving the pane")
+        return await original_post(url, **kwargs)
+
+    async def dispatch(session_id: str, conv: Any, body: Any, *args: Any, **kwargs: Any) -> Any:
+        assert session_id == owner == new
+        pane_inputs.append((pane["metadata"]["instance_id"], body.data["content"][0]["text"]))
+        return SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
+
+    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
+    monkeypatch.setattr(runner, "post", post)
+    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
+    response = await client.post(path, json={"target_session_id": new})
+    assert response.status_code == 502 and owner == new
+    assert store.get_succession(old, new) is None
+
+    terminal_visible = True
+    typed = await client.post(f"/v1/sessions/{new}/events", json=_wake_event("Continue here"))
+    assert typed.status_code == 202, typed.text
+    assert pane_inputs == [("original", "Continue here")]
+    assert store.clear_runner_id(old).runner_id is None
+    schedule_retry = Mock(wraps=succession_module._schedule_retry)
+    monkeypatch.setattr(succession_module, "_schedule_retry", schedule_retry)
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.0,))
+
+    await succession_module.resume_successions_for_runner(
+        RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
+    )
+
+    finished = store.get_succession(old, new)
+    assert finished is not None and finished.phase == "done"
+    assert schedule_retry.call_args is not None and schedule_retry.call_args.args == (finished.id,)
+    assert owner == new and transfers == [path]
+    wake.assert_awaited_once()
+
+
+@pytest.mark.parametrize("trigger", ["replacement_connect", "ordinary_input"])
+async def test_old_claude_input_converges_after_reported_original_runner_exit(
+    client: httpx.AsyncClient,
+    succession_app: FastAPI,
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+) -> None:
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client, "runner-exit")
+    old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    exit_reports = succession_app.state.runner_exit_reports
+    original = runners.for_runner(RUNNER_ID)
+    replacement = runners.for_runner(RUNNER_ID_B)
+    original_online = True
+    offline_lookups: list[str] = []
+    pane = _transfer_test_terminal("original")
+
+    async def lookup(session_id: str, router: Any, *, conversation: Any = None) -> Any:
+        row = conversation if conversation is not None else store.get_conversation(session_id)
+        if row is None or row.runner_id is None:
+            return None
+        if row.runner_id == RUNNER_ID and not original_online:
+            offline_lookups.append(session_id)
+            return None
+        return runners.for_runner(row.runner_id)
+
+    async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
+        return _terminal_probe(url, pane if f"/sessions/{old}/" in url else None)
+
+    async def fail_transfer(url: str, **kwargs: Any) -> httpx.Response:
+        assert url == path
+        raise httpx.ReadTimeout("transfer timed out before move")
+
+    async def replacement_post(url: str, **kwargs: Any) -> httpx.Response:
+        assert url == "/v1/sessions" and kwargs["json"]["session_id"] == old
+        return httpx.Response(
+            201,
+            request=httpx.Request("POST", url),
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+        )
+
+    async def replacement_connected() -> None:
+        await succession_module.resume_successions_for_runner(
+            RUNNER_ID_B,
+            conversation_store=store,
+            runner_router=None,
+            peer_message_store=None,
+            runner_exit_reports=exit_reports,
+        )
+
+    monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
+    monkeypatch.setattr(original, "get", get_terminal, raising=False)
+    transfer = AsyncMock(side_effect=fail_transfer)
+    monkeypatch.setattr(original, "post", transfer)
+    monkeypatch.setattr(replacement, "post", replacement_post)
+    dispatch = AsyncMock(
+        return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
+    )
+    monkeypatch.setattr(sessions_facade, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(sessions_facade, "_ensure_runner_relay_ready", AsyncMock())
+
+    first = await client.post(path, json={"target_session_id": new})
+    assert first.status_code == 502, first.text
+    original_online = False
+    store.replace_runner_id(old, RUNNER_ID_B)
+    await replacement_connected()
+    assert offline_lookups == [old]
+    blocked = await client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
+    assert blocked.status_code == 409, blocked.text
+    dispatch.assert_not_awaited()
+
+    exit_reports.record(RUNNER_ID, "runner process exited", None, had_connected=True)
+    if trigger == "replacement_connect":
+        await replacement_connected()
+        source = store.get_conversation(old)
+        assert source is not None and not succession_module.claude_transfer_pending(source)
+    accepted = await client.post(f"/v1/sessions/{old}/events", json=_wake_event("Continue"))
+    assert accepted.status_code == 202, accepted.text
+    source = store.get_conversation(old)
+    assert source is not None and not succession_module.claude_transfer_pending(source)
+    assert store.get_succession(old, new) is None
+    transfer.assert_awaited_once()
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args is not None
+    assert dispatch.await_args.args[0] == old and dispatch.await_args.args[4] is replacement
+
+
 async def test_old_claude_input_recovers_transfer_after_all_retries_timeout(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,

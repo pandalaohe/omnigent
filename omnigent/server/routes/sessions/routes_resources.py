@@ -2233,6 +2233,7 @@ def register_resources_routes(
                         peer_message_store=getattr(state, "peer_message_store", None),
                         scheduled_task_store=getattr(state, "scheduled_task_store", None),
                         archive_cleanup=getattr(state, "archive_close_coordinator", None),
+                        runner_exit_reports=getattr(state, "runner_exit_reports", None),
                     )
                 )
             except (httpx.HTTPError, ConnectionError) as exc:
