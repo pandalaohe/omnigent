@@ -214,6 +214,7 @@ class SystemStatusHub:
     def __init__(self, data_dir: Path, metrics: ServerPerformanceMetrics | None) -> None:
         self._data_dir = data_dir
         self._metrics = metrics
+        self._server_cpu_count = os.cpu_count()
         self._state_dir = data_dir / "system-status"
         self.history_path = self._state_dir / "history.json"
         self.settings_path = self._state_dir / "settings.json"
@@ -792,6 +793,7 @@ class SystemStatusHub:
                 server = {
                     "state": _STATE_ONLINE,
                     "since": self._started_at,
+                    "cpu_count": self._server_cpu_count,
                     "last_point": self._server_points[-1] if self._server_points else None,
                 }
             return {
