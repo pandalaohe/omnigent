@@ -25,7 +25,7 @@ from omnigent.entities.conversation import (
     MessageData,
     NewConversationItem,
 )
-from omnigent.runtime import pending_inputs
+from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -990,6 +990,113 @@ async def test_codex_native_mirror_after_many_failed_envelopes(db_uri: str) -> N
     )
     await sweeper._reconcile_one(dataclasses.replace(record), 1000)
     assert _row(store, record.id).state == "delivered"
+
+
+async def test_runner_lost_peer_copy_is_resent_not_taken_as_delivered(db_uri: str) -> None:
+    """The failed row a lost copy leaves behind carries the envelope but is no receipt."""
+    from omnigent.server.routes._sessions import orchestration
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    receiver = conv_store.create_conversation(title="Receiver")
+    record = SessionPeerMessage(
+        id=uuid.uuid4().hex,
+        sender_session_id=uuid.uuid4().hex,
+        receiver_session_id=receiver.id,
+        ref="ref-lost",
+        text="body",
+        state="delivering",
+        created_at=1000,
+        expires_at=2000,
+    )
+    store = _FakePeerStore()
+    store.seed(record)
+    sweeper = PeerSweeper(
+        peer_store=store,
+        conversation_store=conv_store,
+        permission_store=None,
+        true_state=_TrueStateScript(),
+        deliver=_DeliverScript(),
+        post_event_impl=_PostEventScript(),
+    )
+    envelope = _envelope(record)
+    pending_id = pending_inputs.record(
+        receiver.id,
+        [{"type": "input_text", "text": envelope}],
+        runner_managed=True,
+        peer_message_id=record.id,
+    )
+    pending_inputs.mark_delivery_stage(receiver.id, pending_id, "forward_accepted")
+    try:
+        # The runner restarted: its first queue snapshot no longer lists the copy.
+        await orchestration._reconcile_runner_input_leases(
+            conv_store,
+            receiver.id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            {pending_id},
+        )
+        failed = [
+            item
+            for item in conv_store.list_items(receiver.id).data
+            if item.type == "message" and item.status == "failed"
+        ]
+        assert len(failed) == 1
+        assert not pending_inputs.holds_peer_message(receiver.id, record.id)
+
+        await sweeper._reconcile_one(dataclasses.replace(record), 1000)
+        assert _row(store, record.id).state == "pending"
+    finally:
+        pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+    # A real transcript record of the resend still settles it.
+    store.transition(record.id, "delivering", None, ("pending",))
+    conv_store.append(
+        receiver.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_mirror",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": envelope}]),
+            )
+        ],
+    )
+    await sweeper._reconcile_one(dataclasses.replace(record), 1000)
+    assert _row(store, record.id).state == "delivered"
+
+
+async def test_held_records_do_not_use_up_the_reconcile_page(harness: _Harness) -> None:
+    """Held copies never expire, so the pass reaches the records behind them."""
+    harness.sweeper._batch_limit = 2
+    old = harness._now - 200
+    held = [
+        harness.seed_record(state="delivering", updated_at=old, expires_at=harness._now - 30)
+        for _ in range(2)
+    ]
+    expired = harness.seed_record(state="delivering", updated_at=old, expires_at=harness._now - 20)
+    marked = harness.seed_record(
+        id="4" * 32, state="delivering", updated_at=old, expires_at=harness._now + 60
+    )
+    harness.conv_store.visible_text["receiver"] = [_envelope(marked)]
+    pending_ids = [
+        pending_inputs.record(
+            "receiver",
+            [{"type": "input_text", "text": f"held copy {index}"}],
+            runner_managed=True,
+            peer_message_id=record.id,
+        )
+        for index, record in enumerate(held)
+    ]
+    try:
+        await harness.sweeper._reconcile_stale_delivering(harness._now)
+        assert [_row(harness.store, record.id).state for record in held] == [
+            "delivering",
+            "delivering",
+        ]
+        assert _row(harness.store, expired.id).state == "expired"
+        assert _row(harness.store, marked.id).state == "delivered"
+    finally:
+        for pending_id in pending_ids:
+            pending_inputs.resolve("receiver", pending_id)
 
 
 async def test_stale_refusal_cannot_requeue_newer_native_attempt(harness: _Harness) -> None:

@@ -9599,9 +9599,13 @@ async def _forward_native_terminal_message(
             if isinstance(accepted, dict) and accepted.get("status") == "buffered":
                 # Keep the durable peer record until the CLI transcript proves
                 # acceptance; a process-local buffer can vanish on restart.
-                if supports_claim and isinstance(runner_pending_id, str):
-                    # The runner holds this copy and will claim it later; its
-                    # heartbeat keeps the queued entry alive until then.
+                if (
+                    supports_claim
+                    and event.get("pending_input_claim_required") is True
+                    and isinstance(runner_pending_id, str)
+                ):
+                    # A Claude runner holds this copy and will claim it later;
+                    # its heartbeat keeps the queued entry alive until then.
                     pending_inputs.mark_delivery_stage(
                         session_id, runner_pending_id, "forward_accepted"
                     )

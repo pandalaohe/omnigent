@@ -7458,6 +7458,56 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("append_fails", [False, True], ids=["landed", "failed"])
+async def test_ttl_during_a_paused_append_leaves_the_entry_to_that_persist(
+    monkeypatch: pytest.MonkeyPatch, append_fails: bool
+) -> None:
+    """Expiry waits for the persist holding an entry; only an unlanded echo leaves a record."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    monkeypatch.setattr(session_stream, "publish", lambda *_args: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=append_fails)
+    sid = "7b1e0f3c2d4a4b5c8e9f0a1b2c3d4e5f"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "ship it"}], stable_id="e" * 32
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "ship it"}]},
+            "response_id": "resp_ship_it",
+            "source_id": "claude:ship-it:0",
+        },
+    )
+    try:
+        persist = asyncio.create_task(
+            _persist_external_conversation_item(sid, conv, body, store)  # type: ignore[arg-type]
+        )
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        clock["t"] += pending_inputs._TTL_S + 1
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [pending_id]
+        assert not pending_inputs.matches_unconfirmed_input_text(sid, "ship it")
+        store.release_first_append.set()
+        if append_fails:
+            with pytest.raises(RuntimeError, match="database unavailable"):
+                await persist
+        else:
+            await persist
+        assert pending_inputs.snapshot_for(sid) == []
+        assert pending_inputs.matches_unconfirmed_input_text(sid, "ship it") is append_fails
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_failed_append_keeps_held_entries_when_the_queue_refills(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

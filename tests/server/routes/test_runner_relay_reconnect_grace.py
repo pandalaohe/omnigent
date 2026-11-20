@@ -186,6 +186,114 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkey
     assert late_mirror.matched.pending_id == pending_id
 
 
+def _confirm_paste(session_id: str, pending_id: str) -> None:
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    orchestration._record_native_input_lifecycle(
+        session_id,
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_paste"},
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_paste_lease_follows_waiting_stop_and_reconnect(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    session_id = conv.id
+    stable_id = "d" * 32
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    # Same predicate create_app registers.
+    monkeypatch.setattr(
+        pending_inputs,
+        "_session_busy_check",
+        lambda conversation_id: (
+            orchestration._session_status_cache.get(conversation_id)
+            in orchestration._MID_TURN_STATUSES
+        ),
+    )
+    published: list[dict] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _conversation_id, event: published.append(event)
+    )
+    waiting = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], stable_id=stable_id
+    )
+    pending_inputs.mark_delivery_stage(session_id, waiting, "forward_accepted")
+    pending_inputs.enable_runner_lease(session_id, waiting)
+    stopped: str | None = None
+    try:
+        assert pending_inputs.claim_runner_input(session_id, waiting, "paste")
+        _confirm_paste(session_id, waiting)
+        orchestration._session_status_cache[session_id] = "waiting"
+        for now in range(60, 1501, 60):
+            # A reconnect at 780 s does not settle a claimed paste as lost.
+            previous = pending_inputs.runner_accepted_ids(session_id) if now == 780 else set()
+            await orchestration._reconcile_runner_input_leases(
+                store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, previous
+            )
+        assert pending_inputs.runner_lease_remaining(session_id, waiting) == 720
+        assert not pending_inputs.claim_runner_input(session_id, waiting, "second")
+        item_id, replay = await orchestration._persist_external_conversation_item(
+            session_id,
+            conv,
+            SessionEventInput.model_validate(
+                {
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "steer"}],
+                        },
+                        "response_id": "resp_mirror",
+                    },
+                }
+            ),
+            store,
+        )
+        assert item_id == stable_id and not replay
+        assert any(
+            event["type"] == "session.input.consumed"
+            and event["data"].get("cleared_pending_id") == waiting
+            for event in published
+        )
+        assert not [item for item in store.list_items(session_id).data if item.type == "error"]
+
+        # Busy, then Stop: an interrupted paste is no longer renewed.
+        stopped = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "stopped"}], runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input(session_id, stopped, "paste-stopped")
+        _confirm_paste(session_id, stopped)
+        orchestration._session_status_cache[session_id] = "running"
+        now = 1560
+        await orchestration._reconcile_runner_input_leases(
+            store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+        )
+        pending_inputs.mark_interrupted(session_id, [stopped])
+        for now in range(1620, 2341, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+            )
+        await orchestration._watch_runner_input_lease(store, session_id, stopped)
+        errors = [item for item in store.list_items(session_id).data if item.type == "error"]
+        assert [error.data.model_dump()["code"] for error in errors] == [
+            "native_input_delivery_uncertain"
+        ]
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        pending_inputs.resolve(session_id, waiting)
+        if stopped is not None:
+            pending_inputs.resolve(session_id, stopped)
+
+
 @pytest.mark.asyncio
 async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_uri, monkeypatch):
     store = SqlAlchemyConversationStore(db_uri)
@@ -242,17 +350,20 @@ async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi-native", "antigravity-native"]
+)
 @pytest.mark.parametrize("claim_capable", [True, False])
 async def test_buffered_peer_copy_stays_claimable_while_the_runner_holds_it(
-    db_uri, monkeypatch, claim_capable
+    db_uri, monkeypatch, claim_capable, harness
 ):
     store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(harness_override="claude-native")
+    conv = store.create_conversation(harness_override=harness)
     peer_id = "c" * 32
     now = 0.0
     monkeypatch.setattr(pending_inputs, "_now", lambda: now)
     monkeypatch.setattr(
-        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+        orchestration, "_native_terminal_runtime", lambda _: ("Native", None, harness)
     )
     real_forward = orchestration._forward_native_terminal_message
     headers = {"X-Omnigent-Pending-Input-Claim": "1"} if claim_capable else {}
@@ -289,8 +400,10 @@ async def test_buffered_peer_copy_stays_claimable_while_the_runner_holds_it(
                 artifact_store=None,
                 native_terminal_ready=True,
             )
-        assert pending_inputs.holds_peer_message(conv.id, peer_id) is claim_capable
-        if not claim_capable:
+        # Only a Claude runner claims its buffered copy; other harnesses keep base cleanup.
+        holds = claim_capable and harness == "claude-native"
+        assert pending_inputs.holds_peer_message(conv.id, peer_id) is holds
+        if not holds:
             assert pending_inputs.snapshot_for(conv.id) == []
             return
         (entry,) = pending_inputs.snapshot_for(conv.id)

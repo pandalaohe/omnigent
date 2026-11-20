@@ -710,21 +710,42 @@ class PeerSweeper:
         duplicate resend of a delivery that actually succeeded; it ages
         into a later tick's pass once the grace elapses.
         """
-        try:
-            records = await asyncio.to_thread(
-                self._store.list_due, ("delivering",), self._batch_limit
-            )
-        except Exception:
-            _logger.exception("Peer sweeper failed to list delivering records")
-            return
-        for record in records:
-            age_from = record.updated_at if record.updated_at is not None else record.created_at
-            if now - age_from < _RECONCILE_GRACE_S and _native_attempt_id(record.reason) is None:
-                continue
+        limit = self._batch_limit
+        seen: set[str] = set()
+        held = 0
+        while True:
             try:
-                await self._reconcile_one(record, now, age_from=age_from)
+                records = await asyncio.to_thread(self._store.list_due, ("delivering",), limit)
             except Exception:
-                _logger.exception("Peer sweeper reconciliation failed for record %s", record.id)
+                _logger.exception("Peer sweeper failed to list delivering records")
+                return
+            for record in records:
+                if record.id in seen:
+                    continue
+                seen.add(record.id)
+                if pending_inputs.holds_peer_message(record.receiver_session_id, record.id):
+                    # The receiver's runner still holds this copy and delivers it
+                    # once the terminal can take it; a resend would paste it twice.
+                    held += 1
+                    continue
+                age_from = (
+                    record.updated_at if record.updated_at is not None else record.created_at
+                )
+                if (
+                    now - age_from < _RECONCILE_GRACE_S
+                    and _native_attempt_id(record.reason) is None
+                ):
+                    continue
+                try:
+                    await self._reconcile_one(record, now, age_from=age_from)
+                except Exception:
+                    _logger.exception(
+                        "Peer sweeper reconciliation failed for record %s", record.id
+                    )
+            # Held records never expire, so they must not use up the page.
+            if len(records) < limit or limit >= self._batch_limit + held:
+                return
+            limit = self._batch_limit + held
 
     async def _reconcile_one(
         self, record: SessionPeerMessage, now: int, *, age_from: int | None = None
@@ -775,8 +796,10 @@ class PeerSweeper:
             if any(
                 _is_record_marker(match, record.id)
                 and (
-                    not native_attempt
-                    or (
+                    # A copy the runner lost is stored as a failed row; it is no receipt.
+                    getattr(match, "status", None) != "failed"
+                    if not native_attempt
+                    else (
                         isinstance(match.response_id, str)
                         and match.response_id.startswith(
                             ("codex_", "pi-consumed-user-", "agy-consumed-user-")
@@ -799,10 +822,6 @@ class PeerSweeper:
                 ("delivering",),
                 expected_reason=record.reason if native_attempt else None,
             )
-            return
-        if pending_inputs.holds_peer_message(record.receiver_session_id, record.id):
-            # The receiver's runner still holds this copy and delivers it once
-            # the terminal can take it; a resend would paste it twice.
             return
         if native_attempt:
             assert attempt_id is not None
