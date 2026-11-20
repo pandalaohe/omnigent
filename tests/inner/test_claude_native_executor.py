@@ -1799,6 +1799,69 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
 
 
 @pytest.mark.asyncio
+async def test_routed_model_switch_waits_for_the_next_idle_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A busy pane gets no ``/model``: Claude Code would queue it, so its confirmation
+    Enter would land blind. The message still goes in, and the next idle turn switches.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    calls: list[tuple[str, str]] = []
+    busy = True
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
+    ) -> None:
+        """Every ``/model`` keystroke and its confirmation Enter go through here."""
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint, wait_for_startup
+        calls.append(("slash", command))
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        calls.append(("message", content))
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_executor, "has_running_turn", lambda *_a, **_k: busy)
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    async def routed_turn(text: str) -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": text}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+            )
+        ]
+
+    assert await routed_turn("steer while busy") == [TurnComplete(response=None)]
+    assert calls == [("message", "steer while busy")]
+    assert executor._applied_model is None
+    busy = False
+    assert await routed_turn("next idle turn") == [TurnComplete(response=None)]
+    assert calls[1:] == [("slash", "/model sonnet"), ("message", "next idle turn")]
+    assert executor._applied_model == "databricks-claude-sonnet-5"
+
+
+@pytest.mark.asyncio
 async def test_a_routed_first_message_switches_the_model_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
