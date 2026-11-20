@@ -110,7 +110,7 @@ describe("AutoRotationChip", () => {
   it.each([
     [
       "requested",
-      "Rotation requested: this session moves to a new session once the current turn ends and the session is idle.",
+      "Rotation requested. Auto-rotation is off, so it is not retried if it cannot run when this turn ends.",
     ],
     [
       "failed",
@@ -139,6 +139,54 @@ describe("AutoRotationChip", () => {
       expect(screen.queryByText("Continues in a new session when this turn ends.")).toBeNull();
     },
   );
+
+  it("says the session moves on only while auto-rotation is on", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        enabled: true,
+        rotation_pending: true,
+        rotation_request: "requested",
+      }),
+    });
+
+    mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: 1/4" }));
+
+    expect(
+      screen.getByText(
+        "Rotation requested: this session moves to a new session once the current turn ends and the session is idle.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("replaces the requested notice with the failure once the status is refetched", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        rotation_pending: true,
+        rotation_request: "requested",
+      }),
+    });
+    const { client } = mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+    expect(screen.getByText(/^Rotation requested\. Auto-rotation is off/)).toBeInTheDocument();
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: "failed" }),
+    });
+    await act(() => client.invalidateQueries({ queryKey: ["auto-rotation", "parent-1"] }));
+
+    expect(
+      await screen.findByText(
+        "This session could not continue in a new session automatically. Type /clear to continue.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/^Rotation requested/)).toBeNull();
+  });
 
   it("shows no request notice when the server reports none, even with the request label", async () => {
     fetchMock.mockResolvedValueOnce({

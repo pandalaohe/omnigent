@@ -45,7 +45,8 @@ function rotationNotice(status: AutoRotationStatus): string | null {
   }
   switch (status.rotation_request) {
     case "requested":
-      return t("rotationRequestedNotice");
+      // Only the switch's server follow-up makes the move dependable.
+      return t(status.enabled ? "rotationRequestedNotice" : "rotationRequestedNoRetryNotice");
     case "failed":
       return t("sessionRotationFailedRecovery");
     case "unconfirmed":
