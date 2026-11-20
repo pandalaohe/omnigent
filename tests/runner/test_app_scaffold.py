@@ -66,6 +66,16 @@ def test_create_runner_app_returns_fresh_instance_each_call() -> None:
     )
 
 
+def test_runner_app_moves_the_claude_forwarder_with_its_pane(runner_app: FastAPI) -> None:
+    """The registry hands each Claude pane transfer to the forwarder rekey."""
+    from omnigent.runner.native import orchestration
+
+    registry = runner_app.state.session_resource_registry
+    assert registry._claude_terminal_transfer_listener is (
+        orchestration._rekey_auto_forwarder_task
+    )
+
+
 # ── ASGI app round trip ─────────────────────────────────
 
 
