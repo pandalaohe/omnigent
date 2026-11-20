@@ -811,6 +811,8 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`, e.g.
         ``"pending_a1b2c3"``.
+    :param hold: Keep the entry held for a subsequent settlement. An immediate
+        removal records its text as unconfirmed.
     :returns: The dropped entry, or ``None`` when no entry had that id.
     """
     with _lock:
@@ -818,15 +820,15 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         if entries is None:
             return None
         entry = entries.get(pending_id)
-        if entry is not None and hold:
+        if entry is None:
+            return None
+        if hold:
             if entry.held:
                 return None
             entry.held = True
         else:
-            entries.pop(pending_id, None)
-        if not entries:
-            _pending.pop(conversation_id, None)
-        return _drained_input(entry) if entry is not None else None
+            _settle_locked(conversation_id, entries, pending_id, delivery_confirmed=False)
+        return _drained_input(entry)
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
@@ -1059,7 +1061,25 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
 
-def release(conversation_id: str, drained: DrainedInput) -> None:
+def _settle_locked(
+    conversation_id: str,
+    entries: dict[str, _Entry],
+    pending_id: str,
+    *,
+    delivery_confirmed: bool,
+) -> None:
+    entry = entries.pop(pending_id, None)
+    if entry is not None and not delivery_confirmed:
+        bare_text = _bare_text(_content_text(entry.content))
+        if bare_text:
+            _unconfirmed_input_texts[conversation_id, bare_text] = True
+    if not entries:
+        _pending.pop(conversation_id, None)
+
+
+def release(
+    conversation_id: str, drained: DrainedInput, *, delivery_confirmed: bool = False
+) -> None:
     """
     Drop a held entry whose persist landed.
 
@@ -1069,23 +1089,15 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param drained: The entry returned by :func:`resolve_oldest` or
         :func:`resolve_matching_text` with ``hold=True``.
+    :param delivery_confirmed: Whether the settlement identified this entry's
+        own echo. Otherwise, its text alone cannot identify a later send.
     """
     with _lock:
         entries = _pending.get(conversation_id)
-        if entries is None:
-            return
-        entries.pop(drained.pending_id, None)
-        if not entries:
-            _pending.pop(conversation_id, None)
-
-
-def remember_unconfirmed_input_text(conversation_id: str, drained: DrainedInput) -> None:
-    """Mark an identical later pending match ambiguous while this echo could still arrive."""
-    bare_text = _bare_text(_content_text(drained.content))
-    if not bare_text or not drained.stable_id or drained.uncertain:
-        return
-    with _lock:
-        _unconfirmed_input_texts[conversation_id, bare_text] = True
+        if entries is not None:
+            _settle_locked(
+                conversation_id, entries, drained.pending_id, delivery_confirmed=delivery_confirmed
+            )
 
 
 def matches_unconfirmed_input_text(conversation_id: str, text: str) -> bool:

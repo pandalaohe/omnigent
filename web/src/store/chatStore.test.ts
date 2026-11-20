@@ -8550,6 +8550,36 @@ describe("chatStore — delivered-but-unacked send", () => {
     ]);
   });
 
+  it("keeps the restored draft when a resend after an explicit failure has no echo alias", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "Message was not delivered" } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("ship it", "agent_xyz");
+    expect(takeFailedSendDraft("conv_existing", false)).toMatchObject({ serverRefused: true });
+
+    const stableId = await failNativeSend("ship it");
+    takeFailedSendDraft("conv_existing", false);
+    commitMirror("retry-record", "ship it");
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      text: "ship it",
+      stableId,
+      delivered: false,
+    });
+    expect(useChatStore.getState().pendingRetryStableId).toBe(stableId);
+  });
+
   it("flips a restored draft to delivered and stops the stable-id reuse", () => {
     const stableId = "a".repeat(32);
     useChatStore.setState({

@@ -10,6 +10,7 @@ from omnigent.runtime import pending_inputs
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _settle_lost_runner_input,
+    _settle_undelivered_native_input,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -169,13 +170,14 @@ async def test_forwarder_cannot_set_web_stable_id(
 
 
 @pytest.mark.parametrize(
-    ("overlapping_send", "interrupted", "mirror_text"),
+    ("overlapping_send", "interrupted", "fifo_before_stop", "mirror_text"),
     [
-        pytest.param(False, False, "ship it", id="manual-same-text-empty-queue"),
+        pytest.param(False, False, False, "ship it", id="manual-same-text-empty-queue"),
         pytest.param(
-            True, False, "[Attached file: /tmp/first.txt]\n\nship it", id="overlapping-send"
+            True, False, False, "[Attached file: /tmp/first.txt]\n\nship it", id="overlapping-send"
         ),
-        pytest.param(True, True, "ship it", id="stop-then-same-text-claim"),
+        pytest.param(True, True, False, "ship it", id="stop-then-same-text-claim"),
+        pytest.param(True, True, True, "ship it", id="fifo-then-stop-then-same-text-claim"),
     ],
 )
 @pytest.mark.asyncio
@@ -184,6 +186,7 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
     monkeypatch: pytest.MonkeyPatch,
     overlapping_send: bool,
     interrupted: bool,
+    fifo_before_stop: bool,
     mirror_text: str,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
@@ -200,6 +203,21 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
 
     try:
+        if fifo_before_stop:
+            positional = pending_inputs.record(
+                conv.id, [{"type": "input_text", "text": "queued before the terminal input"}]
+            )
+            await _persist_external_conversation_item(
+                conv.id, conv, _mirror("unrelated terminal input"), store
+            )
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [
+                pending_id
+            ]
+            assert any(
+                call.args[1]["type"] == "session.input.consumed"
+                and call.args[1]["data"]["cleared_pending_id"] == positional
+                for call in publish.call_args_list
+            )
         if interrupted:
             pending_inputs.mark_interrupted(conv.id, [pending_id])
         assert await _settle_lost_runner_input(
@@ -211,6 +229,7 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
             expected_attempt_id=attempt_id,
         )
         assert not pending_inputs.snapshot_for(conv.id)
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, "ship it")
         if overlapping_send:
             other_content = [prompt]
             if not interrupted:
@@ -228,7 +247,7 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
         item_id, replay = await _persist_external_conversation_item(
             conv.id, conv, _mirror(mirror_text, source_id="independent-terminal-record"), store
         )
-        assert item_id and item_id != _WEB_ID and not replay
+        assert item_id and item_id not in {_WEB_ID, _OTHER_WEB_ID} and not replay
         [error] = [item for item in store.list_items(conv.id).data if item.type == "error"]
         assert error.data.model_dump()["delivery_attempt_id"] == attempt_id
         assert error.data.model_dump()["input_stable_id"] == _WEB_ID
@@ -253,6 +272,90 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
             and frame["error"]["delivery_attempt_id"] == attempt_id
             for frame in live
         )
+    finally:
+        for pending in pending_inputs.snapshot_for(conv.id):
+            pending_inputs.resolve(conv.id, pending["pending_id"])
+
+
+@pytest.mark.parametrize(
+    "settlement",
+    ["runner-uncertainty", "forward-rejected", "legacy-failure", "fifo", "skipped", "confirmed"],
+)
+@pytest.mark.asyncio
+async def test_settlement_remembers_text_unless_delivery_is_confirmed(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, settlement: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    pending_id = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "ship it"}],
+        stable_id=None if settlement == "fifo" else _WEB_ID,
+        runner_managed=settlement == "runner-uncertainty",
+    )
+    try:
+        if settlement == "runner-uncertainty":
+            assert pending_inputs.claim_runner_input(conv.id, pending_id, "original")
+            assert await _settle_lost_runner_input(
+                store, conv.id, pending_id, "native_input_delivery_uncertain", claim_outcome=True
+            )
+        elif settlement == "legacy-failure":
+            assert await _settle_undelivered_native_input(store, conv.id, None, _WEB_ID)
+        elif settlement == "forward-rejected":
+            assert pending_inputs.resolve(conv.id, pending_id) is not None
+        else:
+            text = "ship it" if settlement == "confirmed" else "another input"
+            if settlement == "skipped":
+                pending_inputs.record(conv.id, [{"type": "input_text", "text": text}])
+            item_id, replay = await _persist_external_conversation_item(
+                conv.id, conv, _mirror(text), store
+            )
+            assert item_id and not replay
+
+        assert not pending_inputs.snapshot_for(conv.id)
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, "ship it") is (
+            settlement != "confirmed"
+        )
+    finally:
+        for pending in pending_inputs.snapshot_for(conv.id):
+            pending_inputs.resolve(conv.id, pending["pending_id"])
+
+
+@pytest.mark.parametrize("source_id", ["retry-record", None], ids=["tagged", "source-less"])
+@pytest.mark.asyncio
+async def test_resend_after_confirmed_failure_has_no_echo_alias(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, source_id: str | None
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    content = [{"type": "input_text", "text": "ship it"}]
+    failed_id = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
+    try:
+        assert await _settle_lost_runner_input(
+            store, conv.id, failed_id, "native_input_runner_lost", claim_outcome=False
+        )
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, "ship it")
+        retry_id = pending_inputs.record(
+            conv.id, content, stable_id=_OTHER_WEB_ID, runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input(conv.id, retry_id, "retry")
+        item_id, replay = await _persist_external_conversation_item(
+            conv.id, conv, _mirror("ship it", source_id=source_id), store
+        )
+        assert item_id and item_id not in {_WEB_ID, _OTHER_WEB_ID} and not replay
+        mirror = store.get_item(conv.id, item_id)
+        assert mirror is not None
+        assert "web_stable_id" not in mirror.to_api_dict()
+        [consumed] = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1]["type"] == "session.input.consumed"
+            and call.args[1]["data"]["item_id"] == item_id
+        ]
+        assert "web_stable_id" not in consumed["data"]
     finally:
         for pending in pending_inputs.snapshot_for(conv.id):
             pending_inputs.resolve(conv.id, pending["pending_id"])

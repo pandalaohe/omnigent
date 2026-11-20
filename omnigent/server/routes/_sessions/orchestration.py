@@ -5430,6 +5430,7 @@ async def _persist_external_conversation_item_unlocked(
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
     match_method: str | None = None
+    delivery_confirmed = True
     # Every drain below holds its entries in place (``hold=True``): they keep
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
@@ -5540,6 +5541,16 @@ async def _persist_external_conversation_item_unlocked(
             raise
         if drained is not None:
             cleared_pending_id = drained.pending_id
+            prior_unconfirmed = pending_inputs.matches_unconfirmed_input_text(session_id, text)
+            delivery_confirmed = match_method == "input_id" or (
+                match_method != "fifo_fallback"
+                and not (
+                    matched.shared_text
+                    or drained.uncertain
+                    or drained.interrupted
+                    or prior_unconfirmed
+                )
+            )
             if match_method == "injected_prefix_text":
                 item = item.model_copy(
                     update={"data": item.data.model_copy(update={"content": drained.content})}
@@ -5560,15 +5571,15 @@ async def _persist_external_conversation_item_unlocked(
                 drained.stable_id is not None
                 and item.stable_id is None
                 and item.idempotency_key is None
+                and (not prior_unconfirmed or match_method == "input_id")
             ):
                 item = item.model_copy(update={"stable_id": drained.stable_id})
             if (
                 drained.stable_id is not None
                 and item.stable_id != drained.stable_id
                 and item.idempotency_key is not None
-                and not (matched.shared_text or drained.uncertain or drained.interrupted)
+                and delivery_confirmed
                 and match_method in ("normalized_text", "attachment_normalized_text")
-                and not pending_inputs.matches_unconfirmed_input_text(session_id, text)
                 and isinstance(item.data, MessageData)
             ):
                 item = item.model_copy(
@@ -5649,11 +5660,12 @@ async def _persist_external_conversation_item_unlocked(
         _restore_drained_inputs(session_id, original_held, None)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id, True
-    # Landed: the drained entries are settled (uncertain ones leave without a
-    # record — their mirror may already have been attributed by position);
-    # older messages a slash command jumped over are still on their way and
-    # go back into play.
-    _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
+    # Skipped entries settled without their own echo. Entries merely held
+    # during a command match go back into play.
+    for entry in (*skipped_pending, *uncertain_pending):
+        pending_inputs.release(session_id, entry, delivery_confirmed=False)
+    if drained is not None:
+        pending_inputs.release(session_id, drained, delivery_confirmed=delivery_confirmed)
     _restore_drained_inputs(session_id, held_older, None)
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
@@ -6036,9 +6048,7 @@ async def _settle_undelivered_native_input(
         )
         if isinstance(stable_id, str) and await defer_annotation(stable_id):
             return False
-    drained = pending_inputs.resolve(
-        session_id, matched_pending_id, hold=delivery_error is not None
-    )
+    drained = pending_inputs.resolve(session_id, matched_pending_id, hold=True)
     if drained is None:
         return False
     # A restored automatic retry keeps its completed transcript row and retry marker.
@@ -6106,11 +6116,9 @@ async def _settle_undelivered_native_input(
                 else "pending_id_and_delivery_attempt_id"
             ),
         )
+    pending_inputs.release(session_id, drained, delivery_confirmed=False)
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
     if delivery_error is not None:
-        if uncertain and not annotation:
-            pending_inputs.remember_unconfirmed_input_text(session_id, drained)
-        pending_inputs.release(session_id, drained)
         _publish_error_event(session_id, delivery_error)
     return True
 
@@ -6262,20 +6270,6 @@ def _restore_drained_inputs(
     for entry in reversed([*skipped, drained]):
         if entry is not None:
             pending_inputs.restore(session_id, entry)
-
-
-def _release_drained_inputs(
-    session_id: str, entries: list[pending_inputs.DrainedInput | None]
-) -> None:
-    """
-    Drop a mirror's drained pending entries once their persist landed.
-
-    :param session_id: Conversation the entries belong to.
-    :param entries: The matched entry and any skipped ones; ``None`` is skipped.
-    """
-    for entry in entries:
-        if entry is not None:
-            pending_inputs.release(session_id, entry)
 
 
 def _build_skipped_native_items(
