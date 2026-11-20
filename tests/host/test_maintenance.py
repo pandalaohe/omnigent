@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.host import maintenance
@@ -77,6 +78,193 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
     assert janitor._stage_skip_reasons == {
         "native_bridge_orphans": frozenset({"runner_superseded"})
     }
+
+
+_SERVER = "https://omnigent.example.com"
+
+
+def test_host_janitor_adds_session_retention_for_its_server() -> None:
+    janitor = HostMaintenanceJanitor.for_host(server_url=_SERVER, server_headers=dict)
+
+    assert janitor._stages[-1][0] == "codex_session_retention"
+    assert janitor._stage_skip_reasons["codex_session_retention"] == frozenset(
+        {"runner_superseded"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (
+            200,
+            {"archived": True, "archived_at": 1_700_000_000},
+            ("archived", 1_700_000_000, False),
+        ),
+        (200, {"archived": False, "archived_at": None}, ("active", None, False)),
+        (200, {"archived": True, "archived_at": None}, ("unknown", None, False)),
+        (404, {"error": {"code": "not_found"}}, ("not_found", None, False)),
+        (404, {"detail": "Not Found"}, ("unknown", None, False)),
+        (403, {"error": {"code": "forbidden"}}, ("unknown", None, False)),
+        (401, {"error": {"code": "unauthorized"}}, ("unknown", None, True)),
+        (503, None, ("unknown", None, True)),
+        (None, None, ("unknown", None, True)),
+    ],
+    ids=[
+        "archived",
+        "unarchived",
+        "archived-without-time",
+        "not-found",
+        "route-404",
+        "forbidden",
+        "unauthorized",
+        "server-error",
+        "unreachable",
+    ],
+)
+def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
+    status: int | None, body: dict[str, Any] | None, expected: tuple[str, int | None, bool]
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if status is None:
+            raise httpx.ConnectError("refused", request=request)
+        if body is None:
+            return httpx.Response(status, text="unavailable")
+        return httpx.Response(status, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+        state = maintenance.fetch_session_retention_state(
+            client, _SERVER, "sess-1", {"X-Test": "1"}
+        )
+
+    assert (state.status, state.archived_at, state.stop) == expected
+    assert requests[0].url.path == "/v1/sessions/sess-1"
+    assert requests[0].url.params["include_items"] == "false"
+    assert requests[0].headers["X-Test"] == "1"
+
+
+def test_list_archived_session_times_reads_every_page_and_keeps_rows_on_failure() -> None:
+    pages = [
+        {
+            "data": [
+                {"id": "sess-1", "archived": True, "archived_at": 1_700_000_000},
+                {"id": "sess-2", "archived": True, "archived_at": None},
+            ],
+            "has_more": True,
+            "last_id": "sess-2",
+        },
+        {
+            "data": [{"id": "sess-3", "archived": True, "archived_at": 1_700_000_500}],
+            "has_more": True,
+            "last_id": "sess-3",
+        },
+    ]
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if not pages:
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, json=pages.pop(0))
+
+    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+        archived = maintenance.list_archived_session_times(client, _SERVER, {"X-Test": "1"})
+
+    assert archived == {"sess-1": 1_700_000_000, "sess-3": 1_700_000_500}
+    assert [request.url.params.get("after") for request in requests] == [None, "sess-2", "sess-3"]
+    assert requests[0].url.params["archived_only"] == "true"
+    assert requests[0].headers["X-Test"] == "1"
+
+
+def test_retain_codex_session_dirs_asks_per_session_only_beyond_the_archive_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    root = tmp_path / "codex-native"
+    for name, session_id in (("a" * 32, "sess-listed"), ("b" * 32, "sess-gone")):
+        bridge_dir = root / name
+        bridge_dir.mkdir(parents=True)
+        (bridge_dir / "owner.pid").write_text("999999", encoding="utf-8")
+        (bridge_dir / "state.json").write_text(
+            f'{{"session_id": "{session_id}"}}', encoding="utf-8"
+        )
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    asked: list[tuple[str, str, dict[str, str]]] = []
+
+    def _fetch(
+        _client: httpx.Client, server_url: str, session_id: str, headers: dict[str, str]
+    ) -> bridge.SessionRetentionState:
+        asked.append((server_url, session_id, dict(headers)))
+        return bridge.SessionRetentionState("not_found")
+
+    monkeypatch.setattr(
+        maintenance,
+        "list_archived_session_times",
+        lambda _client, _server_url, _headers: {"sess-listed": int(_NOW - 15 * 24 * 3600)},
+    )
+    monkeypatch.setattr(maintenance, "fetch_session_retention_state", _fetch)
+
+    counts = maintenance.retain_codex_session_dirs(
+        _SERVER, {"X-Test": "1"}, remove=False, now=_NOW
+    )
+
+    assert asked == [(_SERVER, "sess-gone", {"X-Test": "1"})]
+    assert counts["removable"] == 2
+    assert all(entry.exists() for entry in root.iterdir())
+
+
+async def test_session_retention_stage_runs_daily_and_retries_an_unanswered_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results: list[dict[str, int]] = [{"stopped": 1}, {"stopped": 0}]
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def _retain(server_url: str, headers: dict[str, str], **_kwargs: object) -> dict[str, int]:
+        calls.append((server_url, dict(headers)))
+        return results.pop(0)
+
+    monkeypatch.setattr(maintenance, "retain_codex_session_dirs", _retain)
+    stage = maintenance._codex_session_retention_stage(_SERVER, lambda: {"X-Test": "1"})
+
+    assert await stage() == {"stopped": 1}
+    assert await stage() == {"stopped": 0}
+    assert await stage() == "not due"
+    assert calls == [(_SERVER, {"X-Test": "1"})] * 2
+
+
+async def test_session_retention_stage_stops_asking_once_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host shutdown waits for the worker, so a cancelled pass asks nothing more."""
+    started = threading.Event()
+    saw_stop = threading.Event()
+
+    def _retain(_server_url: str, _headers: dict[str, str], *, should_stop: Any) -> dict[str, int]:
+        started.set()
+        deadline = time.monotonic() + 5.0
+        while not should_stop() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if should_stop():
+            saw_stop.set()
+        return {"stopped": 1}
+
+    monkeypatch.setattr(maintenance, "retain_codex_session_dirs", _retain)
+    stage = maintenance._codex_session_retention_stage(_SERVER, dict)
+
+    async def _run_stage() -> object:
+        return await stage()
+
+    task = asyncio.create_task(_run_stage())
+    assert await asyncio.to_thread(started.wait, 5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert saw_stop.is_set()
 
 
 async def test_start_runs_stages_in_background_and_in_order(tmp_path: Path) -> None:

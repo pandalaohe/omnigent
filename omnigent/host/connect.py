@@ -5951,6 +5951,8 @@ class HostProcess:
                 on_runner_log_rotated=lambda path, size, file_id: loop.call_soon_threadsafe(
                     self._note_runner_log_rotated, path, size, file_id
                 ),
+                server_url=self._server_url,
+                server_headers=self._build_connect_headers,
             )
             self._maintenance_janitor.start()
         except Exception:
