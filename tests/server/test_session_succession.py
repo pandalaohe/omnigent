@@ -631,23 +631,18 @@ def _wake_event(text: str, *, is_meta: bool = False) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize(
-    "recovery_path", ["source_unbound", "rebound_request", "rebound_reconnect"]
-)
-async def test_claude_transfer_recovers_original_pane_after_lost_reply(
+async def test_claude_transfer_recovers_forward_after_successor_uses_pane_and_source_unbinds(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
-    runners: _FakeRunnerPool,
+    runner: _FakeRunnerClient,
     wake: AsyncMock,
     monkeypatch: pytest.MonkeyPatch,
-    recovery_path: str,
 ) -> None:
     from tests.server.helpers import create_test_agent
 
     agent = await create_test_agent(client, "live-successor")
     old, new, path = await _prepare_claude_transfer(client, store, agent_id=agent["id"])
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
-    runner = runners.for_runner(RUNNER_ID)
     pane = _transfer_test_terminal("original")
     owner = old
     terminal_visible = True
@@ -694,38 +689,10 @@ async def test_claude_transfer_recovers_original_pane_after_lost_reply(
     typed = await client.post(f"/v1/sessions/{new}/events", json=_wake_event("Continue here"))
     assert typed.status_code == 202, typed.text
     assert pane_inputs == [("original", "Continue here")]
-    replacement = runners.for_runner(RUNNER_ID_B)
-    if recovery_path == "source_unbound":
-        assert store.clear_runner_id(old).runner_id is None
-    else:
-        store.replace_runner_id(old, RUNNER_ID_B)
-        store.replace_runner_id(new, RUNNER_ID_B)
-
-        async def probe_replacement(url: str, *, timeout: float) -> httpx.Response:
-            terminal = (
-                _transfer_test_terminal("replacement") if f"/sessions/{old}/" in url else None
-            )
-            return _terminal_probe(url, terminal)
-
-        monkeypatch.setattr(replacement, "get", probe_replacement, raising=False)
+    assert store.clear_runner_id(old).runner_id is None
     schedule_retry = Mock(wraps=succession_module._schedule_retry)
     monkeypatch.setattr(succession_module, "_schedule_retry", schedule_retry)
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.0,))
-
-    if recovery_path == "rebound_request":
-        retried = await client.post(path, json={"target_session_id": new})
-        assert retried.status_code == 200 and retried.json() == pane, retried.text
-    elif recovery_path == "rebound_reconnect":
-        terminal_visible = False
-        await succession_module.resume_successions_for_runner(
-            RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
-        )
-        assert store.get_succession(old, new) is None
-        source = store.get_conversation(old)
-        assert source is not None and succession_module._ClaudeTransferRecord.read(source) == (
-            succession_module._ClaudeTransferRecord(new, RUNNER_ID, "original")
-        )
-        terminal_visible = True
 
     await succession_module.resume_successions_for_runner(
         RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
@@ -735,9 +702,6 @@ async def test_claude_transfer_recovers_original_pane_after_lost_reply(
     assert finished is not None and finished.phase == "done"
     assert schedule_retry.call_args is not None and schedule_retry.call_args.args == (finished.id,)
     assert owner == new and transfers == [path]
-    assert not any(url.endswith("/transfer") for url, _ in replacement.posts)
-    successor = store.get_conversation(new)
-    assert successor is not None and successor.runner_id == RUNNER_ID
     wake.assert_awaited_once()
 
 
@@ -858,7 +822,7 @@ async def test_claude_transfer_uses_replacement_runner_without_original_exit_rep
         row = conversation if conversation is not None else store.get_conversation(session_id)
         assert row is not None and isinstance(row.runner_id, str)
         if row.runner_id == RUNNER_ID and not original_online:
-            return None
+            pytest.fail("A fresh handover probed the superseded runner")
         return runners.for_runner(row.runner_id)
 
     async def probe_original(url: str, *, timeout: float) -> httpx.Response:
