@@ -7703,6 +7703,11 @@ def create_runner_app(
                 _schedule_pending_rotation(conv_id)
         if inbox_recovery_checked:
             return
+        if sign_in_hold:
+            # Give the prompt waiter ownership as soon as the hold is established.
+            # A deferred drain could otherwise race the release and skip the waiter.
+            _start_claude_prompt_waiter(conv_id)
+            return
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(

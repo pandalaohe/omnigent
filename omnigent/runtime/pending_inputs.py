@@ -1082,7 +1082,7 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
 def remember_unconfirmed_input_text(conversation_id: str, drained: DrainedInput) -> None:
     """Mark an identical later pending match ambiguous while this echo could still arrive."""
     bare_text = _bare_text(_content_text(drained.content))
-    if not bare_text or not drained.stable_id or drained.uncertain or drained.interrupted:
+    if not bare_text or not drained.stable_id or drained.uncertain:
         return
     with _lock:
         _unconfirmed_input_texts[conversation_id, bare_text] = True

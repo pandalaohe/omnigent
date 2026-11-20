@@ -169,25 +169,29 @@ async def test_forwarder_cannot_set_web_stable_id(
 
 
 @pytest.mark.parametrize(
-    ("overlapping_attachment_send", "mirror_text"),
+    ("overlapping_send", "interrupted", "mirror_text"),
     [
-        pytest.param(False, "ship it", id="manual-same-text-empty-queue"),
-        pytest.param(True, "[Attached file: /tmp/first.txt]\n\nship it", id="overlapping-send"),
+        pytest.param(False, False, "ship it", id="manual-same-text-empty-queue"),
+        pytest.param(
+            True, False, "[Attached file: /tmp/first.txt]\n\nship it", id="overlapping-send"
+        ),
+        pytest.param(True, True, "ship it", id="stop-then-same-text-claim"),
     ],
 )
 @pytest.mark.asyncio
 async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    overlapping_attachment_send: bool,
+    overlapping_send: bool,
+    interrupted: bool,
     mirror_text: str,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Native")
-    content = [
-        {"type": "input_text", "text": "ship it"},
-        {"type": "input_file", "file_id": "file_first", "filename": "first.txt"},
-    ]
+    prompt = {"type": "input_text", "text": "ship it"}
+    content = [prompt]
+    if not interrupted:
+        content.append({"type": "input_file", "file_id": "file_first", "filename": "first.txt"})
     pending_id = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
     attempt_id = pending_inputs.delivery_attributes_for(conv.id, pending_id)["delivery_attempt_id"]
     assert isinstance(attempt_id, str)
@@ -196,6 +200,8 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
 
     try:
+        if interrupted:
+            pending_inputs.mark_interrupted(conv.id, [pending_id])
         assert await _settle_lost_runner_input(
             store,
             conv.id,
@@ -205,15 +211,20 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
             expected_attempt_id=attempt_id,
         )
         assert not pending_inputs.snapshot_for(conv.id)
-        if overlapping_attachment_send:
-            pending_inputs.record(
+        if overlapping_send:
+            other_content = [prompt]
+            if not interrupted:
+                other_content.append(
+                    {"type": "input_file", "file_id": "file_second", "filename": "second.txt"}
+                )
+            other_pending_id = pending_inputs.record(
                 conv.id,
-                [
-                    content[0],
-                    {"type": "input_file", "file_id": "file_second", "filename": "second.txt"},
-                ],
+                other_content,
                 stable_id=_OTHER_WEB_ID,
+                runner_managed=interrupted,
             )
+            if interrupted:
+                assert pending_inputs.claim_runner_input(conv.id, other_pending_id, "successor")
         item_id, replay = await _persist_external_conversation_item(
             conv.id, conv, _mirror(mirror_text, source_id="independent-terminal-record"), store
         )
