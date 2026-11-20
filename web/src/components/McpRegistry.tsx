@@ -29,15 +29,29 @@ export function McpRegistryConnections() {
 }
 
 function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled: boolean }) {
-  const params = new URLSearchParams(window.location.search);
-  const callbacks = [...params].filter(([key]) => key.startsWith("mcp-"));
-  const callbackCursors = params.getAll(MCP_PAGE_CURSOR_PARAM);
-  const returning = callbacks.some(([, status]) => status === "connected" || status === "error");
+  const [callback] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const outcomes = [...params].filter(
+      ([key, status]) => key.startsWith("mcp-") && (status === "connected" || status === "error"),
+    );
+    return { outcomes, cursors: params.getAll(MCP_PAGE_CURSOR_PARAM) };
+  });
   const { cursor, cursors, page, next, previous } = useSettingsPageCursor(
-    returning && callbackCursors.every((value) => value.length > 0 && value.length <= 64)
-      ? callbackCursors
+    callback.outcomes.length &&
+      callback.cursors.every((value) => value.length > 0 && value.length <= 64)
+      ? callback.cursors
       : [],
   );
+  useEffect(() => {
+    // Let the resolved viewer restore the page before removing the one-time callback.
+    if (!enabled || !callback.outcomes.length) return;
+    const url = new URL(window.location.href);
+    for (const [key, status] of callback.outcomes) url.searchParams.delete(key, status);
+    url.searchParams.delete(MCP_PAGE_CURSOR_PARAM);
+    if (url.href !== window.location.href) {
+      window.history.replaceState(window.history.state, "", url);
+    }
+  }, [callback, enabled]);
   const returnParams = new URLSearchParams();
   for (const after of cursors) returnParams.append(MCP_PAGE_CURSOR_PARAM, after);
   const returnTo = window.location.pathname + (cursors.length ? `?${returnParams}` : "");
@@ -53,7 +67,7 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
       previous();
     }
   }, [page, data, isFetching, previous]);
-  const callbackFailed = callbacks.some(([, status]) => status === "error");
+  const callbackFailed = callback.outcomes.some(([, status]) => status === "error");
   return (
     <div className="space-y-4">
       <div>

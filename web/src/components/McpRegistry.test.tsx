@@ -162,6 +162,56 @@ describe("MCP account connections", () => {
     }
   });
 
+  it.each(["server", "viewer"] as const)(
+    "consumes the OAuth page cursor before switching %s at the same URL",
+    async (switchScope) => {
+      const originalUrl = window.location.href;
+      const originalState = window.history.state;
+      const routeState = { idx: 2 };
+      window.history.replaceState(
+        routeState,
+        "",
+        "/settings/mcp?mcp_page_after=first-page&mcp-tracker=connected&tab=kept#services",
+      );
+      scope.viewer = null;
+      vi.mocked(registryRequest).mockImplementation(async (path) => ({
+        data: [
+          {
+            ...service,
+            title: path?.includes("after") ? "Later page service" : "First page service",
+          },
+        ],
+      }));
+
+      try {
+        const { rerender } = renderConnections();
+        expect(registryRequest).not.toHaveBeenCalled();
+        scope.viewer = "viewer";
+        rerender(<McpRegistryConnections />);
+        await screen.findByText("Later page service");
+        expect(screen.getByText("Page 2")).toBeInTheDocument();
+
+        if (switchScope === "server") {
+          scope.server = "two";
+          scope.generation += 1;
+        } else {
+          scope.viewer = "another-viewer";
+        }
+        rerender(<McpRegistryConnections />);
+        await screen.findByText("First page service");
+        expect(vi.mocked(registryRequest).mock.calls.map(([url]) => url)).toEqual([
+          "?limit=20&after=first-page",
+          "?limit=20",
+        ]);
+        expect(window.location.search).toBe("?tab=kept");
+        expect(window.location.hash).toBe("#services");
+        expect(window.history.state).toEqual(routeState);
+      } finally {
+        window.history.replaceState(originalState, "", originalUrl);
+      }
+    },
+  );
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {
