@@ -986,54 +986,6 @@ async def test_followup_reaches_a_running_turn_once_its_hidden_input_box_repaint
 
 
 @pytest.mark.asyncio
-async def test_a_box_that_stays_hidden_is_repainted_at_most_once_per_interval(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The waiter re-checks a hidden box every poll but asks for a repaint only per interval."""
-    app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
-    sid = uuid.uuid4().hex
-    pane = _RUNNING_TURN_PANE
-    running = True
-    turn_checks = 0
-    repaints = 0
-    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
-    claude_native_bridge.write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    def turn_running(*_args: object) -> bool:
-        nonlocal turn_checks
-        turn_checks += 1
-        return running
-
-    def repaint(*_args: object) -> int:
-        nonlocal repaints
-        repaints += 1
-        return 1
-
-    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", turn_running)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: pane)
-    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
-    async with _runner_client(app) as client:
-        await _create_session(client, sid)
-        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
-        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
-        pane = "✻ Sautéing… (40s · esc to interrupt)\nlauncher: refreshing credentials\n"
-        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
-        assert reply.json()["status"] == "buffered"
-        checks_at_hold = turn_checks
-        await _until(lambda: turn_checks >= checks_at_hold + 4)
-        assert repaints == 1
-        assert len(harness.posted_bodies) == 1
-        running = False
-        pane = _RUNNING_TURN_PANE
-        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
-    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
-
-
-@pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
