@@ -431,6 +431,105 @@ async def test_agy_handover_reparents_children_and_wakes_successor_once(
     assert "Finish the remaining check." in wake.call_args.args[1]
 
 
+@pytest.mark.parametrize("has_children", [False, True])
+@pytest.mark.parametrize("lost_runner_reply", [False, True])
+async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    has_children: bool,
+    lost_runner_reply: bool,
+) -> None:
+    old = store.create_conversation(
+        agent_id="a" * 32, runner_id=RUNNER_ID, harness_override="claude-native"
+    ).id
+    child = _create(store, parent=old, title="worker") if has_children else None
+    note = await client.post(
+        f"/v1/sessions/{old}/handover",
+        json={"handover": "Continue the work.", "rotate": True},
+    )
+    assert note.status_code == 200, note.text
+    prepared = await client.post(f"/v1/sessions/{old}/successor")
+    assert prepared.status_code == 200, prepared.text
+    new = prepared.json()["id"]
+
+    terminal = {
+        "id": "terminal_claude_main",
+        "metadata": {"running": True, "instance_id": "instance-one"},
+    }
+    owner = old
+    transfer_count = 0
+    original_post = runner.post
+
+    async def get_terminal(path: str, *, timeout: float) -> httpx.Response:
+        present = f"/sessions/{owner}/" in path
+        return httpx.Response(
+            200 if present else 404,
+            request=httpx.Request("GET", f"http://runner.test{path}"),
+            json=terminal if present else {},
+        )
+
+    async def post(path: str, **kwargs: Any) -> httpx.Response:
+        nonlocal owner, transfer_count
+        if not path.endswith("/transfer"):
+            return await original_post(path, **kwargs)
+        assert owner == old
+        assert kwargs["json"] == {
+            "target_session_id": new,
+            "expected_instance_id": "instance-one",
+        }
+        transfer_count += 1
+        owner = new
+        if lost_runner_reply:
+            raise httpx.ReadTimeout("transfer response lost")
+        return httpx.Response(200, json=terminal)
+
+    monkeypatch.setattr(runner, "get", get_terminal, raising=False)
+    monkeypatch.setattr(runner, "post", post)
+
+    path = f"/v1/sessions/{old}/resources/terminals/terminal_claude_main/transfer"
+    accepted = asyncio.Event()
+
+    async def forwarder_until_transfer() -> None:
+        response = await client.post(path, json={"target_session_id": new})
+        assert response.status_code == 200, response.text
+        accepted.set()
+        await asyncio.Future()  # The old forwarder never gets to POST /succession.
+
+    forwarder_task = asyncio.create_task(forwarder_until_transfer())
+    async with asyncio.timeout(5):
+        done, _ = await asyncio.wait(
+            (forwarder_task, asyncio.create_task(accepted.wait())),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    if forwarder_task in done:
+        await forwarder_task
+    forwarder_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder_task
+
+    receipt = store.get_succession(old, new)
+    assert receipt is not None
+    assert store.get_conversation(old).labels[SUCCEEDED_BY_LABEL_KEY] == new
+    assert receipt.moved_ids == ([child] if child is not None else [])
+    if child is not None:
+        assert store.get_conversation(child).parent_conversation_id == new
+    retried = await client.post(path, json={"target_session_id": new})
+    assert retried.status_code == 200, retried.text
+    assert transfer_count == 1
+    assert store.get_succession(old, new).id == receipt.id
+
+    await succession_module.resume_successions_for_runner(
+        RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
+    )
+    assert store.get_succession(old, new).phase == "done"
+    assert store.get_conversation(old).archived
+    assert len(_succession_notices(store, new)) == 1
+    wake.assert_awaited_once()
+
+
 @pytest.mark.parametrize("failed", [False, True])
 async def test_late_claude_clear_delivers_note_and_resets_rotation(
     failed: bool,

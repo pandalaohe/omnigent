@@ -2800,6 +2800,8 @@ class SessionResourceRegistry:
         source_session_id: str,
         target_session_id: str,
         terminal_id: str,
+        *,
+        expected_instance_id: str | None = None,
     ) -> SessionResourceView | None:
         """Move a terminal resource between sessions without closing it.
 
@@ -2813,6 +2815,7 @@ class SessionResourceRegistry:
             ``"conv_new"``.
         :param terminal_id: Opaque terminal resource id, e.g.
             ``"terminal_claude_main"``.
+        :param expected_instance_id: Transfer only this terminal instance, when supplied.
         :returns: The transferred terminal resource view under
             *target_session_id*, or ``None`` if no matching source
             terminal exists.
@@ -2831,6 +2834,11 @@ class SessionResourceRegistry:
                 continue
             if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
                 continue
+            if (
+                expected_instance_id is not None
+                and entry.instance.instance_id != expected_instance_id
+            ):
+                return None
             moved = self._terminal_registry.transfer(
                 source_session_id,
                 target_session_id,

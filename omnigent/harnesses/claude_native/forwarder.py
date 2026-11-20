@@ -5391,6 +5391,9 @@ async def _create_clear_replacement_session(
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
     labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
+    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+    requested_rotation = ROTATE_REQUESTED_LABEL_KEY in labels
     new_session_id = checkpoint.pending_clear_new_id
     if new_session_id is not None and not checkpoint.pending_clear_transferred:
         candidate = await _fetch_session_snapshot(client, new_session_id)
@@ -5434,6 +5437,18 @@ async def _create_clear_replacement_session(
         )
 
     terminal_id = terminal_resource_id("claude", "main")
+    transfer_path = (
+        f"/v1/sessions/{url_component(old_session_id)}"
+        f"/resources/terminals/{url_component(terminal_id)}/transfer"
+    )
+
+    async def transfer() -> None:
+        response = await client.post(
+            transfer_path,
+            json={"target_session_id": new_session_id},
+            timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
+        )
+        response.raise_for_status()
 
     async def owners() -> tuple[bool, bool]:
         present = []
@@ -5478,18 +5493,17 @@ async def _create_clear_replacement_session(
                     "Successor bind timed out but server confirms runner; session=%s",
                     new_session_id,
                 )
-        if not transferred:
-            transfer_resp = await client.post(
-                (
-                    f"/v1/sessions/{url_component(old_session_id)}"
-                    f"/resources/terminals/{url_component(terminal_id)}/transfer"
-                ),
-                json={"target_session_id": new_session_id},
-                timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
-            )
-            transfer_resp.raise_for_status()
-    except httpx.HTTPError:
+        if not transferred or requested_rotation:
+            await transfer()
+    except httpx.HTTPError as exc:
         source_present, target_present = await owners()
+        if requested_rotation:
+            if target_present and not source_present:
+                # Pane ownership alone cannot confirm the server's durable move.
+                # Keep the checkpoint until the idempotent transfer acknowledges it.
+                await transfer()
+            elif not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code >= 500:
+                raise
         if source_present or not target_present:
             if target_present:
                 close_resp = await client.delete(
@@ -5543,11 +5557,8 @@ async def _create_clear_replacement_session(
             extra={"session_id": old_session_id},
             exc_info=True,
         )
-    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
-
-    # User clears retire even childless sessions; requested handover retains
-    # its existing empty-set behaviour.
-    if ROTATE_REQUESTED_LABEL_KEY not in labels:
+    # Requested rotations commit inside the server's transfer handler.
+    if not requested_rotation:
         await post_session_succession(
             client,
             old_session_id=old_session_id,

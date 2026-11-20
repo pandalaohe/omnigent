@@ -126,6 +126,10 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
+from omnigent.server.session_succession import (
+    is_requested_claude_transfer,
+    transfer_requested_claude_terminal,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -2194,7 +2198,7 @@ def register_resources_routes(
                 "'target_session_id' is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        await _validate_session(target_session_id, request, LEVEL_OWNER)
+        target = await _validate_session(target_session_id, request, LEVEL_OWNER)
 
         user_id = _get_user_id(request, auth_provider)
         # Sub-agents inherit their parent's host; check the host the terminal runs on.
@@ -2214,12 +2218,32 @@ def register_resources_routes(
             )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
-        status, payload = await _proxy_post_to_runner(
-            session_id,
-            path,
-            {"target_session_id": target_session_id},
-            conv,
-        )
+        requested_rotation = is_requested_claude_transfer(conv, target, terminal_id)
+        if requested_rotation:
+            state = request.app.state
+            try:
+                # The caller may disappear when the pane changes hands. The
+                # server owns the move from the first write of its intent.
+                status, payload = await asyncio.shield(
+                    transfer_requested_claude_terminal(
+                        session_id,
+                        target_session_id,
+                        conversation_store=conversation_store,
+                        runner_router=runner_router,
+                        peer_message_store=getattr(state, "peer_message_store", None),
+                        scheduled_task_store=getattr(state, "scheduled_task_store", None),
+                        archive_cleanup=getattr(state, "archive_close_coordinator", None),
+                    )
+                )
+            except (httpx.HTTPError, ConnectionError) as exc:
+                raise HTTPException(502, "Claude terminal transfer is unconfirmed") from exc
+        else:
+            status, payload = await _proxy_post_to_runner(
+                session_id,
+                path,
+                {"target_session_id": target_session_id},
+                conv,
+            )
         if status == 404:
             error = payload.get("error", {})
             raise OmnigentError(
@@ -2243,7 +2267,8 @@ def register_resources_routes(
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
             )
 
-        if conv.host_id is not None:
+        # A prepared successor already inherits the source placement.
+        if not requested_rotation and conv.host_id is not None:
             await asyncio.to_thread(
                 conversation_store.set_host_id,
                 target_session_id,
@@ -2253,7 +2278,7 @@ def register_resources_routes(
                 # The replacement keeps the old row's working tree.
                 worktree=conv.worktree,
             )
-        elif conv.worktree is not None:
+        elif not requested_rotation and conv.worktree is not None:
             # A host-less child row (no bind to carry) still keeps the
             # worktree, so a later bind launches in the same working tree.
             await asyncio.to_thread(

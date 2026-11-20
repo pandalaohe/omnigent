@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 from weakref import WeakValueDictionary
 
 import httpx
@@ -32,12 +34,15 @@ import httpx
 from omnigent.db.utils import generate_task_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.native._native_session_labels import replacement_session_labels
+from omnigent.native.native_terminal import url_component
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auto_rotation import AUTO_ROTATION_STATE_PREFIX
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
@@ -54,8 +59,12 @@ from omnigent.server.schemas import SessionCreatedEvent
 from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     HANDOVER_ITEM_LABEL_KEY,
+    ROTATE_REQUESTED_LABEL_KEY,
+    ROTATION_SUCCESSOR_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
+    SUCCEEDS_LABEL_KEY,
     ConversationStore,
+    LabelGroupChange,
     SessionSuccession,
 )
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -84,6 +93,12 @@ _resumer_locks: dict[str, asyncio.Lock] = {}
 _retry_attempts: dict[str, int] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _retry_tasks: dict[str, asyncio.Task[None]] = {}
+
+_CLAUDE_TERMINAL = terminal_resource_id("claude", "main")
+_CLAUDE_TRANSFER_LABEL = f"{AUTO_ROTATION_STATE_PREFIX}claude_transfer"
+_claude_transfer_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    WeakValueDictionary
+)
 
 
 def scheduled_send_lock(session_id: str) -> asyncio.Lock:
@@ -116,6 +131,205 @@ async def commit_succession_move(
 
     # Cancelling the HTTP waiter cannot stop a move already running in a thread.
     await asyncio.shield(move())
+
+
+def is_requested_claude_transfer(old: Conversation, new: Conversation, terminal_id: str) -> bool:
+    """Only the server-prepared, explicitly requested Claude rotation commits on transfer."""
+    if terminal_id != _CLAUDE_TERMINAL or new.labels.get(SUCCEEDS_LABEL_KEY) != old.id:
+        return False
+    requested_revision = old.labels.get(ROTATE_REQUESTED_LABEL_KEY)
+    if requested_revision is None or (
+        requested_revision != str(old.archive_revision)
+        and old.labels.get(SUCCEEDED_BY_LABEL_KEY) != new.id
+    ):
+        return False
+    try:
+        prepared = json.loads(old.labels.get(ROTATION_SUCCESSOR_LABEL_KEY, "null"))
+    except ValueError:
+        return False
+    return (
+        isinstance(prepared, dict)
+        and prepared.get("id") == new.id
+        and str(prepared.get("revision")) == requested_revision
+    )
+
+
+def _terminal_path(session_id: str) -> str:
+    return f"/v1/sessions/{url_component(session_id)}/resources/terminals/{_CLAUDE_TERMINAL}"
+
+
+def _terminal_instance(payload: dict[str, Any]) -> str | None:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("running") is True:
+        instance = metadata.get("instance_id")
+        if isinstance(instance, str) and instance:
+            return instance
+    return None
+
+
+async def _live_terminal(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+    response = await client.get(_terminal_path(session_id), timeout=10.0)
+    if response.status_code == 404:
+        return {}
+    response.raise_for_status()
+    return response.json()
+
+
+async def _clear_transfer_intent(store: ConversationStore, old_id: str, intent: str) -> None:
+    def clear(labels: dict[str, str]) -> LabelGroupChange:
+        return LabelGroupChange(
+            upserts={},
+            deletes={_CLAUDE_TRANSFER_LABEL}
+            if labels.get(_CLAUDE_TRANSFER_LABEL) == intent
+            else set(),
+        )
+
+    await asyncio.to_thread(store.mutate_label_group, old_id, _CLAUDE_TRANSFER_LABEL, clear)
+
+
+async def _commit_claude_transfer(
+    store: ConversationStore, old_id: str, new_id: str, intent: str
+) -> SessionSuccession:
+    receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
+    if receipt is None:
+        # A prepared successor already opts into retiring an empty source.
+        await commit_succession_move(
+            store, old_id, new_id, uuid4().hex, reverse_of=False, allow_empty=True
+        )
+        receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
+    if receipt is None:
+        raise RuntimeError("Transferred Claude terminal has no succession receipt")
+    if intent:
+        await _clear_transfer_intent(store, old_id, intent)
+    return receipt
+
+
+async def transfer_requested_claude_terminal(
+    old_id: str,
+    new_id: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None,
+    archive_cleanup: Any,
+) -> tuple[int, dict[str, Any]]:
+    """Transfer the pane and commit the move before acknowledging the transfer."""
+    store = conversation_store
+    async with _claude_transfer_locks.setdefault(old_id, asyncio.Lock()):
+        old, new = await asyncio.gather(
+            asyncio.to_thread(store.get_conversation, old_id),
+            asyncio.to_thread(store.get_conversation, new_id),
+        )
+        if (
+            old is None
+            or new is None
+            or not is_requested_claude_transfer(old, new, _CLAUDE_TERMINAL)
+        ):
+            raise OmnigentError("Claude rotation changed before transfer", code=ErrorCode.CONFLICT)
+        client = await _get_runner_client(new_id, runner_router, conversation=new)
+        if client is None:
+            raise ConnectionError("Claude successor runner is not connected")
+        intent = old.labels.get(_CLAUDE_TRANSFER_LABEL, "")
+        receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
+        if receipt is not None and old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id:
+            return 200, await _live_terminal(client, new_id)
+        if old.archived or new.archived or not old.runner_id or old.runner_id != new.runner_id:
+            raise OmnigentError("Claude rotation placement changed", code=ErrorCode.CONFLICT)
+
+        if not intent:
+            instance = _terminal_instance(await _live_terminal(client, old_id))
+            if instance is None:
+                return 404, {}
+            intent = await asyncio.to_thread(
+                store.insert_label_if_absent,
+                old_id,
+                _CLAUDE_TRANSFER_LABEL,
+                json.dumps({"target": new_id, "instance": instance}, separators=(",", ":")),
+            )
+        transfer = json.loads(intent)
+        if transfer["target"] != new_id:
+            raise OmnigentError("A different Claude transfer is pending", code=ErrorCode.CONFLICT)
+
+        payload = await _live_terminal(client, new_id)
+        if _terminal_instance(payload) != transfer["instance"]:
+            try:
+                response = await client.post(
+                    f"{_terminal_path(old_id)}/transfer",
+                    json={
+                        "target_session_id": new_id,
+                        "expected_instance_id": transfer["instance"],
+                    },
+                    timeout=30.0,
+                )
+            except (httpx.HTTPError, ConnectionError):
+                payload = await _live_terminal(client, new_id)
+                if _terminal_instance(payload) != transfer["instance"]:
+                    raise
+            else:
+                payload = response.json()
+                if response.is_error:
+                    # A concurrent transfer can have moved the pane while this
+                    # attempt was reaching the runner. Check before rejecting it.
+                    received = await _live_terminal(client, new_id)
+                    if _terminal_instance(received) == transfer["instance"]:
+                        payload = received
+                    else:
+                        if (
+                            response.status_code in (404, 409)
+                            and _terminal_instance(await _live_terminal(client, old_id))
+                            == transfer["instance"]
+                        ):
+                            await _clear_transfer_intent(store, old_id, intent)
+                        return response.status_code, payload
+        if _terminal_instance(payload) != transfer["instance"]:
+            raise RuntimeError("Runner did not confirm the prepared Claude terminal instance")
+        receipt = await _commit_claude_transfer(store, old_id, new_id, intent)
+        _schedule_retry(
+            receipt.id,
+            conversation_store=store,
+            runner_router=runner_router,
+            peer_message_store=peer_message_store,
+            scheduled_task_store=scheduled_task_store,
+            archive_cleanup=archive_cleanup,
+        )
+        return 200, payload
+
+
+async def _recover_claude_transfers(
+    store: ConversationStore, runner_router: RunnerRouter | None, runner_id: str | None = None
+) -> None:
+    intents = await asyncio.to_thread(store.list_label_values, _CLAUDE_TRANSFER_LABEL)
+    for old_id, intent in intents.items():
+        async with _claude_transfer_locks.setdefault(old_id, asyncio.Lock()):
+            try:
+                old = await asyncio.to_thread(store.get_conversation, old_id)
+                if old is None or old.labels.get(_CLAUDE_TRANSFER_LABEL) != intent:
+                    continue
+                transfer = json.loads(intent)
+                new_id = transfer["target"]
+                new = await asyncio.to_thread(store.get_conversation, new_id)
+                if new is None or (runner_id is not None and new.runner_id != runner_id):
+                    continue
+                if old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id:
+                    await _clear_transfer_intent(store, old_id, intent)
+                    continue
+                if (
+                    old.archived
+                    or new.archived
+                    or not is_requested_claude_transfer(old, new, _CLAUDE_TERMINAL)
+                ):
+                    await _clear_transfer_intent(store, old_id, intent)
+                    continue
+                client = await _get_runner_client(new_id, runner_router, conversation=new)
+                if (
+                    client is not None
+                    and _terminal_instance(await _live_terminal(client, new_id))
+                    == transfer["instance"]
+                ):
+                    await _commit_claude_transfer(store, old_id, new_id, intent)
+            except Exception:
+                _logger.exception("Could not reconcile Claude rotation transfer for %s", old_id)
 
 
 class _SuccessionParked(RuntimeError):
@@ -293,6 +507,7 @@ async def resume_unfinished_successions(
     :param peer_message_store: Durable peer-message store, or ``None``.
     """
     try:
+        await _recover_claude_transfers(conversation_store, runner_router)
         receipts = await _resumable_receipts(conversation_store)
     except Exception:
         # A failed startup scan must not break boot.
@@ -332,6 +547,7 @@ async def resume_successions_for_runner(
     :param peer_message_store: Durable peer-message store, or ``None``.
     """
     try:
+        await _recover_claude_transfers(conversation_store, runner_router, runner_id)
         receipts = await _resumable_receipts(conversation_store)
     except Exception:
         # A failed scan must not break the connect hook.
