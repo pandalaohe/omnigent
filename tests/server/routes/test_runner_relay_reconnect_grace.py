@@ -141,8 +141,26 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["confirmed-running", "confirmed-idle", "unconfirmed-running"])
-async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkeypatch, case):
+@pytest.mark.parametrize(
+    ("case", "heartbeat_runner"),
+    [
+        ("confirmed-running", "runner_a"),
+        ("confirmed-idle", "runner_a"),
+        ("unconfirmed-running", "runner_a"),
+        ("confirmed-running", "runner_b"),
+        ("confirmed-running", None),
+    ],
+    ids=[
+        "confirmed-running",
+        "confirmed-idle",
+        "unconfirmed-running",
+        "replacement-runner",
+        "no-runner-id",
+    ],
+)
+async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
+    db_uri, monkeypatch, case, heartbeat_runner
+):
     store = SqlAlchemyConversationStore(db_uri)
     session_id = store.create_conversation().id
     now = 0.0
@@ -158,7 +176,7 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkey
     attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
         "delivery_attempt_id"
     ]
-    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
     if case.startswith("confirmed"):
         orchestration._record_native_input_lifecycle(
             session_id,
@@ -169,12 +187,17 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkey
                 "delivery_attempt_id": attempt_id,
             },
         )
-    # Claude absorbs the queued paste only after a 25-minute step.
+    # Claude absorbs the queued paste only after a 25-minute step. Only the
+    # claiming runner's heartbeats renew it; a replacement never had the paste.
     for now in range(60, 1501, 60):
         await orchestration._reconcile_runner_input_leases(
-            store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            set(),
+            runner_id=heartbeat_runner,
         )
-    if case != "confirmed-running":
+    if case != "confirmed-running" or heartbeat_runner != "runner_a":
         await orchestration._watch_runner_input_lease(store, session_id, pending_id)
         (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
         assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
@@ -256,14 +279,20 @@ async def test_confirmed_paste_lease_follows_waiting_stop_and_reconnect(db_uri, 
     pending_inputs.enable_runner_lease(session_id, waiting)
     stopped: str | None = None
     try:
-        assert pending_inputs.claim_runner_input(session_id, waiting, "paste")
+        assert pending_inputs.claim_runner_input(
+            session_id, waiting, "paste", runner_id="runner_a"
+        )
         _confirm_paste(session_id, waiting)
         orchestration._session_status_cache[session_id] = "waiting"
         for now in range(60, 1501, 60):
             # A reconnect at 780 s does not settle a claimed paste as lost.
             previous = pending_inputs.runner_accepted_ids(session_id) if now == 780 else set()
             await orchestration._reconcile_runner_input_leases(
-                store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, previous
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                previous,
+                runner_id="runner_a",
             )
         assert pending_inputs.runner_lease_remaining(session_id, waiting) == 720
         assert not pending_inputs.claim_runner_input(session_id, waiting, "second")
@@ -297,17 +326,27 @@ async def test_confirmed_paste_lease_follows_waiting_stop_and_reconnect(db_uri, 
         stopped = pending_inputs.record(
             session_id, [{"type": "input_text", "text": "stopped"}], runner_managed=True
         )
-        assert pending_inputs.claim_runner_input(session_id, stopped, "paste-stopped")
+        assert pending_inputs.claim_runner_input(
+            session_id, stopped, "paste-stopped", runner_id="runner_a"
+        )
         _confirm_paste(session_id, stopped)
         orchestration._session_status_cache[session_id] = "running"
         now = 1560
         await orchestration._reconcile_runner_input_leases(
-            store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            set(),
+            runner_id="runner_a",
         )
         pending_inputs.mark_interrupted(session_id, [stopped])
         for now in range(1620, 2341, 60):
             await orchestration._reconcile_runner_input_leases(
-                store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, set()
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                set(),
+                runner_id="runner_a",
             )
         await orchestration._watch_runner_input_lease(store, session_id, stopped)
         errors = [item for item in store.list_items(session_id).data if item.type == "error"]

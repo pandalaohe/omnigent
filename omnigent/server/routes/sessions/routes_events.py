@@ -6622,7 +6622,11 @@ def register_events_routes(
             raise HTTPException(403, "Bound receiver authority required")
         return {
             "claimed": pending_inputs.claim_runner_input(
-                session_id, pending_id, claim_id, expected_attempt_id=attempt_id
+                session_id,
+                pending_id,
+                claim_id,
+                expected_attempt_id=attempt_id,
+                runner_id=conv.runner_id,
             )
         }
 
