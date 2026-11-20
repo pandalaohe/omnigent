@@ -74,34 +74,34 @@ afterEach(() => {
   useChatStore.setState(initialStoreState);
 });
 
-it.each([
-  ["en-US", "Sending"],
-  ["zh-TW", "发送中"],
-])("uses server time and ticks in a pending bubble (%s)", (language, label) => {
-  vi.spyOn(navigator, "language", "get").mockReturnValue(language);
-  vi.useFakeTimers();
-  try {
-    render(
-      <QueryClientProvider client={new QueryClient()}>
-        <BubbleView
-          bubble={{
-            kind: "user",
-            itemId: "pending_waiting",
-            pending: true,
-            sendingSinceMs: Date.now() - 65_000,
-            content: [{ type: "input_text", text: "waiting" }],
-          }}
-          isLastAssistant={false}
-        />
-      </QueryClientProvider>,
-    );
-    expect(screen.getByTestId("message-still-sending")).toHaveTextContent(`${label} 01:05`);
-    act(() => vi.advanceTimersByTime(1000));
-    expect(screen.getByTestId("message-still-sending")).toHaveTextContent(`${label} 01:06`);
-  } finally {
-    vi.useRealTimers();
-  }
-});
+it.each(["en-US", "zh-CN", "zh-TW"])(
+  "uses server time and ticks in a pending bubble, in English on a %s device",
+  (language) => {
+    vi.spyOn(navigator, "language", "get").mockReturnValue(language);
+    vi.useFakeTimers();
+    try {
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "pending_waiting",
+              pending: true,
+              sendingSinceMs: Date.now() - 65_000,
+              content: [{ type: "input_text", text: "waiting" }],
+            }}
+            isLastAssistant={false}
+          />
+        </QueryClientProvider>,
+      );
+      expect(screen.getByTestId("message-still-sending")).toHaveTextContent("Sending 01:05");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(screen.getByTestId("message-still-sending")).toHaveTextContent("Sending 01:06");
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 describe("Mermaid diagram width", () => {
   it("uses the full chat column for a Mermaid fence", () => {
