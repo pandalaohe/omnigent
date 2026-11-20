@@ -93,6 +93,10 @@ from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.flow import validate_flow_start_args
 from omnigent.tools.builtins.list_comments import ListCommentsTool
+from omnigent.tools.builtins.list_models import (
+    HOST_CATALOG_NEEDS_SERVER,
+    requests_host_catalog,
+)
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
     SysOsEditTool,
@@ -3253,25 +3257,153 @@ def _normalize_subagent_model(
     return normalized
 
 
-async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
+async def _execute_list_models_tool(
+    args: _JsonObject,
+    *,
+    agent_spec: AgentSpec | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
     """
     Dispatch ``sys_list_models``: per-worker model availability.
 
     Runs the enumeration off the event loop — provider resolution reads
     config files and the listing fetches hit provider HTTP APIs (TTL-
-    cached in :mod:`omnigent.models.model_catalog`).
+    cached in :mod:`omnigent.models.model_catalog`). A call naming
+    ``host`` / ``agent_id`` lists that host's launch catalog instead.
 
+    :param args: Parsed tool arguments; empty for the worker listing.
     :param agent_spec: The calling session's agent spec; its
         ``sub_agents`` define the worker rows.
+    :param server_client: HTTP client for the host-catalog read, if any.
     :returns: JSON mapping of worker name (plus ``"self"``) to its
         ``{source, verified, models, note}`` row, or an error string.
     """
+    if requests_host_catalog(args):
+        return await _list_host_catalog(args, server_client)
     if agent_spec is None:
         return "Error: sys_list_models requires an agent spec"
     from omnigent.models.model_catalog import catalog_for_spec
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)
+
+
+async def _get_server_object(
+    server_client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, str] | None = None,
+) -> tuple[_JsonObject | None, str | None]:
+    """Read one JSON object from the server, or the reason it could not be read."""
+    try:
+        resp = await server_client.get(path, params=params, timeout=30.0)
+    except httpx.HTTPError as exc:
+        return None, f"{path} failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return None, f"{path} returned {resp.status_code}"
+    try:
+        payload = _string_object_dict(resp.json())
+    except ValueError:
+        payload = None
+    if payload is None:
+        return None, f"{path} returned a malformed body"
+    return payload, None
+
+
+async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient | None) -> str:
+    """
+    List one host's cached launch catalog for an agent's harness.
+
+    The server maps the agent to its harness as a session create would
+    (``/v1/calling-defaults/resolve``); the rows are the cached catalog the
+    new-session picker reads (``/v1/calling-defaults/catalogs``).
+
+    :param args: Tool arguments carrying ``host`` (id or exact name) and
+        ``agent_id``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON with the host, harness, ``fetched_at``, ``stale`` and
+        the model rows, or a JSON ``{"error", "message"}`` object.
+    """
+    host_arg = _optional_string(args.get("host"))
+    agent_id = _optional_string(args.get("agent_id"))
+    if not host_arg or not agent_id:
+        return json.dumps(
+            {
+                "error": "invalid_arguments",
+                "message": "pass 'host' and 'agent_id' together, both non-empty strings",
+            }
+        )
+    if server_client is None:
+        return json.dumps({"error": "server_unavailable", "message": HOST_CATALOG_NEEDS_SERVER})
+    resolved, host_error = await _resolve_host(server_client, host_arg)
+    if resolved is None:
+        return json.dumps({"error": "host_not_found", "host": host_arg, "message": host_error})
+    host_id, host_name = resolved
+    resolution, error = await _get_server_object(
+        server_client,
+        "/v1/calling-defaults/resolve",
+        {"host_id": host_id, "agent_id": agent_id},
+    )
+    if resolution is None:
+        return json.dumps({"error": "catalog_lookup_failed", "message": error})
+    harness = _optional_string(resolution.get("harness"))
+    if not harness:
+        return json.dumps(
+            {
+                "error": "agent_not_resolved",
+                "agent_id": agent_id,
+                "message": (
+                    f"agent {agent_id!r} did not resolve to a harness; "
+                    "use an agent id from sys_agent_list"
+                ),
+            }
+        )
+    catalogs, error = await _get_server_object(server_client, "/v1/calling-defaults/catalogs")
+    if catalogs is None:
+        return json.dumps({"error": "catalog_lookup_failed", "message": error})
+    record = next(
+        (
+            row
+            for row in _json_object_list(catalogs.get("rows"))
+            if row.get("host_id") == host_id and row.get("harness") == harness
+        ),
+        None,
+    )
+    if record is None:
+        return json.dumps(
+            {
+                "error": "catalog_not_cached",
+                "host": host_name,
+                "host_id": host_id,
+                "harness": harness,
+                "message": f"host {host_name!r} has no cached model catalog for {harness!r}",
+            }
+        )
+    from omnigent.models.model_reference import split_model_id
+
+    models = [
+        {
+            "id": model_id,
+            "provider": split_model_id(model_id)[0],
+            "displayName": _optional_string(row.get("displayName")),
+            "isDefault": row.get("isDefault") is True,
+            "hidden": row.get("hidden") is True,
+        }
+        for row in _json_object_list(record.get("models"))
+        if (model_id := _optional_string(row.get("id")))
+    ]
+    return json.dumps(
+        {
+            "host": host_name,
+            "host_id": host_id,
+            "agent_id": agent_id,
+            "harness": harness,
+            "source": "host_catalog",
+            "fetched_at": record.get("fetched_at"),
+            "stale": record.get("stale") is True,
+            "error": _optional_string(record.get("error")),
+            "models": models,
+        }
+    )
 
 
 def _subagent_launching_message(agent: str, title: object, task_id: str) -> str:
@@ -11797,7 +11929,9 @@ async def execute_tool(
             if output.startswith("Error:"):
                 _note_member_dispatch_failure(conversation_id, args.get("agent"), output)
         elif tool_name in _LIST_MODELS_TOOLS:
-            output = await _execute_list_models_tool(agent_spec=agent_spec)
+            output = await _execute_list_models_tool(
+                args, agent_spec=agent_spec, server_client=server_client
+            )
         elif tool_name in _CHILD_CAP_TOOLS:
             output = await _execute_child_cap(args, server_client, conversation_id)
         elif tool_name in _CHILD_CHECKIN_TOOLS:
