@@ -5430,7 +5430,8 @@ async def _persist_external_conversation_item_unlocked(
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
     match_method: str | None = None
-    delivery_confirmed = True
+    delivery_confirmed = False
+    source_less_successors: frozenset[str] = frozenset()
     # Every drain below holds its entries in place (``hold=True``): they keep
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
@@ -5542,6 +5543,9 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             prior_unconfirmed = pending_inputs.matches_unconfirmed_input_text(session_id, text)
+            clean_exact_match = match_method == "normalized_text" and not (
+                drained.uncertain or drained.interrupted
+            )
             delivery_confirmed = match_method == "input_id" or (
                 match_method != "fifo_fallback"
                 and not (
@@ -5571,9 +5575,22 @@ async def _persist_external_conversation_item_unlocked(
                 drained.stable_id is not None
                 and item.stable_id is None
                 and item.idempotency_key is None
-                and (not prior_unconfirmed or match_method == "input_id")
+                and (
+                    not prior_unconfirmed
+                    or match_method == "input_id"
+                    or (
+                        clean_exact_match
+                        and not pending_inputs.matches_unconfirmed_input_text(
+                            session_id, text, source_less_pending_id=drained.pending_id
+                        )
+                    )
+                )
             ):
                 item = item.model_copy(update={"stable_id": drained.stable_id})
+                # Keep the legacy source-less ids for co-queued same-text
+                # echoes without making the match proof for tagged echoes.
+                if clean_exact_match:
+                    source_less_successors = matched.same_text_successors
             if (
                 drained.stable_id is not None
                 and item.stable_id != drained.stable_id
@@ -5611,12 +5628,16 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             original_held.append(drained)
             cleared_pending_id = drained.pending_id
+            delivery_confirmed = not (
+                drained.uncertain or drained.interrupted or matched.shared_text
+            )
         held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
             original_held.append(drained)
             cleared_pending_id = drained.pending_id
+            delivery_confirmed = not (drained.uncertain or drained.interrupted)
     if drained is not None:
         item = item.model_copy(
             update={
@@ -5665,7 +5686,14 @@ async def _persist_external_conversation_item_unlocked(
     for entry in (*skipped_pending, *uncertain_pending):
         pending_inputs.release(session_id, entry, delivery_confirmed=False)
     if drained is not None:
-        pending_inputs.release(session_id, drained, delivery_confirmed=delivery_confirmed)
+        pending_inputs.release(
+            session_id,
+            drained,
+            delivery_confirmed=delivery_confirmed,
+            source_less_successors=(
+                source_less_successors if persisted.id == drained.stable_id else frozenset()
+            ),
+        )
     _restore_drained_inputs(session_id, held_older, None)
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.

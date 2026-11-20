@@ -7,6 +7,7 @@ import pytest
 
 from omnigent.entities import ConversationItem, MessageData
 from omnigent.runtime import pending_inputs
+from omnigent.server.routes._sessions.helpers import _publish_session_superseded
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _settle_lost_runner_input,
@@ -127,6 +128,53 @@ async def test_mirror_without_an_exact_link_names_no_web_send(
     assert "web_stable_id" not in data.model_dump()
     assert "web_stable_id" not in item.to_api_dict()
     assert "web_stable_id" not in receipts[-1]["data"]
+
+
+@pytest.mark.parametrize(
+    "second_source_id", [None, "tagged-echo"], ids=["co-queued-source-less", "tagged-second"]
+)
+@pytest.mark.asyncio
+async def test_same_text_mirrors_keep_legacy_ids_only_for_co_queued_source_less_sends(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    second_source_id: str | None,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    content = [{"type": "input_text", "text": "ship it"}]
+    pending_inputs.record(conv.id, content, stable_id=_WEB_ID)
+    pending_inputs.record(conv.id, content, stable_id=_OTHER_WEB_ID)
+
+    try:
+        first_id, replay = await _persist_external_conversation_item(
+            conv.id, conv, _mirror("ship it", source_id=None), store
+        )
+        assert first_id == _WEB_ID and not replay
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, "ship it")
+
+        second_id, replay = await _persist_external_conversation_item(
+            conv.id, conv, _mirror("ship it", source_id=second_source_id), store
+        )
+        assert second_id != first_id and not replay
+        assert (second_id == _OTHER_WEB_ID) is (second_source_id is None)
+        for item_id in (first_id, second_id):
+            item = store.get_item(conv.id, item_id)
+            assert item is not None
+            assert "web_stable_id" not in item.to_api_dict()
+        receipts = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1]["type"] == "session.input.consumed"
+        ]
+        assert [receipt["item_id"] for receipt in receipts] == [first_id, second_id]
+        assert all("web_stable_id" not in receipt["data"] for receipt in receipts)
+        assert all(receipt["data"].get("delivery_confirmed") is not False for receipt in receipts)
+        assert not pending_inputs.snapshot_for(conv.id)
+    finally:
+        for pending in pending_inputs.snapshot_for(conv.id):
+            pending_inputs.resolve(conv.id, pending["pending_id"])
 
 
 @pytest.mark.asyncio
@@ -279,7 +327,15 @@ async def test_claimed_uncertain_attempt_cannot_be_confirmed_by_text(
 
 @pytest.mark.parametrize(
     "settlement",
-    ["runner-uncertainty", "forward-rejected", "legacy-failure", "fifo", "skipped", "confirmed"],
+    [
+        "runner-uncertainty",
+        "forward-rejected",
+        "legacy-failure",
+        "fifo",
+        "skipped",
+        "superseded",
+        "confirmed",
+    ],
 )
 @pytest.mark.asyncio
 async def test_settlement_remembers_text_unless_delivery_is_confirmed(
@@ -304,6 +360,9 @@ async def test_settlement_remembers_text_unless_delivery_is_confirmed(
             assert await _settle_undelivered_native_input(store, conv.id, None, _WEB_ID)
         elif settlement == "forward-rejected":
             assert pending_inputs.resolve(conv.id, pending_id) is not None
+        elif settlement == "superseded":
+            target = store.create_conversation(title="New native session")
+            _publish_session_superseded(conv.id, target.id)
         else:
             text = "ship it" if settlement == "confirmed" else "another input"
             if settlement == "skipped":
@@ -320,6 +379,62 @@ async def test_settlement_remembers_text_unless_delivery_is_confirmed(
     finally:
         for pending in pending_inputs.snapshot_for(conv.id):
             pending_inputs.resolve(conv.id, pending["pending_id"])
+
+
+@pytest.mark.parametrize(
+    ("text", "item_type", "item_data"),
+    [
+        (
+            "/model sonnet",
+            "slash_command",
+            {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+        ),
+        ("! pwd", "terminal_command", {"kind": "input", "input": "pwd"}),
+    ],
+    ids=["slash", "shell"],
+)
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+@pytest.mark.asyncio
+async def test_command_mirror_remembers_text_when_delivery_is_uncertain(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    item_type: str,
+    item_data: dict[str, Any],
+    prior_state: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    pending_id = pending_inputs.record(conv.id, [{"type": "input_text", "text": text}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(conv.id)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(conv.id, [pending_id])
+    mirror = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": item_type,
+            "item_data": item_data,
+            "response_id": "resp_command",
+            "source_id": "command-echo",
+        },
+    )
+    try:
+        item_id, replay = await _persist_external_conversation_item(conv.id, conv, mirror, store)
+        assert item_id and not replay
+        assert not pending_inputs.pending_ids(conv.id)
+        assert pending_inputs.resolve(conv.id, pending_id) is None
+        assert pending_inputs.matches_unconfirmed_input_text(conv.id, text) is (
+            prior_state != "plain"
+        )
+    finally:
+        pending_inputs.resolve(conv.id, pending_id)
 
 
 @pytest.mark.parametrize("source_id", ["retry-record", None], ids=["tagged", "source-less"])

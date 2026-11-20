@@ -642,6 +642,7 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "ghost")
 
 
 def test_restore_returns_a_drained_entry_to_the_front() -> None:
@@ -772,6 +773,25 @@ def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> Non
 
     assert len(snapshot) == cap
     assert [entry["pending_id"] for entry in snapshot] == ids[2:]
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "m0")
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "m1")
+    assert not pending_inputs.matches_unconfirmed_input_text("conv_a", "m2")
+
+
+def test_non_hold_mirror_drains_remember_unconfirmed_text() -> None:
+    session_id = "conv_non_hold"
+    oldest_id = pending_inputs.record(session_id, [_text_block("first input")])
+    oldest = pending_inputs.resolve_oldest_for_mirrored_text(session_id, "reformatted input")
+    assert oldest is not None and oldest.pending_id == oldest_id
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "first input")
+
+    skipped_id = pending_inputs.record(session_id, [_text_block("skipped input")])
+    matched_id = pending_inputs.record(session_id, [_text_block("matched input")])
+    drain = pending_inputs.resolve_matching_text(session_id, "matched input")
+    assert drain.matched is not None and drain.matched.pending_id == matched_id
+    assert [entry.pending_id for entry in drain.skipped] == [skipped_id]
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "skipped input")
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "matched input")
 
 
 def test_held_entries_keep_their_slot_while_the_queue_refills() -> None:
