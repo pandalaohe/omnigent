@@ -6,6 +6,7 @@ import base64
 import shutil
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -327,6 +328,71 @@ def test_install_cli_reports_service_failure(
     ]
     assert len(set(receipts)) == 3
     assert all(not receipt.exists() for receipt in receipts)
+
+
+@pytest.mark.parametrize(
+    ("action", "stage", "diagnostic"),
+    [
+        ("install", "Preflight", "Existing sshd service; refusing to take ownership."),
+        ("remove", "CheckOwned", "Omnigent enrollment marker is missing; refusing removal."),
+    ],
+)
+def test_admin_terminal_failure_omits_stale_host_hint(
+    enrolled, monkeypatch, capsys, action, stage, diagnostic
+):
+    from omnigent import cli as cli_module
+
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    monkeypatch.setattr(cli_module.click, "confirm", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+    monkeypatch.setattr(cli_module, "_maybe_fast_backfill_install_ledger", lambda argv: None)
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "host", "admin-terminal", action])
+    calls = _process_boundary(monkeypatch, enrolled, service_failures={stage: diagnostic})
+
+    with pytest.raises(SystemExit) as raised:
+        cli_module.main()
+
+    assert raised.value.code == 1
+    error = capsys.readouterr().err
+    assert f"Windows admin-terminal {stage} failed at {diagnostic}" in error
+    assert "omnigent stop" not in error
+    assert "stale host processes" not in error
+    assert [argv[argv.index("-Action") + 1] for argv, _ in calls] == [stage]
+
+
+def test_preflight_names_leftovers_and_gates_recovery_on_ownership():
+    script = Path(admin_terminal.__file__).with_name("windows_admin_terminal.ps1").read_text()
+    preflight = script.split("function Assert-Fresh {", 1)[1].split("function Assert-Owned {", 1)[
+        0
+    ]
+
+    assert "Existing Omnigent enrollment marker at $marker" in preflight
+    assert (
+        preflight.index("try { Assert-Owned } catch { throw")
+        < preflight.index("omni host admin-terminal remove")
+        < preflight.index("if ($service -and $sshEntries.Count -eq 0)")
+    )
+    assert "An existing sshd service is not Omnigent-owned" in preflight
+    assert '"run Remove-WindowsCapability -Online -Name $capability' in preflight
+    assert "$capability = 'OpenSSH.Server~~~~0.0.1.0'" in script
+    assert "restart Windows if asked" in preflight
+    assert r"Existing ProgramData\ssh entries: $($sshEntries.Name -join" in preflight
+    assert "Existing OpenSSH DefaultShell '$shell' is not cmd.exe" in preflight
+
+
+def test_check_owned_distinguishes_marker_refusals():
+    script = Path(admin_terminal.__file__).with_name("windows_admin_terminal.ps1").read_text()
+    check_owned = script.split("function Assert-Owned {", 1)[1].split("function Protect-File", 1)[
+        0
+    ]
+
+    assert "Omnigent enrollment marker is missing; refusing removal." in check_owned
+    assert "Omnigent enrollment marker at $marker is not readable" in check_owned
+    assert "Omnigent enrollment marker is not valid JSON; refusing removal." in check_owned
+    assert "Enrollment marker kind is not omnigent-admin-terminal-v1" in check_owned
+    assert "Enrollment marker id is missing or invalid" in check_owned
+    assert "Enrollment marker id does not match this installation" in check_owned
 
 
 def test_install_preserves_service_diagnostic_with_locked_result(enrolled, monkeypatch):

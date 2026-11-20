@@ -11640,6 +11640,10 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             )
 
 
+class _AdminTerminalError(click.ClickException):
+    omnigent_suppress_recovery_hint = True
+
+
 @host.group("admin-terminal")
 def host_admin_terminal() -> None:
     """Opt in to or remove loopback OpenSSH admin terminals on Windows."""
@@ -11651,7 +11655,7 @@ def host_admin_terminal_install() -> None:
     from omnigent._platform import IS_WINDOWS
 
     if not IS_WINDOWS:
-        raise click.ClickException("admin-terminal install is available on Windows only")
+        raise _AdminTerminalError("admin-terminal install is available on Windows only")
     click.confirm(
         "Install a loopback-only SSH service and a new admin key on this host? "
         "You will choose a key passphrase and approve UAC. Existing SSH state is refused.",
@@ -11663,7 +11667,7 @@ def host_admin_terminal_install() -> None:
     try:
         install_windows_admin_terminal()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise _AdminTerminalError(str(exc)) from exc
     click.echo("Admin terminals enabled. Restart this host to advertise the capability.")
 
 
@@ -11673,7 +11677,7 @@ def host_admin_terminal_remove() -> None:
     from omnigent._platform import IS_WINDOWS
 
     if not IS_WINDOWS:
-        raise click.ClickException("admin-terminal remove is available on Windows only")
+        raise _AdminTerminalError("admin-terminal remove is available on Windows only")
     click.confirm(
         "Close admin SSH sessions and delete this host's enrolled service and keys?",
         default=False,
@@ -11684,7 +11688,7 @@ def host_admin_terminal_remove() -> None:
     try:
         remove_windows_admin_terminal()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise _AdminTerminalError(str(exc)) from exc
     click.echo("Admin terminals removed. Restart this host; Windows may also require a reboot.")
 
 
