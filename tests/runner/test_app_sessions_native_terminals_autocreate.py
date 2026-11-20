@@ -4897,12 +4897,12 @@ async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("successor_tails_stale_label", [False, True])
-@pytest.mark.parametrize("second_successor_tails_cleared_dir", [False, True])
+@pytest.mark.parametrize("cleared_dir_owner", [None, "forwarder", "launch"])
 async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     successor_tails_stale_label: bool,
-    second_successor_tails_cleared_dir: bool,
+    cleared_dir_owner: str | None,
 ) -> None:
     """
     A session re-keyed to "{id}-cleared" by /clear resumes in its OWN dir.
@@ -4915,7 +4915,9 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     double-mirror the transcript and trip the executor guard). A label not yet
     re-keyed gets the same dir while the successor's live forwarder tails it.
     A session resumed in its cleared dir and cleared again left that dir to a
-    second successor, so it moves on to ``{session_id}-cleared-2``.
+    second successor, so it moves on to ``{session_id}-cleared-2``, also while
+    that successor is mid-relaunch with no forwarder yet. Its own pick is
+    claimed across the label write, so a concurrent launch picks around it.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4941,18 +4943,20 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     second_successor_id = "d5a9ac12e0ef6738651aa07bd0ea9758"
     cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(f"{old_id}-cleared")
     second_successor_forwarder = asyncio.create_task(asyncio.Event().wait())
-    if second_successor_tails_cleared_dir:
+    if cleared_dir_owner is not None:
         claude_native_bridge.prepare_bridge_dir(
             second_successor_id, bridge_id=f"{old_id}-cleared", workspace=tmp_path
         )
         claude_native_bridge.record_hook_event(cleared_dir, {"hook_event_name": "Stop"})
+    if cleared_dir_owner == "forwarder":
         orchestration._register_auto_forwarder_task(
             second_successor_id, second_successor_forwarder
         )
         orchestration._CLAUDE_FORWARDER_BRIDGE_DIRS[second_successor_forwarder] = cleared_dir
-    expected_bridge_id = (
-        f"{old_id}-cleared-2" if second_successor_tails_cleared_dir else f"{old_id}-cleared"
-    )
+    if cleared_dir_owner == "launch":
+        # Mid-relaunch: picked and prepared, its forwarder not registered yet.
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS[cleared_dir] = second_successor_id
+    expected_bridge_id = f"{old_id}-cleared-2" if cleared_dir_owner else f"{old_id}-cleared"
     expected_dir = claude_native_bridge.bridge_dir_for_bridge_id(expected_bridge_id)
 
     class _FakeInstance:
@@ -5000,11 +5004,16 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             )
 
     recorded_requests: list[httpx.Request] = []
+    claims_during_label_write: list[str | None] = []
     label = old_id if successor_tails_stale_label else f"{old_id}-cleared"
 
     def _handle(req: httpx.Request) -> httpx.Response:
         """Report the session's bridge_id label as the cleared marker."""
         recorded_requests.append(req)
+        if req.method == "PATCH":
+            claims_during_label_write.append(
+                orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(expected_dir)
+            )
         return httpx.Response(
             200,
             json={
@@ -5037,12 +5046,19 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         assert (
             orchestration._AUTO_FORWARDER_TASKS.get(second_successor_id)
             is second_successor_forwarder
-        ) == second_successor_tails_cleared_dir
+        ) == (cleared_dir_owner == "forwarder")
+        # Claimed across the label write; released once its forwarder tails the dir.
+        assert claims_during_label_write == [old_id]
+        assert expected_dir not in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS
+        assert (cleared_dir in orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS) == (
+            cleared_dir_owner == "launch"
+        )
     finally:
         successor_forwarder.cancel()
         second_successor_forwarder.cancel()
         orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
         orchestration._AUTO_FORWARDER_TASKS.pop(second_successor_id, None)
+        orchestration._CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(cleared_dir, None)
 
     assert forwarder_kwargs["session_id"] == old_id
     assert forwarder_kwargs["bridge_dir"] == expected_dir
@@ -5052,7 +5068,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     if successor_tails_stale_label:
         assert claude_native_bridge.read_active_session_id(natural_dir) == successor_id
         assert (natural_dir / "hooks.jsonl").exists()
-    if second_successor_tails_cleared_dir:
+    if cleared_dir_owner is not None:
         assert claude_native_bridge.read_active_session_id(cleared_dir) == second_successor_id
         assert (cleared_dir / "hooks.jsonl").exists()
         assert not (cleared_dir / "tmux.json").exists()

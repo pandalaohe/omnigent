@@ -205,8 +205,8 @@ def _publish_tmux_target_for_bridge(
 # garbage-collected mid-run, and the handle for cancelling a session's previous
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
-# Current registry key of each forwarder task; a rekey replaces it.
-_AUTO_FORWARDER_TASK_KEYS: weakref.WeakKeyDictionary[asyncio.Task[object], str] = (
+# Latest registration of each forwarder task; only its callback logs the exit.
+_AUTO_FORWARDER_TASK_REGISTRATIONS: weakref.WeakKeyDictionary[asyncio.Task[object], object] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -359,14 +359,15 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     if incumbent is not None and incumbent is not task:
         incumbent.cancel()
     _AUTO_FORWARDER_TASKS[session_id] = task
-    _AUTO_FORWARDER_TASK_KEYS[task] = session_id
+    registration = object()
+    _AUTO_FORWARDER_TASK_REGISTRATIONS[task] = registration
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
-        if _AUTO_FORWARDER_TASK_KEYS.get(done_task, session_id) != session_id:
-            # Rekeyed onto a successor: that key's callback logs the exit.
+        if _AUTO_FORWARDER_TASK_REGISTRATIONS.get(done_task, registration) is not registration:
+            # Rekeyed since, even back onto this session: the latest callback logs the exit.
             return
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
@@ -413,8 +414,8 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
     superseded conversation (terminal re-create, stop, CLI release, delete)
     would cancel the successor's forwarder or close the subagent router the
     pane's hooks call. Re-registering attaches an eviction callback for the new
-    key; the old key's callback no-ops. The router is detached from the old ID,
-    and the forwarder's ``finally`` still closes it.
+    key; the old key's callback no-ops. The router moves to the new ID, so the
+    pane's spawns route as it, and the forwarder's ``finally`` still closes it.
 
     :param old_session_id: Session the task was registered under, e.g. ``"conv_old"``.
     :param new_session_id: Session that now owns the pane, e.g. ``"conv_new"``.
@@ -426,13 +427,21 @@ def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None
     if task is None:
         return
     _register_auto_forwarder_task(new_session_id, task)
-    from omnigent.runner.subagent_routing import detach_session_router
+    from omnigent.runner.subagent_routing import move_session_router
 
-    detach_session_router(old_session_id)
+    move_session_router(old_session_id, new_session_id)
+
+
+# Bridge dir each in-flight Claude launch picked, until its forwarder tails it.
+# A launch that fails first leaves its claim; it only steers another session's
+# pick to a fresh cleared dir.
+_CLAUDE_BRIDGE_LAUNCH_CLAIMS: dict[Path, str] = {}
 
 
 def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) -> bool:
-    """Return whether another session's live Claude forwarder tails *bridge_dir*."""
+    """Return whether another session's live forwarder or in-flight launch uses *bridge_dir*."""
+    if _CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(bridge_dir, session_id) != session_id:
+        return True
     return any(
         owner != session_id
         and not task.done()
@@ -443,7 +452,7 @@ def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) ->
 
 def _untailed_cleared_bridge_id(session_id: str) -> str:
     """
-    Return a cleared bridge id for *session_id* that no other live forwarder tails.
+    Return a cleared bridge id for *session_id* that no other session uses.
 
     A session resumed on ``{id}-cleared`` and cleared again hands that dir to
     its new successor, so the plain marker can already be someone else's.
@@ -10347,6 +10356,8 @@ async def _auto_create_claude_terminal(
     if _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
         # The pane and its forwarder moved to a successor; never wipe or share its bridge.
         bridge_id = _untailed_cleared_bridge_id(session_id)
+    # Claimed before the next await, so a concurrent launch picks around it.
+    _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir_for_bridge_id(bridge_id)] = session_id
     rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
@@ -11303,6 +11314,8 @@ async def _auto_create_claude_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _CLAUDE_FORWARDER_BRIDGE_DIRS[_forwarder_task] = bridge_dir
+    if _CLAUDE_BRIDGE_LAUNCH_CLAIMS.get(bridge_dir) == session_id:
+        del _CLAUDE_BRIDGE_LAUNCH_CLAIMS[bridge_dir]
     _logger.info(
         "Auto-created claude terminal + forwarder for session %s; "
         "forwarder_task=%s elapsed_ms=%.0f",

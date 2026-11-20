@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
-from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint, request_decision
 from omnigent.runner import subagent_routing
 from omnigent.runner.app import _build_spawn_env_from_spec, _ensure_session_subagent_router
 from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session
@@ -31,10 +31,21 @@ class _DeadClient:
         raise RuntimeError("server down")
 
 
+class _RecordingClient:
+    """Records the session each relay names; the server is down."""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    async def post(self, path: str, *args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        self.paths.append(path)
+        raise RuntimeError("server down")
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_routers() -> Any:  # type: ignore[explicit-any]
     yield
-    for session_id in ("conv_native_launch", "conv_sdk_launch"):
+    for session_id in ("conv_native_launch", "conv_native_successor", "conv_sdk_launch"):
         subagent_routing.shutdown_session_router(session_id)
 
 
@@ -163,33 +174,54 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
     assert session_id not in subagent_routing._session_routers
 
 
-async def test_a_detached_router_outlives_old_session_teardown_until_its_launch_closes_it(
-    tmp_path: Path,
+@pytest.mark.parametrize("successor_has_router", [False, True])
+async def test_a_moved_router_routes_as_the_successor_and_outlives_old_session_teardown(
+    tmp_path: Path, successor_has_router: bool
 ) -> None:
-    """A /clear successor keeps the pane's router; the old session relaunches with its own."""
+    """A /clear successor's spawns relay as it; the old session relaunches with its own router."""
     session_id = "conv_native_launch"
+    successor_id = "conv_native_successor"
     pane_dir = tmp_path / "pane"
     relaunch_dir = tmp_path / "relaunch"
+    client = _RecordingClient()
 
     def _launch(bridge_dir: Path) -> subagent_routing.SubagentRouter | None:
         return _start_subagent_router_for_native_session(
             session_id,
             bridge_dir=bridge_dir,
             harness="claude-native",
-            server_client=_DeadClient(),  # type: ignore[arg-type]
+            server_client=client,  # type: ignore[arg-type]
             routing_enabled=True,
             auto_harness=False,
         ).router
 
     pane_router = _launch(pane_dir)
     assert pane_router is not None
-    subagent_routing.detach_session_router(session_id)
+    successor_router = (
+        subagent_routing.ensure_session_router(
+            successor_id,
+            bridge_dir=tmp_path / "successor",
+            server_client=client,  # type: ignore[arg-type]
+        )
+        if successor_has_router
+        else None
+    )
+    subagent_routing.move_session_router(session_id, successor_id)
+    assert session_id not in subagent_routing._session_routers
+    assert subagent_routing._session_routers.get(successor_id) is (successor_router or pane_router)
+
+    # The pane's hook reads the advertisement and relays as the successor.
+    pane_endpoint = read_router_endpoint(pane_dir)
+    assert pane_endpoint is not None and pane_endpoint.url == pane_router.url
+    assert pane_endpoint.session_id == successor_id
+    body = {"harness": "claude-native", "task_name": "review"}
+    assert await asyncio.to_thread(request_decision, pane_endpoint, successor_id, body)
+    assert await asyncio.to_thread(request_decision, pane_endpoint, session_id, body) is None
+    assert client.paths == [subagent_routing.SERVER_ROUTE_PATH.format(session_id=successor_id)]
 
     # Old-session delete and CLI release hold no handle.
     subagent_routing.shutdown_session_router(session_id)
     assert not pane_router._closed
-    pane_endpoint = read_router_endpoint(pane_dir)
-    assert pane_endpoint is not None and pane_endpoint.url == pane_router.url
 
     relaunched = _launch(relaunch_dir)
     assert relaunched is not None and relaunched is not pane_router
@@ -200,6 +232,8 @@ async def test_a_detached_router_outlives_old_session_teardown_until_its_launch_
     assert read_router_endpoint(pane_dir) is None
     assert not relaunched._closed
     assert subagent_routing._session_routers.get(session_id) is relaunched
+    assert subagent_routing._session_routers.get(successor_id) is successor_router
+    assert successor_router is None or not successor_router._closed
 
 
 @pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
@@ -477,6 +511,7 @@ def test_prune_never_removes_the_shared_router_root(
         url="http://127.0.0.1:1",
         token="tok",
         httpd=None,  # type: ignore[arg-type]
+        session_id="conv_x",
     )
     subagent_routing._prune_router_dirs(router)
     assert root.is_dir()
