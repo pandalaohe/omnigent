@@ -461,6 +461,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "handover_note") return `handover_note:${bubble.itemId}`;
+  if (bubble.kind === "rotation_notice") return `rotation_notice:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
@@ -841,6 +842,17 @@ export const BubbleView = memo(
     if (bubble.kind === "handover_note") {
       return (
         <HandoverNote text={bubble.text} itemId={bubble.itemId} responseId={bubble.responseId} />
+      );
+    }
+    if (bubble.kind === "rotation_notice") {
+      return (
+        <ErrorBanner
+          itemId={bubble.itemId}
+          message={bubble.message}
+          source="harness"
+          code="session_rotation"
+          level="info"
+        />
       );
     }
     if (bubble.kind === "subagent_activity") {

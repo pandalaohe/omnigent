@@ -20,6 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { itemsToBlocks } from "./itemsToBlocks";
 import { buildBubbles, createBubbleCache } from "./renderItems";
 import { parseEvent } from "./sse";
 import type { Response } from "./types";
@@ -75,17 +76,31 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
-  it("keeps the flushed prefix in one reply when a handover arrives during streaming", () => {
+  const rotationNotice = parseEvent("response.output_item.done", {
+    item: {
+      type: "error",
+      id: "rotation",
+      response_id: "resp_rotation",
+      source: "harness",
+      code: "session_rotation",
+      level: "info",
+      message: "This session will continue in a new session when the current turn ends.",
+    },
+  })!;
+  const handoverNote: StreamEvent = {
+    type: "message_done",
+    itemId: "note",
+    responseId: "resp_note",
+    content: [{ type: "output_text", text: "Continue here." }],
+    isHandoverNote: true,
+  };
+
+  it.each([false, true])("keeps the flushed prefix in one reply (rotate=%s)", (rotate) => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
       { type: "text_delta", delta: "第一行\n" },
-      {
-        type: "message_done",
-        itemId: "note",
-        responseId: "resp_note",
-        content: [{ type: "output_text", text: "Continue here." }],
-        isHandoverNote: true,
-      },
+      handoverNote,
+      ...(rotate ? [rotationNotice] : []),
       { type: "text_delta", delta: "第二行" },
       { type: "response_completed", response: makeResponse() },
     ]);
@@ -96,37 +111,101 @@ describe("BlockStream — block ctx carries response_id and item_id", () => {
 
     const cache = createBubbleCache();
     const streaming = { responseId: "resp_1", state: "streaming" as const, error: null };
-    const before = buildBubbles(blocks.slice(0, noteIndex + 1), streaming, cache);
+    const before = buildBubbles(blocks.slice(0, noteIndex + (rotate ? 2 : 1)), streaming, cache);
+    const notices = [
+      { kind: "handover_note", itemId: "note", text: "Continue here." },
+      ...(rotate ? [{ kind: "rotation_notice", itemId: "rotation" }] : []),
+    ];
     expect(before).toMatchObject([
       { kind: "assistant", items: [{ kind: "text", text: "第一行\n", final: false }] },
-      { kind: "handover_note", itemId: "note", text: "Continue here." },
+      ...notices,
     ]);
 
     const completed = { ...streaming, state: "completed" as const };
     const after = buildBubbles(blocks, completed, cache);
     expect(after).toMatchObject([
       { kind: "assistant", items: [{ kind: "text", text: "第一行\n第二行", final: true }] },
-      { kind: "handover_note", itemId: "note", text: "Continue here." },
+      ...notices,
     ]);
     expect(after[0]).toMatchObject({ stableId: "resp_1:live:0" });
     expect(after).toEqual(buildBubbles(blocks, completed));
   });
 
-  it("keeps the note between two distinct replies", () => {
-    const blocks = reduce(
-      ["Earlier reply", "Continue here.", "Later reply"].map((text, index) => ({
-        type: "message_done",
-        itemId: `item_${index}`,
-        responseId: `resp_${index}`,
-        content: [{ type: "output_text", text }],
-        ...(index === 1 ? { isHandoverNote: true } : {}),
-      })),
-    );
+  it("keeps the note before the next user turn", () => {
+    const reply = (responseId: string, text: string): StreamEvent => ({
+      type: "message_done",
+      itemId: responseId,
+      responseId,
+      content: [{ type: "output_text", text }],
+    });
+    const blocks = [
+      ...reduce([reply("resp_0", "Earlier reply"), handoverNote, rotationNotice]),
+      ...itemsToBlocks([
+        {
+          type: "message",
+          id: "next_prompt",
+          response_id: "resp_2",
+          status: "completed",
+          role: "user",
+          content: [{ type: "input_text", text: "Another question" }],
+        },
+      ]),
+      ...reduce([reply("resp_2", "Later reply")]),
+    ];
     expect(buildBubbles(blocks, null)).toMatchObject([
       { kind: "assistant", responseId: "resp_0", items: [{ text: "Earlier reply" }] },
       { kind: "handover_note", text: "Continue here." },
+      { kind: "rotation_notice", itemId: "rotation" },
+      { kind: "user", itemId: "next_prompt" },
       { kind: "assistant", responseId: "resp_2", items: [{ text: "Later reply" }] },
     ]);
+  });
+
+  it("settles the tool when narration resumes after the default rotation notices", () => {
+    const events: StreamEvent[] = [
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "test-agent",
+        itemId: "tool_1",
+        responseId: "resp_1",
+      },
+      handoverNote,
+      rotationNotice,
+      { type: "text_delta", delta: "Continuing.\n" },
+    ];
+    const blocks = reduce(events);
+    const cache = createBubbleCache();
+    const waiting = buildBubbles(blocks.slice(0, 3), null, cache, [], true);
+    const resumed = buildBubbles(blocks, null, cache, [], true);
+    expect(resumed).toMatchObject([
+      {
+        kind: "assistant",
+        items: [
+          { kind: "tool", state: "no-output" },
+          { kind: "text", text: "Continuing.\n" },
+        ],
+      },
+      { kind: "handover_note", itemId: "note" },
+      { kind: "rotation_notice", itemId: "rotation" },
+    ]);
+    expect(waiting[0]).toMatchObject({ items: [{ kind: "tool", state: "input-available" }] });
+    const withResult = reduce([
+      ...events,
+      {
+        type: "tool_result",
+        callId: "call_1",
+        output: "Read result",
+        itemId: "result",
+        responseId: "resp_1",
+      },
+    ]);
+    expect(buildBubbles(withResult, null, cache, [], true)[0]).toMatchObject({
+      items: [{ kind: "tool", state: "output-available", output: "Read result" }, { kind: "text" }],
+    });
   });
 
   it("keeps an in-flight reply and its tools in the active response when a handover arrives", () => {

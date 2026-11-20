@@ -268,6 +268,7 @@ export type Bubble =
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
   | { kind: "handover_note"; itemId: string; responseId: string; text: string }
+  | { kind: "rotation_notice"; itemId: string; message: string }
   | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
@@ -282,6 +283,16 @@ export type Bubble =
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
+
+type HandoverRowBlock =
+  HandoverNoteBlock | (ErrorBlock & { code: "session_rotation"; level: "info" });
+
+function isHandoverRowBlock(block: AnyBlock): block is HandoverRowBlock {
+  return (
+    block.type === "handover_note" ||
+    (block.type === "error" && block.code === "session_rotation" && block.level === "info")
+  );
+}
 
 /**
  * Cross-call reuse cache for `buildBubbles`.
@@ -366,7 +377,7 @@ export function createBubbleCache(): BubbleCache {
 function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
-    if (b.type === "handover_note") continue;
+    if (isHandoverRowBlock(b)) continue;
     if (
       b.type === "user_message" ||
       isTerminalCommandInput(b) ||
@@ -1008,10 +1019,10 @@ function walkBubbles(
       continue;
     }
 
-    if (b.type === "handover_note") {
+    if (isHandoverRowBlock(b)) {
       lastBubbleStart = i;
       lastBubbleCount = 1;
-      bubbles.push(handoverNoteBubble(b, i));
+      bubbles.push(handoverRowBubble(b, i));
       i += 1;
       continue;
     }
@@ -1067,8 +1078,7 @@ function walkBubbles(
     // A question/plan card is the user's own answer point, so it takes a
     // bubble of its own even under the turn's response id.
     const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
-    const handoverNotes: Bubble[] = [];
-    let followsHandoverNote = false;
+    const handoverRows: Bubble[] = [];
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -1092,10 +1102,9 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
-      if (cur.type === "handover_note") {
-        // Place the note after the current reply so its chunks and tools stay together.
-        handoverNotes.push(handoverNoteBubble(cur, i));
-        followsHandoverNote = true;
+      if (isHandoverRowBlock(cur)) {
+        // Render handover rows after this reply without affecting turn grouping.
+        handoverRows.push(handoverRowBubble(cur, i));
         i += 1;
         continue;
       }
@@ -1116,18 +1125,14 @@ function walkBubbles(
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
       const curRid = cur.ctx.responseId;
-      if (cur.type !== "tool_result" && !isAnonymousRid(curRid)) {
-        if (curRid !== groupResponseId) {
-          // Preserve transcript order when a different reply follows the note.
-          if (
-            !isAnonymousRid(groupResponseId) &&
-            (followsHandoverNote || isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
-          ) {
-            break;
-          }
-          groupResponseId = curRid;
+      if (cur.type !== "tool_result" && !isAnonymousRid(curRid) && curRid !== groupResponseId) {
+        if (
+          !isAnonymousRid(groupResponseId) &&
+          (isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
+        ) {
+          break;
         }
-        followsHandoverNote = false;
+        groupResponseId = curRid;
       }
       i += 1;
     }
@@ -1135,10 +1140,10 @@ function walkBubbles(
     // A group of only tool_results renders nothing itself — skip it so
     // an orphan late output doesn't paint an empty assistant bubble.
     if (groupBlocks.length > 0 && groupBlocks.every((bk) => bk.type === "tool_result")) {
-      if (handoverNotes.length > 0) {
+      if (handoverRows.length > 0) {
         lastBubbleStart = groupStart;
-        lastBubbleCount = handoverNotes.length;
-        bubbles.push(...handoverNotes);
+        lastBubbleCount = handoverRows.length;
+        bubbles.push(...handoverRows);
       }
       continue;
     }
@@ -1180,7 +1185,7 @@ function walkBubbles(
 
     lastBubbleStart = groupStart;
     // Rewalk both the reply and its notes on an append to that same reply.
-    lastBubbleCount = 1 + handoverNotes.length;
+    lastBubbleCount = 1 + handoverRows.length;
     // A notice is stamped when the sub-agent reported, not when this turn worked.
     const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
     const workedForS = turnWorkedForS(workBlocks);
@@ -1234,19 +1239,26 @@ function walkBubbles(
         ? { defaultExpanded: true }
         : {}),
     });
-    bubbles.push(...handoverNotes);
+    bubbles.push(...handoverRows);
     expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
 }
 
-function handoverNoteBubble(b: HandoverNoteBlock, index: number): Bubble {
+function handoverRowBubble(block: HandoverRowBlock, index: number): Bubble {
+  if (block.type === "error") {
+    return {
+      kind: "rotation_notice",
+      itemId: block.ctx.itemId ?? `rotation_notice_${index}`,
+      message: block.message,
+    };
+  }
   return {
     kind: "handover_note",
-    itemId: b.ctx.itemId ?? `handover_note_${index}`,
-    responseId: b.ctx.responseId,
-    text: b.text,
+    itemId: block.ctx.itemId ?? `handover_note_${index}`,
+    responseId: block.ctx.responseId,
+    text: block.text,
   };
 }
 
@@ -1583,7 +1595,7 @@ function workBesideNotice(
 ): AnyBlock | undefined {
   for (let k = index + step; k >= floor && k < blocks.length; k += step) {
     const b = blocks[k]!;
-    if (isNoticeTransparent(b) || b.type === "handover_note") continue;
+    if (isNoticeTransparent(b) || isHandoverRowBlock(b)) continue;
     if (
       !isAssistantSideBlock(b) ||
       isStandaloneSentinelBlock(b) ||
@@ -1626,7 +1638,7 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
     b.type !== "compaction_loading" &&
-    b.type !== "handover_note" &&
+    !isHandoverRowBlock(b) &&
     // routing_decision is a standalone top-level chip, not an assistant item.
     b.type !== "routing_decision" &&
     b.type !== "response_start" &&
@@ -1658,7 +1670,7 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
     const previous = blocks[previousIndex]!;
     if (isNonRenderingBlock(previous)) return null;
-    if (isSubagentActivityBlock(previous) || previous.type === "handover_note") continue;
+    if (isSubagentActivityBlock(previous) || isHandoverRowBlock(previous)) continue;
     if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
     return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
       ? user.ctx.responseId
@@ -2101,6 +2113,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   }
   if (a.kind === "handover_note" && b.kind === "handover_note") {
     return a.itemId === b.itemId && a.responseId === b.responseId && a.text === b.text;
+  }
+  if (a.kind === "rotation_notice" && b.kind === "rotation_notice") {
+    return a.itemId === b.itemId && a.message === b.message;
   }
   if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
     return a.itemId === b.itemId && a.data === b.data;

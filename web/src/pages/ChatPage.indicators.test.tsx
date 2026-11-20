@@ -994,7 +994,21 @@ describe("BubbleView dispatch", () => {
       content: [{ type: "output_text", text: "Ordinary assistant reply" }],
       is_handover_note: undefined,
     };
-    const items = [reply, note];
+    const rotation = "This session will continue in a new session when the current turn ends.";
+    const items = [
+      reply,
+      note,
+      {
+        type: "error",
+        id: "rotation",
+        response_id: "resp_rotation",
+        status: "completed",
+        source: "harness",
+        code: "session_rotation",
+        level: "info",
+        message: rotation,
+      } as const,
+    ];
     const blocks =
       source === "history"
         ? itemsToBlocks(items)
@@ -1010,6 +1024,8 @@ describe("BubbleView dispatch", () => {
     );
 
     expect(screen.getByText("Ordinary assistant reply")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Notice" }));
+    expect(screen.getByText(rotation)).toBeVisible();
     const trigger = screen.getByRole("button", { name: "Handover note" });
     expect(trigger).toHaveAttribute("data-message-id", note.id);
     expect(trigger.closest(`[data-message-id="${note.response_id}"]`)).toBeInTheDocument();
