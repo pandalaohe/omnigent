@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import MessageData, NewConversationItem, SessionPeerMessage
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import session_succession as succession_module
@@ -41,6 +42,7 @@ from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
     PERMISSION_PROTOCOL_HEADER,
     PERMISSION_PROTOCOL_VERSION,
+    PERMISSION_STATE_LABEL_KEY,
     ConfirmedPermissionState,
 )
 from omnigent.server.routes import sessions as sessions_facade
@@ -797,11 +799,21 @@ async def test_ordinary_succession_forwards_sends_before_the_opening(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
+    succession_app: FastAPI,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
 ) -> None:
+    from tests.server.helpers import create_test_agent
+
+    monkeypatch.setattr(
+        succession_app.state, "user_preferences_store", SqlAlchemyUserPreferencesStore(db_uri)
+    )
+    agent = await create_test_agent(client, "ordinary-succession")
     old, new = (
-        store.create_conversation(runner_id=RUNNER_ID, harness_override=harness).id
+        store.create_conversation(
+            agent_id=agent["id"], runner_id=RUNNER_ID, harness_override=harness
+        ).id
         for _ in range(2)
     )
     await succession_module.commit_succession_move(
@@ -809,6 +821,23 @@ async def test_ordinary_succession_forwards_sends_before_the_opening(
     )
     receipt = store.get_succession(old, new)
     assert receipt is not None and receipt.phase == "moved"
+
+    def initialize_runner(url: str, **request: Any) -> httpx.Response:
+        assert url == "/v1/sessions"
+        init = parse_runner_session_init_envelope(request["json"])
+        assert init is not None and init.session_id == new and init.agent_id == agent["id"]
+        reply: dict[str, Any] = {"session_init_protocol_version": 2, "terminal_ready": True}
+        permission_state = init.snapshot.labels.get(PERMISSION_STATE_LABEL_KEY)
+        if permission_state is not None:
+            reply.update(
+                permission_tiers_capability=PERMISSION_CAPABILITY_VALUE,
+                permission_tier_revision=json.loads(permission_state)["revision"],
+                permission_tier_runtime_id="a" * 32,
+            )
+        return httpx.Response(201, request=httpx.Request("POST", url), json=reply)
+
+    runner_init = AsyncMock(side_effect=initialize_runner)
+    monkeypatch.setattr(runner, "post", runner_init)
     dispatch = AsyncMock(
         return_value=SimpleNamespace(forwarded=True, item_id="accepted", pending_id=None)
     )
@@ -827,6 +856,7 @@ async def test_ordinary_succession_forwards_sends_before_the_opening(
         assert result.status_code == 202, result.text
         assert "timer_delivery" not in result.json()
         assert result.json()["redirected_to"] == new
+    runner_init.assert_awaited()
     assert [call.args[0] for call in dispatch.await_args_list] == [new, new]
 
 
