@@ -3594,6 +3594,7 @@ async def _auto_create_pi_terminal(
     credential_warning: str | None = None
     effort_notice: str | None = None
     model_notice: str | None = None
+    model_dropped_notice: str | None = None
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
@@ -3650,10 +3651,15 @@ async def _auto_create_pi_terminal(
             # model must still reach it — without this the pick is silently
             # dropped and Pi opens its own default model. A managed pick that
             # cannot be expressed for Pi's own resolver (slash-bearing model
-            # id) is refused rather than mis-routed, so Pi keeps its default.
+            # id) is refused rather than mis-routed, so Pi keeps its default
+            # and the session is told.
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
+            else:
+                model_dropped_notice = (
+                    f"{spec_model} isn't available on Pi's own login; using Pi's default model."
+                )
     agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
     if not agent_dir.is_absolute():
         agent_dir = launch_config.workspace / agent_dir
@@ -3881,6 +3887,13 @@ async def _auto_create_pi_terminal(
             server_client=server_client,
             code="pi_native_model_rerouted",
             notice=model_notice,
+        )
+    if model_dropped_notice is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="pi_native_model_dropped",
+            notice=model_dropped_notice,
         )
     # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
     # transcript forwarder, so its slot owns this task until relaunch/teardown.
@@ -10685,6 +10698,8 @@ async def _auto_create_claude_terminal(
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
+    # The pick the provider default replaced, named in a notice once the terminal is up.
+    unserved_pick: str | None = None
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
@@ -10804,6 +10819,7 @@ async def _auto_create_claude_terminal(
                         extra={"session_id": session_id},
                     )
                     launch_model = unpinned_launch_model
+                    unserved_pick = pick
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -11119,6 +11135,16 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    if unserved_pick is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="claude_native_model_unavailable",
+            notice=(
+                f"{unserved_pick} isn't served by this provider; "
+                f"using {launch_model or 'the provider default'}."
+            ),
+        )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but
