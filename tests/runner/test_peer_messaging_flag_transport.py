@@ -209,6 +209,9 @@ class _RelayStubRegistry:
     def set_session_background_publisher(self, publisher: object) -> None:
         del publisher
 
+    def set_claude_terminal_transfer_listener(self, listener: object) -> None:
+        del listener
+
     def client_surface(self, session_id: str) -> str:
         del session_id
         return "unknown"

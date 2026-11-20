@@ -168,6 +168,9 @@ class _CapturingResourceRegistry:
         """
         self._session_background_publisher = publisher
 
+    def set_claude_terminal_transfer_listener(self, listener: Callable[[str, str], None]) -> None:
+        """Accept the Claude terminal-transfer listener without retaining it."""
+
     def set_session_status_publisher(
         self,
         publisher: Callable[
@@ -1980,6 +1983,7 @@ class _LaunchReturningRegistry(TerminalRegistry):
         program_status_app: str | None = None,
         elevated: bool = False,
         origin: str = "harness",
+        agent_tier: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
