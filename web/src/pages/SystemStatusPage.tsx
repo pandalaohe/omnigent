@@ -120,10 +120,12 @@ function processLabel(row: SystemProcessRow): string {
 function Metric({
   label,
   value,
+  detail,
   alert,
 }: {
   label: string;
   value: string;
+  detail?: string;
   /** The alert line that governs this metric, when it has one. */
   alert?: ReactNode;
 }) {
@@ -131,6 +133,7 @@ function Metric({
     <div>
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="text-ui font-semibold tabular-nums">{value}</dd>
+      {detail !== undefined && <dd className="text-xs text-muted-foreground">{detail}</dd>}
       {alert}
     </div>
   );
@@ -184,6 +187,7 @@ function MetricAlert({
   sustainMinutes?: number;
 }) {
   const spec = ALERT_SPECS[field];
+  const isHostCpuAlert = field === "cpu_pct";
   const update = useUpdateSystemStatusSettings();
   const [open, setOpen] = useState(false);
   // The stored number, not its rounded label: changing only the window must send
@@ -238,10 +242,11 @@ function MetricAlert({
         <button
           type="button"
           data-testid={`alert-${field}`}
-          aria-label={`Alert line for ${spec.metric}, currently ${formatThreshold(threshold)} percent`}
+          aria-label={`Alert line for ${isHostCpuAlert ? "host CPU" : spec.metric}, currently ${formatThreshold(threshold)} percent`}
           className="mt-1 inline-flex min-h-6 items-center gap-1 rounded-sm text-xs text-amber-700 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring dark:text-amber-400"
         >
-          alert <span className="tabular-nums">{formatThreshold(threshold)}%</span>
+          {isHostCpuAlert ? "host alert" : "alert"}{" "}
+          <span className="tabular-nums">{formatThreshold(threshold)}%</span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-64">
@@ -514,8 +519,12 @@ function ServerCard({
   const history = useSystemHistory("server");
   const point = server.last_point;
   const entries = history.data ?? [];
-  // The server target's points differ from a host's: CPU is `cpu`, not `cpu_avg`.
-  const points = entries.map((entry) => ("cpu" in entry ? entry.cpu : entry.cpu_avg));
+  const cpuCount = server.cpu_count && server.cpu_count > 0 ? server.cpu_count : null;
+  const coreLabel =
+    cpuCount === null ? undefined : `${cpuCount} ${cpuCount === 1 ? "core" : "cores"}`;
+  const chartThreshold = cpuCount === null ? null : threshold;
+  const cpuScale = cpuCount ?? 1;
+  const points = entries.map((entry) => ("cpu" in entry ? entry.cpu / cpuScale : entry.cpu_avg));
   const firstEntry = entries[0];
   const failureRate = point !== null && point.req > 0 ? (point.err / point.req) * 100 : null;
   const stale = point !== null && isStale(point.t * 1000, SERVER_STALE_AFTER_S, nowMs);
@@ -541,7 +550,12 @@ function ServerCard({
           <dl className="grid grid-cols-2 gap-x-3 gap-y-4 sm:grid-cols-3 lg:grid-cols-4">
             <Metric
               label="CPU"
-              value={formatPct(point.cpu)}
+              value={formatPct(point.cpu / cpuScale)}
+              detail={
+                coreLabel === undefined
+                  ? "of one core"
+                  : `${(point.cpu / 100).toFixed(1)} of ${coreLabel}`
+              }
               alert={
                 settings !== null ? (
                   <MetricAlert
@@ -579,7 +593,11 @@ function ServerCard({
                 ) : undefined
               }
             />
-            <Metric label="Load" value={formatLoad(point.load1)} />
+            <Metric
+              label="Load"
+              value={formatLoad(point.load1)}
+              detail={point.load1 !== null ? coreLabel : undefined}
+            />
             <Metric label="In-flight requests" value={String(point.in_flight)} />
             <Metric label="Open connections" value={String(point.websockets)} />
           </dl>
@@ -587,9 +605,11 @@ function ServerCard({
             <>
               <Sparkline
                 points={points}
-                threshold={threshold}
-                thresholdLabel={threshold === null ? undefined : `${formatThreshold(threshold)}%`}
-                label="Server CPU, last 24 hours"
+                threshold={chartThreshold}
+                thresholdLabel={
+                  chartThreshold === null ? undefined : `${formatThreshold(chartThreshold)}%`
+                }
+                label={`Server CPU (% of ${cpuCount === null ? "one core" : "machine"}), last 24 hours`}
                 className="mt-3"
                 latest={stale ? "stale" : "live"}
               />
