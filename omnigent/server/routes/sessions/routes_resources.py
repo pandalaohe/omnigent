@@ -2268,8 +2268,10 @@ def register_resources_routes(
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
             )
 
-        # A prepared successor already inherits the source placement.
-        if not requested_rotation and conv.host_id is not None:
+        # The requested transfer owns publication and inherits source placement.
+        if requested_rotation:
+            return payload
+        if conv.host_id is not None:
             await asyncio.to_thread(
                 conversation_store.set_host_id,
                 target_session_id,
@@ -2279,7 +2281,7 @@ def register_resources_routes(
                 # The replacement keeps the old row's working tree.
                 worktree=conv.worktree,
             )
-        elif not requested_rotation and conv.worktree is not None:
+        elif conv.worktree is not None:
             # A host-less child row (no bind to carry) still keeps the
             # worktree, so a later bind launches in the same working tree.
             await asyncio.to_thread(

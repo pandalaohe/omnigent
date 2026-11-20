@@ -388,6 +388,28 @@ async def transfer_requested_claude_terminal(
             store.compare_and_set_label, old_id, _CLAUDE_TRANSFER_RECORD, record.encode(), None
         )
 
+    async def finish(
+        receipt: SessionSuccession, record: _ClaudeTransferRecord, payload: dict[str, Any]
+    ) -> None:
+        drive(receipt)
+        for session_id, action, resource in (
+            (old_id, "deleted", None),
+            (new_id, "created", payload),
+        ):
+            stable_id = hashlib.sha256(
+                f"claude-transfer:{receipt.id}:{action}".encode()
+            ).hexdigest()[:32]
+            _publish_and_persist_resource_event(
+                session_id,
+                f"session.resource.{action}",
+                _CLAUDE_TERMINAL,
+                "terminal",
+                store,
+                resource,
+                stable_id=stable_id,
+            )
+        await clear_record(record)
+
     async with _claude_transfer_locks.setdefault(old_id, asyncio.Lock()):
         old, new = await asyncio.gather(
             asyncio.to_thread(store.get_conversation, old_id),
@@ -397,25 +419,37 @@ async def transfer_requested_claude_terminal(
             return 409, conflict
         record = _ClaudeTransferRecord.read(old)
         payload = _claude_transfer_result(old, new_id)
-        if old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id and payload is not None:
-            receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
-            if receipt is None:
-                raise RuntimeError("Confirmed Claude transfer has no succession receipt")
-            drive(receipt)
-            if record is not None and record.target == new_id:
-                await clear_record(record)
-            return 200, payload
-        if recovery is not None and record != recovery:
-            return 409, conflict
-        if record is not None and _claude_runner_exited(runner_exit_reports, record.runner_id):
-            if record.target != new_id or _terminal_instance(payload or {}) != record.instance:
-                await clear_record(record)
-                return 409, conflict
-        if new is None or new.archived or not is_requested_claude_transfer(old, new):
-            return 409, conflict
-        if record is not None and record.target != new_id:
-            record = None
         try:
+            if old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id and payload is not None:
+                receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
+                if receipt is None:
+                    raise RuntimeError("Confirmed Claude transfer has no succession receipt")
+                if record is not None and record.target == new_id:
+                    await finish(receipt, record, payload)
+                else:
+                    drive(receipt)
+                return 200, payload
+            if recovery is not None and record != recovery:
+                return 409, conflict
+            if record is not None and (
+                record.target != new_id or _terminal_instance(payload or {}) != record.instance
+            ):
+                exited = _claude_runner_exited(runner_exit_reports, record.runner_id)
+                rebound = (
+                    old.runner_id is not None
+                    and old.runner_id != record.runner_id
+                    and new is not None
+                    and new.runner_id == old.runner_id
+                )
+                if exited or rebound:
+                    await clear_record(record)
+                    record = None
+                    if recovery is not None or not rebound:
+                        return 409, conflict
+            if new is None or new.archived or not is_requested_claude_transfer(old, new):
+                return 409, conflict
+            if record is not None and record.target != new_id:
+                record = None
             if record is None or _terminal_instance(payload or {}) != record.instance:
                 runner_id = record.runner_id if record is not None else old.runner_id
                 can_move = not old.archived and runner_id == old.runner_id == new.runner_id
@@ -471,15 +505,7 @@ async def transfer_requested_claude_terminal(
             receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
             if receipt is None:
                 raise RuntimeError("Confirmed Claude transfer has no succession receipt")
-            drive(receipt)
-            if receipt.id == receipt_id:
-                _publish_and_persist_resource_event(
-                    old_id, "session.resource.deleted", _CLAUDE_TERMINAL, "terminal", store
-                )
-                _publish_and_persist_resource_event(
-                    new_id, "session.resource.created", payload["id"], "terminal", store, payload
-                )
-            await clear_record(record)
+            await finish(receipt, record, payload)
             return 200, payload
         except Exception:
             if record is not None:

@@ -442,6 +442,21 @@ async def test_agy_handover_reparents_children_and_wakes_successor_once(
     assert "Finish the remaining check." in wake.call_args.args[1]
 
 
+def _assert_transfer_resource_events(
+    store: SqlAlchemyConversationStore,
+    published: list[tuple[str, dict[str, Any]]],
+    old: str,
+    new: str,
+) -> None:
+    assert [
+        (session, event["type"])
+        for session, event in published
+        if event.get("type", "").startswith("session.resource.")
+    ] == [(old, "session.resource.deleted"), (new, "session.resource.created")]
+    for session_id in (old, new):
+        assert len(store.list_items(session_id, type="resource_event").data) == 1
+
+
 @pytest.mark.parametrize("has_children", [False, True])
 @pytest.mark.parametrize("lost_runner_reply", [False, True])
 @pytest.mark.parametrize("stale_field", ["instance", "target"])
@@ -546,6 +561,7 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
     if child is not None:
         moved = store.get_conversation(child)
         assert moved is not None and moved.parent_conversation_id == new
+    _assert_transfer_resource_events(store, published, old, new)
     current_terminal = {**terminal, "metadata": {"running": True, "instance_id": "different"}}
     retried = await client.post(path, json={"target_session_id": new})
     assert retried.status_code == 200 and retried.json() == terminal, retried.text
@@ -553,13 +569,7 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
     retried = await client.post(path, json={"target_session_id": new})
     assert retried.status_code == 200 and retried.json() == terminal, retried.text
     assert transfer_count == 1
-    assert [
-        (session, event["type"])
-        for session, event in published
-        if event.get("type", "").startswith("session.resource.")
-    ] == [(old, "session.resource.deleted"), (new, "session.resource.created")]
-    for session_id in (old, new):
-        assert len(store.list_items(session_id, type="resource_event").data) == 1
+    _assert_transfer_resource_events(store, published, old, new)
     retried_receipt = store.get_succession(old, new)
     assert retried_receipt is not None and retried_receipt.id == receipt.id
 
@@ -794,11 +804,84 @@ async def test_runner_exit_clears_transfer_record_without_fencing_old_claude_inp
     assert all(call.args[4] is replacement for call in dispatch.await_args_list)
 
 
+async def test_claude_transfer_uses_replacement_runner_without_original_exit_report(
+    client: httpx.AsyncClient,
+    succession_app: FastAPI,
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old, new, path = await _prepare_claude_transfer(client, store)
+    child = _create(store, parent=old, title="worker", runner_id=RUNNER_ID_B)
+    original = runners.for_runner(RUNNER_ID)
+    replacement = runners.for_runner(RUNNER_ID_B)
+    original_online = True
+    terminal = _transfer_test_terminal("replacement-pane")
+
+    async def lookup(session_id: str, router: Any, *, conversation: Any = None) -> Any:
+        row = conversation if conversation is not None else store.get_conversation(session_id)
+        assert row is not None
+        if row.runner_id == RUNNER_ID and not original_online:
+            pytest.fail("A fresh handover probed the superseded runner")
+        return runners.for_runner(row.runner_id)
+
+    async def probe_original(url: str, *, timeout: float) -> httpx.Response:
+        pane = _transfer_test_terminal("original-pane") if f"/sessions/{old}/" in url else None
+        return _terminal_probe(url, pane)
+
+    async def probe_replacement(url: str, *, timeout: float) -> httpx.Response:
+        return _terminal_probe(url, terminal if f"/sessions/{old}/" in url else None)
+
+    failed_move = AsyncMock(side_effect=httpx.ReadTimeout("Runner stopped before moving the pane"))
+    successful_move = AsyncMock(return_value=httpx.Response(200, json=terminal))
+    monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
+    monkeypatch.setattr(original, "get", probe_original, raising=False)
+    monkeypatch.setattr(original, "post", failed_move)
+    monkeypatch.setattr(replacement, "get", probe_replacement, raising=False)
+    monkeypatch.setattr(replacement, "post", successful_move)
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+
+    first = await client.post(path, json={"target_session_id": new})
+    assert first.status_code == 502, first.text
+    source = store.get_conversation(old)
+    assert source is not None
+    assert succession_module._ClaudeTransferRecord.read(source) == (
+        succession_module._ClaudeTransferRecord(new, RUNNER_ID, "original-pane")
+    )
+    assert store.get_succession(old, new) is None
+
+    original_online = False
+    store.replace_runner_id(old, RUNNER_ID_B)
+    fresh = await client.post(
+        f"/v1/sessions/{old}/handover",
+        json={"handover": "Continue on the new runner.", "rotate": True},
+    )
+    assert fresh.status_code == 200, fresh.text
+    prepared = await client.post(f"/v1/sessions/{old}/successor")
+    assert prepared.status_code == 200 and prepared.json()["id"] == new, prepared.text
+    store.replace_runner_id(new, RUNNER_ID_B)
+    assert succession_app.state.runner_exit_reports.get(RUNNER_ID) is None
+
+    transferred = await client.post(path, json={"target_session_id": new})
+    assert transferred.status_code == 200 and transferred.json() == terminal, transferred.text
+    failed_move.assert_awaited_once()
+    successful_move.assert_awaited_once_with(
+        path,
+        json={"target_session_id": new, "expected_instance_id": "replacement-pane"},
+        timeout=30.0,
+    )
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.moved_ids == [child]
+    source = store.get_conversation(old)
+    assert source is not None and succession_module._ClaudeTransferRecord.read(source) is None
+
+
 async def test_claude_transfer_background_recovers_receipt_after_commit_readback_failure(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
     wake: AsyncMock,
+    published: list[tuple[str, dict[str, Any]]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old, new, path = await _prepare_claude_transfer(client, store)
@@ -858,6 +941,7 @@ async def test_claude_transfer_background_recovers_receipt_after_commit_readback
     source = store.get_conversation(old)
     assert source is not None and source.archived
     wake.assert_awaited_once()
+    _assert_transfer_resource_events(store, published, old, new)
 
 
 async def test_claude_transfer_replay_drives_receipt_after_record_cleanup_failure(
@@ -865,6 +949,7 @@ async def test_claude_transfer_replay_drives_receipt_after_record_cleanup_failur
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
     wake: AsyncMock,
+    published: list[tuple[str, dict[str, Any]]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old, new, path = await _prepare_claude_transfer(client, store)
@@ -923,6 +1008,7 @@ async def test_claude_transfer_replay_drives_receipt_after_record_cleanup_failur
     assert receipt is not None and receipt.phase == "done"
     assert source is not None and source.archived
     wake.assert_awaited_once()
+    _assert_transfer_resource_events(store, published, old, new)
 
 
 @pytest.mark.parametrize(
