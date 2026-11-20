@@ -6037,6 +6037,8 @@ def _fresh_native_receipt(boundary: SubmitBoundary, text: str) -> bool | None:
     expected = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     another_prompt_observed = False
     for entry in read_fresh_submit_records(boundary):
+        if _queued_prompt_record_matches(entry, boundary, expected):
+            return True
         if (
             entry.get("type") != "user"
             or entry.get("sessionId") != boundary.native_session_id
@@ -6067,6 +6069,29 @@ def _fresh_native_receipt(boundary: SubmitBoundary, text: str) -> bool | None:
             continue
         return True
     return False if another_prompt_observed else None
+
+
+def _queued_prompt_record_matches(
+    entry: _JsonObject, boundary: SubmitBoundary, expected: str
+) -> bool:
+    """
+    Match the record Claude Code writes when it queues a prompt submitted mid-turn.
+
+    The prompt becomes a ``user`` record only once Claude reads it at a later
+    step. Other queued prompts (task notifications, agent messages) prove nothing
+    about this paste, so a mismatch is ignored rather than counted as another prompt.
+    """
+    if (
+        entry.get("type") != "queue-operation"
+        or entry.get("operation") != "enqueue"
+        or entry.get("sessionId") != boundary.native_session_id
+    ):
+        return False
+    content = entry.get("content")
+    if not isinstance(content, str):
+        return False
+    queued = _unwrap_pasted_content_markers(content)
+    return queued.replace("\r\n", "\n").replace("\r", "\n").strip() == expected
 
 
 def _fresh_prompt_hook_receipt(

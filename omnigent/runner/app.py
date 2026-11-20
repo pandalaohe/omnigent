@@ -8005,16 +8005,22 @@ def create_runner_app(
     def _claude_input_blocked(bridge_dir: Path) -> bool:
         from omnigent.harnesses.claude_native.bridge import (
             claude_pane_has_accepted_input,
+            claude_pane_ready,
             has_pending_user_prompt,
             has_running_turn,
         )
 
+        if has_pending_user_prompt(bridge_dir):
+            return True
+        # Claude Code keeps its input box open mid-turn and queues what is typed
+        # there. Only a busy pane without a usable box keeps the message queued,
+        # so its wait never spends the delivery's readiness budget.
         return has_running_turn(
             bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
-        ) or has_pending_user_prompt(bridge_dir)
+        ) and not claude_pane_ready(bridge_dir)
 
     async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
-        """Return the bridge whose turn, question or approval currently owns input."""
+        """Return the bridge whose question, approval or unusable busy pane owns input."""
         if _session_harness_name(session_id) != "claude-native":
             return None
         bridge_dir = await _claude_prompt_bridge_dir(session_id)

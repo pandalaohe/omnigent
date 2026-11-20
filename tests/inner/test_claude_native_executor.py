@@ -2401,8 +2401,10 @@ async def test_readiness_deadline_bounds_executor_lock_wait(
     [
         "transcript-and-prompt",
         "transcript-only",
+        "queued-mid-turn",
         "matching-hook",
         "no-receipt",
+        "foreign-queued",
         "foreign-hook",
         "stale-hook",
         "tmux-unavailable",
@@ -2456,6 +2458,26 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
                 pane = "────────────────\n❯ \n────────────────\n"
             elif outcome == "transcript-only" and not receipt_written and now >= 2.0:
                 write_transcript_receipt()
+            elif (
+                outcome in {"queued-mid-turn", "foreign-queued"}
+                and not receipt_written
+                and now >= 2.0
+            ):
+                # Claude Code records a prompt submitted mid-turn as queued, not as a user record.
+                receipt_written = True
+                queued = content if outcome == "queued-mid-turn" else "<task-notification>"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "queue-operation",
+                            "operation": "enqueue",
+                            "sessionId": native_id,
+                            "content": queued,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
             elif (
                 outcome in {"matching-hook", "foreign-hook"} and not receipt_written and now >= 2.0
             ):
@@ -2524,7 +2546,7 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
     ]
 
     assert mutations == ["paste"]
-    if outcome in {"matching-hook", "transcript-and-prompt", "transcript-only"}:
+    if outcome in {"matching-hook", "transcript-and-prompt", "transcript-only", "queued-mid-turn"}:
         assert receipt_written and now < 3.0
         assert events == [TurnComplete(response=None)]
         monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *_: None)
