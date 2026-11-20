@@ -26,6 +26,7 @@ from omnigent.server.auto_rotation import (
     attempt_failed,
     auto_rotation_for,
     rotation_attempt,
+    rotation_injected,
 )
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.routes._sessions.helpers import _publish_external_conversation_item
@@ -58,14 +59,25 @@ def context_notice(status: AutoRotationStatus) -> str:
     )
 
 
+#: Posted once to a session that stays busy while its rotation request waits.
+ROTATION_PENDING_NOTICE = (
+    "[System: rotation pending] A rotation to a new session is pending, but this session has "
+    "stayed busy. Update the handover note now with sys_session_handover (rotate=false keeps "
+    "the rotation pending), finish the current step, and end your turn. Start no new work "
+    "until the rotation happens; it runs once the session is idle."
+)
+
+
 @dataclass
 class _Retry:
     revision: str
     attempt: str
     idle_ticks: int = 0
+    busy_ticks: int = 0
     attempts: int = 0
     unconfirmed: bool = False
     draft_may_remain: bool = False
+    prompted: bool = False
 
 
 class AutoRotationNotices:
@@ -271,13 +283,42 @@ class AutoRotationNotices:
             except Exception:
                 _logger.exception("Rotation recovery failed for %s", key[1])
 
+    async def _prompt_busy(self, session_id: str, retry: _Retry, conv: Conversation) -> None:
+        """Ask a session that stays busy, once per attempt, to wind down for its rotation."""
+        # Without auto-rotation nothing retries, so the prompt's promise would not hold.
+        if not (await asyncio.to_thread(self._status, conv)).enabled:
+            return
+        owner = await asyncio.to_thread(self._owner_for, conv)
+        state, _ = await self._state(conv)
+        # Revalidated just before posting: a stale or finished request sends nothing.
+        fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
+        if (
+            state not in {"busy", "steerable"}
+            or fresh is None
+            or fresh.runner_id != conv.runner_id
+            or not self._owns(fresh)
+        ):
+            return
+        retry.prompted = True
+        await self._post(
+            PeerSweeper._synthetic_request(session_id, self._app),
+            session_id,
+            SessionEventInput(
+                type="message",
+                data={
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": ROTATION_PENDING_NOTICE}],
+                },
+            ),
+            acting_user_id=owner,
+        )
+
     def _pending_snapshot(self, session_id: str, retry: _Retry) -> Conversation | None:
         conv = self._store.get_conversation(session_id)
         status = self._status(conv) if conv is not None else None
         if (
             conv is None
             or status is None
-            or not status.enabled
             or not status.eligible
             or conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
             or conv.labels.get(ROTATE_REQUESTED_LABEL_KEY) != retry.revision
@@ -300,6 +341,9 @@ class AutoRotationNotices:
             return
         state, _ = await self._state(conv)
         retry.idle_ticks = retry.idle_ticks + 1 if state == "idle" else 0
+        retry.busy_ticks = retry.busy_ticks + 1 if state in {"busy", "steerable"} else 0
+        if retry.busy_ticks >= 2 and not retry.prompted:
+            await self._prompt_busy(session_id, retry, conv)
         if retry.idle_ticks < 2:
             return
         retry.idle_ticks = 0
@@ -308,7 +352,12 @@ class AutoRotationNotices:
             if self._retry.get(key) is retry:
                 self._retry.pop(key, None)
             return
-        if retry.attempts < 2 and not retry.unconfirmed:
+        enabled = (await asyncio.to_thread(self._status, fresh)).enabled
+        if not enabled:
+            # Nothing retries with auto-rotation off: report the request that did not run.
+            retry.unconfirmed = rotation_injected(fresh)
+            retry.draft_may_remain = bool(fresh.labels.get(DRAFT_LABEL_KEY))
+        elif retry.attempts < 2 and not retry.unconfirmed:
             if self._router is None:
                 return
             routed = await asyncio.to_thread(self._router.client_for_session_resources, session_id)
@@ -325,15 +374,11 @@ class AutoRotationNotices:
             )
             response.raise_for_status()
             result = response.json()
-            if result.get("status") == "busy":
-                # Nothing was typed and the runner keeps the request armed; not a spent attempt.
-                retry.attempts -= 1
-                return
             retry.unconfirmed = result.get("status") in {"unconfirmed", "draft_may_remain"}
             retry.draft_may_remain = result.get("status") == "draft_may_remain"
             if not retry.unconfirmed:
                 return
-        if retry.attempts >= 2 or retry.unconfirmed:
+        if not enabled or retry.attempts >= 2 or retry.unconfirmed:
             fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
             if fresh is None:
                 if self._retry.get(key) is retry:

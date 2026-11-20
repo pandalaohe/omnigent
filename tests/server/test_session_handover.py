@@ -155,7 +155,8 @@ async def test_handover_records_item_and_labels(
     notices = _rotation_notices(store, session_id)
     assert len(notices) == 1
     assert notices[0].data.message == (
-        "This session will continue in a new session when the current turn ends."
+        "Rotation requested: this session moves to a new session once the current turn ends and "
+        "the session is idle. If it cannot, a notice follows."
     )
 
     published_items = {
@@ -685,9 +686,9 @@ async def test_pi_claim_never_marks_terminal_draft(client, store):
     )
 
 
-async def test_manual_request_after_an_injected_attempt_gets_a_fresh_attempt(client, store):
-    """An earlier attempt's injection record cannot drop a later manual request."""
-    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY
+async def test_manual_request_keeps_a_typed_attempt_fenced_until_it_fails(client, store):
+    """A typed, unconfirmed command defers a manual request; a failed one gets a new attempt."""
+    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY, rotation_attempt
 
     session_id = _create(store)
     url = f"/v1/sessions/{session_id}/handover"
@@ -700,12 +701,40 @@ async def test_manual_request_after_an_injected_attempt_gets_a_fresh_attempt(cli
     assert (await client.post(claim_url, json=claim | {"input_cleared": "true"})).json()[
         "status"
     ] == "unconfirmed"
-    assert (await client.post(claim_url, json=claim)).json()["status"] == "unconfirmed"
+    response = (await client.post(url, json=body)).json()
+    assert (response["rotate"], response["deferred"]) == (False, "unconfirmed")
+    assert store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY] == first
+    labels = store.get_conversation(session_id).labels
+    store.set_labels(session_id, {FAILED_ATTEMPT_LABEL_KEY: rotation_attempt(labels, 0)})
     assert (await client.post(url, json=body)).json()["rotate"] is True
     second = store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY]
     assert second != first
     claim = {"archive_revision": "0", "attempt": second}
     assert (await client.post(claim_url, json=claim)).json()["status"] == "claimed"
+
+
+async def test_manual_request_during_a_pending_claim_keeps_its_attempt(client, store):
+    """Either order of a manual request and a claim leaves one attempt and a working receipt."""
+    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY, DRAFT_LABEL_KEY
+
+    session_id = _create(store)
+    url = f"/v1/sessions/{session_id}/handover"
+    claim_url = url + "/injection"
+    body = {"handover": "Continue.", "rotate": True}
+    assert (await client.post(url, json=body)).json()["rotate"] is True
+    attempt = store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY]
+    # A request before the claim reuses the never-typed attempt, so the claim still matches.
+    assert (await client.post(url, json=body)).json()["rotate"] is True
+    assert store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY] == attempt
+    claim = {"archive_revision": "0", "attempt": attempt}
+    assert (await client.post(claim_url, json=claim)).json()["status"] == "claimed"
+    # A request after the claim defers and leaves the claim's receipt applicable.
+    response = (await client.post(url, json=body)).json()
+    assert (response["rotate"], response["deferred"]) == (False, "draft_may_remain")
+    assert (await client.post(claim_url, json=claim | {"input_cleared": "true"})).json()[
+        "status"
+    ] == "unconfirmed"
+    assert DRAFT_LABEL_KEY not in store.get_conversation(session_id).labels
 
 
 async def test_manual_request_with_a_possible_draft_is_deferred(client, store):
@@ -725,17 +754,17 @@ async def test_manual_request_with_a_possible_draft_is_deferred(client, store):
     assert _rotation_notices(store, session_id) == []
 
 
-async def test_released_claim_lets_the_same_attempt_claim_again(client, store):
+@pytest.mark.parametrize("attempt_id", ["busy-round", ""])
+async def test_released_claim_lets_the_same_attempt_claim_again(client, store, attempt_id):
     """A refusal that typed nothing returns its claim; a stale release changes nothing."""
     from omnigent.server.auto_rotation import DRAFT_LABEL_KEY, INJECTED_ATTEMPT_LABEL_KEY
 
     session_id = _create(store)
-    store.set_labels(
-        session_id,
-        {ROTATE_REQUESTED_LABEL_KEY: "0", "omnigent.auto_rotation_state.attempt": "busy-round"},
-    )
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    if attempt_id:
+        store.set_labels(session_id, {"omnigent.auto_rotation_state.attempt": attempt_id})
     url = f"/v1/sessions/{session_id}/handover/injection"
-    claim = {"archive_revision": "0", "attempt": "busy-round"}
+    claim = {"archive_revision": "0", "attempt": attempt_id}
     assert (await client.post(url, json=claim)).json()["status"] == "claimed"
     stale = {"archive_revision": "0", "attempt": "other-round", "released": "true"}
     assert (await client.post(url, json=stale)).json()["status"] == "not_requested"
@@ -744,4 +773,39 @@ async def test_released_claim_lets_the_same_attempt_claim_again(client, store):
     assert (await client.post(url, json=release)).json()["status"] == "released"
     labels = store.get_conversation(session_id).labels
     assert DRAFT_LABEL_KEY not in labels and INJECTED_ATTEMPT_LABEL_KEY not in labels
+    # A request without an attempt id was also fenced by revision; that fence goes too.
+    assert (INJECTED_REVISION_LABEL_KEY in labels) is bool(attempt_id)
     assert (await client.post(url, json=claim)).json()["status"] == "claimed"
+
+
+async def test_release_after_the_attempt_changed_keeps_the_old_claim(client, store):
+    """A release names the current attempt; an older claim left in the labels stays fenced."""
+    from omnigent.server.auto_rotation import DRAFT_LABEL_KEY, INJECTED_ATTEMPT_LABEL_KEY
+
+    session_id = _create(store)
+    prefix = "omnigent.auto_rotation_state."
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0", prefix + "attempt": "old"})
+    url = f"/v1/sessions/{session_id}/handover/injection"
+    assert (await client.post(url, json={"archive_revision": "0", "attempt": "old"})).json()[
+        "status"
+    ] == "claimed"
+    store.set_labels(session_id, {prefix + "attempt": "new"})
+    release = {"archive_revision": "0", "attempt": "old", "released": "true"}
+    assert (await client.post(url, json=release)).json()["status"] == "not_requested"
+    labels = store.get_conversation(session_id).labels
+    assert labels[INJECTED_ATTEMPT_LABEL_KEY] == "0:old" and labels[DRAFT_LABEL_KEY] == "true"
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+async def test_manual_request_is_tracked_with_auto_rotation_on_or_off(
+    client, store, handover_app, switch
+):
+    """Off, nothing retries; the tracker still reports a request that did not run."""
+    session_id = _create(store)
+    store.set_labels(session_id, {"omnigent.auto_rotation": switch})
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover", json={"handover": "Continue.", "rotate": True}
+    )
+    assert response.json()["rotate"] is True
+    notices = handover_app.state.auto_rotation_notices
+    assert any(key[1] == session_id for key in notices._retry)

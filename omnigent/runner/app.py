@@ -1413,8 +1413,8 @@ _member_turn_counter = itertools.count(1)
 
 # Sessions whose ``sys_session_handover`` asked for a rotation. Armed when the
 # tool dispatches; consumed by the native idle edge, which types /clear into
-# the session's terminal. A busy session is re-armed for its next idle edge;
-# any other failure leaves the label for a manual /clear.
+# the session's terminal. No runner retry: the server's recovery owns retries
+# and notices; otherwise the label is left for a manual /clear.
 _pending_rotations: set[str] = set()
 
 
@@ -1430,15 +1430,6 @@ def pop_pending_rotation(session_id: str) -> bool:
     _pending_rotations.discard(session_id)
     return True
 
-
-# Posted once when a requested rotation finds its session busy; the runner then
-# retries at the next idle edge.
-_ROTATION_PENDING_NOTICE = (
-    "[System: rotation pending] A rotation to a new session is pending, but this session "
-    "was busy when it was due. Update the handover note now with sys_session_handover "
-    "(rotate=false keeps the rotation pending), finish the current step, and end your turn. "
-    "Start no new work until the rotation happens; it runs at the next idle moment."
-)
 
 # The one runtime follow-up's text, composed and recognized in one place: the
 # runner must never parse its own ``[System: …]`` posts for mentions, and the
@@ -5925,7 +5916,6 @@ def create_runner_app(
         _clean_terminal_exit_responses.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _pending_rotations.discard(session_id)
-        rotations_prompted.discard(session_id)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -6827,8 +6817,7 @@ def create_runner_app(
                 "unconfirmed",
             )
             if _rotation_session_busy(conv_id):
-                await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
-                return "busy"
+                return await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(
@@ -6915,8 +6904,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
-            return "busy"
+            return await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
         if response.status_code >= 400:
             _logger.warning(
                 "Pending rotation /clear was refused for session %s (status %d)",
@@ -6951,11 +6939,10 @@ def create_runner_app(
                 return outcome
         return "started" if response.status_code < 400 else "not_requested"
 
-    async def _release_rotation_claim(conv_id: str, revision: int, labels: dict[str, Any]) -> None:
-        """Return a claim whose command was never typed, so a later idle edge can retry."""
+    async def _release_rotation_claim(conv_id: str, revision: int, labels: dict[str, Any]) -> str:
+        """Hand back a claim whose command was never typed; ``busy`` only once confirmed."""
         from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY
 
-        rotations_started.pop(conv_id, None)
         try:
             response = await server_client.post(
                 f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
@@ -6967,6 +6954,7 @@ def create_runner_app(
                 timeout=10.0,
             )
             response.raise_for_status()
+            released = response.json().get("status") == "released"
         except Exception:
             _logger.warning(
                 "Could not release rotation claim for %s",
@@ -6974,34 +6962,11 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
-
-    # Sessions already told that their pending rotation waits for an idle moment.
-    rotations_prompted: set[str] = set()
-
-    def _note_rotation_outcome(conv_id: str, outcome: str) -> None:
-        """Keep a busy session's rotation armed for its next idle edge and tell it once."""
-        if outcome == "in_flight":
-            return
-        if outcome != "busy":
-            rotations_prompted.discard(conv_id)
-            return
-        record_pending_rotation(conv_id)
-        if conv_id in rotations_prompted:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        rotations_prompted.add(conv_id)
-
-        async def _prompt() -> None:
-            notice = _ROTATION_PENDING_NOTICE
-            if not await _deliver_subagent_wake_post(server_client, conv_id, notice):
-                rotations_prompted.discard(conv_id)
-
-        task = loop.create_task(_prompt())
-        task.add_done_callback(_background_tasks.discard)
-        _background_tasks.add(task)
+            released = False
+        # Nothing was typed, so the server's labels alone decide the next attempt.
+        rotations_started.pop(conv_id, None)
+        # Unconfirmed, the server may still hold the claim and its draft fence.
+        return "busy" if released else "draft_may_remain"
 
     rotations_in_flight: set[str] = set()
     # Keep only the newest injected revision for each live session. An absent
@@ -7057,23 +7022,20 @@ def create_runner_app(
             rotations_in_flight.discard(conv_id)
 
     async def _run_pending_rotation(conv_id: str, *, require_label: bool = True) -> bool:
-        outcome = await _execute_pending_rotation(conv_id, require_label=require_label)
-        if require_label:
-            _note_rotation_outcome(conv_id, outcome)
-        return outcome == "started"
+        return await _execute_pending_rotation(conv_id, require_label=require_label) == "started"
 
     @app.post("/v1/sessions/{session_id}/pending-rotation")
     async def pending_rotation(
         session_id: str, body: dict[str, str] | None = None
     ) -> dict[str, str]:
-        status = await _execute_pending_rotation(
-            session_id,
-            recovery=True,
-            expected_revision=(body or {}).get("archive_revision"),
-            expected_attempt=(body or {}).get("attempt"),
-        )
-        _note_rotation_outcome(session_id, status)
-        return {"status": status}
+        return {
+            "status": await _execute_pending_rotation(
+                session_id,
+                recovery=True,
+                expected_revision=(body or {}).get("archive_revision"),
+                expected_attempt=(body or {}).get("attempt"),
+            )
+        }
 
     def _schedule_pending_rotation(session_id: str) -> None:
         """Consume an armed rotation at the session's native idle edge."""

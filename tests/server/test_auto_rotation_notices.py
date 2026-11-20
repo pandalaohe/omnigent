@@ -146,7 +146,8 @@ async def test_restart_resumes_due_notice_without_new_usage(db_uri, failed):
 
 
 @pytest.mark.asyncio
-async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri):
+@pytest.mark.parametrize("reply", ["not_requested", "busy"])
+async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri, reply):
     store = SqlAlchemyConversationStore(db_uri)
     conv = due_session(store)
     store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
@@ -154,7 +155,7 @@ async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri):
 
     def handler(request):
         calls.append(request.url.path)
-        return httpx.Response(200, json={"status": "not_requested"})
+        return httpx.Response(200, json={"status": reply})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://runner"
@@ -178,32 +179,6 @@ async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri):
             assert "Type /clear" in errors[0].data.message
             await notices.tick()
             assert len(calls) == 2
-        finally:
-            await notices.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_busy_recovery_is_not_a_spent_attempt(db_uri):
-    """A busy runner keeps the request armed, so recovery never marks it failed."""
-    store = SqlAlchemyConversationStore(db_uri)
-    conv = due_session(store)
-    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
-    calls = []
-
-    def handler(request):
-        calls.append(request.url.path)
-        return httpx.Response(200, json={"status": "busy"})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://runner"
-    ) as client:
-        notices = service(store, client, [], ["idle"], [{}])
-        await notices.start(SimpleNamespace())
-        try:
-            for _ in range(8):
-                await notices.tick()
-            assert len(calls) == 4
-            assert store.list_items(conv.id, type="error").data == []
         finally:
             await notices.shutdown()
 
@@ -451,3 +426,64 @@ async def test_finishing_old_failure_keeps_new_attempt_tracking(db_uri, monkeypa
         await notices.tick()
         await notices.tick()
         assert notices._retry[(0, conv.id)].attempt == "0:next-attempt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "superseded", "idle", "off"])
+async def test_busy_session_gets_one_validated_rotation_prompt(db_uri, change):
+    """The prompt names a live request, reaches a session that is still busy, and is sent once."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    posts, state = [], ["busy"]
+    notices = service(store, None, posts, state, [{"forwarded": True}])
+    notices.track(conv.id, "0")
+    await notices.tick()
+    if change == "superseded":
+        store.set_labels(conv.id, {SUCCEEDED_BY_LABEL_KEY: "next"})
+    elif change == "off":
+        store.set_labels(conv.id, {"omnigent.auto_rotation": "off"})
+    elif change == "idle":
+        calls = iter(["busy", "idle"])
+
+        async def readiness(conv):
+            return next(calls, "idle"), True
+
+        notices._state = readiness
+    for _ in range(2):
+        await notices.tick()
+    texts = [post["content"][0]["text"] for post in posts]
+    if change is None:
+        assert len(texts) == 1
+        assert texts[0].startswith("[System: rotation pending]")
+        assert "sys_session_handover" in texts[0]
+    else:
+        assert texts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [False, True])
+async def test_switched_off_request_is_reported_without_runner_calls(db_uri, draft):
+    """With auto-rotation off nothing retries, so a request that did not run is reported once."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store, enabled="off")
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    if draft:
+        store.set_labels(conv.id, {"omnigent.auto_rotation_state.draft_may_remain": "true"})
+    calls = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200)
+        ),
+        base_url="http://runner",
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        notices.track(conv.id, "0")
+        for _ in range(6):
+            await notices.tick()
+    assert calls == []
+    errors = store.list_items(conv.id, type="error").data
+    assert len(errors) == 1
+    message = cast(ErrorData, errors[0].data).message
+    assert ("draft may remain" in message) is draft
+    assert draft or "Type /clear" in message

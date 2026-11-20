@@ -16,8 +16,8 @@ from omnigent.runner.tool_dispatch import (
 from omnigent.spec.types import AgentSpec
 
 _ROTATION_NOTE = (
-    "The session will continue in a new session once this turn ends and the session "
-    "is idle; if it is still busy then, a notice asks you to finish up first."
+    "Rotation requested: the session moves to a new session once this turn ends and "
+    "the session is idle. If it cannot, a notice in this session says what follows."
 )
 
 
@@ -163,7 +163,11 @@ async def test_session_handover_validates_arguments() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("deferred", "auto", "note"),
-    [("compacted", True, "Keep working"), ("draft_may_remain", False, "inspect and clear")],
+    [
+        ("compacted", True, "Keep working"),
+        ("draft_may_remain", False, "inspect and clear"),
+        ("unconfirmed", False, "never confirmed"),
+    ],
 )
 async def test_deferred_handover_never_arms_runner(deferred: str, auto: bool, note: str) -> None:
     requests = []

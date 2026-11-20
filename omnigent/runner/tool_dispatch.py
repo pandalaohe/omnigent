@@ -10751,6 +10751,11 @@ async def _session_handover_via_rest(
             "Rotation not started: an earlier rotation command may still be in the terminal "
             "input. Ask the user to inspect and clear the terminal input, then type /clear."
         )
+    elif payload.get("deferred") == "unconfirmed":
+        result["note"] = (
+            "Rotation not started: an earlier rotation command was typed, but its new session "
+            "was never confirmed. Ask the user to inspect the terminal before typing /clear."
+        )
     elif payload.get("deferred"):
         result["note"] = (
             f"Rotation deferred ({payload['deferred']}). Keep working; a new notice follows "
@@ -10761,8 +10766,8 @@ async def _session_handover_via_rest(
 
         record_pending_rotation(conversation_id)
         result["note"] = (
-            "The session will continue in a new session once this turn ends and the session "
-            "is idle; if it is still busy then, a notice asks you to finish up first."
+            "Rotation requested: the session moves to a new session once this turn ends and "
+            "the session is idle. If it cannot, a notice in this session says what follows."
         )
     return json.dumps(result)
 
