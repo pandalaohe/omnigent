@@ -13,10 +13,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import replace
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -58,7 +58,11 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
 )
 from omnigent.server.schemas import SessionHandoverRequest, SessionSuccessionRequest
-from omnigent.server.session_succession import advance_succession, commit_succession_move
+from omnigent.server.session_succession import (
+    advance_succession,
+    commit_succession_move,
+    prepare_claude_clear_candidate,
+)
 from omnigent.stores import AgentStore
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
@@ -259,7 +263,11 @@ def register_succession_routes(
         return {"status": outcome}
 
     @router.post("/sessions/{session_id}/successor", status_code=200, response_model=None)
-    async def create_session_successor(request: Request, session_id: str) -> dict[str, str]:
+    async def create_session_successor(
+        request: Request,
+        session_id: str,
+        clear_attempt_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+    ) -> dict[str, str]:
         """Create or recover a successor before its runner can initialize it."""
         user_id = _get_user_id(request, auth_provider)
         source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -296,6 +304,11 @@ def register_succession_routes(
                 )
             tier = permission.tier
         await asyncio.to_thread(request.app.state.standing_approval_service.resolve, source)
+        if harness == "claude-native" and clear_attempt_id is not None:
+            if not await prepare_claude_clear_candidate(
+                conversation_store, source, clear_attempt_id
+            ):
+                raise HTTPException(410, "The terminal handover expired")
         try:
             successor = await asyncio.to_thread(
                 conversation_store.create_session_successor,

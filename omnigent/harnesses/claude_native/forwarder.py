@@ -5393,8 +5393,10 @@ async def _create_clear_replacement_session(
     """
     checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
     old_session_id = checkpoint.pending_clear_old_id or old_session_id
-    if checkpoint.clear_rotation_attempt is None:
-        checkpoint = replace(checkpoint, clear_rotation_attempt=uuid.uuid4().hex)
+    clear_attempt_id = checkpoint.clear_rotation_attempt
+    if clear_attempt_id is None:
+        clear_attempt_id = uuid.uuid4().hex
+        checkpoint = replace(checkpoint, clear_rotation_attempt=clear_attempt_id)
         await _write_hook_state_async(bridge_dir, checkpoint)
     old = await _fetch_session_snapshot(client, old_session_id)
     agent_id = old.get("agent_id")
@@ -5407,7 +5409,12 @@ async def _create_clear_replacement_session(
     new_session_id = checkpoint.pending_clear_new_id
     raw_intent = labels.get(CLAUDE_TRANSFER_INTENT_LABEL)
     intent = parse_claude_transfer_intent(raw_intent) if isinstance(raw_intent, str) else None
-    has_recorded_transfer = intent is not None and intent["target"] == new_session_id
+    recorded_attempt = intent.get("clear_attempt_id") if intent is not None else None
+    has_recorded_transfer = (
+        intent is not None
+        and intent["target"] == new_session_id
+        and recorded_attempt in (None, clear_attempt_id)
+    )
     requested_rotation = has_recorded_transfer or ROTATE_REQUESTED_LABEL_KEY in labels
     if (
         new_session_id is not None
@@ -5427,7 +5434,12 @@ async def _create_clear_replacement_session(
             )
             raise RuntimeError("clear replacement was already rejected and archived")
     if new_session_id is None:
-        create_resp = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
+        create_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/successor",
+            params={"clear_attempt_id": clear_attempt_id},
+        )
+        if create_resp.status_code == 410:
+            raise _ClearTransferExpired
         if create_resp.is_error:
             try:
                 error = create_resp.json().get("error", {})
@@ -5461,8 +5473,13 @@ async def _create_clear_replacement_session(
     )
 
     async def transfer() -> None:
+        # Old checkpoints can replay a transfer written before attempt IDs.
+        transfer_attempt = clear_attempt_id
+        if has_recorded_transfer and intent is not None and recorded_attempt is None:
+            transfer_attempt = intent["id"]
         response = await client.post(
             transfer_path,
+            params={"clear_attempt_id": transfer_attempt},
             json={"target_session_id": new_session_id},
             timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
         )

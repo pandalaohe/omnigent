@@ -2172,6 +2172,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         terminal_id: str,
+        clear_attempt_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     ) -> Any:
         """
         Move a terminal resource to another session without closing it.
@@ -2219,11 +2220,12 @@ def register_resources_routes(
             )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
+        # A replay must not wait behind the original runner RPC, even if the
+        # source has since prepared a different successor.
+        if claude_transfer_lease_ended(conv, target_session_id, clear_attempt_id, terminal_id):
+            raise HTTPException(410, "The terminal handover expired")
         requested_rotation = is_requested_claude_transfer(conv, target, terminal_id)
         if requested_rotation:
-            # A replay after expiry must not wait behind the original runner RPC.
-            if claude_transfer_lease_ended(conv, target_session_id):
-                raise HTTPException(410, "The terminal handover expired")
             state = request.app.state
             try:
                 # The caller may disappear when the pane changes hands. The
@@ -2238,6 +2240,7 @@ def register_resources_routes(
                         scheduled_task_store=getattr(state, "scheduled_task_store", None),
                         archive_cleanup=getattr(state, "archive_close_coordinator", None),
                         runner_exit_reports=getattr(state, "runner_exit_reports", None),
+                        clear_attempt_id=clear_attempt_id,
                     )
                 )
             except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
