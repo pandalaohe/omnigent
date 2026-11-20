@@ -1,5 +1,5 @@
+import type { ReactNode } from "react";
 import { PinIcon, PinOffIcon } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 export interface MobileMenuPinToggleProps {
   /** Stable pin id (`mobileMenuPins`), used for the test id. */
@@ -8,44 +8,22 @@ export interface MobileMenuPinToggleProps {
   label: string;
   pinned: boolean;
   onToggle: () => void;
-  className?: string;
 }
 
 /**
- * The trailing pin control inside a phone menu row: tapping it pins or unpins
- * that row without running the row's action.
+ * The pin control that rides at the trailing edge of a phone menu row.
  *
- * The parent is a Radix `DropdownMenuItem`, which selects on the click that
- * bubbles out of this button. Preventing the default and stopping propagation
- * keeps the tap on the toggle alone; pointer-down is deliberately left to
- * bubble so the item records the press and doesn't synthesise a second click.
- *
- * The accessible name states the action ("Pin Shells" / "Unpin Shells") after
- * the neighbouring Mute/Unmute rows, so no aria-pressed is layered on top.
+ * The accessible name states the action ("Pin Shells" / "Unpin Shells"), after
+ * the Mute/Unmute rows beside it, so no aria-pressed is layered on top.
  */
-export function MobileMenuPinToggle({
-  itemId,
-  label,
-  pinned,
-  onToggle,
-  className,
-}: MobileMenuPinToggleProps) {
+export function MobileMenuPinToggle({ itemId, label, pinned, onToggle }: MobileMenuPinToggleProps) {
   return (
     <button
       type="button"
       aria-label={pinned ? `Unpin ${label}` : `Pin ${label}`}
       data-testid={`pin-menu-item-${itemId}`}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onToggle();
-      }}
-      className={cn(
-        // 44 px hit area without growing the row: the negative margins take
-        // back the row's own padding.
-        "-my-2 -mr-1 flex size-11 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground",
-        className,
-      )}
+      onClick={onToggle}
+      className="flex size-11 items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
     >
       {pinned ? (
         <PinOffIcon className="size-4" aria-hidden />
@@ -53,5 +31,32 @@ export function MobileMenuPinToggle({
         <PinIcon className="size-4" aria-hidden />
       )}
     </button>
+  );
+}
+
+/** Reserve the trailing control's width so a row badge doesn't slide under it. */
+export const PIN_TRAILING_PADDING = "pr-12";
+
+/**
+ * A menu row with its pin control beside it.
+ *
+ * The control is a sibling of the menu item, not a child: a control nested
+ * inside `role="menuitem"` joins the item's accessible name ("Shells Unpin
+ * Shells"), which breaks every by-name lookup of the row. Beside it, the row
+ * keeps its own name and the control keeps its own, and the row's hover
+ * background still spans the full width because the item is painted underneath.
+ *
+ * Without a control this returns the row untouched, so the desktop kebab and
+ * the fallback kebab render what they render today.
+ */
+export function withPinControl(pin: ReactNode, row: ReactNode): ReactNode {
+  if (pin === null || pin === undefined) return row;
+  return (
+    <div className="relative">
+      {row}
+      <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-0.5">
+        <span className="pointer-events-auto flex items-center">{pin}</span>
+      </span>
+    </div>
   );
 }

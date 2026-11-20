@@ -1317,6 +1317,10 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "aria-label",
       "Unpin Shells",
     );
+    // The toggle sits beside the row, so the row keeps its own name for the
+    // existing by-name lookups: no "Shells Unpin Shells".
+    expect(screen.getByRole("menuitem", { name: "Shells" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unpin Shells" })).toBeInTheDocument();
   });
 
   it("routes a rail entry from the kebab to its drawer", () => {

@@ -108,7 +108,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { menuRow, type MobileMenuPinId, type PinnableMenuRow } from "@/lib/mobileMenuPins";
 import { toggleMobileMenuPin, useMobileMenuPins } from "@/lib/mobileAssistantPreferences";
-import { MobileMenuPinToggle } from "./MobileMenuPinToggle";
+import { MobileMenuPinToggle, withPinControl } from "./MobileMenuPinToggle";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -520,7 +520,7 @@ export function HeaderConversationMenu({
   const sessionRows: PinnableMenuRow[] = [
     ...(canShare
       ? [
-          menuRow("share", "Share", (pin) => (
+          menuRow("share", "Share", () => (
             <DropdownMenuItem
               data-testid="header-share-conversation"
               className={itemClass}
@@ -537,14 +537,13 @@ export function HeaderConversationMenu({
             >
               <ShareIcon className="size-3.5" />
               Share
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
     ...(canFork
       ? [
-          menuRow("fork", "Fork", (pin) => (
+          menuRow("fork", "Fork", () => (
             <SessionActionMenuItem
               data-testid="header-fork-conversation"
               disabledReason={forkDisabledReason}
@@ -556,12 +555,11 @@ export function HeaderConversationMenu({
               {desktopShortcuts && (
                 <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
               )}
-              {pin()}
             </SessionActionMenuItem>
           )),
         ]
       : []),
-    menuRow("export", "Export", (pin) => (
+    menuRow("export", "Export", () => (
       <DropdownMenuItem
         data-testid="header-export-conversation"
         className={itemClass}
@@ -569,10 +567,9 @@ export function HeaderConversationMenu({
       >
         <DownloadIcon className="size-3.5" />
         Export
-        {pin()}
       </DropdownMenuItem>
     )),
-    menuRow("instructions", "View instructions", (pin) => (
+    menuRow("instructions", "View instructions", () => (
       <DropdownMenuItem
         data-testid="header-view-instructions"
         className={itemClass}
@@ -582,12 +579,11 @@ export function HeaderConversationMenu({
       >
         <FileTextIcon className="size-3.5" />
         View instructions
-        {pin()}
       </DropdownMenuItem>
     )),
     ...(showPeerMessages && onPeerMessages
       ? [
-          menuRow("peer-messages", "Peer messages", (pin) => (
+          menuRow("peer-messages", "Peer messages", () => (
             <DropdownMenuItem
               data-testid="header-peer-messages"
               className={itemClass}
@@ -595,14 +591,13 @@ export function HeaderConversationMenu({
             >
               <MessageCircleIcon className="size-3.5" />
               Peer messages
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
     ...(hasAgentInfo && onAgentInfo
       ? [
-          menuRow("agent-info", "Agent info", (pin) => (
+          menuRow("agent-info", "Agent info", () => (
             <DropdownMenuItem
               data-testid="header-agent-info"
               className={itemClass}
@@ -613,25 +608,23 @@ export function HeaderConversationMenu({
             >
               <InfoIcon className="size-3.5" />
               Agent info
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
-    menuRow("worktree", "Worktree details", (pin) => (
+    menuRow("worktree", "Worktree details", () => (
       <DropdownMenuItem
         data-testid="header-worktree-details"
         className={itemClass}
         onSelect={() => setWorktreeDetailsOpen(true)}
       >
         <InfoIcon className="size-3.5" /> Worktree details
-        {pin()}
       </DropdownMenuItem>
     )),
     // Rename is also reachable on desktop by clicking the breadcrumb title
     // (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
     // menu is the sole entry point.
-    menuRow("rename", "Rename", (pin) => (
+    menuRow("rename", "Rename", () => (
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
@@ -641,43 +634,39 @@ export function HeaderConversationMenu({
       >
         <PencilIcon className="size-3.5" />
         Rename
-        {pin()}
       </DropdownMenuItem>
     )),
     readState.explicitlyUnread || readState.unseen
-      ? menuRow("mark-unread", "Mark as read", (pin) => (
+      ? menuRow("mark-unread", "Mark as read", () => (
           <DropdownMenuItem
             data-testid="header-mark-read-conversation"
             className={itemClass}
             onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
           >
             <MailOpenIcon className="size-3.5" /> Mark as read
-            {pin()}
           </DropdownMenuItem>
         ))
-      : menuRow("mark-unread", "Mark as unread", (pin) => (
+      : menuRow("mark-unread", "Mark as unread", () => (
           <DropdownMenuItem
             data-testid="header-mark-unread-conversation"
             className={itemClass}
             onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
           >
             <MailIcon className="size-3.5" /> Mark as unread
-            {pin()}
           </DropdownMenuItem>
         )),
     ...(surface === "row"
       ? [
-          menuRow("copy-session-id", "Copy session ID", (pin) => (
+          menuRow("copy-session-id", "Copy session ID", () => (
             <DropdownMenuItem
               data-testid="header-copy-session-id"
               className={itemClass}
               onSelect={() => void copySessionId()}
             >
               <CopyIcon className="size-3.5" /> Copy session ID
-              {pin()}
             </DropdownMenuItem>
           )),
-          menuRow("sounds", soundsMuted ? "Unmute sounds" : "Mute sounds", (pin) => (
+          menuRow("sounds", soundsMuted ? "Unmute sounds" : "Mute sounds", () => (
             <DropdownMenuItem
               data-testid="header-toggle-session-sounds"
               className={itemClass}
@@ -695,14 +684,13 @@ export function HeaderConversationMenu({
                 <BellOffIcon className="size-3.5" />
               )}
               {soundsMuted ? "Unmute sounds" : "Mute sounds"}
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
     ...(isChild
       ? [
-          menuRow("open-in-panel", "Open in panel", (pin) => (
+          menuRow("open-in-panel", "Open in panel", () => (
             <DropdownMenuItem
               data-testid="header-open-in-panel"
               className={itemClass}
@@ -718,14 +706,13 @@ export function HeaderConversationMenu({
               }}
             >
               <PanelRightOpenIcon className="size-3.5" /> Open in panel
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
     ...(canCreateAutomation
       ? [
-          menuRow("automation", "Create automation", (pin) => (
+          menuRow("automation", "Create automation", () => (
             <DropdownMenuItem
               data-testid="header-create-automation"
               className={itemClass}
@@ -733,7 +720,6 @@ export function HeaderConversationMenu({
             >
               <ClockPlusIcon className="size-3.5" />
               Create automation
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
@@ -743,7 +729,7 @@ export function HeaderConversationMenu({
     // so this menu is the sole entry point.
     ...(!isChild && !isIndentedSibling(conversation)
       ? [
-          menuRow("move", currentProject ? "Move session" : "Add to project", (pin) =>
+          menuRow("move", currentProject ? "Move session" : "Add to project", () =>
             isMobile ? (
               // Mobile has no room for a side flyout, so this item swaps the menu
               // body to the project picker in place (see the `projectPickerOpen`
@@ -758,7 +744,6 @@ export function HeaderConversationMenu({
               >
                 <FolderInputIcon className="size-3.5" />
                 {currentProject ? "Move session" : "Add to project"}
-                {pin()}
               </DropdownMenuItem>
             ) : (
               <DropdownMenuSub>
@@ -784,7 +769,7 @@ export function HeaderConversationMenu({
   const tailRows: PinnableMenuRow[] = [
     ...(canResume
       ? [
-          menuRow("resume", "Resume session", (pin) => (
+          menuRow("resume", "Resume session", () => (
             <DropdownMenuItem
               data-testid="header-resume-session"
               className={itemClass}
@@ -793,14 +778,13 @@ export function HeaderConversationMenu({
               onSelect={() => resume.mutate()}
             >
               <PlayIcon className="size-3.5" /> {resume.isPending ? "Resuming…" : "Resume session"}
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
       : []),
     ...(surface === "row" && canStop
       ? [
-          menuRow("stop", "Stop session", (pin) => (
+          menuRow("stop", "Stop session", () => (
             <DropdownMenuItem
               data-testid="header-stop-session"
               className={itemClass}
@@ -809,7 +793,6 @@ export function HeaderConversationMenu({
               onSelect={() => setStopOpen(true)}
             >
               <CircleStopIcon className="size-3.5" /> Stop session
-              {pin()}
             </DropdownMenuItem>
           )),
         ]
@@ -864,18 +847,20 @@ export function HeaderConversationMenu({
     const row = allRows.find((candidate) => candidate.id === id);
     if (row) orderedPinnedRows.push(row);
   }
-  const pinSlotFor = (row: PinnableMenuRow) => (className?: string) =>
-    isMobile ? (
-      <MobileMenuPinToggle
-        itemId={row.id}
-        label={row.label}
-        pinned={pinnedSet.has(row.id)}
-        onToggle={() => toggleMobileMenuPin(row.id)}
-        {...(className ? { className } : {})}
-      />
-    ) : null;
-  const renderRow = (row: PinnableMenuRow) => (
-    <Fragment key={row.id}>{row.render(pinSlotFor(row))}</Fragment>
+  const renderRow = (row: PinnableMenuRow): ReactNode => (
+    <Fragment key={row.id}>
+      {withPinControl(
+        isMobile ? (
+          <MobileMenuPinToggle
+            itemId={row.id}
+            label={row.label}
+            pinned={pinnedSet.has(row.id)}
+            onToggle={() => toggleMobileMenuPin(row.id)}
+          />
+        ) : null,
+        row.render(isMobile),
+      )}
+    </Fragment>
   );
   const renderUnpinned = (rows: PinnableMenuRow[]) =>
     rows.filter((row) => !pinnedSet.has(row.id)).map(renderRow);

@@ -52,6 +52,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { menuRow, type PinnableMenuRow } from "@/lib/mobileMenuPins";
+import { PIN_TRAILING_PADDING } from "./MobileMenuPinToggle";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
@@ -438,34 +439,35 @@ export function ChatHeader({
       ? [
           ...(showFilesPanel
             ? [
-                menuRow("files", "Files", (pin) => (
+                menuRow("files", "Files", () => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenFiles}
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <FileIcon className="size-4" />
                     Files
-                    {pin()}
                   </DropdownMenuItem>
                 )),
               ]
             : []),
-          menuRow("archived-sessions", "Archived sessions", (pin) => (
+          menuRow("archived-sessions", "Archived sessions", () => (
             <DropdownMenuItem
               onSelect={mobileMenu.onOpenArchive}
               className="gap-2.5 px-2.5 py-2 text-ui"
             >
               <ArchiveIcon className="size-4" />
               Archived sessions
-              {pin()}
             </DropdownMenuItem>
           )),
           ...(showFilesPanel
             ? [
-                menuRow("changes", "Changes", (pin) => (
+                menuRow("changes", "Changes", (withPin) => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenChanges}
-                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                    className={cn(
+                      "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                      withPin && PIN_TRAILING_PADDING,
+                    )}
                   >
                     <GitCompareIcon className="size-4" />
                     Changes
@@ -476,36 +478,32 @@ export function ChatHeader({
                         {mobileMenu.changedCount}
                       </span>
                     )}
-                    {/* The badge already takes the auto margin. */}
-                    {pin("ml-1.5")}
                   </DropdownMenuItem>
                 )),
               ]
             : []),
           ...(mobileMenu.showContentSearch
             ? [
-                menuRow("content-search", "Content search", (pin) => (
+                menuRow("content-search", "Content search", () => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenContentSearch}
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <SearchIcon className="size-4" />
                     Content search
-                    {pin()}
                   </DropdownMenuItem>
                 )),
               ]
             : []),
           ...(showFilesPanel
             ? [
-                menuRow("pull-requests", "Pull Requests", (pin) => (
+                menuRow("pull-requests", "Pull Requests", () => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenGithub}
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <GitPullRequestIcon className="size-4" />
                     Pull Requests
-                    {pin()}
                   </DropdownMenuItem>
                 )),
               ]
@@ -513,10 +511,13 @@ export function ChatHeader({
           // Agents — always present (the panel lists at least
           // the main agent); the badge counts the whole tree,
           // main agent included.
-          menuRow("agents", "Agents", (pin) => (
+          menuRow("agents", "Agents", (withPin) => (
             <DropdownMenuItem
               onSelect={mobileMenu.onOpenSubagents}
-              className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+              className={cn(
+                "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                withPin && PIN_TRAILING_PADDING,
+              )}
             >
               <BotIcon className="size-4" />
               Agents
@@ -533,20 +534,17 @@ export function ChatHeader({
                   ? `${mobileMenu.subagentsWorking}/${mobileMenu.agentCount}`
                   : mobileMenu.agentCount}
               </span>
-              {/* The badge already takes the auto margin. */}
-              {pin("ml-1.5")}
             </DropdownMenuItem>
           )),
           ...(mobileMenu.showSideChats
             ? [
-                menuRow("side-chats", "Side chats", (pin) => (
+                menuRow("side-chats", "Side chats", () => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenSideChats}
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <MessagesSquareIcon className="size-4" />
                     Side chats
-                    {pin()}
                   </DropdownMenuItem>
                 )),
               ]
@@ -558,10 +556,13 @@ export function ChatHeader({
           // affordance is reachable on mobile too.
           ...(!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab
             ? [
-                menuRow("shells", "Shells", (pin) => (
+                menuRow("shells", "Shells", (withPin) => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}
-                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                    className={cn(
+                      "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                      withPin && PIN_TRAILING_PADDING,
+                    )}
                   >
                     <TerminalIcon className="size-4" />
                     Shells
@@ -572,22 +573,19 @@ export function ChatHeader({
                         {mobileMenu.terminalsLength}
                       </span>
                     )}
-                    {/* The badge already takes the auto margin. */}
-                    {pin(mobileMenu.terminalsLength > 0 ? "ml-1.5" : undefined)}
                   </DropdownMenuItem>
                 )),
               ]
             : []),
           ...(mobileMenu.debugMode
             ? [
-                menuRow("logs", "Logs", (pin) => (
+                menuRow("logs", "Logs", () => (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenMainExecutionLog}
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListIcon className="size-4" />
                     Logs
-                    {pin()}
                   </DropdownMenuItem>
                 )),
               ]
@@ -597,7 +595,7 @@ export function ChatHeader({
   // The fallback kebab below (and any other surface that lists rail entries
   // without pinning) renders the same rows with no toggle.
   const workspaceItems = workspaceRows
-    ? workspaceRows.map((row) => <Fragment key={row.id}>{row.render(() => null)}</Fragment>)
+    ? workspaceRows.map((row) => <Fragment key={row.id}>{row.render(false)}</Fragment>)
     : null;
   const showShare = !pending && canShare;
   // Session actions (pin/share/rename/project/archive/delete). Desktop hangs

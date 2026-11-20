@@ -233,19 +233,12 @@ function openMenu() {
   });
 }
 
-// Workspace-rail rows as ChatHeader hands them over: each carries the id its
-// pin toggle uses.
-const filesRailRow = menuRow("files", "Files", (pin) => (
-  <DropdownMenuItem data-testid="rail-files">
-    Files
-    {pin()}
-  </DropdownMenuItem>
+// Workspace-rail rows as ChatHeader hands them over.
+const filesRailRow = menuRow("files", "Files", () => (
+  <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>
 ));
-const shellsRailRow = menuRow("shells", "Shells", (pin) => (
-  <DropdownMenuItem data-testid="rail-shells">
-    Shells
-    {pin()}
-  </DropdownMenuItem>
+const shellsRailRow = menuRow("shells", "Shells", () => (
+  <DropdownMenuItem data-testid="rail-shells">Shells</DropdownMenuItem>
 ));
 
 /** Store a pin choice the way another device would have left it. */

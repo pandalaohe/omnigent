@@ -86,22 +86,21 @@ export function toggledMobileMenuPins(
 /**
  * One pinnable menu row.
  *
- * `render` receives the pin toggle as a factory: `pin()` puts the control at
- * the row's trailing edge, `pin("ml-1.5")` tucks it beside a row that already
- * has a right-aligned badge, and `() => null` (a surface that doesn't pin)
- * renders the row with no control at all.
+ * The row never renders the control itself: the surface draws it at the row's
+ * trailing edge, beside the item rather than inside it. `withPin` says such a
+ * control is coming, so a row that ends in a badge reserves that width.
  */
 export interface PinnableMenuRow {
   id: MobileMenuPinId;
   /** The row's label, for the toggle's "Pin Shells" / "Unpin Shells" name. */
   label: string;
-  render: (pin: (className?: string) => ReactNode) => ReactNode;
+  render: (withPin: boolean) => ReactNode;
 }
 
 export function menuRow(
   id: MobileMenuPinId,
   label: string,
-  render: (pin: (className?: string) => ReactNode) => ReactNode,
+  render: (withPin: boolean) => ReactNode,
 ): PinnableMenuRow {
   return { id, label, render };
 }
