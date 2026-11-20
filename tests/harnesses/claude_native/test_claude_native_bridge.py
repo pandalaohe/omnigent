@@ -10253,10 +10253,7 @@ async def test_session_create_relay_waits_for_created_handle(
                     "status": "failed",
                     "error": "child_not_ready",
                     "detail": f"503 {detail}",
-                    "guidance": (
-                        "inspect this session before continuing. Do not create a replacement; "
-                        "do not automatically resend the task."
-                    ),
+                    "guidance": tool_dispatch._UNCONFIRMED_FIRST_TASK_GUIDANCE,
                 }
             assert creates == posts == 1
         finally:
