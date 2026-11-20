@@ -380,6 +380,7 @@ from omnigent.server.session_succession import (
     claude_transfer_pending,
     copy_succession_file,
     is_requested_claude_transfer,
+    recover_claude_transfer_on_input,
     released_succession_target,
 )
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -2204,6 +2205,26 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if (
+            claude_transfer_pending(conv)
+            and body.type == "message"
+            and body.data.get("role", "user") == "user"
+            and not body.data.get("is_meta")
+            and not _is_subagent_wake(body)
+        ):
+            state = request.app.state
+            await recover_claude_transfer_on_input(
+                conv,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=getattr(state, "peer_message_store", None),
+                scheduled_task_store=getattr(state, "scheduled_task_store", None),
+                archive_cleanup=getattr(state, "archive_close_coordinator", None),
+            )
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None:
+                raise _session_not_found()
+            conv = current
         pending_transfer = claude_transfer_pending(conv)
         observation = body.type.startswith("external_") or body.type in {
             _SUBAGENT_STATUS_TYPE,

@@ -22,8 +22,8 @@ import asyncio
 import hashlib
 import json
 import logging
-from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -126,7 +126,7 @@ def claude_transfer_pending(conversation: Conversation) -> bool:
 
 def claude_transfer_fenced(conversation: Conversation) -> bool:
     """Identify a requested transfer even after its intent has been cleaned up."""
-    if conversation.labels.get(_CLAUDE_TRANSFER_LABEL):
+    if claude_transfer_pending(conversation):
         return True
     successor = conversation.labels.get(SUCCEEDED_BY_LABEL_KEY)
     result = _claude_transfer_result(conversation)
@@ -278,16 +278,76 @@ async def _live_terminal(client: httpx.AsyncClient, session_id: str) -> dict[str
     return response.json()
 
 
-async def _clear_transfer_intent(store: ConversationStore, old_id: str, intent: str) -> None:
+async def _clear_transfer_intent(
+    store: ConversationStore, old_id: str, intent: str, *, discard_result: bool = False
+) -> None:
     def clear(labels: dict[str, str]) -> LabelGroupChange:
-        return LabelGroupChange(
-            upserts={},
-            deletes={_CLAUDE_TRANSFER_LABEL}
-            if labels.get(_CLAUDE_TRANSFER_LABEL) == intent
-            else set(),
-        )
+        if labels.get(_CLAUDE_TRANSFER_LABEL) != intent:
+            return LabelGroupChange(upserts={}, deletes=set())
+        deletes = {_CLAUDE_TRANSFER_LABEL}
+        if discard_result:
+            deletes.add(_CLAUDE_TRANSFER_RESULT_LABEL)
+        return LabelGroupChange(upserts={}, deletes=deletes)
 
     await asyncio.to_thread(store.mutate_label_group, old_id, _CLAUDE_TRANSFER_LABEL, clear)
+
+
+def _claude_transfer_placement_matches(
+    old: Conversation, new: Conversation | None, runner_id: str | None
+) -> bool:
+    return bool(
+        runner_id
+        and new is not None
+        and not (old.archived or new.archived)
+        and old.runner_id == new.runner_id == runner_id
+        and old.labels.get(SUCCEEDED_BY_LABEL_KEY) in (None, new.id)
+        and is_requested_claude_transfer(old, new)
+    )
+
+
+async def _move_claude_instance(
+    client: httpx.AsyncClient, old_id: str, new_id: str, instance: str
+) -> tuple[int, dict[str, Any]]:
+    payload = await _live_terminal(client, new_id)
+    if _terminal_instance(payload) == instance:
+        return 200, payload
+    try:
+        response = await client.post(
+            f"{_terminal_path(old_id)}/transfer",
+            json={"target_session_id": new_id, "expected_instance_id": instance},
+            timeout=30.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        payload = await _live_terminal(client, new_id)
+        if _terminal_instance(payload) != instance:
+            raise
+        return 200, payload
+    if response.is_error:
+        received = await _live_terminal(client, new_id)
+        if _terminal_instance(received) == instance:
+            return 200, received
+        if response.status_code in (404, 409):
+            return response.status_code, response.json()
+        raise ConnectionError("Runner did not settle the Claude terminal transfer")
+    payload = response.json()
+    if _terminal_instance(payload) != instance:
+        raise ConnectionError("Runner did not confirm the prepared Claude terminal instance")
+    return 200, payload
+
+
+async def _rollback_claude_instance(
+    client: httpx.AsyncClient, old_id: str, new_id: str, instance: str
+) -> None:
+    source, target = await asyncio.gather(
+        _live_terminal(client, old_id), _live_terminal(client, new_id)
+    )
+    if _terminal_instance(target) != instance:
+        return  # The pane is still at the source or has exited on this runner.
+    if _terminal_instance(source) == instance:
+        raise ConnectionError("Claude terminal changed owners during reconciliation")
+    status, _ = await _move_claude_instance(client, new_id, old_id, instance)
+    if status != 200 and _terminal_instance(await _live_terminal(client, new_id)) == instance:
+        raise ConnectionError("Runner did not return the Claude terminal to its previous owner")
 
 
 async def _commit_claude_transfer(
@@ -357,13 +417,19 @@ async def transfer_requested_claude_terminal(
             return
 
     def schedule_recovery(expected_intent: str) -> None:
-        if old_id in _claude_transfer_retries:
+        existing = _claude_transfer_retries.get(old_id)
+        if existing is not None and not existing.done():
             return
         task = asyncio.create_task(
             recover(expected_intent), name=f"claude-transfer-retry:{old_id}"
         )
         _claude_transfer_retries[old_id] = task
-        task.add_done_callback(lambda _: _claude_transfer_retries.pop(old_id, None))
+
+        def forget(done: asyncio.Task[None]) -> None:
+            if _claude_transfer_retries.get(old_id) is done:
+                _claude_transfer_retries.pop(old_id, None)
+
+        task.add_done_callback(forget)
 
     async with claude_transfer_lock(old_id):
         old, new = await asyncio.gather(
@@ -374,95 +440,97 @@ async def transfer_requested_claude_terminal(
             old is None or old.labels.get(_CLAUDE_TRANSFER_LABEL) != recover_intent
         ):
             return 409, {}
-        if (
-            old is None
-            or new is None
-            or not is_requested_claude_transfer(old, new, _CLAUDE_TERMINAL)
-        ):
+        if old is None:
             raise OmnigentError("Claude rotation changed before transfer", code=ErrorCode.CONFLICT)
         intent = old.labels.get(_CLAUDE_TRANSFER_LABEL, "")
-        saved_result = _claude_transfer_result(old)
-        if saved_result is not None and saved_result["target"] != new_id:
-            saved_result = None
+        if not intent and (new is None or not is_requested_claude_transfer(old, new)):
+            raise OmnigentError("Claude rotation changed before transfer", code=ErrorCode.CONFLICT)
         receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
         if receipt is not None and old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id:
             drive(receipt)
             if intent:
                 await _clear_transfer_intent(store, old_id, intent)
-            if saved_result is None:
+            saved_result = _claude_transfer_result(old)
+            if saved_result is None or saved_result.get("target") != new_id:
                 raise RuntimeError("Claude transfer receipt has no terminal result")
             return 200, saved_result["terminal"]
-        if saved_result is None and (
-            old.archived or new.archived or not old.runner_id or old.runner_id != new.runner_id
-        ):
-            raise OmnigentError("Claude rotation placement changed", code=ErrorCode.CONFLICT)
 
+        placement_conflict = {"error": {"message": "Claude rotation placement changed"}}
         try:
-            if saved_result is not None:
-                payload = saved_result["terminal"]
-            else:
-                client = await _get_runner_client(new_id, runner_router, conversation=new)
-                if client is None:
-                    raise ConnectionError("Claude successor runner is not connected")
-                if not intent:
-                    instance = _terminal_instance(await _live_terminal(client, old_id))
-                    if instance is None:
-                        return 404, {}
-                    intent = await asyncio.to_thread(
-                        store.insert_label_if_absent,
-                        old_id,
-                        _CLAUDE_TRANSFER_LABEL,
-                        json.dumps(
-                            {"target": new_id, "instance": instance, "id": uuid4().hex},
-                            separators=(",", ":"),
-                        ),
-                    )
+            transfer = json.loads(intent) if intent else None
+            if transfer is not None and transfer["target"] != new_id:
+                raise OmnigentError(
+                    "A different Claude transfer is pending", code=ErrorCode.CONFLICT
+                )
+            runner_id = transfer.get("runner_id") if transfer is not None else old.runner_id
+            if transfer is not None and not runner_id:
+                # Earlier intents can use an unambiguous surviving binding.
+                bindings = {row.runner_id for row in (old, new) if row and row.runner_id}
+                if len(bindings) != 1:
+                    raise ConnectionError("The original Claude transfer runner is unknown")
+                runner_id = bindings.pop()
+            placement_matches = _claude_transfer_placement_matches(old, new, runner_id)
+            if transfer is None and not placement_matches:
+                return 409, placement_conflict
+            client = await _get_runner_client(
+                old_id, runner_router, conversation=replace(old, runner_id=runner_id)
+            )
+            if client is None:
+                raise ConnectionError("The original Claude transfer runner is not connected")
+            if transfer is None:
+                instance = _terminal_instance(await _live_terminal(client, old_id))
+                if instance is None:
+                    return 404, {}
+                intent = await asyncio.to_thread(
+                    store.insert_label_if_absent,
+                    old_id,
+                    _CLAUDE_TRANSFER_LABEL,
+                    json.dumps(
+                        {
+                            "target": new_id,
+                            "instance": instance,
+                            "runner_id": runner_id,
+                            "id": uuid4().hex,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
                 transfer = json.loads(intent)
-                if transfer["target"] != new_id:
+                if transfer["target"] != new_id or transfer.get("runner_id") != runner_id:
                     raise OmnigentError(
                         "A different Claude transfer is pending", code=ErrorCode.CONFLICT
                     )
 
-                payload = await _live_terminal(client, new_id)
-                if _terminal_instance(payload) != transfer["instance"]:
-                    try:
-                        response = await client.post(
-                            f"{_terminal_path(old_id)}/transfer",
-                            json={
-                                "target_session_id": new_id,
-                                "expected_instance_id": transfer["instance"],
-                            },
-                            timeout=30.0,
-                        )
-                    except (httpx.HTTPError, ConnectionError):
-                        payload = await _live_terminal(client, new_id)
-                        if _terminal_instance(payload) != transfer["instance"]:
-                            raise
-                    else:
-                        payload = response.json()
-                        if response.is_error:
-                            received = await _live_terminal(client, new_id)
-                            if _terminal_instance(received) == transfer["instance"]:
-                                payload = received
-                            elif response.status_code in (404, 409):
-                                # The runner rejected this instance and the target does not own it.
-                                await _clear_transfer_intent(store, old_id, intent)
-                                return response.status_code, payload
-                            else:
-                                raise ConnectionError("Runner did not settle the Claude transfer")
-                if _terminal_instance(payload) != transfer["instance"]:
-                    raise ConnectionError(
-                        "Runner did not confirm the prepared Claude terminal instance"
+            instance = transfer["instance"]
+            if not placement_matches:
+                await _rollback_claude_instance(client, old_id, new_id, instance)
+                await _clear_transfer_intent(store, old_id, intent, discard_result=True)
+                return 409, placement_conflict
+
+            status, payload = await _move_claude_instance(client, old_id, new_id, instance)
+            if status != 200:
+                await _clear_transfer_intent(store, old_id, intent, discard_result=True)
+                return status, payload
+            current_old, current_new = await asyncio.gather(
+                asyncio.to_thread(store.get_conversation, old_id),
+                asyncio.to_thread(store.get_conversation, new_id),
+            )
+            if current_old is None or not _claude_transfer_placement_matches(
+                current_old, current_new, runner_id
+            ):
+                await _rollback_claude_instance(client, old_id, new_id, instance)
+                if current_old is not None:
+                    await _clear_transfer_intent(store, old_id, intent, discard_result=True)
+                return 409, placement_conflict
+            await asyncio.to_thread(
+                store.set_labels,
+                old_id,
+                {
+                    _CLAUDE_TRANSFER_RESULT_LABEL: json.dumps(
+                        {"target": new_id, "terminal": payload}
                     )
-                await asyncio.to_thread(
-                    store.set_labels,
-                    old_id,
-                    {
-                        _CLAUDE_TRANSFER_RESULT_LABEL: json.dumps(
-                            {"target": new_id, "terminal": payload}
-                        )
-                    },
-                )
+                },
+            )
             receipt = await _commit_claude_transfer(store, old_id, new_id)
         except Exception:
             if intent:
@@ -479,6 +547,41 @@ async def transfer_requested_claude_terminal(
         return 200, payload
 
 
+async def recover_claude_transfer_on_input(
+    conversation: Conversation,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None,
+    archive_cleanup: Any,
+) -> None:
+    """Give a stalled transfer another driver when input reaches the old session."""
+    old_id = conversation.id
+    retry = _claude_transfer_retries.get(old_id)
+    if (retry is not None and not retry.done()) or claude_transfer_lock(old_id).locked():
+        return
+    intent = conversation.labels[_CLAUDE_TRANSFER_LABEL]
+    try:
+        target = json.loads(intent)["target"]
+    except (KeyError, TypeError, ValueError):
+        return
+    # An unconfirmed attempt leaves the transfer fenced and retryable.
+    with suppress(httpx.HTTPError, ConnectionError):
+        await asyncio.shield(
+            transfer_requested_claude_terminal(
+                old_id,
+                target,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=peer_message_store,
+                scheduled_task_store=scheduled_task_store,
+                archive_cleanup=archive_cleanup,
+                recover_intent=intent,
+            )
+        )
+
+
 async def _recover_claude_transfers(
     store: ConversationStore,
     runner_router: RunnerRouter | None,
@@ -490,21 +593,14 @@ async def _recover_claude_transfers(
     intents = await asyncio.to_thread(store.list_label_values, _CLAUDE_TRANSFER_LABEL)
     for old_id, intent in intents.items():
         try:
-            new_id = json.loads(intent)["target"]
-            old, new = await asyncio.gather(
-                asyncio.to_thread(store.get_conversation, old_id),
-                asyncio.to_thread(store.get_conversation, new_id),
-            )
-            if old is None or old.labels.get(_CLAUDE_TRANSFER_LABEL) != intent:
-                continue
-            if runner_id is not None and runner_id not in (
-                old.runner_id,
-                getattr(new, "runner_id", None),
+            transfer = json.loads(intent)
+            new_id = transfer["target"]
+            original_runner = transfer.get("runner_id")
+            if (
+                runner_id is not None
+                and original_runner is not None
+                and runner_id != original_runner
             ):
-                continue
-            if new is None or not is_requested_claude_transfer(old, new):
-                async with claude_transfer_lock(old_id):
-                    await _clear_transfer_intent(store, old_id, intent)
                 continue
             await transfer_requested_claude_terminal(
                 old_id,
@@ -1011,14 +1107,14 @@ async def _phase_open(
     questions = (
         receipt.questions if receipt.questions is not None else _open_questions(receipt.old_id)
     )
-    if questions:
+    if questions and claude_transfer_fenced(old_conversation):
         saved_answers = {
             card.elicitation_id
             for card in await asyncio.to_thread(conversation_store.list_detached_cards)
             if card.session_id == receipt.old_id and card.state in {"answered", "settled"}
         }
-        # An already-saved answer has its own durable delivery. Only still-open
-        # questions belong in the successor's list of cards to re-ask.
+        # Requested Claude transfers send saved answers to the successor.
+        # Ordinary handovers still rely on re-asking the carried questions.
         opening_questions = [q for q in questions if q.get("elicitation_id") not in saved_answers]
     else:
         opening_questions = questions
