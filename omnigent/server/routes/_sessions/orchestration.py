@@ -6266,6 +6266,7 @@ async def _reconcile_runner_input_leases(
     session_id: str,
     event: Mapping[str, Any],
     previous_ids: set[str],
+    runner_id: str | None = None,
 ) -> None:
     active, queued = event.get("active_pending_ids"), event.get("queued_pending_ids")
     if not isinstance(active, list) or not isinstance(queued, list):
@@ -6274,7 +6275,7 @@ async def _reconcile_runner_input_leases(
         return
     active_ids = set(active)
     held_ids = active_ids.union(queued)
-    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids)
+    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids, runner_id)
     for pending_id, since in sending.items():
         session_stream.publish(
             session_id,
@@ -12670,7 +12671,11 @@ async def _relay_runner_stream_once(
                             ready.set()
                         if conversation_store is not None:
                             await _reconcile_runner_input_leases(
-                                conversation_store, session_id, event, previous_pending_ids
+                                conversation_store,
+                                session_id,
+                                event,
+                                previous_pending_ids,
+                                runner_id=runner_id,
                             )
                         continue
 

@@ -14,7 +14,7 @@ import asyncio
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from typing import Any, cast
 
@@ -185,6 +185,82 @@ async def test_claim_capable_buffered_peer_stays_uncertain_through_delivery(
             pending_inputs.resolve(receiver.id, web_pending)
 
 
+@pytest.mark.parametrize("claimed", [False, True], ids=["no-claim", "claim-then-mirror"])
+async def test_claim_capable_accepted_peer_stays_delivering_until_its_envelope(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    claimed: bool,
+) -> None:
+    """A copy a Claude runner accepted mid-turn settles from its envelope, not the 202."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import SessionEventInput
+
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    fake: _FakePostEvent = peer_env["fake"]
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    accepted: list[str] = []
+
+    def _accept(session_id: str, body: Any) -> None:
+        # Dispatch of a 202 ``accepted`` from a claim-capable Claude runner.
+        pending_id = pending_inputs.record(
+            session_id, body.data["content"], peer_message_id=body.data["peer_message_id"]
+        )
+        pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+        pending_inputs.enable_runner_lease(session_id, pending_id)
+        accepted.append(pending_id)
+
+    fake.on_call = _accept
+    try:
+        result = await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"],
+            receiver_id=receiver.id,
+            text=f"accepted-{uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        assert result["disposition"] == "queued", result
+        assert result["reason"] == "uncertain"
+        record = peer_env["peer_store"].get(result["peer_id"])
+        assert record is not None and record.state == "delivering"
+        (pending_id,) = accepted
+        if claimed:
+            assert pending_inputs.claim_runner_input(receiver.id, pending_id, "paste")
+            await orchestration._persist_external_conversation_item(
+                receiver.id,
+                receiver,
+                SessionEventInput(
+                    type="external_conversation_item",
+                    data={
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": fake.calls[-1]["data"]["content"],
+                        },
+                        "response_id": "resp_mirror",
+                    },
+                ),
+                conv_store,
+            )
+        else:
+            # The runner exits before its claim; the next queue snapshot lacks the copy.
+            await orchestration._reconcile_runner_input_leases(
+                conv_store,
+                receiver.id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                {pending_id},
+            )
+        assert not pending_inputs.holds_peer_message(receiver.id, record.id)
+        await peer_env["app"].state.peer_sweeper._reconcile_one(record, int(time.time()))
+        stored = peer_env["peer_store"].get(record.id)
+        # Delivered only by the mirrored envelope; a lost copy goes back for a resend.
+        assert stored is not None and stored.state == ("delivered" if claimed else "pending")
+    finally:
+        fake.on_call = None
+        for pending_id in accepted:
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
 def _build_peer_app(
     *,
     conversation_store: SqlAlchemyConversationStore,
@@ -260,9 +336,12 @@ class _FakePostEvent:
         self.outcome: dict[str, Any] = outcome or {"queued": True, "item_id": "item_1"}
         self.calls: list[dict[str, Any]] = []
         self.error: BaseException | None = None
+        self.on_call: Callable[[str, Any], None] | None = None
 
     async def __call__(self, request: Any, session_id: str, body: Any, **_kwargs: Any) -> Any:
         self.calls.append({"session_id": session_id, "type": body.type, "data": body.data})
+        if self.on_call is not None:
+            self.on_call(session_id, body)
         if self.error is not None:
             raise self.error
         return dict(self.outcome)

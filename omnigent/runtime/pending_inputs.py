@@ -271,6 +271,7 @@ class DrainedInput:
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
+    runner_claim_owner: str | None = None
 
 
 @dataclass
@@ -357,6 +358,8 @@ class _Entry:
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
+    # Runner id that claimed this input; only its heartbeats renew a confirmed paste.
+    runner_claim_owner: str | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -528,7 +531,12 @@ def enable_runner_lease(conversation_id: str, pending_id: str) -> None:
 
 
 def claim_runner_input(
-    conversation_id: str, pending_id: str, claim_id: str, *, expected_attempt_id: str | None = None
+    conversation_id: str,
+    pending_id: str,
+    claim_id: str,
+    *,
+    expected_attempt_id: str | None = None,
+    runner_id: str | None = None,
 ) -> bool:
     """Grant one runner attempt the right to paste while its lease is live."""
     with _lock:
@@ -548,6 +556,7 @@ def claim_runner_input(
         if now - last_renewal >= _TTL_S:
             return False
         entry.runner_claim_id = claim_id
+        entry.runner_claim_owner = runner_id
         entry.last_runner_renewal = now
         entry.sending_since_ms = entry.input_enqueued_at_ms
         return True
@@ -571,7 +580,7 @@ def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
 
 
 def renew_runner_inputs(
-    conversation_id: str, held_ids: set[str], active_ids: set[str]
+    conversation_id: str, held_ids: set[str], active_ids: set[str], runner_id: str | None = None
 ) -> dict[str, int | None]:
     """Renew the runner's live inputs and return their current sending timestamps."""
     now = _now()
@@ -600,10 +609,13 @@ def renew_runner_inputs(
         busy_check = _session_busy_check
         if busy_check is not None and busy_check(conversation_id):
             # A running turn absorbs a confirmed paste at its next step, which
-            # can outlast the claim lease; its mirror settles it.
+            # can outlast the claim lease; its mirror settles it. A replacement
+            # runner never had the paste, so only the claiming runner renews it.
             for entry in entries.values():
                 if (
                     entry.runner_claim_id is not None
+                    and runner_id is not None
+                    and entry.runner_claim_owner == runner_id
                     and entry.last_delivery_stage == "native_turn_completed"
                     and not entry.held
                     and not entry.interrupted
@@ -1097,6 +1109,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
+        runner_claim_owner=drained.runner_claim_owner,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1444,6 +1457,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
+        runner_claim_owner=entry.runner_claim_owner,
     )
 
 
