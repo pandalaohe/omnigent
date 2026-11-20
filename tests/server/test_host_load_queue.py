@@ -268,6 +268,71 @@ async def test_tick_two_per_host_rollback_and_restart_scan(queue_env, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, monkeypatch):
+    """The label lookup finds what the full sub-agent scan found, read once per tick."""
+    from omnigent.server.session_choice import SLOT_LABEL
+
+    e = queue_env
+
+    def sub_agent(host, labels):
+        return e.store.create_conversation(
+            parent_conversation_id=e.parent.id,
+            kind="sub_agent",
+            host_id=host,
+            workspace="/opt/work/project",
+            runner_id=RUNNER,
+            labels=labels,
+        )
+
+    queued = child(e)
+    releasing = child(e, marker=f"releasing@{HOST}@1")
+    archived = child(e)
+    e.store.update_conversation(archived.id, archived=True)
+    other_host = child(e, marker=f"queued@{OTHER}", host=OTHER)
+    slot_queued = sub_agent(OTHER, {SLOT_LABEL: f"queued@{OTHER}@pool"})
+    sub_agent(HOST, {SLOT_LABEL: f"admitted@{HOST}@pool@1"})
+    sub_agent(HOST, {LABEL: "released"})
+    sub_agent(HOST, {})
+    e.store.create_conversation(host_id=HOST, labels={LABEL: f"queued@{HOST}"})
+
+    full_scan = []
+    after = None
+    while True:
+        page = e.store.list_conversations(
+            kind="sub_agent", include_archived=True, limit=2, after=after
+        )
+        full_scan.extend(conv for conv in page.data if held_host(conv))
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    full_scan.sort(key=lambda conv: (conv.created_at, conv.id))
+
+    found = e.queue._rows()
+    assert [conv.id for conv in found] == [conv.id for conv in full_scan]
+    assert {conv.id for conv in found} == {
+        queued.id,
+        releasing.id,
+        archived.id,
+        other_host.id,
+        slot_queued.id,
+    }
+
+    monkeypatch.setattr(e.store, "list_conversations", Mock(side_effect=AssertionError))
+    rows = Mock(wraps=e.queue._rows)
+    monkeypatch.setattr(e.queue, "_rows", rows)
+    hub = SimpleNamespace(
+        host_load_keys=lambda: [(0, HOST), (0, OTHER)],
+        set_queued_children=Mock(),
+        queue_enabled=lambda workspace: True,
+        host_load=lambda *a: {"level": "new_session_hold"},
+    )
+    await e.queue.tick(hub, e.app)
+    rows.assert_called_once()
+    assert hub.set_queued_children.call_args_list == [((0, HOST, 3),), ((0, OTHER, 2),)]
+    assert e.queue._tasks == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("placement", ["inherited", "explicit", "cross", "bundle"])
 async def test_agent_create_held_without_notify_or_launch_and_first_inputs_pending(
     client, app, db_uri, monkeypatch, placement

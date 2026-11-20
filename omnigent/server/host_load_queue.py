@@ -136,26 +136,32 @@ class HostLoadQueue:
         self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 
     def _rows(self) -> list[Conversation]:
-        rows: list[Conversation] = []
-        after = None
-        while True:
-            page = self.conversations.list_conversations(
-                kind="sub_agent", include_archived=True, limit=200, after=after
-            )
-            rows.extend(conv for conv in page.data if held_host(conv))
-            if not page.has_more or page.last_id is None:
-                return sorted(rows, key=lambda conv: (conv.created_at, conv.id))
-            after = page.last_id
+        """Held sub-agents, archived included, found by their hold labels, not a full scan."""
+        from omnigent.server.session_choice import SLOT_LABEL
+
+        ids = [
+            conversation_id
+            for key in (LABEL, SLOT_LABEL)
+            for conversation_id, marker in self.conversations.list_label_values(key).items()
+            if marker.startswith(("queued@", "releasing@"))
+        ]
+        rows = [
+            conv
+            for conv in self.conversations.get_conversations(ids).values()
+            if conv.parent_conversation_id is not None and held_host(conv)
+        ]
+        return sorted(rows, key=lambda conv: (conv.created_at, conv.id))
 
     async def tick(self, hub: Any, app: Any) -> None:
+        held_by_workspace: dict[int, list[Conversation]] = {}
         for workspace, host in hub.host_load_keys():
             key = (workspace, host)
             if key in self._tasks:
                 continue
-            with workspace_scope(workspace):
-                rows = [
-                    conv for conv in await asyncio.to_thread(self._rows) if held_host(conv) == host
-                ]
+            if workspace not in held_by_workspace:
+                with workspace_scope(workspace):
+                    held_by_workspace[workspace] = await asyncio.to_thread(self._rows)
+            rows = [conv for conv in held_by_workspace[workspace] if held_host(conv) == host]
             hub.set_queued_children(workspace, host, len(rows))
             conn = app.state.host_registry.get(host, workspace_id=workspace)
             if conn is None:
