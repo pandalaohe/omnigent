@@ -159,6 +159,46 @@ afterEach(() => {
 });
 
 describe("Custom agents settings", () => {
+  it("rebuilds server-agent paging after a deleted cursor returns an empty terminal page", async () => {
+    let cursorDeleted = false;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const { searchParams } = new URL(String(input), "https://example.test");
+      if (searchParams.has("scope")) return response(page([]));
+      const after = searchParams.get("after");
+      if (after === "deleted-cursor") {
+        cursorDeleted = true;
+        return response({
+          object: "list",
+          data: [],
+          first_id: null,
+          last_id: null,
+          has_more: false,
+        });
+      }
+      if (after === "replacement-cursor") return response(page([agent("next-server")]));
+      return cursorDeleted
+        ? response(page([agent("rebuilt-server")], true, "replacement-cursor"))
+        : response(page([agent("initial-server")], true, "deleted-cursor"));
+    });
+    mount();
+    fireEvent.click(
+      within(await screen.findByRole("navigation", { name: "Server agent pages" })).getByRole(
+        "button",
+        { name: "Next" },
+      ),
+    );
+    await screen.findByRole("link", { name: /rebuilt-server/ });
+    const pager = within(screen.getByRole("navigation", { name: "Server agent pages" }));
+    expect(pager.getByText("Page 1")).toBeInTheDocument();
+    expect(pager.getByRole("button", { name: "Previous" })).toBeDisabled();
+    fireEvent.click(pager.getByRole("button", { name: "Next" }));
+    await screen.findByRole("link", { name: /next-server/ });
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/agents?limit=20&after=replacement-cursor",
+      expect.anything(),
+    );
+  });
+
   it("restarts only the scope whose cursor was deleted", async () => {
     let deleted = false;
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {

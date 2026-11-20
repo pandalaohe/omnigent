@@ -16,6 +16,8 @@ import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host
 import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
+const MCP_PAGE_CURSOR_PARAM = "mcp_page_after";
+
 export function McpRegistryConnections() {
   const viewerId = useViewerId();
   const scope = JSON.stringify([
@@ -27,7 +29,18 @@ export function McpRegistryConnections() {
 }
 
 function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled: boolean }) {
-  const { cursor, page, next, previous } = useSettingsPageCursor();
+  const params = new URLSearchParams(window.location.search);
+  const callbacks = [...params].filter(([key]) => key.startsWith("mcp-"));
+  const callbackCursors = params.getAll(MCP_PAGE_CURSOR_PARAM);
+  const returning = callbacks.some(([, status]) => status === "connected" || status === "error");
+  const { cursor, cursors, page, next, previous } = useSettingsPageCursor(
+    returning && callbackCursors.every((value) => value.length > 0 && value.length <= 64)
+      ? callbackCursors
+      : [],
+  );
+  const returnParams = new URLSearchParams();
+  for (const after of cursors) returnParams.append(MCP_PAGE_CURSOR_PARAM, after);
+  const returnTo = window.location.pathname + (cursors.length ? `?${returnParams}` : "");
   const { data, error, isPending, isFetching, refetch } = useMcpRegistryPage(
     scope,
     enabled,
@@ -40,9 +53,7 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
       previous();
     }
   }, [page, data, isFetching, previous]);
-  const callbackFailed = [...new URLSearchParams(window.location.search)].some(
-    ([key, value]) => key.startsWith("mcp-") && value === "error",
-  );
+  const callbackFailed = callbacks.some(([, status]) => status === "error");
   return (
     <div className="space-y-4">
       <div>
@@ -69,6 +80,7 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
         <ServiceConnection
           key={service.id}
           service={service}
+          returnTo={returnTo}
           onChanged={async () => {
             await refetch();
           }}
@@ -94,9 +106,11 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
 
 function ServiceConnection({
   service,
+  returnTo,
   onChanged,
 }: {
   service: RegistryService;
+  returnTo: string;
   onChanged: () => Promise<void>;
 }) {
   const [token, setToken] = useState("");
@@ -135,17 +149,19 @@ function ServiceConnection({
           </Button>
         )}
         {service.auth === "oauth" && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => {
-              window.location.href = withBasePath(
-                `/v1/connections/${service.connect_provider}/connect?return_to=${encodeURIComponent(window.location.pathname)}`,
-              );
-            }}
-          >
-            {service.connected ? "Reconnect" : "Connect"}
+          <Button asChild size="sm" variant="outline" disabled={busy}>
+            <a
+              aria-disabled={busy || undefined}
+              href={
+                busy
+                  ? undefined
+                  : withBasePath(
+                      `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
+                    )
+              }
+            >
+              {service.connected ? "Reconnect" : "Connect"}
+            </a>
           </Button>
         )}
         {(service.auth === "github" || service.auth === "databricks") && (

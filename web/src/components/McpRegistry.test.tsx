@@ -120,6 +120,48 @@ describe("MCP account connections", () => {
     expect(screen.queryByText("Service 41")).not.toBeInTheDocument();
   });
 
+  it("refreshes the connected MCP service on its later page after OAuth and can go back", async () => {
+    const originalUrl = window.location.href;
+    window.history.replaceState(null, "", "/settings/mcp");
+    let connected = false;
+    vi.mocked(registryRequest).mockImplementation(async (path) => {
+      const after = new URLSearchParams(path).get("after");
+      return after
+        ? { data: [{ ...service, auth: "oauth", connect_provider: "mcp-tracker", connected }] }
+        : {
+            data: [{ ...service, id: "first-page", title: "First page service", auth: "none" }],
+            next_cursor: "first-page",
+          };
+    });
+    try {
+      const before = renderConnections();
+      fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Not connected")).toBeInTheDocument();
+      const connect = await screen.findByRole("link", { name: "Connect" });
+      const connectUrl = new URL(connect.getAttribute("href")!, originalUrl);
+      expect(connectUrl.pathname).toBe("/v1/connections/mcp-tracker/connect");
+      const returnedUrl = new URL(connectUrl.searchParams.get("return_to")!, originalUrl);
+      returnedUrl.searchParams.set("mcp-tracker", "connected");
+      before.unmount();
+      connected = true;
+      vi.mocked(registryRequest).mockClear();
+      window.history.replaceState(null, "", returnedUrl);
+
+      renderConnections();
+      expect(await screen.findByRole("link", { name: "Reconnect" })).toBeInTheDocument();
+      expect(screen.getByText("Connected")).toBeInTheDocument();
+      expect(screen.getByText("Page 2")).toBeInTheDocument();
+      expect(vi.mocked(registryRequest).mock.calls.map(([url]) => url)).toEqual([
+        "?limit=20&after=first-page",
+      ]);
+      fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+      expect(await screen.findByText("First page service")).toBeInTheDocument();
+      expect(vi.mocked(registryRequest).mock.calls.at(-1)?.[0]).toBe("?limit=20");
+    } finally {
+      window.history.replaceState(null, "", originalUrl);
+    }
+  });
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {

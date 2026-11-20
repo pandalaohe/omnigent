@@ -3879,10 +3879,7 @@ function ArchivedProjectsPane() {
                 del.mutate(
                   { id: deleting.id, name: deleting.name },
                   {
-                    onSuccess: () => {
-                      setDeleting(null);
-                      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-                    },
+                    onSuccess: () => setDeleting(null),
                     onError: (cause) => setError(cause.message),
                   },
                 );

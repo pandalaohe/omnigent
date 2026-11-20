@@ -49,7 +49,16 @@ export function useCustomAgents(scope: "server" | "user", enabled: boolean) {
     },
     enabled,
   });
-  const lostCursor = !!cursor && isStaleCursorError(query.error ?? query.failureReason);
+  // A deleted server cursor returns a successful empty window with no bounds.
+  const emptyServerWindow =
+    scope === "server" &&
+    query.isSuccess &&
+    !query.isFetching &&
+    query.data.data.length === 0 &&
+    query.data.last_id === null &&
+    !query.data.has_more;
+  const lostCursor =
+    !!cursor && (isStaleCursorError(query.error ?? query.failureReason) || emptyServerWindow);
   useEffect(() => {
     if (!lostCursor || !enabled) return;
     void client.invalidateQueries({ queryKey: ["settings-agents", scope], refetchType: "none" });

@@ -27,16 +27,10 @@ export function BookmarksTab() {
   const inplace = places.has("update-in-place");
   const { bookmarks } = places;
   const filter = query.toLowerCase();
-  const matching = useMemo(
+  const filtered = useMemo(
     () => bookmarks.filter((row) => `${row.title} ${row.url}`.toLowerCase().includes(filter)),
     [bookmarks, filter],
   );
-  const editingUrl = edit?.row?.url;
-  const filtered = useMemo(() => {
-    if (!editingUrl || matching.some((row) => row.url === editingUrl)) return matching;
-    const editing = bookmarks.find((row) => row.url === editingUrl);
-    return editing ? [editing, ...matching] : matching;
-  }, [matching, bookmarks, editingUrl]);
   const { pageRows, ...pager } = usePagedRows(filtered, { resetKey: filter });
   let error = "";
   let url = "";
@@ -137,15 +131,13 @@ export function BookmarksTab() {
           Add bookmark
         </Button>
       </div>
-      {edit && !edit.row && editor()}
+      {editor()}
       <p className="text-xs text-muted-foreground">
         Showing {pageRows.length} of {places.bookmarks.length}
       </p>
       <div>
         {pageRows.map((row) =>
-          edit?.row?.url === row.url ? (
-            <div key={row.url}>{editor()}</div>
-          ) : (
+          edit?.row?.url !== row.url ? (
             <div key={row.url} className="group flex min-w-0 items-center gap-3 border-t py-3">
               <PageTile url={row.url} />
               <button
@@ -184,7 +176,7 @@ export function BookmarksTab() {
                 ]}
               />
             </div>
-          ),
+          ) : null,
         )}
       </div>
       <SettingsPager label="Bookmark pages" {...pager} />

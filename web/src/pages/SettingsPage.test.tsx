@@ -22,6 +22,7 @@ import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as UseCommentsModule from "@/hooks/useComments";
+import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as ContextUsageModule from "@/components/ContextUsageSettings";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
@@ -137,7 +138,8 @@ vi.mock("@/lib/identity", () => ({
   authenticatedFetch: mocks.authenticatedFetch,
   subscribeIdentity: () => () => {},
 }));
-vi.mock("@/hooks/useConversations", async () => {
+vi.mock("@/hooks/useConversations", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseConversationsModule>();
   return {
     PROJECT_LABEL_KEY: "omni_project",
     ARCHIVE_LOCK_LABEL_KEY: "omnigent.archive_locked",
@@ -190,7 +192,8 @@ vi.mock("@/hooks/useConversations", async () => {
       data: { projects: mocks.projectNames, hostIds: mocks.hostIds, agentNames: mocks.agentNames },
     }),
     useProjects: () => ({ data: [] }),
-    useDeleteProject: () => ({ mutate: vi.fn(), isPending: false }),
+    useDeleteProject: actual.useDeleteProject,
+    invalidateProjectArchiveQueries: actual.invalidateProjectArchiveQueries,
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
@@ -2653,6 +2656,77 @@ describe("SettingsPage", () => {
     expect(await screen.findByText("Archived project 22")).toBeInTheDocument();
     expect(requests.at(-1)).toBe("/v1/projects?archived=only&limit=20&after=project-21");
   });
+
+  it.each(["Restore project", "Delete"] as const)(
+    "%s refetches archived projects and backs up when the final page empties",
+    async (action) => {
+      let projects = Array.from({ length: 21 }, (_, index) => ({
+        id: `project-${index + 1}`,
+        name: `Archived project ${index + 1}`,
+        archived_at: 1,
+      }));
+      const last = projects[20];
+      const requests: string[] = [];
+      mocks.authenticatedFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const { pathname, searchParams } = new URL(url, "https://example.test");
+        if (pathname === `/v1/projects/${last.id}/unarchive` && init?.method === "POST") {
+          projects = projects.filter(({ id }) => id !== last.id);
+          return Response.json({
+            status: "complete",
+            project: { ...last, archived_at: null },
+            sessions: { done: [], skipped: [] },
+            tasks: { done: [], skipped: [] },
+            failed: [],
+          });
+        }
+        if (pathname === "/v1/sessions" && searchParams.get("project") === last.name) {
+          return Response.json({ data: [], has_more: false });
+        }
+        if (pathname === `/v1/projects/${last.id}` && init?.method === "DELETE") {
+          projects = projects.filter(({ id }) => id !== last.id);
+          return new Response(null, { status: 204 });
+        }
+        if (pathname !== "/v1/projects") return Response.json({});
+        requests.push(url);
+        const after = searchParams.get("after");
+        const start = after ? projects.findIndex(({ id }) => id === after) + 1 : 0;
+        const data = projects.slice(start, start + 20);
+        return Response.json({
+          data,
+          last_id: data.at(-1)?.id ?? null,
+          has_more: start + 20 < projects.length,
+        });
+      });
+
+      renderPage("/settings/archived?tab=projects");
+      const pager = within(
+        await screen.findByRole("navigation", { name: "Archived project pages" }),
+      );
+      fireEvent.click(pager.getByRole("button", { name: "Next" }));
+      const project = await screen.findByText(last.name);
+      const row = project.closest("li")!;
+      expect(pager.getByText("Page 2")).toBeInTheDocument();
+      fireEvent.click(within(row).getByRole("button", { name: action }));
+      if (action === "Delete") {
+        const confirm = await screen.findByRole("dialog", { name: "Delete archived project?" });
+        fireEvent.click(within(confirm).getByRole("button", { name: "Delete project" }));
+      }
+
+      expect(await screen.findByText("Archived project 20")).toBeInTheDocument();
+      expect(screen.queryByText(last.name)).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("navigation", { name: "Archived project pages" }),
+        ).not.toBeInTheDocument(),
+      );
+      expect(requests).toEqual([
+        "/v1/projects?archived=only&limit=20",
+        "/v1/projects?archived=only&limit=20&after=project-20",
+        "/v1/projects?archived=only&limit=20&after=project-20",
+        "/v1/projects?archived=only&limit=20",
+      ]);
+    },
+  );
 
   it("returns to page one when an archive filter changes", () => {
     mocks.projectNames = ["Alpha"];
