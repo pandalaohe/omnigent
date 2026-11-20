@@ -187,7 +187,9 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
 _ARCHIVE_LINEAGE_MAX_HOPS = 32
 
 
-async def session_lineage_archived(server_client: httpx.AsyncClient, session_id: str) -> bool:
+async def session_lineage_archived(
+    server_client: httpx.AsyncClient, session_id: str, *, missing_ends: bool = False
+) -> bool:
     """
     Whether a fresh snapshot shows the session or an ancestor archived.
 
@@ -199,6 +201,8 @@ async def session_lineage_archived(server_client: httpx.AsyncClient, session_id:
     :param server_client: HTTP client pointed at the Omnigent server.
     :param session_id: Session whose schedule is about to fire, e.g.
         ``"conv_abc123"``.
+    :param missing_ends: Also return ``True`` when the session's own snapshot
+        answers 404 (deleted, or no access at all).
     :returns: ``True`` when any snapshot in the ``parent_session_id`` chain
         answers 200 with ``archived`` true.
     """
@@ -211,7 +215,7 @@ async def session_lineage_archived(server_client: httpx.AsyncClient, session_id:
             seen.add(current_id)
             snapshot = await server_client.get(f"/v1/sessions/{current_id}", timeout=10.0)
             if snapshot.status_code != 200:
-                return False
+                return missing_ends and current_id == session_id and snapshot.status_code == 404
             body = snapshot.json()
             if not isinstance(body, dict):
                 return False

@@ -477,17 +477,26 @@ class _GatedTimerAsyncio:
 
 
 class _TimerServer:
-    """Server stand-in for timer firings: records each event POST's session path."""
+    """Server stand-in for timer firings: session snapshots plus recorded event POSTs."""
 
     def __init__(self) -> None:
         self.posts: list[tuple[str, str]] = []
+        self.statuses: dict[str, int] = {}
+        self.archived: set[str] = set()
+        self.blocked: dict[str, asyncio.Event] = {}
+        self.checking = asyncio.Event()
 
-    def _handle(self, request: httpx.Request) -> httpx.Response:
+    async def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             text = json.loads(request.content)["data"]["content"][0]["text"]
             self.posts.append((request.url.path, text))
             return httpx.Response(202, json={"queued": True})
-        return httpx.Response(404)
+        session_id = request.url.path.rsplit("/", 1)[-1]
+        if session_id in self.blocked:
+            self.checking.set()
+            await self.blocked.pop(session_id).wait()
+        archived = session_id in self.archived
+        return httpx.Response(self.statuses.get(session_id, 200), json={"archived": archived})
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(self._handle), base_url="http://s")
@@ -500,6 +509,10 @@ async def _set_timer(server_client: httpx.AsyncClient, **args: Any) -> str:
         )
     )
     return output["timer_id"]
+
+
+async def _release(client: Any) -> Any:
+    return await client.post(f"/v1/sessions/{NEW_SESSION_ID}/succession/release")
 
 
 async def _cancel_timer(session_id: str, timer_id: str) -> str:
@@ -583,6 +596,7 @@ async def test_moved_repeat_timer_fires_once_per_due_time_on_the_same_cadence(
             await gate.wait_for_sleeps(2)
             async with _runner_client(app) as client:
                 assert (await _post_succession(client, moved_ids=[])).status_code == 200
+                assert (await _release(client)).status_code == 200
             gate.release()
             await gate.wait_for_sleeps(3)
         finally:
@@ -597,6 +611,99 @@ async def test_moved_repeat_timer_fires_once_per_due_time_on_the_same_cadence(
     assert gate.delays == [900.0, 900.0, 900.0]
     assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
     assert timer_id not in runner_app._timer_schedules
+
+
+@pytest.mark.asyncio
+async def test_in_flight_check_counts_only_for_its_holder_and_waits_for_the_opening(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check of the archived predecessor never ends a moved timer; B gets it after release."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    check_answer = asyncio.Event()
+    timer_server.blocked[OLD_SESSION_ID] = check_answer
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=900, repeat=True, note="check")
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            gate.release()
+            await asyncio.wait_for(timer_server.checking.wait(), timeout=5)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 200
+                timer_server.archived.add(OLD_SESSION_ID)
+                check_answer.set()
+                await gate.wait_for_sleeps(2)
+                assert timer_server.posts == []
+                assert (await _release(client)).status_code == 200
+            gate.release()
+            await gate.wait_for_sleeps(3)
+            assert not task.done()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    text = f"[System: timer {timer_id} fired]\nnote: 'check'"
+    assert timer_server.posts == [(f"/v1/sessions/{NEW_SESSION_ID}/events", text)]
+    assert gate.delays == [900.0, tool_dispatch._TIMER_HELD_POLL_S, 900.0]
+
+
+@pytest.mark.asyncio
+async def test_moved_timer_ends_only_once_its_holder_is_gone(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient error keeps delivering; a 404 for the moved timer's holder ends it."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=900, repeat=True)
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 200
+                assert (await _release(client)).status_code == 200
+            timer_server.statuses[NEW_SESSION_ID] = 503
+            gate.release()
+            await gate.wait_for_sleeps(2)
+            timer_server.statuses[NEW_SESSION_ID] = 404
+            gate.release()
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            task.cancel()
+
+    assert timer_server.posts == [
+        (f"/v1/sessions/{NEW_SESSION_ID}/events", f"[System: timer {timer_id} fired]")
+    ]
+    assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_runner_without_the_successor_stops_timers_and_lists_them(
+    _clean_succession_state: None,
+) -> None:
+    """A runner not hosting the successor cannot hand it a task: the timer stops, listed."""
+    timer_task = asyncio.create_task(asyncio.sleep(3600), name="timer-timer_a1b2")
+    runner_app.register_timer(OLD_SESSION_ID, "timer_a1b2", timer_task)
+    app, _server_client = _build_runner()
+    async with _runner_client(app) as client:
+        resp = await _post_succession(client, moved_ids=[])
+
+    assert resp.status_code == 200
+    assert resp.json()["moved_timers"] == []
+    assert resp.json()["dropped"] == [
+        {"kind": "timer", "id": "timer_a1b2", "label": "timer-timer_a1b2"}
+    ]
+    await asyncio.sleep(0)
+    assert timer_task.cancelled()
 
 
 @pytest.mark.asyncio

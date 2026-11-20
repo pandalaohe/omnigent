@@ -2033,6 +2033,16 @@ def timer_session(timer_id: str, session_id: str) -> str:
     return session_id
 
 
+def succession_held(session_id: str) -> bool:
+    """
+    Return whether a successor's delivery is held until its handover opening is out.
+
+    :param session_id: Session that would receive a delivery.
+    :returns: ``True`` between this runner's re-key and its release for the session.
+    """
+    return session_id in _held_successions
+
+
 def move_session_timers(
     session_id: str, target_session_id: str, *, keep: set[str]
 ) -> list[_JsonObject]:
@@ -13984,7 +13994,14 @@ def create_runner_app(
         )
         flow_ids = {flow["flow_id"] for flow in flow_list if isinstance(flow.get("flow_id"), str)}
         # The store move is committed before this call: timers keep firing, in the successor.
-        moved_timers = move_session_timers(session_id, target_session_id, keep=flow_ids)
+        # Only a runner hosting the successor can hand it the running task; elsewhere the
+        # timers stop and the opening lists them as stopped.
+        moved_timers: list[_JsonObject] = []
+        if target_session_id in _session_inboxes:
+            moved_timers = move_session_timers(session_id, target_session_id, keep=flow_ids)
+        for timer_id, timer_task in list(_session_timers.get(session_id, {}).items()):
+            if timer_id not in flow_ids and cancel_timer(session_id, timer_id):
+                dropped.append({"kind": "timer", "id": timer_id, "label": timer_task.get_name()})
         for flow in flow_list:
             flow_id = flow.get("flow_id")
             if not isinstance(flow_id, str):

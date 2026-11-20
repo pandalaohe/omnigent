@@ -7489,6 +7489,46 @@ async def _execute_timer_set(
 _TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
 
+# Poll interval while a successor's delivery is held for its handover opening.
+_TIMER_HELD_POLL_S = 1.0
+
+
+async def _settle_timer_holder(
+    timer_id: str,
+    session_id: str,
+    *,
+    origin: str,
+    server_client: httpx.AsyncClient,
+) -> tuple[str, bool]:
+    """
+    Settle which session a due timer fires into and whether that session ended.
+
+    A committed handover can move the timer while a check is in flight, so a
+    check counts only for the holder it asked about. A successor still held
+    for its handover opening gets the firing once this runner releases it.
+
+    :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
+    :param session_id: The holder last fired into.
+    :param origin: Session the timer was set in; a moved timer also ends once
+        its holder is confirmed gone.
+    :param server_client: httpx client for the archive check.
+    :returns: ``(holder, ended)``.
+    """
+    from omnigent.runner import app as _app
+
+    holder = _app.timer_session(timer_id, session_id)
+    while True:
+        if _app.succession_held(holder):
+            await asyncio.sleep(_TIMER_HELD_POLL_S)
+        else:
+            ended = await flows.session_lineage_archived(
+                server_client, holder, missing_ends=holder != origin
+            )
+            if _app.timer_session(timer_id, holder) == holder:
+                return holder, ended
+        holder = _app.timer_session(timer_id, holder)
+
+
 async def _timer_loop(
     *,
     timer_id: str,
@@ -7511,16 +7551,18 @@ async def _timer_loop(
     """
     from omnigent.runner import app as _app
 
+    origin = conversation_id
     try:
         while True:
             _app.record_timer_schedule(timer_id, seconds=seconds, repeat=repeat, note=note)
             await asyncio.sleep(seconds)
-            # A committed handover may have moved this timer to the successor.
-            conversation_id = _app.timer_session(timer_id, conversation_id)
+            conversation_id, ended = await _settle_timer_holder(
+                timer_id, conversation_id, origin=origin, server_client=server_client
+            )
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
-            if await flows.session_lineage_archived(server_client, conversation_id):
+            if ended:
                 break
             text = f"[System: timer {timer_id} fired]"
             if note:
