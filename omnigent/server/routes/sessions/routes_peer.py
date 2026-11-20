@@ -41,7 +41,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
-from omnigent.runtime import pending_elicitations, pending_inputs
+from omnigent.runtime import pending_elicitations
 from omnigent.sdk_peer_delivery import (
     CLAUDE_SDK_PEER_CAPABILITY,
     PI_RPC_PEER_CAPABILITY,
@@ -1278,10 +1278,6 @@ def register_peer_routes(
             # The events POST only confirms that the runner has the message.
             # The native terminal accepts it later; the durable record settles
             # from the terminal-originated transcript mirror.
-            return "uncertain", "awaiting_native_receipt"
-        if native_receiver and pending_inputs.holds_peer_message(receiver.id, peer_id):
-            # A Claude runner still holds this copy under its lease; the
-            # envelope's transcript mirror settles the record.
             return "uncertain", "awaiting_native_receipt"
         return "delivered", None
 
