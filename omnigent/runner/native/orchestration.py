@@ -7047,6 +7047,15 @@ async def _auto_create_codex_terminal(
                 exc_info=True,
             )
 
+    async def _post_model_unlisted_notice() -> None:
+        if model_unlisted_notice is not None:
+            await _post_native_launch_notice(
+                session_id=session_id,
+                server_client=server_client,
+                code="codex_native_model_unlisted",
+                notice=model_unlisted_notice,
+            )
+
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
     _forwarder_task = asyncio.create_task(
@@ -7067,6 +7076,8 @@ async def _auto_create_codex_terminal(
                 apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                # A fresh TUI can still exit before its thread starts.
+                on_thread_ready=_post_model_unlisted_notice,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -7098,13 +7109,9 @@ async def _auto_create_codex_terminal(
             code="codex_native_model_unavailable",
             notice=model_reset_notice,
         )
-    if model_unlisted_notice is not None:
-        await _post_native_launch_notice(
-            session_id=session_id,
-            server_client=server_client,
-            code="codex_native_model_unlisted",
-            notice=model_unlisted_notice,
-        )
+    if launch_config.external_session_id is not None:
+        # A known thread was preloaded and published before its terminal started.
+        await _post_model_unlisted_notice()
 
     # A prompt a previous launch blocked for routing but never got to replay
     # exists nowhere else: the block consumed it and the marker stops the hook
@@ -7353,6 +7360,7 @@ async def _codex_discover_thread_and_forward(
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
     inventory_incarnation_id: str | None = None,
+    on_thread_ready: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -7409,6 +7417,9 @@ async def _codex_discover_thread_and_forward(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param on_thread_ready: Awaited once the thread is adopted and its bridge
+        state published, e.g. to post a launch notice only a usable session
+        should show. Never called when no thread starts.
     """
     from omnigent.harnesses.codex_native.app_server import apply_codex_thread_permissions
     from omnigent.harnesses.codex_native.bridge import (
@@ -7679,6 +7690,8 @@ async def _codex_discover_thread_and_forward(
                 else None,
             ),
         )
+        if on_thread_ready is not None:
+            await on_thread_ready()
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)

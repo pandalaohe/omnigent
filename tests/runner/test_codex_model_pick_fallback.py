@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native import app_server as codex_app
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
@@ -35,6 +36,7 @@ _CODEX_PATH = "/missing-test-bin/codex"
 _SESSION_ID = "c91a9d508b344ad59c65628ed80b5230"
 _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
+_DISCOVER_THREAD_AND_FORWARD = runner_native._codex_discover_thread_and_forward
 
 
 def _unavailable_notice(pick: str, launched: str) -> dict[str, str]:
@@ -78,16 +80,20 @@ class _LaunchHarness:
     response_status: dict[str, int]
     workspace_models: Mock
     routing: dict[str, bool]
+    threads_adopted: list[asyncio.Event]
 
     async def launch(self) -> SessionResourceView:
-        """Run the production launch path, including snapshot and catalog reads."""
-        return await runner_native._auto_create_codex_terminal(
+        """Run the production launch path, then let a fresh TUI's thread start."""
+        resource = await runner_native._auto_create_codex_terminal(
             _SESSION_ID,
             self.registry,
             lambda _sid, _event: None,
             agent_spec=self.agent_spec,
             server_client=self.server_client,
         )
+        for adopted in self.threads_adopted:
+            await adopted.wait()
+        return resource
 
     def catalog_shape(self, *, ambient: bool = False) -> codex_app.NativeCodexLaunch:
         """Resolve the catalog shape without a per-session model selection."""
@@ -247,9 +253,21 @@ async def codex_launch_harness(
 
     event_client = SimpleNamespace(connect=AsyncMock(), close=AsyncMock())
     forwarder_release = asyncio.Event()
+    threads_adopted: list[asyncio.Event] = []
 
-    async def forwarder(**_kwargs: Any) -> None:
-        await forwarder_release.wait()
+    def forwarder(
+        *, on_thread_ready: Callable[[], Awaitable[None]] | None = None, **_kwargs: Any
+    ) -> Coroutine[Any, Any, None]:
+        adopted = asyncio.Event()
+        threads_adopted.append(adopted)
+
+        async def adopt_thread_and_forward() -> None:
+            if on_thread_ready is not None:
+                await on_thread_ready()
+            adopted.set()
+            await forwarder_release.wait()
+
+        return adopt_thread_and_forward()
 
     monkeypatch.setattr(codex_app, "build_codex_native_server", build_server)
     monkeypatch.setattr(codex_app, "CodexAppServerClient", lambda **_kwargs: event_client)
@@ -281,6 +299,7 @@ async def codex_launch_harness(
             response_status=response_status,
             workspace_models=workspace_models,
             routing=routing,
+            threads_adopted=threads_adopted,
         )
     await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
     runner_native._AUTO_CODEX_APP_SERVERS.pop(_SESSION_ID, None)
@@ -598,6 +617,74 @@ async def test_failed_unlisted_launch_posts_no_notice(
     assert harness.notices == []
     if failure != "app-server":
         harness.app_server.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_starts", [False, True])
+async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
+    thread_starts: bool,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A created terminal whose TUI never starts a thread reports that failure, not the notice."""
+    harness = codex_launch_harness
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(_SESSION_ID)
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
+    published_at_notice: list[str | None] = []
+    forwarding = asyncio.Event()
+
+    async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
+        if not thread_starts:
+            raise RuntimeError("event stream ended")
+        return thread_id
+
+    async def supervise_forwarder(**_kwargs: object) -> None:
+        forwarding.set()
+        await asyncio.Event().wait()
+
+    post_notice = runner_native._post_native_launch_notice
+
+    async def post_notice_recording_bridge_state(**kwargs: Any) -> None:
+        state = codex_native_bridge.read_bridge_state(bridge_dir)
+        published_at_notice.append(state.thread_id if state is not None else None)
+        await post_notice(**kwargs)
+
+    monkeypatch.setattr(
+        runner_native, "_codex_discover_thread_and_forward", _DISCOVER_THREAD_AND_FORWARD
+    )
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", wait_for_thread)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", supervise_forwarder)
+    monkeypatch.setattr(
+        runner_native, "_post_native_launch_notice", post_notice_recording_bridge_state
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda server_url, **_kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+            base_url=server_url,
+        ),
+    )
+
+    resource = await harness.launch()
+    discovery = runner_native._AUTO_FORWARDER_TASKS[_SESSION_ID]
+    await asyncio.wait_for(forwarding.wait() if thread_starts else discovery, timeout=5)
+
+    assert resource.id == "terminal_codex_main"
+    assert harness.events.count("terminal-launch") == 1
+    assert harness.builds[0]["model"] == _RETIRED_PICK
+    assert harness.resets == []
+    failure = codex_native_bridge.read_bridge_startup_failure(bridge_dir)
+    if thread_starts:
+        assert not discovery.done()
+        assert failure is None
+        assert published_at_notice == [thread_id]
+        assert harness.notices == [_unlisted_notice(_RETIRED_PICK)]
+    else:
+        assert failure is not None
+        assert failure.code == "codex_thread_not_started"
+        assert published_at_notice == []
+        assert harness.notices == []
 
 
 @pytest.mark.asyncio
