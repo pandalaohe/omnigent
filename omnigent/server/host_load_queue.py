@@ -24,6 +24,8 @@ from omnigent.stores.conversation_store import ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
 
 LABEL = "omnigent.startup.host_load"
+# Ids per get_conversations call, the store's usual IN-list batch.
+_ROW_BATCH = 500
 _release_session: ContextVar[str | None] = ContextVar("host_load_release", default=None)
 _logger = logging.getLogger(__name__)
 
@@ -136,16 +138,26 @@ class HostLoadQueue:
         self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 
     def _rows(self) -> list[Conversation]:
-        rows: list[Conversation] = []
-        after = None
-        while True:
-            page = self.conversations.list_conversations(
-                kind="sub_agent", include_archived=True, limit=200, after=after
-            )
-            rows.extend(conv for conv in page.data if held_host(conv))
-            if not page.has_more or page.last_id is None:
-                return sorted(rows, key=lambda conv: (conv.created_at, conv.id))
-            after = page.last_id
+        """Held sub-agents, archived included, found by their hold labels, not a full scan."""
+        from omnigent.server.session_choice import SLOT_LABEL
+
+        ids = sorted(
+            {
+                conversation_id
+                for key in (LABEL, SLOT_LABEL)
+                for conversation_id, marker in self.conversations.list_label_values(key).items()
+                if marker.startswith(("queued@", "releasing@"))
+            }
+        )
+        rows = [
+            conv
+            for start in range(0, len(ids), _ROW_BATCH)
+            for conv in self.conversations.get_conversations(
+                ids[start : start + _ROW_BATCH]
+            ).values()
+            if conv.parent_conversation_id is not None and held_host(conv)
+        ]
+        return sorted(rows, key=lambda conv: (conv.created_at, conv.id))
 
     async def tick(self, hub: Any, app: Any) -> None:
         for workspace, host in hub.host_load_keys():
