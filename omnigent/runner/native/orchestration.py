@@ -7343,6 +7343,12 @@ async def _apply_codex_launch_plan_mode(
         raise RuntimeError(message) from exc
 
 
+def _log_codex_thread_ready_failure(task: asyncio.Task[None]) -> None:
+    """Log a failed thread-ready hook; its failure never reaches the forwarder."""
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        _logger.warning("Codex thread-ready hook %s failed", task.get_name(), exc_info=exc)
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -7360,7 +7366,7 @@ async def _codex_discover_thread_and_forward(
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
     inventory_incarnation_id: str | None = None,
-    on_thread_ready: Callable[[], Awaitable[None]] | None = None,
+    on_thread_ready: Callable[[], Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -7417,9 +7423,10 @@ async def _codex_discover_thread_and_forward(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
-    :param on_thread_ready: Awaited once the thread is adopted and its bridge
-        state published, e.g. to post a launch notice only a usable session
-        should show. Never called when no thread starts.
+    :param on_thread_ready: Run as a background task once the thread is
+        adopted, its bridge state published and its server binding sent, e.g.
+        to post a launch notice only a usable session should show. Never
+        called when no thread starts; cancelled when forwarding ends.
     """
     from omnigent.harnesses.codex_native.app_server import apply_codex_thread_permissions
     from omnigent.harnesses.codex_native.bridge import (
@@ -7467,6 +7474,7 @@ async def _codex_discover_thread_and_forward(
     discovery_started_at = time.monotonic()
     startup_pending_recorded = False
     cancelled = False
+    thread_ready_task: asyncio.Task[None] | None = None
     try:
         _bind_codex_inventory_client(
             session_id, app_server, event_client, incarnation_id=inventory_incarnation_id
@@ -7690,8 +7698,6 @@ async def _codex_discover_thread_and_forward(
                 else None,
             ),
         )
-        if on_thread_ready is not None:
-            await on_thread_ready()
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
@@ -7740,6 +7746,12 @@ async def _codex_discover_thread_and_forward(
                 exc_info=True,
             )
 
+        if on_thread_ready is not None:
+            # Off the forwarding path: a slow or failing hook never delays the first turn.
+            thread_ready_task = asyncio.create_task(
+                on_thread_ready(), name=f"codex-thread-ready-{session_id}"
+            )
+            thread_ready_task.add_done_callback(_log_codex_thread_ready_failure)
         await supervise_forwarder(
             base_url=server_url,
             headers=_native_forwarder_headers(headers),
@@ -7754,6 +7766,8 @@ async def _codex_discover_thread_and_forward(
         cancelled = True
         raise
     finally:
+        if thread_ready_task is not None:
+            thread_ready_task.cancel()  # no-op once the hook finished
         # Tear down the listener and the per-session app-server whenever
         # forwarding ends — discovery failed, the app-server connection dropped
         # (``supervise_forwarder`` returned), or the task was cancelled on

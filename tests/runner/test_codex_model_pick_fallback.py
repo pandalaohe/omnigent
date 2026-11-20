@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -633,6 +634,7 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
     published_at_notice: list[str | None] = []
     forwarding = asyncio.Event()
+    noticed = asyncio.Event()
 
     async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
         if not thread_starts:
@@ -649,6 +651,7 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
         state = codex_native_bridge.read_bridge_state(bridge_dir)
         published_at_notice.append(state.thread_id if state is not None else None)
         await post_notice(**kwargs)
+        noticed.set()
 
     monkeypatch.setattr(
         runner_native, "_codex_discover_thread_and_forward", _DISCOVER_THREAD_AND_FORWARD
@@ -676,6 +679,7 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
     assert harness.resets == []
     failure = codex_native_bridge.read_bridge_startup_failure(bridge_dir)
     if thread_starts:
+        await asyncio.wait_for(noticed.wait(), timeout=5)
         assert not discovery.done()
         assert failure is None
         assert published_at_notice == [thread_id]
@@ -685,6 +689,79 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
         assert failure.code == "codex_thread_not_started"
         assert published_at_notice == []
         assert harness.notices == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notice_post", ["hangs", "raises"])
+async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
+    notice_post: str,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The notice post runs beside forwarding; a failure is logged, a pending post is cancelled."""
+    caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
+    harness = codex_launch_harness
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
+    bindings: list[dict[str, Any]] = []
+    forwarding = asyncio.Event()
+    notice_started = asyncio.Event()
+    notice_cancelled = asyncio.Event()
+
+    async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
+        return thread_id
+
+    async def supervise_forwarder(**_kwargs: object) -> None:
+        forwarding.set()
+        await asyncio.Event().wait()
+
+    async def stuck_notice_post(**_kwargs: object) -> None:
+        notice_started.set()
+        if notice_post == "raises":
+            raise ValueError("notice post failed")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            notice_cancelled.set()
+            raise
+
+    def record_binding(request: httpx.Request) -> httpx.Response:
+        bindings.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        runner_native, "_codex_discover_thread_and_forward", _DISCOVER_THREAD_AND_FORWARD
+    )
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", wait_for_thread)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", supervise_forwarder)
+    monkeypatch.setattr(runner_native, "_post_native_launch_notice", stuck_notice_post)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda server_url, **_kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(record_binding), base_url=server_url
+        ),
+    )
+
+    await harness.launch()
+    discovery = runner_native._AUTO_FORWARDER_TASKS[_SESSION_ID]
+    await asyncio.wait_for(forwarding.wait(), timeout=5)
+    await asyncio.wait_for(notice_started.wait(), timeout=5)
+    await asyncio.sleep(0)  # the failed task's done callback
+
+    assert bindings == [{"external_session_id": thread_id}]
+    assert not discovery.done()
+    assert harness.notices == []
+    failure_message = f"Codex thread-ready hook codex-thread-ready-{_SESSION_ID} failed"
+    failures = [record for record in caplog.records if record.getMessage() == failure_message]
+    if notice_post == "raises":
+        assert len(failures) == 1
+        assert failures[0].exc_info is not None
+        assert isinstance(failures[0].exc_info[1], ValueError)
+    else:
+        assert failures == []
+        assert await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
+        await asyncio.wait_for(notice_cancelled.wait(), timeout=5)
 
 
 @pytest.mark.asyncio
