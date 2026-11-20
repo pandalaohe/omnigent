@@ -1444,15 +1444,18 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     panes = {old: original_pane}
     target_visible = False
     runner_recovered = False
+    probed_sessions: list[str] = []
 
     async def get_terminal(url: str, *, timeout: float) -> httpx.Response:
         session_id = url.split("/")[3]
+        probed_sessions.append(session_id)
         return _terminal_probe(
             url, panes.get(session_id) if session_id == old or target_visible else None
         )
 
     async def runner_post(url: str, **kwargs: Any) -> httpx.Response:
         if url == "/v1/sessions":
+            assert kwargs["json"]["session_id"] != new
             return httpx.Response(
                 201,
                 request=httpx.Request("POST", url),
@@ -1484,6 +1487,18 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     source_pane = _transfer_test_terminal("second") if old_transfer_moved else original_pane
     panes[old] = source_pane
     successor = store.get_conversation(new)
+    assert successor is not None
+    probed_sessions.clear()
+
+    def assert_expired_candidate_not_reused() -> None:
+        current = store.get_conversation(new)
+        assert current is not None
+        # Relay readiness for the fresh binding stamps every session on this runner.
+        assert (current.runner_id, current.host_id) == (successor.runner_id, successor.host_id)
+        assert current.labels == successor.labels
+        assert current.archived == successor.archived
+        assert new not in probed_sessions
+
     mutations: list[tuple[str, str]] = []
     attempts: list[str | None] = []
     transfer_replies: list[int] = []
@@ -1520,7 +1535,7 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     assert read_active_session_id(bridge) == old
     assert panes[old] == source_pane
     assert panes.get(new) == (original_pane if old_transfer_moved else None)
-    assert store.get_conversation(new) == successor
+    assert_expired_candidate_not_reused()
     assert store.get_succession(old, new) is None
     transfer.assert_awaited_once()
 
@@ -1555,7 +1570,7 @@ async def test_expired_claude_clear_replay_consumes_checkpoint_and_fresh_clear_r
     ]
     assert read_active_session_id(bridge) == fresh
     assert store.get_succession(old, fresh) is not None
-    assert store.get_conversation(new) == successor
+    assert_expired_candidate_not_reused()
     assert panes[fresh] == source_pane and old not in panes
     assert panes.get(new) == (original_pane if old_transfer_moved else None)
 
