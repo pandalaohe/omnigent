@@ -77,6 +77,7 @@ from omnigent.runner.native import (
     NativeLaunchContext,
     _launch_opencode,
     _OpenCodeNativeLaunchConfig,
+    orchestration,
 )
 from omnigent.runner.native.orchestration import _build_pi_native_args
 from omnigent.runner.resource_registry import (
@@ -4895,9 +4896,11 @@ async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("successor_tails_stale_label", [False, True])
 async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    successor_tails_stale_label: bool,
 ) -> None:
     """
     A session re-keyed to "{id}-cleared" by /clear resumes in its OWN dir.
@@ -4907,16 +4910,30 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     session is later resumed, ``_auto_create_claude_terminal`` must honour the
     marker and prepare the isolated ``D({session_id}-cleared)`` — NOT the
     natural ``D(session_id)`` (the new session's live dir, which would
-    double-mirror the transcript and trip the executor guard).
+    double-mirror the transcript and trip the executor guard). A label not yet
+    re-keyed gets the same dir while the successor's live forwarder tails it.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _recording_forwarder(**kwargs: Any) -> None:
+        forwarder_kwargs.update(kwargs)
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
-        _no_op_forwarder,
+        _recording_forwarder,
     )
+    old_id = "b3e788af0ecd4516439ee859b8c74536"
+    successor_id = "c4f899b01fde5627540ff96ac9d85647"
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id(old_id)
+    successor_forwarder = asyncio.create_task(asyncio.Event().wait())
+    if successor_tails_stale_label:
+        claude_native_bridge.prepare_bridge_dir(successor_id, bridge_id=old_id, workspace=tmp_path)
+        claude_native_bridge.record_hook_event(natural_dir, {"hook_event_name": "Stop"})
+        orchestration._register_auto_forwarder_task(successor_id, successor_forwarder)
+        orchestration._CLAUDE_FORWARDER_BRIDGE_DIRS[successor_forwarder] = natural_dir
 
     class _FakeInstance:
         """Minimal live terminal instance for the tmux-target publish."""
@@ -4963,6 +4980,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             )
 
     recorded_requests: list[httpx.Request] = []
+    label = old_id if successor_tails_stale_label else f"{old_id}-cleared"
 
     def _handle(req: httpx.Request) -> httpx.Response:
         """Report the session's bridge_id label as the cleared marker."""
@@ -4971,7 +4989,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             200,
             json={
                 "reasoning_effort": None,
-                "labels": {BRIDGE_ID_LABEL_KEY: "b3e788af0ecd4516439ee859b8c74536-cleared"},
+                "labels": {BRIDGE_ID_LABEL_KEY: label},
             },
             request=req,
         )
@@ -4981,21 +4999,33 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         transport=httpx.MockTransport(_handle),
     )
 
-    await _auto_create_claude_terminal(
-        "b3e788af0ecd4516439ee859b8c74536",
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-    )
-    await fake_client.aclose()
+    try:
+        await _auto_create_claude_terminal(
+            old_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+        )
+        await orchestration._AUTO_FORWARDER_TASKS[old_id]
+        await fake_client.aclose()
+        # The successor keeps its forwarder; the old session's own tails the cleared dir.
+        assert not successor_forwarder.done()
+        assert (
+            orchestration._AUTO_FORWARDER_TASKS.get(successor_id) is successor_forwarder
+        ) == successor_tails_stale_label
+    finally:
+        successor_forwarder.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop(successor_id, None)
 
-    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(
-        "b3e788af0ecd4516439ee859b8c74536-cleared"
-    )
-    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("b3e788af0ecd4516439ee859b8c74536")
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(f"{old_id}-cleared")
+    assert forwarder_kwargs["session_id"] == old_id
+    assert forwarder_kwargs["bridge_dir"] == cleared_dir
     # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
     assert cleared_dir.exists()
-    assert not natural_dir.exists()
+    assert natural_dir.exists() == successor_tails_stale_label
+    if successor_tails_stale_label:
+        assert claude_native_bridge.read_active_session_id(natural_dir) == successor_id
+        assert (natural_dir / "hooks.jsonl").exists()
     # tmux.json (what the executor reads to inject) must land in the SAME dir the
     # executor + forwarder use — the cleared dir — NOT the natural session_id dir.
     # Hardcoding session_id there was the "tmux target not advertised yet" bug.
@@ -5007,10 +5037,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
     assert len(patch_requests) == 1
     patch_body = _json.loads(patch_requests[0].content)
-    assert (
-        patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY)
-        == "b3e788af0ecd4516439ee859b8c74536-cleared"
-    )
+    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == f"{old_id}-cleared"
 
 
 _RELAUNCHED_SESSION_ID = "6fe4feaa4dc772577c234c9f48c30dda"
