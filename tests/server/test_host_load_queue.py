@@ -295,7 +295,9 @@ async def test_tick_finds_held_children_by_label_for_each_host(queue_env, monkey
     sub_agent(HOST, {SLOT_LABEL: f"admitted@{HOST}@pool@1"})
     sub_agent(HOST, {LABEL: "released"})
     sub_agent(HOST, {})
-    e.store.create_conversation(host_id=HOST, labels={LABEL: f"queued@{HOST}"})
+    e.store.create_conversation(
+        host_id=HOST, workspace="/opt/work/project", labels={LABEL: f"queued@{HOST}"}
+    )
 
     full_scan = []
     after = None
