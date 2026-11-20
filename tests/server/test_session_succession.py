@@ -39,6 +39,8 @@ from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_LABEL_KEY,
     PERMISSION_CAPABILITY_VALUE,
+    PERMISSION_PROTOCOL_HEADER,
+    PERMISSION_PROTOCOL_VERSION,
     ConfirmedPermissionState,
 )
 from omnigent.server.routes import sessions as sessions_facade
@@ -465,6 +467,14 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
         "id": "terminal_claude_main",
         "metadata": {"running": True, "instance_id": "instance-one"},
     }
+    store.set_labels(
+        old,
+        {
+            succession_module._CLAUDE_TRANSFER_RESULT_LABEL: json.dumps(
+                {"target": uuid4().hex, "terminal": _transfer_test_terminal("previous")}
+            )
+        },
+    )
     owner: str | None = old
     current_terminal = terminal
     transfer_count = 0
@@ -809,7 +819,11 @@ async def test_ordinary_succession_forwards_sends_before_the_opening(
         _wake_event("Continue"),
         _wake_event("[System: timer timer_one fired]", is_meta=True),
     ):
-        result = await client.post(f"/v1/sessions/{old}/events", json=body)
+        result = await client.post(
+            f"/v1/sessions/{old}/events",
+            json=body,
+            headers={PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION},
+        )
         assert result.status_code == 202, result.text
         assert "timer_delivery" not in result.json()
         assert result.json()["redirected_to"] == new

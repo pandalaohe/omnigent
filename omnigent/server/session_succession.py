@@ -383,9 +383,7 @@ async def transfer_requested_claude_terminal(
         intent = old.labels.get(_CLAUDE_TRANSFER_LABEL, "")
         saved_result = _claude_transfer_result(old)
         if saved_result is not None and saved_result["target"] != new_id:
-            raise OmnigentError(
-                "A different Claude transfer was confirmed", code=ErrorCode.CONFLICT
-            )
+            saved_result = None
         receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
         if receipt is not None and old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id:
             drive(receipt)
