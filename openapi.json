@@ -20521,7 +20521,8 @@
                 "worktree_defaults",
                 "builtin_agent_prompts",
                 "voice_input",
-                "model_provider_aliases"
+                "model_provider_aliases",
+                "mobile_menu_pins"
               ]
             },
             "title": "Settings",
@@ -25583,6 +25584,7 @@
                         "keep_warm",
                         "keyboard_shortcuts",
                         "mobile_assistant",
+                        "mobile_menu_pins",
                         "model_provider_aliases",
                         "project_host_agents",
                         "runner_log_warnings",
@@ -25767,7 +25769,8 @@
                 "worktree_defaults",
                 "builtin_agent_prompts",
                 "voice_input",
-                "model_provider_aliases"
+                "model_provider_aliases",
+                "mobile_menu_pins"
               ],
               "title": "Namespace",
               "type": "string"

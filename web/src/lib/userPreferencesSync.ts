@@ -21,7 +21,8 @@ export type UserPreferenceNamespace =
   | "sidebar_layout"
   | "sound_alerts"
   | "worktree_defaults"
-  | "voice_input";
+  | "voice_input"
+  | "mobile_menu_pins";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -113,6 +114,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     sidebar_layout: {
       storageKey: "omnigent:sidebar-layout",
       eventName: "omnigent:sidebar-layout-changed",
+    },
+    mobile_menu_pins: {
+      storageKey: "omnigent:mobile-menu-pins",
+      eventName: "omnigent:mobile-menu-pins-changed",
     },
     sound_alerts: {
       storageKey: "omnigent:sound-alerts",

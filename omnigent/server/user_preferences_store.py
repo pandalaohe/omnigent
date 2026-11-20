@@ -88,6 +88,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "worktree_defaults",
         "builtin_agent_prompts",
         "voice_input",
+        "mobile_menu_pins",
         ALIASES_NAMESPACE,
     }
 )

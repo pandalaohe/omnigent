@@ -37,6 +37,11 @@ import {
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
 } from "./mobileAssistantPreferences";
+import {
+  MOBILE_MENU_PINS_STORAGE_KEY,
+  readMobileMenuPinsPreferences,
+  toggleMobileMenuPin,
+} from "./mobileMenuPinPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -1417,4 +1422,199 @@ it("hydrates the voice namespace and refreshes it from another device", async ()
   });
   expect(changed).toHaveBeenCalled();
   window.removeEventListener("omnigent:voice-input-changed", changed);
+});
+
+describe("phone session menu pins", () => {
+  /** A terminal-bearing mobile_assistant value, as the account holds it. */
+  function mobileValue() {
+    const terminalBar = defaultTerminalBar();
+    const terminalButtons = projectLegacy(terminalBar);
+    return {
+      version: 2 as const,
+      enabled: true,
+      buttons: [],
+      chatActionsRevision: 1 as const,
+      terminalBar,
+      terminalButtons,
+      terminalSecondRow: true,
+      terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
+    };
+  }
+
+  function requestPath(call: unknown[]): string {
+    return String(call[0]);
+  }
+
+  /** The `value` a PATCH carried; a GET has no body. */
+  function requestValue(call: unknown[]): unknown {
+    const body = (call[1] as { body?: unknown } | undefined)?.body;
+    return typeof body === "string" ? JSON.parse(body).value : undefined;
+  }
+
+  it("carries the pinned rows in a namespace of their own", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn();
+    fetcher.mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    toggleMobileMenuPin("files");
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(requestPath(fetcher.mock.calls[0])).toBe("/v1/me/preferences/mobile_menu_pins");
+    expect(requestValue(fetcher.mock.calls[0])).toEqual({
+      version: 1,
+      pinnedMenuItems: ["shells", "files"],
+    });
+    expect(readMobileMenuPinsPreferences().pinnedMenuItems).toEqual(["shells", "files"]);
+  });
+
+  it("keeps the terminal prefs and sends no null when a pin save is pending at refresh", async () => {
+    vi.useFakeTimers();
+    const terminal = mobileValue();
+    const fetcher = vi.fn();
+    fetcher.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input) === "/v1/me") {
+        return Response.json(
+          {
+            user_id: "alice",
+            preferences: { version: 1, settings: { mobile_assistant: terminal } },
+          },
+          { status: 200 },
+        );
+      }
+      return new Response(null, { status: 200 });
+    });
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: terminal } },
+      fetcher,
+      "alice",
+    );
+
+    // The pin save is still inside its debounce window when the refetch lands.
+    toggleMobileMenuPin("files");
+    await refreshUserPreferencesFromServer();
+    await vi.advanceTimersByTimeAsync(400);
+
+    const bodies = fetcher.mock.calls
+      .filter((call) => typeof (call[1] as { body?: unknown } | undefined)?.body === "string")
+      .map((call) => JSON.parse((call[1] as { body: string }).body));
+    // The pins are restored as their own object, never as a namespace-wide
+    // value that would delete mobile_assistant.
+    expect(bodies.some((body) => body.value === null)).toBe(false);
+    for (const call of fetcher.mock.calls) {
+      const value = requestValue(call);
+      if (value === undefined || !JSON.stringify(value).includes("pinnedMenuItems")) continue;
+      expect(requestPath(call)).toBe("/v1/me/preferences/mobile_menu_pins");
+    }
+    expect(readMobileMenuPinsPreferences().pinnedMenuItems).toEqual(["shells", "files"]);
+    // The terminal layout this device already had is untouched.
+    expect(readMobileAssistantPreferences().terminalBar).toEqual(terminal.terminalBar);
+    expect(readMobileAssistantPreferences().terminalButtons).toEqual(terminal.terminalButtons);
+    const pinCall = fetcher.mock.calls.find((call) =>
+      requestPath(call).endsWith("/mobile_menu_pins"),
+    );
+    expect(pinCall).toBeDefined();
+    expect(requestValue(pinCall!)).toEqual({
+      version: 1,
+      pinnedMenuItems: ["shells", "files"],
+    });
+  });
+
+  it("reads the first pin of an empty account back on the next fetch", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn();
+    fetcher.mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    toggleMobileMenuPin("files");
+    await vi.advanceTimersByTimeAsync(251);
+    const sent = requestValue(fetcher.mock.calls[0]);
+    expect(sent).toEqual({ version: 1, pinnedMenuItems: ["shells", "files"] });
+
+    // The Server keeps exactly that value; another device — or this one after a
+    // reload — must read it as the pins, not fall back to the stock choice.
+    localStorage.removeItem(MOBILE_MENU_PINS_STORAGE_KEY);
+    fetcher.mockResolvedValueOnce(
+      Response.json(
+        {
+          user_id: "alice",
+          preferences: { version: 1, settings: { mobile_menu_pins: sent } },
+        },
+        { status: 200 },
+      ),
+    );
+    await refreshUserPreferencesFromServer();
+    expect(readMobileMenuPinsPreferences().pinnedMenuItems).toEqual(["shells", "files"]);
+  });
+
+  it("lands a terminal save queued while a pin save is in flight", async () => {
+    vi.useFakeTimers();
+    let releasePin!: (response: Response) => void;
+    const fetcher = vi.fn();
+    fetcher.mockImplementation((input: RequestInfo | URL) => {
+      if (String(input).endsWith("/mobile_menu_pins")) {
+        return new Promise<Response>((resolve) => {
+          releasePin = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: mobileValue() } },
+      fetcher,
+      "alice",
+    );
+
+    toggleMobileMenuPin("files");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(
+      writeTerminalKeyPreferences({ terminalKeyboard: { v: 1, bindings: { next: true } } }),
+    ).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+
+    // The older pin response arrives after the terminal save was queued.
+    releasePin(new Response(null, { status: 200 }));
+    await vi.advanceTimersByTimeAsync(400);
+
+    const paths = fetcher.mock.calls.map(requestPath);
+    expect(paths).toContain("/v1/me/preferences/mobile_menu_pins");
+    expect(paths).toContain("/v1/me/preferences/mobile_assistant");
+    const terminalCall = fetcher.mock.calls.find((call) =>
+      requestPath(call).endsWith("/mobile_assistant"),
+    );
+    expect((requestValue(terminalCall!) as { terminalKeyboard: unknown }).terminalKeyboard).toEqual(
+      { v: 1, bindings: { next: true } },
+    );
+  });
+
+  it("does not let a terminal save from a stale device rewrite the pins", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn();
+    fetcher.mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          mobile_assistant: mobileValue(),
+          mobile_menu_pins: { version: 1, pinnedMenuItems: ["files"] },
+        },
+      },
+      fetcher,
+      "alice",
+    );
+
+    // This device still holds an older pin list than the account.
+    localStorage.setItem(
+      MOBILE_MENU_PINS_STORAGE_KEY,
+      JSON.stringify({ version: 1, pinnedMenuItems: ["shells"] }),
+    );
+    expect(writeTerminalKeyPreferences({ terminalKeyboard: { v: 1 } })).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(requestValue(fetcher.mock.calls[0])).not.toHaveProperty("pinnedMenuItems");
+    expect(fetcher.mock.calls.map(requestPath)).not.toContain(
+      "/v1/me/preferences/mobile_menu_pins",
+    );
+    expect(readMobileMenuPinsPreferences().pinnedMenuItems).toEqual(["shells"]);
+  });
 });

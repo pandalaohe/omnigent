@@ -297,6 +297,23 @@ def test_store_patch_namespace_round_trips_sound_alerts(db_uri: str) -> None:
     assert store.get("alice@example.com") == merged
 
 
+def test_store_patch_namespace_round_trips_mobile_menu_pins(db_uri: str) -> None:
+    """The phone session-menu pins are a namespace of their own."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    value = {"version": 1, "pinnedMenuItems": ["shells", "files"]}
+
+    merged = store.patch_namespace("alice@example.com", "mobile_menu_pins", value)
+
+    assert merged["settings"]["mobile_menu_pins"] == value
+    assert store.get("alice@example.com") == merged
+    # The pins namespace is independent of the phone layout namespace.
+    assert "mobile_assistant" not in merged["settings"]
+    terminal = store.patch_namespace(
+        "alice@example.com", "mobile_assistant", {"version": 2, "enabled": True, "buttons": []}
+    )
+    assert terminal["settings"]["mobile_menu_pins"] == value
+
+
 def test_store_patches_of_sibling_namespaces_merge_across_instances(db_uri: str) -> None:
     """Two stores patching different namespaces: the second envelope has both."""
     first = SqlAlchemyUserPreferencesStore(db_uri)

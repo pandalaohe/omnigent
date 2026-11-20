@@ -3,6 +3,7 @@ import {
   useMemo,
   useRef,
   useState,
+  Fragment,
   type FormEvent,
   type KeyboardEvent,
   type ReactNode,
@@ -105,6 +106,9 @@ import { readSoundAlertPreferences, writeSoundAlertPreferences } from "@/lib/sou
 import { useChatStore } from "@/store/chatStore";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { menuRow, type MobileMenuPinId, type PinnableMenuRow } from "@/lib/mobileMenuPins";
+import { toggleMobileMenuPin, useMobileMenuPins } from "@/lib/mobileMenuPinPreferences";
+import { MobileMenuPinToggle, withPinControl } from "./MobileMenuPinToggle";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -149,8 +153,12 @@ interface HeaderConversationMenuProps {
    * otherwise.
    */
   viewItems?: ReactNode;
-  /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
-  workspaceItems?: ReactNode;
+  /**
+   * Mobile workspace-rail entries (Files · Agents · Shells · Logs). Each row
+   * carries the id its pin toggle uses; the same rows render in the fallback
+   * kebab, which doesn't pin.
+   */
+  workspaceItems?: PinnableMenuRow[] | null;
   trigger?: ReactNode;
   initiallyOpen?: boolean;
   canManage?: boolean;
@@ -184,6 +192,7 @@ export function HeaderConversationMenu({
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
+  const mobileMenuPins = useMobileMenuPins();
   const isEmbedded = useIsEmbedded();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
@@ -202,6 +211,12 @@ export function HeaderConversationMenu({
     conversation.status,
   );
   const [menuOpen, setMenuOpen] = useState(initiallyOpen);
+  // A pinned row unmounts from one group and mounts in the other; remember
+  // which control to focus at its new position, then forget it once it took.
+  const [pendingPinFocus, setPendingPinFocus] = useState<string | null>(null);
+  useEffect(() => {
+    if (pendingPinFocus !== null) setPendingPinFocus(null);
+  }, [pendingPinFocus]);
   const healthSessions = useMemo(
     () => (menuOpen ? [{ id: conversation.id }] : []),
     [menuOpen, conversation.id],
@@ -268,7 +283,9 @@ export function HeaderConversationMenu({
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
-  // Mobile taps need a bigger target than the dense desktop row.
+  // Mobile taps need a bigger target than the dense desktop row. The pin
+  // control's own row height lives in `withPinControl`, so a row this menu did
+  // not build still fits it.
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   // Share and Agent info reach this menu on mobile from the header's legacy
   // Share · Agent info menu, which reported them under these ids. Keep
@@ -469,71 +486,92 @@ export function HeaderConversationMenu({
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
 
-  const mainItems = (
-    <>
-      {canAddAgent && (
-        <>
-          <DropdownMenuItem
-            data-testid="add-sibling-session"
-            className={itemClass}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
-            onSelect={() => navigate(addAgentPath)}
-          >
-            <PlusIcon className="size-3.5" />
-            Add nested agent
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-        </>
-      )}
-      {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
-      {viewItems}
-      {!isChild && (
-        <DropdownMenuItem
-          data-testid="header-pin-conversation"
-          className={itemClass}
-          disabled={pinSaving}
-          onSelect={togglePin}
-        >
-          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-          {isPinned ? "Unpin" : "Pin"}
-          {desktopShortcuts && (
-            <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
-          )}
-        </DropdownMenuItem>
-      )}
-      {canShare && (
-        <DropdownMenuItem
-          data-testid="header-share-conversation"
-          className={itemClass}
-          disabled={shareDisabled}
-          title={shareDisabledReason}
-          onSelect={
-            shareDisabled
-              ? undefined
-              : () => {
-                  trackMobile("chat.header.mobile_share");
-                  onShare();
-                }
-          }
-        >
-          <ShareIcon className="size-3.5" />
-          Share
-        </DropdownMenuItem>
-      )}
-      {canFork && (
-        <SessionActionMenuItem
-          data-testid="header-fork-conversation"
-          disabledReason={forkDisabledReason}
-          className={itemClass}
-          onSelect={onFork}
-        >
-          <GitForkIcon className="size-3.5" />
-          Fork
-          {desktopShortcuts && (
-            <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
-          )}
-        </SessionActionMenuItem>
-      )}
+  // The menu's own rows, each declared once. The same node renders either in
+  // the pinned group or in its usual place, and the surface draws the pin
+  // control beside whichever copy shows.
+  const sessionRows: PinnableMenuRow[] = [
+    ...(canAddAgent
+      ? [
+          menuRow(
+            "add-nested-agent",
+            "Add nested agent",
+            () => (
+              <DropdownMenuItem
+                data-testid="add-sibling-session"
+                className={itemClass}
+                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+                onSelect={() => navigate(addAgentPath)}
+              >
+                <PlusIcon className="size-3.5" />
+                Add nested agent
+              </DropdownMenuItem>
+            ),
+            // The rule that separated the nested-agent action from the session
+            // actions; a pinned copy brings none (the group has its own).
+            { dividerAfter: true },
+          ),
+        ]
+      : []),
+    ...(!isChild
+      ? [
+          menuRow("session-pin", "session", () => (
+            <DropdownMenuItem
+              data-testid="header-pin-conversation"
+              className={itemClass}
+              disabled={pinSaving}
+              onSelect={togglePin}
+            >
+              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+              {isPinned ? "Unpin" : "Pin"}
+              {desktopShortcuts && (
+                <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+              )}
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(canShare
+      ? [
+          menuRow("share", "Share", () => (
+            <DropdownMenuItem
+              data-testid="header-share-conversation"
+              className={itemClass}
+              disabled={shareDisabled}
+              title={shareDisabledReason}
+              onSelect={
+                shareDisabled
+                  ? undefined
+                  : () => {
+                      trackMobile("chat.header.mobile_share");
+                      onShare();
+                    }
+              }
+            >
+              <ShareIcon className="size-3.5" />
+              Share
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(canFork
+      ? [
+          menuRow("fork", "Fork", () => (
+            <SessionActionMenuItem
+              data-testid="header-fork-conversation"
+              disabledReason={forkDisabledReason}
+              className={itemClass}
+              onSelect={onFork}
+            >
+              <GitForkIcon className="size-3.5" />
+              Fork
+              {desktopShortcuts && (
+                <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
+              )}
+            </SessionActionMenuItem>
+          )),
+        ]
+      : []),
+    menuRow("export", "Export", () => (
       <DropdownMenuItem
         data-testid="header-export-conversation"
         className={itemClass}
@@ -542,6 +580,8 @@ export function HeaderConversationMenu({
         <DownloadIcon className="size-3.5" />
         Export
       </DropdownMenuItem>
+    )),
+    menuRow("instructions", "View instructions", () => (
       <DropdownMenuItem
         data-testid="header-view-instructions"
         className={itemClass}
@@ -552,29 +592,39 @@ export function HeaderConversationMenu({
         <FileTextIcon className="size-3.5" />
         View instructions
       </DropdownMenuItem>
-      {showPeerMessages && onPeerMessages && (
-        <DropdownMenuItem
-          data-testid="header-peer-messages"
-          className={itemClass}
-          onSelect={onPeerMessages}
-        >
-          <MessageCircleIcon className="size-3.5" />
-          Peer messages
-        </DropdownMenuItem>
-      )}
-      {hasAgentInfo && onAgentInfo && (
-        <DropdownMenuItem
-          data-testid="header-agent-info"
-          className={itemClass}
-          onSelect={() => {
-            trackMobile("chat.header.mobile_agent_info");
-            onAgentInfo();
-          }}
-        >
-          <InfoIcon className="size-3.5" />
-          Agent info
-        </DropdownMenuItem>
-      )}
+    )),
+    ...(showPeerMessages && onPeerMessages
+      ? [
+          menuRow("peer-messages", "Peer messages", () => (
+            <DropdownMenuItem
+              data-testid="header-peer-messages"
+              className={itemClass}
+              onSelect={onPeerMessages}
+            >
+              <MessageCircleIcon className="size-3.5" />
+              Peer messages
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(hasAgentInfo && onAgentInfo
+      ? [
+          menuRow("agent-info", "Agent info", () => (
+            <DropdownMenuItem
+              data-testid="header-agent-info"
+              className={itemClass}
+              onSelect={() => {
+                trackMobile("chat.header.mobile_agent_info");
+                onAgentInfo();
+              }}
+            >
+              <InfoIcon className="size-3.5" />
+              Agent info
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    menuRow("worktree", "Worktree details", () => (
       <DropdownMenuItem
         data-testid="header-worktree-details"
         className={itemClass}
@@ -582,9 +632,11 @@ export function HeaderConversationMenu({
       >
         <InfoIcon className="size-3.5" /> Worktree details
       </DropdownMenuItem>
-      {/* Rename is also reachable on desktop by clicking the breadcrumb title
-          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
-          menu is the sole entry point. */}
+    )),
+    // Rename is also reachable on desktop by clicking the breadcrumb title
+    // (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
+    // menu is the sole entry point.
+    menuRow("rename", "Rename", () => (
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
@@ -595,140 +647,175 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      {readState.explicitlyUnread || readState.unseen ? (
-        <DropdownMenuItem
-          data-testid="header-mark-read-conversation"
-          className={itemClass}
-          onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
-        >
-          <MailOpenIcon className="size-3.5" /> Mark as read
-        </DropdownMenuItem>
-      ) : (
-        <DropdownMenuItem
-          data-testid="header-mark-unread-conversation"
-          className={itemClass}
-          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-        >
-          <MailIcon className="size-3.5" /> Mark as unread
-        </DropdownMenuItem>
-      )}
-      {surface === "row" && (
-        <>
+    )),
+    readState.explicitlyUnread || readState.unseen
+      ? menuRow("mark-unread", "Mark as read", () => (
           <DropdownMenuItem
-            data-testid="header-copy-session-id"
+            data-testid="header-mark-read-conversation"
             className={itemClass}
-            onSelect={() => void copySessionId()}
+            onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
           >
-            <CopyIcon className="size-3.5" /> Copy session ID
+            <MailOpenIcon className="size-3.5" /> Mark as read
           </DropdownMenuItem>
+        ))
+      : menuRow("mark-unread", "Mark as unread", () => (
           <DropdownMenuItem
-            data-testid="header-toggle-session-sounds"
+            data-testid="header-mark-unread-conversation"
             className={itemClass}
-            onSelect={() => {
-              const preferences = readSoundAlertPreferences();
-              const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
-                ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
-                : [...preferences.mutedSessionIds, conversation.id];
-              writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
-            }}
+            onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
           >
-            {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
-            {soundsMuted ? "Unmute sounds" : "Mute sounds"}
+            <MailIcon className="size-3.5" /> Mark as unread
           </DropdownMenuItem>
-        </>
-      )}
-      {isChild && (
-        <DropdownMenuItem
-          data-testid="header-open-in-panel"
-          className={itemClass}
-          onSelect={() => {
-            useChatStore.setState({
-              sideChatToOpen: {
-                childId: conversation.id,
-                parentId: conversation.parent_session_id!,
-              },
-            });
-            if (location.pathname !== `/c/${conversation.parent_session_id}`)
-              navigate(`/c/${conversation.parent_session_id}`);
-          }}
-        >
-          <PanelRightOpenIcon className="size-3.5" /> Open in panel
-        </DropdownMenuItem>
-      )}
-      {canCreateAutomation && (
-        <DropdownMenuItem
-          data-testid="header-create-automation"
-          className={itemClass}
-          onSelect={() => setAutomationOpen(true)}
-        >
-          <ClockPlusIcon className="size-3.5" />
-          Create automation
-        </DropdownMenuItem>
-      )}
-      {/* Move to project is also reachable on desktop via the breadcrumb's
-          folder tag (HeaderProjectTag); on mobile the native shells hide the
-          breadcrumb, so this menu is the sole entry point. */}
-      {!isChild &&
-        !isIndentedSibling(conversation) &&
-        (isMobile ? (
-          // Mobile has no room for a side flyout, so this item swaps the menu body
-          // to the project picker in place (see the `projectPickerOpen` branch).
-          <DropdownMenuItem
-            data-testid="header-move-to-project"
-            className={cn("whitespace-nowrap", itemClass)}
-            onSelect={(event) => {
-              event.preventDefault();
-              setProjectPickerOpen(true);
-            }}
-          >
-            <FolderInputIcon className="size-3.5" />
-            {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuItem>
-        ) : (
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger
-              data-testid="header-move-to-project"
-              className="whitespace-nowrap"
+        )),
+    ...(surface === "row"
+      ? [
+          menuRow("copy-session-id", "Copy session ID", () => (
+            <DropdownMenuItem
+              data-testid="header-copy-session-id"
+              className={itemClass}
+              onSelect={() => void copySessionId()}
             >
-              <FolderInputIcon className="size-3.5" />
-              {currentProject ? "Move session" : "Add to project"}
-            </DropdownMenuSubTrigger>
-            {/* A native submenu flyout — no separate popover layer, so no
-              open/dismiss race with the parent menu. */}
-            <DropdownMenuSubContent className="min-w-56">
-              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        ))}
-      {workspaceItems && (
-        <>
-          <DropdownMenuSeparator />
-          {workspaceItems}
-        </>
-      )}
-      <DropdownMenuSeparator />
-      {canResume && (
-        <DropdownMenuItem
-          data-testid="header-resume-session"
-          className={itemClass}
-          disabled={!canManage || resume.isPending}
-          title={canManage ? undefined : "Only the session owner can resume this session"}
-          onSelect={() => resume.mutate()}
-        >
-          <PlayIcon className="size-3.5" /> {resume.isPending ? "Resuming…" : "Resume session"}
-        </DropdownMenuItem>
-      )}
-      {surface === "row" && canStop && (
-        <DropdownMenuItem
-          data-testid="header-stop-session"
-          className={itemClass}
-          disabled={!canManage}
-          title={canManage ? undefined : "Only the session owner can stop this session"}
-          onSelect={() => setStopOpen(true)}
-        >
-          <CircleStopIcon className="size-3.5" /> Stop session
-        </DropdownMenuItem>
-      )}
+              <CopyIcon className="size-3.5" /> Copy session ID
+            </DropdownMenuItem>
+          )),
+          menuRow("sounds", soundsMuted ? "Unmute sounds" : "Mute sounds", () => (
+            <DropdownMenuItem
+              data-testid="header-toggle-session-sounds"
+              className={itemClass}
+              onSelect={() => {
+                const preferences = readSoundAlertPreferences();
+                const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
+                  ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
+                  : [...preferences.mutedSessionIds, conversation.id];
+                writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
+              }}
+            >
+              {soundsMuted ? (
+                <BellIcon className="size-3.5" />
+              ) : (
+                <BellOffIcon className="size-3.5" />
+              )}
+              {soundsMuted ? "Unmute sounds" : "Mute sounds"}
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(isChild
+      ? [
+          menuRow("open-in-panel", "Open in panel", () => (
+            <DropdownMenuItem
+              data-testid="header-open-in-panel"
+              className={itemClass}
+              onSelect={() => {
+                useChatStore.setState({
+                  sideChatToOpen: {
+                    childId: conversation.id,
+                    parentId: conversation.parent_session_id!,
+                  },
+                });
+                if (location.pathname !== `/c/${conversation.parent_session_id}`)
+                  navigate(`/c/${conversation.parent_session_id}`);
+              }}
+            >
+              <PanelRightOpenIcon className="size-3.5" /> Open in panel
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(canCreateAutomation
+      ? [
+          menuRow("automation", "Create automation", () => (
+            <DropdownMenuItem
+              data-testid="header-create-automation"
+              className={itemClass}
+              onSelect={() => setAutomationOpen(true)}
+            >
+              <ClockPlusIcon className="size-3.5" />
+              Create automation
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    // Move to project is also reachable on desktop via the breadcrumb's folder
+    // tag (HeaderProjectTag); on mobile the native shells hide the breadcrumb,
+    // so this menu is the sole entry point.
+    ...(!isChild && !isIndentedSibling(conversation)
+      ? [
+          menuRow("move", currentProject ? "Move session" : "Add to project", () =>
+            isMobile ? (
+              // Mobile has no room for a side flyout, so this item swaps the menu
+              // body to the project picker in place (see the `projectPickerOpen`
+              // branch).
+              <DropdownMenuItem
+                data-testid="header-move-to-project"
+                className={cn("whitespace-nowrap", itemClass)}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setProjectPickerOpen(true);
+                }}
+              >
+                <FolderInputIcon className="size-3.5" />
+                {currentProject ? "Move session" : "Add to project"}
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger
+                  data-testid="header-move-to-project"
+                  className="whitespace-nowrap"
+                >
+                  <FolderInputIcon className="size-3.5" />
+                  {currentProject ? "Move session" : "Add to project"}
+                </DropdownMenuSubTrigger>
+                {/* A native submenu flyout — no separate popover layer, so no
+                  open/dismiss race with the parent menu. */}
+                <DropdownMenuSubContent className="min-w-56">
+                  <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            ),
+          ),
+        ]
+      : []),
+  ];
+
+  const tailRows: PinnableMenuRow[] = [
+    ...(canResume
+      ? [
+          menuRow("resume", "Resume session", () => (
+            <DropdownMenuItem
+              data-testid="header-resume-session"
+              className={itemClass}
+              disabled={!canManage || resume.isPending}
+              title={canManage ? undefined : "Only the session owner can resume this session"}
+              onSelect={() => resume.mutate()}
+            >
+              <PlayIcon className="size-3.5" /> {resume.isPending ? "Resuming…" : "Resume session"}
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+    ...(surface === "row" && canStop
+      ? [
+          menuRow("stop", "Stop session", () => (
+            <DropdownMenuItem
+              data-testid="header-stop-session"
+              className={itemClass}
+              disabled={!canManage}
+              title={canManage ? undefined : "Only the session owner can stop this session"}
+              onSelect={() => setStopOpen(true)}
+            >
+              <CircleStopIcon className="size-3.5" /> Stop session
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
+  ];
+
+  const workspaceRows = workspaceItems ?? [];
+  // Archive and Delete stay where they are: they end the session, so they are
+  // never offered at the top of the menu.
+  const fixedTailItems = (
+    <>
       <DropdownMenuItem
         data-testid="header-archive-conversation"
         className={itemClass}
@@ -759,6 +846,68 @@ export function HeaderConversationMenu({
         <Trash2Icon className="size-3.5" />
         Delete this session
       </DropdownMenuItem>
+    </>
+  );
+
+  // Pinning is a phone affordance: the desktop kebab keeps its order and shows
+  // no toggles.
+  const pinnedIds = isMobile ? mobileMenuPins : [];
+  const pinnedSet = new Set<MobileMenuPinId>(pinnedIds);
+  const allRows = [...sessionRows, ...workspaceRows, ...tailRows];
+  const orderedPinnedRows: PinnableMenuRow[] = [];
+  for (const id of pinnedIds) {
+    const row = allRows.find((candidate) => candidate.id === id);
+    if (row) orderedPinnedRows.push(row);
+  }
+  const renderRow = (row: PinnableMenuRow): ReactNode => (
+    <Fragment key={row.id}>
+      {withPinControl(
+        isMobile ? (
+          <MobileMenuPinToggle
+            itemId={row.id}
+            label={row.label}
+            pinned={pinnedSet.has(row.id)}
+            autoFocus={pendingPinFocus === row.id}
+            onToggle={() => {
+              setPendingPinFocus(row.id);
+              toggleMobileMenuPin(row.id);
+            }}
+          />
+        ) : null,
+        row.render(isMobile),
+      )}
+    </Fragment>
+  );
+  const renderUnpinned = (rows: PinnableMenuRow[]) =>
+    rows
+      .filter((row) => !pinnedSet.has(row.id))
+      .flatMap((row) => [
+        renderRow(row),
+        ...(row.dividerAfter ? [<DropdownMenuSeparator key={`${row.id}-divider`} />] : []),
+      ]);
+
+  const mainItems = (
+    <>
+      {/* Chat/Terminal renders its own trailing separator, and leads because
+          the pinned group sits right after it — or first when a session has
+          no switcher. */}
+      {viewItems}
+      {orderedPinnedRows.length > 0 && (
+        <>
+          {orderedPinnedRows.map(renderRow)}
+          <DropdownMenuSeparator />
+        </>
+      )}
+      {renderUnpinned(sessionRows)}
+      {workspaceRows.some((row) => !pinnedSet.has(row.id)) && (
+        <>
+          <DropdownMenuSeparator />
+          {renderUnpinned(workspaceRows)}
+        </>
+      )}
+      <DropdownMenuSeparator />
+      {renderUnpinned(tailRows)}
+      {fixedTailItems}
     </>
   );
 

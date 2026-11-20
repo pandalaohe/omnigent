@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArchiveIcon,
@@ -50,6 +51,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+import { menuRow, type PinnableMenuRow } from "@/lib/mobileMenuPins";
+import { PIN_TRAILING_PADDING } from "./MobileMenuPinToggle";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
@@ -417,7 +420,9 @@ export function ChatHeader({
   // own. Suppressed while a push panel already owns the right side — except in
   // a terminal-first session, where `panelOpen` means the terminal renders
   // inline in main and no drawer is mounted.
-  const workspaceItems =
+  // Each row carries the id the session menu's pin toggle uses; the fallback
+  // kebab below renders the same rows without one.
+  const workspaceRows: PinnableMenuRow[] | null =
     conversationId &&
     !pending &&
     !mobileMenu.fileViewerOpen &&
@@ -430,118 +435,168 @@ export function ChatHeader({
     !mobileMenu.githubPanelOpen &&
     !mobileMenu.contentSearchPanelOpen &&
     !mobileMenu.sideChatsPanelOpen &&
-    (hasRailContent || mobileMenu.debugMode) ? (
-      <>
-        {showFilesPanel && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenFiles}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <FileIcon className="size-4" />
-            Files
-          </DropdownMenuItem>
-        )}
-        <DropdownMenuItem
-          onSelect={mobileMenu.onOpenArchive}
-          className="gap-2.5 px-2.5 py-2 text-ui"
-        >
-          <ArchiveIcon className="size-4" />
-          Archived sessions
-        </DropdownMenuItem>
-        {showFilesPanel && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenChanges}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <GitCompareIcon className="size-4" />
-            Changes
-            {mobileMenu.changedCount > 0 && (
-              <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                {mobileMenu.changedCount}
+    (hasRailContent || mobileMenu.debugMode)
+      ? [
+          ...(showFilesPanel
+            ? [
+                menuRow("files", "Files", () => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenFiles}
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <FileIcon className="size-4" />
+                    Files
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          menuRow("archived-sessions", "Archived sessions", () => (
+            <DropdownMenuItem
+              onSelect={mobileMenu.onOpenArchive}
+              className="gap-2.5 px-2.5 py-2 text-ui"
+            >
+              <ArchiveIcon className="size-4" />
+              Archived sessions
+            </DropdownMenuItem>
+          )),
+          ...(showFilesPanel
+            ? [
+                menuRow("changes", "Changes", (withPin) => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenChanges}
+                    className={cn(
+                      "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                      withPin && PIN_TRAILING_PADDING,
+                    )}
+                  >
+                    <GitCompareIcon className="size-4" />
+                    Changes
+                    {mobileMenu.changedCount > 0 && (
+                      <span
+                        className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
+                      >
+                        {mobileMenu.changedCount}
+                      </span>
+                    )}
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          ...(mobileMenu.showContentSearch
+            ? [
+                menuRow("content-search", "Content search", () => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenContentSearch}
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <SearchIcon className="size-4" />
+                    Content search
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          ...(showFilesPanel
+            ? [
+                menuRow("pull-requests", "Pull Requests", () => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenGithub}
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <GitPullRequestIcon className="size-4" />
+                    Pull Requests
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          // Agents — always present (the panel lists at least
+          // the main agent); the badge counts the whole tree,
+          // main agent included.
+          menuRow("agents", "Agents", (withPin) => (
+            <DropdownMenuItem
+              onSelect={mobileMenu.onOpenSubagents}
+              className={cn(
+                "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                withPin && PIN_TRAILING_PADDING,
+              )}
+            >
+              <BotIcon className="size-4" />
+              Agents
+              <span
+                className={cn(
+                  TAB_BADGE_BASE,
+                  "ml-auto",
+                  mobileMenu.subagentsWorking > 0
+                    ? "bg-success/15 text-success"
+                    : "bg-muted text-muted-foreground",
+                )}
+              >
+                {mobileMenu.subagentsWorking > 0
+                  ? `${mobileMenu.subagentsWorking}/${mobileMenu.agentCount}`
+                  : mobileMenu.agentCount}
               </span>
-            )}
-          </DropdownMenuItem>
-        )}
-        {mobileMenu.showContentSearch && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenContentSearch}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <SearchIcon className="size-4" />
-            Content search
-          </DropdownMenuItem>
-        )}
-        {showFilesPanel && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenGithub}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <GitPullRequestIcon className="size-4" />
-            Pull Requests
-          </DropdownMenuItem>
-        )}
-        {/* Agents — always present (the panel lists at least
-            the main agent); the badge counts the whole tree,
-            main agent included. */}
-        <DropdownMenuItem
-          onSelect={mobileMenu.onOpenSubagents}
-          className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-        >
-          <BotIcon className="size-4" />
-          Agents
-          <span
-            className={cn(
-              TAB_BADGE_BASE,
-              "ml-auto",
-              mobileMenu.subagentsWorking > 0
-                ? "bg-success/15 text-success"
-                : "bg-muted text-muted-foreground",
-            )}
-          >
-            {mobileMenu.subagentsWorking > 0
-              ? `${mobileMenu.subagentsWorking}/${mobileMenu.agentCount}`
-              : mobileMenu.agentCount}
-          </span>
-        </DropdownMenuItem>
-        {mobileMenu.showSideChats && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenSideChats}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <MessagesSquareIcon className="size-4" />
-            Side chats
-          </DropdownMenuItem>
-        )}
-        {/* Shells — the mobile entry into the session's shells
-            (desktop has no Shells tab; it opens shells as soft tabs):
-            visible when a real shell exists, or when the agent spec
-            declares shell access so the empty-state "+ New shell"
-            affordance is reachable on mobile too. */}
-        {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenShells}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <TerminalIcon className="size-4" />
-            Shells
-            {mobileMenu.terminalsLength > 0 && (
-              <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                {mobileMenu.terminalsLength}
-              </span>
-            )}
-          </DropdownMenuItem>
-        )}
-        {mobileMenu.debugMode && (
-          <DropdownMenuItem
-            onSelect={mobileMenu.onOpenMainExecutionLog}
-            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
-          >
-            <ListIcon className="size-4" />
-            Logs
-          </DropdownMenuItem>
-        )}
-      </>
-    ) : null;
+            </DropdownMenuItem>
+          )),
+          ...(mobileMenu.showSideChats
+            ? [
+                menuRow("side-chats", "Side chats", () => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenSideChats}
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <MessagesSquareIcon className="size-4" />
+                    Side chats
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          // Shells — the mobile entry into the session's shells
+          // (desktop has no Shells tab; it opens shells as soft tabs):
+          // visible when a real shell exists, or when the agent spec
+          // declares shell access so the empty-state "+ New shell"
+          // affordance is reachable on mobile too.
+          ...(!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab
+            ? [
+                menuRow("shells", "Shells", (withPin) => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenShells}
+                    className={cn(
+                      "mobile-touch-target gap-2.5 px-2.5 py-2 text-ui",
+                      withPin && PIN_TRAILING_PADDING,
+                    )}
+                  >
+                    <TerminalIcon className="size-4" />
+                    Shells
+                    {mobileMenu.terminalsLength > 0 && (
+                      <span
+                        className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
+                      >
+                        {mobileMenu.terminalsLength}
+                      </span>
+                    )}
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+          ...(mobileMenu.debugMode
+            ? [
+                menuRow("logs", "Logs", () => (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenMainExecutionLog}
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <ListIcon className="size-4" />
+                    Logs
+                  </DropdownMenuItem>
+                )),
+              ]
+            : []),
+        ]
+      : null;
+  // The fallback kebab below (and any other surface that lists rail entries
+  // without pinning) renders the same rows with no toggle.
+  const workspaceItems = workspaceRows
+    ? workspaceRows.map((row) => <Fragment key={row.id}>{row.render(false)}</Fragment>)
+    : null;
   const showShare = !pending && canShare;
   // Session actions (pin/share/rename/project/archive/delete). Desktop hangs
   // them off the breadcrumb title; mobile puts the kebab in the right-hand
@@ -566,7 +621,7 @@ export function ChatHeader({
         showPeerMessages={showPeerMessages}
         onPeerMessages={onPeerMessages}
         viewItems={isMobile ? <ViewModeMenuItems /> : null}
-        workspaceItems={isMobile ? workspaceItems : null}
+        workspaceItems={isMobile ? workspaceRows : null}
       />
     ) : null;
   // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click it to
