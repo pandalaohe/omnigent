@@ -5386,6 +5386,7 @@ async def test_sys_session_send_family_guard_runs_before_normalization(
 
 def _host_catalog_server(
     requests: list[httpx.Request],
+    fail: str | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
     """
     Serve the host list, agent-to-harness resolution and cached catalogs.
@@ -5394,12 +5395,20 @@ def _host_catalog_server(
     no cached row, and any other agent resolves to no harness.
 
     :param requests: Receives every request the handler sees.
+    :param fail: ``"hosts-502"``, ``"hosts-html"`` or ``"catalogs-500"`` to
+        break that read, or ``None``.
     :returns: An ``httpx.MockTransport`` handler.
     """
     harnesses = {"ag_known": "codex-native", "ag_uncached": "pi-native"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.url.path == "/v1/hosts" and fail == "hosts-502":
+            return httpx.Response(502, text="bad gateway")
+        if request.url.path == "/v1/hosts" and fail == "hosts-html":
+            return httpx.Response(200, text="<html>proxy</html>")
+        if request.url.path == "/v1/calling-defaults/catalogs" and fail == "catalogs-500":
+            return httpx.Response(500, json={"error": "boom"})
         if request.url.path == "/v1/hosts":
             hosts = [{"host_id": "host-a", "name": "alpha"}, {"host_id": "host-b", "name": "beta"}]
             return httpx.Response(200, json={"hosts": hosts})
@@ -5431,7 +5440,8 @@ def _host_catalog_server(
                     "harness": "codex-native",
                     "models": [
                         {"id": "relay/model-x", "displayName": "Model X", "isDefault": True},
-                        {"id": "model-y", "model": "model-y", "hidden": True},
+                        {"id": "row-2", "model": "relay/model-y", "hidden": True},
+                        {"id": "model-z", "model": ""},
                         {"displayName": "row without id"},
                     ],
                     "fetched_at": 1700000000,
@@ -5556,44 +5566,59 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
                 "isDefault": True,
                 "hidden": False,
             },
+            # ``model`` is the launch value when the row's ``id`` is only its key.
             {
-                "id": "model-y",
-                "provider": None,
+                "id": "relay/model-y",
+                "provider": "relay",
                 "displayName": None,
                 "isDefault": False,
                 "hidden": True,
+            },
+            {
+                "id": "model-z",
+                "provider": None,
+                "displayName": None,
+                "isDefault": False,
+                "hidden": False,
             },
         ],
     }
     resolve = next(r for r in requests if r.url.path == "/v1/calling-defaults/resolve")
     assert dict(resolve.url.params) == {"host_id": "host-a", "agent_id": "ag_known"}
+    # The catalog read is the filtered, cache-only one.
+    catalogs = next(r for r in requests if r.url.path == "/v1/calling-defaults/catalogs")
+    assert dict(catalogs.url.params) == {"host_id": "host-a", "harness": "codex-native"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("arguments", "with_server", "error"),
+    ("arguments", "with_server", "fail", "error"),
     [
-        ({"host": "gamma", "agent_id": "ag_known"}, True, "host_not_found"),
-        ({"host": "alpha", "agent_id": "ag_missing"}, True, "agent_not_resolved"),
-        ({"host": "alpha", "agent_id": "ag_uncached"}, True, "catalog_not_cached"),
-        ({"host": "alpha"}, True, "invalid_arguments"),
-        ({"host": "alpha", "agent_id": "ag_known"}, False, "server_unavailable"),
+        ({"host": "gamma", "agent_id": "ag_known"}, True, None, "host_not_found"),
+        ({"host": "alpha", "agent_id": "ag_missing"}, True, None, "agent_not_resolved"),
+        ({"host": "alpha", "agent_id": "ag_uncached"}, True, None, "catalog_not_cached"),
+        ({"host": "alpha"}, True, None, "invalid_arguments"),
+        ({"host": "alpha", "agent_id": "ag_known"}, False, None, "server_unavailable"),
+        ({"host": "alpha", "agent_id": "ag_known"}, True, "hosts-502", "catalog_lookup_failed"),
+        ({"host": "alpha", "agent_id": "ag_known"}, True, "hosts-html", "catalog_lookup_failed"),
+        ({"host": "alpha", "agent_id": "ag_known"}, True, "catalogs-500", "catalog_lookup_failed"),
     ],
 )
 async def test_sys_list_models_host_catalog_errors(
-    arguments: dict[str, str], with_server: bool, error: str
+    arguments: dict[str, str], with_server: bool, fail: str | None, error: str
 ) -> None:
     """
-    A host-catalog call that cannot be answered returns a named error.
+    A host-catalog call that cannot be answered returns a named JSON error.
 
     :param arguments: Tool arguments for the call.
     :param with_server: Whether the runner has a server client.
+    :param fail: Which server read the mock breaks, or ``None``.
     :param error: The expected ``error`` code.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_host_catalog_server([])),
+        transport=httpx.MockTransport(_host_catalog_server([], fail)),
         base_url="http://server",
     ) as server_client:
         output = await execute_tool(

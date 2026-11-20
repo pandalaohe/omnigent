@@ -21897,8 +21897,44 @@
     },
     "/v1/calling-defaults/catalogs": {
       "get": {
-        "description": "Return the caller's own cached catalogs, stale rows included.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated.",
+        "description": "Return the caller's own cached catalogs, stale rows included.\n\nA `host_id` or `harness` filter reads the cache only: it skips the\nfirst-use ACP metadata sync, so it never waits on a host probe.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
         "operationId": "list_calling_default_catalogs_v1_calling_defaults_catalogs_get",
+        "parameters": [
+          {
+            "description": "Optional filter narrowing the rows to one owned host.",
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "description": "Optional filter narrowing the rows to one harness.",
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -21909,6 +21945,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Calling Default Catalogs",

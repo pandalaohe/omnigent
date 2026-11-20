@@ -2400,6 +2400,17 @@ async def _resolve_host(
     rows = payload.get("hosts") if payload is not None else None
     if not isinstance(rows, list):
         return None, "host lookup returned no hosts"
+    return _match_host(rows, host)
+
+
+def _match_host(rows: list[object], host: str) -> tuple[tuple[str, str] | None, str | None]:
+    """Match a host id, or an exact name case-insensitively, among ``/v1/hosts`` rows.
+
+    :param rows: The ``hosts`` array of a ``/v1/hosts`` response.
+    :param host: Caller-supplied host id or name.
+    :returns: ``((host_id, name), None)`` on a match, else ``(None, reason)``
+        naming the known hosts.
+    """
     hosts = [row for raw in rows if (row := _string_object_dict(raw)) is not None]
     names = sorted(name for row in hosts if isinstance(name := row.get("name"), str) and name)
     for row in hosts:
@@ -3334,7 +3345,13 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
         )
     if server_client is None:
         return json.dumps({"error": "server_unavailable", "message": HOST_CATALOG_NEEDS_SERVER})
-    resolved, host_error = await _resolve_host(server_client, host_arg)
+    host_list, error = await _get_server_object(server_client, "/v1/hosts")
+    host_rows = host_list.get("hosts") if host_list is not None else None
+    if not isinstance(host_rows, list):
+        return json.dumps(
+            {"error": "catalog_lookup_failed", "message": error or "/v1/hosts returned no hosts"}
+        )
+    resolved, host_error = _match_host(host_rows, host_arg)
     if resolved is None:
         return json.dumps({"error": "host_not_found", "host": host_arg, "message": host_error})
     host_id, host_name = resolved
@@ -3357,7 +3374,12 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
                 ),
             }
         )
-    catalogs, error = await _get_server_object(server_client, "/v1/calling-defaults/catalogs")
+    # The filtered read is cache-only, so other hosts' probes never delay it.
+    catalogs, error = await _get_server_object(
+        server_client,
+        "/v1/calling-defaults/catalogs",
+        {"host_id": host_id, "harness": harness},
+    )
     if catalogs is None:
         return json.dumps({"error": "catalog_lookup_failed", "message": error})
     record = next(
@@ -3380,6 +3402,8 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
         )
     from omnigent.models.model_reference import split_model_id
 
+    # A row's ``id`` may be only its key; a launch takes ``model ?? id``,
+    # as session creation and the picker do.
     models = [
         {
             "id": model_id,
@@ -3389,7 +3413,7 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
             "hidden": row.get("hidden") is True,
         }
         for row in _json_object_list(record.get("models"))
-        if (model_id := _optional_string(row.get("id")))
+        if (model_id := _optional_string(row.get("model")) or _optional_string(row.get("id")))
     ]
     return json.dumps(
         {
