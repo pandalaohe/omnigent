@@ -2090,8 +2090,15 @@ class HarnessApp:
                         request.input_stable_id
                         and ctx.input_refusal_reason not in _INPUT_HANDLED_ELSEWHERE
                     ):
+                        from omnigent.runtime.harnesses._executor_adapter import (
+                            _extract_user_text,
+                        )
+
+                        # Name the message so a sender can tell whether it was its own.
+                        text = " ".join(_extract_user_text(request.input).split())
+                        excerpt = text if len(text) <= 60 else text[:60].rstrip() + "…"
                         raise _InputNotDelivered(
-                            "Not delivered: the session did not admit this message "
+                            f'Not delivered: "{excerpt}" was not admitted by the session '
                             "(admission refused or expired). Send it again if it is still needed."
                         )
                     return

@@ -236,9 +236,10 @@ async def test_refused_turn_admission_never_runs_and_reports_only_sender_message
 
     harness = Harness()
     ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
+    text = "Please rerun the focused tests on the candidate\n and report the result"
     request = CreateResponseRequest(
         model="agent",
-        input="message",
+        input=[{"type": "input_text", "text": text}],
         input_id="e" * 32,
         input_stable_id=sender_id,
         input_admission_required=True,
@@ -262,6 +263,10 @@ async def test_refused_turn_admission_never_runs_and_reports_only_sender_message
     if terminal_type == "response.failed":
         assert terminal.response.error.code == "input_not_delivered"
         assert terminal.response.error.undelivered is True
+        # The text names the refused message in one line, so a sender can tell its own.
+        assert terminal.response.error.message.startswith(
+            'Not delivered: "Please rerun the focused tests on the candidate and report t…"'
+        )
 
 
 @pytest.mark.asyncio
