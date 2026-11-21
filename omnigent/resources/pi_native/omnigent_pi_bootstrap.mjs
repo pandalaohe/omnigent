@@ -71,6 +71,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
             api.events.emit("omnigent:pi-compatibility", text);
           };
           await state.bind(store.sessions.get(ctx.sessionManager));
+          state.flushOmissions?.();
           if (state.notice && !installation.notified) {
             api.sendMessage({customType:"omnigent-pi-compatibility", content:state.notice, display:true});
             api.events.emit("omnigent:pi-compatibility", state.notice);

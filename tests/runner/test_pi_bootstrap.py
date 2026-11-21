@@ -1934,7 +1934,18 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode",
-    ["normal", "loss", "replacement", "missing-bootstrap", "incompatible", "omitted-sources"],
+    [
+        "normal",
+        "loss",
+        "replacement",
+        "missing-bootstrap",
+        "incompatible",
+        "mcp-startup",
+        "mcp-late",
+        "mcp-child",
+        "unknown-source",
+        "lost-warning",
+    ],
 )
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
     node, pi = shutil.which("node"), shutil.which("pi")
@@ -1951,7 +1962,7 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
     version = json.loads((sdk / "package.json").read_text()).get("version") if sdk else None
     if sdk is None or version not in ("1.3.0", "1.5.0"):
         pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
-    if mode == "omitted-sources" and version != "1.5.0":
+    if mode.startswith("mcp-") and version != "1.5.0":
         pytest.skip("Pi 1.5.0 built-in MCP is required")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -1966,28 +1977,23 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         output, error = await asyncio.wait_for(process.communicate(), 30)
         assert process.returncode == 0, (output + error).decode()
         assert b'"receiptExcluded":true' in output
-        expected = (
-            b'"evaluate": 0, "execute": 0, "finish": 0'
-            if mode == "missing-bootstrap"
-            else (
-                b'"evaluate": 1, "execute": 1, "finish": 1'
-                if mode in ("incompatible", "omitted-sources")
-                else (
-                    b'"evaluate": 3, "execute": 3, "finish": 3'
-                    if mode == "normal"
-                    else b'"evaluate": 1, "execute": 1, "finish": 0'
-                )
+        expected = {
+            "missing-bootstrap": b'"evaluate": 0, "execute": 0, "finish": 0',
+            "normal": b'"evaluate": 3, "execute": 3, "finish": 3',
+            "loss": b'"evaluate": 1, "execute": 1, "finish": 0',
+            "replacement": b'"evaluate": 1, "execute": 1, "finish": 0',
+        }
+        assert expected.get(mode, b'"evaluate": 1, "execute": 1, "finish": 1') in output
+        if mode.startswith("mcp-") or mode == "unknown-source":
+            kind = b"builtin:mcp" if mode.startswith("mcp-") else b"unrecognized"
+            notice = (
+                b"Scoped Pi left out tools from unsupported sources (1 total, " + kind + b": 1)."
             )
-        )
-        assert expected in output
-        if mode == "omitted-sources":
-            assert (
-                error.count(b"Scoped Pi omitted tool mcp__fixture__echo (source: builtin:mcp).")
-                == 1
-            )
-            assert (
-                error.count(b"Scoped Pi omitted tool future_fixture (source: unrecognized).") == 1
-            )
+            assert error.count(notice) == 1
+            assert b"mcp__fixture__echo" not in error
+            assert b"opaque_fixture_tool" not in error
+        elif mode == "lost-warning":
+            assert b"Scoped Pi left out tools" not in error
     finally:
         if process.returncode is None:
             process.kill()

@@ -29,7 +29,6 @@ from omnigent.permission_tiers import (
     NativeSupportStatus,
 )
 from omnigent.permission_tiers import _native_digest as native_digest
-from omnigent.permission_tiers.pi_private import redact_pi_authority
 from omnigent.runner.pi_scopes import PiScopeAdmission
 from omnigent.util.atomic_json import atomic_write_json
 
@@ -434,9 +433,12 @@ class PiBootstrapBroker:
                 "support",
             },
             "revoke": {"protocol", "sequence", "op", "handle"},
-            "omitted_tools": {"protocol", "sequence", "op", "handle", "tools"},
         }
-        if not isinstance(op, str) or op not in fields or set(payload) - fields[op]:
+        if (
+            not isinstance(op, str)
+            or op not in fields
+            or set(payload) - fields[op] - {"omitted_tool_counts"}
+        ):
             raise ValueError("Pi bootstrap operation unavailable")
         handle = payload.get("handle")
         if not isinstance(handle, str) or not 1 <= len(handle) <= 128:
@@ -455,32 +457,29 @@ class PiBootstrapBroker:
                     "scope_id": admission.principal.scope_id,
                     "installation_id": admission.principal.installation_id,
                 }
-            elif op == "omitted_tools":
-                reply = {"notices": self._report_omitted_tools(payload.get("tools"))}
             else:
                 reply = self._attest(admission, payload)
         actor.sequence, actor.previous_digest, actor.previous_reply = sequence, digest, reply
+        # Omission diagnostics ride on an existing operation and cannot change its result.
+        with suppress(Exception):
+            self._log_omitted_tools(payload.get("omitted_tool_counts"))
         return reply
 
-    def _report_omitted_tools(self, tools: object) -> list[str]:
-        notices: list[str] = []
-        if not isinstance(tools, list):
-            return notices
-        for row in tools:
-            if not isinstance(row, list) or len(row) != 2:
-                continue
-            name, kind = row
-            if kind not in ("builtin:mcp", "builtin", "sdk", "unrecognized"):
-                continue
-            label = (
-                redact_pi_authority(name)
-                if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name)
-                else "[unprintable name]"
+    def _log_omitted_tools(self, counts: object) -> None:
+        if not isinstance(counts, dict):
+            return
+        verified = {
+            kind: count
+            for kind in ("builtin:mcp", "builtin", "sdk", "unrecognized")
+            if type(count := counts.get(kind)) is int and 0 < count <= 2**53 - 1
+        }
+        if verified:
+            logger.warning(
+                "Scoped Pi left out tools from unsupported sources (%d total, %s). session_id=%s",
+                sum(verified.values()),
+                ", ".join(f"{kind}: {count}" for kind, count in verified.items()),
+                self.session_id,
             )
-            notice = f"Scoped Pi omitted tool {label} (source: {kind})."
-            logger.warning("%s session_id=%s", notice, self.session_id)
-            notices.append(notice)
-        return notices
 
     def _bind(
         self, actor: PiAttestorProcess, handle: str, payload: dict[str, object]

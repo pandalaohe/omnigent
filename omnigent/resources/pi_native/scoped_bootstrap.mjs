@@ -57,7 +57,7 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       const omitted = new Map();
       const profile = {getState:readState, bridgeDir, omitted,
         restrictTools: extensions => registry.restrictExtensionTools(extensions, guard, (name, kind) => {
-          if (profile.reportOmissions) profile.reportOmissions([[name, kind]]);
+          if (profile.recordOmission) profile.recordOmission(name, kind);
           else omitted.set(name, kind);
         })};
       return profile;
@@ -71,24 +71,36 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       published.loaded_extensions = state.sources.map(source => ({
         path:source.path, resolved_path:source.resolved_path, source_sha256:source.sha256,
       }));
-      const binding = await connection.bind({loader:loaders.get(session.resourceLoader), handle, registry:published});
-      if (binding.ready !== true) throw new Error("Native registry acknowledgement unavailable");
-      state.profile.reportOmissions = entries => {
-        const sessionId = session.sessionManager.getSessionId();
-        const reported = reportedOmissions.get(sessionId) || new Set();
-        reportedOmissions.set(sessionId, reported);
-        const tools = entries.filter(([name]) => {
-          if (reported.has(name)) return false;
-          reported.add(name);
-          return true;
-        });
-        if (!tools.length) return;
-        void connection.reportOmittedTools({handle, tools}).then(({notices}) => {
-          for (const text of notices) state.showOmission?.(text);
-        }).catch(() => {});
+      const sessionId = session.sessionManager.getSessionId();
+      const reported = reportedOmissions.get(sessionId) || new Set();
+      reportedOmissions.set(sessionId, reported);
+      const counts = new Map(), visible = new Map();
+      state.flushOmissions = () => {
+        if (!state.showOmission || !visible.size) return;
+        const total = [...visible.values()].reduce((sum, count) => sum + count, 0);
+        const detail = [...visible].map(([kind, count]) => `${kind}: ${count}`).join(", ");
+        visible.clear();
+        try {
+          state.showOmission(`Scoped Pi left out tools from unsupported sources (${total} total, ${detail}).`);
+        } catch { /* A notice must not affect permission binding. */ }
       };
-      state.profile.reportOmissions([...state.profile.omitted]);
+      state.profile.recordOmission = (name, kind) => {
+        if (reported.has(name)) return;
+        reported.add(name);
+        if (state.showOmission && !visible.size) setImmediate(state.flushOmissions);
+        for (const batch of [counts, visible]) batch.set(kind, (batch.get(kind) || 0) + 1);
+      };
+      for (const [name, kind] of state.profile.omitted) state.profile.recordOmission(name, kind);
       state.profile.omitted.clear();
+      const drainCounts = () => {
+        if (!counts.size) return undefined;
+        const result = Object.fromEntries(counts);
+        counts.clear();
+        return result;
+      };
+      const binding = await connection.bind({loader:loaders.get(session.resourceLoader), handle,
+        registry:published, omitted_tool_counts:drainCounts()});
+      if (binding.ready !== true) throw new Error("Native registry acknowledgement unavailable");
       const pkg = await packageApi(session);
       if (pkg && !pkg.unavailable) {
         const id = session.sessionManager.getSessionId();
@@ -97,7 +109,7 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
           extensions:[{id:"omnigent.permission", path:guard}], requireForAllRunners:true}));
       }
       const client = connection.client(binding, handle, readState,
-        (event, ctx) => support.classifyNativeCall(event, ctx, readState()));
+        (event, ctx) => support.classifyNativeCall(event, ctx, readState()), drainCounts);
       return {scope:binding.scope, api:pkg?.unavailable ? undefined : pkg,
         nativePackageFailure:pkg?.unavailable, parentSession:session.resourceLoader === rootLoader ? session : undefined,
         bridgeDir, getState:readState, scopedClient:client,
