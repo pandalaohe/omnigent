@@ -9518,18 +9518,42 @@ async def test_sys_session_create_marks_the_create_as_agent_originated() -> None
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_without_message_registers_no_work() -> None:
-    """A message-less create registers no work entry (nothing to reap)."""
+@pytest.mark.parametrize(
+    ("create_args", "created_response"),
+    [
+        pytest.param({"agent_id": "ag_x"}, {"id": "conv_idle"}, id="agent-id"),
+        pytest.param(
+            {"config_path": "helper.yaml"},
+            {"session_id": "conv_idle", "agent_id": "ag_new"},
+            id="config-path",
+        ),
+    ],
+)
+async def test_sys_session_create_without_message_registers_no_work(
+    tmp_path: Path, create_args: dict[str, str], created_response: dict[str, str]
+) -> None:
+    """A caller whose full snapshot times out can still create without first-turn work."""
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    caller_reads: list[tuple[bool, float]] = []
     event_posts: list[str] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            metadata_only = dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
+            caller_reads.append((metadata_only, request.extensions["timeout"]["read"]))
+            if not metadata_only:
+                raise httpx.ReadTimeout("full caller snapshot timed out", request=request)
             return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         if request.method == "POST" and request.url.path == "/v1/sessions":
-            return httpx.Response(201, json={"id": "conv_idle", "status": "idle"})
+            return httpx.Response(201, json={**created_response, "status": "idle"})
         if request.url.path.endswith("/events"):
             event_posts.append(request.url.path)
         return httpx.Response(404, json={"error": str(request.url)})
@@ -9541,15 +9565,17 @@ async def test_sys_session_create_without_message_registers_no_work() -> None:
         try:
             output = await execute_tool(
                 tool_name="sys_session_create",
-                arguments=json.dumps({"agent_id": "ag_x", "title": "idle"}),
+                arguments=json.dumps({**create_args, "title": "idle"}),
                 server_client=server_client,
                 conversation_id="conv_caller",
+                runner_workspace=tmp_path,
             )
             entry = runner_app.get_subagent_work("conv_idle")
         finally:
             subagent_work.unregister_subagent_work("conv_idle")
 
-    assert json.loads(output)["conversation_id"] == "conv_idle"
+    assert json.loads(output).get("conversation_id") == "conv_idle", output
+    assert set(caller_reads) == {(True, 10.0)}
     assert entry is None
     assert event_posts == []
 
@@ -16333,11 +16359,13 @@ async def test_sys_session_create_other_host_with_workspace_is_placed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_worktree_uses_caller_cwd() -> None:
+@pytest.mark.parametrize("first_read_times_out", [False, True])
+async def test_sys_session_create_worktree_uses_caller_cwd(first_read_times_out: bool) -> None:
     """A worktree without a workspace is cut from the caller's cwd."""
     from omnigent.runner.tool_dispatch import execute_tool
 
     bodies: list[dict[str, Any]] = []
+    caller_reads = 0
     handler = _create_placement_handler(
         caller_body={
             "id": "conv_placement_caller",
@@ -16361,8 +16389,18 @@ async def test_sys_session_create_worktree_uses_caller_cwd() -> None:
         },
     )
 
+    async def handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal caller_reads
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_placement_caller":
+            caller_reads += 1
+            if request.url.params.get("include_items") != "false" or (
+                caller_reads == 1 and first_read_times_out
+            ):
+                raise httpx.ReadTimeout("caller snapshot timed out", request=request)
+        return await handler(request)
+
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://server"
+        transport=httpx.MockTransport(handle_request), base_url="http://server"
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_create",
@@ -16377,6 +16415,7 @@ async def test_sys_session_create_worktree_uses_caller_cwd() -> None:
             conversation_id="conv_placement_caller",
         )
 
+    assert len(bodies) == 1, output
     [body] = bodies
     assert body["host_id"] == "host_a"
     assert body["workspace"] == "/repo"

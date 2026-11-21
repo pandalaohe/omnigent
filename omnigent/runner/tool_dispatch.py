@@ -2234,14 +2234,19 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
 async def _session_snapshot(
     server_client: httpx.AsyncClient,
     conversation_id: str,
+    *,
+    metadata_only: bool = False,
 ) -> _JsonObject | None:
     """Read one session's JSON snapshot, or ``None`` when unreadable.
 
     Shared by the dispatch's calling-defaults lookup and parent-model
     inheritance so one dispatch costs at most one session read.
     """
+    params = (
+        {**_SESSION_METADATA_PARAMS, "include_live_status": "false"} if metadata_only else None
+    )
     try:
-        resp = await server_client.get(_session_url(conversation_id), timeout=10.0)
+        resp = await server_client.get(_session_url(conversation_id), params=params, timeout=10.0)
     except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
@@ -2320,6 +2325,7 @@ async def _effective_host_id(
     session_id: str,
     *,
     snapshot: _JsonObject | None = None,
+    metadata_only: bool = False,
 ) -> str | None:
     """Return the first non-null host id at or above *session_id*.
 
@@ -2331,12 +2337,13 @@ async def _effective_host_id(
     :param session_id: Session to resolve, e.g. ``"conv_child123"``.
     :param snapshot: The session's already-read snapshot, or ``None`` to
         fetch it.
+    :param metadata_only: Request only metadata when fetching the initial session.
     :returns: The effective host id, or ``None`` when no host is bound.
     """
     seen = {session_id}
     current = snapshot
     if current is None:
-        current = await _session_snapshot(server_client, session_id)
+        current = await _session_snapshot(server_client, session_id, metadata_only=metadata_only)
     while current is not None:
         host_id = _optional_string(current.get("host_id"))
         if host_id:
@@ -5390,7 +5397,7 @@ async def _resolve_create_placement(
         return None, json.dumps({"error": "invalid_placement", "message": worktree_error})
 
     caller_host = await _effective_host_id(
-        server_client, conversation_id, snapshot=caller_snapshot
+        server_client, conversation_id, snapshot=caller_snapshot, metadata_only=True
     )
     placement = _CreatePlacement(project_id=project_id, caller_host_id=caller_host)
     target_host_id = caller_host
@@ -6412,7 +6419,7 @@ async def _child_session_create_refusal(
         unreadable — unknown parentage must not grant a create.
     """
     if snapshot is None:
-        snapshot = await _session_snapshot(server_client, conversation_id)
+        snapshot = await _session_snapshot(server_client, conversation_id, metadata_only=True)
     if snapshot is None:
         return json.dumps(
             {
@@ -6615,7 +6622,7 @@ async def _execute_session_create_impl(
             session_runtime_cwd=session_runtime_cwd,
             progress=progress,
         )
-    caller_snapshot = await _session_snapshot(server_client, conversation_id)
+    caller_snapshot = await _session_snapshot(server_client, conversation_id, metadata_only=True)
     refusal = await _child_session_create_refusal(
         server_client, conversation_id, snapshot=caller_snapshot
     )
@@ -7016,7 +7023,7 @@ async def _upload_config_bundle(
 
     # A child caller is refused here, after the local path checks (so a bad
     # config_path never pays for a server read) and before the create POST.
-    caller_snapshot = await _session_snapshot(server_client, conversation_id)
+    caller_snapshot = await _session_snapshot(server_client, conversation_id, metadata_only=True)
     refusal = await _child_session_create_refusal(
         server_client, conversation_id, snapshot=caller_snapshot
     )
@@ -7165,7 +7172,9 @@ async def _session_create_from_config_path(
         title=args.get("title"),
         message=args.get("message"),
         publish_event=publish_event,
-        inherited_host_id=await _effective_host_id(server_client, conversation_id),
+        inherited_host_id=await _effective_host_id(
+            server_client, conversation_id, metadata_only=True
+        ),
         metadata_required_for_registration=True,
     )
 
