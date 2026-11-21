@@ -1,7 +1,11 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Agent } from "./useAgents";
+import { useSettingsPageCursor } from "./useSettingsPageCursor";
 import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
+import { SETTINGS_PAGE_SIZE } from "@/lib/settingsPagination";
+import { isStaleCursorError } from "@/lib/staleCursor";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import {
   getAgentConfig,
@@ -31,20 +35,48 @@ interface AgentPage {
 
 /** Management keeps every ID, including same-name agents omitted by the picker. */
 export function useCustomAgents(scope: "server" | "user", enabled: boolean) {
-  return useInfiniteQuery({
-    queryKey: ["settings-agents", scope],
-    initialPageParam: null as string | null,
-    queryFn: async ({ pageParam, signal }): Promise<AgentPage> => {
-      const params = new URLSearchParams({ limit: "50" });
+  const client = useQueryClient();
+  const { cursor, page, previous, next, restart } = useSettingsPageCursor();
+  const query = useQuery({
+    queryKey: ["settings-agents", scope, cursor],
+    queryFn: async ({ signal }): Promise<AgentPage> => {
+      const params = new URLSearchParams({ limit: String(SETTINGS_PAGE_SIZE) });
       if (scope === "user") params.set("scope", scope);
-      if (pageParam) params.set("after", pageParam);
+      if (cursor) params.set("after", cursor);
       const res = await authenticatedFetch(`/v1/agents?${params}`, { signal });
       if (!res.ok) throw await apiErrorFromResponse(res);
       return res.json();
     },
-    getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
     enabled,
   });
+  // A deleted server cursor returns a successful empty window with no bounds.
+  const emptyServerWindow =
+    scope === "server" &&
+    query.isSuccess &&
+    !query.isFetching &&
+    query.data.data.length === 0 &&
+    query.data.last_id === null &&
+    !query.data.has_more;
+  const lostCursor =
+    !!cursor && (isStaleCursorError(query.error ?? query.failureReason) || emptyServerWindow);
+  useEffect(() => {
+    if (!lostCursor || !enabled) return;
+    void client.invalidateQueries({ queryKey: ["settings-agents", scope], refetchType: "none" });
+    restart();
+  }, [client, enabled, lostCursor, restart, scope]);
+  const hasNext = query.data?.has_more === true;
+  return {
+    query,
+    pager: {
+      page,
+      hasNext,
+      busy: query.isFetching,
+      onPrevious: previous,
+      onNext: () => {
+        if (hasNext) next(query.data?.last_id);
+      },
+    },
+  };
 }
 
 export function useCustomAgent(id: string | undefined, enabled: boolean) {

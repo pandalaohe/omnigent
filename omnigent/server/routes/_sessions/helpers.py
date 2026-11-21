@@ -237,6 +237,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY,
+    _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY,
     _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
@@ -1005,6 +1007,7 @@ def _publish_and_persist_resource_event(
     resource: dict[str, Any] | None = None,
     *,
     instance_id: str | None = None,
+    stable_id: str | None = None,
 ) -> None:
     """Publish an SSE event and persist it as a conversation item.
 
@@ -1020,6 +1023,7 @@ def _publish_and_persist_resource_event(
     :param resource_type: Kind of resource, e.g. ``"terminal"``.
     :param conversation_store: Store for persisting the item.
     :param resource: Full resource dict for created events.
+    :param stable_id: Persist before publishing and skip replays when supplied.
     """
     from omnigent.entities.conversation import ResourceEventData
 
@@ -1033,11 +1037,10 @@ def _publish_and_persist_resource_event(
         if instance_id is not None:
             sse_payload["instance_id"] = instance_id
 
-    session_stream.publish(session_id, sse_payload)
-
     item = NewConversationItem(
         type="resource_event",
         response_id=session_id,
+        stable_id=stable_id,
         data=ResourceEventData(
             event_type=event_type,
             resource_id=resource_id,
@@ -1045,6 +1048,13 @@ def _publish_and_persist_resource_event(
             resource=resource,
         ),
     )
+    if stable_id is not None:
+        (persisted,) = conversation_store.append(session_id, [item])
+        if not persisted.deduplicated:
+            session_stream.publish(session_id, sse_payload)
+        return
+
+    session_stream.publish(session_id, sse_payload)
     try:
         conversation_store.append(session_id, [item])
     except (AttributeError, TypeError, ValueError, RuntimeError):
@@ -2436,12 +2446,15 @@ def _publish_input_consumed(
     shows the task notification as a system marker so the turn Claude
     resumes on it starts a new bubble.
     """
+    item_data = item.data.model_dump() if item.data is not None else {}
+    if item.type == "message" and item.status == "failed":
+        item_data["delivery_confirmed"] = False
     event = SessionInputConsumedEvent(
         type="session.input.consumed",
         data=SessionInputConsumedPayload(
             item_id=item.id,
             type=item.type,
-            data=item.data.model_dump() if item.data is not None else {},
+            data=item_data,
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
         ),
@@ -6833,6 +6846,12 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id or ""),
+            _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY: _truncate_label(
+                error.delivery_attempt_id or ""
+            ),
+            _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY: _truncate_label(
+                error.input_stable_id or ""
+            ),
         }
         if error is not None
         else {
@@ -6844,6 +6863,8 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -6879,7 +6900,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
 
     :param labels: Conversation labels, usually after closed-status projection.
     :returns: ``{"code": "...", "message": "..."}`` plus any recorded structured
-        field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
+        field (including delivery attempt and send IDs for native inputs),
         or ``None`` when either required value is absent/cleared.
     """
     raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
@@ -6895,6 +6916,8 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
             ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
             ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
             ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
+            ("delivery_attempt_id", _LAST_TASK_ERROR_DELIVERY_ATTEMPT_ID_LABEL_KEY),
+            ("input_stable_id", _LAST_TASK_ERROR_INPUT_STABLE_ID_LABEL_KEY),
         ):
             value = labels.get(label)
             if value:
@@ -8987,7 +9010,21 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
         source=error.source,
         error=RetryErrorDetail(code=error.code, message=error.message),
     )
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if error.delivery_attempt_id is not None:
+        payload["error"].update(
+            error.model_dump(
+                include={
+                    "delivery_attempt_id",
+                    "input_stable_id",
+                    "title",
+                    "cause",
+                    "remediation",
+                },
+                exclude_none=True,
+            )
+        )
+    session_stream.publish(session_id, payload)
 
 
 #: Error code for a model change the terminal never applied.
@@ -10481,6 +10518,8 @@ def _optional_error_text(value: object) -> str | None:
 def _error_item_from_sse(
     event: dict[str, Any],
     response_id: str | None = None,
+    *,
+    fallback_response_id: str | None = None,
 ) -> NewConversationItem | None:
     """
     Build a durable ``error`` item from a runner error SSE event.
@@ -10499,6 +10538,7 @@ def _error_item_from_sse(
     :param event: Parsed runner SSE event.
     :param response_id: Current response id, e.g. ``"resp_abc123"``.
         ``None`` means no turn is active.
+    :param fallback_response_id: Synthetic response for an attempt rejected before a turn opened.
     :returns: A ``type="error"`` item, or ``None`` when the event has
         no structured error payload or is not tied to a turn.
     """
@@ -10506,8 +10546,6 @@ def _error_item_from_sse(
     raw_error: Any
     source = event.get("source")
     if evt_type == "response.error":
-        if response_id is None:
-            return None
         raw_error = event.get("error")
     elif evt_type == "response.failed":
         raw_response = event.get("response")
@@ -10521,6 +10559,7 @@ def _error_item_from_sse(
                 response_id = raw_response_id
     else:
         return None
+    response_id = response_id or fallback_response_id
     if response_id is None:
         return None
     if not isinstance(raw_error, dict):

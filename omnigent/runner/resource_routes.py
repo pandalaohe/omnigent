@@ -1163,13 +1163,25 @@ def register_resource_routes(
     ) -> JSONResponse:
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
-        if not isinstance(target_session_id, str) or not target_session_id:
+        expected_instance_id = body.get("expected_instance_id") if isinstance(body, dict) else None
+        if (
+            not isinstance(target_session_id, str)
+            or not target_session_id
+            or (
+                expected_instance_id is not None
+                and (not isinstance(expected_instance_id, str) or not expected_instance_id)
+            )
+        ):
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": {
                         "code": "invalid_input",
-                        "message": "'target_session_id' is required",
+                        "message": (
+                            "'target_session_id' is required"
+                            if not isinstance(target_session_id, str) or not target_session_id
+                            else "'expected_instance_id' must be a non-empty string"
+                        ),
                     }
                 },
             )
@@ -1178,6 +1190,7 @@ def register_resource_routes(
                 source_session_id=session_id,
                 target_session_id=target_session_id,
                 terminal_id=terminal_id,
+                expected_instance_id=expected_instance_id,
             )
         except RuntimeError as exc:
             return JSONResponse(

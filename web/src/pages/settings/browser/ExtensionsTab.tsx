@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { CheckIcon, MoreHorizontalIcon, PuzzleIcon, XIcon } from "lucide-react";
 import { browserLoginBridge } from "@/lib/nativeBridge";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
@@ -29,11 +31,17 @@ export function ExtensionsTab() {
     [query, setQuery] = useState(""),
     [status, setStatus] = useState(""),
     [removing, setRemoving] = useState<Extension | null>(null);
-  const visibleRows = rows.filter((extension) =>
-    `${extension.name} ${extension.id} ${extension.runtimeId ?? ""}`
-      .toLowerCase()
-      .includes(query.trim().toLowerCase()),
+  const filter = query.trim().toLowerCase();
+  const visibleRows = useMemo(
+    () =>
+      rows.filter((extension) =>
+        `${extension.name} ${extension.id} ${extension.runtimeId ?? ""}`
+          .toLowerCase()
+          .includes(filter),
+      ),
+    [rows, filter],
   );
+  const { pageRows, ...pager } = usePagedRows(visibleRows, { resetKey: filter });
   const supported =
     !!bridge?.extensionsList &&
     !!bridge.extensionsAdd &&
@@ -113,12 +121,12 @@ export function ExtensionsTab() {
             onChange={(event) => setQuery(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Showing {visibleRows.length} of {rows.length}
+            Showing {pageRows.length} of {rows.length}
           </p>
         </div>
       )}
-      <div className={`max-h-96 overflow-auto ${login === false ? "opacity-50" : ""}`}>
-        {visibleRows.map((extension) => (
+      <div className={login === false ? "opacity-50" : undefined}>
+        {pageRows.map((extension) => (
           <div key={extension.id} className="flex items-center gap-3 border-t py-3">
             <span className="rounded-lg bg-muted p-2">
               <PuzzleIcon className="size-5" />
@@ -190,6 +198,7 @@ export function ExtensionsTab() {
           </div>
         ))}
       </div>
+      <SettingsPager label="Extension pages" {...pager} />
       {!rows.length && (
         <p className="py-4 text-sm text-muted-foreground">
           No extensions installed. Add an extension from a publisher you trust.

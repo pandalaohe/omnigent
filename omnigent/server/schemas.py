@@ -1339,6 +1339,8 @@ class ErrorDetail(BaseModel):
     cause: str | None = None
     remediation: str | None = None
     undelivered: bool | None = None
+    delivery_attempt_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    input_stable_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorResponse(BaseModel):
@@ -4084,6 +4086,7 @@ class SessionMessageItem(_SessionItemCommon):
     interrupted: bool = False
     stream_message_id: str | None = None
     phase: str | None = None
+    web_stable_id: str | None = None
     startup_options: StartupInputOptions | None = None
 
 

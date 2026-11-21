@@ -11,6 +11,7 @@ import {
 } from "@/lib/agentBadgePreferences";
 import type { CustomAgent, CustomAgentDetail, CustomAgentMember } from "@/lib/customAgentsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { expectSettingsPages } from "@/test/settingsPaging";
 import { AgentBadgeDisplaySetting, AgentsSettings } from "./AgentsSettings";
 
 const mocks = vi.hoisted(() => ({
@@ -277,6 +278,63 @@ afterEach(() => {
 });
 
 describe("AgentsSettings", () => {
+  it.each(["Custom agent", "Saved configuration", "Team agent", "Import from sessions"])(
+    "pages the %s list and searches all 45 entries",
+    async (label) => {
+      const rowText = (number: number) => `${label} ${String(number).padStart(2, "0")}`;
+      const names = Array.from({ length: 45 }, (_, index) => rowText(index + 1));
+      mocks.available = [];
+      mocks.catalog = [];
+      if (label === "Custom agent" || label === "Team agent") {
+        mocks.catalog = names.slice(0, label === "Team agent" ? 35 : 45).map((name, index) => ({
+          ...custom,
+          id: `ca_fixture_${index}`,
+          name,
+          members: label === "Team agent" ? [leadMember, { ...leadMember, name: "helper" }] : null,
+        }));
+        if (label === "Team agent") {
+          mocks.available = names.slice(35).map((name, index) => ({
+            ...builtinPolly,
+            id: `ag_fixture_${index}`,
+            name,
+            display_name: name,
+          }));
+        }
+      } else {
+        const template = label === "Saved configuration" ? installedNative : importable;
+        mocks.available = names.map((name, index) => ({
+          ...template,
+          id: `ag_fixture_${index}`,
+          name,
+          display_name: name,
+        }));
+      }
+      if (label === "Custom agent") {
+        localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: ["ca_fixture_44"] }));
+      }
+      renderSettings();
+      if (label === "Import from sessions") {
+        fireEvent.click(screen.getByText("Import from existing sessions"));
+      }
+      const returnToFirstPage = await expectSettingsPages(`${label} pages`, rowText);
+      returnToFirstPage();
+      if (label === "Custom agent") {
+        expect(
+          screen.queryByRole("button", { name: `Unpin ${rowText(45)}` }),
+        ).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: `Pin ${rowText(1)}` }));
+        expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+          ids: ["ca_fixture_44", "ca_fixture_0"],
+        });
+      }
+      fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), {
+        target: { value: rowText(44) },
+      });
+      expect(screen.getByText(rowText(44))).toBeInTheDocument();
+      expect(screen.queryByText(rowText(45))).not.toBeInTheDocument();
+    },
+  );
+
   it("adds and removes an optional badge on a built-in Agent", async () => {
     renderSettings();
 

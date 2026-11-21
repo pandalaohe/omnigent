@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { SignInTab } from "./SignInTab";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 vi.mock("sonner", () => ({ toast: vi.fn() }));
 afterEach(() => {
@@ -26,6 +27,42 @@ function setup(extra: Record<string, unknown> = {}) {
   );
   return bridge;
 }
+it("paginates and searches saved login approvals and local network choices independently", async () => {
+  const loginRow = (number: number) => `https://login-${number}.example.test · Login ${number}`;
+  const networkRow = (number: number) => `https://network-${number}.example.test`;
+  const sites = Array.from({ length: 45 }, (_, index) => ({
+    origin: `https://login-${index + 1}.example.test`,
+    id: `login-${index + 1}`,
+    label: `Login ${index + 1}`,
+  }));
+  setup({
+    browserFillApprovals: vi.fn().mockResolvedValue({ ok: true, sites }),
+    browserLocalNetworkList: vi.fn().mockResolvedValue({
+      ok: true,
+      sites: sites.map((_, index) => ({ origin: networkRow(index + 1), allowed: false })),
+    }),
+    browserLocalNetworkSet: vi.fn(),
+  });
+  const returnLoginsToFirstPage = await expectSettingsPages("Saved login approval pages", loginRow);
+  const returnNetworkToFirstPage = await expectSettingsPages(
+    "Local network choice pages",
+    networkRow,
+  );
+  returnLoginsToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search saved login approvals" }), {
+    target: { value: "Login 44" },
+  });
+  expect(screen.getByText(loginRow(44))).toBeInTheDocument();
+  expect(screen.queryByText(loginRow(45))).not.toBeInTheDocument();
+  expect(screen.getByText(networkRow(45))).toBeInTheDocument();
+  returnNetworkToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search local network choices" }), {
+    target: { value: "network-44" },
+  });
+  expect(screen.getByText(networkRow(44))).toBeInTheDocument();
+  expect(screen.queryByText(networkRow(45))).not.toBeInTheDocument();
+});
+
 it("saves sign-ins and confirms consequences before clearing", async () => {
   const bridge = setup();
   const toggle = screen.getByRole("switch", { name: "Keep in-app browser sign-ins" });

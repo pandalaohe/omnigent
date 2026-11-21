@@ -721,10 +721,7 @@ async def _deliver_card_verdict(
         if delivery_key in _question_answer_deliveries:
             return
         _question_answer_deliveries.add(delivery_key)
-        if wake_app_state is not None:
-            delivery_options["card_answer_wake"] = _CardAnswerWake(
-                wake_app_state, card.elicitation_id
-            )
+        delivery_options["card_answer_wake"] = _CardAnswerWake(wake_app_state, card.elicitation_id)
     task = asyncio.current_task()
     lapsed = card.kind == "approval" and card.grant_key is None and card.verdict is not None
     if granted and task is not None:

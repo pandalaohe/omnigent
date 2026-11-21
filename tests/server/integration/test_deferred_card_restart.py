@@ -60,6 +60,7 @@ class _Deliveries:
         conversation_store: Any,
         runner_router: Any,
         persist_failure: bool = True,
+        card_answer_wake: orchestration._CardAnswerWake | None = None,
     ) -> bool:
         if self.hold:
             await asyncio.Event().wait()
@@ -328,6 +329,7 @@ async def test_failed_delivery_window_keeps_verdict_for_runner_recovery(
         conversation_store: Any,
         runner_router: Any,
         persist_failure: bool = True,
+        card_answer_wake: orchestration._CardAnswerWake | None = None,
     ) -> bool:
         attempted.set()
         if not online:

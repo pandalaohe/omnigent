@@ -859,6 +859,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
                 "pending_id": body["pending_id"],
+                "pending_input_claim_required": True,
                 "delivery_attempt_id": forwarded["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
                 "usage_admission": None,
@@ -1589,7 +1590,7 @@ async def test_create_terminal_proxies_to_runner(
         assert taken is not None
         assert taken.prefix == (
             "[System: shell] The user opened bash · s1 in this session. "
-            "You can read it, not type into it or close it.\n\n"
+            "Agent access: read_write.\n\n"
         )
     else:
         assert taken is None
@@ -7454,6 +7455,58 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
         assert errors == (["native_prompt_not_recorded"] if prior_state == "plain" else [])
         assert pending_inputs.snapshot_for(sid) == []
     finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("append_fails", [False, True], ids=["landed", "failed"])
+async def test_ttl_during_a_paused_append_leaves_the_record_to_that_persist(
+    monkeypatch: pytest.MonkeyPatch, append_fails: bool
+) -> None:
+    """Expiry during an append writes no same-text record; a failed append re-queues the entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    monkeypatch.setattr(session_stream, "publish", lambda *_args: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=append_fails)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "ship it"}], stable_id="e" * 32
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "ship it"}]},
+            "response_id": "resp_ship_it",
+            "source_id": "claude:ship-it:0",
+        },
+    )
+    try:
+        persist = asyncio.create_task(
+            _persist_external_conversation_item(sid, conv, body, store)  # type: ignore[arg-type]
+        )
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        clock["t"] += pending_inputs._TTL_S + 1
+        assert pending_inputs.snapshot_for(sid) == []
+        assert not pending_inputs.matches_unconfirmed_input_text(sid, "ship it")
+        store.release_first_append.set()
+        if append_fails:
+            with pytest.raises(RuntimeError, match="database unavailable"):
+                await persist
+        else:
+            await persist
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [pending_id] if append_fails else []
+        )
+        assert not pending_inputs.matches_unconfirmed_input_text(sid, "ship it")
+    finally:
+        store.release_first_append.set()
         pending_inputs.reset_for_tests()
 
 

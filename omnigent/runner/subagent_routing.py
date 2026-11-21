@@ -1049,13 +1049,19 @@ class SubagentRouter:
     :param url: Base URL the hook scripts POST to.
     :param token: Bearer token hook scripts present.
     :param httpd: The backing HTTP server.
+    :param session_id: Session the endpoint serves;
+        :func:`move_session_router` hands it to a successor.
+    :param detached: Whether :func:`move_session_router` left it
+        unregistered while its handle holder still owns it.
     """
 
     bridge_dir: Path
     url: str
     token: str
     httpd: ThreadingHTTPServer
+    session_id: str
     advertised_dirs: set[Path] = field(default_factory=set)
+    detached: bool = False
     _closed: bool = False
 
     def advertise(self, bridge_dir: Path, session_id: str | None = None) -> Path:
@@ -1118,7 +1124,12 @@ def start_subagent_router(
         when the session ends.
     """
     token = secrets.token_urlsafe(32)
-    handler_cls = _handler_factory(session_id, token, resolver, loop, request_timeout_s)
+    router: SubagentRouter | None = None
+
+    def _served_session_id() -> str:
+        return router.session_id if router is not None else session_id
+
+    handler_cls = _handler_factory(_served_session_id, token, resolver, loop, request_timeout_s)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     # Handler threads must not hold up ``close()``: the default joins every
     # in-flight request (up to the relay timeout), which stalls session
@@ -1126,7 +1137,9 @@ def start_subagent_router(
     httpd.daemon_threads = True
     host, port = httpd.server_address[0], httpd.server_address[1]
     url = f"http://{host}:{port}"
-    router = SubagentRouter(bridge_dir=bridge_dir, url=url, token=token, httpd=httpd)
+    router = SubagentRouter(
+        bridge_dir=bridge_dir, url=url, token=token, httpd=httpd, session_id=session_id
+    )
     router.advertise(bridge_dir, session_id)
     threading.Thread(
         target=httpd.serve_forever,
@@ -1137,14 +1150,13 @@ def start_subagent_router(
 
 
 def _handler_factory(
-    session_id: str,
+    served_session_id: Callable[[], str],
     token: str,
     resolver: Resolver,
     loop: asyncio.AbstractEventLoop,
     request_timeout_s: float,
 ) -> type[BaseHTTPRequestHandler]:
-    """Build the request handler class for one session's router."""
-    expected_path = ROUTE_PATH_TEMPLATE.format(session_id=session_id)
+    """Build the request handler class for one router, read per request for its session."""
     # Compared as bytes: ``compare_digest`` raises TypeError on a non-ASCII
     # str, and http.server decodes headers as latin-1, so a request with a
     # non-ASCII Authorization byte would crash the handler instead of 401ing.
@@ -1158,7 +1170,8 @@ def _handler_factory(
             if not secrets.compare_digest(presented, expected_auth):
                 self._reject(401, "unauthorized")
                 return
-            if self.path.rstrip("/") != expected_path:
+            session_id = served_session_id()
+            if self.path.rstrip("/") != ROUTE_PATH_TEMPLATE.format(session_id=session_id):
                 self._reject(404, "not found")
                 return
             try:
@@ -1204,7 +1217,9 @@ def _handler_factory(
             self.wfile.write(raw)
 
         def log_message(self, format: str, *args: Any) -> None:
-            _logger.debug("subagent-router: " + format, *args, extra={"session_id": session_id})
+            _logger.debug(
+                "subagent-router: " + format, *args, extra={"session_id": served_session_id()}
+            )
 
     return _Handler
 
@@ -1472,6 +1487,42 @@ def ensure_session_router_quietly(
         return None
 
 
+def move_session_router(router: SubagentRouter, successor_session_id: str) -> None:
+    """Hand a pane's *router* to the successor that now owns the pane.
+
+    A native ``/clear`` moves the pane, whose hooks still call this router, to
+    a successor. The endpoint then routes the pane's spawns as the successor,
+    teardown addressed to the previous owner cannot reach it, and a relaunch
+    of that owner starts its own. If the successor already has a router, the
+    moved one stays unregistered, as does one moved again later, until the
+    launch holding its handle closes it through :func:`shutdown_session_router`.
+
+    :param router: Handle the pane's launch started.
+    :param successor_session_id: Session that now owns the pane.
+    """
+    with _lifecycle_lock:
+        if _session_routers.get(router.session_id) is router:
+            del _session_routers[router.session_id]
+            if successor_session_id in _session_routers:
+                router.detached = True
+            else:
+                _session_routers[successor_session_id] = router
+        elif not router.detached:
+            # A teardown already took it out of the index and is closing it.
+            return
+        router.session_id = successor_session_id
+        for bridge_dir in tuple(router.advertised_dirs):
+            try:
+                advertised = json.loads((bridge_dir / ADVERTISEMENT_FILE).read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            # A newer router may own the file since; only this one's is rewritten.
+            # A failed write leaves the old id, whose spawns then go unrouted.
+            if isinstance(advertised, dict) and advertised.get("url") == router.url:
+                with contextlib.suppress(OSError):
+                    router.advertise(bridge_dir, successor_session_id)
+
+
 def shutdown_session_router(session_id: str, router: SubagentRouter | None = None) -> None:
     """Stop the router serving *session_id* and forget its state.
 
@@ -1484,15 +1535,22 @@ def shutdown_session_router(session_id: str, router: SubagentRouter | None = Non
         is identity-scoped: a delayed teardown from a previous launch of
         the same session must not close the router a re-create has since
         installed, which would leave routing silently dead behind a
-        still-valid advertisement. ``None`` tears down whatever is
+        still-valid advertisement. It is looked up under the session it
+        serves now, which a pane move changes. A detached handle is closed:
+        nothing else can reach it. ``None`` tears down whatever is
         registered (session-delete paths that hold no handle).
     """
     with _lifecycle_lock:
+        if router is not None:
+            session_id = router.session_id
         current = _session_routers.get(session_id)
         if router is not None and current is not router:
-            return
-        _session_routers.pop(session_id, None)
-        _relayed.pop(session_id, None)
+            if not router.detached:
+                return
+            current = router
+        else:
+            _session_routers.pop(session_id, None)
+            _relayed.pop(session_id, None)
     if current is None:
         return
     router = current

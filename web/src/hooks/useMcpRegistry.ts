@@ -1,6 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+import { SETTINGS_PAGE_SIZE } from "@/lib/settingsPagination";
+
+export function useMcpRegistryPage(scope: string, enabled: boolean, after?: string) {
+  const query = useQuery({
+    queryKey: ["mcp-registry", "services-page", scope, after],
+    enabled,
+    refetchOnWindowFocus: false,
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams({ limit: String(SETTINGS_PAGE_SIZE) });
+      if (after) params.set("after", after);
+      return registryRequest<{ data: RegistryService[]; next_cursor?: string | null }>(
+        `?${params}`,
+        { signal },
+      );
+    },
+  });
+  const { refetch } = query;
+  useEffect(() => {
+    if (!enabled) return;
+    const onFocus = () => void refetch();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [enabled, refetch]);
+  return query;
+}
 
 export function useMcpRegistryCatalog(enabled = true) {
   const [services, setServices] = useState<RegistryService[]>([]);

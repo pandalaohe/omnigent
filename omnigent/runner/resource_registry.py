@@ -668,6 +668,10 @@ class SessionResourceRegistry:
         # or stop outliving its turn. Set via
         # :meth:`set_session_background_publisher`.
         self._session_background_publisher: Callable[[str, bool], None] | None = None
+        # Optional callback ``(source_session_id, target_session_id) -> None``
+        # run synchronously when the Claude main pane changes owner. Set via
+        # :meth:`set_claude_terminal_transfer_listener`.
+        self._claude_terminal_transfer_listener: Callable[[str, str], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -791,6 +795,16 @@ class SessionResourceRegistry:
         :param publisher: Callable ``(session_id, running) -> None``.
         """
         self._session_background_publisher = publisher
+
+    def set_claude_terminal_transfer_listener(self, listener: Callable[[str, str], None]) -> None:
+        """Install the callback run when the Claude main pane moves to another session.
+
+        It runs before :meth:`transfer_terminal` first yields, so no other task
+        observes the pane under its new owner before the callback has run.
+
+        :param listener: Callable ``(source_session_id, target_session_id) -> None``.
+        """
+        self._claude_terminal_transfer_listener = listener
 
     def set_terminal_exit_publisher(
         self,
@@ -2800,6 +2814,8 @@ class SessionResourceRegistry:
         source_session_id: str,
         target_session_id: str,
         terminal_id: str,
+        *,
+        expected_instance_id: str | None = None,
     ) -> SessionResourceView | None:
         """Move a terminal resource between sessions without closing it.
 
@@ -2813,6 +2829,7 @@ class SessionResourceRegistry:
             ``"conv_new"``.
         :param terminal_id: Opaque terminal resource id, e.g.
             ``"terminal_claude_main"``.
+        :param expected_instance_id: Transfer only this terminal instance, when supplied.
         :returns: The transferred terminal resource view under
             *target_session_id*, or ``None`` if no matching source
             terminal exists.
@@ -2831,6 +2848,11 @@ class SessionResourceRegistry:
                 continue
             if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
                 continue
+            if (
+                expected_instance_id is not None
+                and entry.instance.instance_id != expected_instance_id
+            ):
+                return None
             moved = self._terminal_registry.transfer(
                 source_session_id,
                 target_session_id,
@@ -2839,6 +2861,9 @@ class SessionResourceRegistry:
             )
             if not moved:
                 return None
+            listener = self._claude_terminal_transfer_listener
+            if listener is not None and terminal_id == terminal_resource_id("claude", "main"):
+                listener(source_session_id, target_session_id)
             with self._lock:
                 role_registration = self._terminal_roles.pop(
                     (source_session_id, terminal_id), None

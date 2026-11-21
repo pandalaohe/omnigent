@@ -5104,6 +5104,28 @@
             "title": "Code",
             "type": "string"
           },
+          "delivery_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Attempt Id"
+          },
+          "input_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Stable Id"
+          },
           "level": {
             "anyOf": [
               {
@@ -5189,6 +5211,28 @@
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
+          },
+          "delivery_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Attempt Id"
+          },
+          "input_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Stable Id"
           },
           "message": {
             "description": "Human-readable error description. Always populated; older clients render this verbatim.",
@@ -7729,6 +7773,17 @@
             "description": "Originated from an explicit user action; may be server-expanded, e.g. skill instructions. Independent of `is_meta`; client-settable by convention, not a trust signal. Also exempts the message from legacy markup cleanup on import.",
             "title": "User Authored",
             "type": "boolean"
+          },
+          "web_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Web Stable Id"
           }
         },
         "required": [
@@ -12051,10 +12106,32 @@
             "description": "Identity of the human author; omitted for agent, tool, and system items.",
             "title": "Created By"
           },
+          "delivery_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Attempt Id"
+          },
           "id": {
             "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "input_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Stable Id"
           },
           "level": {
             "anyOf": [
@@ -13885,6 +13962,17 @@
             "description": "`True` for confirmed or conservatively preserved user input; omitted when `False`.",
             "title": "User Authored",
             "type": "boolean"
+          },
+          "web_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Web Stable Id"
           }
         },
         "required": [

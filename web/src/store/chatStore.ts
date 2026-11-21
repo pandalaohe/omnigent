@@ -1892,6 +1892,7 @@ const interruptRequestsInFlight = new Set<string>();
  * lost and an earlier refused attempt's item already sits in the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
+const inFlightSendSessions = new Map<string, string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -3044,6 +3045,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      inFlightSendSessions.set(stableId, sessionId);
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
@@ -3217,7 +3219,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
-      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3238,13 +3239,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
-      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      const ownBlocks =
+        draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
+      let deliveredDespiteFailure =
+        inFlightSends.get(stableId) === true || mirrorNamesSend(ownBlocks, stableId);
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
         !serverRefused &&
         draftSessionId !== null &&
-        hasCommittedItem(draftState.blocks, stableId)
+        hasDeliveryCandidate(draftState.blocks, stableId)
       ) {
         // Only a snapshot can have put the item in the transcript, and it may
         // predate the runner's verdict (the server persists before it forwards).
@@ -3294,19 +3298,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
+      const native = failGet().isNativeTerminalSession;
+      if (native && deliveredDespiteFailure) return true;
+      if (!heldForHost) opts?.onError?.(message);
       // A delivered send needs no card. One the server never answered may still
       // arrive, so its card names the send for the commit that retracts it.
-      const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      const sentText = native ? messageContentText(content) : "";
       const failureCard: ErrorBlock | null = deliveredDespiteFailure
         ? null
         : {
             ...makeClientErrorBlock(message, code),
+            ...(native && !serverRefused ? { title: "Message delivery is unconfirmed" } : {}),
             ...(serverRefused
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
       if (!alreadyStreaming) {
-        if (failGet().activeResponse !== null) {
+        if (!native && failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
           finalizeActive(failSet, "failed", message, null);
@@ -3316,7 +3324,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           // a standalone error block so the user sees WHY nothing happened
           // instead of being left on a silent, empty composer. Skipped when the
           // caller owns the error UX (it surfaces the failure elsewhere).
-          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
+          failSet((s) => ({ blocks: reconcileDeliveryCards([...s.blocks, failureCard]) }));
         }
         failSet({
           status: "idle",
@@ -3333,13 +3341,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // would fail a live response, and settling status would end a turn that
         // is still running. Skipped when the caller owns the error UX.
         if (!callerHandlesError && failureCard !== null) {
-          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
+          failSet((s) => ({ blocks: reconcileDeliveryCards([...s.blocks, failureCard]) }));
         }
       }
       // The message never reached a runner.
       return false;
     } finally {
       inFlightSends.delete(stableId);
+      inFlightSendSessions.delete(stableId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -4217,6 +4226,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
+      const deliveryProof = confirmedWebSendIds(items);
+      const confirmedIds = new Set(deliveryProof);
       pageSet((state) => {
         // Rebind hydration resets the cursor to the fresh window's top while
         // keeping scrolled-up blocks, so an older page can overlap — dedupe.
@@ -4224,8 +4235,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        const retained = withoutDeliveredSendFailureCards(state.blocks, confirmedIds, []);
         return {
-          blocks: [...unique, ...state.blocks],
+          ...retractDeliveredSendDraft(state, confirmedIds, "consumed"),
+          blocks: reconcileDeliveryCards([...unique, ...retained], deliveryProof),
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -5746,8 +5759,10 @@ async function bindStream(
       const uniquePendingElicitations = pendingElicitationBlocks.filter(
         (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
       );
-      // Synthesize a visible error block when the session failed and no error
-      // block was already produced by itemsToBlocks. The `response.error` SSE
+      // A failed snapshot can supply an error outside the loaded window.
+      // Delivery errors have an attempt ID, so merge them with any matching
+      // history or live card. Other snapshot errors only fill a missing card.
+      // The `response.error` SSE
       // event is transient (published to the in-memory session stream which
       // has no replay), so clients that connect after the task has already
       // failed never receive it. `last_task_error` on the snapshot is the
@@ -5767,7 +5782,6 @@ async function bindStream(
         ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
       ];
-      const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
@@ -5813,15 +5827,23 @@ async function bindStream(
           ...unknownToServer,
         ].filter((p) => p.stableId === undefined || !committedIds.has(p.stableId));
       }
+      const snapshotError = session.lastTaskError;
+      const hasSnapshotError = allBlocks.some(
+        (block) =>
+          block.type === "error" &&
+          (!snapshotError?.delivery_attempt_id ||
+            block.deliveryAttemptId === snapshotError.delivery_attempt_id),
+      );
       const syntheticError: ErrorBlock | null =
-        session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
+        session.status === "failed" && snapshotError != null && !hasSnapshotError
           ? {
               type: "error",
               ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: session.lastTaskError.message,
+              message: snapshotError.message,
               source: "",
-              code: session.lastTaskError.code,
-              ...structuredErrorFields(session.lastTaskError, session.lastTaskError.agent_name),
+              code: snapshotError.code,
+              ...structuredErrorFields(snapshotError, snapshotError.agent_name),
+              ...(snapshotError.delivery_attempt_id ? { fromSessionStatus: true } : {}),
             }
           : null;
       return {
@@ -5830,7 +5852,7 @@ async function bindStream(
         ...(state.failedInputs !== stateBeforeFetch.failedInputs
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
-        blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+        blocks: reconcileDeliveryCards(syntheticError ? [...allBlocks, syntheticError] : allBlocks),
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
@@ -6821,7 +6843,12 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const freshItemIds = new Set(fresh.items.map((it) => it.id));
+  const freshItemIds = committedSendIdsOf(fresh.items);
+  const deliveryProof = confirmedWebSendIds(settlementItems);
+  for (const stableId of deliveryProof) {
+    freshItemIds.add(stableId);
+    recordInFlightNativeDelivery(id, stableId);
+  }
   const gapUserTexts = committedUserTextsOf(
     freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
   );
@@ -6868,10 +6895,12 @@ async function rehydrateWindowOnReconnect(
       ...statusPatch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
-      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session, deliveryProof),
       ...pendingPatch,
-      blocks:
+      blocks: reconcileDeliveryCards(
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
+        deliveryProof,
+      ),
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -7026,7 +7055,9 @@ async function reconcileOnReconnect(
   const overlap = items.findLastIndex((item) => preGapIds.has(item.id));
   const settlementBlocks = itemsToBlocks(items.slice(overlap + 1));
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const snapshotItemIds = new Set(items.map((it) => it.id));
+  const snapshotItemIds = committedSendIdsOf(items);
+  const deliveryProof = confirmedWebSendIds(items);
+  for (const stableId of deliveryProof) recordInFlightNativeDelivery(id, stableId);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -7042,7 +7073,7 @@ async function reconcileOnReconnect(
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
-      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
+      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session, deliveryProof),
     };
     Object.assign(
       patch,
@@ -7064,6 +7095,7 @@ async function reconcileOnReconnect(
       committedUserTextsOf(unseen),
       session,
     );
+    nextBlocks = reconcileDeliveryCards(nextBlocks, deliveryProof);
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -8232,7 +8264,9 @@ export async function pumpStreamEvents(
               mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
             }
           : {}),
-        blocks: [...s.blocks, ...fresh],
+        blocks: fresh.some((block) => block.type === "error" && block.deliveryAttemptId)
+          ? reconcileDeliveryCards([...s.blocks, ...fresh])
+          : [...s.blocks, ...fresh],
       };
     });
   };
@@ -8434,7 +8468,9 @@ export async function pumpStreamEvents(
         // earlier `session.interrupted`, keep that. Session events
         // are the authoritative source for user-initiated terminals.
         if (active?.state !== "cancelled") {
-          const errorMsg = block.response?.error?.message ?? null;
+          const error = block.response?.error;
+          // The attempt card owns delivery errors, including on an open turn.
+          const errorMsg = error?.delivery_attempt_id ? null : (error?.message ?? null);
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
         // agent_run complete + create_session settle. Read the finalized state so
@@ -8548,6 +8584,82 @@ export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
 
+function hasDeliveryCandidate(blocks: AnyBlock[], stableId: string): boolean {
+  return (
+    stableId !== "" && blocks.some((b) => b.ctx.itemId === stableId && !b.ctx.deliveryUnconfirmed)
+  );
+}
+
+function mirrorNamesSend(blocks: AnyBlock[], stableId: string): boolean {
+  return stableId !== "" && blocks.some((block) => block.ctx.webStableId === stableId);
+}
+
+function committedSendIdsOf(items: readonly ConversationItem[]): Set<string> {
+  const ids = new Set(confirmedWebSendIds(items));
+  for (const item of items) {
+    if (item.type !== "message" || item.status !== "failed") ids.add(item.id);
+  }
+  return ids;
+}
+
+function confirmedWebSendIds(items: readonly ConversationItem[]): string[] {
+  return items.flatMap((item) =>
+    item.type === "message" && item.role === "user" && typeof item.web_stable_id === "string"
+      ? [item.web_stable_id]
+      : [],
+  );
+}
+
+function recordInFlightNativeDelivery(conversationId: string | null, stableId: string): void {
+  if (inFlightSendSessions.get(stableId) === conversationId) inFlightSends.set(stableId, true);
+}
+
+/** Keep the first card's position and prefer the durable error when it arrives. */
+function reconcileDeliveryCards(blocks: AnyBlock[], proof: readonly string[] = []): AnyBlock[] {
+  if (!blocks.some((block) => block.type === "error" && block.deliveryAttemptId)) return blocks;
+  const delivered = new Set(proof);
+  const attempts = new Map<string, { index: number; block: ErrorBlock }>();
+  const representedSends = new Set<string>();
+  for (const [index, block] of blocks.entries()) {
+    if (block.ctx.webStableId) delivered.add(block.ctx.webStableId);
+    if (block.type !== "error" || !block.deliveryAttemptId) continue;
+    if (block.inputStableId) representedSends.add(block.inputStableId);
+    const prior = attempts.get(block.deliveryAttemptId);
+    if (
+      !prior ||
+      (!prior.block.ctx.itemId && (block.ctx.itemId || prior.block.fromSessionStatus))
+    ) {
+      attempts.set(block.deliveryAttemptId, { index: prior?.index ?? index, block });
+    }
+  }
+  return blocks.flatMap<AnyBlock>((block, index) => {
+    if (block.type !== "error") return [block];
+    if (block.unansweredSend && representedSends.has(block.unansweredSend.stableId)) return [];
+    const attempt = block.deliveryAttemptId && attempts.get(block.deliveryAttemptId);
+    if (!attempt) return [block];
+    if (attempt.index !== index) return [];
+    const chosen = attempt.block;
+    if (
+      chosen.code === "native_input_delivery_uncertain" &&
+      chosen.inputStableId &&
+      delivered.has(chosen.inputStableId)
+    ) {
+      return [
+        {
+          ...chosen,
+          code: "native_input_delivery_confirmed",
+          level: "info",
+          title: "Message delivered",
+          message: "The terminal transcript confirmed delivery.",
+          cause: undefined,
+          remediation: undefined,
+        } satisfies ErrorBlock,
+      ];
+    }
+    return [chosen];
+  });
+}
+
 /**
  * Whether a committed item proves a failed send was delivered.
  *
@@ -8569,7 +8681,7 @@ export function committedItemProvesDelivery(
     draft.stableId !== undefined &&
     draft.serverRefused !== true &&
     draft.unsettled !== true &&
-    hasCommittedItem(blocks, draft.stableId)
+    (hasDeliveryCandidate(blocks, draft.stableId) || mirrorNamesSend(blocks, draft.stableId))
   );
 }
 
@@ -8753,7 +8865,7 @@ async function sendVerdictFromServer(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
@@ -8776,9 +8888,10 @@ function unsentSendToRestore(
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
+  const committedIds = committedSendIdsOf(items);
   const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !committedIds.has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8809,7 +8922,7 @@ function unsentSendToRestore(
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
@@ -8843,18 +8956,21 @@ function reconcileSendDraftWithSnapshot(
   s: ChatState,
   itemIds: ReadonlySet<string>,
   session: Session,
+  deliveryProof: readonly string[],
 ): Partial<ChatState> {
+  const confirmed = retractDeliveredSendDraft(s, new Set(deliveryProof), "consumed");
+  const confirmedState = { ...s, ...confirmed };
   if (session.lastTaskError?.code !== "runner_rejected_event") {
-    return retractDeliveredSendDraft(s, itemIds, "persisted");
+    return { ...confirmed, ...retractDeliveredSendDraft(confirmedState, itemIds, "persisted") };
   }
   const refused = (stableId: string | undefined): boolean =>
     stableId !== undefined && itemIds.has(stableId) && snapshotRefusesSend(session, stableId);
   const patch: Partial<ChatState> = {};
-  const failed = s.failedSendDraft;
+  const failed = confirmedState.failedSendDraft;
   if (failed !== null && failed.serverRefused !== true && refused(failed.stableId)) {
     patch.failedSendDraft = { ...failed, serverRefused: true };
   }
-  const restored = s.restoredSendDraft;
+  const restored = confirmedState.restoredSendDraft;
   if (
     restored !== null &&
     !restored.delivered &&
@@ -8865,7 +8981,11 @@ function reconcileSendDraftWithSnapshot(
   }
   // Every other draft the snapshot holds an item for was delivered: the
   // rejection names a different message.
-  return { ...patch, ...retractDeliveredSendDraft({ ...s, ...patch }, itemIds, "persisted") };
+  return {
+    ...confirmed,
+    ...patch,
+    ...retractDeliveredSendDraft({ ...confirmedState, ...patch }, itemIds, "persisted"),
+  };
 }
 
 /**
@@ -8969,6 +9089,8 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  webStableId?: string,
+  deliveryUnconfirmed = false,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -8979,6 +9101,8 @@ function committedUserBlock(
       timestamp: 0,
       responseId: "",
       itemId,
+      ...(webStableId !== undefined ? { webStableId } : {}),
+      ...(deliveryUnconfirmed ? { deliveryUnconfirmed: true } : {}),
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
@@ -9273,7 +9397,10 @@ function recoveredPendingInputPatch(
  */
 function committedUserTextsOf(blocks: AnyBlock[]): string[] {
   return blocks
-    .filter((b): b is UserMessageBlock => b.type === "user_message")
+    .filter(
+      (b): b is UserMessageBlock =>
+        b.type === "user_message" && !b.ctx.webStableId && !b.ctx.deliveryUnconfirmed,
+    )
     .map((b) => messageContentText(b.content))
     .filter((text) => text.length > 0);
 }
@@ -9974,6 +10101,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const statusResponseId = event.responseId ?? s.activeResponse?.responseId ?? "";
         const hasMatchingStatusError =
           statusError != null &&
+          !statusError.delivery_attempt_id &&
           s.blocks.some(
             (block) =>
               block.type === "error" &&
@@ -9997,7 +10125,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           const statusAgentName =
             responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
-          patch.blocks = [
+          const statusBlocks: AnyBlock[] = [
             ...s.blocks,
             {
               type: "error",
@@ -10016,6 +10144,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               fromSessionStatus: true,
             } satisfies ErrorBlock,
           ];
+          patch.blocks = statusError.delivery_attempt_id
+            ? reconcileDeliveryCards(statusBlocks)
+            : statusBlocks;
         }
         if (settledResponseId !== null) {
           const settled = withoutSettledCompactionSpinners(
@@ -10132,18 +10263,26 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      const deliveryUnconfirmed = event.data.delivery_confirmed === false;
+      if (!deliveryUnconfirmed && inFlightSends.has(event.itemId))
+        inFlightSends.set(event.itemId, true);
+      const alias = event.webStableId;
+      if (alias) recordInFlightNativeDelivery(sourceConversationId, alias);
       applyToConversation((s) => {
-        const committedIds = new Set([event.itemId]);
+        const committedIds = new Set(
+          deliveryUnconfirmed ? [] : [event.itemId, ...(alias ? [alias] : [])],
+        );
         // A late copy of an item already shown is not a new message.
-        const content = hasCommittedItem(s.blocks, event.itemId)
-          ? null
-          : userContentFromEvent(event);
-        const blocks = withoutDeliveredSendFailureCards(
+        const content =
+          deliveryUnconfirmed || alias || hasCommittedItem(s.blocks, event.itemId)
+            ? null
+            : userContentFromEvent(event);
+        const remaining = withoutDeliveredSendFailureCards(
           s.blocks,
           committedIds,
           content === null ? [] : [messageContentText(content)],
         );
+        const blocks = alias ? reconcileDeliveryCards(remaining, [alias]) : remaining;
         return {
           ...retractDeliveredSendDraft(s, committedIds, "consumed"),
           ...(blocks === s.blocks ? {} : { blocks }),
@@ -10204,11 +10343,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
           const cleared = event.clearedPendingId;
-          const at = cleared
-            ? s.pendingUserMessages.findIndex(
-                (p) => p.tempId === cleared || p.pendingId === cleared,
-              )
-            : -1;
+          const at = s.pendingUserMessages.findIndex(
+            (p) =>
+              (alias !== undefined && p.stableId === alias) ||
+              (cleared != null && (p.tempId === cleared || p.pendingId === cleared)),
+          );
           if (at >= 0) {
             return {
               pendingUserMessages: [
@@ -10217,7 +10356,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
-          if (settledShell) return {};
+          if (settledShell || alias) return {};
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -10234,9 +10373,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
-        if (cleared) {
+        if (cleared || alias) {
           const idx = s.pendingUserMessages.findIndex(
-            (p) => p.tempId === cleared || p.pendingId === cleared,
+            (p) =>
+              (alias !== undefined && p.stableId === alias) ||
+              (cleared != null && (p.tempId === cleared || p.pendingId === cleared)),
           );
           if (idx >= 0) {
             const matched = s.pendingUserMessages[idx]!;
@@ -10257,6 +10398,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  alias,
+                  deliveryUnconfirmed,
                 ),
               ),
             };
@@ -10273,6 +10416,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const head =
           settledShell ||
+          alias ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -10294,6 +10438,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 matchedHead.tempId,
                 event.createdBy ?? matchedHead.author,
                 matchedHead.createdAtS,
+                alias,
+                deliveryUnconfirmed,
               ),
             ),
           };
@@ -10305,7 +10451,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: appendCorrelatedUserBlock(
             s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              alias,
+              deliveryUnconfirmed,
+            ),
           ),
         };
       });

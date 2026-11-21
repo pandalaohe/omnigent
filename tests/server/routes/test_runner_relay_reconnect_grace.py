@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
@@ -140,6 +141,226 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "heartbeat_runner"),
+    [
+        ("confirmed-running", "runner_a"),
+        ("confirmed-idle", "runner_a"),
+        ("unconfirmed-running", "runner_a"),
+        ("confirmed-running", "runner_b"),
+        ("confirmed-running", None),
+    ],
+    ids=[
+        "confirmed-running",
+        "confirmed-idle",
+        "unconfirmed-running",
+        "replacement-runner",
+        "no-runner-id",
+    ],
+)
+async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
+    db_uri, monkeypatch, case, heartbeat_runner
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr(
+        pending_inputs,
+        "_session_busy_check",
+        lambda conversation_id: conversation_id == session_id and case.endswith("running"),
+    )
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
+    if case.startswith("confirmed"):
+        orchestration._record_native_input_lifecycle(
+            session_id,
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_paste"},
+                "pending_id": pending_id,
+                "delivery_attempt_id": attempt_id,
+            },
+        )
+    # Claude absorbs the queued paste only after a 25-minute step. Only the
+    # claiming runner's heartbeats renew it; a replacement never had the paste.
+    for now in range(60, 1501, 60):
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            set(),
+            runner_id=heartbeat_runner,
+        )
+    if case != "confirmed-running" or heartbeat_runner != "runner_a":
+        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+        (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
+        assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+        return
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
+    assert not store.list_items(session_id).data
+    late_mirror = pending_inputs.resolve_matching_text(session_id, "steer")
+    assert late_mirror.matched is not None
+    assert late_mirror.matched.pending_id == pending_id
+
+
+def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(pending_inputs, "_session_busy_check", None)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+    check = pending_inputs._session_busy_check
+    assert check is not None
+    session_id = "f" * 32
+    try:
+        for status, busy in (("waiting", True), ("running", True), ("idle", False)):
+            orchestration._session_status_cache[session_id] = status
+            assert check(session_id) is busy
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+
+
+def _confirm_paste(session_id: str, pending_id: str) -> None:
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    orchestration._record_native_input_lifecycle(
+        session_id,
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_paste"},
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_paste_lease_follows_waiting_stop_and_reconnect(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    session_id = conv.id
+    stable_id = "d" * 32
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    # Same predicate create_app registers.
+    monkeypatch.setattr(
+        pending_inputs,
+        "_session_busy_check",
+        lambda conversation_id: (
+            orchestration._session_status_cache.get(conversation_id)
+            in orchestration._MID_TURN_STATUSES
+        ),
+    )
+    published: list[dict] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _conversation_id, event: published.append(event)
+    )
+    waiting = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], stable_id=stable_id
+    )
+    pending_inputs.mark_delivery_stage(session_id, waiting, "forward_accepted")
+    pending_inputs.enable_runner_lease(session_id, waiting)
+    stopped: str | None = None
+    try:
+        assert pending_inputs.claim_runner_input(
+            session_id, waiting, "paste", runner_id="runner_a"
+        )
+        _confirm_paste(session_id, waiting)
+        orchestration._session_status_cache[session_id] = "waiting"
+        for now in range(60, 1501, 60):
+            # A reconnect at 780 s does not settle a claimed paste as lost.
+            previous = pending_inputs.runner_accepted_ids(session_id) if now == 780 else set()
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                previous,
+                runner_id="runner_a",
+            )
+        assert pending_inputs.runner_lease_remaining(session_id, waiting) == 720
+        assert not pending_inputs.claim_runner_input(session_id, waiting, "second")
+        item_id, replay = await orchestration._persist_external_conversation_item(
+            session_id,
+            conv,
+            SessionEventInput.model_validate(
+                {
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "steer"}],
+                        },
+                        "response_id": "resp_mirror",
+                    },
+                }
+            ),
+            store,
+        )
+        assert item_id == stable_id and not replay
+        assert any(
+            event["type"] == "session.input.consumed"
+            and event["data"].get("cleared_pending_id") == waiting
+            for event in published
+        )
+        assert not [item for item in store.list_items(session_id).data if item.type == "error"]
+
+        # Busy, then Stop: an interrupted paste is no longer renewed.
+        stopped = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "stopped"}], runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input(
+            session_id, stopped, "paste-stopped", runner_id="runner_a"
+        )
+        _confirm_paste(session_id, stopped)
+        orchestration._session_status_cache[session_id] = "running"
+        now = 1560
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            set(),
+            runner_id="runner_a",
+        )
+        pending_inputs.mark_interrupted(session_id, [stopped])
+        for now in range(1620, 2341, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                set(),
+                runner_id="runner_a",
+            )
+        await orchestration._watch_runner_input_lease(store, session_id, stopped)
+        errors = [item for item in store.list_items(session_id).data if item.type == "error"]
+        assert [error.data.model_dump()["code"] for error in errors] == [
+            "native_input_delivery_uncertain"
+        ]
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        pending_inputs.resolve(session_id, waiting)
+        if stopped is not None:
+            pending_inputs.resolve(session_id, stopped)
+
+
+@pytest.mark.asyncio
 async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_uri, monkeypatch):
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(harness_override="claude-native")
@@ -192,6 +413,87 @@ async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_
         runner_forward.assert_not_awaited()
     finally:
         pending_inputs.resolve(conv.id, pending_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi-native", "antigravity-native"]
+)
+@pytest.mark.parametrize("claim_capable", [True, False])
+async def test_buffered_peer_copy_stays_claimable_while_the_runner_holds_it(
+    db_uri, monkeypatch, claim_capable, harness
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override=harness)
+    peer_id = "c" * 32
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Native", None, harness)
+    )
+    real_forward = orchestration._forward_native_terminal_message
+    headers = {"X-Omnigent-Pending-Input-Claim": "1"} if claim_capable else {}
+    runner = httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(202, json={"status": "buffered"}, headers=headers)
+        ),
+    )
+
+    async def forward(_client, session_id, conversation, body, *, input_delivery, **_kwargs):
+        return await real_forward(
+            runner, session_id, conversation, body, input_delivery=input_delivery
+        )
+
+    monkeypatch.setattr(orchestration, "_forward_native_terminal_message", forward)
+    try:
+        with pytest.raises(HTTPException, match="buffered"):
+            await orchestration._dispatch_session_event_to_runner_impl(
+                conv.id,
+                conv,
+                SessionEventInput(
+                    type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "peer report"}],
+                        "peer_message_id": peer_id,
+                    },
+                ),
+                store,
+                AsyncMock(),
+                agent_name=None,
+                file_store=None,
+                artifact_store=None,
+                native_terminal_ready=True,
+            )
+        # Only a Claude runner claims its buffered copy; other harnesses keep base cleanup.
+        holds = claim_capable and harness == "claude-native"
+        assert pending_inputs.holds_peer_message(conv.id, peer_id) is holds
+        if not holds:
+            assert pending_inputs.snapshot_for(conv.id) == []
+            return
+        (entry,) = pending_inputs.snapshot_for(conv.id)
+        pending_id = entry["pending_id"]
+        attempt_id = pending_inputs.delivery_attributes_for(conv.id, pending_id)[
+            "delivery_attempt_id"
+        ]
+        for now in range(60, 1201, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                conv.id,
+                {"active_pending_ids": [], "queued_pending_ids": [pending_id]},
+                set(),
+            )
+        assert pending_inputs.claim_runner_input(
+            conv.id, pending_id, "drained", expected_attempt_id=attempt_id
+        )
+        assert not store.list_items(conv.id).data
+    finally:
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(conv.id):
+            pending_inputs.resolve(conv.id, pending_id)
 
 
 @pytest.mark.asyncio
@@ -393,28 +695,48 @@ async def test_confirmed_forward_treats_tunnel_replacement_before_enqueue_as_uns
 @pytest.mark.asyncio
 async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
     store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation().id
+    session_id = store.create_conversation(agent_id="b" * 32).id
+    input_stable_id = "a" * 32
     pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "in flight"}], runner_managed=True
+        session_id,
+        [{"type": "input_text", "text": "in flight"}],
+        stable_id=input_stable_id,
+        runner_managed=True,
     )
     attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
         "delivery_attempt_id"
     ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "original")
     pending_inputs.mark_interrupted(session_id, [pending_id])
+    collector = await start_session_stream_collector(session_id)
     try:
+        status = {
+            "type": "session.status",
+            "status": "failed",
+            "response_id": "resp_terminal",
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+            "input_stable_id": input_stable_id,
+            "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
+        }
         failure = {
             "type": "response.failed",
             "response": {"id": "resp_terminal"},
             "pending_id": pending_id,
             "delivery_attempt_id": attempt_id,
+            "input_stable_id": input_stable_id,
             "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
         }
         async with httpx.AsyncClient(
             base_url="http://runner",
             transport=httpx.MockTransport(
                 lambda _: httpx.Response(
-                    200, text=f"data: {json.dumps(failure)}\n\ndata: [DONE]\n\n"
+                    200,
+                    text=(
+                        f"data: {json.dumps(status)}\n\n"
+                        f"data: {json.dumps(failure)}\n\n"
+                        "data: [DONE]\n\n"
+                    ),
                 )
             ),
         ) as client:
@@ -427,6 +749,77 @@ async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
             for item in store.list_items(session_id).data
             if item.type == "error"
         ] == ["native_input_delivery_uncertain"]
+        attempts: dict[str, str] = {}
+        while len(attempts) < 2:
+            event = await collector.next_event()
+            if event["type"] in {"session.status", "response.error"} and event.get("error"):
+                attempts[event["type"]] = event["error"]["delivery_attempt_id"]
+        assert attempts == {"session.status": attempt_id, "response.error": attempt_id}
+        snapshot = await orchestration._get_session_snapshot(
+            store, session_id, include_items=False
+        )
+        assert snapshot.status == "failed"
+        assert snapshot.last_task_error is not None
+        assert snapshot.last_task_error["delivery_attempt_id"] == attempt_id
+        assert snapshot.last_task_error["input_stable_id"] == input_stable_id
+    finally:
+        await collector.stop()
+        pending_inputs.resolve(session_id, pending_id)
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.parametrize("runner_managed", [False, True])
+@pytest.mark.asyncio
+async def test_early_native_refusal_keeps_its_reason_in_history(db_uri, runner_managed):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    stable_id = "a" * 32
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "read the latest report"}],
+        stable_id=stable_id,
+        runner_managed=runner_managed,
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    failure = {
+        "type": "response.failed",
+        "source": "harness",
+        **identity,
+        "response": {
+            "status": "failed",
+            "error": {
+                "code": "runner_error",
+                "message": "The terminal rejected the input while initializing.",
+                "undelivered": True,
+            },
+        },
+    }
+    running = {"type": "session.status", "status": "running"}
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200,
+                    text=(
+                        f"data: {json.dumps(failure)}\n\n"
+                        f"data: {json.dumps(running)}\n\n"
+                        "data: [DONE]\n\n"
+                    ),
+                )
+            ),
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=3
+            )
+        assert orchestration._session_status_cache[session_id] == "running"
+        user, error = store.list_items(session_id, order="asc").data
+        assert user.id == stable_id and user.status == "failed"
+        assert error.type == "error" and error.response_id == user.response_id
+        assert error.data.model_dump()["message"] == failure["response"]["error"]["message"]
+        assert error.data.model_dump()["delivery_attempt_id"] == identity["delivery_attempt_id"]
     finally:
         pending_inputs.resolve(session_id, pending_id)
         orchestration._session_status_cache.pop(session_id, None)

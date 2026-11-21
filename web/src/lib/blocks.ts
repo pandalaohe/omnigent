@@ -55,6 +55,9 @@ export interface BlockContext {
   timestamp: number;
   responseId: string;
   itemId: string | null;
+  /** The web send this native mirror delivered (its item's `web_stable_id`). */
+  webStableId?: string;
+  deliveryUnconfirmed?: true;
   createdBy?: string;
   /** Server-side creation time (unix epoch seconds), when the item came
    *  from history hydration. A DIFFERENT clock from `timestamp` (page-
@@ -496,6 +499,8 @@ export interface ErrorBlock {
   unansweredSend?: { stableId: string; text?: string };
   /** A client-only card for a failure carried only by a `failed` session status. */
   fromSessionStatus?: true;
+  deliveryAttemptId?: string;
+  inputStableId?: string;
 }
 
 /**
@@ -511,11 +516,22 @@ export function structuredErrorFields(
     title?: string | null;
     cause?: string | null;
     remediation?: string | null;
+    delivery_attempt_id?: string | null;
+    input_stable_id?: string | null;
   } | null,
   agentName?: string | null,
-): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
-  const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
+): Pick<ErrorBlock, "title" | "cause" | "remediation" | "deliveryAttemptId" | "inputStableId"> {
+  const out: Pick<
+    ErrorBlock,
+    "title" | "cause" | "remediation" | "deliveryAttemptId" | "inputStableId"
+  > = {};
+  if (src?.delivery_attempt_id) out.deliveryAttemptId = src.delivery_attempt_id;
+  if (src?.input_stable_id) out.inputStableId = src.input_stable_id;
   if (src?.title) out.title = src.title;
+  if (!out.title && src?.code === "native_input_delivery_uncertain") {
+    out.title = "Message delivery is unconfirmed";
+  }
+  if (!out.title && src?.delivery_attempt_id) out.title = "Message could not be delivered";
   if (
     !out.title &&
     src?.level !== "info" &&

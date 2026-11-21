@@ -866,11 +866,172 @@ async def test_claude_fallback_bundle_follows_transferred_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_hop", "collides", "advert_write_fails"),
+    [
+        (None, False, False),
+        ("conv_old", False, False),
+        ("conv_third", True, False),
+        (None, False, True),
+    ],
+    ids=["one_way", "back_to_first_owner", "on_after_router_collision", "advert_write_fails"],
+)
+async def test_claude_forwarder_registration_follows_transferred_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    second_hop: str | None,
+    collides: bool,
+    advert_write_fails: bool,
+) -> None:
+    """A /clear successor owns the pane's forwarder before any other task can run.
+
+    The pane's own subagent router moves with it, also past a router its first
+    successor already had, and the forwarder's exit is logged once, under the
+    pane's owner, even after the pane returns to its first owner. A failed
+    advertisement rewrite still completes the transfer; the stale id is not routed.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint, request_decision
+    from omnigent.runner import subagent_routing
+    from omnigent.runner.native import orchestration
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
+    router = subagent_routing.ensure_session_router(
+        "conv_old", bridge_dir=tmp_path / "bridge", server_client=Mock()
+    )
+    successor_router = (
+        subagent_routing.ensure_session_router(
+            "conv_new", bridge_dir=tmp_path / "successor", server_client=Mock()
+        )
+        if collides
+        else None
+    )
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    orchestration._register_auto_forwarder_task("conv_old", forwarder)
+    orchestration._CLAUDE_FORWARDER_ROUTERS[forwarder] = router
+    owner_at_first_yield: list[asyncio.Task[object] | None] = []
+    owner = second_hop or "conv_new"
+    vacated = [session_id for session_id in ("conv_old", "conv_new") if session_id != owner]
+
+    async def _status_link(_link: str) -> None:
+        owner_at_first_yield.append(orchestration._AUTO_FORWARDER_TASKS.get("conv_new"))
+
+    def _write_fails(*_args: object, **_kwargs: object) -> Path:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(instance, "set_conversation_link", _status_link)
+    if advert_write_fails:
+        monkeypatch.setattr(subagent_routing, "write_advertisement", _write_fails)
+    try:
+        assert await registry.transfer_terminal("conv_old", "conv_new", "terminal_claude_main")
+        assert owner_at_first_yield == [forwarder]
+        assert "conv_old" not in orchestration._AUTO_FORWARDER_TASKS
+        if second_hop is not None:
+            assert await registry.transfer_terminal("conv_new", second_hop, "terminal_claude_main")
+        assert orchestration._AUTO_FORWARDER_TASKS.get(owner) is forwarder
+        # The pane's own router serves its owner; a router the successor had keeps serving it.
+        assert router.session_id == owner
+        assert subagent_routing._session_routers.get(owner) is (None if collides else router)
+        if successor_router is not None:
+            assert subagent_routing._session_routers.get("conv_new") is successor_router
+            assert successor_router.session_id == "conv_new"
+        endpoint = read_router_endpoint(tmp_path / "bridge")
+        assert endpoint is not None
+        if advert_write_fails:
+            # The stale advertised id gets no verdict, so the hook lets the spawn run unrouted.
+            assert endpoint.session_id == "conv_old"
+            body = {"harness": "claude-native", "task_name": "review"}
+            assert await asyncio.to_thread(request_decision, endpoint, "conv_old", body) is None
+        else:
+            assert endpoint.session_id == owner
+        # Vacated-session teardown (pane rebuild, stop, CLI release, delete) cannot reach it.
+        for session_id in vacated:
+            assert await orchestration._cancel_auto_forwarder_task(session_id)
+            subagent_routing.shutdown_session_router(session_id)
+            assert session_id not in subagent_routing._session_routers
+        assert not forwarder.done()
+        assert not router._closed
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            assert await orchestration._cancel_auto_forwarder_task(owner)
+            await asyncio.sleep(0)
+        assert forwarder.cancelled()
+        obituaries = [
+            getattr(record, "session_id", None)
+            for record in caplog.records
+            if record.name == "omnigent.runner.app"
+            and "Transcript forwarder task" in record.getMessage()
+        ]
+        assert obituaries == [owner]
+        # The forwarder's own handle-scoped teardown still closes the router.
+        subagent_routing.shutdown_session_router("conv_old", router)
+        assert router._closed
+        assert owner not in subagent_routing._session_routers
+    finally:
+        forwarder.cancel()
+        for session_id in ("conv_old", "conv_new", "conv_third"):
+            orchestration._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        subagent_routing.shutdown_session_router("conv_old", router)
+        if successor_router is not None:
+            subagent_routing.shutdown_session_router("conv_new", successor_router)
+
+
+@pytest.mark.asyncio
+async def test_claude_pane_without_a_router_leaves_other_routers_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routing-off pane's transfer rekeys its forwarder and moves no router.
+
+    A router indexed under the previous owner is not the pane's, so it keeps its
+    index entry, session and advertisement.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.runner import subagent_routing
+    from omnigent.runner.native import orchestration
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
+    other_router = subagent_routing.ensure_session_router(
+        "conv_old", bridge_dir=tmp_path / "other", server_client=Mock()
+    )
+    # Launched with routing off: no router is recorded with the forwarder.
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    orchestration._register_auto_forwarder_task("conv_old", forwarder)
+
+    async def _no_status_link(_link: str) -> None:
+        pass
+
+    monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
+    try:
+        assert await registry.transfer_terminal("conv_old", "conv_new", "terminal_claude_main")
+        assert orchestration._AUTO_FORWARDER_TASKS.get("conv_new") is forwarder
+        assert "conv_old" not in orchestration._AUTO_FORWARDER_TASKS
+        assert subagent_routing._session_routers.get("conv_old") is other_router
+        assert other_router.session_id == "conv_old"
+        assert "conv_new" not in subagent_routing._session_routers
+        endpoint = read_router_endpoint(tmp_path / "other")
+        assert endpoint is not None and endpoint.session_id == "conv_old"
+    finally:
+        forwarder.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_old", None)
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_new", None)
+        subagent_routing.shutdown_session_router("conv_old", other_router)
+
+
+@pytest.mark.asyncio
 async def test_non_claude_transfer_does_not_move_fallback_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    transfers: list[tuple[str, str]] = []
+    registry.set_claude_terminal_transfer_listener(lambda *ids: transfers.append(ids))
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     source_bundle = registry.claude_skill_bundle_dir("source")
     terminal_registry._by_conversation.setdefault("source", {})[("codex", "main")] = instance
@@ -888,6 +1049,7 @@ async def test_non_claude_transfer_does_not_move_fallback_bundle(
     monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
     moved = await registry.transfer_terminal("source", "target", "terminal_codex_main")
     assert moved is not None
+    assert transfers == []
 
     await registry.cleanup_session("source")
     assert not source_bundle.exists()

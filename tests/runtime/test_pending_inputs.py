@@ -642,6 +642,7 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "ghost")
 
 
 def test_restore_returns_a_drained_entry_to_the_front() -> None:
@@ -711,6 +712,37 @@ def test_interrupted_flag_survives_ttl_eviction_of_held_restore(
     assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
 
 
+@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "failed"])
+def test_ttl_eviction_of_a_held_entry_leaves_its_record_to_the_persist(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Expiry during a persist writes no same-text record; the persist's outcome decides."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    first = pending_inputs.record("conv_ttl_hold", [_text_block("ship it")], stable_id="a" * 32)
+    held = pending_inputs.resolve_matching_text("conv_ttl_hold", "ship it", hold=True)
+    assert held.matched is not None and held.matched.pending_id == first
+
+    clock["t"] += pending_inputs._TTL_S + 0.1
+    assert pending_inputs.snapshot_for("conv_ttl_hold") == []
+    assert not pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it")
+
+    if outcome == "failed":
+        pending_inputs.restore("conv_ttl_hold", held.matched)
+    else:
+        pending_inputs.release(
+            "conv_ttl_hold", held.matched, delivery_confirmed=outcome == "confirmed"
+        )
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_ttl_hold")] == (
+        [first] if outcome == "failed" else []
+    )
+    # Only an entry that settled without its own echo blocks a same-text successor.
+    assert pending_inputs.matches_unconfirmed_input_text("conv_ttl_hold", "ship it") is (
+        outcome == "unconfirmed"
+    )
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("matched", [False, True])
 def test_title_preference_survives_drain_and_restore(enabled: bool, matched: bool) -> None:
@@ -772,6 +804,25 @@ def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> Non
 
     assert len(snapshot) == cap
     assert [entry["pending_id"] for entry in snapshot] == ids[2:]
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "m0")
+    assert pending_inputs.matches_unconfirmed_input_text("conv_a", "m1")
+    assert not pending_inputs.matches_unconfirmed_input_text("conv_a", "m2")
+
+
+def test_non_hold_mirror_drains_remember_unconfirmed_text() -> None:
+    session_id = "conv_non_hold"
+    oldest_id = pending_inputs.record(session_id, [_text_block("first input")])
+    oldest = pending_inputs.resolve_oldest_for_mirrored_text(session_id, "reformatted input")
+    assert oldest is not None and oldest.pending_id == oldest_id
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "first input")
+
+    skipped_id = pending_inputs.record(session_id, [_text_block("skipped input")])
+    matched_id = pending_inputs.record(session_id, [_text_block("matched input")])
+    drain = pending_inputs.resolve_matching_text(session_id, "matched input")
+    assert drain.matched is not None and drain.matched.pending_id == matched_id
+    assert [entry.pending_id for entry in drain.skipped] == [skipped_id]
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "skipped input")
+    assert pending_inputs.matches_unconfirmed_input_text(session_id, "matched input")
 
 
 def test_held_entries_keep_their_slot_while_the_queue_refills() -> None:

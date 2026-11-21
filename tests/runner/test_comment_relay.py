@@ -109,6 +109,10 @@ class _StubResourceRegistry:
         """
         del publisher
 
+    def set_claude_terminal_transfer_listener(self, listener: Callable[[str, str], None]) -> None:
+        """Accept the Claude terminal-transfer listener without retaining it."""
+        del listener
+
     def set_session_status_publisher(
         self,
         publisher: Callable[

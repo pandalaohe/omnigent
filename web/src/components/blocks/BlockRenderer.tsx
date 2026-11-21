@@ -1092,6 +1092,7 @@ function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolea
  */
 function keyFor(item: RenderItem, index: number): string {
   if (item.kind === "text" && item.streamKey) return item.streamKey;
+  if (item.kind === "error" && item.deliveryAttemptId) return `delivery:${item.deliveryAttemptId}`;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

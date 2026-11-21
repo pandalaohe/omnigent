@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { CopyIcon, StarIcon, TrashIcon } from "lucide-react";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import {
@@ -33,7 +35,6 @@ export function HistoryTab() {
   const [retentionMessage, setRetentionMessage] = useState(""),
     [previewing, setPreviewing] = useState(false);
   const [query, setQuery] = useState(""),
-    [visible, setVisible] = useState(50),
     [clear, setClear] = useState(false),
     [range, setRange] = useState("all"),
     [limits, setLimits] = useState({ days: 90, entries: 5000 }),
@@ -49,11 +50,15 @@ export function HistoryTab() {
         if (result.ok) setLimits({ days: result.days ?? 90, entries: result.entries ?? 5000 });
       });
   }, [retention, places.bridge]);
-  const filtered = places.history.filter((row) =>
-    `${row.title} ${row.url}`.toLowerCase().includes(query.toLowerCase()),
+  const { history } = places;
+  const filter = query.toLowerCase();
+  const filtered = useMemo(
+    () => history.filter((row) => `${row.title} ${row.url}`.toLowerCase().includes(filter)),
+    [history, filter],
   );
+  const { pageRows, ...pager } = usePagedRows(filtered, { resetKey: filter });
   const groups = new Map<string, BrowserPlace[]>();
-  for (const row of filtered.slice(0, visible)) {
+  for (const row of pageRows) {
     const date = new Date(row.visitedAt ?? 0).toDateString();
     groups.set(date, [...(groups.get(date) ?? []), row]);
   }
@@ -139,10 +144,7 @@ export function HistoryTab() {
           <SearchPages
             kind="history"
             query={query}
-            setQuery={(value) => {
-              setQuery(value);
-              setVisible(50);
-            }}
+            setQuery={setQuery}
             total={places.history.length}
             count={filtered.length}
           />
@@ -156,9 +158,9 @@ export function HistoryTab() {
         </div>
         {!removal && <UpdateReason verb="remove single pages" />}
         <p className="text-xs text-muted-foreground">
-          Showing {Math.min(visible, filtered.length)} of {places.history.length}
+          Showing {pageRows.length} of {places.history.length}
         </p>
-        <div className="max-h-96 overflow-auto">
+        <div>
           {[...groups].map(([day, rows]) => {
             const date = new Date(day),
               label =
@@ -275,11 +277,7 @@ export function HistoryTab() {
             )}
           </p>
         )}
-        {filtered.length > visible && (
-          <Button variant="outline" onClick={() => setVisible(visible + 50)}>
-            Show {Math.min(50, filtered.length - visible)} more
-          </Button>
-        )}
+        <SettingsPager label="Browser history pages" {...pager} />
         <p role="status" className="text-sm">
           {places.message}
         </p>

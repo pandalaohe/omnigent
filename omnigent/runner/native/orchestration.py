@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
@@ -204,6 +205,10 @@ def _publish_tmux_target_for_bridge(
 # garbage-collected mid-run, and the handle for cancelling a session's previous
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
+# Latest registration of each forwarder task; only its callback logs the exit.
+_AUTO_FORWARDER_TASK_REGISTRATIONS: weakref.WeakKeyDictionary[asyncio.Task[object], object] = (
+    weakref.WeakKeyDictionary()
+)
 
 # Include the child's 10-second termination grace and forced-exit cleanup.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
@@ -354,11 +359,16 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     if incumbent is not None and incumbent is not task:
         incumbent.cancel()
     _AUTO_FORWARDER_TASKS[session_id] = task
+    registration = object()
+    _AUTO_FORWARDER_TASK_REGISTRATIONS[task] = registration
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
+        if _AUTO_FORWARDER_TASK_REGISTRATIONS.get(done_task, registration) is not registration:
+            # Rekeyed since, even back onto this session: the latest callback logs the exit.
+            return
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
         # retrieves the failure (no "Task exception was never retrieved").
@@ -387,6 +397,86 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
             )
 
     task.add_done_callback(_evict)
+
+
+# Bridge dir each live Claude forwarder tails, independent of its registry key.
+_CLAUDE_FORWARDER_BRIDGE_DIRS: weakref.WeakKeyDictionary[asyncio.Task[object], Path] = (
+    weakref.WeakKeyDictionary()
+)
+# Subagent router each Claude forwarder's pane calls; a pane transfer moves it.
+_CLAUDE_FORWARDER_ROUTERS: weakref.WeakKeyDictionary[asyncio.Task[object], SubagentRouter] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _rekey_auto_forwarder_task(old_session_id: str, new_session_id: str) -> None:
+    """
+    Move a forwarder registration onto the session that now owns its pane.
+
+    A native ``/clear`` moves the pane to a fresh conversation while the same
+    forwarder keeps mirroring it. Without the move, a teardown addressed to the
+    superseded conversation (terminal re-create, stop, CLI release, delete)
+    would cancel the successor's forwarder or close the subagent router the
+    pane's hooks call. Re-registering attaches an eviction callback for the new
+    key; the old key's callback no-ops. The pane's own router moves to the new
+    ID, so its spawns route as it, and the forwarder's ``finally`` still closes it.
+
+    :param old_session_id: Session the task was registered under, e.g. ``"conv_old"``.
+    :param new_session_id: Session that now owns the pane, e.g. ``"conv_new"``.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        return
+    task = _AUTO_FORWARDER_TASKS.pop(old_session_id, None)
+    if task is None:
+        return
+    _register_auto_forwarder_task(new_session_id, task)
+    router = _CLAUDE_FORWARDER_ROUTERS.get(task)
+    if router is not None:
+        from omnigent.runner.subagent_routing import move_session_router
+
+        move_session_router(router, new_session_id)
+
+
+# Bridge dir and session of each in-flight Claude launch, keyed by its task (each
+# launch runs in its own), until its forwarder tails the dir; :func:`_launch_claude`
+# drops it when that launch fails or is cancelled first.
+_CLAUDE_BRIDGE_LAUNCH_CLAIMS: dict[object, tuple[Path, str]] = {}
+
+
+def _claude_bridge_tailed_by_other_session(bridge_dir: Path, session_id: str) -> bool:
+    """Return whether another session's live forwarder or in-flight launch uses *bridge_dir*."""
+    if any(
+        claimed == bridge_dir and owner != session_id
+        for claimed, owner in _CLAUDE_BRIDGE_LAUNCH_CLAIMS.values()
+    ):
+        return True
+    return any(
+        owner != session_id
+        and not task.done()
+        and _CLAUDE_FORWARDER_BRIDGE_DIRS.get(task) == bridge_dir
+        for owner, task in _AUTO_FORWARDER_TASKS.items()
+    )
+
+
+def _untailed_cleared_bridge_id(session_id: str) -> str:
+    """
+    Return a cleared bridge id for *session_id* that no other session uses.
+
+    A session resumed on ``{id}-cleared`` and cleared again hands that dir to
+    its new successor, so the plain marker can already be someone else's.
+
+    :param session_id: Superseded session id, e.g. ``"conv_old"``.
+    :returns: ``"conv_old-cleared"``, else the first free ``"conv_old-cleared-<n>"``.
+    """
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+    bridge_id = f"{session_id}-cleared"
+    suffix = 1
+    while _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
+        suffix += 1
+        bridge_id = f"{session_id}-cleared-{suffix}"
+    return bridge_id
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -10310,6 +10400,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        bridge_dir_for_bridge_id,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -10353,6 +10444,14 @@ async def _auto_create_claude_terminal(
         current_bridge_id = current_labels.get(BRIDGE_ID_LABEL_KEY)
         if isinstance(current_bridge_id, str) and current_bridge_id:
             bridge_id = current_bridge_id
+    if _claude_bridge_tailed_by_other_session(bridge_dir_for_bridge_id(bridge_id), session_id):
+        # The pane and its forwarder moved to a successor; never wipe or share its bridge.
+        bridge_id = _untailed_cleared_bridge_id(session_id)
+    # Claimed before the next await, so a concurrent launch picks around it.
+    _CLAUDE_BRIDGE_LAUNCH_CLAIMS[asyncio.current_task()] = (
+        bridge_dir_for_bridge_id(bridge_id),
+        session_id,
+    )
     rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
@@ -11300,14 +11399,22 @@ async def _auto_create_claude_terminal(
                 event_dispatcher=event_dispatcher,
             )
         finally:
-            await _shutdown_session_router_async(session_id, _subagent_router)
-            await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
+            # A ``None`` handle would close whichever router ``session_id`` has now,
+            # e.g. one its relaunch installed after this pane moved to a successor.
+            if _subagent_router is not None:
+                await _shutdown_session_router_async(session_id, _subagent_router)
+            if _claude_turn_router is not None:
+                await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
         name=f"claude-forwarder-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
+    _CLAUDE_FORWARDER_BRIDGE_DIRS[_forwarder_task] = bridge_dir
+    if _subagent_router is not None:
+        _CLAUDE_FORWARDER_ROUTERS[_forwarder_task] = _subagent_router
+    _CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(asyncio.current_task(), None)
     _logger.info(
         "Auto-created claude terminal + forwarder for session %s; "
         "forwarder_task=%s elapsed_ms=%.0f",
@@ -12107,23 +12214,28 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """
     if ctx.server_client is None:
         raise ValueError("claude-native launch requires a bound server_client")
-    view = await _auto_create_claude_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
-        server_client=ctx.server_client,
-        event_dispatcher=ctx.event_dispatcher,
-        bundle_dir=ctx.bundle_dir,
-        agent_name=ctx.agent_name,
-        agent_spec=ctx.agent_spec,
-        skills_filter=ctx.skills_filter,
-        session_init=ctx.session_init,
-        auth_token_factory=ctx.auth_token_factory,
-        resolve_launch_config=ctx.resolve_launch_config,
-        record_launch_config=ctx.record_launch_config,
-        global_instructions=ctx.global_instructions,
-        rebind_bridge=ctx.rebind_bridge,
-    )
+    try:
+        view = await _auto_create_claude_terminal(
+            ctx.session_id,
+            ctx.resource_registry,
+            ctx.publish_event,
+            server_client=ctx.server_client,
+            event_dispatcher=ctx.event_dispatcher,
+            bundle_dir=ctx.bundle_dir,
+            agent_name=ctx.agent_name,
+            agent_spec=ctx.agent_spec,
+            skills_filter=ctx.skills_filter,
+            session_init=ctx.session_init,
+            auth_token_factory=ctx.auth_token_factory,
+            resolve_launch_config=ctx.resolve_launch_config,
+            record_launch_config=ctx.record_launch_config,
+            global_instructions=ctx.global_instructions,
+            rebind_bridge=ctx.rebind_bridge,
+        )
+    except BaseException:
+        # No forwarder tails this launch's dir; another launch keeps its own claim.
+        _CLAUDE_BRIDGE_LAUNCH_CLAIMS.pop(asyncio.current_task(), None)
+        raise
     _start_claude_relay_after_launch(ctx)
     return view
 

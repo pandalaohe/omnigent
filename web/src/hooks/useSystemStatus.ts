@@ -139,6 +139,8 @@ export interface SystemServerPoint {
 export interface SystemServerStatus {
   state: "online";
   since: number;
+  /** Logical CPUs on the server machine; older servers omit this field. */
+  cpu_count?: number | null;
   last_point: SystemServerPoint | null;
 }
 

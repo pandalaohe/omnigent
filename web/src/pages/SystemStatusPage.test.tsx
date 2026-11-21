@@ -162,7 +162,7 @@ function hostSnapshot() {
   };
 }
 
-function makeView({ server }: { server: boolean }) {
+function makeView({ server, cpuCount }: { server: boolean; cpuCount?: number | null }) {
   return {
     revision: 4,
     level: "amber",
@@ -183,6 +183,7 @@ function makeView({ server }: { server: boolean }) {
         : {
             state: "online",
             since: 0,
+            ...(cpuCount === undefined ? {} : { cpu_count: cpuCount }),
             last_point: {
               t: 0,
               cpu: 12,
@@ -1015,7 +1016,7 @@ describe("SystemStatusPage alert lines", () => {
   it("writes each alert line under the metric it governs, once each", () => {
     const card = renderWithSettings();
 
-    expect(within(card).getByTestId("alert-cpu_pct")).toHaveTextContent("alert 85%");
+    expect(within(card).getByTestId("alert-cpu_pct")).toHaveTextContent("host alert 85%");
     expect(within(card).getByTestId("alert-mem_pct")).toHaveTextContent("alert 90%");
     expect(within(card).getByTestId("alert-disk_pct")).toHaveTextContent("alert 90%");
     expect(within(card).getByTestId("alert-server_5xx_pct")).toHaveTextContent("alert 5%");
@@ -1127,19 +1128,49 @@ describe("SystemStatusPage alert lines", () => {
 });
 
 describe("SystemStatusPage chart and panel entry", () => {
+  it.each([undefined, null])("labels raw server CPU when the core count is %s", (cpuCount) => {
+    const view = makeView({ server: true, cpuCount });
+    if (view.server === null) throw new Error("the server card is expected");
+    view.server.last_point.cpu = 110;
+    mocks.settings.current = { data: { cpu_pct: 85 } };
+    mocks.status.current = { data: view, isLoading: false, isError: false };
+    mocks.history.set("server", [{ t: 0, cpu: 110 }]);
+    renderPage();
+
+    const card = within(screen.getByTestId("system-status-server-card"));
+    expect(card.getByText("110.0%")).toBeInTheDocument();
+    expect(card.getByText("of one core")).toBeInTheDocument();
+    expect(
+      card.getByRole("button", { name: "Alert line for host CPU, currently 85 percent" }),
+    ).toHaveTextContent("host alert 85%");
+    expect(
+      card.getByRole("img", { name: "Server CPU (% of one core), last 24 hours" }),
+    ).toBeInTheDocument();
+    expect(card.queryByTestId("sparkline-threshold-label")).not.toBeInTheDocument();
+  });
+
   it("labels the alert line in a gutter that opens nothing", () => {
+    const view = makeView({ server: true, cpuCount: 32 });
+    if (view.server === null) throw new Error("the server card is expected");
+    view.server.last_point.cpu = 110;
     mocks.settings.current = { data: { cpu_pct: 85 } };
     mocks.status.current = {
-      data: makeView({ server: true }),
+      data: view,
       isLoading: false,
       isError: false,
       error: null,
     };
+    mocks.history.set("server", [{ t: 0, cpu: 110 }]);
     renderPage();
 
-    const label = within(screen.getByTestId("system-status-server-card")).getByTestId(
-      "sparkline-threshold-label",
-    );
+    const card = within(screen.getByTestId("system-status-server-card"));
+    expect(card.getByText("3.4%")).toBeInTheDocument();
+    expect(card.getByText("1.1 of 32 cores")).toBeInTheDocument();
+    expect(card.getByText("32 cores")).toBeInTheDocument();
+    // A stored 110% point is about 4% of the distance from zero to the 85% line.
+    const chart = card.getByRole("img", { name: /Server CPU.*Alert line 85%/ });
+    expect(chart.querySelector("polyline")).toHaveAttribute("points", "50.00,95.96");
+    const label = card.getByTestId("sparkline-threshold-label");
     expect(label).toHaveTextContent("85%");
     fireEvent.click(label);
     expect(screen.queryByRole("dialog")).toBeNull();

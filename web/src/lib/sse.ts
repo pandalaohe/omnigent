@@ -982,12 +982,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // the nested item data. Keep only a real string so null carries no author.
     const createdBy = p.created_by;
     const clearedPendingId = p.cleared_pending_id;
+    const webStableId = itemType === "message" && payload.role === "user" && payload.web_stable_id;
     return {
       type: "session_input_consumed",
       itemId,
       itemType,
       isMeta: payload.is_meta === true,
       ...(typeof createdBy === "string" ? { createdBy } : {}),
+      ...(typeof webStableId === "string" && webStableId ? { webStableId } : {}),
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;
@@ -1689,6 +1691,12 @@ function parseErrorInfo(raw: unknown): ErrorInfo {
     if (typeof r.title === "string" && r.title) info.title = r.title;
     if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
     if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    if (typeof r.delivery_attempt_id === "string" && r.delivery_attempt_id) {
+      info.delivery_attempt_id = r.delivery_attempt_id;
+    }
+    if (typeof r.input_stable_id === "string" && r.input_stable_id) {
+      info.input_stable_id = r.input_stable_id;
+    }
     if (r.level === "info" || r.level === "warning") info.level = r.level;
     return info;
   }

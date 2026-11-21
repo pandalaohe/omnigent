@@ -1,5 +1,4 @@
 import { useMemo, useState, type ReactNode } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -12,6 +11,7 @@ import {
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
 import { AgentsSettings } from "@/components/AgentsSettings";
+import { SettingsPager } from "@/components/SettingsPager";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import {
   Dialog,
@@ -83,20 +83,12 @@ function InstalledAgentsSettingsSection({
   const supported = enabled && info !== "loading" && info.agent_detail === true;
   const { agentId } = useSettingsRoute();
   const navigate = useNavigate();
-  const servers = useCustomAgents("server", supported && !agentId);
-  const yours = useCustomAgents("user", supported && !agentId);
+  const { query: servers, pager: serverPager } = useCustomAgents("server", supported && !agentId);
+  const { query: yours, pager: userPager } = useCustomAgents("user", supported && !agentId);
   const save = useSaveCustomAgent();
   const labels = useHarnessLabels(supported);
   const acpHarnesses = useAcpHarnessIds(supported);
   const [search, setSearch] = useState("");
-  const serverAgents = useMemo(
-    () => servers.data?.pages.flatMap((page) => page.data) ?? [],
-    [servers.data],
-  );
-  const userAgents = useMemo(
-    () => yours.data?.pages.flatMap((page) => page.data) ?? [],
-    [yours.data],
-  );
   const detailId = agentId === "new" ? undefined : agentId;
   const detail = useCustomAgent(detailId, supported);
 
@@ -105,7 +97,7 @@ function InstalledAgentsSettingsSection({
     const matches = (a: ManagedAgent) =>
       `${a.name} ${a.description ?? ""}`.toLowerCase().includes(searchTerm);
     return {
-      builtins: serverAgents.filter(
+      builtins: (servers.data?.data ?? []).filter(
         (a) =>
           !(
             a.builtin &&
@@ -118,9 +110,11 @@ function InstalledAgentsSettingsSection({
           (!embedded || !a.builtin) &&
           matches(a),
       ),
-      filtered: userAgents.filter(matches),
+      filtered: (yours.data?.data ?? []).filter(matches),
     };
-  }, [serverAgents, userAgents, acpHarnesses, searchTerm, embedded]);
+  }, [servers.data, yours.data, acpHarnesses, searchTerm, embedded]);
+  const userHasPages = userPager.page > 0 || userPager.hasNext;
+  const serverHasPages = serverPager.page > 0 || serverPager.hasNext;
 
   if (!enabled) return null;
   if (!supported) return <UnsupportedServer />;
@@ -213,9 +207,9 @@ function InstalledAgentsSettingsSection({
           </Link>
         </Button>
       </div>
-      {(yours.hasNextPage || servers.hasNextPage) && (
+      {(userHasPages || serverHasPages) && (
         <p className="mb-4 text-xs text-muted-foreground">
-          Search filters loaded agents. Load more to include older agents.
+          Search filters the current page in each list.
         </p>
       )}
       <section className="mb-8" aria-label="Your agents">
@@ -294,18 +288,18 @@ function InstalledAgentsSettingsSection({
         )}
         <ListStatus
           query={yours}
-          scope="user"
           empty={filtered.length === 0}
           emptyText={
-            search
-              ? "No matching agents in the loaded results."
+            search || userHasPages
+              ? "No matching agents on this page."
               : "No custom agents yet. Create an agent to keep it available for new sessions."
           }
         />
+        <SettingsPager label="Your agent pages" {...userPager} />
       </section>
       {(!embedded ||
         builtins.length > 0 ||
-        servers.hasNextPage ||
+        serverHasPages ||
         servers.isPending ||
         servers.isError) && (
         <section aria-label="Server agents">
@@ -332,10 +326,14 @@ function InstalledAgentsSettingsSection({
           </div>
           <ListStatus
             query={servers}
-            scope="server"
             empty={builtins.length === 0}
-            emptyText={search ? "No matching server agents." : "No server agents."}
+            emptyText={
+              search || serverHasPages
+                ? "No matching server agents on this page."
+                : "No server agents."
+            }
           />
+          <SettingsPager label="Server agent pages" {...serverPager} />
         </section>
       )}
     </div>
@@ -356,45 +354,24 @@ function UnsupportedServer() {
 
 function ListStatus({
   query,
-  scope,
   empty,
   emptyText,
 }: {
-  query: ReturnType<typeof useCustomAgents>;
-  scope: "user" | "server";
+  query: ReturnType<typeof useCustomAgents>["query"];
   empty: boolean;
   emptyText: string;
 }) {
-  const client = useQueryClient();
   if (query.isPending) return <p className="py-4 text-ui text-muted-foreground">Loading agents…</p>;
   if (query.isError)
     return (
       <p role="alert" className="py-4 text-ui">
         Could not load agents.{" "}
-        <Button
-          variant="link"
-          onClick={() => void client.resetQueries({ queryKey: ["settings-agents", scope] })}
-        >
+        <Button variant="link" onClick={() => void query.refetch()}>
           Retry
         </Button>
       </p>
     );
-  return (
-    <>
-      {empty && <p className="py-4 text-ui text-muted-foreground">{emptyText}</p>}
-      {query.hasNextPage && (
-        <Button
-          className="mt-4"
-          variant="outline"
-          loading={query.isFetchingNextPage}
-          disabled={query.isFetching}
-          onClick={() => void query.fetchNextPage()}
-        >
-          Load more {scope === "user" ? "agents" : "server agents"}
-        </Button>
-      )}
-    </>
-  );
+  return empty ? <p className="py-4 text-ui text-muted-foreground">{emptyText}</p> : null;
 }
 
 function AgentDetail({

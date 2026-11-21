@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -159,12 +161,17 @@ export function ConnectedAppsSettings({
   };
 
   const visibleApps = loadedScope === scope ? apps : null;
-  const matchingApps =
-    visibleApps?.filter((app) =>
-      `${app.label} ${app.client_name} ${app.scope}`
-        .toLowerCase()
-        .includes(query.trim().toLowerCase()),
-    ) ?? [];
+  const filter = query.trim().toLowerCase();
+  const matchingApps = useMemo(
+    () =>
+      visibleApps?.filter((app) =>
+        `${app.label} ${app.client_name} ${app.scope}`.toLowerCase().includes(filter),
+      ) ?? [],
+    [visibleApps, filter],
+  );
+  const { pageRows, ...pager } = usePagedRows(matchingApps, {
+    resetKey: JSON.stringify([scope, filter]),
+  });
   const visibleBatch = receiptScope === scope ? checkedBatch : null;
   const message = visibleBatch ? receiptMessage(visibleBatch.receipt) : null;
 
@@ -268,10 +275,10 @@ export function ConnectedAppsSettings({
             onChange={(event) => setQuery(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Showing {matchingApps.length} of {visibleApps.length}
+            Showing {pageRows.length} of {visibleApps.length}
           </p>
-          <ul className="mt-4 max-h-96 divide-y divide-border overflow-auto border-y border-border">
-            {matchingApps.map((app) => (
+          <ul className="mt-4 divide-y divide-border border-y border-border">
+            {pageRows.map((app) => (
               <li
                 key={app.grant_id}
                 className="flex flex-wrap items-center justify-between gap-3 py-3"
@@ -296,6 +303,7 @@ export function ConnectedAppsSettings({
               </li>
             ))}
           </ul>
+          <SettingsPager label="Connected app pages" {...pager} />
         </>
       )}
       {pairingAvailable && (

@@ -491,8 +491,12 @@ def test_revision_bumps_only_when_the_finding_set_changes(tmp_path: Path) -> Non
     assert hub._revision == 1
 
 
-def test_view_visibility_for_admin_and_member(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cpu_count", [32, None])
+def test_view_visibility_for_admin_and_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_count: int | None
+) -> None:
     """Admins see the server card and every host; members see only their own."""
+    monkeypatch.setattr(system_status.os, "cpu_count", lambda: cpu_count)
     hub = SystemStatusHub(tmp_path, None)
     hub.host_changed(
         host_id="host_a",
@@ -524,6 +528,7 @@ def test_view_visibility_for_admin_and_member(tmp_path: Path) -> None:
     )
     assert {host["host_id"] for host in admin["hosts"]} == {"host_a", "host_b"}
     assert admin["server"] is not None
+    assert admin["server"]["cpu_count"] == cpu_count
     assert admin["server"]["last_point"] is None
 
     member = hub.view(

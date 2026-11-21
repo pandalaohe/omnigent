@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ConnectedAppsSettings } from "./ConnectedAppsSettings";
+import { expectSettingsPages } from "@/test/settingsPaging";
 
 const api = vi.hoisted(() => ({
   list: vi.fn(),
@@ -108,6 +109,31 @@ it("does not refresh or show a revoke error after a connection switch", async ()
   expect(api.list).toHaveBeenCalledTimes(2);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Revoke Old browser" })).not.toBeInTheDocument();
+});
+
+it("pages connected apps and searches all grants", async () => {
+  api.list.mockResolvedValue(
+    Array.from({ length: 45 }, (_, index) => ({
+      grant_id: `grant-${index + 1}`,
+      label: `Connected app ${index + 1}`,
+      client_name: "test-app",
+      scope: "sessions",
+      created_at: 1,
+      expires_at: 2,
+      last_used_at: null,
+    })),
+  );
+  render(<ConnectedAppsSettings />);
+  const returnToFirstPage = await expectSettingsPages(
+    "Connected app pages",
+    (number) => `Connected app ${number}`,
+  );
+  returnToFirstPage();
+  fireEvent.change(screen.getByRole("textbox", { name: "Search connected apps" }), {
+    target: { value: "Connected app 44" },
+  });
+  expect(screen.getByText("Connected app 44")).toBeInTheDocument();
+  expect(screen.queryByText("Connected app 45")).not.toBeInTheDocument();
 });
 
 it("shows the individual app grant and revokes only the chosen one", async () => {

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useNavigate, useLocation } from "@/lib/routing";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { SettingsPager } from "@/components/SettingsPager";
+import { usePagedRows } from "@/hooks/usePagedRows";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -25,12 +27,22 @@ export function SignInTab() {
     [bitwarden, setBitwarden] = useState<boolean | null>(null);
   const [siteQuery, setSiteQuery] = useState("");
   const [localQuery, setLocalQuery] = useState("");
-  const visibleSites = sites.filter((site) =>
-    `${site.origin} ${site.label}`.toLowerCase().includes(siteQuery.trim().toLowerCase()),
+  const siteFilter = siteQuery.trim().toLowerCase();
+  const localFilter = localQuery.trim().toLowerCase();
+  const visibleSites = useMemo(
+    () => sites.filter((site) => `${site.origin} ${site.label}`.toLowerCase().includes(siteFilter)),
+    [sites, siteFilter],
   );
-  const visibleLocal = local.filter((site) =>
-    site.origin.toLowerCase().includes(localQuery.trim().toLowerCase()),
+  const visibleLocal = useMemo(
+    () => local.filter((site) => site.origin.toLowerCase().includes(localFilter)),
+    [local, localFilter],
   );
+  const { pageRows: sitesPage, ...sitesPager } = usePagedRows(visibleSites, {
+    resetKey: siteFilter,
+  });
+  const { pageRows: localPage, ...localPager } = usePagedRows(visibleLocal, {
+    resetKey: localFilter,
+  });
   useEffect(() => {
     void bridge
       ?.get()
@@ -181,17 +193,17 @@ export function SignInTab() {
                   onChange={(event) => setSiteQuery(event.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Showing {visibleSites.length} of {sites.length}
+                  Showing {sitesPage.length} of {sites.length}
                 </p>
               </>
             )}
-            <div className="max-h-96 divide-y overflow-auto">
+            <div className="divide-y">
               {!sites.length && (
                 <p className="text-sm text-muted-foreground">
                   No sites approved. A session asks the first time it fills a saved login.
                 </p>
               )}
-              {visibleSites.map((site) => (
+              {sitesPage.map((site) => (
                 <div
                   key={`${site.origin}:${site.id}`}
                   className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
@@ -225,6 +237,7 @@ export function SignInTab() {
                 </div>
               ))}
             </div>
+            <SettingsPager label="Saved login approval pages" {...sitesPager} />
           </div>
         )}
       </BrowserGroup>
@@ -244,10 +257,10 @@ export function SignInTab() {
               onChange={(event) => setLocalQuery(event.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Showing {visibleLocal.length} of {local.length}
+              Showing {localPage.length} of {local.length}
             </p>
-            <div className="max-h-96 divide-y overflow-auto">
-              {visibleLocal.map((site) => (
+            <div className="divide-y">
+              {localPage.map((site) => (
                 <div
                   key={site.origin}
                   className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
@@ -274,6 +287,7 @@ export function SignInTab() {
                 </div>
               ))}
             </div>
+            <SettingsPager label="Local network choice pages" {...localPager} />
           </div>
         )}
         {localStatus && (
