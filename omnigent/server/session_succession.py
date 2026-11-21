@@ -1000,6 +1000,7 @@ async def _phase_rekey(
         for item in body.get("dropped") or []:
             if isinstance(item, dict):
                 dropped.append(item)
+        dropped.extend(_moved_timers(body))
         deferred.pop(runner_id, None)
         # A later runner's failure must not lose what an earlier runner
         # already cancelled: a retry calls that runner again, which has
@@ -1474,7 +1475,7 @@ async def _replay_deferred(
             except ValueError:
                 body = {}
             dropped = list(receipt.dropped or [])
-            for item in body.get("dropped") or []:
+            for item in [*(body.get("dropped") or []), *_moved_timers(body)]:
                 if isinstance(item, dict) and item not in dropped:
                     dropped.append(item)
             receipt = await _advance(
@@ -1597,6 +1598,35 @@ def _question_text(question: dict[str, Any]) -> str:
     return elicitation_id if isinstance(elicitation_id, str) and elicitation_id else "question"
 
 
+def _moved_timers(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the runner's moved timers, marked to keep them apart from dropped work."""
+    return [
+        {**item, "moved": True}
+        for item in body.get("moved_timers") or []
+        if isinstance(item, dict)
+    ]
+
+
+def _moved_timer_text(item: dict[str, Any]) -> str:
+    """Render one moved timer: id, cadence, next firing and note."""
+    detail = f"- timer {item.get('id', '')}".rstrip()
+    parts: list[str] = []
+    seconds = item.get("seconds")
+    if isinstance(seconds, int | float) and item.get("repeat") is True:
+        parts.append(f"every {seconds:g}s")
+    due_at = item.get("due_at")
+    if isinstance(due_at, int | float):
+        parts.append(
+            "next " + datetime.fromtimestamp(due_at, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        )
+    if parts:
+        detail += ": " + ", ".join(parts)
+    note = item.get("note")
+    if isinstance(note, str) and note:
+        detail += f"; note: {note!r}"
+    return detail
+
+
 def _opening_text(
     *,
     old_id: str,
@@ -1627,10 +1657,16 @@ def _opening_text(
         for question in questions:
             lines.append(f"- {_question_text(question)}")
         sections.append("\n".join(lines))
-    if dropped:
+    moved_timers = [item for item in dropped if item.get("moved") is True]
+    if moved_timers:
+        lines = ["Timers moved to this session (same schedule; they fire here):"]
+        lines.extend(_moved_timer_text(item) for item in moved_timers)
+        sections.append("\n".join(lines))
+    stopped = [item for item in dropped if item.get("moved") is not True]
+    if stopped:
         lines = []
         lines.append("Stopped and not carried over:")
-        for item in dropped:
+        for item in stopped:
             kind = item.get("kind", "item")
             item_id = item.get("id", "")
             label = item.get("label")

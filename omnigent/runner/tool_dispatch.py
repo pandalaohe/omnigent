@@ -7489,6 +7489,41 @@ async def _execute_timer_set(
 _TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
 
+async def _settle_timer_holder(
+    timer_id: str,
+    session_id: str,
+    *,
+    origin: str,
+    server_client: httpx.AsyncClient,
+) -> tuple[str, str]:
+    """
+    Settle which session a due timer fires into and that session's state.
+
+    A committed handover can move the timer while a check is in flight, so a
+    check counts only for the holder it asked about.
+
+    :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
+    :param session_id: The holder last fired into.
+    :param origin: Session the timer was set in; only a moved timer reports
+        a holder whose snapshot answers 404.
+    :param server_client: httpx client for the archive check.
+    :returns: ``(holder, state)``; state is ``"archived"``, ``"missing"`` or ``"ok"``.
+    """
+    from omnigent.runner import app as _app
+
+    holder = _app.timer_session(timer_id, session_id)
+    while True:
+        archived = await flows.session_lineage_archived(
+            server_client, holder, report_missing=holder != origin
+        )
+        current = _app.timer_session(timer_id, holder)
+        if current == holder:
+            if archived:
+                return holder, "archived"
+            return holder, "missing" if archived is None else "ok"
+        holder = current
+
+
 async def _timer_loop(
     *,
     timer_id: str,
@@ -7502,7 +7537,8 @@ async def _timer_loop(
     Background loop: sleep then fire timer notifications.
 
     :param timer_id: Unique timer id, e.g. ``"timer_a1b2..."``.
-    :param conversation_id: Session to fire into.
+    :param conversation_id: Session the timer was set in; it fires into the
+        session holding it, which a handover may change.
     :param seconds: Delay between firings.
     :param repeat: Loop indefinitely when True.
     :param note: Optional note echoed in firing text.
@@ -7510,15 +7546,25 @@ async def _timer_loop(
     """
     from omnigent.runner import app as _app
 
+    origin = conversation_id
+    missing_holder: str | None = None
     deferred_fire = False
     try:
         while True:
+            _app.record_timer_schedule(timer_id, seconds=seconds, repeat=repeat, note=note)
             await asyncio.sleep(2.0 if deferred_fire else seconds)
+            conversation_id, state = await _settle_timer_holder(
+                timer_id, conversation_id, origin=origin, server_client=server_client
+            )
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
-            if await flows.session_lineage_archived(server_client, conversation_id):
+            if state == "archived":
                 break
+            # A moved timer ends once its holder answers 404 on two ticks in a row.
+            if state == "missing" and missing_holder == conversation_id:
+                break
+            missing_holder = conversation_id if state == "missing" else None
             deferred_fire = False
             text = f"[System: timer {timer_id} fired]"
             if note:
@@ -7563,6 +7609,16 @@ async def _timer_loop(
                     # certainly did not land and a retry cannot double it.
                     if retry_delay_s is not None:
                         await asyncio.sleep(retry_delay_s)
+                        # Nothing was sent: a handover during the wait moves the retry.
+                        holder = _app.timer_session(timer_id, conversation_id)
+                        if holder != conversation_id:
+                            conversation_id, state = await _settle_timer_holder(
+                                timer_id, holder, origin=origin, server_client=server_client
+                            )
+                            if state == "archived":
+                                break
+                            if state == "ok":
+                                missing_holder = None
                         continue
                     _logger.warning(
                         "Timer %s firing persist failed for %s",
@@ -7585,7 +7641,7 @@ async def _timer_loop(
     except asyncio.CancelledError:
         return
     finally:
-        _app.unregister_timer(conversation_id, timer_id)
+        _app.unregister_timer(_app.timer_session(timer_id, conversation_id), timer_id)
 
 
 async def _execute_flow_tool(

@@ -174,6 +174,7 @@ class _FakeRunnerClient:
         self.succession_failures = 0
         self.release_failures = 0
         self.dropped: list[dict[str, Any]] = []
+        self.moved_timers: list[dict[str, Any]] = []
 
     @asynccontextmanager
     async def stream(
@@ -207,7 +208,14 @@ class _FakeRunnerClient:
                 return httpx.Response(409, json={"error": "target_not_ready"})
             if self.succession_status >= 400:
                 return httpx.Response(self.succession_status, json={"error": "bad"})
-            return httpx.Response(200, json={"status": "rekeyed", "dropped": list(self.dropped)})
+            return httpx.Response(
+                200,
+                json={
+                    "status": "rekeyed",
+                    "dropped": list(self.dropped),
+                    "moved_timers": list(self.moved_timers),
+                },
+            )
         if url.endswith("/succession/release"):
             if self.release_failures > 0:
                 self.release_failures -= 1
@@ -1431,6 +1439,58 @@ async def test_succession_reports_dropped_configuration_without_values(
     assert len(_succession_notices(store, new)) == 1
 
 
+async def test_succession_lists_moved_timers_apart_from_stopped_work(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+) -> None:
+    """Timers the runner moved are listed as moved; only the rest reads as stopped."""
+    old = _create(store)
+    new = _create(store)
+    repeating = {
+        "kind": "timer",
+        "id": "timer_check",
+        "seconds": 900.0,
+        "repeat": True,
+        "note": "check children",
+        "due_at": 1_800_000_000.0,
+    }
+    one_shot = {
+        "kind": "timer",
+        "id": "timer_resume",
+        "seconds": 60.0,
+        "repeat": False,
+        "note": None,
+        "due_at": 1_800_000_000.0,
+    }
+    runner.moved_timers = [repeating, one_shot]
+    # An older runner still cancels its timers and reports them unmarked.
+    runner.dropped = [
+        {"kind": "flow", "id": "flow_watch", "label": "watch CI"},
+        {"kind": "timer", "id": "timer_old", "label": "timer-timer_old"},
+    ]
+    response = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new, "allow_empty": True},
+    )
+    assert response.status_code == 200, response.text
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.opening is not None
+    assert receipt.dropped == [
+        *runner.dropped,
+        {**repeating, "moved": True},
+        {**one_shot, "moved": True},
+    ]
+    assert (
+        "Timers moved to this session (same schedule; they fire here):\n"
+        "- timer timer_check: every 900s, next 2027-01-15 08:00:00 UTC; note: 'check children'\n"
+        "- timer timer_resume: next 2027-01-15 08:00:00 UTC\n\n"
+        "Stopped and not carried over:\n"
+        "- flow flow_watch: watch CI\n"
+        "- timer timer_old: timer-timer_old"
+    ) in receipt.opening["text"]
+
+
 async def test_succession_happy_path_moves_children_and_completes(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
@@ -2629,6 +2689,7 @@ async def test_deferred_online_retry_keeps_dropped_and_releases(
         deferred_runners=[{"runner_id": RUNNER_ID_B, "session_ids": [child]}],
     )
     runner.dropped = [{"kind": "timer", "id": "one-shot"}]
+    runner.moved_timers = [{"kind": "timer", "id": "timer_moved", "seconds": 60.0}]
     runner.release_failures = 1
     monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.01,))
     await succession_module.advance_succession(
@@ -2641,7 +2702,10 @@ async def test_deferred_online_retry_keeps_dropped_and_releases(
         timeout_s=3,
         interval_s=0.02,
     )
-    assert store.get_succession_by_id("retry-late").dropped == runner.dropped
+    assert store.get_succession_by_id("retry-late").dropped == [
+        *runner.dropped,
+        {**runner.moved_timers[0], "moved": True},
+    ]
     assert len(runner.posts) == 4
 
 
