@@ -8413,7 +8413,7 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     if clipped:
-        # The rule above the mode footer is the closing edge. Everything above
+        # The composer's last frame rule is the closing edge. Everything above
         # it may be draft text, including sentences that look like permissions.
         region = "\n".join(lines[_composer_frame_rule_indices(lines)[-1] + 1 :])
     else:
@@ -9505,7 +9505,9 @@ def _clipped_draft_rows(pane: str) -> tuple[list[str], bool] | None:
 
     The draft is taller than the composer: its prompt row scrolled away, or the
     opening rule collapsed to ``─── ↑ N more ───``. Only a column-0 closing rule
-    with the composer's own footer under it (no dialog footer) qualifies.
+    without a dialog footer under it qualifies. A collapsed opening rule marks
+    the composer by itself; without one, the composer's mode footer must show,
+    which default permission mode under a custom status line does not draw.
 
     :returns: ``(rows, collapsed)``, or ``None`` when the pane has no such composer.
     """
@@ -9515,13 +9517,14 @@ def _clipped_draft_rows(pane: str) -> tuple[list[str], bool] | None:
         return None
     closing_rule = rules[-1]
     footer = [line.strip() for line in lines[closing_rule + 1 :] if line.strip()]
-    if not footer or not footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts")):
-        return None
     if any(_DIALOG_FOOTER_RE.search(line) for line in footer):
         return None
     opening_rule = rules[-2] if len(rules) >= 2 else -1
     collapsed = opening_rule >= 0 and bool(_CLIPPED_DRAFT_RULE_RE.fullmatch(lines[opening_rule]))
     if opening_rule >= 0 and not collapsed:
+        return None
+    mode_footer = bool(footer) and footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts"))
+    if not collapsed and not mode_footer:
         return None
     rows = [line for line in lines[opening_rule + 1 : closing_rule] if line.strip()]
     if not rows or any(not row.startswith("  ") for row in rows):
