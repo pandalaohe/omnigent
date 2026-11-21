@@ -5345,7 +5345,7 @@ async def _caller_cwd(
     """Return the caller's working directory: its workspace, else the runner's."""
     snapshot = caller_snapshot
     if snapshot is None:
-        snapshot = await _fetch_session_metadata(server_client, conversation_id)
+        snapshot = await _session_snapshot(server_client, conversation_id, metadata_only=True)
     workspace = _optional_string(snapshot.get("workspace")) if snapshot is not None else None
     if workspace:
         return workspace

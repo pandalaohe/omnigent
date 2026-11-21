@@ -16392,10 +16392,15 @@ async def test_sys_session_create_worktree_uses_caller_cwd(first_read_times_out:
     async def handle_request(request: httpx.Request) -> httpx.Response:
         nonlocal caller_reads
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_placement_caller":
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
+            assert request.extensions["timeout"]["read"] == 10.0
             caller_reads += 1
-            if request.url.params.get("include_items") != "false" or (
-                caller_reads == 1 and first_read_times_out
-            ):
+            if caller_reads == 1 and first_read_times_out:
                 raise httpx.ReadTimeout("caller snapshot timed out", request=request)
         return await handler(request)
 
