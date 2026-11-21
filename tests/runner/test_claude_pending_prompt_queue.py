@@ -270,6 +270,57 @@ async def test_each_buffered_drain_checks_for_new_question(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "state", "held"),
+    [
+        ("/my-skill tidy up", "running", True),
+        ("plain steer", "running", False),
+        ("/tmp/build.log is where the error is", "running", False),
+        ("// TODO explain this", "running", False),
+        # An unreadable turn state with a usable box must not block the queue.
+        ("/my-skill tidy up", "unknown", False),
+    ],
+)
+async def test_guessed_skill_waits_for_claude_turn_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    pending_prompt: dict[str, bool],
+    text: str,
+    state: str,
+    held: bool,
+) -> None:
+    """Claude runs a queued slash command at turn end, after the unknown-command watch."""
+    pending_prompt["pending"] = False
+    turn = {"running": True}
+
+    def has_running_turn(_dir: Path, *, unknown_is_busy: bool = False) -> bool:
+        return turn["running"] if state == "running" else unknown_is_busy
+
+    monkeypatch.setattr(claude_native_bridge, "has_running_turn", has_running_turn)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_has_accepted_input", lambda _dir: True)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _dir: True)
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        await client.post(f"/v1/sessions/{sid}/events", json=_message(text))
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("next"))
+        if held:
+            # The message behind the held command keeps its order.
+            assert harness.posted_bodies == []
+            assert len(app.state.session_message_buffers[sid]) == 2
+            turn["running"] = False
+        await _until(
+            lambda: (
+                len(harness.posted_bodies) == 2
+                and sid not in app.state.active_turns
+                and sid not in app.state.claude_prompt_waiters
+            )
+        )
+    sent = [body["content"][-1]["content"][0]["text"] for body in harness.posted_bodies]
+    assert sent == [text, "next"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["interrupt", "stop_session", "delete"])
 async def test_control_cancels_question_waiter_and_queued_input(
     action: str, monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
