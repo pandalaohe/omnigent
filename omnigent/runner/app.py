@@ -315,6 +315,8 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
 # Minimum spacing of repaint requests for a busy Claude pane whose input box is hidden.
 _CLAUDE_BUSY_REPAINT_INTERVAL_S = 5.0
+# A skill or command name, e.g. ``my-skill`` or ``plugin:cmd``; ``/tmp/x`` and ``//`` are text.
+_GUESSED_SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 # How long a message refused by a launcher sign-in may wait, including the time the server
 # already had it queued. Must stay inside the server's pending-input lifetime, so a refusal
@@ -8056,17 +8058,20 @@ def create_runner_app(
 
         if has_pending_user_prompt(bridge_dir):
             return True
+        # Claude Code runs a queued slash command only at turn end, after the bridge
+        # stops watching for "Unknown command"; a guessed skill waits for an idle pane.
+        # An unknown turn state does not hold it, so an idle pane is never blocked.
+        text = _leading_input_text(head) if head is not None else ""
+        guessed = _passthrough_slash_command_name(text)
+        if (
+            guessed is not None
+            and _GUESSED_SKILL_NAME_RE.fullmatch(guessed)
+            and has_running_turn(bridge_dir)
+        ):
+            return True
         running = has_running_turn(
             bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
         )
-        # Claude Code runs a queued slash command only at turn end, after the bridge
-        # stops watching for "Unknown command"; a guessed skill waits for an idle pane.
-        if (
-            running
-            and head is not None
-            and _passthrough_slash_command_name(_leading_input_text(head)) is not None
-        ):
-            return True
         # Claude Code keeps its input box open mid-turn and queues what is typed
         # there. Only a busy pane without a usable box keeps the message queued,
         # so its wait never spends the delivery's readiness budget.

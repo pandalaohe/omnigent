@@ -270,16 +270,33 @@ async def test_each_buffered_drain_checks_for_new_question(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("text", "held"), [("/my-skill tidy up", True), ("plain steer", False)])
+@pytest.mark.parametrize(
+    ("text", "state", "held"),
+    [
+        ("/my-skill tidy up", "running", True),
+        ("plain steer", "running", False),
+        ("/tmp/build.log is where the error is", "running", False),
+        ("// TODO explain this", "running", False),
+        # An unreadable turn state with a usable box must not block the queue.
+        ("/my-skill tidy up", "unknown", False),
+    ],
+)
 async def test_guessed_skill_waits_for_claude_turn_to_end(
-    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool], text: str, held: bool
+    monkeypatch: pytest.MonkeyPatch,
+    pending_prompt: dict[str, bool],
+    text: str,
+    state: str,
+    held: bool,
 ) -> None:
     """Claude runs a queued slash command at turn end, after the unknown-command watch."""
     pending_prompt["pending"] = False
     turn = {"running": True}
-    monkeypatch.setattr(
-        claude_native_bridge, "has_running_turn", lambda *_a, **_k: turn["running"]
-    )
+
+    def has_running_turn(_dir: Path, *, unknown_is_busy: bool = False) -> bool:
+        return turn["running"] if state == "running" else unknown_is_busy
+
+    monkeypatch.setattr(claude_native_bridge, "has_running_turn", has_running_turn)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_has_accepted_input", lambda _dir: True)
     monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _dir: True)
     app, harness = _build_app()
     sid = uuid.uuid4().hex
