@@ -208,6 +208,34 @@ class _RecordingClaudeRegistry(SessionResourceRegistry):
         )
 
 
+class _RecordingPostsServerClient(NullServerClient):
+    """Server client recording every POST as ``(url, json)``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Record the request and answer it empty."""
+        self.posts.append((url, kwargs.get("json") or {}))
+        return self._Response()
+
+
+def _posted_notices(posts: list[tuple[str, dict[str, Any]]], code: str) -> list[dict[str, Any]]:
+    """The session items posted with notice *code*, in posting order."""
+    items = [
+        body.get("data", {}).get("item_data", {})
+        for url, body in posts
+        if url.endswith("/events") and body.get("type") == "external_conversation_item"
+    ]
+    return [item for item in items if item.get("code") == code]
+
+
+def _info_notice(code: str, message: str) -> dict[str, str]:
+    """The informational launch notice a native launch posts into the session."""
+    return {"source": "execution", "code": code, "message": message, "level": "info"}
+
+
 class _ResumeSnapshotServerClient(NullServerClient):
     """Server client serving one session snapshot, empty labels and optional items.
 
@@ -900,14 +928,16 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_launch_choices(
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    server_client = _RecordingPostsServerClient()
     seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
     )
 
+    assert _posted_notices(server_client.posts, "pi_native_model_dropped") == []
     args = captured["spec"].args
     if model or (terminal_args and "--model" in terminal_args):
         assert args[args.index("--model") + 1] == "anthropic/claude-sonnet-4-5"
@@ -934,7 +964,8 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
     ``omnigent/moonshotai/kimi-k2.5`` is unresolvable without the managed
     provider, and stripping the prefix would leave ``moonshotai/kimi-k2.5``,
     which Pi's ``--model`` parser mis-routes (leading segment read as a
-    provider). The launch must omit ``--model`` so Pi keeps its own default.
+    provider). The launch must omit ``--model`` so Pi keeps its own default,
+    and the session says the pick was dropped.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
@@ -975,17 +1006,25 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    server_client = _RecordingPostsServerClient()
     seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
     )
 
     args = captured["spec"].args
     assert "--model" not in args
     assert "--provider" not in args
+    assert _posted_notices(server_client.posts, "pi_native_model_dropped") == [
+        _info_notice(
+            "pi_native_model_dropped",
+            "omnigent/moonshotai/kimi-k2.5 isn't available on Pi's own login; "
+            "using Pi's default model.",
+        )
+    ]
 
 
 def _pi_launch_test_stubs(
@@ -7585,8 +7624,9 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
     The pick outlives the provider it was made under, so a relaunch that
     cannot honor it must still bring the session back: it takes the Default
-    launch (the fresh catalog's ``isDefault`` row) and clears the persisted
-    pick, so the picker shows the Default the session now runs.
+    launch (the fresh catalog's ``isDefault`` row), clears the persisted
+    pick, so the picker shows the Default the session now runs, and says so
+    in the session.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -7619,10 +7659,13 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
     captured: dict[str, Any] = {}
 
     patches: list[dict[str, Any]] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posts.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -7645,6 +7688,12 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
     assert [body for body in patches if "model_override" in body] == [
         {"model_override": "default"}
     ]
+    assert _posted_notices(posts, "claude_native_model_unavailable") == [
+        _info_notice(
+            "claude_native_model_unavailable",
+            "gpt-5.4 isn't served by this provider; using claude-opus-4-8[1m].",
+        )
+    ]
 
     await fake_client.aclose()
 
@@ -7655,7 +7704,7 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A pick is reset only once the fallback terminal is up.
+    A pick is reset, and the swap announced, only once the fallback terminal is up.
 
     The reset would otherwise outlive a launch that failed after the gate, so
     a tmux or bridge failure must leave the persisted pick untouched.
@@ -7688,10 +7737,13 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
             raise RuntimeError("tmux exited")
 
     patches: list[dict[str, Any]] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posts.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -7711,6 +7763,7 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
             resolve_launch_config=_resolve,
         )
     assert [body for body in patches if "model_override" in body] == []
+    assert _posted_notices(posts, "claude_native_model_unavailable") == []
 
     await fake_client.aclose()
 
@@ -7787,10 +7840,13 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     captured: dict[str, Any] = {}
 
     patches: list[dict[str, Any]] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posts.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"model_override": "claude-haiku-4-5", "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -7811,20 +7867,34 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     args = captured["spec"].args
     assert probes == [1], "the launch must await exactly one re-probe"
     pick_resets = [body for body in patches if "model_override" in body]
+    notices = _posted_notices(posts, "claude_native_model_unavailable")
     if refresh == "serves_pick":
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
         assert args[args.index("--model") + 1] == "claude-haiku-4-5"
         assert pick_resets == []
+        assert notices == []
     elif refresh == "lacks_pick":
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
         assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]"
         assert pick_resets == [{"model_override": "default"}]
+        assert notices == [
+            _info_notice(
+                "claude_native_model_unavailable",
+                "claude-haiku-4-5 isn't served by this provider; using claude-opus-4-8[1m].",
+            )
+        ]
     else:
         # No fresh rows: the stale entry stays, the Default launch of a stale
         # catalog goes bare, and the pick survives for the next relaunch.
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == stale_rows
         assert "--model" not in args
         assert pick_resets == []
+        assert notices == [
+            _info_notice(
+                "claude_native_model_unavailable",
+                "claude-haiku-4-5 isn't served by this provider; using the provider default.",
+            )
+        ]
 
     await fake_client.aclose()
 
@@ -7967,10 +8037,13 @@ async def test_auto_create_claude_terminal_validates_managed_gateway_pick(
     )
     captured: dict[str, Any] = {}
     patches: list[dict[str, Any]] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posts.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"model_override": pick, "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -7991,6 +8064,16 @@ async def test_auto_create_claude_terminal_validates_managed_gateway_pick(
     assert args[args.index("--model") + 1] == expected_model
     assert [body for body in patches if "model_override" in body] == (
         [{"model_override": "default"}] if reset_pick else []
+    )
+    assert _posted_notices(posts, "claude_native_model_unavailable") == (
+        [
+            _info_notice(
+                "claude_native_model_unavailable",
+                f"{pick} isn't served by this provider; using {expected_model}.",
+            )
+        ]
+        if reset_pick
+        else []
     )
     await fake_client.aclose()
 
@@ -8061,7 +8144,11 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
 
     captured: dict[str, Any] = {}
 
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posts.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -8089,6 +8176,9 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
             await task
         # The background re-probe healed the store for the next launch.
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
+    assert _posted_notices(posts, "claude_native_model_unavailable") == [], (
+        "a Default launch names no model, so nothing was swapped"
+    )
 
     await fake_client.aclose()
 
