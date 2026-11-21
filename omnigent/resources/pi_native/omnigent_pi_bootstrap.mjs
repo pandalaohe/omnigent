@@ -52,6 +52,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
     const before = [...result.extensions];
     for (const source of state.sources)
       if (!before.some(entry => entry.resolvedPath === source.path)) throw new Error("Native loaded identity is missing");
+    profile.restrictTools?.(before);
     const final = await this.loadExtensionFactories.call({cwd:this.cwd, eventBus:this.eventBus,
       extensionFactories:[{name:"omnigent-native-final", factory(api) {
         state.finalHook = async (event, ctx) => {
@@ -65,6 +66,10 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
         };
         api.on("tool_call", state.finalHook);
         api.on("session_start", async (_event, ctx) => {
+          state.showOmission = text => {
+            ctx.ui?.notify?.(text, "warning");
+            api.events.emit("omnigent:pi-compatibility", text);
+          };
           await state.bind(store.sessions.get(ctx.sessionManager));
           if (state.notice && !installation.notified) {
             api.sendMessage({customType:"omnigent-pi-compatibility", content:state.notice, display:true});

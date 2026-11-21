@@ -377,6 +377,22 @@ def test_scoped_registry_accepts_only_observed_tool_search_alias(tmp_path, path,
     assert runtime.acknowledge_pi_scope("session-a", admission.credential) is accepted
 
 
+@pytest.mark.parametrize("fault", ["missing-hash", "forged-hash"])
+def test_scoped_registry_rejects_bad_file_proof(tmp_path, fault):
+    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    admission = runtime.begin_pi_scope_launch("session-a", native_guard=True)
+    _write_scope_registry(admission, registry["tools"])
+    path = admission.registry_dir / "permission_tools.json"
+    published = json.loads(path.read_text())
+    tool = published["tools"][0]
+    if fault == "missing-hash":
+        del tool["source_sha256"]
+    else:
+        tool["source_sha256"] = "0" * 64
+    path.write_text(json.dumps(published))
+    assert not runtime.acknowledge_pi_scope("session-a", admission.credential)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "publication", ["pending", "ready", "changed-registry", "revoked", "state-write-retry"]
@@ -1917,7 +1933,8 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["normal", "loss", "replacement", "missing-bootstrap", "incompatible"]
+    "mode",
+    ["normal", "loss", "replacement", "missing-bootstrap", "incompatible", "omitted-sources"],
 )
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
     node, pi = shutil.which("node"), shutil.which("pi")
@@ -1931,11 +1948,11 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         ),
         None,
     )
-    if sdk is None or json.loads((sdk / "package.json").read_text()).get("version") not in (
-        "1.3.0",
-        "1.5.0",
-    ):
+    version = json.loads((sdk / "package.json").read_text()).get("version") if sdk else None
+    if sdk is None or version not in ("1.3.0", "1.5.0"):
         pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
+    if mode == "omitted-sources" and version != "1.5.0":
+        pytest.skip("Pi 1.5.0 built-in MCP is required")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(Path(__file__).with_name("pi_scoped_sdk_consumer.py")),
@@ -1954,7 +1971,7 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
             if mode == "missing-bootstrap"
             else (
                 b'"evaluate": 1, "execute": 1, "finish": 1'
-                if mode == "incompatible"
+                if mode in ("incompatible", "omitted-sources")
                 else (
                     b'"evaluate": 3, "execute": 3, "finish": 3'
                     if mode == "normal"
@@ -1963,6 +1980,14 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
             )
         )
         assert expected in output
+        if mode == "omitted-sources":
+            assert (
+                error.count(b"Scoped Pi omitted tool mcp__fixture__echo (source: builtin:mcp).")
+                == 1
+            )
+            assert (
+                error.count(b"Scoped Pi omitted tool future_fixture (source: unrecognized).") == 1
+            )
     finally:
         if process.returncode is None:
             process.kill()

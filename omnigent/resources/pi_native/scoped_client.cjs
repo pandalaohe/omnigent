@@ -286,7 +286,9 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       },
     }});
   }
-  return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose("connection_close");watch.destroy();}});
+  return Object.freeze({bind:values=>control("bind",values),
+    reportOmittedTools:values=>control("omitted_tools",values),
+    client,close:()=>{lose("connection_close");watch.destroy();}});
 }
 
 async function connectFromHandoff(locator, {timeoutMs=120000}={}) {

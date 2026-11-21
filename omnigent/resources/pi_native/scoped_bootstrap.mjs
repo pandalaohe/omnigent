@@ -23,6 +23,7 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
   }
   const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
   const loaders = new WeakMap(), registrations = new Map();
+  const reportedOmissions = new Map();
   let rootLoader, apiPromise;
   const runtimeInputs = ["scoped_bootstrap.mjs", "scoped_client.cjs", "native_support.cjs",
     "omnigent_pi_bootstrap.mjs", "permission_tool_registry.cjs"].map(name => support.snapshot(path.join(resources, name)));
@@ -53,7 +54,13 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       if (!loaders.has(loader)) loaders.set(loader, randomUUID());
       if (!Array.isArray(loader.additionalExtensionPaths)) throw new Error("Native SDK loader layout unavailable");
       if (!loader.additionalExtensionPaths.includes(guard)) loader.additionalExtensionPaths.push(guard);
-      return {getState:readState, bridgeDir};
+      const omitted = new Map();
+      const profile = {getState:readState, bridgeDir, omitted,
+        restrictTools: extensions => registry.restrictExtensionTools(extensions, guard, (name, kind) => {
+          if (profile.reportOmissions) profile.reportOmissions([[name, kind]]);
+          else omitted.set(name, kind);
+        })};
+      return profile;
     },
     async describeSession(session, state) {
       const handle = randomUUID();
@@ -66,6 +73,22 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       }));
       const binding = await connection.bind({loader:loaders.get(session.resourceLoader), handle, registry:published});
       if (binding.ready !== true) throw new Error("Native registry acknowledgement unavailable");
+      state.profile.reportOmissions = entries => {
+        const sessionId = session.sessionManager.getSessionId();
+        const reported = reportedOmissions.get(sessionId) || new Set();
+        reportedOmissions.set(sessionId, reported);
+        const tools = entries.filter(([name]) => {
+          if (reported.has(name)) return false;
+          reported.add(name);
+          return true;
+        });
+        if (!tools.length) return;
+        void connection.reportOmittedTools({handle, tools}).then(({notices}) => {
+          for (const text of notices) state.showOmission?.(text);
+        }).catch(() => {});
+      };
+      state.profile.reportOmissions([...state.profile.omitted]);
+      state.profile.omitted.clear();
       const pkg = await packageApi(session);
       if (pkg && !pkg.unavailable) {
         const id = session.sessionManager.getSessionId();

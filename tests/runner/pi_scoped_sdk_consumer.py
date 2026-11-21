@@ -200,7 +200,7 @@ async def main():
                 if mode == "missing-bootstrap"
                 else (
                     {"evaluate": 1, "execute": 1, "finish": 1}
-                    if mode == "incompatible"
+                    if mode in ("incompatible", "omitted-sources")
                     else (
                         {"evaluate": 3, "execute": 3, "finish": 3}
                         if mode == "normal"
