@@ -104,11 +104,7 @@ from omnigent.provider_usage_limits import (
     pi_provider_usage_limits_from_headers,
     validate_provider_usage_limits_snapshot,
 )
-from omnigent.runner.launch_failure import (
-    CODEX_NATIVE_MODEL_UNLISTED,
-    RUNNER_PROCESS_CRASH,
-    codex_model_unlisted_notice,
-)
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -4222,6 +4218,10 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+#: Info notice for a started Codex thread running an explicit pick its model list lacks.
+_CODEX_NATIVE_MODEL_UNLISTED_CODE = "codex_native_model_unlisted"
+
+
 async def _persist_unlisted_model_notice(
     session_id: str,
     thread_id: str,
@@ -4229,40 +4229,43 @@ async def _persist_unlisted_model_notice(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Post the info notice for a started Codex thread running an unlisted model pick.
+    Post the info notice for a bound Codex thread running an unlisted model pick.
 
-    The item id derives from the session and thread, so a retried binding posts
-    nothing new. A failed write loses only the notice, never the binding.
+    Best effort, after the binding is recorded: the item id derives from the
+    session and thread, so a retried binding posts nothing new, and a failed
+    write or publish only loses the notice.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param thread_id: The started Codex thread the binding names.
+    :param thread_id: The Codex thread the binding recorded.
     :param model: The pick the launch ran as requested, e.g. ``"router-a/gpt-6.2-sol"``.
     :param conversation_store: Store used for the durable append.
     """
-    notice_key = f"{CODEX_NATIVE_MODEL_UNLISTED}:{session_id}:{thread_id}"
+    notice_key = f"{_CODEX_NATIVE_MODEL_UNLISTED_CODE}:{session_id}:{thread_id}"
     item = NewConversationItem(
         type="error",
         response_id=generate_task_id(),
         data=ErrorData(
             source="execution",
-            code=CODEX_NATIVE_MODEL_UNLISTED,
-            message=codex_model_unlisted_notice(model),
+            code=_CODEX_NATIVE_MODEL_UNLISTED_CODE,
+            message=(
+                f"{model} isn't in this host's Codex model list; launched as requested. "
+                "If the provider rejects it, this turn fails."
+            ),
             level="info",
         ),
         stable_id=hashlib.sha256(notice_key.encode()).hexdigest()[:32],
     )
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+        if persisted and not persisted[0].deduplicated:
+            _publish_external_conversation_item(session_id, persisted[0])
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "Failed to persist unlisted-model notice for session %s",
+            "Failed to post unlisted-model notice for session %s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
-    if persisted and not persisted[0].deduplicated:
-        _publish_external_conversation_item(session_id, persisted[0])
 
 
 def _question_card_image_ids(result: ElicitationResult) -> list[str]:

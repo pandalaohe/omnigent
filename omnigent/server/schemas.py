@@ -3109,9 +3109,9 @@ class UpdateSessionRequest(BaseModel):
     :param unlisted_model: Explicit model pick a codex-native launch ran as
         requested although its live model list did not name it, e.g.
         ``"router-a/gpt-6.2-sol"``. Only valid with ``external_session_id``,
-        which a runner sends once that thread started: the server posts one
-        info notice per thread naming the model, so only a launch whose thread
-        started shows it. ``None`` posts nothing.
+        which a runner sends once that thread started: after recording that
+        binding the server posts one best-effort info notice per thread naming
+        the model. ``None`` posts nothing.
     :param terminal_launch_args: Per-session native-terminal
         pass-through args, e.g. ``["--dangerously-skip-permissions"]``.
         Updating this field requires session ownership.

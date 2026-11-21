@@ -49,19 +49,6 @@ def _unavailable_notice(pick: str, launched: str) -> dict[str, str]:
     }
 
 
-def _unlisted_notice(pick: str) -> dict[str, str]:
-    """The in-session notice a launch posts when it runs a pick its live list lacks."""
-    return {
-        "source": "execution",
-        "code": "codex_native_model_unlisted",
-        "message": (
-            f"{pick} isn't in this host's Codex model list; launched as requested. "
-            "If the provider rejects it, this turn fails."
-        ),
-        "level": "info",
-    }
-
-
 @dataclass
 class _LaunchHarness:
     """A real runner launch with scripted provider configuration and processes."""
@@ -812,74 +799,6 @@ async def test_unlisted_pick_keeps_its_resolved_model_config(
     harness.workspace_models.assert_not_called()
 
 
-def _resume_known_thread(
-    harness: _LaunchHarness,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    preload: AsyncMock | None = None,
-) -> AsyncMock:
-    """Make the launch resume a known Codex thread through a scripted preload."""
-    harness.snapshot["external_session_id"] = "019e96aa-0be2-7343-8d3b-6f914d60936c"
-    preload = preload or AsyncMock()
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
-    )
-    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
-    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
-    return preload
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 500])
-async def test_failed_notice_post_keeps_successfully_launched_terminal(
-    status: int,
-    codex_launch_harness: _LaunchHarness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resumed launch's failed notice post keeps the terminal and the pick; never PATCH."""
-    harness = codex_launch_harness
-    _resume_known_thread(harness, monkeypatch)
-    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
-    harness.response_status["notice"] = status
-
-    resource = await harness.launch()
-
-    assert resource.id == "terminal_codex_main"
-    assert harness.resets == []
-    assert harness.notices == [_unlisted_notice(_RETIRED_PICK)]
-    assert harness.snapshot["model_override"] == _RETIRED_PICK
-    assert harness.builds[0]["model"] == _RETIRED_PICK
-    harness.app_server.close.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_closed_notice_client_keeps_successfully_launched_terminal(
-    codex_launch_harness: _LaunchHarness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A client closed during terminal startup cannot turn the notice into launch failure."""
-    harness = codex_launch_harness
-    _resume_known_thread(harness, monkeypatch)
-    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
-    launch_terminal = harness.registry.launch_auxiliary_terminal.side_effect
-
-    async def launch_and_close_client(**kwargs: Any) -> SessionResourceView:
-        resource = await launch_terminal(**kwargs)
-        await harness.server_client.aclose()
-        return resource
-
-    harness.registry.launch_auxiliary_terminal.side_effect = launch_and_close_client
-
-    resource = await harness.launch()
-
-    assert resource.id == "terminal_codex_main"
-    assert harness.resets == []
-    assert harness.notices == []
-    assert harness.snapshot["model_override"] == _RETIRED_PICK
-    assert harness.builds[0]["model"] == _RETIRED_PICK
-    harness.app_server.close.assert_not_awaited()
-
-
 @pytest.mark.asyncio
 async def test_conditional_reset_still_propagates_cancellation(
     codex_launch_harness: _LaunchHarness,
@@ -932,38 +851,30 @@ async def test_subscription_unlisted_pick_launches_as_requested(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preload_fails", [False, True])
-async def test_resumed_unlisted_launch_notices_only_if_preload_and_terminal_succeed(
-    preload_fails: bool,
+async def test_resumed_unlisted_launch_runs_the_pick_without_a_notice(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed known-thread preload keeps the selection and posts no notice."""
+    """A known thread got its notice when it first started; resuming it posts none."""
     harness = codex_launch_harness
-    preload = _resume_known_thread(
-        harness,
-        monkeypatch,
-        preload=AsyncMock(
-            side_effect=RuntimeError("preload unavailable") if preload_fails else None
-        ),
-    )
+    harness.snapshot["external_session_id"] = "019e96aa-0be2-7343-8d3b-6f914d60936c"
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    preload = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    )
+    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
+    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
 
-    if preload_fails:
-        with pytest.raises(RuntimeError, match="preload unavailable"):
-            await harness.launch()
-        harness.app_server.close.assert_awaited_once()
-        harness.registry.launch_auxiliary_terminal.assert_not_awaited()
-    else:
-        await harness.launch()
-        harness.registry.launch_auxiliary_terminal.assert_awaited_once()
+    resource = await harness.launch()
 
+    assert resource.id == "terminal_codex_main"
     preload.assert_awaited_once()
     assert harness.builds[0]["model"] == _RETIRED_PICK
+    assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.resets == []
-    # A known thread binds no new thread, so the runner posts the notice itself, once.
     assert harness.unlisted_bindings == []
-    assert harness.notices == ([] if preload_fails else [_unlisted_notice(_RETIRED_PICK)])
+    assert harness.notices == []
 
 
 _FORK_PICK = "system.ai.gpt-6-1-sol"

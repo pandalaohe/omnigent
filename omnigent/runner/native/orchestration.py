@@ -7154,7 +7154,8 @@ async def _auto_create_codex_terminal(
                 apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
-                # The server posts the notice once it records the started thread.
+                # The server posts the notice once it records the started thread; a
+                # resumed thread got its notice when it first started.
                 unlisted_model=unlisted_pick,
             )
             if launch_config.external_session_id is None
@@ -7186,19 +7187,6 @@ async def _auto_create_codex_terminal(
             server_client=server_client,
             code="codex_native_model_unavailable",
             notice=model_reset_notice,
-        )
-    if unlisted_pick is not None and launch_config.external_session_id is not None:
-        from omnigent.runner.launch_failure import (
-            CODEX_NATIVE_MODEL_UNLISTED,
-            codex_model_unlisted_notice,
-        )
-
-        # A known thread was preloaded and published before its terminal started.
-        await _post_native_launch_notice(
-            session_id=session_id,
-            server_client=server_client,
-            code=CODEX_NATIVE_MODEL_UNLISTED,
-            notice=codex_model_unlisted_notice(unlisted_pick),
         )
 
     # A prompt a previous launch blocked for routing but never got to replay

@@ -6038,7 +6038,7 @@ async def test_thread_binding_with_an_unlisted_model_posts_one_notice_per_thread
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runner's started-thread binding naming its unlisted pick posts one info notice."""
+    """A recorded thread binding naming its unlisted pick posts one info notice."""
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
@@ -6055,7 +6055,7 @@ async def test_thread_binding_with_an_unlisted_model_posts_one_notice_per_thread
             path, json={"external_session_id": "sid-1", "unlisted_model": pick}
         )
         assert bound.status_code == 200, bound.text
-    # A later thread the row cannot bind still started, so that launch says so too.
+    # A thread the row cannot bind keeps its original 400 and posts nothing.
     conflict = await client.patch(
         path, json={"external_session_id": "sid-2", "unlisted_model": pick}
     )
@@ -6077,15 +6077,97 @@ async def test_thread_binding_with_an_unlisted_model_posts_one_notice_per_thread
     }
     items = (await client.get(f"{path}/items")).json()["data"]
     errors = [{key: item.get(key) for key in notice} for item in items if item["type"] == "error"]
-    assert errors == [notice, notice]
+    assert errors == [notice]
     live = [
         (sid, event["item"]["code"])
         for sid, event in published
         if event.get("type") == "response.output_item.done" and event["item"]["type"] == "error"
     ]
-    assert live == [(session["id"], notice["code"])] * 2
+    assert live == [(session["id"], notice["code"])]
     listed_items = (await client.get(f"/v1/sessions/{listed['id']}/items")).json()["data"]
     assert [item for item in listed_items if item["type"] == "error"] == []
+
+
+def _is_unlisted_model_notice(items: list[Any]) -> bool:
+    """Whether a store append carries the unlisted-model notice."""
+    return any(getattr(item.data, "code", None) == "codex_native_model_unlisted" for item in items)
+
+
+@pytest.mark.parametrize("failure", ["append", "publish"])
+async def test_failed_unlisted_model_notice_never_changes_the_binding(
+    failure: str,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A notice write or publish that fails leaves the binding and its 200 untouched."""
+    from omnigent.server.routes._sessions import orchestration as session_orchestration
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    if failure == "append":
+        append = SqlAlchemyConversationStore.append
+
+        def failing_append(self: Any, session_id: str, items: list[Any], **kwargs: Any) -> Any:
+            if _is_unlisted_model_notice(items):
+                raise RuntimeError("store unavailable")
+            return append(self, session_id, items, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "append", failing_append)
+    else:
+
+        def failing_publish(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("stream unavailable")
+
+        monkeypatch.setattr(
+            session_orchestration, "_publish_external_conversation_item", failing_publish
+        )
+
+    resp = await client.patch(
+        path, json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["external_session_id"] == "sid-1"
+    assert (await client.get(path)).json()["external_session_id"] == "sid-1"
+
+
+async def test_stuck_unlisted_model_notice_never_holds_back_the_binding(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The binding lands before the notice write, so a stuck write cannot change who binds."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    notice_entered = threading.Event()
+    release_notice = threading.Event()
+    append = SqlAlchemyConversationStore.append
+
+    def stuck_append(self: Any, session_id: str, items: list[Any], **kwargs: Any) -> Any:
+        if _is_unlisted_model_notice(items):
+            notice_entered.set()
+            release_notice.wait(timeout=10)
+        return append(self, session_id, items, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", stuck_append)
+    first = asyncio.create_task(
+        client.patch(
+            path, json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"}
+        )
+    )
+    try:
+        assert await asyncio.to_thread(notice_entered.wait, 10)
+        # The first thread is already bound while its notice write is stuck.
+        later = await client.patch(path, json={"external_session_id": "sid-2"})
+        assert later.status_code == 400, later.text
+        assert (await client.get(path)).json()["external_session_id"] == "sid-1"
+    finally:
+        release_notice.set()
+    assert (await first).status_code == 200
 
 
 async def test_create_session_returns_null_external_session_id(

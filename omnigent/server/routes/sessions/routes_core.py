@@ -7807,14 +7807,6 @@ def register_core_routes(
                 session_id,
                 requested_codex_collaboration_mode,
             )
-        if body.unlisted_model is not None and body.external_session_id is not None:
-            # A runner names a thread only once it started, even one it cannot bind.
-            await _persist_unlisted_model_notice(
-                session_id,
-                body.external_session_id,
-                body.unlisted_model,
-                conversation_store,
-            )
         if body.external_session_id is not None:
             try:
                 await asyncio.to_thread(
@@ -7835,6 +7827,14 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+            if body.unlisted_model is not None:
+                # Only after the binding: the notice can never change who binds.
+                await _persist_unlisted_model_notice(
+                    session_id,
+                    body.external_session_id,
+                    body.unlisted_model,
+                    conversation_store,
+                )
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
