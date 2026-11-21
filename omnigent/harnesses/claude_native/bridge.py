@@ -421,6 +421,10 @@ _message_readiness_deadline: ContextVar[float | None] = ContextVar(
 _message_delivery_claim: ContextVar[Callable[[float], Future[bool]] | None] = ContextVar(
     "claude_native_message_delivery_claim", default=None
 )
+# Set once the message got past its claim; later retries under the budget keep the claimed path.
+_message_claim_passed: ContextVar[threading.Event | None] = ContextVar(
+    "claude_native_message_claim_passed", default=None
+)
 
 
 @contextlib.contextmanager
@@ -436,9 +440,11 @@ def message_readiness_budget(
         time.monotonic() + (MESSAGE_READINESS_TIMEOUT_S if timeout_s is None else timeout_s)
     )
     claim_token = _message_delivery_claim.set(claim)
+    claim_passed_token = _message_claim_passed.set(threading.Event())
     try:
         yield
     finally:
+        _message_claim_passed.reset(claim_passed_token)
         _message_delivery_claim.reset(claim_token)
         _message_readiness_deadline.reset(token)
 
@@ -5727,7 +5733,7 @@ def _inject_user_message_into_pane(
         timeout_s=message_readiness_remaining(),
         bridge_dir=bridge_dir,
         extend_for_slow_boot=False,
-        queue_when_busy=True,
+        queue_when_busy=not _claim_passed(),
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -5819,6 +5825,11 @@ def _claim_message_delivery() -> None:
     raise ClaudeDeliveryClaimRefused("The message could no longer be claimed for delivery.")
 
 
+def _claim_passed() -> bool:
+    claim_passed = _message_claim_passed.get()
+    return claim_passed is not None and claim_passed.is_set()
+
+
 def _pane_runs_a_turn(bridge_dir: Path) -> bool:
     return has_running_turn(bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir))
 
@@ -5890,7 +5901,7 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     owner = _MESSAGE_PANE.get()
-    if owner is not None and not owner.wrote_paste:
+    if owner is not None and not owner.wrote_paste and not _claim_passed():
         # The box can hide again after the readiness gate; nothing is claimed or typed yet.
         pane = _capture_pane(socket_path, tmux_target)
         if (
@@ -5904,6 +5915,8 @@ def _paste_and_submit(
     tail_needle = (_submit_tail_needle(text) or _submit_cross_line_tail(text)) if needle else ""
     _check_message_readiness_budget()
     _claim_message_delivery()
+    if (claim_passed := _message_claim_passed.get()) is not None:
+        claim_passed.set()
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.

@@ -225,6 +225,51 @@ def test_box_hidden_after_the_readiness_gate_requeues_only_before_the_claim(
     assert claims == ([] if refused else [True])
 
 
+def test_retry_of_a_claimed_message_is_not_handed_back_when_the_box_hides(
+    clock: _Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    pane = _READY_PANE
+    readiness_queues: list[bool] = []
+    claims: list[bool] = []
+    clears: list[bool] = []
+
+    class _Typed(Exception):
+        pass
+
+    def ready(*_args: object, queue_when_busy: bool = False, **_kwargs: object) -> None:
+        readiness_queues.append(queue_when_busy)
+
+    def clear(*_args: object, **_kwargs: object) -> None:
+        clears.append(True)
+        if len(clears) == 1:
+            raise bridge.ClaudeComposerNotCleared("Claude's input box hid before it was cleared.")
+        raise _Typed
+
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda *_: False)
+    monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
+    monkeypatch.setattr(bridge, "_claim_message_delivery", lambda: claims.append(True))
+    monkeypatch.setattr(bridge, "_clear_composer", clear)
+
+    with bridge.message_readiness_budget(30.0):
+        # Claimed, then the box hid before the clear: the turn holds and retries.
+        with pytest.raises(bridge.ClaudeComposerNotCleared):
+            bridge.inject_user_message(bridge_dir, content="hello")
+        pane = _OVERDRAWN_PANE
+        # The retry keeps the claimed message on its own path instead of requeueing it.
+        with pytest.raises(_Typed):
+            bridge.inject_user_message(bridge_dir, content="hello")
+
+    assert readiness_queues == [True, False]
+    assert claims == [True, True]
+
+
 def test_repaint_requests_reach_the_delivery_summary(
     clock: _Clock,
     tmp_path: Path,

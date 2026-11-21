@@ -28185,33 +28185,63 @@ describe("a send cut off by a reload", () => {
     expect(peekRestoredSend("conv_reload")).toBeNull();
   });
 
-  it("tracks a reloaded draft once identity names its sender", async () => {
-    vi.mocked(getCurrentUserId).mockReturnValue(null);
-    let identityChanged: (() => void) | undefined;
-    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
-      identityChanged = listener;
-      return () => {};
-    });
-    seedSession("conv_reload", [
-      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
-    ]);
-    rememberRestoredSend("conv_reload", {
-      stableId: "stable_restored",
-      text: "rerun the failing test",
-      authorId: "user_a",
-    });
+  it.each([
+    ["the sender", "user_a"],
+    ["another account", "user_b"],
+  ])(
+    "settles a receipt that beats identity, then keeps the draft only for %s",
+    async (_viewer, viewerId) => {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+      let identityChanged: (() => void) | undefined;
+      vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+        identityChanged = listener;
+        return () => {};
+      });
+      // The snapshot holds no proof yet; the receipt arrives before `/v1/me` answers.
+      seedSession("conv_reload", []);
+      rememberRestoredSend("conv_reload", {
+        stableId: "stable_restored",
+        text: "rerun the failing test",
+        authorId: "user_a",
+      });
 
-    await useChatStore.getState().switchTo("conv_reload");
-    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      await useChatStore.getState().switchTo("conv_reload");
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId: "stable_restored",
+        delivered: false,
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "1".repeat(32),
+        itemType: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "rerun the failing test" }],
+          web_stable_id: "stable_restored",
+        },
+        createdBy: "user@example.com",
+        webStableId: "stable_restored",
+      });
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId: "stable_restored",
+        delivered: true,
+      });
 
-    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
-    identityChanged!();
+      vi.mocked(getCurrentUserId).mockReturnValue(viewerId);
+      identityChanged!();
 
-    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
-      stableId: "stable_restored",
-      delivered: true,
-    });
-  });
+      if (viewerId === "user_a") {
+        expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+          stableId: "stable_restored",
+          delivered: true,
+        });
+        expect(peekRestoredSend("conv_reload")?.stableId).toBe("stable_restored");
+      } else {
+        expect(useChatStore.getState().restoredSendDraft).toBeNull();
+        expect(peekRestoredSend("conv_reload")).toBeNull();
+      }
+    },
+  );
 
   it("keeps each queued message for the next load until it leaves the queue", async () => {
     seedSession("conv_queue", []);

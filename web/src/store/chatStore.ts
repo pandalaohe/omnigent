@@ -140,6 +140,7 @@ import {
   rememberQueuedSends,
   rememberRestoredSend,
   rememberUnsentSend,
+  type RestoredSend,
 } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -8960,16 +8961,13 @@ function restoredSendAfterReload(
   const send = peekRestoredSend(conversationId);
   if (send === null) return null;
   const viewerId = getCurrentUserId();
-  // The viewer can't be checked before identity resolves; try again once it does.
-  if (viewerId === null) {
-    trackRestoredSendOnceIdentified(conversationId, items);
-    return null;
-  }
   // Another account may have signed in to this tab since.
-  if (send.authorId !== viewerId) {
+  if (viewerId !== null && send.authorId !== viewerId) {
     forgetRestoredSend(conversationId);
     return null;
   }
+  // Tracked from the bind on, so a receipt that beats `/v1/me` still retracts the text.
+  if (viewerId === null) dropRestoredSendOnceForeign(conversationId, send);
   return {
     conversationId,
     stableId: send.stableId,
@@ -8982,25 +8980,24 @@ function restoredSendAfterReload(
 }
 
 /**
- * Finish tracking a reloaded draft `restoredSendAfterReload` put off until `/v1/me`
- * names the viewer, as `restoreUnsentSendOnceIdentified` does for unsent text.
+ * Drop a reloaded draft's record and tracker once `/v1/me` names an account other
+ * than its sender; the sender keeps both.
  *
- * @param conversationId - The session whose bind put the tracking off.
- * @param items - That bind's snapshot items.
+ * @param conversationId - The session whose bind tracked the send.
+ * @param send - The restored send the bind tracked.
  */
-function trackRestoredSendOnceIdentified(
-  conversationId: string,
-  items: readonly ConversationItem[],
-): void {
+function dropRestoredSendOnceForeign(conversationId: string, send: RestoredSend): void {
   const unsubscribe = subscribeIdentity(() => {
-    if (getCurrentUserId() === null) return;
+    const viewerId = getCurrentUserId();
+    if (viewerId === null) return;
     unsubscribe();
-    // An evicted session keeps the record for its next bind.
+    if (viewerId === send.authorId) return;
+    if (peekRestoredSend(conversationId)?.stableId === send.stableId) {
+      forgetRestoredSend(conversationId);
+    }
     if (isConversationDisposed(conversationId)) return;
-    const tracker = restoredSendAfterReload(conversationId, items);
-    if (tracker === null) return;
     setterFor(conversationId)((state) =>
-      state.restoredSendDraft === null ? { restoredSendDraft: tracker } : {},
+      state.restoredSendDraft?.stableId === send.stableId ? { restoredSendDraft: null } : {},
     );
   });
 }
