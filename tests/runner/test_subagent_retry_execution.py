@@ -480,8 +480,10 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
 @pytest.mark.parametrize("accepted", [True, False])
+# A steered input's refusal in the same response must not change the opener's outcome.
+@pytest.mark.parametrize("steered", [False, True])
 async def test_refused_turn_input_ends_turn_without_failure_or_result(
-    monkeypatch, native, accepted
+    monkeypatch, native, accepted, steered
 ):
     from omnigent.runner import app as runner_app
     from omnigent.runner.subagent_work import _SubagentDeliveryAck
@@ -517,10 +519,19 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             return await super().post(url, **kwargs)
 
     event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
+    # An unregistered steered input is refused at the receiver without a server call.
+    steer = InputExecutionClaimEvent(
+        claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
+    )
     frames = [
         'event: response.created\ndata: {"type":"response.created",'
         '"response":{"id":"resp_multiturn"}}\n\n',
         "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
+        *(
+            ["event: input.execution.claim\ndata: " + json.dumps(steer.model_dump()) + "\n\n"]
+            if steered
+            else []
+        ),
         'event: response.completed\ndata: {"type":"response.completed",'
         '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
     ]
@@ -553,6 +564,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
         assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
     else:
         assert (started, terminals) == ([], [])
+    assert app.state.refused_turn_inputs == set()
 
 
 @pytest.mark.asyncio
@@ -560,7 +572,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
 async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end):
     deadline = time.time() + 30
     input_id, session_id = "f" * 32, "child"
-    newer = (session_id, "resp_newer")
+    newer = (session_id, "resp_newer", "b" * 32)
     claim = InputExecutionClaim(
         input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
     )
@@ -594,7 +606,7 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
         process_manager=_FakeProcessManager(Harness(frames)), server_client=Server()
     )
     # A newer turn's marker, recorded before this older stream ends.
-    app.state.refused_turn_inputs[newer] = "b" * 32
+    app.state.refused_turn_inputs.add(newer)
     async with _runner_test_client(app) as client:
         await client.post(
             f"/v1/sessions/{session_id}/events?stream=true",
@@ -608,7 +620,7 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
                 "input_admission_deadline": deadline,
             },
         )
-    assert app.state.refused_turn_inputs == {newer: "b" * 32}
+    assert app.state.refused_turn_inputs == {newer}
 
 
 @pytest.mark.asyncio
