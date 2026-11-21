@@ -42,6 +42,9 @@ class _Clock:
     def monotonic(self) -> float:
         return self.now
 
+    def time(self) -> float:
+        return self.now
+
     def sleep(self, seconds: float) -> None:
         self.now += seconds
 
@@ -121,6 +124,54 @@ def test_unanswered_repaint_is_not_counted(clock: _Clock, monkeypatch: pytest.Mo
         bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "main", timeout_s=30.0)
 
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    ("queue_when_busy", "running"),
+    [(True, True), (True, False), (False, True)],
+    ids=["message-busy-pane", "message-idle-pane", "command-busy-pane"],
+)
+def test_busy_pane_that_hides_its_box_hands_a_message_back_instead_of_timing_out(
+    clock: _Clock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    queue_when_busy: bool,
+    running: bool,
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_tmux_target(
+        bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0"
+    )
+    repainted_at: list[float] = []
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(
+        bridge, "_request_claude_repaint", lambda *_: repainted_at.append(clock.now) or 1
+    )
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: running)
+
+    def wait() -> None:
+        bridge._wait_for_claude_prompt_ready(
+            "/tmp/test.sock",
+            "main",
+            timeout_s=30.0,
+            bridge_dir=bridge_dir,
+            extend_for_slow_boot=False,
+            queue_when_busy=queue_when_busy,
+        )
+
+    if queue_when_busy and running:
+        with pytest.raises(bridge.ClaudeInputBoxBusy):
+            wait()
+        # Refused on the first capture after the repaint, long before the budget.
+        assert [round(at) for at in repainted_at] == [5]
+        assert clock.now < 6.0
+    else:
+        # An idle pane, or a command's own wait, keeps today's readiness timeout.
+        with pytest.raises(bridge.ClaudePromptTimeout):
+            wait()
+        assert clock.now >= 30.0
 
 
 def test_repaint_requests_reach_the_delivery_summary(

@@ -7588,7 +7588,8 @@ def create_runner_app(
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif sign_in_hold:
-            # Nothing failed: the queued message is sent once the sign-in completes.
+            # Nothing failed: the queued message is sent once the sign-in completes
+            # or the busy pane's input box is usable.
             pass
         elif delivery_unknown:
             # The native CLI has its own lifecycle stream. A missing admission
@@ -8174,6 +8175,42 @@ def create_runner_app(
             # refusal stands, and so do those of the messages queued during the wait.
             return False
         return True
+
+    def _holds_for_busy_pane(conv_id: str, error: Mapping[str, Any] | None) -> bool:
+        """
+        Return whether a turn's refusal goes back to the queue for a busy Claude pane.
+
+        The pane hid its input box after the queue let the message through, before
+        anything was typed. Queued, it waits outside the delivery's readiness budget.
+
+        :param conv_id: Session whose background turn was refused.
+        :param error: The harness ``response.failed`` error.
+        :returns: ``True`` when the message should be queued again.
+        """
+        from omnigent.harnesses.claude_native.bridge import ClaudeInputBoxBusy
+
+        return (
+            error is not None
+            and error.get("code") == ClaudeInputBoxBusy.code
+            and bool(error.get("undelivered"))
+            and _session_harness_name(conv_id) == "claude-native"
+            and conv_id in _turn_message_bodies
+            and conv_id not in _interrupted_sessions
+        )
+
+    def _requeue_message_for_busy_pane(conv_id: str) -> None:
+        """Queue a message the busy pane refused first again, for the prompt waiter."""
+        body = _turn_message_bodies[conv_id]
+        history = _session_histories.get(conv_id)
+        if history and history[-1].get("content") == body.get("content"):
+            # The queue records the message again when it sends it.
+            history.pop()
+        _session_message_buffers.setdefault(conv_id, []).insert(0, body)
+        _logger.info(
+            "Queueing a message for %s again until Claude's input box is usable",
+            conv_id,
+            extra={"session_id": conv_id, "event_name": "native_input_held_for_busy_pane"},
+        )
 
     def _is_sub_agent_session(conv_id: str) -> bool:
         """Return whether *conv_id* runs a sub-agent dispatch rather than a main session."""
@@ -11024,12 +11061,12 @@ def create_runner_app(
             _terminal_response_type: str | None = None
             _dispatch_tasks: list[_asyncio.Task[object]] = []
             _stream_failed_error: _JsonObject | None = None
-            # A sign-in refusal kept from the chat while its message waits to be resent.
+            # A sign-in or busy-pane refusal kept from the chat while its message waits.
             _held_refusal: _JsonObject | None = None
             _held_body: _JsonObject | None = None
 
             def _report_held_refusal() -> None:
-                """Publish a kept sign-in refusal as the harness sent it: nothing is held."""
+                """Publish a kept refusal as the harness sent it: nothing is held."""
                 nonlocal _held_refusal
                 if _held_refusal is None:
                     return
@@ -11084,7 +11121,10 @@ def create_runner_app(
                     _report_held_refusal()
                 holding = _held_refusal is not None and _stream_failed_error is not None
                 if holding:
-                    _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                    if _stream_failed_error.get("code") == "databricks_sign_in_pending":
+                        _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                    else:
+                        _requeue_message_for_busy_pane(conv_id)
                     _held_refusal = None
                 if lifecycle_event is not None:
                     _publish_event(conv_id, lifecycle_event)
@@ -11376,10 +11416,14 @@ def create_runner_app(
                                     if (
                                         dispatch is not None
                                         and _owns_live_turn()
-                                        and _holds_for_sign_in(conv_id, _stream_failed_error)
+                                        and (
+                                            _holds_for_sign_in(conv_id, _stream_failed_error)
+                                            or _holds_for_busy_pane(conv_id, _stream_failed_error)
+                                        )
                                     ):
                                         # Neither fail the turn nor mark the message
-                                        # undelivered: it is sent after the sign-in.
+                                        # undelivered: it is sent after the sign-in,
+                                        # or once the busy pane's input box is usable.
                                         _held_refusal = event
                                         _held_body = _turn_message_bodies.get(conv_id)
                                         continue

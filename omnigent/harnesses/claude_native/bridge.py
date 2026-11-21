@@ -933,6 +933,12 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
+class ClaudeInputBoxBusy(ClaudeMessageNotAccepted):
+    """A working pane hid its input box before anything was typed; the runner queues it again."""
+
+    code = "claude_input_busy"
+
+
 class ClaudeSubmitBlockedUnconfirmed(ClaudeDeliveryUnconfirmed):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
@@ -5715,6 +5721,7 @@ def _inject_user_message_into_pane(
         timeout_s=message_readiness_remaining(),
         bridge_dir=bridge_dir,
         extend_for_slow_boot=False,
+        queue_when_busy=True,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -9713,6 +9720,7 @@ def _wait_for_claude_prompt_ready(
     timeout_s: float,
     bridge_dir: Path | None = None,
     extend_for_slow_boot: bool = True,
+    queue_when_busy: bool = False,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -9747,7 +9755,11 @@ def _wait_for_claude_prompt_ready(
         time). A slow boot then fails the wait instead of outliving the request,
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
+    :param queue_when_busy: Refuse a message while a running turn keeps the
+        box hidden past the first repaint, so the runner queues it again.
     :returns: None.
+    :raises ClaudeInputBoxBusy: With *queue_when_busy*, if a running turn keeps
+        the input box hidden after a repaint was requested. Nothing was typed.
     :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
         process exited, carrying its wait-status so a clean quit is
         distinguishable from a crash, or tmux no longer reports the pane
@@ -9799,6 +9811,8 @@ def _wait_for_claude_prompt_ready(
     waited_on_password = False
     waited_on_install = False
     waited_on_tall_draft = False
+    # Set once a repaint was tried; the busy check then reads post-repaint captures.
+    busy_check_at: float | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -9934,6 +9948,8 @@ def _wait_for_claude_prompt_ready(
                 repaint_requests += 1
                 delivery_diagnostics.record_readiness(prompt_repaint_requests=repaint_requests)
             next_repaint = time.monotonic() + _CLAUDE_REPAINT_INTERVAL_S
+            if queue_when_busy and busy_check_at is None:
+                busy_check_at = time.monotonic()
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -9941,6 +9957,22 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if (
+            busy_check_at is not None
+            and now >= busy_check_at
+            and not tall_draft
+            and bridge_dir is not None
+        ):
+            # The runner queues input for a busy pane without a usable box; a box
+            # that hid after its check goes back there instead of spending this budget.
+            if has_running_turn(
+                bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
+            ):
+                raise ClaudeInputBoxBusy(
+                    "Claude Code's input box is hidden while it works, so the message "
+                    "was not delivered." + _format_terminal_failure_tail(pane)
+                )
+            busy_check_at = now + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         if time.monotonic() >= hard_deadline:
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)

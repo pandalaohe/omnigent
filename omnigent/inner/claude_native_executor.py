@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeDeliveryClaimRefused,
     ClaudeDeliveryOwner,
     ClaudeDeliveryUnconfirmed,
+    ClaudeInputBoxBusy,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
@@ -809,6 +810,12 @@ class ClaudeNativeExecutor(Executor):
                 preserve_session=True,
             )
             return
+        except ClaudeInputBoxBusy as exc:
+            # Nothing was typed; the runner queues the message until the box is usable.
+            yield ExecutorError(
+                message=str(exc), code=exc.code, undelivered=True, preserve_session=True
+            )
+            return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
             # The terminal may still launch, or its unsent draft may be recoverable.
             _logger.warning(
@@ -843,6 +850,9 @@ class ClaudeNativeExecutor(Executor):
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
             if paste_started.is_set():
+                if not worker.cancelled() and worker.exception() is None:
+                    # The worker confirmed the submit before it saw the cancel.
+                    raise
                 raise ClaudeDeliveryUnconfirmed(
                     "Claude delivery was interrupted after the paste started. "
                     "The message may already be queued or running."
