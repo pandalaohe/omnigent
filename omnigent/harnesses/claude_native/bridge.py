@@ -5890,10 +5890,15 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     owner = _MESSAGE_PANE.get()
-    if owner is not None and not owner.wrote_paste and _pane_runs_a_turn(bridge_dir):
+    if owner is not None and not owner.wrote_paste:
         # The box can hide again after the readiness gate; nothing is claimed or typed yet.
         pane = _capture_pane(socket_path, tmux_target)
-        if pane.strip() and not _claude_prompt_rendered(pane) and not _occupied_tall_draft(pane):
+        if (
+            pane.strip()
+            and not _claude_prompt_rendered(pane)
+            and not _occupied_tall_draft(pane)
+            and _pane_runs_a_turn(bridge_dir)
+        ):
             raise _busy_pane_refusal(pane)
     # A short last line cannot identify a clipped draft alone; match across lines then.
     tail_needle = (_submit_tail_needle(text) or _submit_cross_line_tail(text)) if needle else ""
