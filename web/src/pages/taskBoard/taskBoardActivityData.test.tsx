@@ -265,7 +265,7 @@ it.each(["By time", "By root session"])(
     };
     const props = { tasks: [task], sessions: [], onSelect: vi.fn() };
     const { container, rerender } = render(<TaskBoardLog {...props} events={[event]} />);
-    fireEvent.click(screen.getByRole("button", { name: grouping }));
+    fireEvent.click(screen.getByRole("radio", { name: grouping }));
     fireEvent.click(container.querySelector(".lr")!);
     rerender(
       <TaskBoardLog
@@ -362,7 +362,7 @@ it("folds only loaded changes by source, task and day, preserving every event on
   expect(container.querySelectorAll(".lr")).toHaveLength(4);
   expect(container.textContent).toContain("30 field changes");
   expect(container.textContent).not.toContain(task.uid);
-  fireEvent.click(screen.getByRole("button", { name: "Field changes" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Field changes" }));
   expect(container.querySelectorAll(".lr")).toHaveLength(2);
   const summary = container.querySelector(".lr")!;
   fireEvent.click(summary);
@@ -679,7 +679,7 @@ it.each([
   wrap(<TaskBoardActivity view="log" tasks={tasks} sessions={sessions} onSelect={vi.fn()} />);
   await screen.findByRole("button", { name: "Upload task 0" });
   fireEvent.click(
-    screen.getByRole("button", { name: group === "mother" ? "By root session" : "By task group" }),
+    screen.getByRole("radio", { name: group === "mother" ? "By root session" : "By task group" }),
   );
   const headings = screen.getAllByRole("heading", { name: new RegExp(label) });
   expect(headings).toHaveLength(2);

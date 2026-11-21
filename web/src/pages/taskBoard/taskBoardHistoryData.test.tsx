@@ -139,7 +139,7 @@ it.each(["button", "brush"])(
       target: { value: "2020-01" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Load month" }));
-    if (control === "button") fireEvent.click(screen.getByRole("button", { name: "1 week" }));
+    if (control === "button") fireEvent.click(screen.getByRole("radio", { name: "1 week" }));
     else
       fireEvent.keyDown(screen.getByRole("slider", { name: "Range start" }), { key: "ArrowRight" });
     const range = view.container.querySelector(".h-range")!.textContent;
@@ -404,7 +404,7 @@ it("filters before rollups and expands source, group, task and nodes", () => {
     </MemoryRouter>,
   );
   expect(document.querySelector(".r-head text")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Priced" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Priced" }));
   expect(screen.getByText("1 sources")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: /Task source.*1 groups/ }));
   fireEvent.click(screen.getByRole("button", { name: /A group/ }));
@@ -661,7 +661,7 @@ it.each(["agent", "outcome", "cost"])(
         0,
       );
     expect(plotTotal()).toBe(2);
-    if (filter === "cost") fireEvent.click(screen.getByRole("button", { name: "≥ $10" }));
+    if (filter === "cost") fireEvent.click(screen.getByRole("radio", { name: "≥ $10" }));
     else {
       fireEvent.click(container.querySelectorAll(".fdd")[filter === "agent" ? 1 : 2]);
       const options = container.querySelector(".fopts")!;

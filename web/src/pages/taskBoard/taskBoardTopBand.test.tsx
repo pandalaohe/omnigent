@@ -38,7 +38,7 @@ it("keeps the opening default separate from the current tab and resets display o
     );
   }
   const first = render(<Settings />);
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(screen.getByRole("radio", { name: "History" }));
   expect(JSON.parse(localStorage.getItem(BOARD_PREFERENCES_KEY)!).defaultView).toBe("history");
   first.unmount();
   const hook = renderHook(useBoardPreferences);
@@ -86,8 +86,8 @@ it("explains malformed storage and retains a failed save for this visit", () => 
   vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
     throw new Error("Storage denied");
   });
-  fireEvent.click(screen.getByRole("button", { name: "Off" }));
-  expect(screen.getByRole("button", { name: "Off" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(screen.getByRole("radio", { name: "Off" }));
+  expect(screen.getByRole("radio", { name: "Off" }).getAttribute("aria-checked")).toBe("true");
   expect(screen.getByRole("status").textContent).toContain("this visit only");
 });
 it("honours refresh off and all three intervals, and hides polling with the page", () => {

@@ -9,6 +9,7 @@ import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { HTML_PANEL_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
 import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
@@ -143,7 +144,11 @@ function Providers({ children }: { children: ReactNode }) {
       }),
     [],
   );
-  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>{children}</TooltipProvider>
+    </QueryClientProvider>
+  );
 }
 
 interface RenderViewerOpts {

@@ -1566,7 +1566,7 @@ describe("PullRequestChangesTab commits", () => {
     });
     expect(isListed("a.ts")).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
 
     expect(isListed("b.ts")).toBe(true);
@@ -1585,14 +1585,14 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(viewedBox("a.ts"));
     expect(screen.getAllByText(/^Viewed,/).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: /^Viewed / })).toBeNull();
     expect(screen.queryAllByText(/^Viewed,/)).toHaveLength(0);
     expect(isCollapsed("a.ts")).toBe(false);
 
-    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Changes" }));
     expect(viewedBox("a.ts")).toBeChecked();
     expect(isCollapsed("a.ts")).toBe(true);
   });
@@ -1602,7 +1602,7 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(viewedBox("a.ts"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
       target: { value: "nothing-matches" },
@@ -1611,7 +1611,7 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show" }));
     expect(isListed("a.ts")).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Changes" }));
     expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toBeChecked();
   });
 
@@ -1622,7 +1622,7 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(viewedBox("a.ts"));
     expect(isCollapsed("a.ts")).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     expect(isCollapsed("a.ts")).toBe(false);
     // The commit's own collapse toggles, then a sidebar jump reveals the collapsed file, in the commit only.
@@ -1631,7 +1631,7 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(document.querySelector<HTMLButtonElement>('button[title="a.ts"]')!);
     expect(isCollapsed("a.ts")).toBe(false);
 
-    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Changes" }));
     expect(viewedBox("a.ts")).toBeChecked();
     expect(isCollapsed("a.ts")).toBe(true);
 
@@ -1656,12 +1656,12 @@ describe("PullRequestChangesTab commits", () => {
     });
     expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     expect(isListed("a.ts")).toBe(true);
     expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Changes" }));
     expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
   });
 
@@ -1671,14 +1671,14 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     expect(screen.getByText("2 commits")).toBeInTheDocument();
 
     // A capable host behind an older server: the 404 from the commit routes marks the PR.
     mocks.commitsUnsupported = true;
     rerender(PATCH);
 
-    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Commits" })).toBeNull();
     expect(screen.queryByText("2 commits")).toBeNull();
     expect(isListed("a.ts")).toBe(true);
     expect(toast).toHaveBeenCalledWith(
@@ -1689,7 +1689,7 @@ describe("PullRequestChangesTab commits", () => {
     // The saved commit view did not survive: once the server has the routes, Changes is shown.
     mocks.commitsUnsupported = false;
     rerender(PATCH);
-    expect(screen.getByRole("button", { name: "Commits" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Commits" })).toBeInTheDocument();
     expect(screen.queryByText("2 commits")).toBeNull();
   });
 
@@ -1699,7 +1699,7 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.change(screen.getByRole("searchbox", { name: "Search commits" }), {
       target: { value: "add b" },
     });
@@ -1718,7 +1718,7 @@ describe("PullRequestChangesTab commits", () => {
         commitHistory: true,
         listing: { head_sha: "head" },
       });
-      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+      fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
 
       expect(screen.queryByRole("button", { name: "Show file filter" })).toBeNull();
       expect(screen.getByRole("searchbox", { name: "Search commits" })).toBeInTheDocument();
@@ -1735,7 +1735,7 @@ describe("PullRequestChangesTab commits", () => {
         commitHistory: true,
         listing: { head_sha: "head" },
       });
-      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+      fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
 
       expect(screen.getByText("Commits are unavailable.")).toBeInTheDocument();
     } finally {
@@ -1746,13 +1746,13 @@ describe("PullRequestChangesTab commits", () => {
   it("offers no Commits view when the provider does not list commits", () => {
     renderTab({ conversationId: "commits-absent", listing: { head_sha: "head" } });
 
-    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Commits" })).toBeNull();
   });
 
   it("offers no Commits view while the file list is not pinned to a head", () => {
     renderTab({ conversationId: "commits-unpinned", commitHistory: true });
 
-    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Commits" })).toBeNull();
     expect(isListed("a.ts")).toBe(true);
   });
 
@@ -1762,7 +1762,7 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
 
     const search = screen.getByRole("searchbox", { name: "Search commits" });
     expect(fireEvent.keyDown(search, { key: "f", ctrlKey: true })).toBe(true);
@@ -1775,7 +1775,7 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
 
     mocks.commitList = { object: "list", has_more: false, data: [commit(SHA_A, "Add a.ts")] };
@@ -1792,7 +1792,7 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
 
     expect(screen.getByRole("alert")).toHaveTextContent("Commit diff unavailable");
@@ -1811,7 +1811,7 @@ describe("PullRequestChangesTab commits", () => {
       commitHistory: true,
       listing: { head_sha: "head" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Empty commit/ }));
 
     expect(screen.getAllByText("This commit has no file changes.").length).toBeGreaterThan(0);
@@ -1831,7 +1831,7 @@ describe("PullRequestChangesTab commits", () => {
       listing: { head_sha: "head" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Remove gone\.ts/ }));
     fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for gone.ts" }), {
       button: 0,
