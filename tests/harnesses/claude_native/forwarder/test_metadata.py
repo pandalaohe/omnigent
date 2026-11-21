@@ -68,46 +68,52 @@ async def test_forward_model_from_status_posts_the_status_model_verbatim(
 
 
 @pytest.mark.asyncio
-async def test_queue_records_are_reported_once_and_not_to_an_older_server() -> None:
-    operations = (ClaudeQueueOperation("popAll", "steer", "2026-11-21T05:00:00.000Z"),)
+async def test_queue_records_survive_a_failed_post_and_skip_an_older_server() -> None:
+    popped = (ClaudeQueueOperation("popAll", "steer", "2026-11-21T05:00:00.000Z"),)
+    statuses = [503, 202, 400]
     requests: list[dict[str, Any]] = []
-    known = {"value": True}
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content.decode("utf-8")))
-        if known["value"]:
-            return httpx.Response(202, json={})
-        message = "Unknown event type: 'external_queue_operations'."
-        return httpx.Response(400, json={"error": {"code": "invalid_input", "message": message}})
+        status = statuses.pop(0)
+        if status == 400:
+            message = "Unknown event type: 'external_queue_operations'."
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_input", "message": message}}
+            )
+        return httpx.Response(status, json={})
 
     dedupe = forwarder._ForwardDedupeState()
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for _ in range(2):  # a re-read region is not reported again
+
+        async def post(operations: tuple[ClaudeQueueOperation, ...]) -> None:
             await forwarder._post_external_queue_operations(
-                client, session_id="conv_abc", operations=operations, dedupe=dedupe
+                client,
+                session_id="conv_abc",
+                operations=operations,
+                dedupe=dedupe,
+                retry_tracker=tracker,
             )
-        assert requests == [
-            {
-                "type": "external_queue_operations",
-                "data": {
-                    "operations": [
-                        {
-                            "operation": "popAll",
-                            "content": "steer",
-                            "timestamp": "2026-11-21T05:00:00.000Z",
-                        }
-                    ]
-                },
-            }
-        ]
-        known["value"] = False
+
+        await post(popped)
+        # The transcript cursor is past the record now; the failed record is still sent.
+        await post(())
+        await post(popped)  # already reported
+        expected = {
+            "type": "external_queue_operations",
+            "data": {
+                "operations": [
+                    {"operation": "popAll", "content": "steer", "timestamp": popped[0].timestamp}
+                ]
+            },
+        }
+        assert requests == [expected, expected]
         later = (ClaudeQueueOperation("popAll", "next", "2026-11-21T05:00:02.000Z"),)
-        for _ in range(2):
-            await forwarder._post_external_queue_operations(
-                client, session_id="conv_abc", operations=later, dedupe=dedupe
-            )
-    assert len(requests) == 2
+        await post(later)
+        await post(later)
+    assert len(requests) == 3
     assert dedupe.queue_operations_unsupported
 
 

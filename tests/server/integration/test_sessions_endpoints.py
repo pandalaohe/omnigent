@@ -14786,7 +14786,7 @@ async def test_stop_settles_a_paste_claude_returned_before_the_interrupt_landed(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Claude's popAll can reach the server first; the landed Stop then settles the paste."""
+    """The Stop's popAll can land before its interrupt; an earlier Up popAll never counts."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _interrupt_fenced_sessions
 
@@ -14794,9 +14794,15 @@ async def test_stop_settles_a_paste_claude_returned_before_the_interrupt_landed(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Claude reports this Stop's popAll while the interrupt is still in flight."""
+        del request
+        pending_inputs.mark_returned_to_composer(session_id, "steer", "2026-11-21T05:00:09.000Z")
+        return httpx.Response(202)
+
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
-        base_url="http://runner",
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
     ) as fake_runner:
         _route_to_runner(monkeypatch, fake_runner)
         try:
@@ -14804,6 +14810,7 @@ async def test_stop_settles_a_paste_claude_returned_before_the_interrupt_landed(
                 session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
             )
             assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+            # Up popped the queue for an edit before Stop; it settles nothing.
             popped = await client.post(
                 f"/v1/sessions/{session_id}/events",
                 json={
@@ -14820,7 +14827,6 @@ async def test_stop_settles_a_paste_claude_returned_before_the_interrupt_landed(
                 },
             )
             assert popped.status_code == 202, popped.text
-            # Up pops the queue too, so the paste stays until Stop lands.
             assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
 
             resp = await client.post(

@@ -6302,10 +6302,16 @@ _QUEUE_TAKEN_INPUT_MESSAGES = {
 
 async def _settle_inputs_taken_from_queue(
     conversation_store: ConversationStore, session_id: str, pending_ids: list[str], code: str
-) -> None:
-    """Settle claimed inputs Claude took out of its queue unread as not delivered."""
+) -> list[str]:
+    """
+    Settle claimed inputs Claude took out of its queue unread as not delivered.
+
+    :returns: Ids still claimed because their settlement did not land, e.g.
+        after a failed append; a retry of the same queue record settles them.
+    """
+    unsettled: list[str] = []
     for pending_id in pending_ids:
-        await _settle_lost_runner_input(
+        settled = await _settle_lost_runner_input(
             conversation_store,
             session_id,
             pending_id,
@@ -6315,6 +6321,9 @@ async def _settle_inputs_taken_from_queue(
                 source="execution", code=code, message=_QUEUE_TAKEN_INPUT_MESSAGES[code]
             ),
         )
+        if not settled and pending_inputs.runner_input_is_claimed(session_id, pending_id):
+            unsettled.append(pending_id)
+    return unsettled
 
 
 async def _settle_queue_operations(
@@ -6327,28 +6336,39 @@ async def _settle_queue_operations(
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param data: ``external_queue_operations`` payload, e.g. ``{"operations":
         [{"operation": "popAll", "content": "Then summarize"}]}``.
-    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload.
+    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload, and
+        ``INTERNAL_ERROR`` when a matched input could not be settled, so the
+        forwarder retries the record.
     """
     operations = data.get("operations")
     if not isinstance(operations, list) or not all(
         isinstance(operation, dict)
         and isinstance(operation.get("operation"), str)
         and isinstance(operation.get("content"), str)
+        and isinstance(operation.get("timestamp", ""), str)
         for operation in operations
     ):
         raise OmnigentError(
             "external_queue_operations requires data.operations entries with string "
-            "operation and content",
+            "operation, content and timestamp",
             code=ErrorCode.INVALID_INPUT,
         )
+    unsettled: list[str] = []
     for operation in operations:
         if operation["operation"] == "popAll":
-            await _settle_inputs_taken_from_queue(
+            unsettled += await _settle_inputs_taken_from_queue(
                 conversation_store,
                 session_id,
-                pending_inputs.mark_returned_to_composer(session_id, operation["content"]),
+                pending_inputs.mark_returned_to_composer(
+                    session_id, operation["content"], operation.get("timestamp", "")
+                ),
                 "native_input_returned_to_composer",
             )
+    if unsettled:
+        raise OmnigentError(
+            "Could not record a message Stop returned to Claude's input box; retry the record.",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
 
 
 _runner_input_lease_tasks: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
