@@ -9210,7 +9210,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     useChatStore.setState({ conversationId: "conv_abc" });
   });
 
-  it("keeps a received event that arrives before the send's POST names its pending id", async () => {
+  it("ignores a received frame that beats the send's POST, then commits the send once", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
       abortController: new AbortController(),
@@ -9230,8 +9230,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
     await tick();
     const [sent] = useChatStore.getState().pendingUserMessages;
-    expect(sent!.pendingId).toBeUndefined();
-    // The runner confirmed the paste on the stream before the POST returned.
     handleSessionEvent({
       type: "session_input_sending",
       pendingId: "pending_early",
@@ -9239,106 +9237,24 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       received: true,
       stableId: sent!.stableId!,
     });
-    // The bubble stays untouched until its POST names its pending id.
+    // No bubble carries that pending id before the POST returns.
     expect(useChatStore.getState().pendingUserMessages).toEqual([sent]);
     resolvePost();
     await sendPromise;
 
     const [linked] = useChatStore.getState().pendingUserMessages;
-    expect(linked).toMatchObject({ pendingId: "pending_early", received: true });
-    const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
-    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
-    expect(bubble).not.toHaveProperty("sendingSinceMs");
-  });
-
-  it("keeps a received send's bubble when its POST answer is lost", async () => {
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      abortController: new AbortController(),
-      status: "idle",
-      sessionStatus: "idle",
-      isNativeTerminalSession: true,
-    });
-    let failPost: () => void = () => {};
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
-        return new Promise<Response>((_resolve, reject) => {
-          failPost = () => reject(new TypeError("Failed to fetch"));
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
-
-    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
-    await tick();
-    const [sent] = useChatStore.getState().pendingUserMessages;
-    handleSessionEvent({
-      type: "session_input_sending",
-      pendingId: "pending_lost",
-      sinceMs: 1_710_000_000_000,
-      received: true,
-      stableId: sent!.stableId!,
-    });
-    failPost();
-    await sendPromise;
-
-    const state = useChatStore.getState();
-    // Only the mirror is pending: no restored draft, the bubble keeps waiting.
-    expect(state.failedSendDraft).toBeNull();
-    expect(state.pendingUserMessages).toMatchObject([
-      { tempId: sent!.tempId, pendingId: "pending_lost", received: true },
-    ]);
-    const [bubble] = buildPendingBubbles(state.pendingUserMessages, null);
-    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
-    expect(bubble).not.toHaveProperty("stillSending");
-  });
-
-  it("does not give a settled attempt's late receipt to a retry with the same pending id", async () => {
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      abortController: new AbortController(),
-      status: "idle",
-      sessionStatus: "idle",
-    });
-    let resolvePost: () => void = () => {};
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
-        return new Promise<Response>((resolve) => {
-          resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_same" }));
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
-
-    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
-    await tick();
-    const [retry] = useChatStore.getState().pendingUserMessages;
-    // Attempt A of this stable id (so of this pending id) was received, then settled,
-    // before the server took retry B; both frames reach the tab while B's POST is out.
-    handleSessionEvent({
-      type: "session_input_sending",
-      pendingId: "pending_same",
-      sinceMs: 1_710_000_000_000,
-      received: true,
-      stableId: retry!.stableId!,
-    });
+    expect(linked).toMatchObject({ tempId: sent!.tempId, pendingId: "pending_early" });
+    expect(linked).not.toHaveProperty("received");
     handleSessionEvent({
       type: "session_input_consumed",
-      itemId: "err_attempt_a",
-      itemType: "error",
-      data: {},
-      clearedPendingId: "pending_same",
+      itemId: "msg_early",
+      itemType: "message",
+      clearedPendingId: "pending_early",
+      data: { role: "user", content: sent!.content },
     });
-    resolvePost();
-    await sendPromise;
-
-    const [bubble] = useChatStore.getState().pendingUserMessages;
-    expect(bubble).toMatchObject({
-      tempId: retry!.tempId,
-      pendingId: "pending_same",
-      posted: true,
-    });
-    expect(bubble).not.toHaveProperty("received");
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
   });
 
   it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
@@ -22171,7 +22087,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     { snapshot: "a stale snapshot", serverHasInput: false },
     { snapshot: "a fresh snapshot", serverHasInput: true },
   ])(
-    "keeps an early-received send through a reconnect with $snapshot before its POST returns",
+    "ignores an early received frame through a reconnect with $snapshot, then commits the send once",
     async ({ serverHasInput }) => {
       const id = "conv_early_received";
       seedSession(id, []);
@@ -22210,7 +22126,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         },
         id,
       );
-      // Held until the POST names the pending id, so the reconnect sees the bubble as sent.
+      // Ignored: no bubble carries that pending id before the POST returns.
       expect(useChatStore.getState().pendingUserMessages).toEqual([sent]);
 
       seedPendingInputs(
@@ -22236,9 +22152,24 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       resolvePost();
       await drainAsync();
       await sendPromise;
-      expect(useChatStore.getState().pendingUserMessages).toMatchObject([
-        { tempId: sent!.tempId, pendingId: "pending_early", received: true, posted: true },
-      ]);
+      const [posted] = useChatStore.getState().pendingUserMessages;
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+      expect(posted).toMatchObject({ tempId: sent!.tempId, pendingId: "pending_early" });
+      expect(posted).not.toHaveProperty("received");
+      handleSessionEvent(
+        {
+          type: "session_input_consumed",
+          itemId: "msg_early",
+          itemType: "message",
+          clearedPendingId: "pending_early",
+          data: { role: "user", content: sent!.content },
+        },
+        id,
+      );
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(
+        useChatStore.getState().blocks.filter((block) => block.type === "user_message"),
+      ).toHaveLength(1);
       sinks[1]!.push("data: [DONE]\n\n");
       sinks[1]!.close();
       await drainAsync(2);
