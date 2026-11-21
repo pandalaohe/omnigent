@@ -6034,6 +6034,60 @@ async def test_patch_session_external_session_id_rejects_overwrite(
     assert after.json()["external_session_id"] == "sid-1"
 
 
+async def test_thread_binding_with_an_unlisted_model_posts_one_notice_per_thread(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner's started-thread binding naming its unlisted pick posts one info notice."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    listed = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    pick = "router-a/gpt-6.2-sol"
+
+    alone = await client.patch(path, json={"unlisted_model": pick})
+    assert alone.status_code == 400, alone.text
+    assert alone.json()["error"]["code"] == "invalid_input"
+    for _attempt in range(2):  # a retried binding posts nothing new
+        bound = await client.patch(
+            path, json={"external_session_id": "sid-1", "unlisted_model": pick}
+        )
+        assert bound.status_code == 200, bound.text
+    # A later thread the row cannot bind still started, so that launch says so too.
+    conflict = await client.patch(
+        path, json={"external_session_id": "sid-2", "unlisted_model": pick}
+    )
+    assert conflict.status_code == 400, conflict.text
+    plain = await client.patch(
+        f"/v1/sessions/{listed['id']}", json={"external_session_id": "sid-3"}
+    )
+    assert plain.status_code == 200, plain.text
+
+    notice = {
+        "type": "error",
+        "source": "execution",
+        "code": "codex_native_model_unlisted",
+        "message": (
+            f"{pick} isn't in this host's Codex model list; launched as requested. "
+            "If the provider rejects it, this turn fails."
+        ),
+        "level": "info",
+    }
+    items = (await client.get(f"{path}/items")).json()["data"]
+    errors = [{key: item.get(key) for key in notice} for item in items if item["type"] == "error"]
+    assert errors == [notice, notice]
+    live = [
+        (sid, event["item"]["code"])
+        for sid, event in published
+        if event.get("type") == "response.output_item.done" and event["item"]["type"] == "error"
+    ]
+    assert live == [(session["id"], notice["code"])] * 2
+    listed_items = (await client.get(f"/v1/sessions/{listed['id']}/items")).json()["data"]
+    assert [item for item in listed_items if item["type"] == "error"] == []
+
+
 async def test_create_session_returns_null_external_session_id(
     client: httpx.AsyncClient,
 ) -> None:

@@ -3106,6 +3106,12 @@ class UpdateSessionRequest(BaseModel):
         writes; the server rejects attempts to overwrite an
         already-set different value with ``invalid_input`` to
         surface programmer errors. ``None`` leaves unchanged.
+    :param unlisted_model: Explicit model pick a codex-native launch ran as
+        requested although its live model list did not name it, e.g.
+        ``"router-a/gpt-6.2-sol"``. Only valid with ``external_session_id``,
+        which a runner sends once that thread started: the server posts one
+        info notice per thread naming the model, so only a launch whose thread
+        started shows it. ``None`` posts nothing.
     :param terminal_launch_args: Per-session native-terminal
         pass-through args, e.g. ``["--dangerously-skip-permissions"]``.
         Updating this field requires session ownership.
@@ -3173,6 +3179,7 @@ class UpdateSessionRequest(BaseModel):
     subagent_routing_override: str | None = None
     share_workspace_files: bool | None = None
     external_session_id: str | None = None
+    unlisted_model: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     archive_locked: bool | None = None

@@ -19233,6 +19233,18 @@
             "description": "New title, e.g. `\"debugging auth flow\"`. `None` leaves unchanged.",
             "title": "Title"
           },
+          "unlisted_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit model pick a codex-native launch ran as requested although its live model list did not name it, e.g. `\"router-a/gpt-6.2-sol\"`. Only valid with `external_session_id`: once that thread binding is recorded the server posts one info notice naming the model, so only a launch whose thread started shows it. `None` posts nothing.",
+            "title": "Unlisted Model"
+          },
           "worktree_archive_mode": {
             "anyOf": [
               {

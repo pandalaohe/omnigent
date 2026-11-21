@@ -291,6 +291,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _mark_session_moving,
     _persist_external_conversation_item,
     _persist_model_change_note,
+    _persist_unlisted_model_notice,
     _publish_runner_recovered_status,
     _retry_host_admission_lease,
     _run_managed_launch,
@@ -5952,6 +5953,18 @@ def register_core_routes(
                 "delete_worktree is only valid with archived=true",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.unlisted_model is not None:
+            if body.external_session_id is None:
+                raise OmnigentError(
+                    "unlisted_model is only valid with external_session_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            try:
+                validate_model_override(body.unlisted_model)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid unlisted_model: {exc}", code=ErrorCode.INVALID_INPUT
+                ) from exc
         # This PATCH gates at the least level the request actually needs, in
         # three tiers matching the if/elif/else below:
         #
@@ -7793,6 +7806,14 @@ def register_core_routes(
             _publish_collaboration_mode(
                 session_id,
                 requested_codex_collaboration_mode,
+            )
+        if body.unlisted_model is not None and body.external_session_id is not None:
+            # A runner names a thread only once it started, even one it cannot bind.
+            await _persist_unlisted_model_notice(
+                session_id,
+                body.external_session_id,
+                body.unlisted_model,
+                conversation_store,
             )
         if body.external_session_id is not None:
             try:

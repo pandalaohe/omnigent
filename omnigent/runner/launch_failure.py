@@ -28,10 +28,12 @@ from omnigent.llms.errors import (
 )
 
 __all__ = [
+    "CODEX_NATIVE_MODEL_UNLISTED",
     "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
+    "codex_model_unlisted_notice",
     "describe_failure_code",
     "diagnose_client_update_required",
     "diagnose_codex_compaction_model_failure",
@@ -47,6 +49,16 @@ CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
 # A runner that connected and then exited, as opposed to one that never came up.
 RUNNER_PROCESS_CRASH = "runner_process_crash"
+# A codex-native launch ran an explicit model pick its live model list does not name.
+CODEX_NATIVE_MODEL_UNLISTED = "codex_native_model_unlisted"
+
+
+def codex_model_unlisted_notice(model: str) -> str:
+    """Info notice text for an unlisted Codex model pick that launched as requested."""
+    return (
+        f"{model} isn't in this host's Codex model list; launched as requested. "
+        "If the provider rejects it, this turn fails."
+    )
 
 
 @dataclass(frozen=True)

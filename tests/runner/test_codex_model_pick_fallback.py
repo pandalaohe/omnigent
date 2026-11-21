@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,20 +80,18 @@ class _LaunchHarness:
     response_status: dict[str, int]
     workspace_models: Mock
     routing: dict[str, bool]
-    threads_adopted: list[asyncio.Event]
+    # The unlisted pick each fresh launch hands its thread binding (None: listed).
+    unlisted_bindings: list[str | None]
 
     async def launch(self) -> SessionResourceView:
-        """Run the production launch path, then let a fresh TUI's thread start."""
-        resource = await runner_native._auto_create_codex_terminal(
+        """Run the production launch path, including snapshot and catalog reads."""
+        return await runner_native._auto_create_codex_terminal(
             _SESSION_ID,
             self.registry,
             lambda _sid, _event: None,
             agent_spec=self.agent_spec,
             server_client=self.server_client,
         )
-        for adopted in self.threads_adopted:
-            await adopted.wait()
-        return resource
 
     def catalog_shape(self, *, ambient: bool = False) -> codex_app.NativeCodexLaunch:
         """Resolve the catalog shape without a per-session model selection."""
@@ -254,21 +251,13 @@ async def codex_launch_harness(
 
     event_client = SimpleNamespace(connect=AsyncMock(), close=AsyncMock())
     forwarder_release = asyncio.Event()
-    threads_adopted: list[asyncio.Event] = []
+    unlisted_bindings: list[str | None] = []
 
     def forwarder(
-        *, on_thread_ready: Callable[[], Awaitable[None]] | None = None, **_kwargs: Any
-    ) -> Coroutine[Any, Any, None]:
-        adopted = asyncio.Event()
-        threads_adopted.append(adopted)
-
-        async def adopt_thread_and_forward() -> None:
-            if on_thread_ready is not None:
-                await on_thread_ready()
-            adopted.set()
-            await forwarder_release.wait()
-
-        return adopt_thread_and_forward()
+        *, unlisted_model: str | None = None, **_kwargs: Any
+    ) -> Coroutine[Any, Any, bool]:
+        unlisted_bindings.append(unlisted_model)
+        return forwarder_release.wait()
 
     monkeypatch.setattr(codex_app, "build_codex_native_server", build_server)
     monkeypatch.setattr(codex_app, "CodexAppServerClient", lambda **_kwargs: event_client)
@@ -300,7 +289,7 @@ async def codex_launch_harness(
             response_status=response_status,
             workspace_models=workspace_models,
             routing=routing,
-            threads_adopted=threads_adopted,
+            unlisted_bindings=unlisted_bindings,
         )
     await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
     runner_native._AUTO_CODEX_APP_SERVERS.pop(_SESSION_ID, None)
@@ -328,6 +317,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
     assert harness.notices == []
+    assert harness.unlisted_bindings == [None]
     harness.probe.assert_not_awaited()
     harness.workspace_models.assert_not_called()
 
@@ -441,7 +431,7 @@ async def test_unlisted_pick_launches_as_requested_with_a_notice(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A live list without the pick launches it unchanged, keeps it, and says so after launch."""
+    """A live list without the pick launches it unchanged, keeps it, and binds it as unlisted."""
     harness = codex_launch_harness
     assert isinstance(harness.agent_spec, AgentSpec)
     harness.snapshot["model_override"] = pick
@@ -473,8 +463,9 @@ async def test_unlisted_pick_launches_as_requested_with_a_notice(
     assert harness.builds[0]["model"] == pick
     assert harness.resets == []
     assert harness.snapshot["model_override"] == pick
-    assert harness.notices == [_unlisted_notice(pick)]
-    assert harness.events.index("terminal-launch") < harness.events.index("notice")
+    # The server posts the notice when the started thread's binding names the pick.
+    assert harness.unlisted_bindings == [pick]
+    assert harness.notices == []
     harness.probe.assert_not_awaited()
 
 
@@ -492,7 +483,7 @@ async def test_unlisted_pick_also_pinned_by_the_spec_launches_as_requested(
 
     assert harness.builds[0]["model"] == _RETIRED_PICK
     assert harness.resets == []
-    assert harness.notices == [_unlisted_notice(_RETIRED_PICK)]
+    assert harness.unlisted_bindings == [_RETIRED_PICK]
 
 
 @pytest.mark.asyncio
@@ -508,7 +499,7 @@ async def test_spec_only_model_launches_unchecked(codex_launch_harness: _LaunchH
 
     assert harness.builds[0]["model"] == _RETIRED_PICK
     assert harness.resets == []
-    assert harness.notices == []
+    assert harness.unlisted_bindings == [None]
 
 
 @pytest.mark.asyncio
@@ -516,7 +507,7 @@ async def test_spec_only_model_launches_unchecked(codex_launch_harness: _LaunchH
 async def test_stale_miss_awaits_reprobe_before_judging_the_pick(
     refresh: str, codex_launch_harness: _LaunchHarness
 ) -> None:
-    """A stale miss reloads once; only a fresh miss posts the notice, and the pick launches."""
+    """A stale miss reloads once; only a fresh miss is named unlisted, and the pick launches."""
     harness = codex_launch_harness
     pick = "databricks-gpt-5-6-sol"
     harness.snapshot["model_override"] = pick
@@ -549,7 +540,7 @@ async def test_stale_miss_awaits_reprobe_before_judging_the_pick(
 
     assert harness.builds[0]["model"] == pick
     assert harness.resets == []
-    assert harness.notices == ([_unlisted_notice(pick)] if refresh == "miss" else [])
+    assert harness.unlisted_bindings == ([pick] if refresh == "miss" else [None])
     harness.probe.assert_awaited_once()
     assert model_catalog_store.read_catalog("codex-native", fingerprint) == (
         fresh_rows if refresh in {"hit", "miss"} else stale_rows
@@ -616,28 +607,22 @@ async def test_failed_unlisted_launch_posts_no_notice(
     assert harness.builds[0]["model"] == _RETIRED_PICK
     assert harness.resets == []
     assert harness.notices == []
+    assert harness.unlisted_bindings == []  # no thread binding was ever started
     if failure != "app-server":
         harness.app_server.close.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("thread_starts", [False, True])
-async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
-    thread_starts: bool,
-    codex_launch_harness: _LaunchHarness,
+def _bind_discovered_thread(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A created terminal whose TUI never starts a thread reports that failure, not the notice."""
-    harness = codex_launch_harness
-    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
-    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(_SESSION_ID)
-    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
-    published_at_notice: list[str | None] = []
+    *,
+    thread_id: str | None,
+    binding: Callable[[httpx.Request], httpx.Response],
+) -> asyncio.Event:
+    """Run the real thread discovery against a scripted thread start and binding server."""
     forwarding = asyncio.Event()
-    noticed = asyncio.Event()
 
     async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
-        if not thread_starts:
+        if thread_id is None:
             raise RuntimeError("event stream ended")
         return thread_id
 
@@ -645,28 +630,43 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
         forwarding.set()
         await asyncio.Event().wait()
 
-    post_notice = runner_native._post_native_launch_notice
-
-    async def post_notice_recording_bridge_state(**kwargs: Any) -> None:
-        state = codex_native_bridge.read_bridge_state(bridge_dir)
-        published_at_notice.append(state.thread_id if state is not None else None)
-        await post_notice(**kwargs)
-        noticed.set()
-
     monkeypatch.setattr(
         runner_native, "_codex_discover_thread_and_forward", _DISCOVER_THREAD_AND_FORWARD
     )
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", wait_for_thread)
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", supervise_forwarder)
     monkeypatch.setattr(
-        runner_native, "_post_native_launch_notice", post_notice_recording_bridge_state
-    )
-    monkeypatch.setattr(
         "omnigent.cli_auth.open_server_client",
         lambda server_url, **_kwargs: httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
-            base_url=server_url,
+            transport=httpx.MockTransport(binding), base_url=server_url
         ),
+    )
+    return forwarding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_starts", [False, True])
+async def test_fresh_unlisted_launch_names_its_pick_only_in_a_started_threads_binding(
+    thread_starts: bool,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TUI that never starts a thread reports that failure; a started one binds with the pick."""
+    harness = codex_launch_harness
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(_SESSION_ID)
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
+    bindings: list[dict[str, Any]] = []
+    published_at_binding: list[str | None] = []
+
+    def record_binding(request: httpx.Request) -> httpx.Response:
+        state = codex_native_bridge.read_bridge_state(bridge_dir)
+        published_at_binding.append(state.thread_id if state is not None else None)
+        bindings.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    forwarding = _bind_discovered_thread(
+        monkeypatch, thread_id=thread_id if thread_starts else None, binding=record_binding
     )
 
     resource = await harness.launch()
@@ -677,117 +677,57 @@ async def test_fresh_unlisted_launch_notices_only_after_its_thread_starts(
     assert harness.events.count("terminal-launch") == 1
     assert harness.builds[0]["model"] == _RETIRED_PICK
     assert harness.resets == []
+    assert harness.notices == []  # a fresh launch leaves the notice to the server
     failure = codex_native_bridge.read_bridge_startup_failure(bridge_dir)
     if thread_starts:
-        await asyncio.wait_for(noticed.wait(), timeout=5)
-        assert not discovery.done()
         assert failure is None
-        assert published_at_notice == [thread_id]
-        assert harness.notices == [_unlisted_notice(_RETIRED_PICK)]
+        assert bindings == [{"external_session_id": thread_id, "unlisted_model": _RETIRED_PICK}]
+        assert published_at_binding == [thread_id]
     else:
         assert failure is not None
         assert failure.code == "codex_thread_not_started"
-        assert published_at_notice == []
-        assert harness.notices == []
+        assert bindings == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("notice_post", ["hangs", "raises", "cleanup-stuck"])
-async def test_stuck_unlisted_notice_never_delays_thread_binding_or_forwarding(
-    notice_post: str,
+@pytest.mark.parametrize("server", ["current", "older"])
+async def test_unlisted_thread_binding_leaves_no_task_beside_forwarding(
+    server: str,
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The notice post runs beside forwarding; failures are logged, teardown awaits its exit."""
-    caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
+    """Forwarding is the launch's only task and teardown awaits nothing else; old servers bind."""
     harness = codex_launch_harness
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
     bindings: list[dict[str, Any]] = []
-    forwarding = asyncio.Event()
-    notice_started = asyncio.Event()
-    notice_cancelled = asyncio.Event()
-    notice_cleanup_release = asyncio.Event()
-    client_closed_at_cleanup: list[bool] = []
-
-    async def wait_for_thread(*_args: object, **_kwargs: object) -> str:
-        return thread_id
-
-    async def supervise_forwarder(**_kwargs: object) -> None:
-        forwarding.set()
-        await asyncio.Event().wait()
-
-    async def stuck_notice_post(**_kwargs: object) -> None:
-        notice_started.set()
-        if notice_post == "raises":
-            raise ValueError("notice post failed")
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            notice_cancelled.set()
-            await notice_cleanup_release.wait()  # e.g. auth cleanup awaiting its worker
-            client_closed_at_cleanup.append(harness.server_client.is_closed)
-            raise
 
     def record_binding(request: httpx.Request) -> httpx.Response:
-        bindings.append(json.loads(request.content))
+        body = json.loads(request.content)
+        bindings.append(body)
+        if server == "older" and "unlisted_model" in body:
+            # A server whose request schema forbids the unknown field.
+            return httpx.Response(422, json={"detail": [{"type": "extra_forbidden"}]})
         return httpx.Response(200, json={})
 
-    monkeypatch.setattr(
-        runner_native, "_codex_discover_thread_and_forward", _DISCOVER_THREAD_AND_FORWARD
-    )
-    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", wait_for_thread)
-    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", supervise_forwarder)
-    monkeypatch.setattr(runner_native, "_post_native_launch_notice", stuck_notice_post)
-    monkeypatch.setattr(
-        "omnigent.cli_auth.open_server_client",
-        lambda server_url, **_kwargs: httpx.AsyncClient(
-            transport=httpx.MockTransport(record_binding), base_url=server_url
-        ),
-    )
+    forwarding = _bind_discovered_thread(monkeypatch, thread_id=thread_id, binding=record_binding)
+    tasks_before = asyncio.all_tasks()
 
     await harness.launch()
     discovery = runner_native._AUTO_FORWARDER_TASKS[_SESSION_ID]
     await asyncio.wait_for(forwarding.wait(), timeout=5)
-    await asyncio.wait_for(notice_started.wait(), timeout=5)
-    await asyncio.sleep(0)  # the failed task's done callback
 
-    assert bindings == [{"external_session_id": thread_id}]
-    assert not discovery.done()
+    unlisted_binding = {"external_session_id": thread_id, "unlisted_model": _RETIRED_PICK}
+    assert bindings == (
+        [unlisted_binding]
+        if server == "current"
+        else [unlisted_binding, {"external_session_id": thread_id}]
+    )
     assert harness.notices == []
-    failure_message = f"Codex thread-ready hook codex-thread-ready-{_SESSION_ID} failed"
-    failures = [record for record in caplog.records if record.getMessage() == failure_message]
-    if notice_post == "raises":
-        assert len(failures) == 1
-        assert failures[0].exc_info is not None
-        assert isinstance(failures[0].exc_info[1], ValueError)
-    elif notice_post == "hangs":
-        assert failures == []
-        stopping = asyncio.create_task(runner_native._cancel_auto_forwarder_task(_SESSION_ID))
-        await asyncio.wait_for(notice_cancelled.wait(), timeout=5)
-        _done, pending = await asyncio.wait({stopping}, timeout=0.5)
-        assert pending == {stopping}  # teardown waits for the notice's cleanup
-        notice_cleanup_release.set()
-        assert await asyncio.wait_for(stopping, timeout=5)
-        await harness.server_client.aclose()  # the runner closes its client after teardown
-        assert client_closed_at_cleanup == [False]
-    else:
-        # A cleanup that outlives its share still lets teardown beat the caller's cancel wait.
-        assert failures == []
-        monkeypatch.setattr(runner_native, "_AUTO_FORWARDER_CANCEL_TIMEOUT_S", 0.6)
-        (notice_task,) = [
-            task
-            for task in asyncio.all_tasks()
-            if task.get_name() == f"codex-thread-ready-{_SESSION_ID}"
-        ]
-        assert await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
-        assert notice_cancelled.is_set()
-        assert any("thread-ready hook" in record.getMessage() for record in caplog.records)
-        assert not notice_task.done()  # its cleanup still owns the request
-        notice_cleanup_release.set()
-        await asyncio.wait({notice_task}, timeout=5)
-        assert notice_task.cancelled()
+    assert asyncio.all_tasks() - tasks_before == {discovery}
+    assert await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
+    assert discovery.done()
+    assert asyncio.all_tasks() - tasks_before == set()
 
 
 @pytest.mark.asyncio
@@ -821,7 +761,7 @@ async def test_spec_catalog_is_not_replaced_by_ambient_provider_catalog(
     assert 'model_provider="session-provider"' in harness.builds[0]["extra_config_overrides"]
     assert harness.resets == []
     # Only the session provider's list decides whether the pick is unlisted.
-    assert harness.notices == ([] if spec_serves_pick else [_unlisted_notice(pick)])
+    assert harness.unlisted_bindings == ([None] if spec_serves_pick else [pick])
     if stale:
         task = model_catalog_store._inflight.get(("codex-native", fingerprint))
         if task is not None:
@@ -872,14 +812,33 @@ async def test_unlisted_pick_keeps_its_resolved_model_config(
     harness.workspace_models.assert_not_called()
 
 
+def _resume_known_thread(
+    harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    preload: AsyncMock | None = None,
+) -> AsyncMock:
+    """Make the launch resume a known Codex thread through a scripted preload."""
+    harness.snapshot["external_session_id"] = "019e96aa-0be2-7343-8d3b-6f914d60936c"
+    preload = preload or AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    )
+    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
+    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
+    return preload
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [404, 500])
 async def test_failed_notice_post_keeps_successfully_launched_terminal(
     status: int,
     codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed notice post keeps the terminal and the pick; never retry with PATCH."""
+    """A resumed launch's failed notice post keeps the terminal and the pick; never PATCH."""
     harness = codex_launch_harness
+    _resume_known_thread(harness, monkeypatch)
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     harness.response_status["notice"] = status
 
@@ -890,18 +849,17 @@ async def test_failed_notice_post_keeps_successfully_launched_terminal(
     assert harness.notices == [_unlisted_notice(_RETIRED_PICK)]
     assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.builds[0]["model"] == _RETIRED_PICK
-    await asyncio.sleep(0)
-    forwarder = runner_native._AUTO_FORWARDER_TASKS[_SESSION_ID]
-    assert not forwarder.done()
     harness.app_server.close.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_closed_notice_client_keeps_successfully_launched_terminal(
     codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A client closed during terminal startup cannot turn the notice into launch failure."""
     harness = codex_launch_harness
+    _resume_known_thread(harness, monkeypatch)
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     launch_terminal = harness.registry.launch_auxiliary_terminal.side_effect
 
@@ -919,8 +877,6 @@ async def test_closed_notice_client_keeps_successfully_launched_terminal(
     assert harness.notices == []
     assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.builds[0]["model"] == _RETIRED_PICK
-    await asyncio.sleep(0)
-    assert not runner_native._AUTO_FORWARDER_TASKS[_SESSION_ID].done()
     harness.app_server.close.assert_not_awaited()
 
 
@@ -948,7 +904,7 @@ async def test_subscription_unlisted_pick_launches_as_requested(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """On Codex's own login an unlisted pick launches; only a fresh miss posts the notice."""
+    """On Codex's own login an unlisted pick launches; only a fresh miss is named unlisted."""
     harness = codex_launch_harness
 
     def resolve_launch(
@@ -972,7 +928,7 @@ async def test_subscription_unlisted_pick_launches_as_requested(
     assert harness.builds[0]["profile"] is None
     assert 'model_provider="openai"' in harness.builds[0]["extra_config_overrides"]
     assert harness.resets == []
-    assert harness.notices == ([] if stale else [_unlisted_notice(_RETIRED_PICK)])
+    assert harness.unlisted_bindings == ([None] if stale else [_RETIRED_PICK])
 
 
 @pytest.mark.asyncio
@@ -984,14 +940,14 @@ async def test_resumed_unlisted_launch_notices_only_if_preload_and_terminal_succ
 ) -> None:
     """A failed known-thread preload keeps the selection and posts no notice."""
     harness = codex_launch_harness
-    harness.snapshot["external_session_id"] = "019e96aa-0be2-7343-8d3b-6f914d60936c"
-    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
-    preload = AsyncMock(side_effect=RuntimeError("preload unavailable") if preload_fails else None)
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    preload = _resume_known_thread(
+        harness,
+        monkeypatch,
+        preload=AsyncMock(
+            side_effect=RuntimeError("preload unavailable") if preload_fails else None
+        ),
     )
-    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
-    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
 
     if preload_fails:
         with pytest.raises(RuntimeError, match="preload unavailable"):
@@ -1005,6 +961,8 @@ async def test_resumed_unlisted_launch_notices_only_if_preload_and_terminal_succ
     preload.assert_awaited_once()
     assert harness.builds[0]["model"] == _RETIRED_PICK
     assert harness.resets == []
+    # A known thread binds no new thread, so the runner posts the notice itself, once.
+    assert harness.unlisted_bindings == []
     assert harness.notices == ([] if preload_fails else [_unlisted_notice(_RETIRED_PICK)])
 
 
