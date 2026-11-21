@@ -10230,7 +10230,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (sourceConversationId === null) break;
       setterFor(sourceConversationId)((s) => ({
         pendingUserMessages: s.pendingUserMessages.map((p) =>
-          (p.pendingId ?? p.tempId) === event.pendingId &&
+          // Before its POST returns, the sender's bubble is known only by its stable id.
+          ((p.pendingId ?? p.tempId) === event.pendingId ||
+            (event.stableId !== undefined && p.stableId === event.stableId)) &&
           (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
             (event.received === true && !p.received))
             ? {

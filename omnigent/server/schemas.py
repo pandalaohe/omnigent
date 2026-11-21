@@ -4955,13 +4955,15 @@ class SessionInputSendingEvent(_SSEEventBase):
     The runner is delivering a pending input, or has queued it (null).
 
     ``received`` is true once the native agent accepted the input; a running
-    turn may still hold it queued until its next step.
+    turn may still hold it queued until its next step. ``stable_id`` is the
+    client's id for that input, for a sender that has no pending id yet.
     """
 
     type: Literal["session.input.sending"]
     pending_id: str
     since_ms: int | None
     received: bool = False
+    stable_id: str | None = None
 
 
 class SessionInputConsumedPayload(BaseModel):
@@ -5818,10 +5820,13 @@ class CompletedEvent(_SSEEventBase):
     :param type: Always ``"response.completed"``.
     :param response: The final response object with
         ``status="completed"``.
+    :param input_received: ``True`` when a native terminal holds the claimed
+        input this turn delivered, with evidence of its submit; omitted otherwise.
     """
 
     type: Literal["response.completed"]
     response: ResponseObject
+    input_received: bool | None = None
 
 
 class FailedEvent(_SSEEventBase):

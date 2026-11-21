@@ -9210,6 +9210,45 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     useChatStore.setState({ conversationId: "conv_abc" });
   });
 
+  it("keeps a received event that arrives before the send's POST names its pending id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    let resolvePost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((resolve) => {
+          resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_early" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await tick();
+    const [sent] = useChatStore.getState().pendingUserMessages;
+    expect(sent!.pendingId).toBeUndefined();
+    // The runner confirmed the paste on the stream before the POST returned.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_early",
+      sinceMs: 1_710_000_000_000,
+      received: true,
+      stableId: sent!.stableId!,
+    });
+    resolvePost();
+    await sendPromise;
+
+    const [linked] = useChatStore.getState().pendingUserMessages;
+    expect(linked).toMatchObject({ pendingId: "pending_early", received: true });
+    const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("sendingSinceMs");
+  });
+
   it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
     const since = 1_710_000_000_000;
     const content = [{ type: "input_text" as const, text: "steer" }];

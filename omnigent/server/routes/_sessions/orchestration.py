@@ -5996,6 +5996,8 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "rejected_before_handoff"
     elif event_type in {"response.cancelled", "response.incomplete"}:
         cause_class = "interrupted_or_lifecycle"
+    # Only the claiming attempt's own submit evidence marks the input received.
+    input_received = event_type == "response.completed" and event.get("input_received") is True
     matched = pending_inputs.mark_lifecycle(
         session_id,
         stable_id if isinstance(stable_id, str) else None,
@@ -6008,9 +6010,14 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         reason_code=_native_input_reason_code(event),
         native_turn_id=native_turn_id if isinstance(native_turn_id, str) else None,
         lifecycle_response_id=response_id if isinstance(response_id, str) else None,
+        input_received=input_received,
     )
-    # The agent may hold a confirmed paste queued for a whole turn; stop showing it as sending.
-    received = pending_inputs.agent_received(session_id, matched) if matched is not None else None
+    # The agent may hold a received input queued for a whole turn; stop showing it as sending.
+    received = (
+        pending_inputs.agent_received(session_id, matched)
+        if input_received and matched is not None
+        else None
+    )
     if received is not None:
         session_stream.publish(
             session_id,
@@ -6019,6 +6026,8 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
                 "pending_id": received.pending_id,
                 "since_ms": received.sending_since_ms,
                 "received": True,
+                # The sender's bubble may not know its pending id before the POST returns.
+                **({"stable_id": received.stable_id} if received.stable_id is not None else {}),
             },
         )
 

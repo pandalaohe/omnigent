@@ -226,6 +226,9 @@ class TurnComplete(ExecutorEvent):
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    # A native terminal holds the claimed input this turn delivered, with
+    # evidence of its submit; it may still queue it behind a running turn.
+    input_received: bool = False
 
 
 class ToolCallStatus(str, enum.Enum):

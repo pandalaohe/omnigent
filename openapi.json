@@ -4057,6 +4057,19 @@
       "CompletedEvent": {
         "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject`.",
         "properties": {
+          "input_received": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "`True` when a native terminal holds the claimed input this turn delivered, with evidence of its submit; omitted otherwise.",
+            "title": "Input Received"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"completed\"`."
@@ -12892,7 +12905,7 @@
         "type": "object"
       },
       "SessionInputSendingEvent": {
-        "description": "The runner is delivering a pending input, or has queued it (null).\n\n`received` is true once the native agent accepted the input; a running\nturn may still hold it queued until its next step.",
+        "description": "The runner is delivering a pending input, or has queued it (null).\n\n`received` is true once the native agent accepted the input; a running\nturn may still hold it queued until its next step. `stable_id` is the\nclient's id for that input, for a sender that has no pending id yet.",
         "properties": {
           "pending_id": {
             "title": "Pending Id",
@@ -12927,6 +12940,18 @@
               }
             ],
             "title": "Since Ms"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stable Id"
           },
           "type": {
             "const": "session.input.sending",

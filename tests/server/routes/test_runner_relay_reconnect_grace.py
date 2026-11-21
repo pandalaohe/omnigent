@@ -147,6 +147,7 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
         ("confirmed-running", "runner_a"),
         ("confirmed-idle", "runner_a"),
         ("unconfirmed-running", "runner_a"),
+        ("unverified-running", "runner_a"),
         ("confirmed-running", "runner_b"),
         ("confirmed-running", None),
     ],
@@ -154,6 +155,7 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
         "confirmed-running",
         "confirmed-idle",
         "unconfirmed-running",
+        "blind-submit-running",
         "replacement-runner",
         "no-runner-id",
     ],
@@ -177,9 +179,12 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
         "delivery_attempt_id"
     ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
+    # A blind submit completes the turn without submit evidence: the lease and
+    # settlement follow the completed turn, but the input is never shown received.
+    evidence = case.startswith("confirmed")
     collector = await start_session_stream_collector(session_id)
     try:
-        if case.startswith("confirmed"):
+        if case.startswith(("confirmed", "unverified")):
             orchestration._record_native_input_lifecycle(
                 session_id,
                 {
@@ -187,8 +192,10 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
                     "response": {"id": "resp_paste"},
                     "pending_id": pending_id,
                     "delivery_attempt_id": attempt_id,
+                    **({"input_received": True} if evidence else {}),
                 },
             )
+        if evidence:
             # Claude holds the queued paste: chat stops counting it as sending,
             # while its send time stays for reconnect settlement.
             received = await collector.next_event()
@@ -208,16 +215,18 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
                 set(),
                 runner_id=heartbeat_runner,
             )
-        if case != "confirmed-running" or heartbeat_runner != "runner_a":
+        if case not in {"confirmed-running", "unverified-running"} or (
+            heartbeat_runner != "runner_a"
+        ):
             await orchestration._watch_runner_input_lease(store, session_id, pending_id)
             (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
             assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
             return
         assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
         assert not store.list_items(session_id).data
-        # A reload or second device during the long step reads it as received.
+        # A reload or second device during the long step reads the same state.
         [entry] = pending_inputs.snapshot_for(session_id)
-        assert entry["received"] is True
+        assert entry.get("received", False) is evidence
         assert entry["sending_since_ms"] is not None
         conversation = store.get_conversation(session_id)
         assert conversation is not None

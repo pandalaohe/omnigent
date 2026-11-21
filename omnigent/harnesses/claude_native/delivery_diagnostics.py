@@ -351,6 +351,21 @@ def _draft_observation(pane: str, needle: str, *, prompt_glyph: str) -> DraftObs
     }
 
 
+# Verifications that prove the paste was submitted: the draft left the box, or
+# Claude recorded the prompt. Anything else, including a blind Enter, does not.
+_SUBMIT_EVIDENCE = frozenset({"draft_absent", "native_recorded"})
+
+
+def delivery_confirmed() -> bool:
+    """Whether the current delivery's last attempt recorded evidence of its submit."""
+    trace = _prompt_delivery_trace.get()
+    return bool(
+        trace is not None
+        and trace.attempts
+        and trace.attempts[-1].get("verification") in _SUBMIT_EVIDENCE
+    )
+
+
 @_best_effort
 def start_attempt() -> None:
     trace = _prompt_delivery_trace.get()

@@ -967,6 +967,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       pendingId,
       sinceMs,
       ...(data.received === true ? { received: true } : {}),
+      ...(typeof data.stable_id === "string" ? { stableId: data.stable_id } : {}),
     };
   }
   if (eventType === "session.input.consumed") {

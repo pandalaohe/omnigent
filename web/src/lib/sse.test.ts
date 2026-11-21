@@ -262,10 +262,15 @@ describe("parseEvent — session.input.consumed", () => {
 
 describe("parseEvent — session.input.sending", () => {
   it.each([
-    [true, { received: true }],
+    [true, { received: true, stableId: "a".repeat(32) }],
     [false, {}],
   ])("carries received=%s only when the agent accepted the input", (received, extra) => {
-    const data = { pending_id: "pending_steer", since_ms: 1, received };
+    const data = {
+      pending_id: "pending_steer",
+      since_ms: 1,
+      received,
+      ...(received ? { stable_id: "a".repeat(32) } : { stable_id: null }),
+    };
     expect(parseEvent("session.input.sending", data)).toEqual({
       type: "session_input_sending",
       pendingId: "pending_steer",
