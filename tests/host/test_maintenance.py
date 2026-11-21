@@ -195,7 +195,9 @@ def test_list_archived_session_times_uses_a_listing_only_when_complete(
         return httpx.Response(200, json=pages[len(requests) - 1])
 
     with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
-        archived = maintenance.list_archived_session_times(client, _SERVER, {"X-Test": "1"})
+        archived = maintenance.list_archived_session_times(
+            client, _SERVER, {"X-Test": "1"}, host_id="host-1"
+        )
 
     if fail_at is None:
         assert archived == {
@@ -208,6 +210,8 @@ def test_list_archived_session_times_uses_a_listing_only_when_complete(
         assert archived is None
     assert [request.url.params.get("after") for request in requests] == [None, "sess-4"]
     assert requests[0].url.params["archived_only"] == "true"
+    # Only this host's sessions are listed.
+    assert {request.url.params["host_id"] for request in requests} == {"host-1"}
     assert requests[0].headers["X-Test"] == "1"
 
 
@@ -262,20 +266,22 @@ def test_retain_codex_session_dirs_rechecks_only_listed_children(
         rechecked.append((server_url, session_id, dict(headers)))
         return bridge.SessionRetentionState("archived", archived_at=archived_at, child=True)
 
-    monkeypatch.setattr(
-        maintenance,
-        "list_archived_session_times",
-        lambda _client, _server_url, _headers, **_kwargs: {
-            "sess-child": (archived_at, True),
-            "sess-main": (archived_at, False),
-        },
-    )
+    listed_for: list[object] = []
+
+    def _list(
+        _client: httpx.Client, _server_url: str, _headers: dict[str, str], **kwargs: object
+    ) -> dict[str, tuple[int, bool]]:
+        listed_for.append(kwargs["host_id"])
+        return {"sess-child": (archived_at, True), "sess-main": (archived_at, False)}
+
+    monkeypatch.setattr(maintenance, "list_archived_session_times", _list)
     monkeypatch.setattr(maintenance, "fetch_session_retention_state", _fetch)
 
     counts = maintenance.retain_codex_session_dirs(
-        _SERVER, {"X-Test": "1"}, remove=False, now=_NOW
+        _SERVER, {"X-Test": "1"}, remove=False, now=_NOW, host_id="host-1"
     )
 
+    assert listed_for == ["host-1"]
     assert rechecked == [(_SERVER, "sess-child", {"X-Test": "1"})]
     assert counts["removable"] == 1
     assert counts["kept_main"] == 1
@@ -327,7 +333,9 @@ async def test_session_retention_stage_stops_asking_once_cancelled(
     started = threading.Event()
     saw_stop = threading.Event()
 
-    def _retain(_server_url: str, _headers: dict[str, str], *, should_stop: Any) -> dict[str, int]:
+    def _retain(
+        _server_url: str, _headers: dict[str, str], *, should_stop: Any, host_id: object = None
+    ) -> dict[str, int]:
         started.set()
         deadline = time.monotonic() + 5.0
         while not should_stop() and time.monotonic() < deadline:

@@ -45,7 +45,8 @@ _CODEX_SESSION_RETENTION_INTERVAL_S = 24 * 60 * 60
 # The pass holds the host maintenance lock; listing alone takes a few minutes
 # on a busy server with thousands of archived sessions.
 _CODEX_SESSION_RETENTION_BUDGET_S = 10 * 60
-_SESSION_STATE_TIMEOUT_S = 10.0
+# A busy server takes several seconds per session snapshot.
+_SESSION_STATE_TIMEOUT_S = 30.0
 # One page of every archived session the host's user can see, children and
 # side chats included.
 _ARCHIVED_SESSIONS_QUERY = {
@@ -769,6 +770,7 @@ def list_archived_session_times(
     server_url: str,
     headers: Mapping[str, str],
     *,
+    host_id: str | None = None,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> dict[str, tuple[int, bool]] | None:
     """Read the archive time and role of every archived session, page by page.
@@ -777,6 +779,7 @@ def list_archived_session_times(
     failed page, a stop or an exhausted budget ends the listing and discards
     every page read so far.
 
+    :param host_id: Lists only sessions bound to this host when given.
     :returns: ``(archive epoch seconds, has a parent)`` by session id, or
         ``None`` when the listing did not complete.
     """
@@ -787,6 +790,8 @@ def list_archived_session_times(
             if should_stop():
                 return None
             params = dict(_ARCHIVED_SESSIONS_QUERY)
+            if host_id is not None:
+                params["host_id"] = host_id
             if after is not None:
                 params["after"] = after
             response = client.get(
@@ -820,6 +825,7 @@ def retain_codex_session_dirs(
     now: float | None = None,
     should_stop: Callable[[], bool] = lambda: False,
     budget_s: float = _CODEX_SESSION_RETENTION_BUDGET_S,
+    host_id: str | None = None,
 ) -> dict[str, int]:
     """Apply the archived-session retention to the codex-native bridge dirs.
 
@@ -830,6 +836,7 @@ def retain_codex_session_dirs(
     :param should_stop: Returns ``True`` once the host is shutting down.
     :param budget_s: Wall-clock seconds for the pass; past it nothing more is
         read or removed.
+    :param host_id: The host whose sessions are listed; others are kept.
     :returns: Counts from
         :func:`~omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state`;
         ``stopped`` is set when the server could not be read.
@@ -846,7 +853,9 @@ def retain_codex_session_dirs(
         return should_stop() or time.monotonic() >= deadline
 
     with httpx.Client(timeout=_SESSION_STATE_TIMEOUT_S, verify=client_ssl_context()) as client:
-        archived = list_archived_session_times(client, server_url, headers, should_stop=_stopping)
+        archived = list_archived_session_times(
+            client, server_url, headers, host_id=host_id, should_stop=_stopping
+        )
         if archived is None:
             interrupted = _stopping()
             return {"removed": 0, "stopped": int(not interrupted), "interrupted": int(interrupted)}
@@ -873,6 +882,7 @@ def _codex_session_retention_stage(
     server_url: str,
     server_headers: Callable[[], Mapping[str, str]],
     *,
+    host_id: str | None = None,
     interval_s: float = _CODEX_SESSION_RETENTION_INTERVAL_S,
 ) -> Callable[[], Awaitable[object]]:
     """Build the stage that runs the archived-session retention at most once per interval.
@@ -891,7 +901,7 @@ def _codex_session_retention_stage(
         cancelled = threading.Event()
         result = await _run_sync_stage(
             lambda: retain_codex_session_dirs(
-                server_url, server_headers(), should_stop=cancelled.is_set
+                server_url, server_headers(), should_stop=cancelled.is_set, host_id=host_id
             ),
             on_cancel=cancelled.set,
         )
@@ -940,6 +950,7 @@ class HostMaintenanceJanitor:
         on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
         server_url: str | None = None,
         server_headers: Callable[[], Mapping[str, str]] | None = None,
+        host_id: str | None = None,
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon.
 
@@ -954,6 +965,7 @@ class HostMaintenanceJanitor:
             codex-native bridge dirs.
         :param server_headers: Returns the host's request headers, auth
             included. Called off-loop once per retention pass.
+        :param host_id: This host's id; the retention lists only its sessions.
         """
         from omnigent.process_logging import data_dir, process_log_dir
         from omnigent.runtime.harnesses.paths import (
@@ -1023,7 +1035,7 @@ class HostMaintenanceJanitor:
             stages.append(
                 (
                     "codex_session_retention",
-                    _codex_session_retention_stage(server_url, server_headers),
+                    _codex_session_retention_stage(server_url, server_headers, host_id=host_id),
                 )
             )
             # A superseded runner's bridge is mid-handover, as for the orphan sweep.

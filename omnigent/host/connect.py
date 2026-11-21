@@ -5953,6 +5953,7 @@ class HostProcess:
                 ),
                 server_url=self._server_url,
                 server_headers=self._build_connect_headers,
+                host_id=self._identity.host_id,
             )
             self._maintenance_janitor.start()
         except Exception:
