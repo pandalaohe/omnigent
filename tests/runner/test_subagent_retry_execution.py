@@ -479,17 +479,17 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
-@pytest.mark.parametrize("outcome", ["accepted", "quiet", "not_delivered"])
+@pytest.mark.parametrize("accepted", [True, False])
 async def test_refused_turn_input_ends_turn_without_failure_or_result(
-    monkeypatch, native, outcome
+    monkeypatch, native, accepted
 ):
     from omnigent.runner import app as runner_app
     from omnigent.runner.subagent_work import _SubagentDeliveryAck
 
     terminals, started = [], []
 
-    def record_terminal(child, **kwargs):
-        terminals.append((child, kwargs["status"]))
+    def record_terminal(child, **_kwargs):
+        terminals.append(child)
         return _SubagentDeliveryAck(entry=None, delivered=True, delivered_now=False, reason="test")
 
     monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
@@ -506,7 +506,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             if url.endswith("/input-admission"):
                 receipt = (
                     InputExecutionReceipt(state="accepted", reason="accepted")
-                    if outcome == "accepted"
+                    if accepted
                     else InputExecutionReceipt(reason="input_closed")
                 )
                 return httpx.Response(
@@ -517,31 +517,12 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             return await super().post(url, **kwargs)
 
     event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
-    # The scaffold ends a quiet refusal completed and a sender's refused message failed.
-    terminal = (
-        {
-            "type": "response.failed",
-            "response": {
-                "id": "resp_multiturn",
-                "status": "failed",
-                "error": {
-                    "code": "input_not_delivered",
-                    "message": "Not delivered: resend it.",
-                    "undelivered": True,
-                },
-            },
-        }
-        if outcome == "not_delivered"
-        else {
-            "type": "response.completed",
-            "response": {"id": "resp_multiturn", "status": "completed"},
-        }
-    )
     frames = [
         'event: response.created\ndata: {"type":"response.created",'
         '"response":{"id":"resp_multiturn"}}\n\n',
         "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
-        f"event: {terminal['type']}\ndata: " + json.dumps(terminal) + "\n\n",
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
     ]
     harness = _ScriptedHarnessClient(frames)
     app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
@@ -552,7 +533,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
                 "type": "message",
                 "role": "user",
                 "model": "test",
-                "content": [{"type": "input_text", "text": "message"}],
+                "content": [{"type": "input_text", "text": "[System: host load] notice"}],
                 "input_id": input_id,
                 "input_admission_required": True,
                 "input_admission_deadline": deadline,
@@ -568,13 +549,10 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
     assert "failed" not in statuses
     if not native:
         assert statuses[-1:] == ["idle"]
-    expected = {
-        "accepted": ([session_id], []) if native else ([], [(session_id, "completed")]),
-        "quiet": ([], []),
-        # The outstanding dispatch hears "not delivered" as a cancelled, non-error result.
-        "not_delivered": ([], [(session_id, "cancelled")]),
-    }[outcome]
-    assert (started, terminals) == expected
+    if accepted:
+        assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
+    else:
+        assert (started, terminals) == ([], [])
 
 
 @pytest.mark.asyncio

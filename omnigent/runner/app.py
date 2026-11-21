@@ -7557,16 +7557,6 @@ def create_runner_app(
             )
             return
 
-        # A refused sender message ends not delivered: told to its sender, not a failure.
-        not_delivered_error = (
-            error
-            if admission_refused
-            and error is not None
-            and error.get("code") == "input_not_delivered"
-            else None
-        )
-        if not_delivered_error is not None:
-            error = None
         terminal_data = dict(_turn_identities.get(conv_id, {}))
         response_id = owner_response_id or _live_response_id.get(conv_id)
         if response_id is not None and terminal_data.get("turn_id") is None:
@@ -7658,14 +7648,10 @@ def create_runner_app(
         pi_peer_turn = _pi_peer_turns.pop(conv_id, None)
         if pi_peer_turn is not None:
             # The peer still learns its refused message was not consumed.
-            peer_error = (
-                error
-                or not_delivered_error
-                or (
-                    {"code": "input_execution_admission_refused", "message": "Input not run"}
-                    if admission_refused
-                    else None
-                )
+            peer_error = error or (
+                {"code": "input_execution_admission_refused", "message": "Input not run"}
+                if admission_refused
+                else None
             )
             terminal_status = (
                 "cancelled"
@@ -7720,14 +7706,6 @@ def create_runner_app(
                 error=error,
                 status="failed",
                 output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
-            )
-        elif not_delivered_error is not None:
-            # An outstanding dispatch learns its message never ran, as a non-error outcome.
-            _mark_subagent_terminal_and_wake(
-                conv_id,
-                terminal_data=terminal_data,
-                status="cancelled",
-                output=str(not_delivered_error.get("message") or "Not delivered."),
             )
         elif admission_refused:
             # Nothing ran: no result for the parent, and no proof the prompt was submitted.

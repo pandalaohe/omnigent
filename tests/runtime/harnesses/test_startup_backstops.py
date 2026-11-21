@@ -213,21 +213,8 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reason", "sender_id", "terminal_type"),
-    [
-        ("accepted", None, "response.completed"),
-        # A runtime notice carries no sender id: it ends quietly.
-        ("input_closed", None, "response.completed"),
-        # A sender's message is reported not delivered so it can be resent.
-        ("input_closed", "a" * 32, "response.failed"),
-        # The same input already ran elsewhere: a resend would duplicate it.
-        ("input_identity_conflict", "a" * 32, "response.completed"),
-    ],
-)
-async def test_refused_turn_admission_never_runs_and_reports_only_sender_messages(
-    reason, sender_id, terminal_type
-):
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_refused_turn_admission_ends_unrun_without_failure(accepted):
     runs = []
 
     class Harness(_scaffold.HarnessApp):
@@ -236,12 +223,10 @@ async def test_refused_turn_admission_never_runs_and_reports_only_sender_message
 
     harness = Harness()
     ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
-    text = "Please rerun the focused tests on the candidate\n and report the result"
     request = CreateResponseRequest(
         model="agent",
-        input=[{"type": "input_text", "text": text}],
+        input="notice",
         input_id="e" * 32,
-        input_stable_id=sender_id,
         input_admission_required=True,
         input_admission_deadline=time.time() + 30,
     )
@@ -250,23 +235,16 @@ async def test_refused_turn_admission_never_runs_and_reports_only_sender_message
     assert event.claim.boundary == "receiver"
     receipt = (
         InputExecutionReceipt(state="accepted", reason="accepted")
-        if reason == "accepted"
-        else InputExecutionReceipt(reason=reason)
+        if accepted
+        else InputExecutionReceipt(reason="input_closed")
     )
     assert ctx._complete_input_claim(event.claim_id, receipt)
-    await asyncio.wait({run_task}, timeout=3)
-    assert runs == ([request] if reason == "accepted" else [])
+    await asyncio.wait_for(run_task, 3)
+    assert runs == ([request] if accepted else [])
     terminal = await harness._build_terminal_event(
         ctx, model="agent", run_task=run_task, sequence=2
     )
-    assert terminal.type == terminal_type
-    if terminal_type == "response.failed":
-        assert terminal.response.error.code == "input_not_delivered"
-        assert terminal.response.error.undelivered is True
-        # The text names the refused message in one line, so a sender can tell its own.
-        assert terminal.response.error.message.startswith(
-            'Not delivered: "Please rerun the focused tests on the candidate and report t…"'
-        )
+    assert terminal.type == "response.completed"
 
 
 @pytest.mark.asyncio

@@ -517,16 +517,6 @@ class _InputExecutionAcceptanceUnknown(RuntimeError):
     """The receiver cannot prove whether its original admission committed."""
 
 
-class _InputNotDelivered(RuntimeError):
-    """A sender's input was refused at final admission and never ran."""
-
-
-# Refusals meaning the same input ran or belongs elsewhere; resending would duplicate it.
-_INPUT_HANDLED_ELSEWHERE = frozenset(
-    {"input_identity_conflict", "input_already_consumed", "superseded"}
-)
-
-
 class TurnContext:
     """
     Per-turn interaction surface the scaffold hands to ``run_turn``.
@@ -592,7 +582,6 @@ class TurnContext:
         self._pending_policy_evaluations: dict[str, asyncio.Future[PolicyVerdictPayload]] = {}
         self._pending_startup_claims: dict[str, asyncio.Future[bool]] = {}
         self._pending_input_claims: dict[str, asyncio.Future[InputExecutionReceipt]] = {}
-        self.input_refusal_reason: str | None = None
         self.retry_input = False
         # In-band injections (steering, async completions) the
         # scaffold's ``message`` /events handler pushes here when
@@ -913,8 +902,6 @@ class TurnContext:
             )
             if result.state == "pending":
                 raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown")
-            if result.state == "refused":
-                self.input_refusal_reason = result.reason
             return result.state in {"accepted", "reserved"} and not self.cancelled.is_set()
         except TimeoutError:
             if boundary == "native_delivery":
@@ -1215,11 +1202,6 @@ class HarnessApp:
                 message=(
                     "Input delivery could not be confirmed; inspect its receipt before resending."
                 ),
-            )
-        if isinstance(exception, _InputNotDelivered):
-            # ``undelivered`` lets the relay settle the queued message as not delivered.
-            return ErrorDetail(
-                code="input_not_delivered", message=str(exception), undelivered=True
             )
 
         # P2.11: a turn-context desync (the inner generation outlived its turn)
@@ -2077,30 +2059,11 @@ class HarnessApp:
                     # Fenced at final acceptance: the input must not run, but the
                     # refusal is not a turn or session failure.
                     _logger.info(
-                        "Input execution admission refused for %s input_id=%s reason=%s; "
-                        "input not run",
+                        "Input execution admission refused for %s input_id=%s; input not run",
                         ctx.session_id,
                         request.input_id,
-                        ctx.input_refusal_reason,
                         extra={"session_id": ctx.session_id},
                     )
-                    # A sender's own message is reported not delivered; runtime notices
-                    # (no sender id) and inputs handled elsewhere end quietly.
-                    if (
-                        request.input_stable_id
-                        and ctx.input_refusal_reason not in _INPUT_HANDLED_ELSEWHERE
-                    ):
-                        from omnigent.runtime.harnesses._executor_adapter import (
-                            _extract_user_text,
-                        )
-
-                        # Name the message so a sender can tell whether it was its own.
-                        text = " ".join(_extract_user_text(request.input).split())
-                        excerpt = text if len(text) <= 60 else text[:60].rstrip() + "…"
-                        raise _InputNotDelivered(
-                            f'Not delivered: "{excerpt}" was not admitted by the session '
-                            "(admission refused or expired). Send it again if it is still needed."
-                        )
                     return
             # Absolute outer (spans every recovery attempt), idle inner
             # (fresh per attempt): ``.expired()`` on each tells which
