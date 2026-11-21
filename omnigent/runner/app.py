@@ -991,6 +991,21 @@ class InstructionComposition:
 _GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes", "kimi"})
 
 
+def _leading_input_text(body: _JsonObject) -> str:
+    """Return the text a native paste of *body* starts with, as the executor joins it."""
+    from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
+
+    content = body.get("content")
+    if isinstance(content, str):
+        return content
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict) or block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE:
+            continue
+        text = block.get("text")
+        return text if block.get("type") == "input_text" and isinstance(text, str) else ""
+    return ""
+
+
 def _history_message_from_body(body: _JsonObject) -> _JsonObject:
     """Preserve the persisted initiating item when recording an incoming message."""
     return {
@@ -8029,8 +8044,9 @@ def create_runner_app(
 
     busy_pane_repaints: dict[Path, float] = {}
 
-    def _claude_input_blocked(bridge_dir: Path) -> bool:
+    def _claude_input_blocked(bridge_dir: Path, head: dict[str, Any] | None = None) -> bool:
         from omnigent.harnesses.claude_native.bridge import (
+            _passthrough_slash_command_name,
             claude_pane_has_accepted_input,
             claude_pane_ready,
             has_pending_user_prompt,
@@ -8040,12 +8056,21 @@ def create_runner_app(
 
         if has_pending_user_prompt(bridge_dir):
             return True
+        running = has_running_turn(
+            bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
+        )
+        # Claude Code runs a queued slash command only at turn end, after the bridge
+        # stops watching for "Unknown command"; a guessed skill waits for an idle pane.
+        if (
+            running
+            and head is not None
+            and _passthrough_slash_command_name(_leading_input_text(head)) is not None
+        ):
+            return True
         # Claude Code keeps its input box open mid-turn and queues what is typed
         # there. Only a busy pane without a usable box keeps the message queued,
         # so its wait never spends the delivery's readiness budget.
-        if not has_running_turn(
-            bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
-        ) or claude_pane_ready(bridge_dir):
+        if not running or claude_pane_ready(bridge_dir):
             return False
         # Output printed over the box hides it until Claude Code repaints.
         now = time.monotonic()
@@ -8054,12 +8079,14 @@ def create_runner_app(
             input_box_reads_clear(bridge_dir, repaint=True)
         return True
 
-    async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
-        """Return the bridge whose question, approval or unusable busy pane owns input."""
+    async def _pending_claude_prompt_bridge_dir(
+        session_id: str, head: dict[str, Any] | None = None
+    ) -> Path | None:
+        """Return the bridge whose question, approval or busy pane holds the *head* message."""
         if _session_harness_name(session_id) != "claude-native":
             return None
         bridge_dir = await _claude_prompt_bridge_dir(session_id)
-        if await asyncio.to_thread(_claude_input_blocked, bridge_dir):
+        if await asyncio.to_thread(_claude_input_blocked, bridge_dir, head):
             return bridge_dir
         return None
 
@@ -8110,7 +8137,10 @@ def create_runner_app(
                     try:
                         if resolved_dir is None:
                             resolved_dir = await _claude_prompt_bridge_dir(session_id)
-                        pending = await asyncio.to_thread(_claude_input_blocked, resolved_dir)
+                        queued = _session_message_buffers.get(session_id)
+                        pending = await asyncio.to_thread(
+                            _claude_input_blocked, resolved_dir, queued[0] if queued else None
+                        )
                     except HTTPException:
                         await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
                         continue
@@ -8290,7 +8320,7 @@ def create_runner_app(
                 _start_claude_prompt_waiter(session_id)
                 return
             try:
-                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id, buf[0])
             except (HTTPException, httpx.HTTPError, RuntimeError, OSError):
                 # Nothing else resumes this queue, so a failed pane check hands it to the
                 # waiter, which retries until the check succeeds.
@@ -12410,7 +12440,7 @@ def create_runner_app(
                     has_queued_messages = bool(_session_message_buffers.get(conversation_id))
                     if not has_queued_messages:
                         pending_bridge_dir = await _pending_claude_prompt_bridge_dir(
-                            conversation_id
+                            conversation_id, message_body
                         )
                     if has_queued_messages or pending_bridge_dir is not None:
                         if conversation_id not in _session_histories:
