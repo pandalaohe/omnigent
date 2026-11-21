@@ -213,6 +213,55 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "sender_id", "terminal_type"),
+    [
+        ("accepted", None, "response.completed"),
+        # A runtime notice carries no sender id: its refusal ends quietly.
+        ("input_closed", None, "response.completed"),
+        # A sender's message keeps the visible refusal failure.
+        ("input_closed", "a" * 32, "response.failed"),
+    ],
+)
+async def test_refused_turn_admission_never_runs_and_is_quiet_only_without_sender(
+    reason, sender_id, terminal_type
+):
+    runs = []
+
+    class Harness(_scaffold.HarnessApp):
+        async def run_turn(self, request, ctx):
+            runs.append(request)
+
+    harness = Harness()
+    ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
+    request = CreateResponseRequest(
+        model="agent",
+        input="notice",
+        input_id="e" * 32,
+        input_stable_id=sender_id,
+        input_admission_required=True,
+        input_admission_deadline=time.time() + 30,
+    )
+    run_task = asyncio.create_task(harness._guarded_run_turn(request, ctx))
+    event = await asyncio.wait_for(ctx._event_queue.get(), 3)
+    assert event.claim.boundary == "receiver"
+    receipt = (
+        InputExecutionReceipt(state="accepted", reason="accepted")
+        if reason == "accepted"
+        else InputExecutionReceipt(reason=reason)
+    )
+    assert ctx._complete_input_claim(event.claim_id, receipt)
+    await asyncio.wait({run_task}, timeout=3)
+    assert runs == ([request] if reason == "accepted" else [])
+    terminal = await harness._build_terminal_event(
+        ctx, model="agent", run_task=run_task, sequence=2
+    )
+    assert terminal.type == terminal_type
+    if terminal_type == "response.failed":
+        assert terminal.response.error.message == "Input execution admission refused"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("adapter", [False, True])
 @pytest.mark.parametrize("previous_response", [False, True])
 async def test_live_injection_ingress_keeps_non_executor_admission(adapter, previous_response):

@@ -2058,7 +2058,19 @@ class HarnessApp:
                 and getattr(self, "_startup_source", None) == "native"
             ):
                 if not await ctx.claim_input_execution(request):
-                    raise RuntimeError("Input execution admission refused")
+                    if request.input_stable_id:
+                        # A sender's message (web, session, peer, wake, recovery) keeps
+                        # the visible failure until a not-delivered notice can name it.
+                        raise RuntimeError("Input execution admission refused")
+                    # A runtime notice (no sender id) fenced at final acceptance must
+                    # not run, but its refusal is not a turn or session failure.
+                    _logger.info(
+                        "Input execution admission refused for %s input_id=%s; input not run",
+                        ctx.session_id,
+                        request.input_id,
+                        extra={"session_id": ctx.session_id},
+                    )
+                    return
             # Absolute outer (spans every recovery attempt), idle inner
             # (fresh per attempt): ``.expired()`` on each tells which
             # ceiling tripped so the error message is accurate.

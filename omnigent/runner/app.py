@@ -2658,6 +2658,9 @@ def create_runner_app(
     _input_execution_claims: dict[tuple[str, str], tuple[object, float, str]] = {}
     _pending_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     _abandoned_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
+    # Refused receiver claims of live turns: (session id, turn id, input id).
+    _refused_turn_inputs: set[tuple[str, str, str]] = set()
+    app.state.refused_turn_inputs = _refused_turn_inputs
     _control_receipts: dict[tuple[str, str], bool] = {}
 
     async def _flush_control_receipts(session_id: str) -> None:
@@ -2896,6 +2899,14 @@ def create_runner_app(
                     deadline_remaining_s=deadline_remaining_s,
                 ),
             )
+            if (
+                frame.claim.boundary == "receiver"
+                and frame.claim.turn_id is not None
+                and frame.claim.turn_id == _live_response_id.get(session_id)
+            ):
+                # Recorded before the reply ends the turn; its stream end matches the input.
+                # Keyed by input too: a steered input's refusal leaves the opener's intact.
+                _refused_turn_inputs.add((session_id, frame.claim.turn_id, frame.claim.input_id))
         reply = await harness_client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -5970,6 +5981,9 @@ def create_runner_app(
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         _turn_occurrences.pop(session_id, None)
+        _refused_turn_inputs.difference_update(
+            [key for key in _refused_turn_inputs if key[0] == session_id]
+        )
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _turn_identities.pop(session_id, None)
@@ -7632,6 +7646,7 @@ def create_runner_app(
         sign_in_hold: bool = False,
         cancelled: bool = False,
         input_identity: Mapping[str, object] | None = None,
+        admission_refused: bool = False,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -7717,9 +7732,11 @@ def create_runner_app(
         else:
             # A delivered turn proves the pane takes input, so any sign-in wait is over,
             # and a watcher still polling could only ask for a resend that already happened.
-            _sign_in_holds.pop(conv_id, None)
-            if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
-                watcher.cancel()
+            # A refused input never reached the pane and proves nothing.
+            if not admission_refused:
+                _sign_in_holds.pop(conv_id, None)
+                if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
+                    watcher.cancel()
             if not has_buffered and not _suppress_status:
                 # Schedule unread inbox results before deciding the session is done.
                 # An intermediate idle lets headless clients stop the runner early.
@@ -7735,8 +7752,18 @@ def create_runner_app(
                 _publish_turn_status(conv_id, "waiting" if waiting else "idle")
         pi_peer_turn = _pi_peer_turns.pop(conv_id, None)
         if pi_peer_turn is not None:
+            # The peer still learns its refused message was not consumed.
+            peer_error = error or (
+                {"code": "input_execution_admission_refused", "message": "Input not run"}
+                if admission_refused
+                else None
+            )
             terminal_status = (
-                "cancelled" if was_interrupted or cancelled else "failed" if error else "completed"
+                "cancelled"
+                if was_interrupted or cancelled
+                else "failed"
+                if peer_error
+                else "completed"
             )
             _post_untracked_subagent_terminal_soon(
                 conv_id,
@@ -7748,7 +7775,7 @@ def create_runner_app(
                     parent_id=None,
                     status=terminal_status,
                     data=terminal_data,
-                    error=error,
+                    error=peer_error,
                 ),
                 sdk_peer_delivery=pi_peer_turn,
                 response_id=owner_response_id,
@@ -7785,6 +7812,9 @@ def create_runner_app(
                 status="failed",
                 output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
             )
+        elif admission_refused:
+            # Nothing ran: no result for the parent, and no proof the prompt was submitted.
+            _logger.info("Refused input ended its turn unrun for %s", conv_id)
         elif not _is_native_harness(conv_id) and not has_buffered:
             _mark_subagent_terminal_and_wake(
                 conv_id,
@@ -7804,7 +7834,12 @@ def create_runner_app(
         # was typed, so it must not treat the work as finished.
         if not was_interrupted and not _is_native_harness(conv_id):
             _handle_member_turn_end(conv_id)
-            if error is None and not has_buffered and _session_harness_name(conv_id) == "pi":
+            if (
+                error is None
+                and not admission_refused
+                and not has_buffered
+                and _session_harness_name(conv_id) == "pi"
+            ):
                 _schedule_pending_rotation(conv_id)
         if inbox_recovery_checked:
             return
@@ -11188,6 +11223,10 @@ def create_runner_app(
                     _held_refusal = None
                 if lifecycle_event is not None:
                     _publish_event(conv_id, lifecycle_event)
+                # Only this turn's opening input counts, never another turn's or a steer's.
+                opening_refusal = (conv_id, str(_response_id), str(event_body.get("input_id")))
+                admission_refused = opening_refusal in _refused_turn_inputs
+                _refused_turn_inputs.discard(opening_refusal)
                 _on_proxy_stream_end(
                     conv_id,
                     error=lifecycle_error
@@ -11196,6 +11235,7 @@ def create_runner_app(
                     sign_in_hold=holding,
                     cancelled=cancelled,
                     input_identity=turn_input_identity,
+                    admission_refused=admission_refused,
                 )
                 return lifecycle_event
 
@@ -11897,6 +11937,11 @@ def create_runner_app(
                 raise
 
             finally:
+                if _response_id is not None:
+                    # Every end of this turn drops its refusal markers, terminal or not.
+                    _refused_turn_inputs.difference_update(
+                        [key for key in _refused_turn_inputs if key[:2] == (conv_id, _response_id)]
+                    )
                 # Dispatches outlive individual SSE frames, but belong to this turn.
                 _cancel_dispatch_tasks()
                 if _dispatch_tasks:
