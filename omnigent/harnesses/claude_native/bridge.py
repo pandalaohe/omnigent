@@ -5549,10 +5549,14 @@ class _MessagePane:
 _MESSAGE_PANE: ContextVar[_MessagePane | None] = ContextVar("claude_message_pane", default=None)
 
 
-def inject_user_message(bridge_dir: Path, *, content: str, timeout_s: float | None = None) -> None:
-    """Deliver a Claude message within the active or newly allocated readiness budget."""
+def inject_user_message(bridge_dir: Path, *, content: str, timeout_s: float | None = None) -> bool:
+    """
+    Deliver a Claude message within the active or newly allocated readiness budget.
+
+    :returns: Whether evidence confirmed the submit; ``False`` for a blind submit.
+    """
     with message_readiness_budget(timeout_s):
-        _inject_user_message(bridge_dir, content=content)
+        return _inject_user_message(bridge_dir, content=content)
 
 
 @dataclass(frozen=True)
@@ -5589,7 +5593,7 @@ def _inject_user_message(
     bridge_dir: Path,
     *,
     content: str,
-) -> None:
+) -> bool:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
 
@@ -5637,7 +5641,8 @@ def _inject_user_message(
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
-    :returns: None.
+    :returns: Whether evidence confirmed the submit (the draft left the box or
+        Claude recorded the prompt); ``False`` when it was submitted blind.
     :raises ClaudeTerminalDialog: If a dialog blocks delivery or a side chat
         cannot be confirmed closed. Dismissal Escapes may have been sent,
         but the message was not delivered; the terminal remains available.
@@ -5672,7 +5677,7 @@ def _inject_user_message(
         if owner.read_receipt() is True:
             _record_accepted_input(bridge_dir, owner.check_owner)
             delivery_diagnostics.record_details(verification="native_recorded")
-            return
+            return True
         if isinstance(exc, ClaudeDeliveryUnconfirmed):
             raise
         detail = (
@@ -5686,6 +5691,7 @@ def _inject_user_message(
         ) from exc
     finally:
         _MESSAGE_PANE.reset(token)
+    return delivery_diagnostics.delivery_confirmed()
 
 
 def _inject_user_message_into_pane(

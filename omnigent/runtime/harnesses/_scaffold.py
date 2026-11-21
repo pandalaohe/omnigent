@@ -594,6 +594,8 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        # Set when the executor confirmed its native terminal holds the input.
+        self.input_received = False
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -2393,7 +2395,10 @@ class HarnessApp:
         terminal: ServerStreamEvent
         if status_value == "completed":
             terminal = CompletedEvent(
-                type="response.completed", response=response, sequence_number=sequence
+                type="response.completed",
+                response=response,
+                sequence_number=sequence,
+                input_received=True if ctx.input_received else None,
             )
         elif status_value == "failed":
             terminal = FailedEvent(

@@ -360,6 +360,8 @@ class _Entry:
     peer_message_id: str | None = None
     # Runner id that claimed this input; only its heartbeats renew a confirmed paste.
     runner_claim_owner: str | None = None
+    # The claiming attempt's runner confirmed its terminal holds this input.
+    agent_received: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -566,6 +568,19 @@ def runner_input_is_claimed(conversation_id: str, pending_id: str) -> bool:
     with _lock:
         entry = _pending.get(conversation_id, {}).get(pending_id)
         return entry is not None and entry.runner_claim_id is not None
+
+
+def _agent_received(entry: _Entry) -> bool:
+    # A running turn may keep a received input queued until its next step,
+    # when the mirror lands; later lifecycle stages do not undo the receipt.
+    return entry.agent_received
+
+
+def agent_received(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """Return a claimed input once the native agent accepted its paste, else ``None``."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None and _agent_received(entry) else None
 
 
 def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
@@ -777,8 +792,14 @@ def mark_lifecycle(
     reason_code: str | None = None,
     native_turn_id: str | None = None,
     lifecycle_response_id: str | None = None,
+    input_received: bool = False,
 ) -> str | None:
-    """Attach one identity-linked runner lifecycle edge to a queued input."""
+    """
+    Attach one identity-linked runner lifecycle edge to a queued input.
+
+    ``input_received`` records that the claiming attempt's terminal holds the
+    input; it needs that attempt's id and a live claim.
+    """
     identity = {
         key: value
         for key, value in {
@@ -823,6 +844,16 @@ def mark_lifecycle(
                 entry.native_turn_id = native_turn_id
             if lifecycle_response_id is not None:
                 entry.lifecycle_response_id = lifecycle_response_id
+            if (
+                input_received
+                and delivery_attempt_id is not None
+                and entry.runner_claim_id is not None
+                and not entry.interrupted
+                and entry.last_runner_renewal is not None
+                # A lapsed claim waits for its cleanup to settle it as uncertain.
+                and _now() - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
+            ):
+                entry.agent_received = True
             return entry.pending_id
     return None
 
@@ -1421,6 +1452,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                     if entry.sending_since_ms is not None
                     else {}
                 ),
+                **({"received": True} if _agent_received(entry) else {}),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
                 **(
                     {"auto_retry": entry.auto_retry.model_dump(mode="json")}

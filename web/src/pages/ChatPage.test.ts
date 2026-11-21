@@ -540,6 +540,31 @@ describe("buildPendingBubbles", () => {
     expect(midTurn.awaitingAgent).toBe(true);
     expect(plain.awaitingAgent).toBeUndefined();
   });
+
+  it("swaps the sending timer for the agent note once the agent received the input", () => {
+    const since = 1_753_900_000_000;
+    // The sender's own bubble and a reload or second device (no send-time status).
+    const [sending, sender, replayed] = buildPendingBubbles(
+      [
+        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since },
+        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since, received: true },
+        { ...pending[0]!, sendingSinceMs: since, received: true },
+      ],
+      null,
+    ) as Extract<Bubble, { kind: "user" }>[];
+    expect(sending).toMatchObject({ sendingSinceMs: since });
+    expect(sending!.awaitingAgent).toBeUndefined();
+    for (const bubble of [sender!, replayed!]) {
+      expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+      expect(bubble.sendingSinceMs).toBeUndefined();
+    }
+    // A slow POST does not bring back "Still sending…" once the agent has the input.
+    const [slowPost] = buildPendingBubbles(
+      [{ ...pending[0]!, stillSending: true, received: true }],
+      null,
+    ) as Extract<Bubble, { kind: "user" }>[];
+    expect(slowPost!.stillSending).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────

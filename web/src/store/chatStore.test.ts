@@ -48,7 +48,8 @@ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
-import { buildBubbles } from "@/lib/renderItems";
+import { buildBubbles, type Bubble } from "@/lib/renderItems";
+import { buildPendingBubbles } from "@/components/chat/chatBubbleParts";
 import {
   getSessionSlim,
   INITIAL_WINDOW_ITEMS,
@@ -732,6 +733,7 @@ function seedPendingInputs(
     created_by?: string;
     stable_id?: string;
     sending_since_ms?: number;
+    received?: boolean;
   }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
@@ -2115,6 +2117,23 @@ describe("chatStore — switchTo", () => {
     expect(state.pendingUserMessages).toEqual([
       { tempId: "pending_srv1", content: [{ type: "input_text", text: "queued msg" }] },
     ]);
+  });
+
+  it("replays a received paste as received on a reload or second device", async () => {
+    seedSession("conv_native", []);
+    const received = {
+      pending_id: "pending_received",
+      content: [{ type: "input_text", text: "queued in Claude" }],
+      sending_since_ms: 1710000000000,
+      received: true,
+    };
+    seedPendingInputs("conv_native", [received]);
+
+    await useChatStore.getState().switchTo("conv_native");
+
+    const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+    expect(bubble).toMatchObject({ itemId: "pending_received", awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("sendingSinceMs");
   });
 
   it("replays the server send time for a native message waiting for delivery", async () => {
@@ -9189,6 +9208,192 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   // deliberately bind something else, or name another conversation in the event.
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_abc" });
+  });
+
+  it("keeps a received event that arrives before the send's POST names its pending id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    let resolvePost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((resolve) => {
+          resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_early" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await tick();
+    const [sent] = useChatStore.getState().pendingUserMessages;
+    expect(sent!.pendingId).toBeUndefined();
+    // The runner confirmed the paste on the stream before the POST returned.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_early",
+      sinceMs: 1_710_000_000_000,
+      received: true,
+      stableId: sent!.stableId!,
+    });
+    // The bubble stays untouched until its POST names its pending id.
+    expect(useChatStore.getState().pendingUserMessages).toEqual([sent]);
+    resolvePost();
+    await sendPromise;
+
+    const [linked] = useChatStore.getState().pendingUserMessages;
+    expect(linked).toMatchObject({ pendingId: "pending_early", received: true });
+    const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("sendingSinceMs");
+  });
+
+  it("keeps a received send's bubble when its POST answer is lost", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      isNativeTerminalSession: true,
+    });
+    let failPost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((_resolve, reject) => {
+          failPost = () => reject(new TypeError("Failed to fetch"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await tick();
+    const [sent] = useChatStore.getState().pendingUserMessages;
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_lost",
+      sinceMs: 1_710_000_000_000,
+      received: true,
+      stableId: sent!.stableId!,
+    });
+    failPost();
+    await sendPromise;
+
+    const state = useChatStore.getState();
+    // Only the mirror is pending: no restored draft, the bubble keeps waiting.
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.pendingUserMessages).toMatchObject([
+      { tempId: sent!.tempId, pendingId: "pending_lost", received: true },
+    ]);
+    const [bubble] = buildPendingBubbles(state.pendingUserMessages, null);
+    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("stillSending");
+  });
+
+  it("does not give a settled attempt's late receipt to a retry with the same pending id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    let resolvePost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((resolve) => {
+          resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_same" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await tick();
+    const [retry] = useChatStore.getState().pendingUserMessages;
+    // Attempt A of this stable id (so of this pending id) was received, then settled,
+    // before the server took retry B; both frames reach the tab while B's POST is out.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_same",
+      sinceMs: 1_710_000_000_000,
+      received: true,
+      stableId: retry!.stableId!,
+    });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "err_attempt_a",
+      itemType: "error",
+      data: {},
+      clearedPendingId: "pending_same",
+    });
+    resolvePost();
+    await sendPromise;
+
+    const [bubble] = useChatStore.getState().pendingUserMessages;
+    expect(bubble).toMatchObject({
+      tempId: retry!.tempId,
+      pendingId: "pending_same",
+      posted: true,
+    });
+    expect(bubble).not.toHaveProperty("received");
+  });
+
+  it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
+    const since = 1_710_000_000_000;
+    const content = [{ type: "input_text" as const, text: "steer" }];
+    const queued = { tempId: "tmp_steer", pendingId: "pending_steer", content };
+    useChatStore.setState({
+      sessionStatus: "running",
+      pendingUserMessages: [
+        { ...queued, sentMidTurn: true },
+        { ...queued, tempId: "tmp_other", pendingId: "pending_other" },
+      ],
+    });
+    const steerBubble = () =>
+      buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0] as Extract<
+        Bubble,
+        { kind: "user" }
+      >;
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+    });
+    expect(steerBubble()).toMatchObject({ sendingSinceMs: since });
+    // The runner confirmed the paste while the turn keeps running.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+      received: true,
+    });
+    // A later heartbeat without the flag cannot make it sending again.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+    });
+    const [steer, other] = useChatStore.getState().pendingUserMessages;
+    // The send time stays for reconnect settlement; only the display changes.
+    expect(steer).toMatchObject({ sendingSinceMs: since, received: true });
+    expect(other!.received).toBeUndefined();
+    expect(steerBubble()).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(steerBubble().sendingSinceMs).toBeUndefined();
+
+    // Claude absorbs it at its next step; the mirror commits it exactly once.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_steer",
+      itemType: "message",
+      clearedPendingId: "pending_steer",
+      data: { role: "user", content },
+    });
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["tmp_other"]);
   });
 
   describe("session.presence", () => {
@@ -21994,6 +22199,85 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    { snapshot: "a stale snapshot", serverHasInput: false },
+    { snapshot: "a fresh snapshot", serverHasInput: true },
+  ])(
+    "keeps an early-received send through a reconnect with $snapshot before its POST returns",
+    async ({ serverHasInput }) => {
+      const id = "conv_early_received";
+      seedSession(id, []);
+      const sinks = routeStreamOpens();
+      const streamRoute = fetchMock.getMockImplementation()!;
+      let resolvePost: () => void = () => {};
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith(`/v1/sessions/${id}/events`)) {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () =>
+              resolve(mockResponse({ queued: true, pending_id: "pending_early" }));
+          });
+        }
+        return streamRoute(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        sessionStatus: "idle",
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+      await drainAsync();
+      const [sent] = useChatStore.getState().pendingUserMessages;
+      const since = 1_710_000_000_000;
+      handleSessionEvent(
+        {
+          type: "session_input_sending",
+          pendingId: "pending_early",
+          sinceMs: since,
+          received: true,
+          stableId: sent!.stableId!,
+        },
+        id,
+      );
+      // Held until the POST names the pending id, so the reconnect sees the bubble as sent.
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent]);
+
+      seedPendingInputs(
+        id,
+        serverHasInput
+          ? [
+              {
+                pending_id: "pending_early",
+                content: sent!.content,
+                stable_id: sent!.stableId!,
+                sending_since_ms: since,
+                received: true,
+              },
+            ]
+          : [],
+      );
+      sinks[0]!.error();
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+        sent!.tempId,
+      ]);
+
+      resolvePost();
+      await drainAsync();
+      await sendPromise;
+      expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+        { tempId: sent!.tempId, pendingId: "pending_early", received: true, posted: true },
+      ]);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it.each([
     { path: "ordinary backfill", gapLength: 5 },
