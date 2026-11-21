@@ -611,7 +611,10 @@ class FetchBackedXHR {
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
   ontimeout: (() => void) | null = null;
+  onprogress: (() => void) | null = null;
+  onreadystatechange: (() => void) | null = null;
   timeout = 0;
+  aborted = false;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   private headers = new Headers();
 
@@ -650,6 +653,7 @@ class FetchBackedXHR {
   }
 
   abort() {
+    this.aborted = true;
     this.onabort?.();
   }
 }
@@ -7729,7 +7733,7 @@ describe("chatStore — send (file attachments)", () => {
     }
   });
 
-  it("shows still sending before an aborted native upload returns the text for retry", async () => {
+  it("shows still sending before a stalled native upload returns the text for retry", async () => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
@@ -7761,7 +7765,7 @@ describe("chatStore — send (file attachments)", () => {
     );
 
     try {
-      FetchBackedXHR.instances.at(-1)?.abort();
+      await vi.advanceTimersByTimeAsync(60_000);
       await sendPromise;
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
       expect(useChatStore.getState().failedSendDraft).toMatchObject({

@@ -26,7 +26,7 @@ interface UploadResourcePayload {
   };
 }
 
-const FILE_UPLOAD_TIMEOUT_MS = 30_000;
+const FILE_UPLOAD_STALL_TIMEOUT_MS = 60_000;
 
 function uploadedFileFromResource(
   resource: UploadResourcePayload,
@@ -85,17 +85,54 @@ export async function uploadFile(
   const headers = await authenticatedRequestHeaders(path);
   return new Promise<UploadedFile>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    let responseFinished = false;
+    let abortReason: Error | null = null;
+
+    const clearStallTimer = () => {
+      if (stallTimer !== null) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    };
+    const rejectUpload = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearStallTimer();
+      reject(error);
+    };
+    const resolveUpload = (uploaded: UploadedFile) => {
+      if (settled) return;
+      settled = true;
+      clearStallTimer();
+      resolve(uploaded);
+    };
+    const resetStallTimer = () => {
+      if (settled || responseFinished) return;
+      clearStallTimer();
+      stallTimer = setTimeout(() => {
+        abortReason = new Error("File upload stalled");
+        xhr.abort();
+        rejectUpload(abortReason);
+      }, FILE_UPLOAD_STALL_TIMEOUT_MS);
+    };
+
     xhr.open("POST", withBasePath(path));
-    xhr.timeout = FILE_UPLOAD_TIMEOUT_MS;
     for (const [name, value] of headers.entries()) {
       xhr.setRequestHeader(name, value);
     }
     xhr.upload.onprogress = (event) => {
+      resetStallTimer();
       if (onProgress && event.lengthComputable && event.total > 0) {
         onProgress(Math.min(1, event.loaded / event.total));
       }
     };
+    xhr.onprogress = resetStallTimer;
+    xhr.onreadystatechange = resetStallTimer;
     xhr.onload = () => {
+      responseFinished = true;
+      clearStallTimer();
       const response = new Response(xhr.responseText, {
         status: xhr.status,
         statusText: xhr.statusText,
@@ -104,21 +141,22 @@ export async function uploadFile(
         // Reuse authenticatedFetch's 401 handling so a standalone session
         // expiry redirects exactly as every other API call would.
         handleUnauthorizedResponse(path, response);
-        void apiErrorFromResponse(response).then(reject, reject);
+        void apiErrorFromResponse(response).then(rejectUpload, rejectUpload);
         return;
       }
       let resource: UploadResourcePayload;
       try {
         resource = JSON.parse(xhr.responseText) as UploadResourcePayload;
       } catch (error) {
-        reject(error);
+        rejectUpload(error);
         return;
       }
-      resolve(uploadedFileFromResource(resource, file, filename));
+      resolveUpload(uploadedFileFromResource(resource, file, filename));
     };
-    xhr.onerror = () => reject(new Error("Network error while uploading the file"));
-    xhr.onabort = () => reject(new Error("File upload was aborted"));
-    xhr.ontimeout = () => reject(new Error("File upload timed out"));
+    xhr.onerror = () => rejectUpload(new Error("Network error while uploading the file"));
+    xhr.onabort = () => rejectUpload(abortReason ?? new Error("File upload was aborted"));
+    xhr.ontimeout = () => rejectUpload(new Error("File upload timed out"));
+    resetStallTimer();
     xhr.send(form);
   });
 }

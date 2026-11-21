@@ -32,7 +32,10 @@ class FakeXHR {
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
   ontimeout: (() => void) | null = null;
+  onprogress: (() => void) | null = null;
+  onreadystatechange: (() => void) | null = null;
   timeout = 0;
+  aborted = false;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   requestHeaders: Record<string, string> = {};
   sentBody: FormData | null = null;
@@ -66,6 +69,7 @@ class FakeXHR {
   }
 
   abort() {
+    this.aborted = true;
     this.onabort?.();
   }
 }
@@ -205,9 +209,46 @@ describe("uploadFile", () => {
   it("rejects when the upload times out", async () => {
     const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
     const xhr = await nextXhr();
-    expect(xhr.timeout).toBeGreaterThan(0);
     xhr.ontimeout?.();
     await expect(promise).rejects.toThrow("timed out");
+  });
+
+  it("keeps an upload alive while transfer and response activity continue", async () => {
+    vi.useFakeTimers();
+    try {
+      const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+      const xhr = await nextXhr();
+
+      await vi.advanceTimersByTimeAsync(59_000);
+      xhr.upload.onprogress?.({ lengthComputable: true, loaded: 1, total: 2 } as ProgressEvent);
+      await vi.advanceTimersByTimeAsync(59_000);
+      xhr.onprogress?.();
+      await vi.advanceTimersByTimeAsync(59_000);
+      xhr.onreadystatechange?.();
+      await vi.advanceTimersByTimeAsync(59_000);
+
+      expect(xhr.aborted).toBe(false);
+      xhr.respond(201, JSON.stringify({ id: "file_1" }));
+      await promise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects an upload with no progress after the stall limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+      const xhr = await nextXhr();
+      const rejection = expect(promise).rejects.toThrow("stalled");
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(xhr.aborted).toBe(true);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
