@@ -7272,6 +7272,14 @@ _SLASH_MENU_PANE = (
             lambda _n, content: f"❯ {content}\n  ⎿  done\n",
             id="old-echo-alone",
         ),
+        pytest.param(
+            lambda n, content: (
+                _status_line_draft(content)
+                if n == 1
+                else _persons_btw_over(_status_line_draft(content))
+            ),
+            id="btw-over-status-line-draft-before-enter",
+        ),
     ],
 )
 def test_inject_user_message_never_submits_without_the_current_draft(
@@ -7388,6 +7396,121 @@ def test_inject_user_message_submits_the_live_clipped_draft_once(
     assert mutations == ["paste", "submit"]
 
 
+# A live 80x24 pane in default permission mode under a custom status line: the
+# opening rule collapsed and no mode row sits under the closing rule.
+_STATUS_LINE_CLIPPED_CONTENT = (
+    "[System: host load] Host host-a is above its heavy-work line (4.14 per core ≥ 4). "
+    "New heavy test runs on this host wait. Do not dispatch new heavy work to it until "
+    "a later notice says it is clear."
+)
+_STATUS_LINE_FOOTER = (
+    "  [Model]\n"
+    "  workspace +.claude +1 more\n"
+    "  Context 417k/1.0M │ 7d: 66% (16h 48m)\n"
+    "  ◐ SendMessage | ✓ Bash ×17 | ✓ Edit ×1\n"
+    "  ✓ reviewer: Review the branch (14m 12s)\n"
+)
+_STATUS_LINE_CLIPPED_PANE = (
+    "✻ Cogitated for 58m 40s · done 7:12 AM · 3 shells still running\n"
+    f"─── ↑ 1 more {'─' * 67}\n"
+    "  (4.14 per core ≥ 4). New heavy test runs on this host wait. Do not dispatch\n"
+    "  new heavy work to it until a later notice says it is clear.\n"
+    f"{'─' * 80}\n"
+    f"{_STATUS_LINE_FOOTER}"
+)
+
+
+def test_status_line_clipped_pane_reads_as_a_clipped_draft() -> None:
+    """The collapsed rule identifies the composer; a scrolled-away draft still needs a mode row."""
+    bridge = claude_native_bridge
+    content = _STATUS_LINE_CLIPPED_CONTENT
+    tail = bridge._submit_tail_needle(content) or bridge._submit_cross_line_tail(content)
+
+    assert bridge._clipped_draft_matches(_STATUS_LINE_CLIPPED_PANE, tail)
+    assert not bridge._clipped_draft_matches(_STATUS_LINE_CLIPPED_PANE, "an unrelated tail")
+    assert not bridge._claude_prompt_rendered(_STATUS_LINE_CLIPPED_PANE)
+    assert not bridge._user_prompt_visible(_STATUS_LINE_CLIPPED_PANE)
+    scrolled_away = f"  earlier line\n  end of draft\n{'─' * 80}\n{_STATUS_LINE_FOOTER}"
+    assert bridge._clipped_draft_rows(scrolled_away) is None
+    # No tail marker: the draft stays protected but is no evidence of this message.
+    assert bridge._occupied_tall_draft(_STATUS_LINE_CLIPPED_PANE)
+    assert not bridge._clipped_draft_matches(_STATUS_LINE_CLIPPED_PANE, "")
+    assert bridge._clipped_draft_matches(f"{_STATUS_LINE_CLIPPED_PANE}  ⏵⏵ auto mode on\n", "")
+    assert bridge._clipped_draft_rows(_persons_btw_over(_STATUS_LINE_CLIPPED_PANE)) is None
+
+
+def test_inject_user_message_submits_the_status_line_clipped_draft_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrapped notice in a short default-mode pane is confirmed: one paste, one Enter."""
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _STATUS_LINE_CLIPPED_PANE
+    )
+
+    inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT)
+
+    assert mutations == ["paste", "submit"]
+
+
+# Status-line content that reads like a dismissal hint, with no overlay on screen.
+_STATUS_LINE_ESC_TEXT_PANE = _STATUS_LINE_CLIPPED_PANE.replace(
+    "Review the branch", "Review Esc to dismiss behavior"
+)
+
+
+def test_status_line_esc_text_after_paste_still_confirms_the_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status-line text "Esc to …" is no cover: the draft's own tail confirms it."""
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _STATUS_LINE_ESC_TEXT_PANE
+    )
+
+    inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT)
+
+    assert mutations == ["paste", "submit"]
+
+
+def test_short_message_never_submits_a_status_line_clipped_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A message too short for a tail marker cannot claim another clipped draft."""
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _STATUS_LINE_CLIPPED_PANE
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content="OK")
+
+    assert mutations == ["paste"]
+
+
+def _status_line_draft(text: str) -> str:
+    """A collapsed status-line composer whose visible row is *text*."""
+    return f"─── ↑ 1 more {'─' * 67}\n  {text}\n{'─' * 80}\n{_STATUS_LINE_FOOTER}"
+
+
+def _persons_btw_over(composer: str) -> str:
+    """The person's borderless /btw side chat drawn under an older composer."""
+    return composer + _BTW_BORDERLESS_SPLIT_CLOSE_PANE.replace(
+        "[omnigent keep-warm] reply with only: ok", "my own question"
+    )
+
+
+def test_btw_over_a_status_line_clipped_draft_is_handled_before_the_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before the paste: the side chat is closed first, the revealed draft only blocks."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    covered = _persons_btw_over(_STATUS_LINE_CLIPPED_PANE)
+    sends = _fake_tmux(monkeypatch, [covered, covered, _STATUS_LINE_CLIPPED_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT)
+
+    assert sends == [["send-keys", "-t", "claude:0.0", "Escape"]]
+
+
 _CLIPPED_WITH_DIALOG_TEXT = (
     "❯ an earlier message\n"
     "  ⎿  done\n"
@@ -7431,6 +7554,8 @@ def test_clipped_draft_body_is_not_a_pending_permission(
             _LIVE_CLIPPED_PANE.replace(_LIVE_CLIPPED_ROWS[0], "  Do you want to deploy?"),
             id="permission-text-in-visible-draft-tail",
         ),
+        pytest.param(_STATUS_LINE_CLIPPED_PANE, id="status-line-footer"),
+        pytest.param(_STATUS_LINE_ESC_TEXT_PANE, id="status-line-esc-text"),
     ],
 )
 def test_a_tall_draft_before_paste_is_an_occupied_input_box(
