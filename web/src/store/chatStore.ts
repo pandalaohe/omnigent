@@ -676,6 +676,8 @@ export interface PendingUserMessage {
   stillSending?: boolean;
   /** Original server send time while the runner is delivering this input. */
   sendingSinceMs?: number;
+  /** The native agent accepted this input; a running turn may still hold it queued. */
+  received?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -1898,6 +1900,33 @@ const interruptRequestsInFlight = new Set<string>();
 const inFlightSends = new Map<string, boolean>();
 const inFlightSendSessions = new Map<string, string>();
 
+/**
+ * Agent receipts that arrived before their send's POST named the pending id,
+ * keyed by pending id with the send's stable id. Applied when that POST
+ * returns, so the bubble stays untouched until it knows its own id.
+ */
+const earlyReceipts = new Map<string, string | undefined>();
+const MAX_EARLY_RECEIPTS = 64;
+
+function rememberEarlyReceipt(pendingId: string, stableId: string | undefined): void {
+  earlyReceipts.delete(pendingId);
+  earlyReceipts.set(pendingId, stableId);
+  const oldest = earlyReceipts.keys().next().value;
+  if (earlyReceipts.size > MAX_EARLY_RECEIPTS && oldest !== undefined) {
+    earlyReceipts.delete(oldest);
+  }
+}
+
+/** Remove and return the pending id of the early receipt for this send. */
+function takeEarlyReceiptForSend(stableId: string): string | undefined {
+  for (const [pendingId, receiptStableId] of earlyReceipts) {
+    if (receiptStableId !== stableId) continue;
+    earlyReceipts.delete(pendingId);
+    return pendingId;
+  }
+  return undefined;
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2151,6 +2180,7 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   startupReads.clear();
+  earlyReceipts.clear();
   queryClient = client;
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
     if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
@@ -3163,6 +3193,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // what releases this conversation's entry for eviction, since the
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
+        const receivedEarly =
+          postResult.pendingId !== undefined && earlyReceipts.delete(postResult.pendingId);
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId
@@ -3170,6 +3202,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                   ...p,
                   posted: true,
                   ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                  ...(receivedEarly ? { received: true } : {}),
                 }
               : p,
           ),
@@ -3249,8 +3282,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // took it, whatever became of the POST's answer.
       const ownBlocks =
         draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
+      // The runner confirmed its terminal holds this send; only the mirror is pending.
+      // A receipt for an earlier attempt of the same stable id has the same text.
+      const earlyReceiptId = takeEarlyReceiptForSend(stableId);
+      const receivedByAgent =
+        earlyReceiptId !== undefined ||
+        draftState.pendingUserMessages.some((p) => p.tempId === tempId && p.received === true);
       let deliveredDespiteFailure =
-        inFlightSends.get(stableId) === true || mirrorNamesSend(ownBlocks, stableId);
+        receivedByAgent ||
+        inFlightSends.get(stableId) === true ||
+        mirrorNamesSend(ownBlocks, stableId);
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
@@ -3302,9 +3343,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      // Roll back the optimistic bubble — no server idle will fire. A received
+      // send keeps its bubble until its mirror commits it.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: receivedByAgent
+          ? s.pendingUserMessages.map((p) =>
+              p.tempId === tempId
+                ? {
+                    ...p,
+                    stillSending: false,
+                    // The id lets a lapsed claim's settlement remove the bubble.
+                    ...(earlyReceiptId !== undefined
+                      ? { received: true, pendingId: p.pendingId ?? earlyReceiptId }
+                      : {}),
+                  }
+                : p,
+            )
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       const native = failGet().isNativeTerminalSession;
       if (native && deliveredDespiteFailure) return true;
@@ -5815,6 +5870,7 @@ async function bindStream(
         content: p.content,
         ...(p.stableId === undefined ? {} : { stableId: p.stableId }),
         ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
+        ...(p.received ? { received: true } : {}),
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       const serverPending = pendingInputsById(session.pendingInputs);
@@ -9373,8 +9429,10 @@ function syncPendingSendTimes(
 ): PendingUserMessage[] {
   return messages.map((message) => {
     const input = inputs.get(message.pendingId ?? message.tempId);
-    return input && input.sendingSinceMs !== message.sendingSinceMs
-      ? { ...message, sendingSinceMs: input.sendingSinceMs }
+    if (!input) return message;
+    const received = message.received || input.received;
+    return input.sendingSinceMs !== message.sendingSinceMs || received !== message.received
+      ? { ...message, sendingSinceMs: input.sendingSinceMs, ...(received ? { received } : {}) }
       : message;
   });
 }
@@ -10277,17 +10335,33 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_sending": {
       if (sourceConversationId === null) break;
+      const matches = (p: PendingUserMessage) => (p.pendingId ?? p.tempId) === event.pendingId;
+      // The sender's bubble learns its pending id from the POST; hold the receipt until then.
+      if (
+        event.received === true &&
+        !(setterForState(sourceConversationId)?.pendingUserMessages.some(matches) ?? false)
+      ) {
+        rememberEarlyReceipt(event.pendingId, event.stableId);
+        break;
+      }
       setterFor(sourceConversationId)((s) => ({
         pendingUserMessages: s.pendingUserMessages.map((p) =>
-          (p.pendingId ?? p.tempId) === event.pendingId &&
-          p.sendingSinceMs !== (event.sinceMs ?? undefined)
-            ? { ...p, sendingSinceMs: event.sinceMs ?? undefined }
+          matches(p) &&
+          (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
+            (event.received === true && !p.received))
+            ? {
+                ...p,
+                sendingSinceMs: event.sinceMs ?? undefined,
+                ...(event.received === true ? { received: true } : {}),
+              }
             : p,
         ),
       }));
       break;
     }
     case "session_input_consumed": {
+      // A settled input's receipt must not reach a later attempt that reuses its id.
+      if (event.clearedPendingId) earlyReceipts.delete(event.clearedPendingId);
       if (event.itemType === "error" && event.clearedPendingId !== null) {
         applyToConversation((s) => ({
           pendingUserMessages: s.pendingUserMessages.filter(

@@ -442,6 +442,7 @@ function usageByModelFromWire(
 
 interface PendingInputWire {
   sending_since_ms?: number;
+  received?: boolean;
   stable_id?: string;
   pending_id: string;
   content: MessageContentBlock[];
@@ -453,6 +454,7 @@ function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInp
     pendingId: p.pending_id,
     content: p.content,
     ...(p.sending_since_ms === undefined ? {} : { sendingSinceMs: p.sending_since_ms }),
+    ...(p.received === true ? { received: true } : {}),
     ...(p.stable_id === undefined ? {} : { stableId: p.stable_id }),
     ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
   }));

@@ -360,8 +360,12 @@ class ClaudeNativeExecutor(Executor):
         notices: list[str],
         wanted_model: str | None,
         wanted_model_arg: str | None,
-    ) -> None:
-        """Apply a routed ``/model`` switch and send the message under the injection lock."""
+    ) -> bool:
+        """
+        Apply a routed ``/model`` switch and send the message under the injection lock.
+
+        :returns: Whether evidence confirmed the message's submit.
+        """
         self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
@@ -402,7 +406,7 @@ class ClaudeNativeExecutor(Executor):
             snapshot = await asyncio.to_thread(get_snapshot, self._bridge_dir, guard.session_id)
             prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
             await claim_execution()
-        await self._inject_prompt(text, notices)
+        return await self._inject_prompt(text, notices)
 
     def _pane_turn_running(self) -> bool:
         """
@@ -546,8 +550,12 @@ class ClaudeNativeExecutor(Executor):
             ),
         )
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
-        """Inject user text with one-shot context while holding the injection lock."""
+    async def _inject_prompt(self, text: str, notices: list[str]) -> bool:
+        """
+        Inject user text with one-shot context while holding the injection lock.
+
+        :returns: Whether evidence confirmed the submit.
+        """
         self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
@@ -555,10 +563,13 @@ class ClaudeNativeExecutor(Executor):
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
             with submission_scope(self._bridge_dir):
-                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+                confirmed = await self._inject(
+                    partial(inject_user_message, self._bridge_dir, content=text)
+                )
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
+        return confirmed is True
 
     def _require_active_session(self) -> None:
         """Reject queued input if /clear replaced its conversation while it waited."""
@@ -656,6 +667,7 @@ class ClaudeNativeExecutor(Executor):
         claim_native_delivery = config.claim_native_delivery if config is not None else None
         loop = asyncio.get_running_loop()
         delivery_claimed = False
+        submit_confirmed = False
 
         async def claim_delivery(deadline: float) -> bool:
             nonlocal delivery_claimed
@@ -692,7 +704,9 @@ class ClaudeNativeExecutor(Executor):
                         owner: ClaudeDeliveryOwner | None = None
                         try:
                             owner = read_delivery_owner(self._bridge_dir)
-                            await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                            submit_confirmed = await self._inject_turn(
+                                text, notices, wanted_model, wanted_model_arg
+                            )
                         except ClaudePromptTimeout as exc:
                             # The bridge classifies post-paste failures before they reach cleanup.
                             exited = isinstance(exc, ClaudeTerminalExited)
@@ -831,9 +845,9 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc))
             return
-        yield TurnComplete(response=None)
+        yield TurnComplete(response=None, input_received=delivery_claimed and submit_confirmed)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(self, operation: Callable[[], object]) -> object:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         paste_started = threading.Event()
@@ -841,7 +855,7 @@ class ClaudeNativeExecutor(Executor):
         with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
-            await asyncio.shield(worker)
+            return await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
             while not worker.done():

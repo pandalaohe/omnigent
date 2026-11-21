@@ -234,8 +234,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step in the timestamp row. It appears on desktop hover or
-  focus and stays visible with truncation on touch, without adding row height.
+  after its current step in the timestamp row. The note stays visible, with
+  truncation, on desktop and touch until the agent reads the message, while the
+  row's timestamp and actions keep their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -856,7 +857,9 @@ Other connection providers alone do not enable the managed MCP picker.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
   `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
-  verifies phone and tablet touch visibility without hover.
+  verifies phone and tablet touch visibility without hover, and
+  `test_steering_explanation_stays_visible_on_desktop` keeps the notice visible
+  without hover on desktop.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing

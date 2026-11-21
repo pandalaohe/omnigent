@@ -145,7 +145,9 @@ def test_delivery_diagnostics(
         ),
     ):
         if outcome == "returned":
-            bridge.inject_user_message(tmp_path, content=content)
+            confirmed = bridge.inject_user_message(tmp_path, content=content)
+            # A returned delivery without submit evidence is not reported as received.
+            assert confirmed is (verification == "draft_absent")
         else:
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
             if scenario == "pending_before_paste":
@@ -471,6 +473,26 @@ def test_delivery_summary_reports_a_queued_submit_and_the_claude_version(
     assert attrs["content_word_count"] == 3
     assert attrs["content_non_ascii"] is True
     assert "vu again" not in json.dumps(record_to_row(record, "harness"))
+
+
+@pytest.mark.parametrize(
+    ("verification", "confirmed"),
+    [("draft_absent", True), ("native_recorded", True), ("unverified", False)],
+)
+def test_only_submit_evidence_confirms_a_delivery(
+    verification: str, confirmed: bool, tmp_path: Path
+) -> None:
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> bool:
+        delivery_diagnostics.start_attempt()
+        delivery_diagnostics.record_details(verification=verification)
+        return delivery_diagnostics.delivery_confirmed()
+
+    assert deliver(tmp_path, content="\tindented") is confirmed
+    assert delivery_diagnostics.delivery_confirmed() is False
 
 
 @pytest.mark.parametrize("context", [None, "not json", '["a list"]', '{"claude_code_version": 7}'])

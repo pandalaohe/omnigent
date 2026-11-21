@@ -232,6 +232,46 @@ def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
     )
 
 
+def test_only_the_claiming_attempts_submit_evidence_marks_an_input_received() -> None:
+    pending_id = pending_inputs.record(
+        "conv", [_text_block("steer")], stable_id="a" * 32, runner_managed=True
+    )
+    attempt = str(
+        pending_inputs.delivery_attributes_for("conv", pending_id)["delivery_attempt_id"]
+    )
+
+    def mark(stage: str, *, received: bool, attempt_id: str | None = attempt) -> None:
+        pending_inputs.mark_lifecycle(
+            "conv",
+            "a" * 32,
+            pending_id=pending_id,
+            delivery_attempt_id=attempt_id,
+            stage=stage,  # type: ignore[arg-type]
+            input_received=received,
+        )
+
+    def received() -> bool:
+        [entry] = pending_inputs.snapshot_for("conv")
+        return entry.get("received", False)
+
+    # Unclaimed: no paste happened under a claim.
+    mark("native_turn_completed", received=True)
+    assert not received()
+    assert pending_inputs.claim_runner_input("conv", pending_id, "paste")
+    # A successful terminal without submit evidence (a blind Enter).
+    mark("native_turn_completed", received=False)
+    assert not received()
+    # Evidence that names no attempt cannot be tied to this paste.
+    mark("native_turn_completed", received=True, attempt_id=None)
+    assert not received()
+    mark("native_turn_completed", received=True)
+    assert received()
+    # A later lifecycle edge for the same attempt does not undo the receipt.
+    mark("native_turn_incomplete", received=False)
+    assert received()
+    assert pending_inputs.agent_received("conv", pending_id) is not None
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """

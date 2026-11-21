@@ -147,6 +147,7 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
         ("confirmed-running", "runner_a"),
         ("confirmed-idle", "runner_a"),
         ("unconfirmed-running", "runner_a"),
+        ("unverified-running", "runner_a"),
         ("confirmed-running", "runner_b"),
         ("confirmed-running", None),
     ],
@@ -154,6 +155,7 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
         "confirmed-running",
         "confirmed-idle",
         "unconfirmed-running",
+        "blind-submit-running",
         "replacement-runner",
         "no-runner-id",
     ],
@@ -177,7 +179,119 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
         "delivery_attempt_id"
     ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
-    if case.startswith("confirmed"):
+    # A blind submit completes the turn without submit evidence: the lease and
+    # settlement follow the completed turn, but the input is never shown received.
+    evidence = case.startswith("confirmed")
+    collector = await start_session_stream_collector(session_id)
+    try:
+        if case.startswith(("confirmed", "unverified")):
+            orchestration._record_native_input_lifecycle(
+                session_id,
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_paste"},
+                    "pending_id": pending_id,
+                    "delivery_attempt_id": attempt_id,
+                    **({"input_received": True} if evidence else {}),
+                },
+            )
+        if evidence:
+            # Claude holds the queued paste: chat stops counting it as sending,
+            # while its send time stays for reconnect settlement.
+            received = await collector.next_event()
+            assert received["type"] == "session.input.sending"
+            assert received["pending_id"] == pending_id
+            assert received["received"] is True
+            assert received["since_ms"] is not None
+        else:
+            await collector.assert_no_event(within=0.05)
+        # Claude absorbs the queued paste only after a 25-minute step. Only the
+        # claiming runner's heartbeats renew it; a replacement never had the paste.
+        for now in range(60, 1501, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                set(),
+                runner_id=heartbeat_runner,
+            )
+        if case not in {"confirmed-running", "unverified-running"} or (
+            heartbeat_runner != "runner_a"
+        ):
+            await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+            (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
+            assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+            return
+        assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
+        assert not store.list_items(session_id).data
+        # A reload or second device during the long step reads the same state.
+        [entry] = pending_inputs.snapshot_for(session_id)
+        assert entry.get("received", False) is evidence
+        assert entry["sending_since_ms"] is not None
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        await orchestration._persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput.model_validate(
+                {
+                    "type": "external_conversation_item",
+                    "data": {
+                        "source_id": "claude-queued-steer",
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "steer"}],
+                        },
+                        "response_id": "resp_turn",
+                    },
+                }
+            ),
+            store,
+            created_by=None,
+        )
+        # The late mirror commits the send once and clears its bubble by id.
+        consumed = await collector.next_event()
+        while consumed["type"] != "session.input.consumed":
+            consumed = await collector.next_event()
+        assert consumed["data"]["cleared_pending_id"] == pending_id
+        assert not pending_inputs.has_pending(session_id)
+        [user] = store.list_items(session_id, type="message").data
+        assert user.id == consumed["data"]["item_id"]
+        while True:
+            try:
+                extra = await collector.next_event(timeout=0.05)
+            except TimeoutError:
+                break
+            assert extra["type"] != "session.input.consumed"
+    finally:
+        await collector.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_state", ["lapsed", "interrupted"])
+async def test_a_completion_after_the_claim_ends_marks_nothing_received(
+    db_uri, monkeypatch, claim_state
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
+    if claim_state == "lapsed":
+        # The lease lapsed; its cleanup has not settled the entry yet.
+        now = 721.0
+        assert not pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    else:
+        pending_inputs.mark_interrupted(session_id, [pending_id])
+    collector = await start_session_stream_collector(session_id)
+    try:
         orchestration._record_native_input_lifecycle(
             session_id,
             {
@@ -185,28 +299,15 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
                 "response": {"id": "resp_paste"},
                 "pending_id": pending_id,
                 "delivery_attempt_id": attempt_id,
+                "input_received": True,
             },
         )
-    # Claude absorbs the queued paste only after a 25-minute step. Only the
-    # claiming runner's heartbeats renew it; a replacement never had the paste.
-    for now in range(60, 1501, 60):
-        await orchestration._reconcile_runner_input_leases(
-            store,
-            session_id,
-            {"active_pending_ids": [], "queued_pending_ids": []},
-            set(),
-            runner_id=heartbeat_runner,
-        )
-    if case != "confirmed-running" or heartbeat_runner != "runner_a":
-        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
-        (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
-        assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
-        return
-    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
-    assert not store.list_items(session_id).data
-    late_mirror = pending_inputs.resolve_matching_text(session_id, "steer")
-    assert late_mirror.matched is not None
-    assert late_mirror.matched.pending_id == pending_id
+        await collector.assert_no_event(within=0.05)
+    finally:
+        await collector.stop()
+    assert pending_inputs.agent_received(session_id, pending_id) is None
+    assert all("received" not in entry for entry in pending_inputs.snapshot_for(session_id))
+    pending_inputs.resolve(session_id, pending_id)
 
 
 def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):

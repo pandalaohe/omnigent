@@ -16521,13 +16521,17 @@ async def test_input_sending_reaches_public_session_stream(client: httpx.AsyncCl
         {"type": "session.input.sending", "pending_id": "pending_test", "since_ms": since}
         for since in (None, 1710000000000)
     ]
+    events.append({**events[-1], "received": True, "stable_id": "a" * 32})
 
     async def publish() -> None:
         for event in events:
             session_stream.publish(session_id, event)
 
     frames = await _publish_while_streaming(client, session_id, publish, "session.input.sending")
-    assert frames == [{"sequence_number": None, **event} for event in events]
+    assert frames == [
+        {"sequence_number": None, "received": False, "stable_id": None, **event}
+        for event in events
+    ]
 
 
 async def test_native_paste_claim_is_bound_to_runner_and_attempt(

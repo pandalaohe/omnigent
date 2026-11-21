@@ -4583,3 +4583,29 @@ async def test_resident_inventory_stays_unknown_after_orphan_resync_replacement(
         old.close_session.assert_awaited_once_with("owner-key")
         old.close.assert_awaited_once_with()
         assert (await client.get(route)).json() == {"inventory": None}
+
+
+@pytest.mark.parametrize("input_received", [False, True])
+async def test_turn_complete_input_receipt_reaches_response_completed(
+    input_received: bool,
+) -> None:
+    import asyncio
+
+    from omnigent.inner.executor import TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext, _format_sse_event
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = TurnContext(
+        response_id="resp_paste", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    adapter._translate_event(TurnComplete(response=None, input_received=input_received), ctx)
+    run_task = asyncio.create_task(asyncio.sleep(0))
+    await run_task
+
+    terminal = await adapter._build_terminal_event(ctx, "agent", run_task, 1)
+
+    payload = json.loads(_format_sse_event(terminal).decode().split("data: ", 1)[1])
+    assert payload["type"] == "response.completed"
+    # Only a receipt the executor confirmed rides on the wire; none is omitted.
+    assert payload.get("input_received") is (True if input_received else None)
