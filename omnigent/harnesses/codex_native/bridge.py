@@ -579,6 +579,277 @@ def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
     return False
 
 
+#: An archived session keeps its bridge this long, so unarchive-and-resume
+#: still finds its ``codex-home``.
+ARCHIVED_SESSION_RETENTION_SECONDS = 14 * 24 * 60 * 60
+#: Bridge dirs are named by a 32-hex digest (:func:`bridge_dir_for_bridge_id`).
+_BRIDGE_DIR_NAME = re.compile(r"[0-9a-f]{32}")
+
+
+@dataclass(frozen=True)
+class SessionRetentionState:
+    """
+    The server's answer about the session that owns a bridge dir.
+
+    :param status: ``"archived"``, ``"active"`` (not archived),
+        ``"not_found"``, or ``"unknown"`` (no authoritative answer).
+    :param archived_at: Archive time in epoch seconds, e.g. ``1795000000``.
+    :param stop: Whether the server cannot answer at all, so the sweep asks
+        nothing more this pass.
+    :param child: Whether the server reports a parent session; an unknown
+        role counts as a main session.
+    :param parent: The parent session id the server reported, if any.
+    """
+
+    status: Literal["archived", "active", "not_found", "unknown"]
+    archived_at: int | None = None
+    stop: bool = False
+    child: bool = False
+    parent: str | None = None
+
+
+def _archived_child_expired(answer: SessionRetentionState | None, now: float) -> bool:
+    """Only a child session archived at least 14 days ago may leave."""
+    return (
+        answer is not None
+        and answer.status == "archived"
+        and answer.child
+        and answer.archived_at is not None
+        and now - answer.archived_at >= ARCHIVED_SESSION_RETENTION_SECONDS
+    )
+
+
+def _read_owner_pid(bridge_dir: Path) -> int | None:
+    """Return the marker's pid; a missing or unreadable marker names none."""
+    marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        return int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_owner_session(bridge_dir: Path) -> str | None:
+    """Return the session in the dir's own regular ``state.json``; anything else is none."""
+    try:
+        # Non-blocking, so a FIFO is rejected by the type check instead of hanging.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(bridge_dir / _STATE_FILE, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            raw = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    session_id = raw.get("session_id") if isinstance(raw, dict) else None
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _newest_mtime(bridge_dir: Path) -> float | None:
+    """Return the newest mtime of the dir and anything in it; unknown when a scan fails."""
+    failed = False
+
+    def _scan_failed(_error: OSError) -> None:
+        nonlocal failed
+        failed = True
+
+    try:
+        newest = bridge_dir.lstat().st_mtime
+        for directory, subdirs, filenames in os.walk(
+            bridge_dir, onerror=_scan_failed, followlinks=False
+        ):
+            for name in (*subdirs, *filenames):
+                newest = max(newest, os.lstat(Path(directory) / name).st_mtime)
+    except OSError:
+        return None
+    return None if failed else newest
+
+
+def _bridge_dir_bytes(bridge_dir: Path) -> int:
+    """Sum the apparent size of every file under *bridge_dir*, never following links."""
+    total = 0
+    for directory, _subdirs, filenames in os.walk(bridge_dir, followlinks=False):
+        for filename in filenames:
+            with contextlib.suppress(OSError):
+                total += os.lstat(Path(directory) / filename).st_size
+    return total
+
+
+def _trusted_root_identity(root: Path) -> tuple[int, int] | None:
+    """Return the root's identity when it is a real dir at ``<data dir>/codex-native``."""
+    expected = Path(native_bridge_common.native_bridge_data_dir()).resolve() / root.name
+    try:
+        info = root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or root.resolve() != expected:
+            return None
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def prune_bridge_dirs_by_session_state(
+    candidate: Callable[[str], SessionRetentionState | None],
+    confirm: Callable[[str], SessionRetentionState],
+    *,
+    now: float | None = None,
+    remove: bool = True,
+    should_stop: Callable[[], bool] = lambda: False,
+    max_reads: int | None = None,
+) -> dict[str, int]:
+    """
+    Remove dead-owner bridge dirs of child sessions archived at least 14 days.
+
+    *candidate* proposes; a fresh *confirm* read authorizes, and a second one
+    inside the cleanup lock right before the delete must again report an
+    archived child at least :data:`ARCHIVED_SESSION_RETENTION_SECONDS` old
+    with the same parent. No read starts once *should_stop* says so or
+    *max_reads* reads were made. A dir also needs a
+    32-hex name, its own regular ``state.json`` naming the session, no live
+    ``owner.pid``, and nothing in it modified for 14 days. Main sessions,
+    unknown roles and sessions the server does not show are kept. The whole
+    pass is refused unless the root is a real dir at ``<data dir>/codex-native``,
+    and stops if its identity changes. Removal re-checks the owner under the
+    bridge's cleanup lock and logs the session id and bytes.
+
+    :param candidate: The server's listed answer for a session, or ``None``.
+    :param confirm: Reads the session's current state from the server.
+    :param now: Epoch seconds for the age checks; ``None`` uses the clock.
+    :param remove: ``False`` only reports, taking no lock and writing nothing.
+    :param should_stop: Returns ``True`` to stop before the next read or delete.
+    :param max_reads: *confirm* calls allowed in the pass; ``None`` is no cap.
+    :returns: Counts, e.g. ``{"removable": 2, "removable_bytes": 4096,
+        "removed": 2, "kept_main": 5, "stopped": 0}``.
+    """
+    from omnigent.inner.terminal import _process_alive
+
+    now = time.time() if now is None else now
+    counts = {"removable": 0, "removable_bytes": 0, "removed": 0, "stopped": 0}
+
+    def keep(reason: str) -> None:
+        counts[f"kept_{reason}"] = counts.get(f"kept_{reason}", 0) + 1
+
+    reads = 0
+
+    def may_read() -> bool:
+        if should_stop() or (max_reads is not None and reads >= max_reads):
+            counts["interrupted"] = 1
+            return False
+        return True
+
+    def ask(session_id: str) -> SessionRetentionState:
+        nonlocal reads
+        reads += 1
+        try:
+            return confirm(session_id)
+        except Exception:
+            _logger.exception("Codex session retention re-check failed for %s", session_id)
+            return SessionRetentionState("unknown", stop=True)
+
+    root = bridge_root()
+    root_identity = _trusted_root_identity(root)
+    if root_identity is None:
+        if os.path.lexists(root):
+            _logger.warning("Refusing codex-native retention: %s is not a trusted root", root)
+            counts["refused"] = 1
+        return counts
+    for entry in sorted(root.iterdir()):
+        if should_stop():
+            counts["interrupted"] = 1
+            break
+        if not _BRIDGE_DIR_NAME.fullmatch(entry.name) or entry.is_symlink() or not entry.is_dir():
+            continue
+        pid = _read_owner_pid(entry)
+        if pid is not None and _process_alive(pid):
+            keep("owner")
+            continue
+        session_id = _read_owner_session(entry)
+        if session_id is None:
+            keep("no_session")
+            continue
+        listed = candidate(session_id)
+        if not _archived_child_expired(listed, now):
+            if listed is None:
+                keep("unlisted")
+            elif listed.status == "archived" and not listed.child:
+                keep("main")
+            else:
+                keep("recent_archive" if listed.status == "archived" else listed.status)
+            continue
+        newest = _newest_mtime(entry)
+        if newest is None or now - newest < ARCHIVED_SESSION_RETENTION_SECONDS:
+            keep("recent_activity")
+            continue
+        if not may_read():
+            break
+        fresh = ask(session_id)
+        if not _archived_child_expired(fresh, now):
+            keep("unconfirmed")
+            if fresh.stop:
+                counts["stopped"] = 1
+                break
+            continue
+        if not remove:
+            size = _bridge_dir_bytes(entry)
+            counts["removable"] += 1
+            counts["removable_bytes"] += size
+            _logger.info(
+                "Would remove codex-native bridge dir %s for session %s: %d bytes",
+                entry.name,
+                session_id,
+                size,
+            )
+            continue
+        if should_stop():
+            counts["interrupted"] = 1
+            break
+        if _trusted_root_identity(root) != root_identity:
+            _logger.warning("Stopping codex-native retention: %s changed identity", root)
+            counts["refused"] = 1
+            break
+        with native_bridge_common.try_bridge_dir_cleanup_lock(entry) as acquired:
+            if not acquired:
+                keep("busy")
+                continue
+            # A resume between the checks and the lock rewrites the marker.
+            if (
+                _read_owner_pid(entry) != pid
+                or (pid is not None and _process_alive(pid))
+                or _read_owner_session(entry) != session_id
+            ):
+                keep("owner")
+                continue
+            size = _bridge_dir_bytes(entry)
+            if not may_read():
+                break
+            # The archive state can change without this lock; read it once more.
+            final = ask(session_id)
+            if not _archived_child_expired(final, now) or final.parent != fresh.parent:
+                keep("unconfirmed")
+                if final.stop:
+                    counts["stopped"] = 1
+                    break
+                continue
+            if should_stop():
+                counts["interrupted"] = 1
+                break
+            counts["removable"] += 1
+            counts["removable_bytes"] += size
+            shutil.rmtree(entry, ignore_errors=True)
+            if entry.exists():
+                keep("remove_failed")
+                continue
+            counts["removed"] += 1
+            _logger.info(
+                "Removed codex-native bridge dir %s for session %s: %d bytes",
+                entry.name,
+                session_id,
+                size,
+            )
+    return counts
+
+
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
     """
     Write a minimal ``bridge.json`` so ``serve-mcp`` can boot.

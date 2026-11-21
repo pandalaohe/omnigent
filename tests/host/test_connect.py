@@ -9979,16 +9979,21 @@ async def test_run_starts_and_shuts_down_host_maintenance(
     janitor_roots: list[Path | None] = []
     janitor_live_paths: list[object] = []
     janitor_rotation_callbacks: list[object] = []
+    janitor_servers: list[tuple[object, object, object]] = []
 
     def _for_host(
         *,
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: object = None,
         on_runner_log_rotated: object = None,
+        server_url: object = None,
+        server_headers: object = None,
+        host_id: object = None,
     ) -> _RecordingJanitor:
         janitor_roots.append(harness_tmp_parent)
         janitor_live_paths.append(live_runner_log_paths)
         janitor_rotation_callbacks.append(on_runner_log_rotated)
+        janitor_servers.append((server_url, server_headers, host_id))
         return janitor
 
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
@@ -10003,6 +10008,10 @@ async def test_run_starts_and_shuts_down_host_maintenance(
     # The runner-log sweep must be able to exclude this host's live logs.
     assert janitor_live_paths == [host._live_runner_log_paths]
     assert callable(janitor_rotation_callbacks[0])
+    # The archived-session retention asks the host's own server about its own sessions.
+    assert janitor_servers == [
+        (host._server_url, host._build_connect_headers, host._identity.host_id)
+    ]
     assert host._maintenance_janitor is None
 
 

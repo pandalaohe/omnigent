@@ -17,9 +17,15 @@ from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, 
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+from urllib.parse import quote
+
+import httpx
 
 from omnigent.debug_logging import debug_event
+
+if TYPE_CHECKING:
+    from omnigent.harnesses.codex_native.bridge import SessionRetentionState
 
 try:
     import fcntl
@@ -33,6 +39,34 @@ _DEFAULT_LOCK_RETRY_S = 0.5
 # A long-lived host sees no runner lifecycle events for hours, so a periodic
 # self-trigger keeps orphan cleanup running while the host stays up.
 _DEFAULT_PERIODIC_INTERVAL_S = 600.0
+# The archived-session retention reads the server's whole archive list and
+# re-reads each removal, so it runs at most daily, not every pass.
+_CODEX_SESSION_RETENTION_INTERVAL_S = 24 * 60 * 60
+# The pass holds the host maintenance lock; listing alone takes a few minutes
+# on a busy server with thousands of archived sessions.
+_CODEX_SESSION_RETENTION_BUDGET_S = 10 * 60
+# Single-session reads per pass, two per removal; further candidates wait for the next day.
+_CODEX_SESSION_RETENTION_MAX_READS = 200
+# A busy server takes several seconds per session snapshot.
+_SESSION_STATE_TIMEOUT_S = 30.0
+# One page of every archived session the host's user can see, children and
+# side chats included.
+_ARCHIVED_SESSIONS_QUERY = {
+    "archived_only": "true",
+    "kind": "any",
+    "include_side_chats": "true",
+    "visibility": "all",
+    "limit": "200",
+}
+# A 200-row archive page takes a few seconds on a busy server.
+_ARCHIVED_SESSIONS_TIMEOUT_S = 30.0
+# Archive state only: skip the snapshot's expensive parts.
+_SESSION_STATE_QUERY = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+    "include_usage": "false",
+}
 
 # ── Runner-log retention ─────────────────────────────────
 #
@@ -82,12 +116,19 @@ _LockOutcome = Literal["acquired", "busy", "failed"]
 _RunOutcome = Literal["completed", "busy", "failed"]
 
 
-async def _run_sync_stage(call: Callable[[], object]) -> object:
-    """Do not release the janitor lock while its worker thread still runs."""
+async def _run_sync_stage(
+    call: Callable[[], object], *, on_cancel: Callable[[], object] | None = None
+) -> object:
+    """Do not release the janitor lock while its worker thread still runs.
+
+    :param on_cancel: Asks the worker to finish early once cancelled.
+    """
     task = asyncio.create_task(asyncio.to_thread(call))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel()
         with contextlib.suppress(Exception):
             await task
         raise
@@ -669,6 +710,214 @@ class RunnerLogRunawayTracker:
             self._windowed_bytes.pop(runner_id, None)
 
 
+def fetch_session_retention_state(
+    client: httpx.Client,
+    server_url: str,
+    session_id: str,
+    headers: Mapping[str, str],
+) -> SessionRetentionState:
+    """Ask the server whether *session_id* is archived, active, or gone.
+
+    Only a 404 carrying the server's own ``not_found`` error counts as gone;
+    a proxy or route 404 is unknown. Transport errors, 401 and 5xx stop the
+    pass because no later answer can be trusted either.
+
+    :param client: Client reused across one pass.
+    :param server_url: Server base URL, e.g. ``"https://example.com"``.
+    :param session_id: Session that owns a bridge dir.
+    :param headers: The host's request headers, auth included.
+    :returns: The server's answer.
+    """
+    from omnigent.errors import ErrorCode
+    from omnigent.harnesses.codex_native.bridge import SessionRetentionState
+
+    try:
+        response = client.get(
+            f"{server_url}/v1/sessions/{quote(session_id, safe='')}",
+            params=_SESSION_STATE_QUERY,
+            headers=dict(headers),
+        )
+    except httpx.HTTPError:
+        return SessionRetentionState("unknown", stop=True)
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    status = response.status_code
+    if status == 404:
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("code") == ErrorCode.NOT_FOUND:
+            return SessionRetentionState("not_found")
+        return SessionRetentionState("unknown")
+    if status != 200 or not isinstance(body, dict):
+        return SessionRetentionState("unknown", stop=status == 401 or status >= 500)
+    if body.get("archived") is False:
+        return SessionRetentionState("active")
+    archived_at = body.get("archived_at")
+    if body.get("archived") is True and type(archived_at) is int:
+        parent = body["parent_session_id"] if _reports_parent(body) else None
+        return SessionRetentionState(
+            "archived", archived_at=archived_at, child=parent is not None, parent=parent
+        )
+    return SessionRetentionState("unknown")
+
+
+def _reports_parent(row: Mapping[str, object]) -> bool:
+    """A child session names its parent; a missing or empty field counts as main."""
+    parent = row.get("parent_session_id")
+    return isinstance(parent, str) and bool(parent)
+
+
+def list_archived_session_times(
+    client: httpx.Client,
+    server_url: str,
+    headers: Mapping[str, str],
+    *,
+    host_id: str | None = None,
+    should_stop: Callable[[], bool] = lambda: False,
+) -> dict[str, tuple[int, bool]] | None:
+    """Read the archive time and role of every archived session, page by page.
+
+    The list only proposes candidates; each delete re-reads its session. A
+    failed page, a stop or an exhausted budget ends the listing and discards
+    every page read so far.
+
+    :param host_id: Lists only sessions bound to this host when given.
+    :returns: ``(archive epoch seconds, has a parent)`` by session id, or
+        ``None`` when the listing did not complete.
+    """
+    archived: dict[str, tuple[int, bool]] = {}
+    after: str | None = None
+    try:
+        while True:
+            if should_stop():
+                return None
+            params = dict(_ARCHIVED_SESSIONS_QUERY)
+            if host_id is not None:
+                params["host_id"] = host_id
+            if after is not None:
+                params["after"] = after
+            response = client.get(
+                f"{server_url}/v1/sessions",
+                params=params,
+                headers=dict(headers),
+                timeout=_ARCHIVED_SESSIONS_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            page = response.json()
+            for row in page["data"]:
+                archived_at = row.get("archived_at")
+                if row.get("archived") is True and type(archived_at) is int:
+                    archived[str(row["id"])] = (archived_at, _reports_parent(row))
+            cursor = page.get("last_id")
+            if not page.get("has_more"):
+                return archived
+            if not isinstance(cursor, str) or cursor == after:
+                return None
+            after = cursor
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        _logger.warning("Archived session list failed; no codex-native dir removed", exc_info=True)
+        return None
+
+
+def retain_codex_session_dirs(
+    server_url: str,
+    headers: Mapping[str, str],
+    *,
+    remove: bool = True,
+    now: float | None = None,
+    should_stop: Callable[[], bool] = lambda: False,
+    budget_s: float = _CODEX_SESSION_RETENTION_BUDGET_S,
+    host_id: str | None = None,
+    max_reads: int = _CODEX_SESSION_RETENTION_MAX_READS,
+) -> dict[str, int]:
+    """Apply the archived-session retention to the codex-native bridge dirs.
+
+    :param server_url: Server base URL the host is connected to.
+    :param headers: The host's request headers, auth included.
+    :param remove: ``False`` reports what would be removed and writes nothing.
+    :param now: Epoch seconds for the age checks; ``None`` uses the clock.
+    :param should_stop: Returns ``True`` once the host is shutting down.
+    :param budget_s: Wall-clock seconds for the pass; past it nothing more is
+        read or removed.
+    :param host_id: The host whose sessions are listed; others are kept.
+    :param max_reads: Single-session reads allowed in the pass.
+    :returns: Counts from
+        :func:`~omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state`;
+        ``stopped`` is set when the server could not be read.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        SessionRetentionState,
+        prune_bridge_dirs_by_session_state,
+    )
+    from omnigent.util.tls import client_ssl_context
+
+    deadline = time.monotonic() + budget_s
+
+    def _stopping() -> bool:
+        return should_stop() or time.monotonic() >= deadline
+
+    with httpx.Client(timeout=_SESSION_STATE_TIMEOUT_S, verify=client_ssl_context()) as client:
+        archived = list_archived_session_times(
+            client, server_url, headers, host_id=host_id, should_stop=_stopping
+        )
+        if archived is None:
+            interrupted = _stopping()
+            return {"removed": 0, "stopped": int(not interrupted), "interrupted": int(interrupted)}
+        listed = archived
+
+        def _candidate(session_id: str) -> SessionRetentionState | None:
+            row = listed.get(session_id)
+            if row is None:
+                return None
+            return SessionRetentionState("archived", archived_at=row[0], child=row[1])
+
+        return prune_bridge_dirs_by_session_state(
+            _candidate,
+            lambda session_id: fetch_session_retention_state(
+                client, server_url, session_id, headers
+            ),
+            now=now,
+            remove=remove,
+            should_stop=_stopping,
+            max_reads=max_reads,
+        )
+
+
+def _codex_session_retention_stage(
+    server_url: str,
+    server_headers: Callable[[], Mapping[str, str]],
+    *,
+    host_id: str | None = None,
+    interval_s: float = _CODEX_SESSION_RETENTION_INTERVAL_S,
+) -> Callable[[], Awaitable[object]]:
+    """Build the stage that runs the archived-session retention at most once per interval.
+
+    A pass the server could not answer is not counted, so the next trigger
+    retries it; a pass cut by its budget waits for the next interval.
+    """
+    last_completed: float | None = None
+
+    async def _stage() -> object:
+        nonlocal last_completed
+        started = time.monotonic()
+        if last_completed is not None and started - last_completed < interval_s:
+            return "not due"
+        # Host shutdown waits for the worker; stop asking the server at once.
+        cancelled = threading.Event()
+        result = await _run_sync_stage(
+            lambda: retain_codex_session_dirs(
+                server_url, server_headers(), should_stop=cancelled.is_set, host_id=host_id
+            ),
+            on_cancel=cancelled.set,
+        )
+        if isinstance(result, dict) and not result.get("stopped"):
+            last_completed = started
+        return result
+
+    return _stage
+
+
 class HostMaintenanceJanitor:
     """Coalesce host lifecycle triggers into background cleanup passes."""
 
@@ -705,6 +954,9 @@ class HostMaintenanceJanitor:
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: Callable[[], Collection[Path]] | None = None,
         on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
+        server_url: str | None = None,
+        server_headers: Callable[[], Mapping[str, str]] | None = None,
+        host_id: str | None = None,
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon.
 
@@ -714,6 +966,12 @@ class HostMaintenanceJanitor:
             runner still writes. The janitor cannot see the host's runner
             set itself, so the owner passes this in. Resolved on the caller's
             thread (the event loop) before the sweep runs off-loop.
+        :param server_url: Server the host is connected to; with
+            *server_headers* it enables the archived-session retention of
+            codex-native bridge dirs.
+        :param server_headers: Returns the host's request headers, auth
+            included. Called off-loop once per retention pass.
+        :param host_id: This host's id; the retention lists only its sessions.
         """
         from omnigent.process_logging import data_dir, process_log_dir
         from omnigent.runtime.harnesses.paths import (
@@ -770,17 +1028,28 @@ class HostMaintenanceJanitor:
                 )
             )
 
+        stages: list[MaintenanceStage] = [
+            ("harness_process_orphans", _reap_harness_processes),
+            ("codex_process_registry", _reconcile_codex_processes),
+            ("terminal_orphans", _reap_terminals),
+            ("native_bridge_orphans", _reap_native_bridge_dirs),
+            ("codex_home_orphans", _reap_codex_homes),
+            ("runner_log_retention", _retain_runner_logs),
+        ]
+        stage_skip_reasons = {"native_bridge_orphans": {"runner_superseded"}}
+        if server_url is not None and server_headers is not None:
+            stages.append(
+                (
+                    "codex_session_retention",
+                    _codex_session_retention_stage(server_url, server_headers, host_id=host_id),
+                )
+            )
+            # A superseded runner's bridge is mid-handover, as for the orphan sweep.
+            stage_skip_reasons["codex_session_retention"] = {"runner_superseded"}
         return cls(
-            stages=(
-                ("harness_process_orphans", _reap_harness_processes),
-                ("codex_process_registry", _reconcile_codex_processes),
-                ("terminal_orphans", _reap_terminals),
-                ("native_bridge_orphans", _reap_native_bridge_dirs),
-                ("codex_home_orphans", _reap_codex_homes),
-                ("runner_log_retention", _retain_runner_logs),
-            ),
+            stages=stages,
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",
-            stage_skip_reasons={"native_bridge_orphans": {"runner_superseded"}},
+            stage_skip_reasons=stage_skip_reasons,
         )
 
     def start(self) -> None:
