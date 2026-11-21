@@ -6134,10 +6134,11 @@ async def test_failed_unlisted_model_notice_never_changes_the_binding(
 
 
 async def test_stuck_unlisted_model_notice_never_holds_back_the_binding(
+    app: Any,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The binding lands before the notice write, so a stuck write cannot change who binds."""
+    """The PATCH answers 200 once the binding lands; a stuck notice write follows the response."""
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     agent = await create_test_agent(client)
@@ -6154,20 +6155,61 @@ async def test_stuck_unlisted_model_notice_never_holds_back_the_binding(
         return append(self, session_id, items, **kwargs)
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "append", stuck_append)
-    first = asyncio.create_task(
-        client.patch(
-            path, json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"}
-        )
+    # httpx's ASGI transport returns only after after-response work ends, so the
+    # app's own response messages show when the runner would have its answer.
+    binding = client.build_request(
+        "PATCH",
+        path,
+        json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"},
     )
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "PATCH",
+        "headers": [(key.lower(), value) for key, value in binding.headers.raw],
+        "scheme": binding.url.scheme,
+        "path": binding.url.path,
+        "raw_path": binding.url.raw_path.split(b"?")[0],
+        "query_string": binding.url.query,
+        "server": (binding.url.host, binding.url.port),
+        "client": ("127.0.0.1", 123),
+        "root_path": "",
+    }
+    answered = asyncio.Event()
+    statuses: list[int] = []
+    body_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": binding.content, "more_body": False}
+        await answered.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+        elif message["type"] == "http.response.body" and not message.get("more_body", False):
+            answered.set()
+
+    request = asyncio.create_task(app(scope, receive, send))
     try:
+        await asyncio.wait_for(answered.wait(), timeout=5)
+        assert statuses == [200]
         assert await asyncio.to_thread(notice_entered.wait, 10)
-        # The first thread is already bound while its notice write is stuck.
+        assert not request.done()  # the notice write is still held after the answer
+        assert (await client.get(path)).json()["external_session_id"] == "sid-1"
         later = await client.patch(path, json={"external_session_id": "sid-2"})
         assert later.status_code == 400, later.text
-        assert (await client.get(path)).json()["external_session_id"] == "sid-1"
     finally:
         release_notice.set()
-    assert (await first).status_code == 200
+    await asyncio.wait_for(request, timeout=10)
+    items = (await client.get(f"{path}/items")).json()["data"]
+    assert [item["code"] for item in items if item["type"] == "error"] == [
+        "codex_native_model_unlisted"
+    ]
 
 
 async def test_create_session_returns_null_external_session_id(
