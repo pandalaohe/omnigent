@@ -4951,11 +4951,17 @@ class SessionModelOptionsEvent(_SSEEventBase):
 
 
 class SessionInputSendingEvent(_SSEEventBase):
-    """The runner is delivering a pending input, or has queued it (null)."""
+    """
+    The runner is delivering a pending input, or has queued it (null).
+
+    ``received`` is true once the native agent accepted the input; a running
+    turn may still hold it queued until its next step.
+    """
 
     type: Literal["session.input.sending"]
     pending_id: str
     since_ms: int | None
+    received: bool = False
 
 
 class SessionInputConsumedPayload(BaseModel):

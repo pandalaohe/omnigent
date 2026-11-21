@@ -1167,7 +1167,13 @@ export type StreamEvent =
   | SessionStartupEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
-  | { type: "session_input_sending"; pendingId: string; sinceMs: number | null }
+  | {
+      type: "session_input_sending";
+      pendingId: string;
+      sinceMs: number | null;
+      /** The native agent accepted the input; it may wait for the turn's next step. */
+      received?: boolean;
+    }
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

@@ -568,6 +568,21 @@ def runner_input_is_claimed(conversation_id: str, pending_id: str) -> bool:
         return entry is not None and entry.runner_claim_id is not None
 
 
+def _agent_received(entry: _Entry) -> bool:
+    # A claimed paste whose runner turn completed is in the agent's input; a
+    # running turn may keep it queued until its next step, when the mirror lands.
+    return (
+        entry.runner_claim_id is not None and entry.last_delivery_stage == "native_turn_completed"
+    )
+
+
+def agent_received(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """Return a claimed input once the native agent accepted its paste, else ``None``."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None and _agent_received(entry) else None
+
+
 def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
     """Whether a live queued entry still carries this peer message to its runner."""
     with _lock:
@@ -1421,6 +1436,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                     if entry.sending_since_ms is not None
                     else {}
                 ),
+                **({"received": True} if _agent_received(entry) else {}),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
                 **(
                     {"auto_retry": entry.auto_retry.model_dump(mode="json")}

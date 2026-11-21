@@ -177,16 +177,32 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
         "delivery_attempt_id"
     ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
-    if case.startswith("confirmed"):
-        orchestration._record_native_input_lifecycle(
-            session_id,
-            {
-                "type": "response.completed",
-                "response": {"id": "resp_paste"},
-                "pending_id": pending_id,
-                "delivery_attempt_id": attempt_id,
-            },
-        )
+    collector = await start_session_stream_collector(session_id)
+    try:
+        if case.startswith("confirmed"):
+            orchestration._record_native_input_lifecycle(
+                session_id,
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_paste"},
+                    "pending_id": pending_id,
+                    "delivery_attempt_id": attempt_id,
+                },
+            )
+            # Claude holds the queued paste: chat stops counting it as sending,
+            # while its send time stays for reconnect settlement.
+            received = await collector.next_event()
+            assert received["type"] == "session.input.sending"
+            assert received["pending_id"] == pending_id
+            assert received["received"] is True
+            assert received["since_ms"] is not None
+        else:
+            await collector.assert_no_event(within=0.05)
+        [entry] = pending_inputs.snapshot_for(session_id)
+        assert entry.get("received", False) is case.startswith("confirmed")
+        assert entry["sending_since_ms"] is not None
+    finally:
+        await collector.stop()
     # Claude absorbs the queued paste only after a 25-minute step. Only the
     # claiming runner's heartbeats renew it; a replacement never had the paste.
     for now in range(60, 1501, 60):

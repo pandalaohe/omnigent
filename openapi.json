@@ -12892,11 +12892,16 @@
         "type": "object"
       },
       "SessionInputSendingEvent": {
-        "description": "The runner is delivering a pending input, or has queued it (null).",
+        "description": "The runner is delivering a pending input, or has queued it (null).\n\n`received` is true once the native agent accepted the input; a running\nturn may still hold it queued until its next step.",
         "properties": {
           "pending_id": {
             "title": "Pending Id",
             "type": "string"
+          },
+          "received": {
+            "default": false,
+            "title": "Received",
+            "type": "boolean"
           },
           "sequence_number": {
             "anyOf": [

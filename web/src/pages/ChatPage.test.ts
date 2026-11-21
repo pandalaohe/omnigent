@@ -540,6 +540,24 @@ describe("buildPendingBubbles", () => {
     expect(midTurn.awaitingAgent).toBe(true);
     expect(plain.awaitingAgent).toBeUndefined();
   });
+
+  it("stops the sending timer once the agent received the input", () => {
+    const since = 1_753_900_000_000;
+    const [sending, midTurn, idle] = buildPendingBubbles(
+      [
+        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since },
+        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since, received: true },
+        { ...pending[0]!, sendingSinceMs: since, received: true },
+      ],
+      null,
+    ) as Extract<Bubble, { kind: "user" }>[];
+    expect(sending).toMatchObject({ sendingSinceMs: since });
+    expect(sending!.awaitingAgent).toBeUndefined();
+    expect(midTurn).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(midTurn!.sendingSinceMs).toBeUndefined();
+    expect(idle!.sendingSinceMs).toBeUndefined();
+    expect(idle!.awaitingAgent).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────

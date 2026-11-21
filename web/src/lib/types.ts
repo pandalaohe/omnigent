@@ -98,6 +98,8 @@ export interface AgyPermission {
  */
 export interface PendingInput {
   sendingSinceMs?: number;
+  /** The native agent accepted this input; a running turn may still hold it queued. */
+  received?: boolean;
   stableId?: string;
   /** Server index id, e.g. ``"pending_a1b2c3"``; the bubble's stable key. */
   pendingId: string;

@@ -9191,6 +9191,37 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     useChatStore.setState({ conversationId: "conv_abc" });
   });
 
+  it("marks a received input while keeping its server send time", () => {
+    const since = 1_710_000_000_000;
+    const queued = { tempId: "tmp_steer", pendingId: "pending_steer", content: [] };
+    useChatStore.setState({
+      pendingUserMessages: [
+        { ...queued, sentMidTurn: true },
+        { ...queued, tempId: "tmp_other", pendingId: "pending_other" },
+      ],
+    });
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+    });
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+      received: true,
+    });
+    // A later heartbeat without the flag cannot make it sending again.
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: since,
+    });
+    const [steer, other] = useChatStore.getState().pendingUserMessages;
+    expect(steer).toMatchObject({ sendingSinceMs: since, received: true });
+    expect(other!.received).toBeUndefined();
+  });
+
   describe("session.presence", () => {
     it("replaces the viewer list wholesale for the bound conversation", () => {
       useChatStore.setState({

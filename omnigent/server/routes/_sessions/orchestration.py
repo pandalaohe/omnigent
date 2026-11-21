@@ -5996,7 +5996,7 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "rejected_before_handoff"
     elif event_type in {"response.cancelled", "response.incomplete"}:
         cause_class = "interrupted_or_lifecycle"
-    pending_inputs.mark_lifecycle(
+    matched = pending_inputs.mark_lifecycle(
         session_id,
         stable_id if isinstance(stable_id, str) else None,
         pending_id=pending_id if isinstance(pending_id, str) else None,
@@ -6009,6 +6009,18 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         native_turn_id=native_turn_id if isinstance(native_turn_id, str) else None,
         lifecycle_response_id=response_id if isinstance(response_id, str) else None,
     )
+    # The agent may hold a confirmed paste queued for a whole turn; stop showing it as sending.
+    received = pending_inputs.agent_received(session_id, matched) if matched is not None else None
+    if received is not None:
+        session_stream.publish(
+            session_id,
+            {
+                "type": "session.input.sending",
+                "pending_id": received.pending_id,
+                "since_ms": received.sending_since_ms,
+                "received": True,
+            },
+        )
 
 
 async def _settle_undelivered_native_input(

@@ -962,7 +962,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof pendingId !== "string" || (typeof sinceMs !== "number" && sinceMs !== null)) {
       return null;
     }
-    return { type: "session_input_sending", pendingId, sinceMs };
+    return {
+      type: "session_input_sending",
+      pendingId,
+      sinceMs,
+      ...(data.received === true ? { received: true } : {}),
+    };
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

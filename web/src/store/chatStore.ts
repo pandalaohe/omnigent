@@ -672,6 +672,8 @@ export interface PendingUserMessage {
   stillSending?: boolean;
   /** Original server send time while the runner is delivering this input. */
   sendingSinceMs?: number;
+  /** The native agent accepted this input; a running turn may still hold it queued. */
+  received?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -5806,6 +5808,7 @@ async function bindStream(
         content: p.content,
         ...(p.stableId === undefined ? {} : { stableId: p.stableId }),
         ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
+        ...(p.received ? { received: true } : {}),
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       const serverPending = pendingInputsById(session.pendingInputs);
@@ -9319,8 +9322,10 @@ function syncPendingSendTimes(
 ): PendingUserMessage[] {
   return messages.map((message) => {
     const input = inputs.get(message.pendingId ?? message.tempId);
-    return input && input.sendingSinceMs !== message.sendingSinceMs
-      ? { ...message, sendingSinceMs: input.sendingSinceMs }
+    if (!input) return message;
+    const received = message.received || input.received;
+    return input.sendingSinceMs !== message.sendingSinceMs || received !== message.received
+      ? { ...message, sendingSinceMs: input.sendingSinceMs, ...(received ? { received } : {}) }
       : message;
   });
 }
@@ -10226,8 +10231,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       setterFor(sourceConversationId)((s) => ({
         pendingUserMessages: s.pendingUserMessages.map((p) =>
           (p.pendingId ?? p.tempId) === event.pendingId &&
-          p.sendingSinceMs !== (event.sinceMs ?? undefined)
-            ? { ...p, sendingSinceMs: event.sinceMs ?? undefined }
+          (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
+            (event.received === true && !p.received))
+            ? {
+                ...p,
+                sendingSinceMs: event.sinceMs ?? undefined,
+                ...(event.received === true ? { received: true } : {}),
+              }
             : p,
         ),
       }));
