@@ -310,6 +310,69 @@ async def test_a_completion_after_the_claim_ends_marks_nothing_received(
     pending_inputs.resolve(session_id, pending_id)
 
 
+async def _settled_input_error_codes(
+    store: SqlAlchemyConversationStore, session_id: str, pending_id: str, collector
+) -> list[str]:
+    """Wait for the input's settlement frame, then return the persisted error codes."""
+    consumed = await collector.next_event()
+    while consumed["type"] != "session.input.consumed":
+        consumed = await collector.next_event()
+    assert consumed["data"]["cleared_pending_id"] == pending_id
+    assert not pending_inputs.has_pending(session_id)
+    return [
+        item.data.model_dump().get("code")
+        for item in store.list_items(session_id).data
+        if item.type == "error"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["stop-then-pop", "pop-then-stop", "up-arrow-edit"])
+async def test_stop_settles_a_paste_claude_moved_back_to_its_input_box(db_uri, order):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(agent_id="b" * 32).id
+    text = "steer the run"
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": text}], runner_managed=True
+    )
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    popped = {
+        "operations": [
+            {"operation": "popAll", "content": text, "timestamp": "2026-11-21T05:00:00.000Z"}
+        ]
+    }
+    collector = await start_session_stream_collector(session_id)
+    try:
+        if order == "stop-then-pop":
+            pending_inputs.mark_interrupted(session_id, [pending_id])
+            await orchestration._settle_queue_operations(store, session_id, popped)
+        else:
+            await orchestration._settle_queue_operations(store, session_id, popped)
+            # Up also moves queued prompts back, and the person may queue them again.
+            assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
+            if order == "pop-then-stop":
+                pending_inputs.mark_interrupted(session_id, [pending_id])
+            # What the Stop route runs once its interrupt has landed.
+            await orchestration._settle_inputs_taken_from_queue(
+                store,
+                session_id,
+                pending_inputs.returned_interrupted_ids(session_id),
+                "native_input_returned_to_composer",
+            )
+        if order == "up-arrow-edit":
+            await collector.assert_no_event(within=0.05)
+            assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
+            assert not store.list_items(session_id).data
+        else:
+            assert await _settled_input_error_codes(store, session_id, pending_id, collector) == [
+                "native_input_returned_to_composer"
+            ]
+    finally:
+        await collector.stop()
+        pending_inputs.resolve(session_id, pending_id)
+        session_stream.close(session_id)
+
+
 def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app

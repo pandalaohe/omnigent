@@ -362,6 +362,8 @@ class _Entry:
     runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
+    # Claude moved this input from its queue back into its input box (``popAll``).
+    returned_to_composer: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -1053,6 +1055,62 @@ def resolve_oldest_for_mirrored_text(
         else:
             _settle_locked(conversation_id, entries, oldest_id)
         return _drained_input(entry)
+
+
+def _claimed_entry_for_queued_text_locked(conversation_id: str, text: str) -> _Entry | None:
+    """The oldest claimed input whose paste Claude queued as *text*, not yet returned."""
+    needle = _collapse_whitespace(text)
+    if not needle:
+        return None
+    for entry in _pending.get(conversation_id, {}).values():
+        if entry.held or entry.runner_claim_id is None or entry.returned_to_composer:
+            continue
+        own = _collapse_whitespace(_content_text(entry.content))
+        attachments = _attachment_count(entry.content)
+        if (
+            own == needle
+            or _matches_injected_prefix(entry, needle)
+            or (
+                attachments > 0
+                and bool(own)
+                and _collapse_whitespace(_strip_generated_markers(text, attachments)) == own
+            )
+        ):
+            return entry
+    return None
+
+
+def mark_returned_to_composer(conversation_id: str, text: str) -> list[str]:
+    """
+    Flag the claimed input Claude moved from its queue back into its input box.
+
+    Esc, Stop and Up each make Claude log one ``popAll`` record per queued
+    prompt. After Up the person may queue it again, so only an input Stop
+    interrupted counts as not sent; see :func:`returned_interrupted_ids` for
+    a Stop whose interrupt lands after this record.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param text: The popped prompt text.
+    :returns: The flagged input's id when Stop already interrupted it, else
+        an empty list.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _claimed_entry_for_queued_text_locked(conversation_id, text)
+        if entry is None:
+            return []
+        entry.returned_to_composer = True
+        return [entry.pending_id] if entry.interrupted else []
+
+
+def returned_interrupted_ids(conversation_id: str) -> list[str]:
+    """Ids of inputs Stop interrupted that Claude moved back into its input box."""
+    with _lock:
+        return [
+            pending_id
+            for pending_id, entry in _pending.get(conversation_id, {}).items()
+            if entry.interrupted and entry.returned_to_composer and not entry.held
+        ]
 
 
 def pending_ids(conversation_id: str) -> list[str]:

@@ -200,6 +200,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_PULL_REQUESTS_TYPE,
+    _EXTERNAL_QUEUE_OPERATIONS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -347,6 +348,8 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
+    _settle_inputs_taken_from_queue,
+    _settle_queue_operations,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -2446,6 +2449,7 @@ def register_events_routes(
         if body.type in {
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
         } and not _has_bound_runner_authority(request, conv):
             # Owner-authenticated local forwarders also report native settings.
             await _require_access_and_level(
@@ -2688,6 +2692,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_GOAL_STATE_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -3361,6 +3366,13 @@ def register_events_routes(
                 # Multiple clients share the same delivery result. Shield it so one
                 # disconnected request cannot cancel the interrupt for every waiter.
                 await asyncio.shield(delivery)
+                # Claude's popAll records may have arrived before this interrupt landed.
+                await _settle_inputs_taken_from_queue(
+                    conversation_store,
+                    session_id,
+                    pending_inputs.returned_interrupted_ids(session_id),
+                    "native_input_returned_to_composer",
+                )
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -5071,6 +5083,9 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_GOAL_STATE_TYPE:
             await _persist_external_goal_state(session_id, conv, body, conversation_store)
+            return {"queued": False}
+        if body.type == _EXTERNAL_QUEUE_OPERATIONS_TYPE:
+            await _settle_queue_operations(conversation_store, session_id, body.data)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id, existing_child = await _persist_subagent_start_with_archive_fence(

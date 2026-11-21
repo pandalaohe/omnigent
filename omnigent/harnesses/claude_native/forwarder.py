@@ -35,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
+    ClaudeQueueOperation,
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptCostLedger,
@@ -1093,6 +1094,11 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # Queue records already reported, keyed by (timestamp, operation, content,
+    # occurrence), so a re-read transcript region is not reported again.
+    posted_queue_operations: dict[tuple[str, str, str, int], None] = field(default_factory=dict)
+    # Set once the server rejects queue records as an unknown event type.
+    queue_operations_unsupported: bool = False
 
 
 def _provider_usage_limits_should_post(
@@ -7505,7 +7511,7 @@ async def _forward_available_items(
     # awaited POSTs.
     cancelled = False
     try:
-        return await _forward_transcript_item_batch(
+        forwarded = await _forward_transcript_item_batch(
             client=client,
             session_id=session_id,
             bridge_dir=bridge_dir,
@@ -7516,6 +7522,11 @@ async def _forward_available_items(
             dedupe=dedupe,
             result=result,
         )
+        # After the items, so a mirror of the same prompt settles its input first.
+        await _post_external_queue_operations(
+            client, session_id=session_id, operations=result.queue_operations, dedupe=dedupe
+        )
+        return forwarded
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -7528,6 +7539,84 @@ async def _forward_available_items(
                 dedupe=dedupe,
                 result=result,
             )
+
+
+_MAX_POSTED_QUEUE_OPERATIONS = 256
+
+
+async def _post_external_queue_operations(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    operations: tuple[ClaudeQueueOperation, ...],
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Report queued prompts Claude took out unread, so their web inputs settle.
+
+    Best-effort: a failed post is retried when the next poll re-reads the
+    records, and records already reported are skipped. A server that does not
+    know the event is not sent queue records again.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param operations: Queue records in transcript order.
+    :param dedupe: Per-session forwarder state; records what was reported.
+    """
+    if dedupe.queue_operations_unsupported or not operations:
+        return
+    occurrences: dict[tuple[str, str, str], int] = {}
+    keys: list[tuple[str, str, str, int]] = []
+    unreported: list[ClaudeQueueOperation] = []
+    for operation in operations:
+        triple = (operation.timestamp, operation.operation, operation.content)
+        occurrences[triple] = occurrences.get(triple, 0) + 1
+        key = (*triple, occurrences[triple])
+        if key not in dedupe.posted_queue_operations:
+            keys.append(key)
+            unreported.append(operation)
+    if not unreported:
+        return
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_queue_operations",
+                "data": {
+                    "operations": [
+                        {
+                            "operation": operation.operation,
+                            "content": operation.content,
+                            "timestamp": operation.timestamp,
+                        }
+                        for operation in unreported
+                    ]
+                },
+            },
+        )
+        if resp.status_code == 400 and "Unknown event type: 'external_queue_operations'" in (
+            resp.text
+        ):
+            _logger.info(
+                "Omnigent server does not accept external_queue_operations; "
+                "messages Claude takes out of its queue unread settle when their lease ends",
+                extra={"session_id": session_id},
+            )
+            dedupe.queue_operations_unsupported = True
+            return
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        _logger.warning(
+            "Failed to forward Claude queue operations; session=%s http_status=%s",
+            session_id,
+            _http_status_for_log(exc),
+            extra={"session_id": session_id},
+        )
+        return
+    for key in keys:
+        dedupe.posted_queue_operations[key] = None
+    while len(dedupe.posted_queue_operations) > _MAX_POSTED_QUEUE_OPERATIONS:
+        del dedupe.posted_queue_operations[next(iter(dedupe.posted_queue_operations))]
 
 
 async def _forward_transcript_item_batch(
