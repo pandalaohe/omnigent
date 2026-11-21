@@ -27,6 +27,7 @@ interface UploadResourcePayload {
 }
 
 const FILE_UPLOAD_STALL_TIMEOUT_MS = 60_000;
+const FILE_UPLOAD_FIRST_RESPONSE_TIMEOUT_MS = 5 * 60_000;
 
 function uploadedFileFromResource(
   resource: UploadResourcePayload,
@@ -87,6 +88,7 @@ export async function uploadFile(
     const xhr = new XMLHttpRequest();
     let stallTimer: ReturnType<typeof setTimeout> | null = null;
     let settled = false;
+    let responseStarted = false;
     let responseFinished = false;
     let abortReason: Error | null = null;
 
@@ -108,14 +110,18 @@ export async function uploadFile(
       clearStallTimer();
       resolve(uploaded);
     };
-    const resetStallTimer = () => {
+    const resetStallTimer = (timeoutMs = FILE_UPLOAD_STALL_TIMEOUT_MS) => {
       if (settled || responseFinished) return;
       clearStallTimer();
       stallTimer = setTimeout(() => {
         abortReason = new Error("File upload stalled");
         xhr.abort();
         rejectUpload(abortReason);
-      }, FILE_UPLOAD_STALL_TIMEOUT_MS);
+      }, timeoutMs);
+    };
+    const recordResponseActivity = () => {
+      responseStarted = true;
+      resetStallTimer();
     };
 
     xhr.open("POST", withBasePath(path));
@@ -128,8 +134,16 @@ export async function uploadFile(
         onProgress(Math.min(1, event.loaded / event.total));
       }
     };
-    xhr.onprogress = resetStallTimer;
-    xhr.onreadystatechange = resetStallTimer;
+    xhr.upload.onload = () => {
+      // The server may still be writing the file after the request body is sent.
+      if (!responseStarted) resetStallTimer(FILE_UPLOAD_FIRST_RESPONSE_TIMEOUT_MS);
+    };
+    xhr.onprogress = recordResponseActivity;
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState === xhr.HEADERS_RECEIVED || xhr.readyState === xhr.LOADING) {
+        recordResponseActivity();
+      }
+    };
     xhr.onload = () => {
       responseFinished = true;
       clearStallTimer();

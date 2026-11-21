@@ -23,6 +23,9 @@ import { uploadFile } from "./filesApi";
 class FakeXHR {
   static instances: FakeXHR[] = [];
 
+  readonly HEADERS_RECEIVED = 2;
+  readonly LOADING = 3;
+  readyState = 0;
   method = "";
   url = "";
   status = 0;
@@ -36,7 +39,10 @@ class FakeXHR {
   onreadystatechange: (() => void) | null = null;
   timeout = 0;
   aborted = false;
-  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  upload: { onprogress: ((event: ProgressEvent) => void) | null; onload: (() => void) | null } = {
+    onprogress: null,
+    onload: null,
+  };
   requestHeaders: Record<string, string> = {};
   sentBody: FormData | null = null;
 
@@ -222,14 +228,62 @@ describe("uploadFile", () => {
       await vi.advanceTimersByTimeAsync(59_000);
       xhr.upload.onprogress?.({ lengthComputable: true, loaded: 1, total: 2 } as ProgressEvent);
       await vi.advanceTimersByTimeAsync(59_000);
+      xhr.upload.onload?.();
+      xhr.readyState = xhr.HEADERS_RECEIVED;
+      xhr.onreadystatechange?.();
+      await vi.advanceTimersByTimeAsync(59_000);
       xhr.onprogress?.();
       await vi.advanceTimersByTimeAsync(59_000);
+      xhr.readyState = xhr.LOADING;
       xhr.onreadystatechange?.();
       await vi.advanceTimersByTimeAsync(59_000);
 
       expect(xhr.aborted).toBe(false);
       xhr.respond(201, JSON.stringify({ id: "file_1" }));
       await promise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a first response 90 seconds after the request body is sent", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = uploadFile("s1", new File(["bytes"], "clip.mp4")).catch(
+        (error: unknown) => error,
+      );
+      const xhr = await nextXhr();
+      xhr.upload.onload?.();
+
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      expect(xhr.aborted).toBe(false);
+      xhr.readyState = xhr.HEADERS_RECEIVED;
+      xhr.onreadystatechange?.();
+      xhr.respond(201, JSON.stringify({ id: "file_1" }));
+      expect(await result).toMatchObject({ id: "file_1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns to the stall limit once the response headers arrive", async () => {
+    vi.useFakeTimers();
+    try {
+      const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+      const xhr = await nextXhr();
+      const rejection = expect(promise).rejects.toThrow("stalled");
+      xhr.upload.onload?.();
+      await vi.advanceTimersByTimeAsync(10_000);
+      xhr.readyState = xhr.HEADERS_RECEIVED;
+      xhr.onreadystatechange?.();
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(xhr.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(xhr.aborted).toBe(true);
+      await rejection;
     } finally {
       vi.useRealTimers();
     }

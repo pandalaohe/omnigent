@@ -615,7 +615,10 @@ class FetchBackedXHR {
   onreadystatechange: (() => void) | null = null;
   timeout = 0;
   aborted = false;
-  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  upload: { onprogress: ((event: ProgressEvent) => void) | null; onload: (() => void) | null } = {
+    onprogress: null,
+    onload: null,
+  };
   private headers = new Headers();
 
   constructor() {
@@ -7733,7 +7736,10 @@ describe("chatStore — send (file attachments)", () => {
     }
   });
 
-  it("shows still sending before a stalled native upload returns the text for retry", async () => {
+  it.each([
+    { phase: "60 seconds without upload progress", bodySent: false, timeoutMs: 60_000 },
+    { phase: "5 minutes without a first response", bodySent: true, timeoutMs: 300_000 },
+  ])("retains the native send for retry after $phase", async ({ bodySent, timeoutMs }) => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
@@ -7756,16 +7762,23 @@ describe("chatStore — send (file attachments)", () => {
 
     const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
     const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
-    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
-    expect(buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0]).toMatchObject(
-      {
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const xhr = FetchBackedXHR.instances[0]!;
+      await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+      expect(
+        buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0],
+      ).toMatchObject({
         pending: true,
         stillSending: true,
-      },
-    );
+      });
 
-    try {
-      await vi.advanceTimersByTimeAsync(60_000);
+      if (bodySent) xhr.upload.onload?.();
+      const elapsedMs = bodySent ? 0 : SEND_STILL_SENDING_AFTER_MS;
+      await vi.advanceTimersByTimeAsync(timeoutMs - elapsedMs - 1);
+      expect(xhr.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(xhr.aborted).toBe(true);
       await sendPromise;
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
       expect(useChatStore.getState().failedSendDraft).toMatchObject({
