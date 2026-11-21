@@ -39,9 +39,12 @@ _DEFAULT_LOCK_RETRY_S = 0.5
 # A long-lived host sees no runner lifecycle events for hours, so a periodic
 # self-trigger keeps orphan cleanup running while the host stays up.
 _DEFAULT_PERIODIC_INTERVAL_S = 600.0
-# The archived-session retention reads the server's archive list and asks
-# per session for the rest, so it runs at most daily, not every pass.
+# The archived-session retention reads the server's whole archive list and
+# re-reads each removal, so it runs at most daily, not every pass.
 _CODEX_SESSION_RETENTION_INTERVAL_S = 24 * 60 * 60
+# The pass holds the host maintenance lock; listing alone takes a few minutes
+# on a busy server with thousands of archived sessions.
+_CODEX_SESSION_RETENTION_BUDGET_S = 10 * 60
 _SESSION_STATE_TIMEOUT_S = 10.0
 # One page of every archived session the host's user can see, children and
 # side chats included.
@@ -765,19 +768,24 @@ def list_archived_session_times(
     client: httpx.Client,
     server_url: str,
     headers: Mapping[str, str],
-) -> dict[str, tuple[int, bool]]:
-    """Read the archive time of every archived session in a few list pages.
+    *,
+    should_stop: Callable[[], bool] = lambda: False,
+) -> dict[str, tuple[int, bool]] | None:
+    """Read the archive time and role of every archived session, page by page.
 
-    Each row is the server's own record, so a hit is proof of the archive
-    time; a miss proves nothing and is asked per session. A failed page
-    keeps the rows already read.
+    The list only proposes candidates; each delete re-reads its session. A
+    failed page, a stop or an exhausted budget ends the listing and discards
+    every page read so far.
 
-    :returns: ``(archive epoch seconds, has a parent)`` by session id.
+    :returns: ``(archive epoch seconds, has a parent)`` by session id, or
+        ``None`` when the listing did not complete.
     """
     archived: dict[str, tuple[int, bool]] = {}
     after: str | None = None
     try:
         while True:
+            if should_stop():
+                return None
             params = dict(_ARCHIVED_SESSIONS_QUERY)
             if after is not None:
                 params["after"] = after
@@ -794,12 +802,14 @@ def list_archived_session_times(
                 if row.get("archived") is True and type(archived_at) is int:
                     archived[str(row["id"])] = (archived_at, _reports_parent(row))
             cursor = page.get("last_id")
-            if not page.get("has_more") or not isinstance(cursor, str) or cursor == after:
+            if not page.get("has_more"):
                 return archived
+            if not isinstance(cursor, str) or cursor == after:
+                return None
             after = cursor
     except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
-        _logger.warning("Archived session list incomplete; asking per session", exc_info=True)
-        return archived
+        _logger.warning("Archived session list failed; no codex-native dir removed", exc_info=True)
+        return None
 
 
 def retain_codex_session_dirs(
@@ -809,17 +819,20 @@ def retain_codex_session_dirs(
     remove: bool = True,
     now: float | None = None,
     should_stop: Callable[[], bool] = lambda: False,
+    budget_s: float = _CODEX_SESSION_RETENTION_BUDGET_S,
 ) -> dict[str, int]:
     """Apply the archived-session retention to the codex-native bridge dirs.
 
     :param server_url: Server base URL the host is connected to.
     :param headers: The host's request headers, auth included.
     :param remove: ``False`` reports what would be removed and writes nothing.
-    :param now: Epoch seconds for the archive age; ``None`` uses the clock.
-    :param should_stop: Returns ``True`` once the host is shutting down; no
-        further session is asked about.
+    :param now: Epoch seconds for the age checks; ``None`` uses the clock.
+    :param should_stop: Returns ``True`` once the host is shutting down.
+    :param budget_s: Wall-clock seconds for the pass; past it nothing more is
+        read or removed.
     :returns: Counts from
-        :func:`~omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state`.
+        :func:`~omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state`;
+        ``stopped`` is set when the server could not be read.
     """
     from omnigent.harnesses.codex_native.bridge import (
         SessionRetentionState,
@@ -827,18 +840,33 @@ def retain_codex_session_dirs(
     )
     from omnigent.util.tls import client_ssl_context
 
+    deadline = time.monotonic() + budget_s
+
+    def _stopping() -> bool:
+        return should_stop() or time.monotonic() >= deadline
+
     with httpx.Client(timeout=_SESSION_STATE_TIMEOUT_S, verify=client_ssl_context()) as client:
-        archived = list_archived_session_times(client, server_url, headers)
+        archived = list_archived_session_times(client, server_url, headers, should_stop=_stopping)
+        if archived is None:
+            interrupted = _stopping()
+            return {"removed": 0, "stopped": int(not interrupted), "interrupted": int(interrupted)}
+        listed = archived
 
-        def _lookup(session_id: str) -> SessionRetentionState:
-            if should_stop():
-                return SessionRetentionState("unknown", stop=True)
-            if session_id in archived:
-                archived_at, child = archived[session_id]
-                return SessionRetentionState("archived", archived_at=archived_at, child=child)
-            return fetch_session_retention_state(client, server_url, session_id, headers)
+        def _candidate(session_id: str) -> SessionRetentionState | None:
+            row = listed.get(session_id)
+            if row is None:
+                return None
+            return SessionRetentionState("archived", archived_at=row[0], child=row[1])
 
-        return prune_bridge_dirs_by_session_state(_lookup, now=now, remove=remove)
+        return prune_bridge_dirs_by_session_state(
+            _candidate,
+            lambda session_id: fetch_session_retention_state(
+                client, server_url, session_id, headers
+            ),
+            now=now,
+            remove=remove,
+            should_stop=_stopping,
+        )
 
 
 def _codex_session_retention_stage(
@@ -850,7 +878,7 @@ def _codex_session_retention_stage(
     """Build the stage that runs the archived-session retention at most once per interval.
 
     A pass the server could not answer is not counted, so the next trigger
-    retries it.
+    retries it; a pass cut by its budget waits for the next interval.
     """
     last_completed: float | None = None
 

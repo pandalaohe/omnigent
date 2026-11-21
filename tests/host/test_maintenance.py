@@ -159,10 +159,17 @@ def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
     assert requests[0].headers["X-Test"] == "1"
 
 
-def test_list_archived_session_times_reads_every_page_and_keeps_rows_on_failure() -> None:
+def _archived_page(rows: list[dict[str, Any]], *, more: bool) -> dict[str, Any]:
+    return {"data": rows, "has_more": more, "last_id": rows[-1]["id"] if rows else None}
+
+
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_list_archived_session_times_uses_a_listing_only_when_complete(
+    fail_at: int | None,
+) -> None:
     pages = [
-        {
-            "data": [
+        _archived_page(
+            [
                 {"id": "sess-1", "archived": True, "archived_at": 1_700_000_000},
                 {"id": "sess-2", "archived": True, "archived_at": None},
                 {
@@ -172,65 +179,96 @@ def test_list_archived_session_times_reads_every_page_and_keeps_rows_on_failure(
                     "parent_session_id": "sess-1",
                 },
             ],
-            "has_more": True,
-            "last_id": "sess-2",
-        },
-        {
-            "data": [{"id": "sess-3", "archived": True, "archived_at": 1_700_000_500}],
-            "has_more": True,
-            "last_id": "sess-3",
-        },
+            more=True,
+        ),
+        _archived_page(
+            [{"id": "sess-3", "archived": True, "archived_at": 1_700_000_500}], more=False
+        ),
     ]
     requests: list[httpx.Request] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if not pages:
+        if len(requests) == fail_at:
+            requests.append(request)
             return httpx.Response(503, text="unavailable")
-        return httpx.Response(200, json=pages.pop(0))
+        requests.append(request)
+        return httpx.Response(200, json=pages[len(requests) - 1])
 
     with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
         archived = maintenance.list_archived_session_times(client, _SERVER, {"X-Test": "1"})
 
-    assert archived == {
-        "sess-1": (1_700_000_000, False),
-        "sess-4": (1_700_000_100, True),
-        "sess-3": (1_700_000_500, False),
-    }
-    assert [request.url.params.get("after") for request in requests] == [None, "sess-2", "sess-3"]
+    if fail_at is None:
+        assert archived == {
+            "sess-1": (1_700_000_000, False),
+            "sess-4": (1_700_000_100, True),
+            "sess-3": (1_700_000_500, False),
+        }
+    else:
+        # Pages read before a failure authorize nothing.
+        assert archived is None
+    assert [request.url.params.get("after") for request in requests] == [None, "sess-4"]
     assert requests[0].url.params["archived_only"] == "true"
     assert requests[0].headers["X-Test"] == "1"
 
 
-def test_retain_codex_session_dirs_asks_per_session_only_beyond_the_archive_list(
+def test_list_archived_session_times_checks_the_stop_flag_before_each_page() -> None:
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json=_archived_page([{"id": f"sess-{len(requests)}"}], more=True)
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+        archived = maintenance.list_archived_session_times(
+            client, _SERVER, {}, should_stop=lambda: len(requests) >= 1
+        )
+
+    assert archived is None
+    assert len(requests) == 1
+
+
+def test_retain_codex_session_dirs_rechecks_only_listed_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.harnesses.codex_native import bridge
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
 
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     root = tmp_path / "codex-native"
-    for name, session_id in (("a" * 32, "sess-listed"), ("b" * 32, "sess-gone")):
+    idle = _NOW - 30 * 24 * 3600
+    for name, session_id in (
+        ("a" * 32, "sess-child"),
+        ("b" * 32, "sess-main"),
+        ("c" * 32, "sess-unlisted"),
+    ):
         bridge_dir = root / name
         bridge_dir.mkdir(parents=True)
         (bridge_dir / "owner.pid").write_text("999999", encoding="utf-8")
         (bridge_dir / "state.json").write_text(
             f'{{"session_id": "{session_id}"}}', encoding="utf-8"
         )
-        # Last written well before both sessions' monthly archive.
-        os.utime(bridge_dir / "owner.pid", (_NOW - 60 * 24 * 3600,) * 2)
+        for path in (bridge_dir / "owner.pid", bridge_dir / "state.json", bridge_dir):
+            os.utime(path, (idle, idle))
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
-    asked: list[tuple[str, str, dict[str, str]]] = []
+    archived_at = int(_NOW - 15 * 24 * 3600)
+    rechecked: list[tuple[str, str, dict[str, str]]] = []
 
     def _fetch(
         _client: httpx.Client, server_url: str, session_id: str, headers: dict[str, str]
     ) -> bridge.SessionRetentionState:
-        asked.append((server_url, session_id, dict(headers)))
-        return bridge.SessionRetentionState("not_found")
+        rechecked.append((server_url, session_id, dict(headers)))
+        return bridge.SessionRetentionState("archived", archived_at=archived_at, child=True)
 
     monkeypatch.setattr(
         maintenance,
         "list_archived_session_times",
-        lambda _client, _server_url, _headers: {"sess-listed": (int(_NOW - 15 * 24 * 3600), True)},
+        lambda _client, _server_url, _headers, **_kwargs: {
+            "sess-child": (archived_at, True),
+            "sess-main": (archived_at, False),
+        },
     )
     monkeypatch.setattr(maintenance, "fetch_session_retention_state", _fetch)
 
@@ -238,9 +276,29 @@ def test_retain_codex_session_dirs_asks_per_session_only_beyond_the_archive_list
         _SERVER, {"X-Test": "1"}, remove=False, now=_NOW
     )
 
-    assert asked == [(_SERVER, "sess-gone", {"X-Test": "1"})]
-    assert counts["removable"] == 2
+    assert rechecked == [(_SERVER, "sess-child", {"X-Test": "1"})]
+    assert counts["removable"] == 1
+    assert counts["kept_main"] == 1
+    assert counts["kept_unlisted"] == 1
     assert all(entry.exists() for entry in root.iterdir())
+
+
+@pytest.mark.parametrize(("budget_s", "stopped"), [(60.0, 1), (0.0, 0)])
+def test_retain_codex_session_dirs_removes_nothing_without_a_complete_listing(
+    monkeypatch: pytest.MonkeyPatch, budget_s: float, stopped: int
+) -> None:
+    def _prune(*_args: object, **_kwargs: object) -> dict[str, int]:
+        raise AssertionError("an incomplete listing must not reach the sweep")
+
+    monkeypatch.setattr(maintenance, "list_archived_session_times", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state", _prune
+    )
+
+    counts = maintenance.retain_codex_session_dirs(_SERVER, {}, budget_s=budget_s)
+
+    # A server failure retries on the next trigger; a spent budget waits a day.
+    assert counts == {"removed": 0, "stopped": stopped, "interrupted": 1 - stopped}
 
 
 async def test_session_retention_stage_runs_daily_and_retries_an_unanswered_pass(
