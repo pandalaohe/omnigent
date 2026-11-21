@@ -23,6 +23,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -717,6 +718,28 @@ async def test_control_bridge_lists_tmux_answers_before_any_pane_output(
     assert steps[:3] == ["probe", "probed", "capture"]
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.asyncio
+async def test_seed_resets_background_before_restoring_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    background = b"\x1b[48;2;166;227;161m"
+    metadata = Mock(returncode=0, communicate=AsyncMock(return_value=(b"7,8,1,0\n", b"")))
+    capture = Mock(
+        returncode=0, communicate=AsyncMock(return_value=(background + b"prompt\n", b""))
+    )
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge.shutil", Mock(which=Mock(return_value="/bin/tmux"))
+    )
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge.asyncio",
+        Mock(wraps=asyncio, create_subprocess_exec=AsyncMock(side_effect=[metadata, capture])),
+    )
+
+    seed = await _run_tmux_capture("/tmp/example.sock", "main")
+
+    assert seed == b"\x1b[H\x1b[2J" + background + b"prompt\x1b[0m\x1b[9;8H\x1b[?25h"
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")

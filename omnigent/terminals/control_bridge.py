@@ -461,7 +461,7 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     normalized = _CAPTURE_ROW_SEP_RE.sub(b"\r\n", body)
     cursor = _cursor_restore_escape(meta)
     prelude, postlude = _mode_restore_escapes(meta)
-    return prelude + b"\x1b[H\x1b[2J" + normalized + cursor + postlude
+    return prelude + b"\x1b[H\x1b[2J" + normalized + b"\x1b[0m" + cursor + postlude
 
 
 @dataclass(frozen=True)
