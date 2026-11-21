@@ -7489,8 +7489,10 @@ async def _execute_timer_set(
 _TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
 
-# Poll interval while a successor's delivery is held for its handover opening.
+# Poll interval and cap while a successor's delivery is held for its handover
+# opening; the opening normally lands within seconds.
 _TIMER_HELD_POLL_S = 1.0
+_TIMER_HELD_MAX_POLLS = 60
 
 
 async def _settle_timer_holder(
@@ -7499,33 +7501,40 @@ async def _settle_timer_holder(
     *,
     origin: str,
     server_client: httpx.AsyncClient,
-) -> tuple[str, bool]:
+) -> tuple[str, str]:
     """
-    Settle which session a due timer fires into and whether that session ended.
+    Settle which session a due timer fires into and that session's state.
 
     A committed handover can move the timer while a check is in flight, so a
     check counts only for the holder it asked about. A successor still held
-    for its handover opening gets the firing once this runner releases it.
+    for its handover opening is checked again each poll and gets the firing
+    once released, or after ``_TIMER_HELD_MAX_POLLS`` polls.
 
     :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
     :param session_id: The holder last fired into.
-    :param origin: Session the timer was set in; a moved timer also ends once
-        its holder is confirmed gone.
+    :param origin: Session the timer was set in; only a moved timer reports
+        a holder whose snapshot answers 404.
     :param server_client: httpx client for the archive check.
-    :returns: ``(holder, ended)``.
+    :returns: ``(holder, state)``; state is ``"archived"``, ``"missing"`` or ``"ok"``.
     """
     from omnigent.runner import app as _app
 
     holder = _app.timer_session(timer_id, session_id)
+    polls = 0
     while True:
-        if _app.succession_held(holder):
-            await asyncio.sleep(_TIMER_HELD_POLL_S)
-        else:
-            ended = await flows.session_lineage_archived(
-                server_client, holder, missing_ends=holder != origin
-            )
-            if _app.timer_session(timer_id, holder) == holder:
-                return holder, ended
+        archived = await flows.session_lineage_archived(
+            server_client, holder, report_missing=holder != origin
+        )
+        current = _app.timer_session(timer_id, holder)
+        if current != holder:
+            holder = current
+            continue
+        if archived:
+            return holder, "archived"
+        if not _app.succession_held(holder) or polls >= _TIMER_HELD_MAX_POLLS:
+            return holder, "missing" if archived is None else "ok"
+        polls += 1
+        await asyncio.sleep(_TIMER_HELD_POLL_S)
         holder = _app.timer_session(timer_id, holder)
 
 
@@ -7552,18 +7561,23 @@ async def _timer_loop(
     from omnigent.runner import app as _app
 
     origin = conversation_id
+    missing_holder: str | None = None
     try:
         while True:
             _app.record_timer_schedule(timer_id, seconds=seconds, repeat=repeat, note=note)
             await asyncio.sleep(seconds)
-            conversation_id, ended = await _settle_timer_holder(
+            conversation_id, state = await _settle_timer_holder(
                 timer_id, conversation_id, origin=origin, server_client=server_client
             )
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
-            if ended:
+            if state == "archived":
                 break
+            # A moved timer ends once its holder answers 404 on two ticks in a row.
+            if state == "missing" and missing_holder == conversation_id:
+                break
+            missing_holder = conversation_id if state == "missing" else None
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
@@ -7596,6 +7610,14 @@ async def _timer_loop(
                     # certainly did not land and a retry cannot double it.
                     if retry_delay_s is not None:
                         await asyncio.sleep(retry_delay_s)
+                        # Nothing was sent: a handover during the wait moves the retry.
+                        holder = _app.timer_session(timer_id, conversation_id)
+                        if holder != conversation_id or _app.succession_held(holder):
+                            conversation_id, state = await _settle_timer_holder(
+                                timer_id, holder, origin=origin, server_client=server_client
+                            )
+                            if state == "archived":
+                                break
                         continue
                     _logger.warning(
                         "Timer %s firing persist failed for %s",
@@ -7613,7 +7635,7 @@ async def _timer_loop(
                         extra={"session_id": conversation_id},
                     )
                 break
-            if not repeat:
+            if state == "archived" or not repeat:
                 break
     except asyncio.CancelledError:
         return

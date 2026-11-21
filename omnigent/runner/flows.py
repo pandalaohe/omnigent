@@ -188,8 +188,8 @@ _ARCHIVE_LINEAGE_MAX_HOPS = 32
 
 
 async def session_lineage_archived(
-    server_client: httpx.AsyncClient, session_id: str, *, missing_ends: bool = False
-) -> bool:
+    server_client: httpx.AsyncClient, session_id: str, *, report_missing: bool = False
+) -> bool | None:
     """
     Whether a fresh snapshot shows the session or an ancestor archived.
 
@@ -201,8 +201,8 @@ async def session_lineage_archived(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param session_id: Session whose schedule is about to fire, e.g.
         ``"conv_abc123"``.
-    :param missing_ends: Also return ``True`` when the session's own snapshot
-        answers 404 (deleted, or no access at all).
+    :param report_missing: Return ``None`` when the session's own snapshot
+        answers 404 (deleted, or no access at all), instead of ``False``.
     :returns: ``True`` when any snapshot in the ``parent_session_id`` chain
         answers 200 with ``archived`` true.
     """
@@ -215,7 +215,8 @@ async def session_lineage_archived(
             seen.add(current_id)
             snapshot = await server_client.get(f"/v1/sessions/{current_id}", timeout=10.0)
             if snapshot.status_code != 200:
-                return missing_ends and current_id == session_id and snapshot.status_code == 404
+                gone = current_id == session_id and snapshot.status_code == 404
+                return None if report_missing and gone else False
             body = snapshot.json()
             if not isinstance(body, dict):
                 return False

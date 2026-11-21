@@ -485,9 +485,13 @@ class _TimerServer:
         self.archived: set[str] = set()
         self.blocked: dict[str, asyncio.Event] = {}
         self.checking = asyncio.Event()
+        self.refused_posts = 0
 
     async def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
+            if self.refused_posts:
+                self.refused_posts -= 1
+                raise httpx.ConnectError("connection refused")
             text = json.loads(request.content)["data"]["content"][0]["text"]
             self.posts.append((request.url.path, text))
             return httpx.Response(202, json={"queued": True})
@@ -657,7 +661,7 @@ async def test_moved_timer_ends_only_once_its_holder_is_gone(
     _clean_succession_state: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A transient error keeps delivering; a 404 for the moved timer's holder ends it."""
+    """Errors and a single 404 keep delivering; two 404 ticks in a row end a moved timer."""
     runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
     gate = _GatedTimerAsyncio()
     monkeypatch.setattr(tool_dispatch, "asyncio", gate)
@@ -671,19 +675,101 @@ async def test_moved_timer_ends_only_once_its_holder_is_gone(
             async with _runner_client(app) as client:
                 assert (await _post_succession(client, moved_ids=[])).status_code == 200
                 assert (await _release(client)).status_code == 200
-            timer_server.statuses[NEW_SESSION_ID] = 503
-            gate.release()
-            await gate.wait_for_sleeps(2)
-            timer_server.statuses[NEW_SESSION_ID] = 404
+            for tick, status in enumerate((503, 404, 200, 404), start=2):
+                timer_server.statuses[NEW_SESSION_ID] = status
+                gate.release()
+                await gate.wait_for_sleeps(tick)
             gate.release()
             await asyncio.wait_for(task, timeout=5)
         finally:
             task.cancel()
 
-    assert timer_server.posts == [
-        (f"/v1/sessions/{NEW_SESSION_ID}/events", f"[System: timer {timer_id} fired]")
-    ]
+    fired = (f"/v1/sessions/{NEW_SESSION_ID}/events", f"[System: timer {timer_id} fired]")
+    assert timer_server.posts == [fired] * 4
     assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["archived", "cap"])
+async def test_never_released_successor_still_ends_or_gets_the_firing_after_the_cap(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """A hold that is never released keeps checking the successor and is bounded."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    monkeypatch.setattr(tool_dispatch, "_TIMER_HELD_MAX_POLLS", 2)
+    timer_server = _TimerServer()
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=900, repeat=True)
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 200
+            gate.release()
+            await gate.wait_for_sleeps(2)
+            if outcome == "archived":
+                timer_server.archived.add(NEW_SESSION_ID)
+                gate.release()
+                await asyncio.wait_for(task, timeout=5)
+            else:
+                gate.release()
+                await gate.wait_for_sleeps(3)
+                gate.release()
+                await gate.wait_for_sleeps(4)
+                assert not task.done()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    poll = tool_dispatch._TIMER_HELD_POLL_S
+    if outcome == "archived":
+        assert timer_server.posts == []
+        assert gate.delays == [900.0, poll]
+        assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
+    else:
+        fired = (f"/v1/sessions/{NEW_SESSION_ID}/events", f"[System: timer {timer_id} fired]")
+        assert timer_server.posts == [fired]
+        assert gate.delays == [900.0, poll, poll, 900.0]
+
+
+@pytest.mark.asyncio
+async def test_connect_error_retry_follows_the_moved_timer_to_its_successor(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry after a refused connection goes to the new holder, after its opening."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    timer_server.refused_posts = 1
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=60, note="resume")
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            gate.release()
+            await gate.wait_for_sleeps(2)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 200
+                gate.release()
+                await gate.wait_for_sleeps(3)
+                assert timer_server.posts == []
+                assert (await _release(client)).status_code == 200
+            gate.release()
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            task.cancel()
+
+    text = f"[System: timer {timer_id} fired]\nnote: 'resume'"
+    assert timer_server.posts == [(f"/v1/sessions/{NEW_SESSION_ID}/events", text)]
+    assert gate.delays == [60.0, 2.0, tool_dispatch._TIMER_HELD_POLL_S]
 
 
 @pytest.mark.asyncio
