@@ -1944,7 +1944,7 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
         "mcp-late",
         "mcp-child",
         "unknown-source",
-        "lost-warning",
+        "control-shape",
     ],
 )
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
@@ -1962,7 +1962,7 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
     version = json.loads((sdk / "package.json").read_text()).get("version") if sdk else None
     if sdk is None or version not in ("1.3.0", "1.5.0"):
         pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
-    if mode.startswith("mcp-") and version != "1.5.0":
+    if (mode.startswith("mcp-") or mode == "control-shape") and version != "1.5.0":
         pytest.skip("Pi 1.5.0 built-in MCP is required")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -1984,16 +1984,18 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
             "replacement": b'"evaluate": 1, "execute": 1, "finish": 0',
         }
         assert expected.get(mode, b'"evaluate": 1, "execute": 1, "finish": 1') in output
-        if mode.startswith("mcp-") or mode == "unknown-source":
-            kind = b"builtin:mcp" if mode.startswith("mcp-") else b"unrecognized"
-            notice = (
-                b"Scoped Pi left out tools from unsupported sources (1 total, " + kind + b": 1)."
-            )
-            assert error.count(notice) == 1
+        notice = {
+            "control-shape": b"2 total, unrecognized: 1, builtin:mcp: 1",
+            "unknown-source": b"1 total, unrecognized: 1",
+        }.get(mode)
+        if mode.startswith("mcp-"):
+            notice = b"1 total, builtin:mcp: 1"
+        if notice is not None:
+            prefix = b"Scoped Pi left out tools from unsupported sources"
+            assert error.count(prefix) == 1
+            assert prefix + b" (" + notice + b")." in error
             assert b"mcp__fixture__echo" not in error
             assert b"opaque_fixture_tool" not in error
-        elif mode == "lost-warning":
-            assert b"Scoped Pi left out tools" not in error
     finally:
         if process.returncode is None:
             process.kill()

@@ -78,7 +78,11 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
             installation.notified = true;
           }
         });
-        api.on("session_shutdown", (_event, ctx) => nativeSupport.closeNativeSession(ctx.sessionManager));
+        api.on("session_shutdown", (event, ctx) => {
+          const closing = nativeSupport.closeNativeSession(ctx.sessionManager);
+          if (event?.reason === "reload" || !state.logOmissions) return closing;
+          return Promise.resolve(closing).finally(state.logOmissions);
+        });
       }}]}, result.runtime);
     if (final.errors.length || final.extensions.length !== 1) throw new Error("Native final hook could not be installed");
     state.finalExtension = final.extensions[0];

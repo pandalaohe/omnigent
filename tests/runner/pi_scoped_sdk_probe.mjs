@@ -5,26 +5,39 @@ import http from "node:http";
 import {createRequire, findPackageJSON} from "node:module";
 import {pathToFileURL} from "node:url";
 const [sdkRoot, locator, root, adapter, extension, mode="normal"] = process.argv.slice(2);
-const mcpMode = ["mcp-startup", "mcp-late", "mcp-child"].includes(mode);
-const unknownMode = ["unknown-source", "lost-warning"].includes(mode);
+const mcpMode = ["mcp-startup", "mcp-late", "mcp-child", "control-shape"].includes(mode);
+const unknownMode = ["unknown-source", "control-shape"].includes(mode);
 const omissionMode = mcpMode || unknownMode;
-const omittedName = mcpMode ? "mcp__fixture__echo" : "opaque_fixture_tool";
+const mcpName = "mcp__fixture__echo", unknownName = "opaque_fixture_tool";
+const omittedNames = [...(mcpMode?[mcpName]:[]), ...(unknownMode?[unknownName]:[])];
 let ackDispatch=false, definitionStarts=0;
-let droppedOmissionCounts = false;
+const observedControls = [];
 const originalRequest=http.request;
 http.request=function(url,options,callback){
- if (url.pathname === "/pi/bootstrap" && mode === "lost-warning") {
+ if (url.pathname === "/pi/bootstrap" && mode === "control-shape") {
   const request = originalRequest(url, options, callback);
   const end = request.end;
   request.end = function (body) {
    const payload = JSON.parse(body);
-   assert.ok(["bind", "attest", "revoke"].includes(payload.op), "warnings cannot allocate a control request");
-   if (payload.omitted_tool_counts) {
-    droppedOmissionCounts = true;
-    delete payload.omitted_tool_counts;
-    body = JSON.stringify(payload);
-    request.setHeader("content-length", Buffer.byteLength(body));
+   const operation = payload.op === "bind" && Object.hasOwn(payload,"registry") ? "registry" : payload.op;
+   const baseFields = {
+    bind: ["loader"],
+    registry: ["loader", "registry"],
+    attest: ["call_id", "name", "arguments", "revision", "support"],
+    revoke: [],
+   };
+   assert.ok(Object.hasOwn(baseFields, operation));
+   assert.deepEqual(Object.keys(payload).sort(), ["protocol", "sequence", "op", "handle", ...baseFields[operation]].sort());
+   assert.equal(payload.protocol, 1);
+   assert.equal(payload.sequence, observedControls.length + 1);
+   if (operation === "registry") {
+    assert.deepEqual(Object.keys(payload.registry).sort(), [
+     "version", "installation_id", "session_id", "harness", "extension_path", "extension_sha256",
+     "tool_registry_version", "bridge_extension_path", "bridge_extension_sha256", "scope_id", "runner_epoch",
+     "launch_epoch", "origin", "canonical_cwd", "registry_generation", "scope_protocol_version", "tools", "loaded_extensions",
+    ].sort());
    }
+   observedControls.push(operation);
    return end.call(this, body);
   };
   return request;
@@ -105,7 +118,7 @@ runtime.registerProvider("scoped-fixture",{
   const last=context.messages.findLastIndex(item=>item.role==="user");
   const done=context.messages.slice(last+1).some(item=>item.role==="toolResult");
   const user=JSON.stringify(context.messages[last]);
-  const tool=[...helperNames,omittedName].find(name=>user.includes("helper "+name+'"')) || (user.includes("exception")?"sys_exception":user.includes("remote")?"sys_fixture":"read");
+  const tool=[...helperNames,...omittedNames].find(name=>user.includes("helper "+name+'"')) || (user.includes("exception")?"sys_exception":user.includes("remote")?"sys_fixture":"read");
   const content=done?[{type:"text",text:"done"}]:[{type:"toolCall",id:"probe-"+tool,name:tool,arguments:tool==="read"?{path:"marker.txt"}:{}}];
   const message={role:"assistant",api:model.api,provider:model.provider,model:model.id,content,
    usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},
@@ -126,7 +139,7 @@ async function createSession({withMcp = false, child = false} = {}) {
    const set = tools.set;
    tools.set = function (name, tool) {
     const result = set.call(this, name, tool);
-    if (name === omittedName) resolve();
+    if (name === mcpName) resolve();
     return result;
    };
    if (mode === "mcp-startup") {
@@ -145,7 +158,7 @@ async function createSession({withMcp = false, child = false} = {}) {
   extensionFactories.unshift(...builtInExtensions.filter(item=>["mcp","tool-search"].includes(item.name)));
  }
  if (unknownMode) {
-  extensionFactories.push({name:"future-fixture", factory:api=>api.registerTool({name:omittedName,label:"Fixture",description:"Fixture",parameters:{type:"object"},execute:async()=>assert.fail("unknown tool was executed")})});
+  extensionFactories.push({name:"future-fixture", factory:api=>api.registerTool({name:unknownName,label:"Fixture",description:"Fixture",parameters:{type:"object"},execute:async()=>assert.fail("unknown tool was executed")})});
   extensionsOverride = result => {
    result.extensions.find(item=>item.path === "<inline:future-fixture>").path = "<future:fixture>";
    return result;
@@ -154,13 +167,13 @@ async function createSession({withMcp = false, child = false} = {}) {
  loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager:settings,noExtensions:!(helperEntry||withMcp||unknownMode),noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,extensionFactories,extensionsOverride});
  await loader.reload();
  const tools = ["read", "sys_fixture", "sys_exception", ...helperNames];
- if (omissionMode) tools.push("tool_search", omittedName);
+ if (omissionMode) tools.push("tool_search", ...omittedNames);
  const sessionManager=sdk.SessionManager.create(cwd, path.join(root, child?"child-sessions":"sessions"));
  if (child) childLifecycles.set(sessionManager, {state:"open",closingSignal:new AbortController().signal,bindHost(){return {};}});
  const {session}=await sdk.createAgentSession({cwd,agentDir,resourceLoader:loader,modelRuntime:runtime,model:runtime.getModel("scoped-fixture","local"),sessionManager,settingsManager:settings,tools});
  return {session, discoveries};
 }
-async function assertOmitted(session) {
+async function assertOmitted(session, omittedName) {
  assert.equal(session.getAllTools().some(tool=>tool.name===omittedName),false);
  assert.equal(session.getCallableToolNames().includes(omittedName),false);
  assert.equal(session.getToolDefinition(omittedName),undefined);
@@ -190,19 +203,18 @@ try{
  }
  await session.prompt("Read marker.txt");
  if (omissionMode) {
-  await assertOmitted(session);
+  for (const name of omittedNames) await assertOmitted(session, name);
   if (mode === "mcp-late") {
    fs.unlinkSync(discoveryGate);
    await session.reload();
    assert.equal(discoveries.length, 2);
    fs.writeFileSync(discoveryGate, "allow again");
    await discoveries[1];
-   await assertOmitted(session);
+   await assertOmitted(session, mcpName);
   }
-  const expectedNotice = `Scoped Pi left out tools from unsupported sources (1 total, ${mcpMode?"builtin:mcp":"unrecognized"}: 1).`;
-  assert.deepEqual(forwardedNotices, [expectedNotice]);
+  const expectedKinds = [...(unknownMode?["unrecognized"]:[]), ...(mcpMode?["builtin:mcp"]:[])];
+  assert.deepEqual(forwardedNotices, expectedKinds.map(kind=>`Scoped Pi left out tools from unsupported sources (1 total, ${kind}: 1).`));
   assert.equal(fs.existsSync(path.join(root,"mcp-called")),false);
-  if (mode === "lost-warning") assert.equal(droppedOmissionCounts, true);
  }
  if(mode==="incompatible"){
   for(const name of helperNames){
@@ -244,4 +256,8 @@ try{
  console.log(JSON.stringify({sdk:JSON.parse(fs.readFileSync(path.join(sdkRoot,"package.json"))).version,result,events:events.length,definitionStarts,mode,receiptExcluded:true}));
  if(mode==="normal" || mode==="incompatible" || omissionMode)await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"});
  else if(mode!=="missing-bootstrap")await assert.rejects(()=>session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}),/Scoped Pi/);
+ if (mode === "control-shape") {
+  // The read is attested at policy evaluation and again immediately before execution.
+  assert.deepEqual(observedControls, ["bind", "registry", "attest", "attest", "revoke"]);
+ }
 }finally{clearInterval(alive);session.dispose();if(session!==parent.session)parent.session.dispose();dispose();http.request=originalRequest;}

@@ -253,17 +253,16 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       task.then(resolve,reject).finally(()=>signal.removeEventListener("abort",abort));
     });
   }
-  function client(binding,handle,readState,recheck,drainOmittedCounts) {
+  function client(binding,handle,readState,recheck) {
     const scope=binding.scope, scopeCredential=binding.credential, scopeLifetime=new AbortController();
     return createScopedClient({scope,readState,recheck,report,transport:{
       isCurrent:value=>live&&ready&&!revoked.has(value.scope_id)&&value.runner_epoch===scope.runner_epoch&&value.launch_epoch===launchEpoch,
       onLoss:callback=>{const close=cause=>{scopeLifetime.abort();callback(cause);};listeners.add(close);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(close);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))close("scope_revoked");},
-      attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support,
-        omitted_tool_counts:drainOmittedCounts?.()},scopeLifetime.signal),
+      attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support},scopeLifetime.signal),
       evaluate:(event,revision)=>request("/policies/evaluate",{event:{type:"PHASE_TOOL_CALL",target:"",context:{},data:{name:event.toolName,arguments:event.input,call_id:event.toolCallId,expected_permission_tier_revision:revision}}},scopeCredential),
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
       finish:metadata=>request("/permission-tiers/control",{type:"permission_tier_finish",...metadata},scopeCredential),
-      revoke:()=>{scopeLifetime.abort();return control("revoke",{handle,omitted_tool_counts:drainOmittedCounts?.()});},
+      revoke:()=>{scopeLifetime.abort();return control("revoke",{handle});},
       rpc:(port,metadata)=>{
         if(port===0||port===null||port===undefined)
           return request("/pi/rpc",{payload:JSON.stringify(metadata)},scopeCredential,undefined,scopeLifetime.signal);

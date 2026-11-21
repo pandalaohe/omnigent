@@ -434,11 +434,7 @@ class PiBootstrapBroker:
             },
             "revoke": {"protocol", "sequence", "op", "handle"},
         }
-        if (
-            not isinstance(op, str)
-            or op not in fields
-            or set(payload) - fields[op] - {"omitted_tool_counts"}
-        ):
+        if not isinstance(op, str) or op not in fields or set(payload) - fields[op]:
             raise ValueError("Pi bootstrap operation unavailable")
         handle = payload.get("handle")
         if not isinstance(handle, str) or not 1 <= len(handle) <= 128:
@@ -460,26 +456,7 @@ class PiBootstrapBroker:
             else:
                 reply = self._attest(admission, payload)
         actor.sequence, actor.previous_digest, actor.previous_reply = sequence, digest, reply
-        # Omission diagnostics ride on an existing operation and cannot change its result.
-        with suppress(Exception):
-            self._log_omitted_tools(payload.get("omitted_tool_counts"))
         return reply
-
-    def _log_omitted_tools(self, counts: object) -> None:
-        if not isinstance(counts, dict):
-            return
-        verified = {
-            kind: count
-            for kind in ("builtin:mcp", "builtin", "sdk", "unrecognized")
-            if type(count := counts.get(kind)) is int and 0 < count <= 2**53 - 1
-        }
-        if verified:
-            logger.warning(
-                "Scoped Pi left out tools from unsupported sources (%d total, %s). session_id=%s",
-                sum(verified.values()),
-                ", ".join(f"{kind}: {count}" for kind, count in verified.items()),
-                self.session_id,
-            )
 
     def _bind(
         self, actor: PiAttestorProcess, handle: str, payload: dict[str, object]
