@@ -26,6 +26,8 @@
   "contextNotReportedSummary": "Context usage not reported yet",
   "approximateSessionNote": "Approximate for this session type",
   "continuesNextTurnNotice": "Continues in a new session when this turn ends.",
+  "rotationRequestedNotice": "Rotation requested: this session moves to a new session once the current turn ends and the session is idle.",
+  "rotationRequestedNoRetryNotice": "Rotation requested. Auto-rotation is off, so it is not retried if it cannot run when this turn ends.",
   "readOnlyNotice": "Read-only here.",
   "useDefaultOnOption": "Use default (On)",
   "useDefaultOffOption": "Use default (Off)",
@@ -34,7 +36,7 @@
   "saveSessionError": "Could not save auto-rotation settings.",
   "sessionRotationFailedRecovery": "This session could not continue in a new session automatically. Type /clear to continue.",
   "sessionRotationDraftMayRemainRecovery": "Rotation unconfirmed; draft may remain. Inspect and clear the terminal input before pressing Enter.",
-  "sessionRotationUnconfirmedRecovery": "Rotation unconfirmed. The command was already injected and will not be retried automatically. Inspect the terminal before typing /clear.",
+  "sessionRotationUnconfirmedRecovery": "Rotation unconfirmed. An injection attempt was recorded and will not be retried automatically. Inspect the terminal before typing /clear.",
   "warningBannerTitle": "Warning",
   "dismissWarningAriaLabel": "Dismiss warning"
 }

@@ -38,6 +38,26 @@ function draftFromStatus(status: AutoRotationStatus): SessionAutoRotationDraft {
   };
 }
 
+// Older servers send only rotation_pending; they keep the notice they showed before.
+function rotationNotice(status: AutoRotationStatus): string | null {
+  if (status.rotation_request === undefined) {
+    return status.rotation_pending ? t("continuesNextTurnNotice") : null;
+  }
+  switch (status.rotation_request) {
+    case "requested":
+      // Only the switch's server follow-up makes the move dependable.
+      return t(status.enabled ? "rotationRequestedNotice" : "rotationRequestedNoRetryNotice");
+    case "failed":
+      return t("sessionRotationFailedRecovery");
+    case "unconfirmed":
+      return t("sessionRotationUnconfirmedRecovery");
+    case "draft_may_remain":
+      return t("sessionRotationDraftMayRemainRecovery");
+    default:
+      return null;
+  }
+}
+
 function parseOptionalBoundedInteger(
   text: string,
   min: number,
@@ -232,6 +252,7 @@ export function AutoRotationChip({
     return null;
   }
 
+  const notice = rotationNotice(status);
   const defaultEnabled =
     status.sources.enabled !== "session" ? status.enabled : preferences.autoRotationEnabled;
   const defaultCompactions =
@@ -332,9 +353,7 @@ export function AutoRotationChip({
               : t("contextNotReportedSummary")}
           </p>
           {status.approximate.length > 0 && <p>{t("approximateSessionNote")}</p>}
-          {status.rotation_pending && (
-            <p className="font-medium text-foreground">{t("continuesNextTurnNotice")}</p>
-          )}
+          {notice && <p className="font-medium text-foreground">{notice}</p>}
         </div>
 
         {readOnly ? (

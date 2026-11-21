@@ -15,7 +15,10 @@ from omnigent.runner.tool_dispatch import (
 )
 from omnigent.spec.types import AgentSpec
 
-_ROTATION_NOTE = "The session will continue in a new session when this turn ends."
+_ROTATION_NOTE = (
+    "Rotation requested: the session moves to a new session once this turn ends and "
+    "the session is idle. If it cannot, a notice in this session says what follows."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -158,14 +161,21 @@ async def test_session_handover_validates_arguments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_handover_deferred_never_arms_runner() -> None:
+@pytest.mark.parametrize(
+    ("deferred", "auto", "note"),
+    [
+        ("compacted", True, "Keep working"),
+        ("draft_may_remain", False, "inspect and clear"),
+        ("unconfirmed", False, "never confirmed"),
+    ],
+)
+async def test_deferred_handover_never_arms_runner(deferred: str, auto: bool, note: str) -> None:
     requests = []
+    arguments = {"handover": "Continue.", **({"auto": True} if auto else {})}
 
     def handler(request):
         requests.append(json.loads(request.content))
-        return httpx.Response(
-            200, json={"item_id": "note", "rotate": False, "deferred": "compacted"}
-        )
+        return httpx.Response(200, json={"item_id": "note", "rotate": False, "deferred": deferred})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
@@ -173,12 +183,12 @@ async def test_auto_handover_deferred_never_arms_runner() -> None:
         result = json.loads(
             await execute_tool(
                 tool_name="sys_session_handover",
-                arguments=json.dumps({"handover": "Continue.", "auto": True}),
+                arguments=json.dumps(arguments),
                 server_client=client,
                 conversation_id="current",
             )
         )
-    assert requests == [{"handover": "Continue.", "rotate": True, "auto": True}]
-    assert result["deferred"] == "compacted"
-    assert "Keep working" in result["note"]
+    assert requests == [{**arguments, "rotate": True}]
+    assert result["deferred"] == deferred
+    assert note in result["note"]
     assert not runner_app.pop_pending_rotation("current")

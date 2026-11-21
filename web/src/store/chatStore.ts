@@ -9690,6 +9690,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "error":
       if (event.error.code === "pi_compact_unavailable") settleLegacyPiCompact();
+      // A failed rotation changes the session's auto-rotation status; refetch it.
+      if (event.error.code === "session_rotation_failed" && sourceConversationId !== null) {
+        void queryClient?.invalidateQueries({ queryKey: ["auto-rotation", sourceConversationId] });
+      }
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders

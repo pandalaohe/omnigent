@@ -22,6 +22,8 @@ export interface AutoRotationStatus {
   approximate: AutoRotationApproximatePart[];
   due: boolean;
   rotation_pending: boolean;
+  /** Absent on servers that predate it; the chip then keeps its older notice. */
+  rotation_request?: "requested" | "failed" | "unconfirmed" | "draft_may_remain" | null;
 }
 
 export interface AutoRotationPatch {

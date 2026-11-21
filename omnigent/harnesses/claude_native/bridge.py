@@ -899,6 +899,10 @@ class ClaudeRotationUnconfirmed(RuntimeError):
         )
 
 
+class ClaudePaneBusy(RuntimeError):
+    """An automatic command found Claude busy and typed nothing; it may run again later."""
+
+
 class ClaudeUserPromptPending(RuntimeError):
     """
     A native question or permission prompt must be answered before injection.
@@ -6900,7 +6904,7 @@ def _inject_slash_command_into_pane(
             require_idle
             and _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False
         ):
-            raise RuntimeError("Automatic rotation requires a confirmed idle Claude pane")
+            raise ClaudePaneBusy("Automatic rotation requires a confirmed idle Claude pane")
 
     check_idle()
     startup_submit = wait_for_startup and (

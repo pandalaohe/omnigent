@@ -34,10 +34,13 @@ from omnigent.server.auto_rotation import (
     ATTEMPT_LABEL_KEY,
     DRAFT_LABEL_KEY,
     FAILED_ATTEMPT_LABEL_KEY,
+    FRESH_ROUND_LABEL_KEY,
     INJECTED_ATTEMPT_LABEL_KEY,
     INJECTED_REVISION_LABEL_KEY,
+    NOTICED_COUNT_LABEL_KEY,
     _label_int,
     attempt_failed,
+    auto_rotation_for,
     rotation_attempt,
     rotation_injected,
 )
@@ -83,7 +86,10 @@ _ROTATION_NATIVE_HARNESSES = frozenset(
 )
 
 #: Visible notice persisted alongside ``omnigent.rotate_requested``.
-_ROTATE_NOTICE = "This session will continue in a new session when the current turn ends."
+_ROTATE_NOTICE = (
+    "Rotation requested: this session moves to a new session once the current turn ends and "
+    "the session is idle. If it cannot, a notice follows."
+)
 
 
 def _fresh_pi_launch_args(args: list[str] | None) -> list[str] | None:
@@ -217,6 +223,16 @@ def register_succession_routes(
             if labels.get(ATTEMPT_LABEL_KEY, "") != body.get("attempt", ""):
                 return LabelGroupChange({}, set())
             attempt = rotation_attempt(labels, revision)
+            if body.get("released") == "true":
+                if labels.get(INJECTED_ATTEMPT_LABEL_KEY) != attempt:
+                    return LabelGroupChange({}, set())
+                # Nothing was typed: undo this claim. Without an attempt id the claim
+                # also fenced by revision, and any earlier revision mark was lower.
+                outcome = "released"
+                released = {INJECTED_ATTEMPT_LABEL_KEY, DRAFT_LABEL_KEY}
+                if not labels.get(ATTEMPT_LABEL_KEY):
+                    released.add(INJECTED_REVISION_LABEL_KEY)
+                return LabelGroupChange({}, released)
             if body.get("input_cleared") == "true":
                 if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == attempt:
                     outcome = "unconfirmed"
@@ -395,14 +411,6 @@ def register_succession_routes(
         deferred = None
         status = None
         if body.auto:
-            from dataclasses import replace
-
-            from omnigent.server.auto_rotation import (
-                FRESH_ROUND_LABEL_KEY,
-                NOTICED_COUNT_LABEL_KEY,
-                auto_rotation_for,
-            )
-            from omnigent.stores.conversation_store import LabelGroupChange
 
             def auto_change(labels: dict[str, str]) -> LabelGroupChange:
                 nonlocal rotate, deferred, status
@@ -456,8 +464,34 @@ def register_succession_routes(
                 conversation_store.mutate_label_group, session_id, "omnigent.", auto_change
             )
         elif rotate:
-            label_updates[ROTATE_REQUESTED_LABEL_KEY] = str(conversation.archive_revision)
-        if not body.auto:
+
+            def manual_change(labels: dict[str, str]) -> LabelGroupChange:
+                # Decided on current labels, serialized with the runner's claim and receipts.
+                nonlocal rotate, deferred
+                latest = conversation_store.get_conversation(session_id)
+                if latest is None:
+                    raise _session_not_found()
+                current = replace(latest, labels=labels)
+                failed = attempt_failed(current)
+                if labels.get(DRAFT_LABEL_KEY):
+                    # An earlier command may remain in the terminal input; a person must check.
+                    deferred = "draft_may_remain"
+                elif rotation_injected(current) and not failed:
+                    # An earlier command was typed and its new session is not confirmed yet.
+                    deferred = "unconfirmed"
+                rotate = deferred is None
+                updates = dict(label_updates)
+                if rotate:
+                    updates[ROTATE_REQUESTED_LABEL_KEY] = str(latest.archive_revision)
+                    if not labels.get(ROTATE_REQUESTED_LABEL_KEY) or failed:
+                        # A new attempt only once the previous one is resolved.
+                        updates[ATTEMPT_LABEL_KEY] = generate_task_id()
+                return LabelGroupChange(updates, set())
+
+            await asyncio.to_thread(
+                conversation_store.mutate_label_group, session_id, "omnigent.", manual_change
+            )
+        else:
             await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
 
         if rotate:
@@ -480,8 +514,6 @@ def register_succession_routes(
             if persisted_notice and not persisted_notice[0].deduplicated:
                 _publish_external_conversation_item(session_id, persisted_notice[0])
 
-            from omnigent.server.auto_rotation import auto_rotation_for
-
             latest = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if latest is not None:
                 current_status = await asyncio.to_thread(
@@ -492,7 +524,8 @@ def register_succession_routes(
                     getattr(request.app.state, "user_preferences_store", None),
                 )
                 notices = getattr(request.app.state, "auto_rotation_notices", None)
-                if current_status.enabled and current_status.eligible and notices is not None:
+                # With auto-rotation off the tracker only reports a request that did not run.
+                if current_status.eligible and notices is not None:
                     notices.track(session_id, latest.labels[ROTATE_REQUESTED_LABEL_KEY])
         result = {"item_id": handover_item.id, "rotate": rotate, "deferred": deferred}
         if status is not None:

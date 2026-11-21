@@ -11227,6 +11227,39 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("rotation failure notice", () => {
+    it("refetches the delivering session's auto-rotation status", () => {
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent(
+        {
+          type: "error",
+          source: "harness",
+          toolName: null,
+          itemId: "item_failed",
+          responseId: "task_failed",
+          error: {
+            code: "session_rotation_failed",
+            message: "This session could not continue in a new session automatically.",
+            level: "warning",
+          },
+        },
+        "conv_bg",
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["auto-rotation", "conv_bg"] });
+    });
+
+    it("leaves the auto-rotation status alone for the requested notice", () => {
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "error",
+        source: "harness",
+        toolName: null,
+        error: { code: "session_rotation", message: "Rotation requested.", level: "info" },
+      });
+      expect(spy).not.toHaveBeenCalledWith({ queryKey: ["auto-rotation", "conv_abc"] });
+    });
+  });
+
   describe("session.reasoning_effort", () => {
     it("reflects a TUI-side effort switch in sessionReasoningEffort", () => {
       // A thinking-level change inside a native terminal arrives as

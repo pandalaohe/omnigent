@@ -107,6 +107,101 @@ describe("AutoRotationChip", () => {
     expect(screen.queryByTestId("auto-rotation-chip-trigger")).toBeNull();
   });
 
+  it.each([
+    [
+      "requested",
+      "Rotation requested. Auto-rotation is off, so it is not retried if it cannot run when this turn ends.",
+    ],
+    [
+      "failed",
+      "This session could not continue in a new session automatically. Type /clear to continue.",
+    ],
+    [
+      "unconfirmed",
+      "Rotation unconfirmed. An injection attempt was recorded and will not be retried automatically. Inspect the terminal before typing /clear.",
+    ],
+    [
+      "draft_may_remain",
+      "Rotation unconfirmed; draft may remain. Inspect and clear the terminal input before pressing Enter.",
+    ],
+  ] as const)(
+    "shows the %s request state instead of promising a new session",
+    async (state, text) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: state }),
+      });
+
+      mountChip();
+      fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+
+      expect(screen.getByText(text)).toBeInTheDocument();
+      expect(screen.queryByText("Continues in a new session when this turn ends.")).toBeNull();
+    },
+  );
+
+  it("says the session moves on only while auto-rotation is on", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        enabled: true,
+        rotation_pending: true,
+        rotation_request: "requested",
+      }),
+    });
+
+    mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: 1/4" }));
+
+    expect(
+      screen.getByText(
+        "Rotation requested: this session moves to a new session once the current turn ends and the session is idle.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("replaces the requested notice with the failure once the status is refetched", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        rotation_pending: true,
+        rotation_request: "requested",
+      }),
+    });
+    const { client } = mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+    expect(screen.getByText(/^Rotation requested\. Auto-rotation is off/)).toBeInTheDocument();
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: "failed" }),
+    });
+    await act(() => client.invalidateQueries({ queryKey: ["auto-rotation", "parent-1"] }));
+
+    expect(
+      await screen.findByText(
+        "This session could not continue in a new session automatically. Type /clear to continue.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/^Rotation requested/)).toBeNull();
+  });
+
+  it("shows no request notice when the server reports none, even with the request label", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...initialStatus, rotation_pending: true, rotation_request: null }),
+    });
+
+    mountChip();
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-rotation: Off" }));
+
+    expect(screen.getByText("Compactions: 1 of 4")).toBeInTheDocument();
+    expect(screen.queryByText("Continues in a new session when this turn ends.")).toBeNull();
+    expect(screen.queryByText(/^Rotation requested/)).toBeNull();
+  });
+
   it("displays status summary, approximate note, pending notice, and round-trips session overrides", async () => {
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,

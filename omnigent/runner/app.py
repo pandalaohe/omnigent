@@ -1416,8 +1416,8 @@ _member_turn_counter = itertools.count(1)
 
 # Sessions whose ``sys_session_handover`` asked for a rotation. Armed when the
 # tool dispatches; consumed by the native idle edge, which types /clear into
-# the session's terminal. No retry: a failure leaves the label for a manual
-# /clear.
+# the session's terminal. No runner retry: the server's recovery owns retries
+# and notices; otherwise the label is left for a manual /clear.
 _pending_rotations: set[str] = set()
 
 
@@ -6835,7 +6835,7 @@ def create_runner_app(
                 "unconfirmed",
             )
             if _rotation_session_busy(conv_id):
-                return "busy"
+                return await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(
@@ -6911,6 +6911,18 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
             return "not_requested"
+        result = (
+            json.loads(bytes(response.body))
+            if require_label and isinstance(response, JSONResponse)
+            else {}
+        )
+        if result.get("rotation_busy") is True:
+            _logger.info(
+                "Pending rotation for session %s waits for an idle moment",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return await _release_rotation_claim(conv_id, snapshot["archive_revision"], labels)
         if response.status_code >= 400:
             _logger.warning(
                 "Pending rotation /clear was refused for session %s (status %d)",
@@ -6919,7 +6931,6 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
         if require_label:
-            result = json.loads(bytes(response.body)) if isinstance(response, JSONResponse) else {}
             confirmed_clean = response.status_code < 400 or (
                 result.get("rotation_unconfirmed") is True
                 and result.get("draft_may_remain") is False
@@ -6945,6 +6956,35 @@ def create_runner_app(
             if result.get("rotation_unconfirmed") is True:
                 return outcome
         return "started" if response.status_code < 400 else "not_requested"
+
+    async def _release_rotation_claim(conv_id: str, revision: int, labels: dict[str, Any]) -> str:
+        """Hand back a claim whose command was never typed; ``busy`` only once confirmed."""
+        from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY
+
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
+                json={
+                    "archive_revision": str(revision),
+                    "attempt": labels.get(ATTEMPT_LABEL_KEY, ""),
+                    "released": "true",
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            released = response.json().get("status") == "released"
+        except Exception:
+            _logger.warning(
+                "Could not release rotation claim for %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            released = False
+        # Nothing was typed, so the server's labels alone decide the next attempt.
+        rotations_started.pop(conv_id, None)
+        # Unconfirmed, the server may still hold the claim and its draft fence.
+        return "busy" if released else "draft_may_remain"
 
     rotations_in_flight: set[str] = set()
     # Keep only the newest injected revision for each live session. An absent

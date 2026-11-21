@@ -58,6 +58,9 @@ class _RotationServerClient:
         self.errors: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
         self.claims: list[str] = []
+        self.released: list[str] = []
+        self.release_status = "released"
+        self.prompts: list[str] = []
         self.fail_claim = False
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
@@ -95,6 +98,15 @@ class _RotationServerClient:
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         if url.endswith("/handover/injection"):
             revision = kwargs["json"]["archive_revision"]
+            if kwargs["json"].get("released") == "true":
+                self.released.append(revision)
+                if self.release_status == "released":
+                    self.labels.pop(INJECTED_REVISION_LABEL_KEY, None)
+                return httpx.Response(
+                    200,
+                    json={"status": self.release_status},
+                    request=httpx.Request("POST", f"http://test{url}"),
+                )
             self.claims.append(revision)
             outcome = "claimed"
             if self.labels.get(INJECTED_REVISION_LABEL_KEY) == revision:
@@ -111,6 +123,8 @@ class _RotationServerClient:
             and kwargs.get("json", {}).get("type") == "external_conversation_item"
         ):
             self.errors.append(kwargs["json"]["data"]["item_data"])
+        if url.endswith("/events") and kwargs.get("json", {}).get("type") == "message":
+            self.prompts.append(kwargs["json"]["data"]["content"][0]["text"])
         if url.endswith("/successor"):
             if not self.created:
                 self.created.append({"id": "conv_pi_next"})
@@ -292,12 +306,14 @@ async def test_aborted_injection_is_fenced_and_reports_draft(monkeypatch, draft_
 
 
 @pytest.mark.asyncio
-async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
+@pytest.mark.parametrize("release_status", ["released", "unconfirmed"])
+async def test_terminal_turn_during_label_read_defers_rotation(monkeypatch, release_status):
     effects = []
     monkeypatch.setattr(
         claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
     )
     server = _RotationServerClient()
+    server.release_status = release_status
     app = _build_app(server)
     original_get = server.get
     async with _runner_client(app) as client:
@@ -313,10 +329,40 @@ async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
             return await original_get(url, **kwargs)
 
         server.get = get
+        # Nothing was typed: busy only once the server confirms the claim is handed back.
         assert (await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")).json() == {
-            "status": "not_requested"
+            "status": "busy" if release_status == "released" else "draft_may_remain"
         }
     assert effects == []
+    assert server.released == ["0"]
+    # The server owns retries and notices; the runner neither re-arms nor posts.
+    assert runner_app.pop_pending_rotation(CONV_ID) is False
+    assert server.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_busy_pane_hands_back_claim_and_next_recovery_rotates(monkeypatch):
+    """A refusal before typing leaves the same attempt claimable; nothing is re-armed."""
+    effects: list[str] = []
+    busy = [True]
+
+    def inject(*args: Any, **kwargs: Any) -> None:
+        effects.append(kwargs["command"])
+        if busy[0]:
+            raise claude_native_bridge.ClaudePaneBusy("busy")
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    server = _RotationServerClient()
+    async with _runner_client(_build_app(server)) as client:
+        await _seed_session(client)
+        url = f"/v1/sessions/{CONV_ID}/pending-rotation"
+        assert (await client.post(url)).json() == {"status": "busy"}
+        assert server.released == ["0"]
+        assert runner_app.pop_pending_rotation(CONV_ID) is False
+        busy[0] = False
+        assert (await client.post(url)).json() == {"status": "started"}
+    assert effects == ["/clear", "/clear"]
+    assert server.prompts == []
 
 
 @pytest.mark.asyncio
@@ -792,7 +838,7 @@ async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path,
         result = await asyncio.wait_for(
             client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"), timeout=2
         )
-        assert result.json() == {"status": "not_requested" if terminal_input else "started"}
+        assert result.json() == {"status": "busy" if terminal_input else "started"}
     assert effects == (["heal"] if terminal_input else ["heal", "/clear"])
 
 

@@ -2355,11 +2355,14 @@ def build_native_controls(
     ) -> Response:
         """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudePaneBusy,
             ClaudeRotationUnconfirmed,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
 
+        # A busy pane under the rotation lock typed nothing; the rotation may run later.
+        busy = JSONResponse(status_code=409, content={"rotation_busy": True})
         deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
@@ -2367,12 +2370,12 @@ def build_native_controls(
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
-            return Response(status_code=409)
+            return busy
         await _prepare_claude_native_pane_for_injection(
             conv_id, bridge_dir, lifecycle_locked=lifecycle_locked
         )
         if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
-            return Response(status_code=409)
+            return busy
         injection_options = {"require_idle": True} if lifecycle_locked else {}
         try:
             await _drive_claude_pane(
@@ -2393,6 +2396,8 @@ def build_native_controls(
                     "detail": str(exc),
                 },
             )
+        except ClaudePaneBusy:
+            return busy
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,

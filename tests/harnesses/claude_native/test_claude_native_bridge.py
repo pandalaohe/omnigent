@@ -8989,6 +8989,9 @@ def test_automatic_clear_rechecks_live_status_before_keys(
     if busy_check >= 3:
         assert isinstance(caught.value, claude_native_bridge.ClaudeRotationUnconfirmed)
         assert caught.value.draft_may_remain is False
+    else:
+        # Refused before the command was typed: the rotation can run again later.
+        assert isinstance(caught.value, claude_native_bridge.ClaudePaneBusy)
     run_tmux(str(_TEST_TMUX_SOCKET), "send-keys", "-t", "claude:0.0", "Enter")
     assert composer.submitted == [""]
 
