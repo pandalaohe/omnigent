@@ -1688,11 +1688,16 @@ _DAY = 24 * 60 * 60
 _IDLE_SINCE = _RETENTION_NOW - 30 * _DAY
 
 
-def _archived(at: float, *, child: bool = True) -> codex_native_bridge.SessionRetentionState:
-    return codex_native_bridge.SessionRetentionState("archived", archived_at=int(at), child=child)
+def _archived(
+    at: float, *, child: bool = True, parent: str = "sess-parent"
+) -> codex_native_bridge.SessionRetentionState:
+    return codex_native_bridge.SessionRetentionState(
+        "archived", archived_at=int(at), child=child, parent=parent if child else None
+    )
 
 
 _CHILD_14D = _archived(_RETENTION_NOW - 14 * _DAY)
+_UNREACHABLE = codex_native_bridge.SessionRetentionState("unknown", stop=True)
 
 
 @pytest.fixture
@@ -1733,62 +1738,53 @@ def _make_session_bridge(
 
 
 @pytest.mark.parametrize(
-    ("listed", "fresh", "owner", "active_at", "confirmed", "removed"),
+    ("listed", "answers", "owner", "active_at", "removed"),
     [
-        (_CHILD_14D, _CHILD_14D, "999999", _IDLE_SINCE, True, True),
-        (
-            _archived(_RETENTION_NOW - 14 * _DAY + 60),
-            _CHILD_14D,
-            "999999",
-            _IDLE_SINCE,
-            False,
-            False,
-        ),
-        (
-            _archived(_RETENTION_NOW - 30 * _DAY, child=False),
-            _CHILD_14D,
-            "999999",
-            _IDLE_SINCE,
-            False,
-            False,
-        ),
-        (None, _CHILD_14D, "999999", _IDLE_SINCE, False, False),
+        (_CHILD_14D, (_CHILD_14D, _CHILD_14D), "999999", _IDLE_SINCE, True),
+        (_archived(_RETENTION_NOW - 14 * _DAY + 60), (), "999999", _IDLE_SINCE, False),
+        (_archived(_RETENTION_NOW - 30 * _DAY, child=False), (), "999999", _IDLE_SINCE, False),
+        (None, (), "999999", _IDLE_SINCE, False),
         (
             _CHILD_14D,
-            codex_native_bridge.SessionRetentionState("active"),
+            (codex_native_bridge.SessionRetentionState("active"),),
             "999999",
             _IDLE_SINCE,
-            True,
             False,
         ),
         (
             _CHILD_14D,
-            codex_native_bridge.SessionRetentionState("not_found"),
+            (codex_native_bridge.SessionRetentionState("not_found"),),
             "999999",
             _IDLE_SINCE,
-            True,
             False,
         ),
         (
             _CHILD_14D,
-            _archived(_RETENTION_NOW - 14 * _DAY, child=False),
+            (_archived(_RETENTION_NOW - 14 * _DAY, child=False),),
             "999999",
             _IDLE_SINCE,
-            True,
+            False,
+        ),
+        (_CHILD_14D, (_UNREACHABLE,), "999999", _IDLE_SINCE, False),
+        (
+            _CHILD_14D,
+            (_CHILD_14D, codex_native_bridge.SessionRetentionState("active")),
+            "999999",
+            _IDLE_SINCE,
             False,
         ),
         (
             _CHILD_14D,
-            codex_native_bridge.SessionRetentionState("unknown", stop=True),
+            (_CHILD_14D, _archived(_RETENTION_NOW - 14 * _DAY, parent="sess-other")),
             "999999",
             _IDLE_SINCE,
-            True,
             False,
         ),
-        (_CHILD_14D, _CHILD_14D, "999999", _RETENTION_NOW - 13 * _DAY, False, False),
-        (_CHILD_14D, _CHILD_14D, "not-a-pid", _IDLE_SINCE, True, True),
-        (_CHILD_14D, _CHILD_14D, None, _IDLE_SINCE, True, True),
-        (_CHILD_14D, _CHILD_14D, "4242", _IDLE_SINCE, False, False),
+        (_CHILD_14D, (_CHILD_14D, _UNREACHABLE), "999999", _IDLE_SINCE, False),
+        (_CHILD_14D, (), "999999", _RETENTION_NOW - 13 * _DAY, False),
+        (_CHILD_14D, (_CHILD_14D, _CHILD_14D), "not-a-pid", _IDLE_SINCE, True),
+        (_CHILD_14D, (_CHILD_14D, _CHILD_14D), None, _IDLE_SINCE, True),
+        (_CHILD_14D, (), "4242", _IDLE_SINCE, False),
     ],
     ids=[
         "child-archived-14d",
@@ -1799,6 +1795,9 @@ def _make_session_bridge(
         "recheck-not-found",
         "recheck-role-changed",
         "recheck-unreachable",
+        "final-unarchived",
+        "final-other-parent",
+        "final-unreachable",
         "recent-local-activity",
         "unreadable-owner-idle",
         "missing-owner-idle",
@@ -1809,27 +1808,28 @@ def test_session_retention_removes_only_idle_children_archived_14_days(
     retention_root: Path,
     caplog: pytest.LogCaptureFixture,
     listed: codex_native_bridge.SessionRetentionState | None,
-    fresh: codex_native_bridge.SessionRetentionState,
+    answers: tuple[codex_native_bridge.SessionRetentionState, ...],
     owner: str | None,
     active_at: float,
-    confirmed: bool,
     removed: bool,
 ) -> None:
     bridge_dir = _make_session_bridge(
         retention_root, "b" * 32, session_id="sess-1", owner=owner, active_at=active_at
     )
+    pending = iter(answers)
     rechecked: list[str] = []
 
     def _confirm(session_id: str) -> codex_native_bridge.SessionRetentionState:
         rechecked.append(session_id)
-        return fresh
+        return next(pending)
 
     with caplog.at_level(logging.INFO, logger=codex_native_bridge.__name__):
         counts = codex_native_bridge.prune_bridge_dirs_by_session_state(
             lambda _session_id: listed, _confirm, now=_RETENTION_NOW
         )
 
-    assert rechecked == (["sess-1"] if confirmed else [])
+    # A removal reads the session twice: once to authorize, once inside the lock.
+    assert rechecked == ["sess-1"] * len(answers)
     assert bridge_dir.exists() is not removed
     assert counts["removed"] == int(removed)
     if removed:
@@ -1838,7 +1838,16 @@ def test_session_retention_removes_only_idle_children_archived_14_days(
         assert counts["removable_bytes"] > 0
 
 
-@pytest.mark.parametrize("case", ["no-session", "foreign-name", "state-symlink", "state-dir"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-session",
+        "foreign-name",
+        "state-symlink",
+        "state-dir",
+        pytest.param("state-fifo", marks=pytest.mark.posix_only),
+    ],
+)
 def test_session_retention_keeps_dirs_it_cannot_attribute(retention_root: Path, case: str) -> None:
     lender = _make_session_bridge(retention_root, "a" * 32, session_id=None, owner="4242")
     (lender / "state.json").write_text(json.dumps({"session_id": "sess-1"}), encoding="utf-8")
@@ -1851,6 +1860,9 @@ def test_session_retention_keeps_dirs_it_cannot_attribute(retention_root: Path, 
         (bridge_dir / "state.json").symlink_to(lender / "state.json")
     elif case == "state-dir":
         (bridge_dir / "state.json").mkdir()
+    elif case == "state-fifo":
+        # A FIFO with no writer must not block the read.
+        os.mkfifo(bridge_dir / "state.json")
     rechecked: list[str] = []
 
     def _confirm(session_id: str) -> codex_native_bridge.SessionRetentionState:
@@ -1953,20 +1965,77 @@ def test_session_retention_dry_run_writes_nothing_and_stops_on_unreachable_serve
 
 def test_session_retention_stops_before_a_delete_once_asked(retention_root: Path) -> None:
     bridge_dir = _make_session_bridge(retention_root, "a2" * 16, session_id="sess-1")
-    stop = False
+    rechecked: list[str] = []
 
-    def _confirm(_session_id: str) -> codex_native_bridge.SessionRetentionState:
+    def _confirm(session_id: str) -> codex_native_bridge.SessionRetentionState:
+        # The stop arrives during the final read inside the lock.
+        rechecked.append(session_id)
+        return _CHILD_14D
+
+    counts = codex_native_bridge.prune_bridge_dirs_by_session_state(
+        lambda _session_id: _CHILD_14D,
+        _confirm,
+        now=_RETENTION_NOW,
+        should_stop=lambda: len(rechecked) >= 2,
+    )
+
+    assert rechecked == ["sess-1", "sess-1"]
+    assert bridge_dir.exists()
+    assert counts["interrupted"] == 1
+    assert counts["removed"] == 0
+
+
+@pytest.mark.parametrize(("walk", "reads"), [("_newest_mtime", 0), ("_bridge_dir_bytes", 1)])
+def test_session_retention_starts_no_read_after_a_stop_during_a_walk(
+    retention_root: Path, monkeypatch: pytest.MonkeyPatch, walk: str, reads: int
+) -> None:
+    bridge_dir = _make_session_bridge(retention_root, "a3" * 16, session_id="sess-1")
+    stop = False
+    original = getattr(codex_native_bridge, walk)
+
+    def _walk_then_stop(path: Path) -> object:
         nonlocal stop
         stop = True
+        return original(path)
+
+    monkeypatch.setattr(codex_native_bridge, walk, _walk_then_stop)
+    rechecked: list[str] = []
+
+    def _confirm(session_id: str) -> codex_native_bridge.SessionRetentionState:
+        rechecked.append(session_id)
         return _CHILD_14D
 
     counts = codex_native_bridge.prune_bridge_dirs_by_session_state(
         lambda _session_id: _CHILD_14D, _confirm, now=_RETENTION_NOW, should_stop=lambda: stop
     )
 
+    assert rechecked == ["sess-1"] * reads
     assert bridge_dir.exists()
     assert counts["interrupted"] == 1
-    assert counts["removed"] == 0
+
+
+def test_session_retention_caps_reads_per_pass(retention_root: Path) -> None:
+    first = _make_session_bridge(retention_root, "a4" * 16, session_id="sess-a")
+    later = [
+        _make_session_bridge(retention_root, name * 16, session_id=f"sess-{name}")
+        for name in ("a5", "a6")
+    ]
+    rechecked: list[str] = []
+
+    def _confirm(session_id: str) -> codex_native_bridge.SessionRetentionState:
+        rechecked.append(session_id)
+        return _CHILD_14D
+
+    counts = codex_native_bridge.prune_bridge_dirs_by_session_state(
+        lambda _session_id: _CHILD_14D, _confirm, now=_RETENTION_NOW, max_reads=2
+    )
+
+    # Two reads remove the first dir; the rest wait for the next pass.
+    assert rechecked == ["sess-a", "sess-a"]
+    assert not first.exists()
+    assert all(path.exists() for path in later)
+    assert counts["removed"] == 1
+    assert counts["interrupted"] == 1
 
 
 def test_session_retention_keeps_a_bridge_resumed_during_the_recheck(retention_root: Path) -> None:

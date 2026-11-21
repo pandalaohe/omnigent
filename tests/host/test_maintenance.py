@@ -98,26 +98,26 @@ def test_host_janitor_adds_session_retention_for_its_server() -> None:
         (
             200,
             {"archived": True, "archived_at": 1_700_000_000, "parent_session_id": "sess-0"},
-            ("archived", 1_700_000_000, False, True),
+            ("archived", 1_700_000_000, False, "sess-0"),
         ),
         (
             200,
             {"archived": True, "archived_at": 1_700_000_000, "parent_session_id": None},
-            ("archived", 1_700_000_000, False, False),
+            ("archived", 1_700_000_000, False, None),
         ),
         (
             200,
             {"archived": True, "archived_at": 1_700_000_000},
-            ("archived", 1_700_000_000, False, False),
+            ("archived", 1_700_000_000, False, None),
         ),
-        (200, {"archived": False, "archived_at": None}, ("active", None, False, False)),
-        (200, {"archived": True, "archived_at": None}, ("unknown", None, False, False)),
-        (404, {"error": {"code": "not_found"}}, ("not_found", None, False, False)),
-        (404, {"detail": "Not Found"}, ("unknown", None, False, False)),
-        (403, {"error": {"code": "forbidden"}}, ("unknown", None, False, False)),
-        (401, {"error": {"code": "unauthorized"}}, ("unknown", None, True, False)),
-        (503, None, ("unknown", None, True, False)),
-        (None, None, ("unknown", None, True, False)),
+        (200, {"archived": False, "archived_at": None}, ("active", None, False, None)),
+        (200, {"archived": True, "archived_at": None}, ("unknown", None, False, None)),
+        (404, {"error": {"code": "not_found"}}, ("not_found", None, False, None)),
+        (404, {"detail": "Not Found"}, ("unknown", None, False, None)),
+        (403, {"error": {"code": "forbidden"}}, ("unknown", None, False, None)),
+        (401, {"error": {"code": "unauthorized"}}, ("unknown", None, True, None)),
+        (503, None, ("unknown", None, True, None)),
+        (None, None, ("unknown", None, True, None)),
     ],
     ids=[
         "archived-child",
@@ -136,7 +136,7 @@ def test_host_janitor_adds_session_retention_for_its_server() -> None:
 def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
     status: int | None,
     body: dict[str, Any] | None,
-    expected: tuple[str, int | None, bool, bool],
+    expected: tuple[str, int | None, bool, str | None],
 ) -> None:
     requests: list[httpx.Request] = []
 
@@ -153,7 +153,8 @@ def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
             client, _SERVER, "sess-1", {"X-Test": "1"}
         )
 
-    assert (state.status, state.archived_at, state.stop, state.child) == expected
+    assert (state.status, state.archived_at, state.stop, state.parent) == expected
+    assert state.child is (state.parent is not None)
     assert requests[0].url.path == "/v1/sessions/sess-1"
     assert requests[0].url.params["include_items"] == "false"
     assert requests[0].headers["X-Test"] == "1"

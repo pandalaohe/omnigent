@@ -598,12 +598,14 @@ class SessionRetentionState:
         nothing more this pass.
     :param child: Whether the server reports a parent session; an unknown
         role counts as a main session.
+    :param parent: The parent session id the server reported, if any.
     """
 
     status: Literal["archived", "active", "not_found", "unknown"]
     archived_at: int | None = None
     stop: bool = False
     child: bool = False
+    parent: str | None = None
 
 
 def _archived_child_expired(answer: SessionRetentionState | None, now: float) -> bool:
@@ -629,7 +631,9 @@ def _read_owner_pid(bridge_dir: Path) -> int | None:
 def _read_owner_session(bridge_dir: Path) -> str | None:
     """Return the session in the dir's own regular ``state.json``; anything else is none."""
     try:
-        fd = os.open(bridge_dir / _STATE_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # Non-blocking, so a FIFO is rejected by the type check instead of hanging.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(bridge_dir / _STATE_FILE, flags)
     except OSError:
         return None
     try:
@@ -692,13 +696,16 @@ def prune_bridge_dirs_by_session_state(
     now: float | None = None,
     remove: bool = True,
     should_stop: Callable[[], bool] = lambda: False,
+    max_reads: int | None = None,
 ) -> dict[str, int]:
     """
     Remove dead-owner bridge dirs of child sessions archived at least 14 days.
 
-    *candidate* proposes; only a fresh *confirm* read right before the delete
-    authorizes it, and must again report an archived child at least
-    :data:`ARCHIVED_SESSION_RETENTION_SECONDS` old. A dir also needs a
+    *candidate* proposes; a fresh *confirm* read authorizes, and a second one
+    inside the cleanup lock right before the delete must again report an
+    archived child at least :data:`ARCHIVED_SESSION_RETENTION_SECONDS` old
+    with the same parent. No read starts once *should_stop* says so or
+    *max_reads* reads were made. A dir also needs a
     32-hex name, its own regular ``state.json`` naming the session, no live
     ``owner.pid``, and nothing in it modified for 14 days. Main sessions,
     unknown roles and sessions the server does not show are kept. The whole
@@ -710,7 +717,8 @@ def prune_bridge_dirs_by_session_state(
     :param confirm: Reads the session's current state from the server.
     :param now: Epoch seconds for the age checks; ``None`` uses the clock.
     :param remove: ``False`` only reports, taking no lock and writing nothing.
-    :param should_stop: Returns ``True`` to stop before the next dir.
+    :param should_stop: Returns ``True`` to stop before the next read or delete.
+    :param max_reads: *confirm* calls allowed in the pass; ``None`` is no cap.
     :returns: Counts, e.g. ``{"removable": 2, "removable_bytes": 4096,
         "removed": 2, "kept_main": 5, "stopped": 0}``.
     """
@@ -721,6 +729,23 @@ def prune_bridge_dirs_by_session_state(
 
     def keep(reason: str) -> None:
         counts[f"kept_{reason}"] = counts.get(f"kept_{reason}", 0) + 1
+
+    reads = 0
+
+    def may_read() -> bool:
+        if should_stop() or (max_reads is not None and reads >= max_reads):
+            counts["interrupted"] = 1
+            return False
+        return True
+
+    def ask(session_id: str) -> SessionRetentionState:
+        nonlocal reads
+        reads += 1
+        try:
+            return confirm(session_id)
+        except Exception:
+            _logger.exception("Codex session retention re-check failed for %s", session_id)
+            return SessionRetentionState("unknown", stop=True)
 
     root = bridge_root()
     root_identity = _trusted_root_identity(root)
@@ -756,11 +781,9 @@ def prune_bridge_dirs_by_session_state(
         if newest is None or now - newest < ARCHIVED_SESSION_RETENTION_SECONDS:
             keep("recent_activity")
             continue
-        try:
-            fresh = confirm(session_id)
-        except Exception:
-            _logger.exception("Codex session retention re-check failed for %s", session_id)
-            fresh = SessionRetentionState("unknown", stop=True)
+        if not may_read():
+            break
+        fresh = ask(session_id)
         if not _archived_child_expired(fresh, now):
             keep("unconfirmed")
             if fresh.stop:
@@ -798,6 +821,19 @@ def prune_bridge_dirs_by_session_state(
                 keep("owner")
                 continue
             size = _bridge_dir_bytes(entry)
+            if not may_read():
+                break
+            # The archive state can change without this lock; read it once more.
+            final = ask(session_id)
+            if not _archived_child_expired(final, now) or final.parent != fresh.parent:
+                keep("unconfirmed")
+                if final.stop:
+                    counts["stopped"] = 1
+                    break
+                continue
+            if should_stop():
+                counts["interrupted"] = 1
+                break
             counts["removable"] += 1
             counts["removable_bytes"] += size
             shutil.rmtree(entry, ignore_errors=True)

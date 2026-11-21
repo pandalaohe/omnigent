@@ -45,6 +45,8 @@ _CODEX_SESSION_RETENTION_INTERVAL_S = 24 * 60 * 60
 # The pass holds the host maintenance lock; listing alone takes a few minutes
 # on a busy server with thousands of archived sessions.
 _CODEX_SESSION_RETENTION_BUDGET_S = 10 * 60
+# Single-session reads per pass, two per removal; further candidates wait for the next day.
+_CODEX_SESSION_RETENTION_MAX_READS = 200
 # A busy server takes several seconds per session snapshot.
 _SESSION_STATE_TIMEOUT_S = 30.0
 # One page of every archived session the host's user can see, children and
@@ -753,8 +755,9 @@ def fetch_session_retention_state(
         return SessionRetentionState("active")
     archived_at = body.get("archived_at")
     if body.get("archived") is True and type(archived_at) is int:
+        parent = body["parent_session_id"] if _reports_parent(body) else None
         return SessionRetentionState(
-            "archived", archived_at=archived_at, child=_reports_parent(body)
+            "archived", archived_at=archived_at, child=parent is not None, parent=parent
         )
     return SessionRetentionState("unknown")
 
@@ -826,6 +829,7 @@ def retain_codex_session_dirs(
     should_stop: Callable[[], bool] = lambda: False,
     budget_s: float = _CODEX_SESSION_RETENTION_BUDGET_S,
     host_id: str | None = None,
+    max_reads: int = _CODEX_SESSION_RETENTION_MAX_READS,
 ) -> dict[str, int]:
     """Apply the archived-session retention to the codex-native bridge dirs.
 
@@ -837,6 +841,7 @@ def retain_codex_session_dirs(
     :param budget_s: Wall-clock seconds for the pass; past it nothing more is
         read or removed.
     :param host_id: The host whose sessions are listed; others are kept.
+    :param max_reads: Single-session reads allowed in the pass.
     :returns: Counts from
         :func:`~omnigent.harnesses.codex_native.bridge.prune_bridge_dirs_by_session_state`;
         ``stopped`` is set when the server could not be read.
@@ -875,6 +880,7 @@ def retain_codex_session_dirs(
             now=now,
             remove=remove,
             should_stop=_stopping,
+            max_reads=max_reads,
         )
 
 
