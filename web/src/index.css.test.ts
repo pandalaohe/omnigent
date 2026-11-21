@@ -1133,6 +1133,50 @@ describe("index.css mobile settings title", () => {
   });
 });
 
+describe("index.css phone transcript under a pinned plan", () => {
+  const squash = (text: string) => text.replace(/\s+/g, " ");
+  const blockWith = (selector: string) =>
+    cssBlocks.find(([block]) => squash(block.split("{")[0]).includes(selector));
+  const inPhoneMedia = (index: number) => {
+    const before = cssSource.slice(0, index);
+    const depth = (before.match(/\{/g) ?? []).length - (before.match(/\}/g) ?? []).length;
+    return (
+      depth === 1 && before.slice(before.lastIndexOf("@media")).startsWith("@media (width < 48rem)")
+    );
+  };
+
+  it("fades a pinned transcript only into the composer, not under the header", () => {
+    const pinned = blockWith('.session-chat-transcript.chat-transcript-pinned > [role="log"]');
+    expect(pinned, "the pinned phone transcript rule is gone").toBeDefined();
+    expect(inPhoneMedia(pinned!.index!)).toBe(true);
+    expect(squash(pinned![0])).toContain(
+      "--chat-edge-fade: linear-gradient( to bottom, black var(--chat-composer-fade-start), transparent var(--chat-composer-fade-end) );",
+    );
+  });
+
+  it("keeps the header fade for a transcript with nothing pinned above it", () => {
+    const unpinned = blockWith('.session-chat-transcript > [role="log"]');
+    expect(unpinned, "the phone transcript fade rule is gone").toBeDefined();
+    expect(inPhoneMedia(unpinned!.index!)).toBe(true);
+    expect(squash(unpinned![0])).toContain(
+      "transparent calc(var(--omnigent-safe-top) + 44px), black calc(var(--omnigent-safe-top) + 84px)",
+    );
+  });
+
+  it("keeps the pt-4 inset under a pinned plan in native shells", () => {
+    const header = blockWith("[data-ios-native] .chat-conversation-content");
+    const pinned = blockWith(
+      ":is([data-ios-native], [data-android-native]) .chat-transcript-pinned .chat-conversation-content",
+    );
+    expect(pinned, "the native pinned padding rule is gone").toBeDefined();
+    expect(inPhoneMedia(pinned!.index!)).toBe(true);
+    expect(pinned![0]).toContain("padding-top: 1rem;");
+    expect(header![0]).toContain(
+      "padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));",
+    );
+  });
+});
+
 describe("index.css electron-mac window drag region", () => {
   const dragRule = cssBlocks
     .map(([block]) => block)

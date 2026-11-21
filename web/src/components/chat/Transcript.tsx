@@ -416,10 +416,14 @@ function TranscriptImpl({
       <ChatPlanAccordion className="mt-14 md:mt-12" />
       {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-      conversation area without requiring Conversation to forward refs. */}
+      conversation area without requiring Conversation to forward refs.
+      chat-transcript-pinned drops the phone header fade and padding. */}
       <div
         ref={setConversationEl}
-        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className={cn(
+          "session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden",
+          hasPinnedBanner && "chat-transcript-pinned",
+        )}
       >
         <Conversation
           className={cn(

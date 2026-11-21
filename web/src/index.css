@@ -1264,6 +1264,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
     mask-image: var(--chat-edge-fade);
   }
 
+  /* A pinned plan or banner already clears the header: fade only into the composer. */
+  .session-chat-transcript.chat-transcript-pinned > [role="log"] {
+    --chat-edge-fade: linear-gradient(
+      to bottom,
+      black var(--chat-composer-fade-start),
+      transparent var(--chat-composer-fade-end)
+    );
+  }
+
   [data-chat-surface] .session-chat-transcript {
     margin-bottom: calc(-1 * var(--session-composer-height, 0px));
   }
@@ -1768,6 +1777,8 @@ html[data-electron-mac] .breadcrumb-folder {
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
   }
 
+  /* A pinned plan or banner already clears the header: keep the pt-4 inset. */
+  :is([data-ios-native], [data-android-native]) .chat-transcript-pinned .chat-conversation-content,
   :is([data-ios-native], [data-android-native])
     .chat-conversation-content.chat-content-under-arca-banner {
     padding-top: 1rem;

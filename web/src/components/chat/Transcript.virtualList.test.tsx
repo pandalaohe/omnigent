@@ -399,6 +399,31 @@ function renderTranscript(blocks: ElicitationBlock[], canCancelStartup = false) 
   );
 }
 
+it("marks the transcript pinned only while a plan sits above it", () => {
+  // Phone CSS keys the header fade and native header padding off this class.
+  try {
+    const view = renderTranscript([]);
+    const wrapper = () => view.container.querySelector(".session-chat-transcript");
+    expect(wrapper()).not.toHaveClass("chat-transcript-pinned");
+
+    act(() => {
+      useChatStore.setState({
+        todos: [{ content: "Ship it", status: "in_progress", activeForm: "Shipping it" }],
+      });
+    });
+    expect(view.getByTestId("plan-tracker")).toBeInTheDocument();
+    expect(wrapper()).toHaveClass("chat-transcript-pinned");
+
+    act(() => {
+      useChatStore.setState({ todos: [] });
+    });
+    expect(view.queryByTestId("plan-tracker")).toBeNull();
+    expect(wrapper()).not.toHaveClass("chat-transcript-pinned");
+  } finally {
+    useChatStore.setState({ todos: [] });
+  }
+});
+
 it("shows the created session waiting for its first message in the transcript", () => {
   renderTranscript([]);
   act(() => {
