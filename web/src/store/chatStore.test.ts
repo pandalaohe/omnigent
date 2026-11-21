@@ -28258,6 +28258,7 @@ describe("a send cut off by a reload", () => {
       expect(useChatStore.getState().restoredSendDraft).toMatchObject({
         stableId: "stable_restored",
         delivered: true,
+        senderUnconfirmed: true,
       });
 
       vi.mocked(getCurrentUserId).mockReturnValue(viewerId);
@@ -28267,6 +28268,7 @@ describe("a send cut off by a reload", () => {
         expect(useChatStore.getState().restoredSendDraft).toMatchObject({
           stableId: "stable_restored",
           delivered: true,
+          senderUnconfirmed: false,
         });
         expect(peekRestoredSend("conv_reload")?.stableId).toBe("stable_restored");
       } else {

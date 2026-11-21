@@ -39,7 +39,7 @@ import {
   hasSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
-import { peekRestoredSend, rememberRestoredSend } from "@/lib/unsentSends";
+import { forgetRestoredSend, peekRestoredSend, rememberRestoredSend } from "@/lib/unsentSends";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -6942,6 +6942,72 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
     expect(peekRestoredSend("conv_test")).toBeNull();
     await waitFor(() => expect(getSessionDraft("conv_test")).toBeUndefined());
+  });
+
+  it.each([
+    ["the sender", true],
+    ["another account", false],
+  ])("holds a reloaded draft after an early receipt until identity names %s", (_viewer, sender) => {
+    const stableId = "b".repeat(32);
+    // The bind tracked a previous page's send before `/v1/me` answered; the
+    // composer holds the same text, which may be another account's draft.
+    setSessionDraft("conv_test", { text: "resend me", files: [] });
+    rememberRestoredSend("conv_test", { stableId, text: "resend me", authorId: "user-a" });
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          serverRefused: true,
+          delivered: false,
+          senderUnconfirmed: true,
+        },
+      }),
+    );
+
+    act(() =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "f".repeat(32),
+        itemType: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "resend me" }],
+          web_stable_id: stableId,
+        },
+        webStableId: stableId,
+      }),
+    );
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      delivered: true,
+      senderUnconfirmed: true,
+    });
+    expect(textarea()).toHaveValue("resend me");
+    expect(getSessionDraft("conv_test")?.text).toBe("resend me");
+    expect(peekRestoredSend("conv_test")?.stableId).toBe(stableId);
+
+    // chatStore.test covers the identity callback that supplies these states.
+    act(() => {
+      const tracked = useChatStore.getState().restoredSendDraft!;
+      if (sender) {
+        useChatStore.setState({ restoredSendDraft: { ...tracked, senderUnconfirmed: false } });
+      } else {
+        forgetRestoredSend("conv_test");
+        useChatStore.setState({ restoredSendDraft: null });
+      }
+    });
+
+    expect(textarea()).toHaveValue(sender ? "" : "resend me");
+    if (sender) {
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    } else {
+      expect(getSessionDraft("conv_test")?.text).toBe("resend me");
+    }
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(peekRestoredSend("conv_test")).toBeNull();
   });
 
   it("keeps the user's edits when the delivered retraction lands", () => {

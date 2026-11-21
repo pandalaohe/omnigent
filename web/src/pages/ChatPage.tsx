@@ -4132,6 +4132,8 @@ function ComposerImpl(
   // the text is cleared only while it is exactly what the restore put there.
   useEffect(() => {
     if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    // A reload's text may now be another account's draft; wait until `/v1/me` names the sender.
+    if (restoredSendDraft.senderUnconfirmed) return;
     if (restoredSendDraft.conversationId !== conversationId) return;
     if (settledConversationId !== conversationId) return;
     // Delivery can interrupt the queued text restore with a store render.

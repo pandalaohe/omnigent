@@ -2096,6 +2096,26 @@ it.each(["none", "text", "files", "quote", "rejected-file"] as const)(
   },
 );
 
+it("keeps a delivered reloaded draft until identity names its sender", () => {
+  const entry = conversationRegistry.acquire(childId);
+  entry.setState({
+    failedSendDraft: { conversationId: childId, text: "Retry", files: [], stableId: "stable" },
+  });
+  renderPane(<SideChatPane childId={childId} fullSession />);
+  const tracked = () => entry.getState().restoredSendDraft!;
+
+  act(() =>
+    entry.setState({
+      restoredSendDraft: { ...tracked(), delivered: true, senderUnconfirmed: true },
+    }),
+  );
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("Retry");
+
+  act(() => entry.setState({ restoredSendDraft: { ...tracked(), senderUnconfirmed: false } }));
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+  expect(entry.getState().restoredSendDraft).toBeNull();
+});
+
 it.each([false, true])(
   "revalidates recovered files and preserves newer quoted drafts: %s",
   async (hasNewDraft) => {

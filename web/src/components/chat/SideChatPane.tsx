@@ -624,7 +624,9 @@ function SideChatComposer({
     if (!fullSession || !restoredSendDraft?.delivered) return;
     const entry = conversationRegistry.peek(childId);
     const restored = entry?.getState().restoredSendDraft;
-    if (!restored?.delivered || restored.conversationId !== childId) return;
+    // A reloaded send clears nothing until `/v1/me` names its sender.
+    if (!restored?.delivered || restored.senderUnconfirmed || restored.conversationId !== childId)
+      return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
     entry!.setState({ restoredSendDraft: null });
     if (current.quotes?.length) return;
