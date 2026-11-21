@@ -11,12 +11,26 @@ and the in-process path runs the same enumerator via :meth:`invoke`.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 # Any: tool schemas are heterogeneous dicts.
 from typing import Any
 
 from omnigent.spec.types import AgentSpec
 from omnigent.tools.base import Tool, ToolContext
+
+#: Error text for a host-catalog request on a path without server access.
+HOST_CATALOG_NEEDS_SERVER = "listing a host catalog requires server access"
+
+
+def requests_host_catalog(args: Mapping[str, object]) -> bool:
+    """
+    Whether a call asks for a host's launch catalog instead of worker listings.
+
+    :param args: Parsed tool arguments, e.g. ``{"host": "h1", "agent_id": "ag_1"}``.
+    :returns: ``True`` when ``host`` or ``agent_id`` is present and non-null.
+    """
+    return args.get("host") is not None or args.get("agent_id") is not None
 
 
 class SysListModelsTool(Tool):
@@ -61,12 +75,21 @@ class SysListModelsTool(Tool):
             "(source 'none' means dispatches to that worker cannot run "
             "in this deployment). Each entry reports {source, verified, "
             "models: [{id, family, context_window?}], note}; pick "
-            "'args.model' values verbatim from the target worker's list."
+            "'args.model' values verbatim from the target worker's list. "
+            "With 'host' and 'agent_id' instead, it lists that host's "
+            "cached launch catalog for the agent's harness — the list the "
+            "new-session model picker shows — as {host, host_id, agent_id, "
+            "harness, source, fetched_at, stale, error, models: [{id, "
+            "provider, displayName, isDefault, hidden}]}: filter the rows "
+            "by provider and name, then pass a row's 'id' verbatim as the "
+            "model for a session of that agent on that host. 'stale' is "
+            "true only when the last catalog sync failed or the host is "
+            "offline; judge the list's age from 'fetched_at' (Unix seconds)."
         )
 
     def get_schema(self) -> dict[str, Any]:
         """
-        Return the OpenAI-format tool schema (no parameters).
+        Return the OpenAI-format tool schema (both parameters optional).
 
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
@@ -78,7 +101,23 @@ class SysListModelsTool(Tool):
                 "description": SysListModelsTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "host": {
+                            "type": "string",
+                            "description": (
+                                "Host id or exact host name whose launch "
+                                "catalog to list. Pass together with agent_id."
+                            ),
+                        },
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Agent whose harness selects the catalog, "
+                                "e.g. an id from sys_agent_list. Pass "
+                                "together with host."
+                            ),
+                        },
+                    },
                     "required": [],
                     "additionalProperties": False,
                 },
@@ -89,12 +128,23 @@ class SysListModelsTool(Tool):
         """
         Enumerate per-worker model availability (in-process path).
 
-        :param arguments: Ignored — the tool takes no parameters.
+        This path has no server, so a host-catalog request is refused.
+
+        :param arguments: JSON arguments; ``host`` / ``agent_id`` select
+            the host catalog, anything else is ignored.
         :param ctx: Tool execution context (unused).
         :returns: JSON mapping of worker name (plus ``"self"``) to its
-            ``{source, verified, models, note}`` row.
+            ``{source, verified, models, note}`` row, or a JSON error.
         """
-        del arguments, ctx
+        del ctx
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except ValueError:
+            parsed = {}
+        if isinstance(parsed, dict) and requests_host_catalog(parsed):
+            return json.dumps(
+                {"error": "server_unavailable", "message": HOST_CATALOG_NEEDS_SERVER}
+            )
         from omnigent.models.model_catalog import catalog_for_spec
 
         return json.dumps(catalog_for_spec(self._spec))

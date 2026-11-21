@@ -28,14 +28,15 @@ def _ctx() -> ToolContext:
 
 
 def test_schema_shape() -> None:
-    """Schema is a function-type tool with no parameters."""
+    """Schema is a function-type tool whose host-catalog parameters are optional."""
     tool = SysListModelsTool(spec=_make_spec())
     schema = tool.get_schema()
     assert schema["type"] == "function"
     func = schema["function"]
     assert func["name"] == "sys_list_models"
-    assert func["parameters"]["properties"] == {}
+    assert set(func["parameters"]["properties"]) == {"host", "agent_id"}
     assert func["parameters"]["required"] == []
+    assert func["parameters"]["additionalProperties"] is False
 
 
 def test_name_and_description() -> None:
@@ -72,6 +73,16 @@ def test_invoke_returns_catalog(
     parsed = json.loads(result)
     assert "self" in parsed
     assert parsed["self"]["models"][0]["id"] == "gpt-4o"
+
+
+@pytest.mark.parametrize("arguments", ['{"host": "h1", "agent_id": "ag_1"}', '{"host": "h1"}'])
+def test_invoke_refuses_host_catalog_without_server(arguments: str) -> None:
+    """The in-process path has no server, so a host-catalog call errors, never lists workers."""
+    with patch("omnigent.models.model_catalog.catalog_for_spec") as mock_catalog:
+        parsed = json.loads(SysListModelsTool(spec=_make_spec()).invoke(arguments, _ctx()))
+
+    mock_catalog.assert_not_called()
+    assert parsed["error"] == "server_unavailable"
 
 
 def test_invoke_lists_acp_curated_models_without_gateway_credentials(

@@ -300,6 +300,43 @@ async def test_catalogs_returns_only_the_callers_hosts(
     assert rows[0]["stale"] is False
 
 
+async def test_catalogs_filter_reads_one_cached_row_without_probing(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    stores: _Stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host / harness filter reads the cache only; another host's pending ACP probe waits."""
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.upsert_on_connect(HOST_B, "box-b", "local")
+    stores.host_store.upsert_on_connect(HOST_FOREIGN, "box-x", "someone-else")
+    stores.host_store.update_harness_readiness(HOST_B, {"acp:neutral": True})
+    _register_host(app, HOST_A)
+    _register_host(app, HOST_B)
+    stores.cache.upsert(HOST_A, "codex", [{"id": "row-1", "model": "relay/model-x"}], 5)
+    stores.cache.upsert(HOST_A, "claude-native", [{"id": "other-harness"}], 5)
+    proxy = AsyncMock(return_value={"status": "ok", "models": [], "injects_prompt": False})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+
+    resp = await client.get(
+        "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": "codex"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(row["host_id"], row["harness"], row["models"]) for row in resp.json()["rows"]] == [
+        (HOST_A, "codex", [{"id": "row-1", "model": "relay/model-x"}])
+    ]
+    proxy.assert_not_awaited()
+
+    foreign = await client.get("/v1/calling-defaults/catalogs", params={"host_id": HOST_FOREIGN})
+    assert foreign.status_code == 404, foreign.text
+
+    # The unfiltered read still fills B's first-use ACP metadata.
+    full = await client.get("/v1/calling-defaults/catalogs")
+    assert full.status_code == 200, full.text
+    proxy.assert_awaited_once()
+    assert proxy.await_args.kwargs["host_conn"].host_id == HOST_B
+
+
 async def test_resolve_exposes_unavailable_defaults(client, stores, monkeypatch):
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
     _seed_agent(stores, AGENT_ID, harness="codex")

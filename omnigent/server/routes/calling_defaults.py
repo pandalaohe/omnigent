@@ -240,15 +240,47 @@ def create_calling_defaults_router(
     @router.get("/calling-defaults/catalogs")
     async def list_calling_default_catalogs(
         request: Request,
+        host_id: str | None = Query(default=None),
+        harness: str | None = Query(default=None),
     ) -> CallingDefaultsCatalogsResponse:
         """Return the caller's own cached catalogs, stale rows included.
 
+        A ``host_id`` or ``harness`` filter reads the cache only: it skips the
+        first-use ACP metadata sync, so it never waits on a host probe.
+
         :param request: The incoming request, used to identify the caller.
+        :param host_id: Optional filter narrowing the rows to one owned host.
+        :param harness: Optional filter narrowing the rows to one harness.
         :returns: ``{"rows": [...]}`` for the caller's hosts.
-        :raises OmnigentError: 401 unauthenticated.
+        :raises OmnigentError: 401 unauthenticated, 404 for an unowned
+            ``host_id`` filter.
         """
         user_id = require_user(request, auth_provider)
-        hosts = await asyncio.to_thread(host_store.list_hosts, _owner(user_id))
+        owner = _owner(user_id)
+        if host_id is not None or harness is not None:
+            if host_id is not None:
+                host = await asyncio.to_thread(host_store.get_host, host_id)
+                if host is None or host.user_id != owner:
+                    raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
+                host_ids = [host.host_id]
+            else:
+                host_ids = [
+                    host.host_id for host in await asyncio.to_thread(host_store.list_hosts, owner)
+                ]
+            wanted = (
+                harness
+                if harness is None or harness.startswith("acp:")
+                else canonicalize_harness(harness) or harness
+            )
+            records = await asyncio.to_thread(catalog_store.list, host_ids)
+            return CallingDefaultsCatalogsResponse(
+                rows=[
+                    _catalog_row(record, host_registry)
+                    for record in records
+                    if wanted is None or record["harness"] == wanted
+                ]
+            )
+        hosts = await asyncio.to_thread(host_store.list_hosts, owner)
         records = await asyncio.to_thread(catalog_store.list, [host.host_id for host in hosts])
         # Configuration metadata must be visible on first use, independently
         # of a model probe succeeding or an explicit Sync models action.
