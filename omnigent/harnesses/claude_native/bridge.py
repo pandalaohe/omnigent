@@ -1213,17 +1213,15 @@ class ClaudeQueueOperation:
     One ``queue-operation`` record that took a queued prompt out unread.
 
     :param operation: ``"popAll"`` when Esc, Stop or Up moved queued prompts
-        back into the composer, or ``"remove"`` for a prompt a hook dropped.
+        back into the composer.
     :param content: The queued prompt text, e.g. ``"Then summarize"``.
     :param timestamp: Claude's ISO timestamp for the record, e.g.
         ``"2026-11-05T09:45:15.794Z"``.
-    :param reason: Claude's removal reason, e.g. ``"dropped_by_hook"``.
     """
 
     operation: str
     content: str
     timestamp: str
-    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -12488,8 +12486,7 @@ def _queue_operation_from_transcript_entry(entry: _JsonObject) -> ClaudeQueueOpe
     Return the queue record of a prompt Claude took out of its queue unread.
 
     ``popAll`` moves every queued prompt back into the composer (Esc, Stop or
-    Up), one record each. ``remove`` with reason ``dropped_by_hook`` is a
-    prompt a ``UserPromptSubmit`` hook blocked when Claude dequeued it.
+    Up), one record each.
 
     :param entry: One decoded transcript JSONL record.
     :returns: The operation, or ``None`` for any other record.
@@ -12497,18 +12494,14 @@ def _queue_operation_from_transcript_entry(entry: _JsonObject) -> ClaudeQueueOpe
     if entry.get("type") != "queue-operation":
         return None
     operation = entry.get("operation")
-    reason = entry.get("reason")
     content = entry.get("content")
-    if not isinstance(content, str) or not (
-        operation == "popAll" or (operation == "remove" and reason == "dropped_by_hook")
-    ):
+    if operation != "popAll" or not isinstance(content, str):
         return None
     timestamp = entry.get("timestamp")
     return ClaudeQueueOperation(
         operation=operation,
         content=_unwrap_pasted_content_markers(content),
         timestamp=timestamp if isinstance(timestamp, str) else "",
-        reason=reason if isinstance(reason, str) else None,
     )
 
 

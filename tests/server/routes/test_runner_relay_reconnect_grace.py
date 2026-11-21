@@ -373,55 +373,6 @@ async def test_stop_settles_a_paste_claude_moved_back_to_its_input_box(db_uri, o
         session_stream.close(session_id)
 
 
-@pytest.mark.asyncio
-async def test_a_paste_a_hook_dropped_from_claudes_queue_settles_as_blocked(db_uri):
-    store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation(agent_id="b" * 32).id
-    pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "steer the run"}], runner_managed=True
-    )
-    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
-    collector = await start_session_stream_collector(session_id)
-    try:
-        await orchestration._settle_queue_operations(
-            store,
-            session_id,
-            {
-                "operations": [
-                    # A queued notification the hook dropped is not this input.
-                    {"operation": "remove", "reason": "dropped_by_hook", "content": "notice"},
-                    {
-                        "operation": "remove",
-                        "reason": "absorbed_mid_turn",
-                        "content": "steer the run",
-                    },
-                ]
-            },
-        )
-        await collector.assert_no_event(within=0.05)
-        assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
-        await orchestration._settle_queue_operations(
-            store,
-            session_id,
-            {
-                "operations": [
-                    {
-                        "operation": "remove",
-                        "reason": "dropped_by_hook",
-                        "content": "steer the run",
-                    }
-                ]
-            },
-        )
-        assert await _settled_input_error_codes(store, session_id, pending_id, collector) == [
-            "native_input_blocked_by_hook"
-        ]
-    finally:
-        await collector.stop()
-        pending_inputs.resolve(session_id, pending_id)
-        session_stream.close(session_id)
-
-
 def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app

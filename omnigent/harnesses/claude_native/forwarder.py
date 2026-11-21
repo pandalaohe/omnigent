@@ -7588,7 +7588,6 @@ async def _post_external_queue_operations(
                             "operation": operation.operation,
                             "content": operation.content,
                             "timestamp": operation.timestamp,
-                            **({"reason": operation.reason} if operation.reason else {}),
                         }
                         for operation in unreported
                     ]
