@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
@@ -109,9 +110,11 @@ function renderMarkdown(
   });
   render(
     <QueryClientProvider client={client}>
-      <FileViewerContext.Provider value={viewer}>
-        <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
-      </FileViewerContext.Provider>
+      <TooltipProvider>
+        <FileViewerContext.Provider value={viewer}>
+          <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }

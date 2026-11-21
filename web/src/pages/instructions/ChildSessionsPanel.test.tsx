@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as RegistryModule from "@/hooks/useAgentRegistry";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
@@ -83,6 +84,15 @@ vi.mock("@/hooks/useAgentRegistry", async (original) => ({
   }),
 }));
 
+// QuotaPreferencesSettings also reads available agents and calling-default
+// catalogs; the panels here do not depend on either list.
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: [] }),
+}));
+vi.mock("@/lib/callingDefaultsApi", () => ({
+  listCallingDefaultCatalogs: async () => [],
+}));
+
 import { ChildSessionsPanel } from "./ChildSessionsPanel";
 import { QuotaPreferencesSettings } from "@/pages/settings/sessionChoice/QuotaPreferencesSettings";
 import { readChildIdlePreferences, writeChildIdlePreferences } from "@/lib/childIdlePreferences";
@@ -92,8 +102,16 @@ import {
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 
+function renderQuotaSettings() {
+  return render(
+    <QueryClientProvider client={new QueryClient()}>
+      <QuotaPreferencesSettings />
+    </QueryClientProvider>,
+  );
+}
+
 it("preserves an unsaved quota draft across unrelated storage notifications", () => {
-  render(<QuotaPreferencesSettings />);
+  renderQuotaSettings();
   const tight = screen.getByRole("textbox", { name: /Tight below/ });
   fireEvent.change(tight, { target: { value: "60" } });
   fireEvent(window, new StorageEvent("storage", { key: "theme" }));
@@ -239,7 +257,7 @@ describe("ChildSessionsPanel", () => {
 
   it("moves quota controls without dropping child or collaboration preferences", () => {
     writeSessionCollabPreferences({ ...SESSION_COLLAB_DEFAULTS, relayDepthMax: 3, childCap: 4 });
-    render(<QuotaPreferencesSettings />);
+    renderQuotaSettings();
     fireEvent.change(screen.getByRole("textbox", { name: /Tight below/ }), {
       target: { value: "45.5" },
     });
@@ -281,7 +299,7 @@ describe("ChildSessionsPanel", () => {
       ...SESSION_COLLAB_DEFAULTS,
       quotaPeriods: { codex: "7d" },
     });
-    render(<QuotaPreferencesSettings />);
+    renderQuotaSettings();
     fireEvent.click(screen.getByText("Deciding period"));
     expect(screen.getByRole("textbox", { name: "All products" })).toHaveValue("");
     expect(screen.getByText("7d")).toBeInTheDocument();
@@ -301,7 +319,7 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("requires a period before saving an added exception", () => {
-    render(<QuotaPreferencesSettings />);
+    renderQuotaSettings();
     fireEvent.click(screen.getByText("Deciding period"));
     fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
     fireEvent.click(screen.getByRole("button", { name: /Kite.*Native CLI/ }));
@@ -311,7 +329,7 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("keeps invalid thresholds in the draft until corrected", () => {
-    render(<QuotaPreferencesSettings />);
+    renderQuotaSettings();
     fireEvent.change(screen.getByRole("textbox", { name: /Low below/ }), {
       target: { value: "60" },
     });

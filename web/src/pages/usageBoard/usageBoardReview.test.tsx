@@ -228,7 +228,10 @@ describe("Connect command", () => {
       );
     });
     expect(document.execCommand).toHaveBeenCalledWith("copy");
-    expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
+    // The icon-only Copy button keeps its name; the confirmation is the status line.
+    await waitFor(() =>
+      expect(within(screen.getByRole("dialog")).getByRole("status")).toHaveTextContent("Copied"),
+    );
   });
 
   it("keeps Connect, Price source and the Issues link in Settings when the board switch is off", async () => {

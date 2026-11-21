@@ -53,13 +53,13 @@ export function TaskSourceDetails({
             {t("visual.files")} <small>{current.length}</small>
           </h5>
           <Input
-            aria-label="Search files"
-            placeholder="Search files"
+            aria-label={t("detail.searchFiles")}
+            placeholder={t("detail.searchFiles")}
             value={fileQuery}
             onChange={(event) => setFileQuery(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Showing {visibleCurrent.length} of {current.length}
+            {t("detail.searchResults", { shown: visibleCurrent.length, total: current.length })}
           </p>
           <div className="max-h-64 overflow-auto">
             {visibleCurrent.map((file) => (
@@ -74,7 +74,7 @@ export function TaskSourceDetails({
               {oldFiles && (
                 <>
                   <p className="text-xs text-muted-foreground">
-                    Showing {visibleOld.length} of {old.length}
+                    {t("detail.searchResults", { shown: visibleOld.length, total: old.length })}
                   </p>
                   <div className="max-h-64 overflow-auto">
                     {visibleOld.map((file) => (
@@ -126,13 +126,13 @@ export function TaskSourceDetails({
       {!!display.links?.length && (
         <div>
           <Input
-            aria-label="Search links"
-            placeholder="Search links"
+            aria-label={t("detail.searchLinks")}
+            placeholder={t("detail.searchLinks")}
             value={linkQuery}
             onChange={(event) => setLinkQuery(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Showing {visibleLinks.length} of {display.links.length}
+            {t("detail.searchResults", { shown: visibleLinks.length, total: display.links.length })}
           </p>
           <ul className="max-h-64 space-y-1 overflow-auto">
             {visibleLinks.map((link) => {

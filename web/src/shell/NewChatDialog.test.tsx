@@ -6,6 +6,14 @@ vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SandboxProfilesModule>()),
   fetchSandboxProfiles: vi.fn(),
 }));
+import type * as VoiceInputApiModule from "@/lib/voiceInputApi";
+
+// The composer's mic button reads voice settings from /v1/me on mount; keep
+// that read out of the authenticatedFetch calls these tests count.
+vi.mock("@/lib/voiceInputApi", async (importOriginal) => {
+  const api = await importOriginal<typeof VoiceInputApiModule>();
+  return { ...api, getVoiceInputSettings: vi.fn(async () => api.defaultVoiceInputSettings) };
+});
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -12594,7 +12602,7 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
 
     const view = await screen.findByRole("dialog");
     expect(within(view).getByText("Built-in · save your own starting prompt")).toBeInTheDocument();
-    expect(within(view).getAllByTestId("builtin-member-row")).toHaveLength(2);
+    expect(within(view).getByRole("button", { name: "Members: 2" })).toBeInTheDocument();
     fireEvent.click(within(view).getByRole("button", { name: "Duplicate to edit" }));
 
     expect(await screen.findByTestId("agent-editor")).toBeInTheDocument();
@@ -12606,7 +12614,7 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
     expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
       source_agent_id: "ag_polly",
     });
-    expect(screen.queryAllByTestId("builtin-member-row")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Members: 2" })).toBeNull();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
         "Polly copy",

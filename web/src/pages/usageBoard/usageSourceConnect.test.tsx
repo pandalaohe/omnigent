@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UsageSourceConnect } from "./UsageSourceConnect";
@@ -41,26 +42,33 @@ describe("source connection", () => {
     const open = vi.fn();
     const amount = usageActivityFixture().accounts[0];
     amount.totals.partial_rows = 1;
-    for (const density of ["std", "mini"] as const) {
+    for (const [density, linkName] of [
+      ["std", "Codex Balance"],
+      ["mini", "Codex"],
+    ] as const) {
       const view = render(
-        <MemoryRouter>
-          <TooltipProvider>
-            <UsageTile
-              account={account}
-              amount={amount}
-              density={density}
-              pinnedWindowId={undefined}
-              renewal={null}
-              onOpen={open}
-            />
-          </TooltipProvider>
-        </MemoryRouter>,
+        <QueryClientProvider
+          client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+        >
+          <MemoryRouter>
+            <TooltipProvider>
+              <UsageTile
+                account={account}
+                amount={amount}
+                density={density}
+                pinnedWindowId={undefined}
+                renewal={null}
+                onOpen={open}
+              />
+            </TooltipProvider>
+          </MemoryRouter>
+        </QueryClientProvider>,
       );
       expect(document.querySelector("[data-usage-amount]")?.textContent).toBe("$0.00");
       expect(screen.getByText("Incomplete coverage")).toBeTruthy();
       expect(screen.getByText("Balance reading is old")).toBeTruthy();
       expect(screen.queryByTestId("usage-ring")).toBeNull();
-      fireEvent.click(screen.getByRole("link"));
+      fireEvent.click(screen.getByRole("link", { name: linkName }));
       view.unmount();
     }
     expect(open).toHaveBeenCalledTimes(2);

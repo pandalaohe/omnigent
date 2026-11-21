@@ -1,4 +1,12 @@
 import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
+import type * as VoiceInputApiModule from "@/lib/voiceInputApi";
+
+// The composer's mic button reads voice settings from /v1/me on mount; keep
+// that read out of the authenticatedFetch calls these tests count.
+vi.mock("@/lib/voiceInputApi", async (importOriginal) => {
+  const api = await importOriginal<typeof VoiceInputApiModule>();
+  return { ...api, getVoiceInputSettings: vi.fn(async () => api.defaultVoiceInputSettings) };
+});
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
