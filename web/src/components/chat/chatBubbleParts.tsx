@@ -245,7 +245,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
-      ...((p.sentMidTurn && sendingSinceMs === undefined) || p.received
+      ...((p.sentMidTurn && p.posted === true && sendingSinceMs === undefined) || p.received
         ? { awaitingAgent: true }
         : {}),
       ...(p.stillSending && p.posted !== true && !p.received ? { stillSending: true } : {}),

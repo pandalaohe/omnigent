@@ -30,6 +30,9 @@ class FakeXHR {
   responseText = "";
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+  timeout = 0;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   requestHeaders: Record<string, string> = {};
   sentBody: FormData | null = null;
@@ -60,6 +63,10 @@ class FakeXHR {
 
   fail() {
     this.onerror?.();
+  }
+
+  abort() {
+    this.onabort?.();
   }
 }
 
@@ -186,6 +193,21 @@ describe("uploadFile", () => {
     const xhr = await nextXhr();
     xhr.fail();
     await expect(promise).rejects.toThrow("Network error");
+  });
+
+  it("rejects when the upload is aborted", async () => {
+    const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+    const xhr = await nextXhr();
+    xhr.abort();
+    await expect(promise).rejects.toThrow("aborted");
+  });
+
+  it("rejects when the upload times out", async () => {
+    const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+    const xhr = await nextXhr();
+    expect(xhr.timeout).toBeGreaterThan(0);
+    xhr.ontimeout?.();
+    await expect(promise).rejects.toThrow("timed out");
   });
 });
 

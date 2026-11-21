@@ -26,6 +26,8 @@ interface UploadResourcePayload {
   };
 }
 
+const FILE_UPLOAD_TIMEOUT_MS = 30_000;
+
 function uploadedFileFromResource(
   resource: UploadResourcePayload,
   file: File,
@@ -84,6 +86,7 @@ export async function uploadFile(
   return new Promise<UploadedFile>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", withBasePath(path));
+    xhr.timeout = FILE_UPLOAD_TIMEOUT_MS;
     for (const [name, value] of headers.entries()) {
       xhr.setRequestHeader(name, value);
     }
@@ -114,6 +117,8 @@ export async function uploadFile(
       resolve(uploadedFileFromResource(resource, file, filename));
     };
     xhr.onerror = () => reject(new Error("Network error while uploading the file"));
+    xhr.onabort = () => reject(new Error("File upload was aborted"));
+    xhr.ontimeout = () => reject(new Error("File upload timed out"));
     xhr.send(form);
   });
 }

@@ -600,6 +600,8 @@ function makeFakeSlotManager(
  * handlers (URLs, gates, canned bodies) driving the upload path.
  */
 class FetchBackedXHR {
+  static instances: FetchBackedXHR[] = [];
+
   method = "GET";
   url = "";
   status = 0;
@@ -607,8 +609,15 @@ class FetchBackedXHR {
   responseText = "";
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+  timeout = 0;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   private headers = new Headers();
+
+  constructor() {
+    FetchBackedXHR.instances.push(this);
+  }
 
   open(method: string, url: string) {
     this.method = method;
@@ -638,6 +647,10 @@ class FetchBackedXHR {
         this.onerror?.();
       }
     })();
+  }
+
+  abort() {
+    this.onabort?.();
   }
 }
 
@@ -681,6 +694,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
   vi.stubGlobal("fetch", fetchMock);
+  FetchBackedXHR.instances = [];
   vi.stubGlobal("XMLHttpRequest", FetchBackedXHR);
 });
 
@@ -7665,6 +7679,99 @@ describe("chatStore — send (file attachments)", () => {
       file_id: "file_gif",
       filename: "moving.gif",
     });
+  });
+
+  it("does not call a mid-turn attachment send received before its upload posts", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+    });
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+    let sendSettled = false;
+    const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
+    void sendPromise.then(
+      () => {
+        sendSettled = true;
+      },
+      () => {
+        sendSettled = true;
+      },
+    );
+    await tick();
+
+    try {
+      const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+      expect(bubble).toMatchObject({ pending: true });
+      expect(bubble).not.toHaveProperty("awaitingAgent");
+      expect(sendSettled).toBe(false);
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url, init]) =>
+            String(url).endsWith("/v1/sessions/conv_existing/events") &&
+            (init as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+      await sendPromise;
+    }
+  });
+
+  it("shows still sending before an aborted native upload returns the text for retry", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+    });
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+    const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    expect(buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0]).toMatchObject(
+      {
+        pending: true,
+        stillSending: true,
+      },
+    );
+
+    try {
+      FetchBackedXHR.instances.at(-1)?.abort();
+      await sendPromise;
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: "look at this",
+        files: [file],
+      });
+      expect(useChatStore.getState().blocks.at(-1)).toMatchObject({ type: "error" });
+    } finally {
+      resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+    }
   });
 
   it("keeps an inline attachment between the surrounding text blocks", async () => {

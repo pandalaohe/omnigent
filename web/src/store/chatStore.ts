@@ -3079,51 +3079,51 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         return true;
       }
 
-      // Upload any attached files and build the real content blocks with
-      // server-assigned file_ids (input_image for images, input_file
-      // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
-      // a prior successful upload of the same File so a retry after a
-      // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
-        uploadFileBlock(sessionId, file),
-      );
-      const fileBlocks = serverContent.filter(
-        (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
-          block.type === "input_image" || block.type === "input_file",
-      );
-      if (initialDraft && !initialSendPending()) return false;
+      const sendResult = await withStillSendingMark(sessionId, tempId, async () => {
+        // Upload any attached files and build the real content blocks with
+        // server-assigned file_ids (input_image for images, input_file
+        // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
+        // a prior successful upload of the same File so a retry after a
+        // post-phase failure doesn't re-upload — and orphan — blobs that landed.
+        const serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
+          uploadFileBlock(sessionId, file),
+        );
+        const fileBlocks = serverContent.filter(
+          (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
+            block.type === "input_image" || block.type === "input_file",
+        );
+        if (initialDraft && !initialSendPending()) return null;
 
-      // Promote "pending:<filename>" to real file_ids. Claude-native's
-      // session.input.consumed is text-only (transcript round-trip
-      // drops input_image blocks), so the consumed handler falls back
-      // to the pending file blocks — they must already carry real ids.
-      //
-      // Targets the session this send posted to, not the visible one: the
-      // upload can outlive a switch away, and leaving the bubble on
-      // `pending:<filename>` ids means the consumed fallback commits those
-      // placeholders as if they were real attachments.
-      if (fileBlocks.length > 0) {
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, content: serverContent } : p,
-          ),
-        }));
-      }
+        // Promote "pending:<filename>" to real file_ids. Claude-native's
+        // session.input.consumed is text-only (transcript round-trip
+        // drops input_image blocks), so the consumed handler falls back
+        // to the pending file blocks — they must already carry real ids.
+        //
+        // Targets the session this send posted to, not the visible one: the
+        // upload can outlive a switch away, and leaving the bubble on
+        // `pending:<filename>` ids means the consumed fallback commits those
+        // placeholders as if they were real attachments.
+        if (fileBlocks.length > 0) {
+          setterFor(sessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, content: serverContent } : p,
+            ),
+          }));
+        }
 
-      if (initialDraft) {
-        // From this point Interrupt belongs to the runner, not the local draft.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
-          ),
-          status: "streaming",
-          sendLatchedAt: Date.now(),
-          sendLatchSeenRunning: null,
-        }));
-        initialDispatched = true;
-      }
-      const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postConversationEvent(
+        if (initialDraft) {
+          // From this point Interrupt belongs to the runner, not the local draft.
+          setterFor(sessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+            ),
+            status: "streaming",
+            sendLatchedAt: Date.now(),
+            sendLatchSeenRunning: null,
+          }));
+          initialDispatched = true;
+        }
+        const postResult = await postConversationEvent(
           sessionId,
           {
             type: "message",
@@ -3134,8 +3134,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             },
           },
           { holdWhenHostOffline: true },
-        ),
-      );
+        );
+        return { postResult };
+      });
+      if (sendResult === null) return false;
+      const { postResult } = sendResult;
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic

@@ -428,7 +428,7 @@ describe("UserBubble awaiting-agent marker", () => {
         removeEventListener: vi.fn(),
       }));
       const [pending] = buildPendingBubbles(
-        [{ tempId: "pend_1", content, sentMidTurn: true }],
+        [{ tempId: "pend_1", content, sentMidTurn: true, posted: true }],
         null,
       );
       if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
@@ -464,6 +464,7 @@ describe("UserBubble awaiting-agent marker", () => {
           tempId: "pend_attachment",
           content: [{ type: "input_file", file_id: "file_1", filename: "notes.txt" }],
           sentMidTurn: true,
+          posted: true,
         },
       ],
       null,
