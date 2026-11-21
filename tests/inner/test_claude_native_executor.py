@@ -2668,7 +2668,7 @@ async def test_cancelled_delivery_cannot_reap_a_pane_advertised_during_drain(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("worker_outcome", ["submit-confirmed", "interrupted"])
+@pytest.mark.parametrize("worker_outcome", ["submit-confirmed", "submit-blind", "interrupted"])
 async def test_stop_during_a_paste_reports_uncertain_only_when_the_worker_did_not_confirm(
     monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path, worker_outcome: str
 ) -> None:
@@ -2676,7 +2676,7 @@ async def test_stop_during_a_paste_reports_uncertain_only_when_the_worker_did_no
     pasted = asyncio.Event()
     kills: list[Path] = []
 
-    def inject(*_args: object, **_kwargs: object) -> None:
+    def inject(*_args: object, **_kwargs: object) -> bool:
         paste_started = claude_bridge._INJECTION_PASTE_STARTED.get()
         cancel_event = claude_bridge._INJECTION_CANCEL_EVENT.get()
         assert paste_started is not None and cancel_event is not None
@@ -2686,6 +2686,8 @@ async def test_stop_during_a_paste_reports_uncertain_only_when_the_worker_did_no
         assert cancel_event.wait(5)
         if worker_outcome == "interrupted":
             claude_bridge._check_injection_cancelled()
+        # A blind Enter returns normally without submit evidence.
+        return worker_outcome == "submit-confirmed"
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
     monkeypatch.setattr(

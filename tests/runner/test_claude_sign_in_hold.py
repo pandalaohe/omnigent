@@ -1056,6 +1056,50 @@ async def test_message_a_busy_pane_refused_goes_back_to_the_queue_instead_of_fai
 
 
 @pytest.mark.asyncio
+async def test_archive_drops_a_message_a_busy_pane_handed_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archiving while the queue holds a busy pane's message keeps it from ever being sent."""
+    monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *_a, **_k: None)
+    harness = _PausedStreamHarness([_BUSY_REFUSED, _DELIVERED])
+    app, _harness, _server = _build_app([_BUSY_REFUSED, _DELIVERED], harness=harness)
+    sid = uuid.uuid4().hex
+    pane = _RUNNING_TURN_PANE
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: pane)
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 1)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await asyncio.wait_for(harness.frames_sent.wait(), budget(5))
+        pane = _HIDDEN_BOX_RUNNING_PANE
+        harness.resume.set()
+        await _until(
+            lambda: (
+                bool(app.state.session_message_buffers.get(sid))
+                and sid not in app.state.active_turns
+            )
+        )
+        released = await client.post(
+            f"/v1/sessions/{sid}/cli-retention/release", json={"reason": "archive"}
+        )
+        assert released.status_code == 200
+        # The box comes back after the archive.
+        pane = _RUNNING_TURN_PANE
+        await asyncio.sleep(0.1)  # custom-lint: disable=sleep-then-assert -- no send in window
+
+    assert len(harness.posted_bodies) == 1
+    assert not app.state.session_message_buffers.get(sid)
+    assert sid not in app.state.claude_prompt_waiters
+
+
+@pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

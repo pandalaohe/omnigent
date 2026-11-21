@@ -864,8 +864,12 @@ class ClaudeNativeExecutor(Executor):
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
             if paste_started.is_set():
-                if not worker.cancelled() and worker.exception() is None:
-                    # The worker confirmed the submit before it saw the cancel.
+                if (
+                    not worker.cancelled()
+                    and worker.exception() is None
+                    and worker.result() is True
+                ):
+                    # Evidence confirmed the submit before the worker saw the cancel.
                     raise
                 raise ClaudeDeliveryUnconfirmed(
                     "Claude delivery was interrupted after the paste started. "

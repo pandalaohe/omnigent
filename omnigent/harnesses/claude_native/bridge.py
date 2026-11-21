@@ -5819,6 +5819,17 @@ def _claim_message_delivery() -> None:
     raise ClaudeDeliveryClaimRefused("The message could no longer be claimed for delivery.")
 
 
+def _pane_runs_a_turn(bridge_dir: Path) -> bool:
+    return has_running_turn(bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir))
+
+
+def _busy_pane_refusal(pane: str) -> ClaudeInputBoxBusy:
+    return ClaudeInputBoxBusy(
+        "Claude Code's input box is hidden while it works, so the message was not delivered."
+        + _format_terminal_failure_tail(pane)
+    )
+
+
 def _check_message_readiness_budget() -> None:
     if message_readiness_remaining() <= 0:
         raise _MessageReadinessExpired(
@@ -5852,6 +5863,8 @@ def _paste_and_submit(
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
+    :raises ClaudeInputBoxBusy: If a running turn hid the input box before the
+        message's first claim; nothing was typed.
     :raises ClaudeComposerNotCleared: If a draft left in the input box could
         not be cleared first; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
@@ -5876,6 +5889,12 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    owner = _MESSAGE_PANE.get()
+    if owner is not None and not owner.wrote_paste and _pane_runs_a_turn(bridge_dir):
+        # The box can hide again after the readiness gate; nothing is claimed or typed yet.
+        pane = _capture_pane(socket_path, tmux_target)
+        if pane.strip() and not _claude_prompt_rendered(pane) and not _occupied_tall_draft(pane):
+            raise _busy_pane_refusal(pane)
     # A short last line cannot identify a clipped draft alone; match across lines then.
     tail_needle = (_submit_tail_needle(text) or _submit_cross_line_tail(text)) if needle else ""
     _check_message_readiness_budget()
@@ -5886,7 +5905,6 @@ def _paste_and_submit(
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     paste_tmux = _tmux_input_identity(bridge_dir)
     paste_native_session_id = read_claude_session_id(bridge_dir)
-    owner = _MESSAGE_PANE.get()
     if owner is not None:
         owner.message_text = text
 
@@ -9971,13 +9989,8 @@ def _wait_for_claude_prompt_ready(
         ):
             # The runner queues input for a busy pane without a usable box; a box
             # that hid after its check goes back there instead of spending this budget.
-            if has_running_turn(
-                bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
-            ):
-                raise ClaudeInputBoxBusy(
-                    "Claude Code's input box is hidden while it works, so the message "
-                    "was not delivered." + _format_terminal_failure_tail(pane)
-                )
+            if _pane_runs_a_turn(bridge_dir):
+                raise _busy_pane_refusal(pane)
             busy_check_at = now + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         if time.monotonic() >= hard_deadline:
             break

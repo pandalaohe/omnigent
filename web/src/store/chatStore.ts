@@ -140,7 +140,6 @@ import {
   rememberQueuedSends,
   rememberRestoredSend,
   rememberUnsentSend,
-  type RestoredSend,
 } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -5792,7 +5791,7 @@ async function bindStream(
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
-    const reloadedSend = hydratePending ? peekRestoredSend(id) : null;
+    const reloadedSend = hydratePending ? restoredSendAfterReload(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(
@@ -5923,7 +5922,7 @@ async function bindStream(
           ? { failedSendDraft: unsentDraft }
           : {}),
         ...(reloadedSend !== null && state.restoredSendDraft === null
-          ? { restoredSendDraft: restoredSendAfterReload(id, reloadedSend, items) }
+          ? { restoredSendDraft: reloadedSend }
           : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
@@ -8819,10 +8818,12 @@ export function takeFailedSendDraft(
     const textOnly =
       failed.files.length === 0 &&
       !failed.composerParts?.some((part) => part.type === "attachment");
-    if (textOnly) {
+    const authorId = getCurrentUserId();
+    if (textOnly && authorId !== null) {
       rememberRestoredSend(conversationId, {
         stableId: failed.stableId,
         text: failed.text,
+        authorId,
         ...(failed.replyDraft ? { replyDraft: failed.replyDraft } : {}),
       });
     } else {
@@ -9002,15 +9003,26 @@ function unsentSendToRestore(
  * or a live acknowledgement retracts the text, never a persisted item alone.
  *
  * @param conversationId - The session being bound.
- * @param send - The restored send this tab recorded.
  * @param items - The snapshot's committed items.
- * @returns The tracker the composer's retraction reads.
+ * @returns The tracker the composer's retraction reads, or `null`.
  */
 function restoredSendAfterReload(
   conversationId: string,
-  send: RestoredSend,
   items: readonly ConversationItem[],
-): NonNullable<ConversationState["restoredSendDraft"]> {
+): ConversationState["restoredSendDraft"] {
+  const send = peekRestoredSend(conversationId);
+  if (send === null) return null;
+  const viewerId = getCurrentUserId();
+  // The viewer can't be checked before identity resolves; try again once it does.
+  if (viewerId === null) {
+    trackRestoredSendOnceIdentified(conversationId, items);
+    return null;
+  }
+  // Another account may have signed in to this tab since.
+  if (send.authorId !== viewerId) {
+    forgetRestoredSend(conversationId);
+    return null;
+  }
   return {
     conversationId,
     stableId: send.stableId,
@@ -9020,6 +9032,30 @@ function restoredSendAfterReload(
     serverRefused: true,
     delivered: confirmedWebSendIds(items).includes(send.stableId),
   };
+}
+
+/**
+ * Finish tracking a reloaded draft `restoredSendAfterReload` put off until `/v1/me`
+ * names the viewer, as `restoreUnsentSendOnceIdentified` does for unsent text.
+ *
+ * @param conversationId - The session whose bind put the tracking off.
+ * @param items - That bind's snapshot items.
+ */
+function trackRestoredSendOnceIdentified(
+  conversationId: string,
+  items: readonly ConversationItem[],
+): void {
+  const unsubscribe = subscribeIdentity(() => {
+    if (getCurrentUserId() === null) return;
+    unsubscribe();
+    // An evicted session keeps the record for its next bind.
+    if (isConversationDisposed(conversationId)) return;
+    const tracker = restoredSendAfterReload(conversationId, items);
+    if (tracker === null) return;
+    setterFor(conversationId)((state) =>
+      state.restoredSendDraft === null ? { restoredSendDraft: tracker } : {},
+    );
+  });
 }
 
 /**

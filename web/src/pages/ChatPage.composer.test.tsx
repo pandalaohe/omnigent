@@ -6921,7 +6921,7 @@ describe("Composer reply quotes", () => {
     const stableId = "c".repeat(32);
     // The reload kept the composer's text, and the bind tracked its send again.
     setSessionDraft("conv_test", { text: "resend me", files: [] });
-    rememberRestoredSend("conv_test", { stableId, text: "resend me" });
+    rememberRestoredSend("conv_test", { stableId, text: "resend me", authorId: "user-a" });
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("resend me");
 

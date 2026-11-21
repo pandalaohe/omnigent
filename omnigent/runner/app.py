@@ -15497,6 +15497,8 @@ def create_runner_app(
                 )
             body["archive_scope_id"] = archive_scope_id
             body["archive_revision"] = archive_revision
+            # A message held for a busy pane or a prompt must not be sent after archive.
+            _cancel_claude_prompt_waiter(session_id)
             # Interrupt outside the lifecycle lock: a background turn holds it
             # shared for its full runtime-start/stream section, so cancellation
             # is what makes it release promptly for archive teardown.

@@ -174,6 +174,57 @@ def test_busy_pane_that_hides_its_box_hands_a_message_back_instead_of_timing_out
         assert clock.now >= 30.0
 
 
+@pytest.mark.parametrize(
+    ("running", "wrote_paste"),
+    [(True, False), (False, False), (True, True)],
+    ids=["busy-before-claim", "idle-before-claim", "busy-after-a-paste"],
+)
+def test_box_hidden_after_the_readiness_gate_requeues_only_before_the_claim(
+    clock: _Clock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+    wrote_paste: bool,
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    socket_path = tmp_path / "tmux.sock"
+    bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="claude:0.0")
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: running)
+    monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda *_: False)
+
+    class _Claimed(Exception):
+        pass
+
+    claims: list[bool] = []
+
+    def claim() -> None:
+        claims.append(True)
+        raise _Claimed
+
+    monkeypatch.setattr(bridge, "_claim_message_delivery", claim)
+    owner = bridge._MessagePane(
+        bridge_dir, str(socket_path), "claude:0.0", None, None, wrote_paste=wrote_paste
+    )
+    token = bridge._MESSAGE_PANE.set(owner)
+    try:
+        refused = running and not wrote_paste
+        with pytest.raises(bridge.ClaudeInputBoxBusy if refused else _Claimed):
+            bridge._paste_and_submit(
+                bridge_dir,
+                str(socket_path),
+                "claude:0.0",
+                text="hello",
+                needle=bridge._submit_needle("hello"),
+            )
+    finally:
+        bridge._MESSAGE_PANE.reset(token)
+    # Only an unclaimed, untyped message goes back; a later paste keeps today's path.
+    assert claims == ([] if refused else [True])
+
+
 def test_repaint_requests_reach_the_delivery_summary(
     clock: _Clock,
     tmp_path: Path,

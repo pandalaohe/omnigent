@@ -8360,13 +8360,23 @@ describe("chatStore — delivered-but-unacked send", () => {
   });
 
   it("keeps a restored native draft's send identity for a reload until the composer is resubmitted", async () => {
-    const stableId = await failNativeSend("ship it");
-    takeFailedSendDraft("conv_existing", false);
-    expect(peekRestoredSend("conv_existing")).toEqual({ stableId, text: "ship it" });
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    try {
+      const stableId = await failNativeSend("ship it");
+      takeFailedSendDraft("conv_existing", false);
+      expect(peekRestoredSend("conv_existing")).toEqual({
+        stableId,
+        text: "ship it",
+        authorId: "user_a",
+      });
 
-    await useChatStore.getState().send("something new", "agent_xyz");
+      await useChatStore.getState().send("something new", "agent_xyz");
 
-    expect(peekRestoredSend("conv_existing")).toBeNull();
+      expect(peekRestoredSend("conv_existing")).toBeNull();
+    } finally {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+      clearUnsentSends();
+    }
   });
 
   it("drops a failed native draft before it is restored once the mirror naming its send commits", async () => {
@@ -28178,6 +28188,7 @@ describe("a send cut off by a reload", () => {
     rememberRestoredSend("conv_reload", {
       stableId: "stable_restored",
       text: "rerun the failing test",
+      authorId: "user_a",
     });
 
     await useChatStore.getState().switchTo("conv_reload");
@@ -28199,6 +28210,7 @@ describe("a send cut off by a reload", () => {
     rememberRestoredSend("conv_reload", {
       stableId: "stable_restored",
       text: "rerun the failing test",
+      authorId: "user_a",
     });
 
     await useChatStore.getState().switchTo("conv_reload");
@@ -28219,6 +28231,50 @@ describe("a send cut off by a reload", () => {
       createdBy: "user@example.com",
       webStableId: "stable_restored",
     });
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId: "stable_restored",
+      delivered: true,
+    });
+  });
+
+  it("does not track a reloaded draft another account's page restored", async () => {
+    seedSession("conv_reload", [
+      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      authorId: "user_b",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(peekRestoredSend("conv_reload")).toBeNull();
+  });
+
+  it("tracks a reloaded draft once identity names its sender", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
+    seedSession("conv_reload", [
+      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    identityChanged!();
 
     expect(useChatStore.getState().restoredSendDraft).toMatchObject({
       stableId: "stable_restored",

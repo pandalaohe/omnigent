@@ -16,6 +16,8 @@ export interface RestoredSend {
   stableId: string;
   text: string;
   replyDraft?: StoredReplyDraft;
+  /** The sender, as on {@link UnsentSend}. */
+  authorId: string;
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -46,8 +48,9 @@ function parseSend(entry: unknown): UnsentSend | null {
 function parseRestored(entry: unknown): RestoredSend | null {
   const draft = readComposerDraft(entry);
   if (!draft?.text || typeof entry !== "object" || entry === null) return null;
-  const { stableId } = entry as { stableId?: unknown };
-  return typeof stableId === "string" ? { ...draft, stableId } : null;
+  const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
+  if (typeof stableId !== "string" || typeof authorId !== "string") return null;
+  return { ...draft, stableId, authorId };
 }
 
 function parseQueue(entry: unknown): UnsentSend[] | null {
