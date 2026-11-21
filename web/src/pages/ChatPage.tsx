@@ -203,6 +203,7 @@ import { hasMultipleMembers, parseSessionMembers, type SessionMember } from "@/l
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { forgetRestoredSend } from "@/lib/unsentSends";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -4139,6 +4140,7 @@ function ComposerImpl(
     if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
     pendingFailedSendRestore.current = null;
     useChatStore.setState({ restoredSendDraft: null });
+    forgetRestoredSend(restoredSendDraft.conversationId);
     // Compare with what the restore put in the composer, tokens included.
     const restoredDraft = recallComposerDraft(
       restoredSendDraft.text,

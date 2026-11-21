@@ -11,8 +11,16 @@ export interface UnsentSend {
   authorId: string;
 }
 
+/** A failed send the composer restored; a reload keeps the id its delivery proof names. */
+export interface RestoredSend {
+  stableId: string;
+  text: string;
+  replyDraft?: StoredReplyDraft;
+}
+
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
 const QUEUED_SENDS_KEY = "omnigent.queuedSends";
+const RESTORED_SENDS_KEY = "omnigent.restoredSends";
 
 // A page that is going away aborts its open sends, and their cleanup still runs
 // as it unloads; keep their records for the next page instead.
@@ -33,6 +41,13 @@ function parseSend(entry: unknown): UnsentSend | null {
   // A record with no sender can't be matched to the viewer.
   if (typeof stableId !== "string" || typeof authorId !== "string") return null;
   return { ...draft, stableId, authorId };
+}
+
+function parseRestored(entry: unknown): RestoredSend | null {
+  const draft = readComposerDraft(entry);
+  if (!draft?.text || typeof entry !== "object" || entry === null) return null;
+  const { stableId } = entry as { stableId?: unknown };
+  return typeof stableId === "string" ? { ...draft, stableId } : null;
 }
 
 function parseQueue(entry: unknown): UnsentSend[] | null {
@@ -102,8 +117,27 @@ export function peekQueuedSends(conversationId: string): UnsentSend[] {
   return read(QUEUED_SENDS_KEY, parseQueue)[conversationId] ?? [];
 }
 
+/** Track the failed send a session's composer now holds; the latest restore wins. */
+export function rememberRestoredSend(conversationId: string, send: RestoredSend): void {
+  write({ ...read(RESTORED_SENDS_KEY, parseRestored), [conversationId]: send }, RESTORED_SENDS_KEY);
+}
+
+/** Stop tracking a session's restored send once its composer no longer holds it. */
+export function forgetRestoredSend(conversationId: string): void {
+  const sends = read(RESTORED_SENDS_KEY, parseRestored);
+  if (!(conversationId in sends)) return;
+  const others = Object.entries(sends).filter(([id]) => id !== conversationId);
+  write(Object.fromEntries(others), RESTORED_SENDS_KEY);
+}
+
+/** The failed send a previous page of this tab restored into a session's composer. */
+export function peekRestoredSend(conversationId: string): RestoredSend | null {
+  return read(RESTORED_SENDS_KEY, parseRestored)[conversationId] ?? null;
+}
+
 /** Clear every record, for isolated tests. */
 export function clearUnsentSends(): void {
   write({}, UNSENT_SENDS_KEY);
   write({}, QUEUED_SENDS_KEY);
+  write({}, RESTORED_SENDS_KEY);
 }

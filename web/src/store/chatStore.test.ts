@@ -68,8 +68,10 @@ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
   clearUnsentSends,
   peekQueuedSends,
+  peekRestoredSend,
   peekUnsentSend,
   rememberQueuedSends,
+  rememberRestoredSend,
   rememberUnsentSend,
 } from "@/lib/unsentSends";
 import {
@@ -8336,6 +8338,16 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
     expect(errorCards()).toEqual([]);
+  });
+
+  it("keeps a restored native draft's send identity for a reload until the composer is resubmitted", async () => {
+    const stableId = await failNativeSend("ship it");
+    takeFailedSendDraft("conv_existing", false);
+    expect(peekRestoredSend("conv_existing")).toEqual({ stableId, text: "ship it" });
+
+    await useChatStore.getState().send("something new", "agent_xyz");
+
+    expect(peekRestoredSend("conv_existing")).toBeNull();
   });
 
   it("drops a failed native draft before it is restored once the mirror naming its send commits", async () => {
@@ -27872,6 +27884,62 @@ describe("a send cut off by a reload", () => {
       recovered: true,
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
+  });
+
+  it("retracts a draft a previous page restored once the snapshot holds the mirror naming its send", async () => {
+    // The send failed in the UI, its text went back to the composer, then the tab reloaded.
+    seedSession("conv_reload", [
+      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      conversationId: "conv_reload",
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      delivered: true,
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("keeps a reloaded draft until a mirror names its send, not on a persisted item alone", async () => {
+    // The server persists a refused send too; after a reload that refusal may be gone.
+    seedSession("conv_reload", [
+      { ...userMessage("refused", "rerun the failing test"), id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId: "stable_restored",
+      delivered: false,
+    });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "1".repeat(32),
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "rerun the failing test" }],
+        web_stable_id: "stable_restored",
+      },
+      createdBy: "user@example.com",
+      webStableId: "stable_restored",
+    });
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId: "stable_restored",
+      delivered: true,
+    });
   });
 
   it("keeps each queued message for the next load until it leaves the queue", async () => {
