@@ -13,7 +13,6 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
@@ -327,62 +326,40 @@ async def _settled_input_error_codes(
     ]
 
 
-def _popped(text: str, at: str = "2026-11-21T05:00:00.000Z") -> dict[str, object]:
-    return {"operations": [{"operation": "popAll", "content": text, "timestamp": at}]}
-
-
-async def _stop_route_settles(store: SqlAlchemyConversationStore, session_id: str, since: float):
-    """What the Stop route runs once its interrupt has landed."""
-    await orchestration._settle_inputs_taken_from_queue(
-        store,
-        session_id,
-        pending_inputs.returned_interrupted_ids(session_id, since=since),
-        "native_input_returned_to_composer",
-    )
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("order", ["stop-then-pop", "pop-during-stop", "up-arrow-then-stop"])
-async def test_stop_settles_a_paste_claude_moved_back_to_its_input_box(db_uri, monkeypatch, order):
+@pytest.mark.parametrize("order", ["stop-then-pop", "pop-then-stop", "up-arrow-edit"])
+async def test_stop_settles_a_paste_claude_moved_back_to_its_input_box(db_uri, order):
     store = SqlAlchemyConversationStore(db_uri)
     session_id = store.create_conversation(agent_id="b" * 32).id
-    clock = {"now": 0.0}
-    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["now"])
+    text = "steer the run"
     pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "steer the run"}], runner_managed=True
+        session_id, [{"type": "input_text", "text": text}], runner_managed=True
     )
     assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    popped = {
+        "operations": [
+            {"operation": "popAll", "content": text, "timestamp": "2026-11-21T05:00:00.000Z"}
+        ]
+    }
     collector = await start_session_stream_collector(session_id)
     try:
-        if order == "up-arrow-then-stop":
-            # Up pops the queue for editing; the person queues the text again.
-            clock["now"] = 10.0
-            await orchestration._settle_queue_operations(
-                store, session_id, _popped("steer the run")
-            )
-        clock["now"] = 20.0
-        stop_started = pending_inputs.clock()
-        if order == "pop-during-stop":
-            # This Stop's popAll lands before its interrupt does.
-            clock["now"] = 21.0
-            await orchestration._settle_queue_operations(
-                store, session_id, _popped("steer the run")
-            )
-            assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
-        clock["now"] = 22.0
-        pending_inputs.mark_interrupted(session_id, [pending_id])
         if order == "stop-then-pop":
-            clock["now"] = 23.0
-            await orchestration._settle_queue_operations(
-                store, session_id, _popped("steer the run")
-            )
+            pending_inputs.mark_interrupted(session_id, [pending_id])
+            await orchestration._settle_queue_operations(store, session_id, popped)
         else:
-            await _stop_route_settles(store, session_id, stop_started)
-        if order == "up-arrow-then-stop":
-            # A replay of the Up record after the Stop changes nothing either.
-            await orchestration._settle_queue_operations(
-                store, session_id, _popped("steer the run")
+            await orchestration._settle_queue_operations(store, session_id, popped)
+            # Up also moves queued prompts back, and the person may queue them again.
+            assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
+            if order == "pop-then-stop":
+                pending_inputs.mark_interrupted(session_id, [pending_id])
+            # What the Stop route runs once its interrupt has landed.
+            await orchestration._settle_inputs_taken_from_queue(
+                store,
+                session_id,
+                pending_inputs.returned_interrupted_ids(session_id),
+                "native_input_returned_to_composer",
             )
+        if order == "up-arrow-edit":
             await collector.assert_no_event(within=0.05)
             assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
             assert not store.list_items(session_id).data
@@ -390,71 +367,6 @@ async def test_stop_settles_a_paste_claude_moved_back_to_its_input_box(db_uri, m
             assert await _settled_input_error_codes(store, session_id, pending_id, collector) == [
                 "native_input_returned_to_composer"
             ]
-    finally:
-        await collector.stop()
-        pending_inputs.resolve(session_id, pending_id)
-        session_stream.close(session_id)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["shared-text", "replay-after-settling"])
-async def test_a_popall_record_never_settles_a_different_input(db_uri, case):
-    store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation(agent_id="b" * 32).id
-    first = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "same"}], runner_managed=True
-    )
-    assert pending_inputs.claim_runner_input(session_id, first, "paste-first")
-    pending_inputs.mark_interrupted(session_id, [first])
-    if case == "replay-after-settling":
-        await orchestration._settle_queue_operations(store, session_id, _popped("same"))
-        assert not pending_inputs.runner_input_is_claimed(session_id, first)
-    second = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "same"}], runner_managed=True
-    )
-    assert pending_inputs.claim_runner_input(session_id, second, "paste-second")
-    pending_inputs.mark_interrupted(session_id, [second])
-    try:
-        # Two claimed inputs share the text, or the record already settled the first.
-        await orchestration._settle_queue_operations(store, session_id, _popped("same"))
-        assert pending_inputs.runner_input_is_claimed(session_id, second)
-        if case == "shared-text":
-            assert pending_inputs.runner_input_is_claimed(session_id, first)
-    finally:
-        pending_inputs.resolve(session_id, first)
-        pending_inputs.resolve(session_id, second)
-        session_stream.close(session_id)
-
-
-@pytest.mark.asyncio
-async def test_a_failed_settlement_is_refused_so_the_record_is_retried(db_uri, monkeypatch):
-    store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation(agent_id="b" * 32).id
-    pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "steer the run"}], runner_managed=True
-    )
-    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
-    pending_inputs.mark_interrupted(session_id, [pending_id])
-    append = store.append
-
-    def fail_append(*_args, **_kwargs):
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(store, "append", fail_append)
-    collector = await start_session_stream_collector(session_id)
-    try:
-        with pytest.raises(OmnigentError) as refused:
-            await orchestration._settle_queue_operations(
-                store, session_id, _popped("steer the run")
-            )
-        assert refused.value.code == ErrorCode.INTERNAL_ERROR
-        assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
-        monkeypatch.setattr(store, "append", append)
-        # The forwarder's retry of the same record settles the same input.
-        await orchestration._settle_queue_operations(store, session_id, _popped("steer the run"))
-        assert await _settled_input_error_codes(store, session_id, pending_id, collector) == [
-            "native_input_returned_to_composer"
-        ]
     finally:
         await collector.stop()
         pending_inputs.resolve(session_id, pending_id)

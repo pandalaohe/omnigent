@@ -3343,7 +3343,6 @@ def register_events_routes(
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
             else:
-                stop_started = pending_inputs.clock()
                 delivery = _interrupt_delivery_tasks.get(session_id)
                 if delivery is None:
                     if session_id in _interrupt_fenced_sessions:
@@ -3371,7 +3370,7 @@ def register_events_routes(
                 await _settle_inputs_taken_from_queue(
                     conversation_store,
                     session_id,
-                    pending_inputs.returned_interrupted_ids(session_id, since=stop_started),
+                    pending_inputs.returned_interrupted_ids(session_id),
                     "native_input_returned_to_composer",
                 )
             if stop_codex_side_chat:

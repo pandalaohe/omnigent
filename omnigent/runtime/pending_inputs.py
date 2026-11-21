@@ -362,12 +362,8 @@ class _Entry:
     runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
-    # When Stop interrupted this input (:func:`_now` clock).
-    interrupted_at: float | None = None
-    # When a ``popAll`` record moved this input back into Claude's input box, and
-    # that record's (timestamp, text).
-    returned_at: float | None = None
-    returned_record: tuple[str, str] | None = None
+    # Claude moved this input from its queue back into its input box (``popAll``).
+    returned_to_composer: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -382,13 +378,6 @@ _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] = (
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
 )
-# Queue records already applied, by (conversation, record timestamp, text), so a
-# replayed record never selects another input.
-_applied_queue_records: WorkspaceScopedCache[tuple[str, str, str], bool] = WorkspaceScopedCache(
-    lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now)
-)
-# A Stop's own popAll reaches the server within this many seconds of its interrupt.
-_STOP_POP_WINDOW_S = 30.0
 _lock = threading.Lock()
 
 # Optional check the server wires to its cached session status; called under
@@ -1068,95 +1057,59 @@ def resolve_oldest_for_mirrored_text(
         return _drained_input(entry)
 
 
-def _queued_text_matches(entry: _Entry, text: str) -> bool:
-    """Whether Claude's queue record *text* is this input's paste."""
+def _claimed_entry_for_queued_text_locked(conversation_id: str, text: str) -> _Entry | None:
+    """The oldest claimed input whose paste Claude queued as *text*, not yet returned."""
     needle = _collapse_whitespace(text)
-    own = _collapse_whitespace(_content_text(entry.content))
-    attachments = _attachment_count(entry.content)
-    return bool(needle) and (
-        own == needle
-        or _matches_injected_prefix(entry, needle)
-        or (
-            attachments > 0
-            and bool(own)
-            and _collapse_whitespace(_strip_generated_markers(text, attachments)) == own
-        )
-    )
+    if not needle:
+        return None
+    for entry in _pending.get(conversation_id, {}).values():
+        if entry.held or entry.runner_claim_id is None or entry.returned_to_composer:
+            continue
+        own = _collapse_whitespace(_content_text(entry.content))
+        attachments = _attachment_count(entry.content)
+        if (
+            own == needle
+            or _matches_injected_prefix(entry, needle)
+            or (
+                attachments > 0
+                and bool(own)
+                and _collapse_whitespace(_strip_generated_markers(text, attachments)) == own
+            )
+        ):
+            return entry
+    return None
 
 
-def clock() -> float:
-    """Return the clock :func:`returned_interrupted_ids` compares against."""
-    return _now()
-
-
-def mark_returned_to_composer(conversation_id: str, text: str, record_time: str) -> list[str]:
+def mark_returned_to_composer(conversation_id: str, text: str) -> list[str]:
     """
     Flag the claimed input Claude moved from its queue back into its input box.
 
     Esc, Stop and Up each make Claude log one ``popAll`` record per queued
-    prompt. Only the popAll of the input's own Stop counts as not sent: it
-    arrives within :data:`_STOP_POP_WINDOW_S` after that Stop interrupted the
-    input, or after the Stop began but before its interrupt landed (see
-    :func:`returned_interrupted_ids`). A record selects at most one input,
-    never one whose text another claimed input shares, and a replay of it
-    never selects another.
+    prompt. After Up the person may queue it again, so only an input Stop
+    interrupted counts as not sent; see :func:`returned_interrupted_ids` for
+    a Stop whose interrupt lands after this record.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text: The popped prompt text.
-    :param record_time: The record's own timestamp, e.g.
-        ``"2026-11-21T05:00:00.000Z"``; with *text* it identifies the record.
-    :returns: The flagged input's id when its Stop already interrupted it,
-        else an empty list.
+    :returns: The flagged input's id when Stop already interrupted it, else
+        an empty list.
     """
-    record = (record_time, text)
     with _lock:
-        now = _now()
-        _evict_stale_locked(conversation_id, now)
-        entries = _pending.get(conversation_id, {})
-        entry = next((e for e in entries.values() if e.returned_record == record), None)
+        _evict_stale_locked(conversation_id, _now())
+        entry = _claimed_entry_for_queued_text_locked(conversation_id, text)
         if entry is None:
-            if (conversation_id, *record) in _applied_queue_records:
-                return []
-            _applied_queue_records[(conversation_id, *record)] = True
-            matches = [
-                candidate
-                for candidate in entries.values()
-                if not candidate.held
-                and candidate.runner_claim_id is not None
-                and _queued_text_matches(candidate, text)
-            ]
-            if len(matches) != 1:
-                return []
-            entry = matches[0]
-            entry.returned_at = now
-            entry.returned_record = record
-        returned_at = entry.returned_at
-        interrupted_at = entry.interrupted_at
-        if (
-            returned_at is not None
-            and interrupted_at is not None
-            and 0 <= returned_at - interrupted_at <= _STOP_POP_WINDOW_S
-        ):
-            return [entry.pending_id]
-        return []
+            return []
+        entry.returned_to_composer = True
+        return [entry.pending_id] if entry.interrupted else []
 
 
-def returned_interrupted_ids(conversation_id: str, *, since: float) -> list[str]:
-    """
-    Ids of interrupted inputs a popAll moved back into Claude's input box.
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param since: When the Stop began (:func:`clock`); an earlier popAll, such
-        as one from Up, belongs to an edit, not to this Stop.
-    """
+def returned_interrupted_ids(conversation_id: str) -> list[str]:
+    """Ids of inputs Stop interrupted that Claude moved back into its input box."""
     with _lock:
         return [
             pending_id
             for pending_id, entry in _pending.get(conversation_id, {}).items()
-            if entry.interrupted
-            and not entry.held
-            and entry.returned_at is not None
-            and entry.returned_at >= since
+            if entry.interrupted and entry.returned_to_composer and not entry.held
         ]
 
 
@@ -1201,7 +1154,6 @@ def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
             entry = entries.get(pending_id)
             if entry is not None and not entry.held:
                 entry.interrupted = True
-                entry.interrupted_at = _now()
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:
@@ -1780,4 +1732,3 @@ def reset_for_tests() -> None:
     with _lock:
         _pending.clear()
         _unconfirmed_input_texts.clear()
-        _applied_queue_records.clear()
