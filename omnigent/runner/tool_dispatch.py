@@ -7489,12 +7489,6 @@ async def _execute_timer_set(
 _TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
 
-# Poll interval and cap while a successor's delivery is held for its handover
-# opening; the opening normally lands within seconds.
-_TIMER_HELD_POLL_S = 1.0
-_TIMER_HELD_MAX_POLLS = 60
-
-
 async def _settle_timer_holder(
     timer_id: str,
     session_id: str,
@@ -7506,9 +7500,7 @@ async def _settle_timer_holder(
     Settle which session a due timer fires into and that session's state.
 
     A committed handover can move the timer while a check is in flight, so a
-    check counts only for the holder it asked about. A successor still held
-    for its handover opening is checked again each poll and gets the firing
-    once released, or after ``_TIMER_HELD_MAX_POLLS`` polls.
+    check counts only for the holder it asked about.
 
     :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
     :param session_id: The holder last fired into.
@@ -7520,22 +7512,16 @@ async def _settle_timer_holder(
     from omnigent.runner import app as _app
 
     holder = _app.timer_session(timer_id, session_id)
-    polls = 0
     while True:
         archived = await flows.session_lineage_archived(
             server_client, holder, report_missing=holder != origin
         )
         current = _app.timer_session(timer_id, holder)
-        if current != holder:
-            holder = current
-            continue
-        if archived:
-            return holder, "archived"
-        if not _app.succession_held(holder) or polls >= _TIMER_HELD_MAX_POLLS:
+        if current == holder:
+            if archived:
+                return holder, "archived"
             return holder, "missing" if archived is None else "ok"
-        polls += 1
-        await asyncio.sleep(_TIMER_HELD_POLL_S)
-        holder = _app.timer_session(timer_id, holder)
+        holder = current
 
 
 async def _timer_loop(
@@ -7612,12 +7598,14 @@ async def _timer_loop(
                         await asyncio.sleep(retry_delay_s)
                         # Nothing was sent: a handover during the wait moves the retry.
                         holder = _app.timer_session(timer_id, conversation_id)
-                        if holder != conversation_id or _app.succession_held(holder):
+                        if holder != conversation_id:
                             conversation_id, state = await _settle_timer_holder(
                                 timer_id, holder, origin=origin, server_client=server_client
                             )
                             if state == "archived":
                                 break
+                            if state == "ok":
+                                missing_holder = None
                         continue
                     _logger.warning(
                         "Timer %s firing persist failed for %s",

@@ -2033,16 +2033,6 @@ def timer_session(timer_id: str, session_id: str) -> str:
     return session_id
 
 
-def succession_held(session_id: str) -> bool:
-    """
-    Return whether a successor's delivery is held until its handover opening is out.
-
-    :param session_id: Session that would receive a delivery.
-    :returns: ``True`` between this runner's re-key and its release for the session.
-    """
-    return session_id in _held_successions
-
-
 def move_session_timers(
     session_id: str, target_session_id: str, *, keep: set[str]
 ) -> list[_JsonObject]:
