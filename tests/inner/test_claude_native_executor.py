@@ -2668,6 +2668,90 @@ async def test_cancelled_delivery_cannot_reap_a_pane_advertised_during_drain(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worker_outcome", ["submit-confirmed", "submit-blind", "interrupted"])
+async def test_stop_during_a_paste_reports_uncertain_only_when_the_worker_did_not_confirm(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path, worker_outcome: str
+) -> None:
+    loop = asyncio.get_running_loop()
+    pasted = asyncio.Event()
+    kills: list[Path] = []
+
+    def inject(*_args: object, **_kwargs: object) -> bool:
+        paste_started = claude_bridge._INJECTION_PASTE_STARTED.get()
+        cancel_event = claude_bridge._INJECTION_CANCEL_EVENT.get()
+        assert paste_started is not None and cancel_event is not None
+        paste_started.set()
+        loop.call_soon_threadsafe(pasted.set)
+        # Stop lands while the worker is finishing the submit check.
+        assert cancel_event.wait(5)
+        if worker_outcome == "interrupted":
+            claude_bridge._check_injection_cancelled()
+        # A blind Enter returns normally without submit evidence.
+        return worker_outcome == "submit-confirmed"
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda bridge_dir, **_: kills.append(bridge_dir)
+    )
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+    events: list[Any] = []
+
+    async def deliver() -> None:
+        async for event in executor.run_turn([{"role": "user", "content": "hello"}], [], ""):
+            events.append(event)
+
+    task = asyncio.create_task(deliver())
+    try:
+        async with asyncio.timeout(5):
+            await pasted.wait()
+            task.cancel()
+            if worker_outcome == "submit-confirmed":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    if worker_outcome == "submit-confirmed":
+        # Delivered: only the Stop stands, with no "delivery uncertain" card.
+        assert events == []
+    else:
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].code == "claude_delivery_unconfirmed"
+        assert events[0].preserve_session and not events[0].undelivered
+    assert kills == []
+    assert not executor._inject_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_busy_pane_refusal_returns_the_message_to_the_runner_queue(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    kills: list[Path] = []
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise claude_bridge.ClaudeInputBoxBusy("Claude Code's input box is hidden while it works.")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", refuse)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda bridge_dir, **_: kills.append(bridge_dir)
+    )
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+
+    events = [
+        event async for event in executor.run_turn([{"role": "user", "content": "hello"}], [], "")
+    ]
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].code == "claude_input_busy"
+    assert events[0].undelivered and events[0].preserve_session
+    assert kills == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", ["socket", "native-session"])
 async def test_prompt_timeout_rechecks_ownership_when_reaping(
     tmp_path: Path,

@@ -39,6 +39,7 @@ import {
   hasSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
+import { peekRestoredSend, rememberRestoredSend } from "@/lib/unsentSends";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -6915,6 +6916,33 @@ describe("Composer reply quotes", () => {
       expect(useChatStore.getState().pendingRetryStableId).toBeNull();
     },
   );
+
+  it("drops text a previous page restored once the reloaded tracker proves its send delivered", async () => {
+    const stableId = "c".repeat(32);
+    // The reload kept the composer's text, and the bind tracked its send again.
+    setSessionDraft("conv_test", { text: "resend me", files: [] });
+    rememberRestoredSend("conv_test", { stableId, text: "resend me", authorId: "user-a" });
+    render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("resend me");
+
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          serverRefused: true,
+          delivered: true,
+        },
+      }),
+    );
+
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(peekRestoredSend("conv_test")).toBeNull();
+    await waitFor(() => expect(getSessionDraft("conv_test")).toBeUndefined());
+  });
 
   it("keeps the user's edits when the delivered retraction lands", () => {
     const stableId = "d".repeat(32);

@@ -69,8 +69,10 @@ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
   clearUnsentSends,
   peekQueuedSends,
+  peekRestoredSend,
   peekUnsentSend,
   rememberQueuedSends,
+  rememberRestoredSend,
   rememberUnsentSend,
 } from "@/lib/unsentSends";
 import {
@@ -8355,6 +8357,26 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
     expect(errorCards()).toEqual([]);
+  });
+
+  it("keeps a restored native draft's send identity for a reload until the composer is resubmitted", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    try {
+      const stableId = await failNativeSend("ship it");
+      takeFailedSendDraft("conv_existing", false);
+      expect(peekRestoredSend("conv_existing")).toEqual({
+        stableId,
+        text: "ship it",
+        authorId: "user_a",
+      });
+
+      await useChatStore.getState().send("something new", "agent_xyz");
+
+      expect(peekRestoredSend("conv_existing")).toBeNull();
+    } finally {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+      clearUnsentSends();
+    }
   });
 
   it("drops a failed native draft before it is restored once the mirror naming its send commits", async () => {
@@ -28121,6 +28143,138 @@ describe("a send cut off by a reload", () => {
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
+
+  it("retracts a draft a previous page restored once the snapshot holds the mirror naming its send", async () => {
+    // The send failed in the UI, its text went back to the composer, then the tab reloaded.
+    seedSession("conv_reload", [
+      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      conversationId: "conv_reload",
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      delivered: true,
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("keeps a reloaded draft until a mirror names its send, not on a persisted item alone", async () => {
+    // The server persists a refused send too; after a reload that refusal may be gone.
+    seedSession("conv_reload", [
+      { ...userMessage("refused", "rerun the failing test"), id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId: "stable_restored",
+      delivered: false,
+    });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "1".repeat(32),
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "rerun the failing test" }],
+        web_stable_id: "stable_restored",
+      },
+      createdBy: "user@example.com",
+      webStableId: "stable_restored",
+    });
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId: "stable_restored",
+      delivered: true,
+    });
+  });
+
+  it("does not track a reloaded draft another account's page restored", async () => {
+    seedSession("conv_reload", [
+      { ...userMessage("delivered", "rerun the failing test"), web_stable_id: "stable_restored" },
+    ]);
+    rememberRestoredSend("conv_reload", {
+      stableId: "stable_restored",
+      text: "rerun the failing test",
+      authorId: "user_b",
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(peekRestoredSend("conv_reload")).toBeNull();
+  });
+
+  it.each([
+    ["the sender", "user_a"],
+    ["another account", "user_b"],
+  ])(
+    "settles a receipt that beats identity, then keeps the draft only for %s",
+    async (_viewer, viewerId) => {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+      let identityChanged: (() => void) | undefined;
+      vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+        identityChanged = listener;
+        return () => {};
+      });
+      // The snapshot holds no proof yet; the receipt arrives before `/v1/me` answers.
+      seedSession("conv_reload", []);
+      rememberRestoredSend("conv_reload", {
+        stableId: "stable_restored",
+        text: "rerun the failing test",
+        authorId: "user_a",
+      });
+
+      await useChatStore.getState().switchTo("conv_reload");
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId: "stable_restored",
+        delivered: false,
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "1".repeat(32),
+        itemType: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "rerun the failing test" }],
+          web_stable_id: "stable_restored",
+        },
+        createdBy: "user@example.com",
+        webStableId: "stable_restored",
+      });
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId: "stable_restored",
+        delivered: true,
+      });
+
+      vi.mocked(getCurrentUserId).mockReturnValue(viewerId);
+      identityChanged!();
+
+      if (viewerId === "user_a") {
+        expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+          stableId: "stable_restored",
+          delivered: true,
+        });
+        expect(peekRestoredSend("conv_reload")?.stableId).toBe("stable_restored");
+      } else {
+        expect(useChatStore.getState().restoredSendDraft).toBeNull();
+        expect(peekRestoredSend("conv_reload")).toBeNull();
+      }
+    },
+  );
 
   it("keeps each queued message for the next load until it leaves the queue", async () => {
     seedSession("conv_queue", []);

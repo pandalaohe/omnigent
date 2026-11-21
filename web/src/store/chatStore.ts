@@ -132,11 +132,15 @@ import {
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  forgetRestoredSend,
   forgetUnsentSend,
   peekQueuedSends,
+  peekRestoredSend,
   peekUnsentSend,
   rememberQueuedSends,
+  rememberRestoredSend,
   rememberUnsentSend,
+  type RestoredSend,
 } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -2444,6 +2448,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
     const offScreen = targetId !== undefined && targetId !== get().conversationId;
+    forgetRestoredSend(conversationId);
     target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
@@ -2844,6 +2849,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (retryId !== null || restoredDraft !== null) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
+    const composerConversationId =
+      restoredDraft?.conversationId ?? pinnedId ?? get().conversationId;
+    if (composerConversationId !== null) forgetRestoredSend(composerConversationId);
     // A restored failed send keeps its stable id only when resent untouched:
     // the server persists a web send under that id and dedupes a repeat, so an
     // edited body under the old id would run without ever being persisted.
@@ -5731,6 +5739,7 @@ async function bindStream(
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
+    const reloadedSend = hydratePending ? restoredSendAfterReload(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(
@@ -5859,6 +5868,9 @@ async function bindStream(
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
+          : {}),
+        ...(reloadedSend !== null && state.restoredSendDraft === null
+          ? { restoredSendDraft: reloadedSend }
           : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
@@ -8739,7 +8751,7 @@ export function takeFailedSendDraft(
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
-  if (tracked && failed.stableId)
+  if (tracked && failed.stableId) {
     patch.restoredSendDraft = {
       conversationId,
       stableId: failed.stableId,
@@ -8750,6 +8762,22 @@ export function takeFailedSendDraft(
       serverRefused: failed.serverRefused,
       delivered: false,
     };
+    // A reload keeps the composer's text but not its files, so only plain text is tracked.
+    const textOnly =
+      failed.files.length === 0 &&
+      !failed.composerParts?.some((part) => part.type === "attachment");
+    const authorId = getCurrentUserId();
+    if (textOnly && authorId !== null) {
+      rememberRestoredSend(conversationId, {
+        stableId: failed.stableId,
+        text: failed.text,
+        authorId,
+        ...(failed.replyDraft ? { replyDraft: failed.replyDraft } : {}),
+      });
+    } else {
+      forgetRestoredSend(conversationId);
+    }
+  }
   setterFor(conversationId)(patch);
   return restore ? failed : null;
 }
@@ -8913,6 +8941,65 @@ function unsentSendToRestore(
     serverRefused: false,
     recovered: true,
   };
+}
+
+/**
+ * Track again a failed send that a previous page of this tab restored into the composer.
+ *
+ * The reload kept the composer's text but lost the tracker, and with it any refusal
+ * seen since, so the send counts as refused: only an item naming it (`web_stable_id`)
+ * or a live acknowledgement retracts the text, never a persisted item alone.
+ *
+ * @param conversationId - The session being bound.
+ * @param items - The snapshot's committed items.
+ * @returns The tracker the composer's retraction reads, or `null`.
+ */
+function restoredSendAfterReload(
+  conversationId: string,
+  items: readonly ConversationItem[],
+): ConversationState["restoredSendDraft"] {
+  const send = peekRestoredSend(conversationId);
+  if (send === null) return null;
+  const viewerId = getCurrentUserId();
+  // Another account may have signed in to this tab since.
+  if (viewerId !== null && send.authorId !== viewerId) {
+    forgetRestoredSend(conversationId);
+    return null;
+  }
+  // Tracked from the bind on, so a receipt that beats `/v1/me` still retracts the text.
+  if (viewerId === null) dropRestoredSendOnceForeign(conversationId, send);
+  return {
+    conversationId,
+    stableId: send.stableId,
+    text: send.text,
+    files: [],
+    ...(send.replyDraft ? { replyDraft: send.replyDraft } : {}),
+    serverRefused: true,
+    delivered: confirmedWebSendIds(items).includes(send.stableId),
+  };
+}
+
+/**
+ * Drop a reloaded draft's record and tracker once `/v1/me` names an account other
+ * than its sender; the sender keeps both.
+ *
+ * @param conversationId - The session whose bind tracked the send.
+ * @param send - The restored send the bind tracked.
+ */
+function dropRestoredSendOnceForeign(conversationId: string, send: RestoredSend): void {
+  const unsubscribe = subscribeIdentity(() => {
+    const viewerId = getCurrentUserId();
+    if (viewerId === null) return;
+    unsubscribe();
+    if (viewerId === send.authorId) return;
+    if (peekRestoredSend(conversationId)?.stableId === send.stableId) {
+      forgetRestoredSend(conversationId);
+    }
+    if (isConversationDisposed(conversationId)) return;
+    setterFor(conversationId)((state) =>
+      state.restoredSendDraft?.stableId === send.stableId ? { restoredSendDraft: null } : {},
+    );
+  });
 }
 
 /**

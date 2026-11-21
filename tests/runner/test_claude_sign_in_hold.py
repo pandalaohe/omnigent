@@ -985,6 +985,120 @@ async def test_followup_reaches_a_running_turn_once_its_hidden_input_box_repaint
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
 
 
+_HIDDEN_BOX_RUNNING_PANE = (
+    "✻ Sautéing… (40s · esc to interrupt)\nlauncher: refreshing credentials\n"
+)
+_BUSY_REFUSED = [
+    _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+    _sse(
+        {
+            "type": "response.failed",
+            "response": {"status": "failed"},
+            "error": {
+                "code": "claude_input_busy",
+                "message": "Claude Code's input box is hidden while it works.",
+                "undelivered": True,
+            },
+        }
+    ),
+]
+
+
+@pytest.mark.asyncio
+async def test_message_a_busy_pane_refused_goes_back_to_the_queue_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The box hid after the queue let the message through; it waits in the queue again."""
+    harness = _PausedStreamHarness([_BUSY_REFUSED, _DELIVERED])
+    app, _harness, _server = _build_app([_BUSY_REFUSED, _DELIVERED], harness=harness)
+    sid = uuid.uuid4().hex
+    pane = _RUNNING_TURN_PANE
+    hidden_reads = 0
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def capture(*_args: object, **_kwargs: object) -> str:
+        nonlocal hidden_reads
+        if pane == _HIDDEN_BOX_RUNNING_PANE:
+            hidden_reads += 1
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 1)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        assert reply.json()["status"] == "accepted"
+        await asyncio.wait_for(harness.frames_sent.wait(), budget(5))
+        pane = _HIDDEN_BOX_RUNNING_PANE
+        harness.resume.set()
+        # The queue holds the message while the busy pane keeps its box hidden.
+        await _until(lambda: hidden_reads >= 3)
+        assert len(harness.posted_bodies) == 1
+        assert [m["content"][0]["text"] for m in app.state.session_message_buffers[sid]] == [
+            "first"
+        ]
+        published = _published(app, sid)
+        assert not [e for e in published if e.get("type") == "response.failed"]
+        assert not [
+            e for e in published if e.get("type") == "session.status" and e["status"] == "failed"
+        ]
+        pane = _RUNNING_TURN_PANE
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
+    resent_history = [item for item in harness.posted_bodies[1]["content"] if "content" in item]
+    assert [item["content"][0]["text"] for item in resent_history].count("first") == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_drops_a_message_a_busy_pane_handed_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archiving while the queue holds a busy pane's message keeps it from ever being sent."""
+    monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *_a, **_k: None)
+    harness = _PausedStreamHarness([_BUSY_REFUSED, _DELIVERED])
+    app, _harness, _server = _build_app([_BUSY_REFUSED, _DELIVERED], harness=harness)
+    sid = uuid.uuid4().hex
+    pane = _RUNNING_TURN_PANE
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: pane)
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 1)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await asyncio.wait_for(harness.frames_sent.wait(), budget(5))
+        pane = _HIDDEN_BOX_RUNNING_PANE
+        harness.resume.set()
+        await _until(
+            lambda: (
+                bool(app.state.session_message_buffers.get(sid))
+                and sid not in app.state.active_turns
+            )
+        )
+        released = await client.post(
+            f"/v1/sessions/{sid}/cli-retention/release", json={"reason": "archive"}
+        )
+        assert released.status_code == 200
+        # The box comes back after the archive.
+        pane = _RUNNING_TURN_PANE
+        await asyncio.sleep(0.1)  # custom-lint: disable=sleep-then-assert -- no send in window
+
+    assert len(harness.posted_bodies) == 1
+    assert not app.state.session_message_buffers.get(sid)
+    assert sid not in app.state.claude_prompt_waiters
+
+
 @pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

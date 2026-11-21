@@ -42,6 +42,9 @@ class _Clock:
     def monotonic(self) -> float:
         return self.now
 
+    def time(self) -> float:
+        return self.now
+
     def sleep(self, seconds: float) -> None:
         self.now += seconds
 
@@ -121,6 +124,150 @@ def test_unanswered_repaint_is_not_counted(clock: _Clock, monkeypatch: pytest.Mo
         bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "main", timeout_s=30.0)
 
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    ("queue_when_busy", "running"),
+    [(True, True), (True, False), (False, True)],
+    ids=["message-busy-pane", "message-idle-pane", "command-busy-pane"],
+)
+def test_busy_pane_that_hides_its_box_hands_a_message_back_instead_of_timing_out(
+    clock: _Clock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    queue_when_busy: bool,
+    running: bool,
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_tmux_target(
+        bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0"
+    )
+    repainted_at: list[float] = []
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(
+        bridge, "_request_claude_repaint", lambda *_: repainted_at.append(clock.now) or 1
+    )
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: running)
+
+    def wait() -> None:
+        bridge._wait_for_claude_prompt_ready(
+            "/tmp/test.sock",
+            "main",
+            timeout_s=30.0,
+            bridge_dir=bridge_dir,
+            extend_for_slow_boot=False,
+            queue_when_busy=queue_when_busy,
+        )
+
+    if queue_when_busy and running:
+        with pytest.raises(bridge.ClaudeInputBoxBusy):
+            wait()
+        # Refused on the first capture after the repaint, long before the budget.
+        assert [round(at) for at in repainted_at] == [5]
+        assert clock.now < 6.0
+    else:
+        # An idle pane, or a command's own wait, keeps today's readiness timeout.
+        with pytest.raises(bridge.ClaudePromptTimeout):
+            wait()
+        assert clock.now >= 30.0
+
+
+@pytest.mark.parametrize(
+    ("running", "wrote_paste"),
+    [(True, False), (False, False), (True, True)],
+    ids=["busy-before-claim", "idle-before-claim", "busy-after-a-paste"],
+)
+def test_box_hidden_after_the_readiness_gate_requeues_only_before_the_claim(
+    clock: _Clock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+    wrote_paste: bool,
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    socket_path = tmp_path / "tmux.sock"
+    bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="claude:0.0")
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: running)
+    monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda *_: False)
+
+    class _Claimed(Exception):
+        pass
+
+    claims: list[bool] = []
+
+    def claim() -> None:
+        claims.append(True)
+        raise _Claimed
+
+    monkeypatch.setattr(bridge, "_claim_message_delivery", claim)
+    owner = bridge._MessagePane(
+        bridge_dir, str(socket_path), "claude:0.0", None, None, wrote_paste=wrote_paste
+    )
+    token = bridge._MESSAGE_PANE.set(owner)
+    try:
+        refused = running and not wrote_paste
+        with pytest.raises(bridge.ClaudeInputBoxBusy if refused else _Claimed):
+            bridge._paste_and_submit(
+                bridge_dir,
+                str(socket_path),
+                "claude:0.0",
+                text="hello",
+                needle=bridge._submit_needle("hello"),
+            )
+    finally:
+        bridge._MESSAGE_PANE.reset(token)
+    # Only an unclaimed, untyped message goes back; a later paste keeps today's path.
+    assert claims == ([] if refused else [True])
+
+
+def test_retry_of_a_claimed_message_is_not_handed_back_when_the_box_hides(
+    clock: _Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    pane = _READY_PANE
+    readiness_queues: list[bool] = []
+    claims: list[bool] = []
+    clears: list[bool] = []
+
+    class _Typed(Exception):
+        pass
+
+    def ready(*_args: object, queue_when_busy: bool = False, **_kwargs: object) -> None:
+        readiness_queues.append(queue_when_busy)
+
+    def clear(*_args: object, **_kwargs: object) -> None:
+        clears.append(True)
+        if len(clears) == 1:
+            raise bridge.ClaudeComposerNotCleared("Claude's input box hid before it was cleared.")
+        raise _Typed
+
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    monkeypatch.setattr(bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda *_: False)
+    monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
+    monkeypatch.setattr(bridge, "_claim_message_delivery", lambda: claims.append(True))
+    monkeypatch.setattr(bridge, "_clear_composer", clear)
+
+    with bridge.message_readiness_budget(30.0):
+        # Claimed, then the box hid before the clear: the turn holds and retries.
+        with pytest.raises(bridge.ClaudeComposerNotCleared):
+            bridge.inject_user_message(bridge_dir, content="hello")
+        pane = _OVERDRAWN_PANE
+        # The retry keeps the claimed message on its own path instead of requeueing it.
+        with pytest.raises(_Typed):
+            bridge.inject_user_message(bridge_dir, content="hello")
+
+    assert readiness_queues == [True, False]
+    assert claims == [True, True]
 
 
 def test_repaint_requests_reach_the_delivery_summary(
