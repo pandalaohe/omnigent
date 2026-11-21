@@ -478,6 +478,84 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_refused_turn_input_ends_turn_without_failure_or_result(
+    monkeypatch, native, accepted
+):
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.subagent_work import _SubagentDeliveryAck
+
+    terminals, started = [], []
+
+    def record_terminal(child, **_kwargs):
+        terminals.append(child)
+        return _SubagentDeliveryAck(entry=None, delivered=True, delivered_now=False, reason="test")
+
+    monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
+    monkeypatch.setattr(runner_app, "mark_subagent_work_terminal", record_terminal)
+    monkeypatch.setattr(runner_app, "mark_subagent_work_started", started.append)
+    deadline = time.time() + 30
+    input_id, session_id = "f" * 32, "child"
+    claim = InputExecutionClaim(
+        input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
+    )
+
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/input-admission"):
+                receipt = (
+                    InputExecutionReceipt(state="accepted", reason="accepted")
+                    if accepted
+                    else InputExecutionReceipt(reason="input_closed")
+                )
+                return httpx.Response(
+                    200,
+                    json=receipt.model_dump(),
+                    request=httpx.Request("POST", "http://server" + url),
+                )
+            return await super().post(url, **kwargs)
+
+    event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
+    frames = [
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_multiturn"}}\n\n',
+        "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
+    ]
+    harness = _ScriptedHarnessClient(frames)
+    app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
+    async with _runner_test_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "content": [{"type": "input_text", "text": "[System: host load] notice"}],
+                "input_id": input_id,
+                "input_admission_required": True,
+                "input_admission_deadline": deadline,
+            },
+        )
+    assert response.status_code == 200
+    queue = app.state.session_event_queues.get(session_id)
+    statuses = []
+    while queue is not None and not queue.empty():
+        published = queue.get_nowait()
+        if published.get("type") == "session.status":
+            statuses.append(published.get("status"))
+    assert "failed" not in statuses
+    if not native:
+        assert statuses[-1:] == ["idle"]
+    if accepted:
+        assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
+    else:
+        assert (started, terminals) == ([], [])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["accepted", "refused", "unknown", "superseded"])
 async def test_injection_reservation_releases_only_definite_refusal(db_uri, outcome):
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore

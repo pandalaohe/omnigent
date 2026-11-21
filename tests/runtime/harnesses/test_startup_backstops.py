@@ -213,6 +213,41 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_refused_turn_admission_ends_unrun_without_failure(accepted):
+    runs = []
+
+    class Harness(_scaffold.HarnessApp):
+        async def run_turn(self, request, ctx):
+            runs.append(request)
+
+    harness = Harness()
+    ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
+    request = CreateResponseRequest(
+        model="agent",
+        input="notice",
+        input_id="e" * 32,
+        input_admission_required=True,
+        input_admission_deadline=time.time() + 30,
+    )
+    run_task = asyncio.create_task(harness._guarded_run_turn(request, ctx))
+    event = await asyncio.wait_for(ctx._event_queue.get(), 3)
+    assert event.claim.boundary == "receiver"
+    receipt = (
+        InputExecutionReceipt(state="accepted", reason="accepted")
+        if accepted
+        else InputExecutionReceipt(reason="input_closed")
+    )
+    assert ctx._complete_input_claim(event.claim_id, receipt)
+    await asyncio.wait_for(run_task, 3)
+    assert runs == ([request] if accepted else [])
+    terminal = await harness._build_terminal_event(
+        ctx, model="agent", run_task=run_task, sequence=2
+    )
+    assert terminal.type == "response.completed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("adapter", [False, True])
 @pytest.mark.parametrize("previous_response", [False, True])
 async def test_live_injection_ingress_keeps_non_executor_admission(adapter, previous_response):
