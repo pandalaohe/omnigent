@@ -268,6 +268,48 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
         await collector.stop()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_state", ["lapsed", "interrupted"])
+async def test_a_completion_after_the_claim_ends_marks_nothing_received(
+    db_uri, monkeypatch, claim_state
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "paste", runner_id="runner_a")
+    if claim_state == "lapsed":
+        # The lease lapsed; its cleanup has not settled the entry yet.
+        now = 721.0
+        assert not pending_inputs.claim_runner_input(session_id, pending_id, "paste")
+    else:
+        pending_inputs.mark_interrupted(session_id, [pending_id])
+    collector = await start_session_stream_collector(session_id)
+    try:
+        orchestration._record_native_input_lifecycle(
+            session_id,
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_paste"},
+                "pending_id": pending_id,
+                "delivery_attempt_id": attempt_id,
+                "input_received": True,
+            },
+        )
+        await collector.assert_no_event(within=0.05)
+    finally:
+        await collector.stop()
+    assert pending_inputs.agent_received(session_id, pending_id) is None
+    assert all("received" not in entry for entry in pending_inputs.snapshot_for(session_id))
+    pending_inputs.resolve(session_id, pending_id)
+
+
 def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app

@@ -248,7 +248,7 @@ export function buildPendingBubbles(
       ...((p.sentMidTurn && sendingSinceMs === undefined) || p.received
         ? { awaitingAgent: true }
         : {}),
-      ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.stillSending && p.posted !== true && !p.received ? { stillSending: true } : {}),
       ...(sendingSinceMs === undefined ? {} : { sendingSinceMs }),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),

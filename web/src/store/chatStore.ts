@@ -3243,8 +3243,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // took it, whatever became of the POST's answer.
       const ownBlocks =
         draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
+      // The runner confirmed its terminal holds this send; only the mirror is pending.
+      const receivedByAgent = draftState.pendingUserMessages.some(
+        (p) => p.tempId === tempId && p.received === true,
+      );
       let deliveredDespiteFailure =
-        inFlightSends.get(stableId) === true || mirrorNamesSend(ownBlocks, stableId);
+        receivedByAgent ||
+        inFlightSends.get(stableId) === true ||
+        mirrorNamesSend(ownBlocks, stableId);
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
@@ -3296,9 +3302,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      // Roll back the optimistic bubble — no server idle will fire. A received
+      // send keeps its bubble until its mirror commits it.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: receivedByAgent
+          ? s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, stillSending: false } : p,
+            )
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       const native = failGet().isNativeTerminalSession;
       if (native && deliveredDespiteFailure) return true;
@@ -10234,11 +10245,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ((p.pendingId ?? p.tempId) === event.pendingId ||
             (event.stableId !== undefined && p.stableId === event.stableId)) &&
           (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
-            (event.received === true && !p.received))
+            (event.received === true && !p.received) ||
+            (p.pendingId === undefined && p.tempId !== event.pendingId))
             ? {
                 ...p,
                 sendingSinceMs: event.sinceMs ?? undefined,
                 ...(event.received === true ? { received: true } : {}),
+                // Bind the server id early so a reconnect before the POST returns
+                // still finds this bubble in the snapshot; tempId stays the React key.
+                ...(p.pendingId === undefined && p.tempId !== event.pendingId
+                  ? { pendingId: event.pendingId }
+                  : {}),
               }
             : p,
         ),

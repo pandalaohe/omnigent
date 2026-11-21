@@ -9249,6 +9249,48 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     expect(bubble).not.toHaveProperty("sendingSinceMs");
   });
 
+  it("keeps a received send's bubble when its POST answer is lost", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      isNativeTerminalSession: true,
+    });
+    let failPost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((_resolve, reject) => {
+          failPost = () => reject(new TypeError("Failed to fetch"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await tick();
+    const [sent] = useChatStore.getState().pendingUserMessages;
+    handleSessionEvent({
+      type: "session_input_sending",
+      pendingId: "pending_lost",
+      sinceMs: 1_710_000_000_000,
+      received: true,
+      stableId: sent!.stableId!,
+    });
+    failPost();
+    await sendPromise;
+
+    const state = useChatStore.getState();
+    // Only the mirror is pending: no restored draft, the bubble keeps waiting.
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.pendingUserMessages).toMatchObject([
+      { tempId: sent!.tempId, pendingId: "pending_lost", received: true },
+    ]);
+    const [bubble] = buildPendingBubbles(state.pendingUserMessages, null);
+    expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("stillSending");
+  });
+
   it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
     const since = 1_710_000_000_000;
     const content = [{ type: "input_text" as const, text: "steer" }];
@@ -22069,6 +22111,77 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sinks[0]!.error();
     await drainAsync();
     expect(useChatStore.getState().pendingUserMessages).toEqual([keep]);
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps an early-received send through a reconnect before its POST returns", async () => {
+    const id = "conv_early_received";
+    seedSession(id, []);
+    const sinks = routeStreamOpens();
+    const streamRoute = fetchMock.getMockImplementation()!;
+    let resolvePost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith(`/v1/sessions/${id}/events`)) {
+        return new Promise<Response>((resolve) => {
+          resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_early" }));
+        });
+      }
+      return streamRoute(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      isNativeTerminalSession: true,
+      sessionStatus: "idle",
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    const sendPromise = useChatStore.getState().send("steer", "agent_xyz");
+    await drainAsync();
+    const [sent] = useChatStore.getState().pendingUserMessages;
+    const since = 1_710_000_000_000;
+    handleSessionEvent(
+      {
+        type: "session_input_sending",
+        pendingId: "pending_early",
+        sinceMs: since,
+        received: true,
+        stableId: sent!.stableId!,
+      },
+      id,
+    );
+    // The early confirmation binds the server id; the temp id stays the React key.
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+      tempId: sent!.tempId,
+      pendingId: "pending_early",
+      received: true,
+    });
+
+    seedPendingInputs(id, [
+      {
+        pending_id: "pending_early",
+        content: sent!.content,
+        stable_id: sent!.stableId!,
+        sending_since_ms: since,
+        received: true,
+      },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      sent!.tempId,
+    ]);
+
+    resolvePost();
+    await drainAsync();
+    await sendPromise;
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { tempId: sent!.tempId, pendingId: "pending_early", received: true, posted: true },
+    ]);
     sinks[1]!.push("data: [DONE]\n\n");
     sinks[1]!.close();
     await drainAsync(2);

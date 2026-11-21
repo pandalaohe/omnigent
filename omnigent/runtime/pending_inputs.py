@@ -848,6 +848,10 @@ def mark_lifecycle(
                 input_received
                 and delivery_attempt_id is not None
                 and entry.runner_claim_id is not None
+                and not entry.interrupted
+                and entry.last_runner_renewal is not None
+                # A lapsed claim waits for its cleanup to settle it as uncertain.
+                and _now() - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
             ):
                 entry.agent_received = True
             return entry.pending_id

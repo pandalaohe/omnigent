@@ -558,6 +558,12 @@ describe("buildPendingBubbles", () => {
       expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
       expect(bubble.sendingSinceMs).toBeUndefined();
     }
+    // A slow POST does not bring back "Still sending…" once the agent has the input.
+    const [slowPost] = buildPendingBubbles(
+      [{ ...pending[0]!, stillSending: true, received: true }],
+      null,
+    ) as Extract<Bubble, { kind: "user" }>[];
+    expect(slowPost!.stillSending).toBeUndefined();
   });
 });
 
