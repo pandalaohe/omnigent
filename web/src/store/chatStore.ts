@@ -1053,6 +1053,11 @@ export interface ConversationState {
     /** Carried over from `failedSendDraft.serverRefused`; see there. */
     serverRefused?: boolean;
     delivered: boolean;
+    /**
+     * A reloaded send whose sender `/v1/me` has not confirmed yet. Delivery still
+     * records; the composer clears only once the viewer proves to be the sender.
+     */
+    senderUnconfirmed?: boolean;
   } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
@@ -8966,8 +8971,8 @@ function restoredSendAfterReload(
     forgetRestoredSend(conversationId);
     return null;
   }
-  // Tracked from the bind on, so a receipt that beats `/v1/me` still retracts the text.
-  if (viewerId === null) dropRestoredSendOnceForeign(conversationId, send);
+  // Tracked from the bind on, so a receipt that beats `/v1/me` still records delivery.
+  if (viewerId === null) confirmRestoredSendSender(conversationId, send);
   return {
     conversationId,
     stableId: send.stableId,
@@ -8976,29 +8981,32 @@ function restoredSendAfterReload(
     ...(send.replyDraft ? { replyDraft: send.replyDraft } : {}),
     serverRefused: true,
     delivered: confirmedWebSendIds(items).includes(send.stableId),
+    ...(viewerId === null ? { senderUnconfirmed: true } : {}),
   };
 }
 
 /**
- * Drop a reloaded draft's record and tracker once `/v1/me` names an account other
- * than its sender; the sender keeps both.
+ * Settle a reloaded draft's sender once `/v1/me` names the viewer: the sender's
+ * composer may then retract the text; another account drops the record and tracker.
  *
  * @param conversationId - The session whose bind tracked the send.
  * @param send - The restored send the bind tracked.
  */
-function dropRestoredSendOnceForeign(conversationId: string, send: RestoredSend): void {
+function confirmRestoredSendSender(conversationId: string, send: RestoredSend): void {
   const unsubscribe = subscribeIdentity(() => {
     const viewerId = getCurrentUserId();
     if (viewerId === null) return;
     unsubscribe();
-    if (viewerId === send.authorId) return;
-    if (peekRestoredSend(conversationId)?.stableId === send.stableId) {
+    const foreign = viewerId !== send.authorId;
+    if (foreign && peekRestoredSend(conversationId)?.stableId === send.stableId) {
       forgetRestoredSend(conversationId);
     }
     if (isConversationDisposed(conversationId)) return;
-    setterFor(conversationId)((state) =>
-      state.restoredSendDraft?.stableId === send.stableId ? { restoredSendDraft: null } : {},
-    );
+    setterFor(conversationId)((state) => {
+      const tracked = state.restoredSendDraft;
+      if (tracked?.stableId !== send.stableId) return {};
+      return { restoredSendDraft: foreign ? null : { ...tracked, senderUnconfirmed: false } };
+    });
   });
 }
 
