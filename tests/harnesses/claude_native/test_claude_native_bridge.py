@@ -7452,6 +7452,25 @@ def test_inject_user_message_submits_the_status_line_clipped_draft_once(
     assert mutations == ["paste", "submit"]
 
 
+# Status-line content that reads like a dismissal hint, with no overlay on screen.
+_STATUS_LINE_ESC_TEXT_PANE = _STATUS_LINE_CLIPPED_PANE.replace(
+    "Review the branch", "Review Esc to dismiss behavior"
+)
+
+
+def test_status_line_esc_text_after_paste_still_confirms_the_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status-line text "Esc to …" is no cover: the draft's own tail confirms it."""
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _STATUS_LINE_ESC_TEXT_PANE
+    )
+
+    inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT)
+
+    assert mutations == ["paste", "submit"]
+
+
 def test_short_message_never_submits_a_status_line_clipped_draft(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7536,6 +7555,7 @@ def test_clipped_draft_body_is_not_a_pending_permission(
             id="permission-text-in-visible-draft-tail",
         ),
         pytest.param(_STATUS_LINE_CLIPPED_PANE, id="status-line-footer"),
+        pytest.param(_STATUS_LINE_ESC_TEXT_PANE, id="status-line-esc-text"),
     ],
 )
 def test_a_tall_draft_before_paste_is_an_occupied_input_box(

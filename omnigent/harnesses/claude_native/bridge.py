@@ -9507,7 +9507,8 @@ def _clipped_draft_rows(pane: str) -> tuple[list[str], bool, bool] | None:
     opening rule collapsed to ``─── ↑ N more ───``. Only a column-0 closing rule
     without a dialog footer under it qualifies. Without the composer's mode
     footer (default permission mode under a custom status line draws none), a
-    collapsed opening rule marks the composer, unless an overlay covers it.
+    collapsed opening rule marks the composer, unless a ``/btw`` side chat
+    covers it.
 
     :returns: ``(rows, collapsed, mode_footer)``, or ``None`` when the pane has
         no such composer.
@@ -9525,12 +9526,9 @@ def _clipped_draft_rows(pane: str) -> tuple[list[str], bool, bool] | None:
     if opening_rule >= 0 and not collapsed:
         return None
     mode_footer = bool(footer) and footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts"))
-    if not mode_footer and (
-        not collapsed
-        # A side chat or panel drawn under an older composer covers it.
-        or _btw_overlay_present(pane)
-        or _ESCAPE_DISMISS_HINT.search(" ".join(footer))
-    ):
+    # Only the structural side-chat read counts as cover: "Esc to …" text can be
+    # status-line content, and an overlay reading would spend an Escape on it.
+    if not mode_footer and (not collapsed or _btw_overlay_present(pane)):
         return None
     rows = [line for line in lines[opening_rule + 1 : closing_rule] if line.strip()]
     if not rows or any(not row.startswith("  ") for row in rows):
