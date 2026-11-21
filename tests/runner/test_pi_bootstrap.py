@@ -377,6 +377,22 @@ def test_scoped_registry_accepts_only_observed_tool_search_alias(tmp_path, path,
     assert runtime.acknowledge_pi_scope("session-a", admission.credential) is accepted
 
 
+@pytest.mark.parametrize("fault", ["missing-hash", "forged-hash"])
+def test_scoped_registry_rejects_bad_file_proof(tmp_path, fault):
+    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    admission = runtime.begin_pi_scope_launch("session-a", native_guard=True)
+    _write_scope_registry(admission, registry["tools"])
+    path = admission.registry_dir / "permission_tools.json"
+    published = json.loads(path.read_text())
+    tool = published["tools"][0]
+    if fault == "missing-hash":
+        del tool["source_sha256"]
+    else:
+        tool["source_sha256"] = "0" * 64
+    path.write_text(json.dumps(published))
+    assert not runtime.acknowledge_pi_scope("session-a", admission.credential)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "publication", ["pending", "ready", "changed-registry", "revoked", "state-write-retry"]
@@ -1917,7 +1933,19 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["normal", "loss", "replacement", "missing-bootstrap", "incompatible"]
+    "mode",
+    [
+        "normal",
+        "loss",
+        "replacement",
+        "missing-bootstrap",
+        "incompatible",
+        "mcp-startup",
+        "mcp-late",
+        "mcp-child",
+        "unknown-source",
+        "control-shape",
+    ],
 )
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
     node, pi = shutil.which("node"), shutil.which("pi")
@@ -1931,11 +1959,11 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         ),
         None,
     )
-    if sdk is None or json.loads((sdk / "package.json").read_text()).get("version") not in (
-        "1.3.0",
-        "1.5.0",
-    ):
+    version = json.loads((sdk / "package.json").read_text()).get("version") if sdk else None
+    if sdk is None or version not in ("1.3.0", "1.5.0"):
         pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
+    if (mode.startswith("mcp-") or mode == "control-shape") and version != "1.5.0":
+        pytest.skip("Pi 1.5.0 built-in MCP is required")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(Path(__file__).with_name("pi_scoped_sdk_consumer.py")),
@@ -1949,20 +1977,25 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         output, error = await asyncio.wait_for(process.communicate(), 30)
         assert process.returncode == 0, (output + error).decode()
         assert b'"receiptExcluded":true' in output
-        expected = (
-            b'"evaluate": 0, "execute": 0, "finish": 0'
-            if mode == "missing-bootstrap"
-            else (
-                b'"evaluate": 1, "execute": 1, "finish": 1'
-                if mode == "incompatible"
-                else (
-                    b'"evaluate": 3, "execute": 3, "finish": 3'
-                    if mode == "normal"
-                    else b'"evaluate": 1, "execute": 1, "finish": 0'
-                )
-            )
-        )
-        assert expected in output
+        expected = {
+            "missing-bootstrap": b'"evaluate": 0, "execute": 0, "finish": 0',
+            "normal": b'"evaluate": 3, "execute": 3, "finish": 3',
+            "loss": b'"evaluate": 1, "execute": 1, "finish": 0',
+            "replacement": b'"evaluate": 1, "execute": 1, "finish": 0',
+        }
+        assert expected.get(mode, b'"evaluate": 1, "execute": 1, "finish": 1') in output
+        notice = {
+            "control-shape": b"2 total, unrecognized: 1, builtin:mcp: 1",
+            "unknown-source": b"1 total, unrecognized: 1",
+        }.get(mode)
+        if mode.startswith("mcp-"):
+            notice = b"1 total, builtin:mcp: 1"
+        if notice is not None:
+            prefix = b"Scoped Pi left out tools from unsupported sources"
+            assert error.count(prefix) == 1
+            assert prefix + b" (" + notice + b")." in error
+            assert b"mcp__fixture__echo" not in error
+            assert b"opaque_fixture_tool" not in error
     finally:
         if process.returncode is None:
             process.kill()

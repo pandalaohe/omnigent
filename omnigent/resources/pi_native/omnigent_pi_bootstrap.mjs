@@ -52,6 +52,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
     const before = [...result.extensions];
     for (const source of state.sources)
       if (!before.some(entry => entry.resolvedPath === source.path)) throw new Error("Native loaded identity is missing");
+    profile.restrictTools?.(before);
     const final = await this.loadExtensionFactories.call({cwd:this.cwd, eventBus:this.eventBus,
       extensionFactories:[{name:"omnigent-native-final", factory(api) {
         state.finalHook = async (event, ctx) => {
@@ -65,14 +66,23 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
         };
         api.on("tool_call", state.finalHook);
         api.on("session_start", async (_event, ctx) => {
+          state.showOmission = text => {
+            ctx.ui?.notify?.(text, "warning");
+            api.events.emit("omnigent:pi-compatibility", text);
+          };
           await state.bind(store.sessions.get(ctx.sessionManager));
+          state.flushOmissions?.();
           if (state.notice && !installation.notified) {
             api.sendMessage({customType:"omnigent-pi-compatibility", content:state.notice, display:true});
             api.events.emit("omnigent:pi-compatibility", state.notice);
             installation.notified = true;
           }
         });
-        api.on("session_shutdown", (_event, ctx) => nativeSupport.closeNativeSession(ctx.sessionManager));
+        api.on("session_shutdown", (event, ctx) => {
+          const closing = nativeSupport.closeNativeSession(ctx.sessionManager);
+          if (event?.reason === "reload" || !state.logOmissions) return closing;
+          return Promise.resolve(closing).finally(state.logOmissions);
+        });
       }}]}, result.runtime);
     if (final.errors.length || final.extensions.length !== 1) throw new Error("Native final hook could not be installed");
     state.finalExtension = final.extensions[0];

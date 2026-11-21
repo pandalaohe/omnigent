@@ -11,6 +11,22 @@ const {connectFromHandoff} = require("./scoped_client.cjs");
 const resources = path.dirname(fileURLToPath(import.meta.url));
 const guard = path.join(resources, "omnigent_pi_child_extension.js");
 
+function omissionNotice(counts) {
+  const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  const detail = [...counts].map(([kind, count]) => `${kind}: ${count}`).join(", ");
+  return `Scoped Pi left out tools from unsupported sources (${total} total, ${detail}).`;
+}
+
+function logOmissions(report, exiting = false) {
+  if (report.logged || !report.counts.size) return;
+  report.logged = true;
+  try {
+    const line = `${omissionNotice(report.counts)}\n`;
+    if (exiting) fs.writeSync(2, line);
+    else fs.write(2, line, () => {});
+  } catch { /* Pi stderr is best-effort. */ }
+}
+
 /** Called by the trusted launcher before any resource loader exists. */
 export async function installScopedSdkFromHandoff(sdk, locator, sdkIdentity) {
   return installScopedSdk(sdk, await connectFromHandoff(locator), sdkIdentity);
@@ -23,6 +39,11 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
   }
   const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
   const loaders = new WeakMap(), registrations = new Map();
+  const omissionReports = new Map();
+  const logRemainingOmissions = exiting => {
+    for (const report of omissionReports.values()) logOmissions(report, exiting);
+  };
+  const logOnExit = () => logRemainingOmissions(true);
   let rootLoader, apiPromise;
   const runtimeInputs = ["scoped_bootstrap.mjs", "scoped_client.cjs", "native_support.cjs",
     "omnigent_pi_bootstrap.mjs", "permission_tool_registry.cjs"].map(name => support.snapshot(path.join(resources, name)));
@@ -53,7 +74,13 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       if (!loaders.has(loader)) loaders.set(loader, randomUUID());
       if (!Array.isArray(loader.additionalExtensionPaths)) throw new Error("Native SDK loader layout unavailable");
       if (!loader.additionalExtensionPaths.includes(guard)) loader.additionalExtensionPaths.push(guard);
-      return {getState:readState, bridgeDir};
+      const omitted = new Map();
+      const profile = {getState:readState, bridgeDir, omitted,
+        restrictTools: extensions => registry.restrictExtensionTools(extensions, guard, (name, kind) => {
+          if (profile.recordOmission) profile.recordOmission(name, kind);
+          else omitted.set(name, kind);
+        })};
+      return profile;
     },
     async describeSession(session, state) {
       const handle = randomUUID();
@@ -66,6 +93,28 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       }));
       const binding = await connection.bind({loader:loaders.get(session.resourceLoader), handle, registry:published});
       if (binding.ready !== true) throw new Error("Native registry acknowledgement unavailable");
+      const sessionId = session.sessionManager.getSessionId();
+      const report = omissionReports.get(sessionId) || {names:new Set(), counts:new Map(), logged:false};
+      omissionReports.set(sessionId, report);
+      // Wait for session end so stderr includes discoveries on both sides of a reload.
+      state.logOmissions = () => logOmissions(report);
+      const visible = new Map();
+      state.flushOmissions = () => {
+        if (!state.showOmission || !visible.size) return;
+        const notice = omissionNotice(visible);
+        visible.clear();
+        try {
+          state.showOmission(notice);
+        } catch { /* A notice must not affect permission binding. */ }
+      };
+      state.profile.recordOmission = (name, kind) => {
+        if (report.names.has(name)) return;
+        report.names.add(name);
+        if (state.showOmission && !visible.size) setImmediate(state.flushOmissions);
+        for (const batch of [report.counts, visible]) batch.set(kind, (batch.get(kind) || 0) + 1);
+      };
+      for (const [name, kind] of state.profile.omitted) state.profile.recordOmission(name, kind);
+      state.profile.omitted.clear();
       const pkg = await packageApi(session);
       if (pkg && !pkg.unavailable) {
         const id = session.sessionManager.getSessionId();
@@ -84,9 +133,12 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
         beforeClose:() => client.close()};
     },
   });
+  process.once("exit", logOnExit);
   return () => {
     dispose();
     connection.close();
     for (const registration of registrations.values()) registration.dispose();
+    process.off("exit", logOnExit);
+    logRemainingOmissions(false);
   };
 }

@@ -195,20 +195,21 @@ async def main():
                 )
             else:
                 assert process.returncode == 0, process.returncode
-            expected = (
-                {"evaluate": 0, "execute": 0, "finish": 0}
-                if mode == "missing-bootstrap"
-                else (
-                    {"evaluate": 1, "execute": 1, "finish": 1}
-                    if mode == "incompatible"
-                    else (
-                        {"evaluate": 3, "execute": 3, "finish": 3}
-                        if mode == "normal"
-                        else {"evaluate": 1, "execute": 1, "finish": 0}
-                    )
-                )
-            )
+            expected_counts = {
+                "missing-bootstrap": (0, 0, 0),
+                "normal": (3, 3, 3),
+                "loss": (1, 1, 0),
+                "replacement": (1, 1, 0),
+            }
+            expected = dict(zip(counts, expected_counts.get(mode, (1, 1, 1)), strict=True))
             assert counts == expected, counts
+            if mode == "mcp-child":
+                assert {
+                    admission.principal.origin for admission in actor.installations.values()
+                } == {
+                    "parent",
+                    "child",
+                }
             assert actor.token.encode() not in output + error
             print(json.dumps(counts))
         finally:
