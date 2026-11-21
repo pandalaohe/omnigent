@@ -12602,7 +12602,15 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
 
     const view = await screen.findByRole("dialog");
     expect(within(view).getByText("Built-in · save your own starting prompt")).toBeInTheDocument();
-    expect(within(view).getByRole("button", { name: "Members: 2" })).toBeInTheDocument();
+    const membersButton = within(view).getByRole("button", { name: "Members: 2" });
+    fireEvent.click(membersButton);
+    const roster = await screen.findByRole("dialog", { name: "Members" });
+    const memberRows = within(roster).getAllByText(/^(polly|codex) ·/);
+    expect(memberRows.map((row) => row.textContent)).toEqual([
+      "polly · Lead · Claude SDK · opus",
+      "codex · Codex · Default · high",
+    ]);
+    fireEvent.click(membersButton);
     fireEvent.click(within(view).getByRole("button", { name: "Duplicate to edit" }));
 
     expect(await screen.findByTestId("agent-editor")).toBeInTheDocument();
@@ -12614,7 +12622,7 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
     expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
       source_agent_id: "ag_polly",
     });
-    expect(screen.queryByRole("button", { name: "Members: 2" })).toBeNull();
+    expect(view).not.toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
         "Polly copy",

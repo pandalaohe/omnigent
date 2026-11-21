@@ -230,7 +230,7 @@ describe("Connect command", () => {
     expect(document.execCommand).toHaveBeenCalledWith("copy");
     // The icon-only Copy button keeps its name; the confirmation is the status line.
     await waitFor(() =>
-      expect(within(screen.getByRole("dialog")).getByRole("status")).toHaveTextContent("Copied"),
+      expect(within(screen.getByRole("dialog")).getByRole("status")).toHaveTextContent(/^Copied$/),
     );
   });
 
