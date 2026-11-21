@@ -6297,6 +6297,9 @@ _QUEUE_TAKEN_INPUT_MESSAGES = {
     "native_input_returned_to_composer": (
         "Stop moved this message from Claude's queue back to its input box, so it was not sent."
     ),
+    "native_input_blocked_by_hook": (
+        "A Claude Code hook blocked this message, so Claude did not read it."
+    ),
 }
 
 
@@ -6348,6 +6351,15 @@ async def _settle_queue_operations(
                 session_id,
                 pending_inputs.mark_returned_to_composer(session_id, operation["content"]),
                 "native_input_returned_to_composer",
+            )
+        elif operation["operation"] == "remove" and operation.get("reason") == "dropped_by_hook":
+            text = operation["content"]
+            pending_id = pending_inputs.claimed_id_for_queued_text(session_id, text)
+            await _settle_inputs_taken_from_queue(
+                conversation_store,
+                session_id,
+                [pending_id] if pending_id is not None else [],
+                "native_input_blocked_by_hook",
             )
 
 

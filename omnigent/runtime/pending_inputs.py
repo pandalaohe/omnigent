@@ -1057,13 +1057,17 @@ def resolve_oldest_for_mirrored_text(
         return _drained_input(entry)
 
 
-def _claimed_entry_for_queued_text_locked(conversation_id: str, text: str) -> _Entry | None:
-    """The oldest claimed input whose paste Claude queued as *text*, not yet returned."""
+def _claimed_entry_for_queued_text_locked(
+    conversation_id: str, text: str, *, skip_returned: bool
+) -> _Entry | None:
+    """The oldest claimed input whose paste Claude queued as *text*."""
     needle = _collapse_whitespace(text)
     if not needle:
         return None
     for entry in _pending.get(conversation_id, {}).values():
-        if entry.held or entry.runner_claim_id is None or entry.returned_to_composer:
+        if entry.held or entry.runner_claim_id is None:
+            continue
+        if skip_returned and entry.returned_to_composer:
             continue
         own = _collapse_whitespace(_content_text(entry.content))
         attachments = _attachment_count(entry.content)
@@ -1096,7 +1100,7 @@ def mark_returned_to_composer(conversation_id: str, text: str) -> list[str]:
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
-        entry = _claimed_entry_for_queued_text_locked(conversation_id, text)
+        entry = _claimed_entry_for_queued_text_locked(conversation_id, text, skip_returned=True)
         if entry is None:
             return []
         entry.returned_to_composer = True
@@ -1111,6 +1115,14 @@ def returned_interrupted_ids(conversation_id: str) -> list[str]:
             for pending_id, entry in _pending.get(conversation_id, {}).items()
             if entry.interrupted and entry.returned_to_composer and not entry.held
         ]
+
+
+def claimed_id_for_queued_text(conversation_id: str, text: str) -> str | None:
+    """Id of the claimed input Claude queued as *text*, e.g. one a hook then dropped."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _claimed_entry_for_queued_text_locked(conversation_id, text, skip_returned=False)
+        return entry.pending_id if entry is not None else None
 
 
 def pending_ids(conversation_id: str) -> list[str]:

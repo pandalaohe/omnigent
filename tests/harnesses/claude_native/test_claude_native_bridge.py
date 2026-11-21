@@ -1878,6 +1878,7 @@ def test_transcript_reports_prompts_claude_took_out_of_its_queue_unread(tmp_path
         queue("enqueue", "steer"),
         queue("remove", "steer", "absorbed_mid_turn"),
         queue("popAll", wrapped),
+        queue("remove", "late", "dropped_by_hook"),
     ]
     transcript_path.write_text("".join(f"{record}\n" for record in records), encoding="utf-8")
 
@@ -1885,7 +1886,10 @@ def test_transcript_reports_prompts_claude_took_out_of_its_queue_unread(tmp_path
         transcript_path, 0, start_line=0, agent_name="claude-native-ui"
     )
 
-    assert [(op.operation, op.content) for op in result.queue_operations] == [("popAll", "steer")]
+    assert [(op.operation, op.content, op.reason) for op in result.queue_operations] == [
+        ("popAll", "steer", None),
+        ("remove", "late", "dropped_by_hook"),
+    ]
     assert result.items == []
 
 

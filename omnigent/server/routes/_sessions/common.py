@@ -417,7 +417,7 @@ _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 _EXTERNAL_GOAL_STATE_TYPE: str = "external_goal_state"
 
 
-# Claude's queue records of prompts it took out unread (Stop, Up).
+# Claude's queue records of prompts it took out unread (Stop, Up, a blocking hook).
 _EXTERNAL_QUEUE_OPERATIONS_TYPE: str = "external_queue_operations"
 
 

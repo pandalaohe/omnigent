@@ -69,7 +69,10 @@ async def test_forward_model_from_status_posts_the_status_model_verbatim(
 
 @pytest.mark.asyncio
 async def test_queue_records_are_reported_once_and_not_to_an_older_server() -> None:
-    operations = (ClaudeQueueOperation("popAll", "steer", "2026-11-21T05:00:00.000Z"),)
+    operations = (
+        ClaudeQueueOperation("popAll", "steer", "2026-11-21T05:00:00.000Z"),
+        ClaudeQueueOperation("remove", "late", "2026-11-21T05:00:01.000Z", "dropped_by_hook"),
+    )
     requests: list[dict[str, Any]] = []
     known = {"value": True}
 
@@ -96,7 +99,13 @@ async def test_queue_records_are_reported_once_and_not_to_an_older_server() -> N
                             "operation": "popAll",
                             "content": "steer",
                             "timestamp": "2026-11-21T05:00:00.000Z",
-                        }
+                        },
+                        {
+                            "operation": "remove",
+                            "content": "late",
+                            "timestamp": "2026-11-21T05:00:01.000Z",
+                            "reason": "dropped_by_hook",
+                        },
                     ]
                 },
             }
