@@ -6034,6 +6034,184 @@ async def test_patch_session_external_session_id_rejects_overwrite(
     assert after.json()["external_session_id"] == "sid-1"
 
 
+async def test_thread_binding_with_an_unlisted_model_posts_one_notice_per_thread(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded thread binding naming its unlisted pick posts one info notice."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    listed = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    pick = "router-a/gpt-6.2-sol"
+
+    alone = await client.patch(path, json={"unlisted_model": pick})
+    assert alone.status_code == 400, alone.text
+    assert alone.json()["error"]["code"] == "invalid_input"
+    for _attempt in range(2):  # a retried binding posts nothing new
+        bound = await client.patch(
+            path, json={"external_session_id": "sid-1", "unlisted_model": pick}
+        )
+        assert bound.status_code == 200, bound.text
+    # A thread the row cannot bind keeps its original 400 and posts nothing.
+    conflict = await client.patch(
+        path, json={"external_session_id": "sid-2", "unlisted_model": pick}
+    )
+    assert conflict.status_code == 400, conflict.text
+    plain = await client.patch(
+        f"/v1/sessions/{listed['id']}", json={"external_session_id": "sid-3"}
+    )
+    assert plain.status_code == 200, plain.text
+
+    notice = {
+        "type": "error",
+        "source": "execution",
+        "code": "codex_native_model_unlisted",
+        "message": (
+            f"{pick} isn't in this host's Codex model list; launched as requested. "
+            "If the provider rejects it, this turn fails."
+        ),
+        "level": "info",
+    }
+    items = (await client.get(f"{path}/items")).json()["data"]
+    errors = [{key: item.get(key) for key in notice} for item in items if item["type"] == "error"]
+    assert errors == [notice]
+    live = [
+        (sid, event["item"]["code"])
+        for sid, event in published
+        if event.get("type") == "response.output_item.done" and event["item"]["type"] == "error"
+    ]
+    assert live == [(session["id"], notice["code"])]
+    listed_items = (await client.get(f"/v1/sessions/{listed['id']}/items")).json()["data"]
+    assert [item for item in listed_items if item["type"] == "error"] == []
+
+
+def _is_unlisted_model_notice(items: list[Any]) -> bool:
+    """Whether a store append carries the unlisted-model notice."""
+    return any(getattr(item.data, "code", None) == "codex_native_model_unlisted" for item in items)
+
+
+@pytest.mark.parametrize("failure", ["append", "publish"])
+async def test_failed_unlisted_model_notice_never_changes_the_binding(
+    failure: str,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A notice write or publish that fails leaves the binding and its 200 untouched."""
+    from omnigent.server.routes._sessions import orchestration as session_orchestration
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    if failure == "append":
+        append = SqlAlchemyConversationStore.append
+
+        def failing_append(self: Any, session_id: str, items: list[Any], **kwargs: Any) -> Any:
+            if _is_unlisted_model_notice(items):
+                raise RuntimeError("store unavailable")
+            return append(self, session_id, items, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "append", failing_append)
+    else:
+
+        def failing_publish(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("stream unavailable")
+
+        monkeypatch.setattr(
+            session_orchestration, "_publish_external_conversation_item", failing_publish
+        )
+
+    resp = await client.patch(
+        path, json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["external_session_id"] == "sid-1"
+    assert (await client.get(path)).json()["external_session_id"] == "sid-1"
+
+
+async def test_stuck_unlisted_model_notice_never_holds_back_the_binding(
+    app: Any,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PATCH answers 200 once the binding lands; a stuck notice write follows the response."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session['id']}"
+    notice_entered = threading.Event()
+    release_notice = threading.Event()
+    append = SqlAlchemyConversationStore.append
+
+    def stuck_append(self: Any, session_id: str, items: list[Any], **kwargs: Any) -> Any:
+        if _is_unlisted_model_notice(items):
+            notice_entered.set()
+            release_notice.wait(timeout=10)
+        return append(self, session_id, items, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", stuck_append)
+    # httpx's ASGI transport returns only after after-response work ends, so the
+    # app's own response messages show when the runner would have its answer.
+    binding = client.build_request(
+        "PATCH",
+        path,
+        json={"external_session_id": "sid-1", "unlisted_model": "router-a/gpt-6.2-sol"},
+    )
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "PATCH",
+        "headers": [(key.lower(), value) for key, value in binding.headers.raw],
+        "scheme": binding.url.scheme,
+        "path": binding.url.path,
+        "raw_path": binding.url.raw_path.split(b"?")[0],
+        "query_string": binding.url.query,
+        "server": (binding.url.host, binding.url.port),
+        "client": ("127.0.0.1", 123),
+        "root_path": "",
+    }
+    answered = asyncio.Event()
+    statuses: list[int] = []
+    body_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": binding.content, "more_body": False}
+        await answered.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+        elif message["type"] == "http.response.body" and not message.get("more_body", False):
+            answered.set()
+
+    request = asyncio.create_task(app(scope, receive, send))
+    try:
+        await asyncio.wait_for(answered.wait(), timeout=5)
+        assert statuses == [200]
+        assert await asyncio.to_thread(notice_entered.wait, 10)
+        assert not request.done()  # the notice write is still held after the answer
+        assert (await client.get(path)).json()["external_session_id"] == "sid-1"
+        later = await client.patch(path, json={"external_session_id": "sid-2"})
+        assert later.status_code == 400, later.text
+    finally:
+        release_notice.set()
+    await asyncio.wait_for(request, timeout=10)
+    items = (await client.get(f"{path}/items")).json()["data"]
+    assert [item["code"] for item in items if item["type"] == "error"] == [
+        "codex_native_model_unlisted"
+    ]
+
+
 async def test_create_session_returns_null_external_session_id(
     client: httpx.AsyncClient,
 ) -> None:
@@ -8805,6 +8983,20 @@ _CODEX_MODEL_CARD = {
         "on the host, then start a new session."
     ),
 }
+# A provider's rejection of an id the host's Codex list does not show, forwarded as turn text.
+_CODEX_MODEL_NOT_FOUND_DETAIL = (
+    'unexpected status 404 Not Found: {"error":{"message":"The model `gpt-unlisted-example` '
+    'does not exist or you do not have access to it.","type":"invalid_request_error",'
+    '"param":null,"code":"model_not_found"}}'
+)
+_CODEX_MODEL_NOT_FOUND_CARD = {
+    "title": "Model unavailable",
+    "cause": _CODEX_MODEL_NOT_FOUND_DETAIL,
+    "remediation": (
+        "Choose a different model with the model picker or /model, or check that the "
+        "provider is configured and your account can access this model."
+    ),
+}
 
 
 _CODEX_COMPACTION_MODELS = {
@@ -8930,6 +9122,14 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
             {},
         ),
         (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False, {}),
+        (
+            _CODEX_MODEL_NOT_FOUND_DETAIL,
+            None,
+            _CODEX_MODEL_NOT_FOUND_CARD,
+            "codex-native-ui",
+            False,
+            {},
+        ),
         (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False, {}),
         (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True, {}),
         (

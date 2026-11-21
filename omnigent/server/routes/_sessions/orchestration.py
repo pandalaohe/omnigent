@@ -4218,6 +4218,56 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+#: Info notice for a started Codex thread running an explicit pick its model list lacks.
+_CODEX_NATIVE_MODEL_UNLISTED_CODE = "codex_native_model_unlisted"
+
+
+async def _persist_unlisted_model_notice(
+    session_id: str,
+    thread_id: str,
+    model: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Post the info notice for a bound Codex thread running an unlisted model pick.
+
+    Best effort, after the binding is recorded: the item id derives from the
+    session and thread, so a retried binding posts nothing new, and a failed
+    write or publish only loses the notice.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param thread_id: The Codex thread the binding recorded.
+    :param model: The pick the launch ran as requested, e.g. ``"router-a/gpt-6.2-sol"``.
+    :param conversation_store: Store used for the durable append.
+    """
+    notice_key = f"{_CODEX_NATIVE_MODEL_UNLISTED_CODE}:{session_id}:{thread_id}"
+    item = NewConversationItem(
+        type="error",
+        response_id=generate_task_id(),
+        data=ErrorData(
+            source="execution",
+            code=_CODEX_NATIVE_MODEL_UNLISTED_CODE,
+            message=(
+                f"{model} isn't in this host's Codex model list; launched as requested. "
+                "If the provider rejects it, this turn fails."
+            ),
+            level="info",
+        ),
+        stable_id=hashlib.sha256(notice_key.encode()).hexdigest()[:32],
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+        if persisted and not persisted[0].deduplicated:
+            _publish_external_conversation_item(session_id, persisted[0])
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to post unlisted-model notice for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+
+
 def _question_card_image_ids(result: ElicitationResult) -> list[str]:
     """Read the already-validated image ids in question order."""
     raw = (result.meta or {}).get("omnigent_question_images")
@@ -19117,6 +19167,7 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
+    "_persist_unlisted_model_notice",
     "_post_system_message",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",

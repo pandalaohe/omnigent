@@ -92,6 +92,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    diagnose_model_unavailable,
     turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
@@ -4471,6 +4472,9 @@ def register_events_routes(
                     "native_turn_error",
                 }:
                     diagnosis = diagnose_codex_model_rejection(output)
+                    if diagnosis is None:
+                        # Codex forwards a provider's model-not-found rejection as bare text.
+                        diagnosis = diagnose_model_unavailable(output)
                 if classified_code == CODEX_PROVIDER_AUTH_FAILED:
                     diagnosis = diagnose_codex_provider_auth_failure(output)
                 compaction_model = data.get("compaction_model")

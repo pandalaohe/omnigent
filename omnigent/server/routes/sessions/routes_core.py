@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 import httpx
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     HTTPException,
     Query,
@@ -291,6 +292,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _mark_session_moving,
     _persist_external_conversation_item,
     _persist_model_change_note,
+    _persist_unlisted_model_notice,
     _publish_runner_recovered_status,
     _retry_host_admission_lease,
     _run_managed_launch,
@@ -5898,6 +5900,7 @@ def register_core_routes(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
+        background_tasks: BackgroundTasks,
         include_usage: bool = Query(default=True),
     ) -> SessionResponse | JSONResponse:
         """
@@ -5914,6 +5917,8 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
+        :param background_tasks: Work run after the response is sent, e.g. the
+            ``unlisted_model`` notice.
         :param include_usage: When ``False``, skip usage aggregation in the
             response. Metadata writes during native launch do not need it.
         :returns: The updated :class:`SessionResponse` snapshot, with
@@ -5932,8 +5937,12 @@ def register_core_routes(
         ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
-                return await _update_session(request, session_id, body, include_usage, live_change)
-        return await _update_session(request, session_id, body, include_usage)
+                return await _update_session(
+                    request, session_id, body, include_usage, live_change, background_tasks
+                )
+        return await _update_session(
+            request, session_id, body, include_usage, background_tasks=background_tasks
+        )
 
     async def _update_session(
         request: Request,
@@ -5941,8 +5950,13 @@ def register_core_routes(
         body: UpdateSessionRequest,
         include_usage: bool,
         live_change: _LiveSettingsChange | None = None,
+        background_tasks: BackgroundTasks | None = None,
     ) -> SessionResponse | JSONResponse:
-        """Apply the PATCH that :func:`update_session` documents."""
+        """Apply the PATCH that :func:`update_session` documents.
+
+        Internal callers without a response of their own pass no
+        ``background_tasks``; a notice they request is then awaited inline.
+        """
         began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
         if (
@@ -5952,6 +5966,18 @@ def register_core_routes(
                 "delete_worktree is only valid with archived=true",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.unlisted_model is not None:
+            if body.external_session_id is None:
+                raise OmnigentError(
+                    "unlisted_model is only valid with external_session_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            try:
+                validate_model_override(body.unlisted_model)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid unlisted_model: {exc}", code=ErrorCode.INVALID_INPUT
+                ) from exc
         # This PATCH gates at the least level the request actually needs, in
         # three tiers matching the if/elif/else below:
         #
@@ -7814,6 +7840,19 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+            if body.unlisted_model is not None:
+                # Only after the binding, and after the response: the notice can
+                # never change who binds or delay the binding's answer.
+                notice_args = (
+                    session_id,
+                    body.external_session_id,
+                    body.unlisted_model,
+                    conversation_store,
+                )
+                if background_tasks is None:
+                    await _persist_unlisted_model_notice(*notice_args)
+                else:
+                    background_tasks.add_task(_persist_unlisted_model_notice, *notice_args)
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

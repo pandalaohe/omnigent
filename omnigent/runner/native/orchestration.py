@@ -6411,6 +6411,7 @@ async def _auto_create_codex_terminal(
         )
     pick_to_reset: str | None = None
     model_reset_notice: str | None = None
+    unlisted_pick: str | None = None
     # Validate an explicit pick against the launch's model list. A Default launch on
     # codex's own login pins the account default, so a ``model =`` line copied from the
     # shared config never governs it. Profile shapes resolve their default when built.
@@ -6463,6 +6464,21 @@ async def _auto_create_codex_terminal(
                     session_id,
                     extra={"session_id": session_id},
                 )
+            elif reachable is None and _codex_launch.profile is None:
+                # A list can lag what the provider serves and never shows router pins, so
+                # launch the explicit pick as requested; the provider's answer decides.
+                offered = ", ".join(
+                    str(row.get("id") or row.get("model") or "") for row in _launch_models.rows
+                )
+                _logger.warning(
+                    "codex-native: model pick %r for session %s is not in the launch's "
+                    "model list (it offers: %s); launching it as requested",
+                    pick,
+                    session_id,
+                    offered,
+                    extra={"session_id": session_id},
+                )
+                unlisted_pick = pick
             elif reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
                 listed = _launch_models.rows
@@ -7151,6 +7167,9 @@ async def _auto_create_codex_terminal(
                 apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                # The server posts the notice once it records the started thread; a
+                # resumed thread got its notice when it first started.
+                unlisted_model=unlisted_pick,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -7430,6 +7449,7 @@ async def _codex_discover_thread_and_forward(
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
     inventory_incarnation_id: str | None = None,
+    unlisted_model: str | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -7486,6 +7506,9 @@ async def _codex_discover_thread_and_forward(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param unlisted_model: The explicit pick this launch ran although its
+        model list did not name it. Sent with the thread binding so the server
+        posts its notice only for a launch whose thread started.
     """
     from omnigent.harnesses.codex_native.app_server import apply_codex_thread_permissions
     from omnigent.harnesses.codex_native.bridge import (
@@ -7782,11 +7805,20 @@ async def _codex_discover_thread_and_forward(
                 auth=_RunnerDatabricksAuth(auth_factory),
                 timeout=httpx.Timeout(10.0),
             ) as _ext_client:
+                _ext_path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+                _ext_body: dict[str, str] = {"external_session_id": thread_id}
+                if unlisted_model is not None:
+                    _ext_body["unlisted_model"] = unlisted_model
                 _ext_resp = await _ext_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": thread_id},
-                    params={"include_usage": "false"},
+                    _ext_path, json=_ext_body, params={"include_usage": "false"}
                 )
+                if _ext_resp.status_code == 422 and unlisted_model is not None:
+                    # A server without the notice field still records the binding.
+                    _ext_resp = await _ext_client.patch(
+                        _ext_path,
+                        json={"external_session_id": thread_id},
+                        params={"include_usage": "false"},
+                    )
             if _ext_resp.status_code >= 400:
                 _logger.warning(
                     "AP rejected codex external_session_id PATCH (%s); session=%s thread=%s — "

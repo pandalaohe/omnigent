@@ -815,6 +815,8 @@ def test_subscribe_until_ready_replays_completed_turn_status(
         **_expected_status_data("idle", "turn_123"),
         "input_id": "thread_123:turn_123:item_user",
         "recovered": True,
+        "native_turn_generation": 1,
+        "turn_completed": True,
     }
     state = read_bridge_state(tmp_path)
     assert state is not None
