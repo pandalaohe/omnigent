@@ -14782,63 +14782,6 @@ async def test_interrupt_forward_success_marks_queued_native_messages_interrupte
             _interrupt_fenced_sessions.discard(session_id)
 
 
-async def test_stop_settles_a_paste_claude_returned_before_the_interrupt_landed(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Claude's popAll can reach the server first; the landed Stop then settles the paste."""
-    from omnigent.runtime import pending_inputs
-    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
-
-    pending_inputs.reset_for_tests()
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    session_id = session["id"]
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
-        base_url="http://runner",
-    ) as fake_runner:
-        _route_to_runner(monkeypatch, fake_runner)
-        try:
-            pending_id = pending_inputs.record(
-                session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
-            )
-            assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
-            popped = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "external_queue_operations",
-                    "data": {
-                        "operations": [
-                            {
-                                "operation": "popAll",
-                                "content": "steer",
-                                "timestamp": "2026-11-21T05:00:00.000Z",
-                            }
-                        ]
-                    },
-                },
-            )
-            assert popped.status_code == 202, popped.text
-            # Up pops the queue too, so the paste stays until Stop lands.
-            assert pending_inputs.runner_input_is_claimed(session_id, pending_id)
-
-            resp = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={"type": "interrupt", "data": {}},
-            )
-
-            assert resp.status_code == 202, resp.text
-            assert pending_inputs.pending_ids(session_id) == []
-            items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-            assert [item.get("code") for item in items if item["type"] == "error"] == [
-                "native_input_returned_to_composer"
-            ]
-        finally:
-            pending_inputs.reset_for_tests()
-            _interrupt_fenced_sessions.discard(session_id)
-
-
 @pytest.mark.parametrize(
     "failure_mode",
     [

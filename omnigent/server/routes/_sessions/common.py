@@ -417,10 +417,6 @@ _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 _EXTERNAL_GOAL_STATE_TYPE: str = "external_goal_state"
 
 
-# Claude's queue records of prompts it took out unread (Stop, Up).
-_EXTERNAL_QUEUE_OPERATIONS_TYPE: str = "external_queue_operations"
-
-
 _EXTERNAL_GOAL_STATE_VALUES: frozenset[str] = frozenset({"active", "paused"})
 
 
@@ -702,7 +698,6 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
         _EXTERNAL_SPEED_TIER_CHANGE_TYPE,
         _EXTERNAL_GOAL_STATE_TYPE,
-        _EXTERNAL_QUEUE_OPERATIONS_TYPE,
         _EXTERNAL_COMPACTION_STATUS_TYPE,
         _EXTERNAL_MCP_STARTUP_TYPE,
         _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -1362,7 +1357,6 @@ __all__ = [
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_PULL_REQUESTS_TYPE",
-    "_EXTERNAL_QUEUE_OPERATIONS_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",

@@ -16,7 +16,6 @@ import pytest
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
-    ClaudeQueueOperation,
     ClaudeTranscriptItem,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -65,50 +64,6 @@ async def test_forward_model_from_status_posts_the_status_model_verbatim(
         {"type": "external_model_change", "data": {"model": "databricks-claude-opus-4-9"}}
     ]
     assert dedupe.posted_model == "databricks-claude-opus-4-9"
-
-
-@pytest.mark.asyncio
-async def test_queue_records_are_reported_once_and_not_to_an_older_server() -> None:
-    operations = (ClaudeQueueOperation("popAll", "steer", "2026-11-21T05:00:00.000Z"),)
-    requests: list[dict[str, Any]] = []
-    known = {"value": True}
-
-    def _handle_request(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content.decode("utf-8")))
-        if known["value"]:
-            return httpx.Response(202, json={})
-        message = "Unknown event type: 'external_queue_operations'."
-        return httpx.Response(400, json={"error": {"code": "invalid_input", "message": message}})
-
-    dedupe = forwarder._ForwardDedupeState()
-    transport = httpx.MockTransport(_handle_request)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for _ in range(2):  # a re-read region is not reported again
-            await forwarder._post_external_queue_operations(
-                client, session_id="conv_abc", operations=operations, dedupe=dedupe
-            )
-        assert requests == [
-            {
-                "type": "external_queue_operations",
-                "data": {
-                    "operations": [
-                        {
-                            "operation": "popAll",
-                            "content": "steer",
-                            "timestamp": "2026-11-21T05:00:00.000Z",
-                        }
-                    ]
-                },
-            }
-        ]
-        known["value"] = False
-        later = (ClaudeQueueOperation("popAll", "next", "2026-11-21T05:00:02.000Z"),)
-        for _ in range(2):
-            await forwarder._post_external_queue_operations(
-                client, session_id="conv_abc", operations=later, dedupe=dedupe
-            )
-    assert len(requests) == 2
-    assert dedupe.queue_operations_unsupported
 
 
 @pytest.mark.asyncio

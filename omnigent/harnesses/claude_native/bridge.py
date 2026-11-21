@@ -1208,23 +1208,6 @@ class ClaudeTaskNotification:
 
 
 @dataclass(frozen=True)
-class ClaudeQueueOperation:
-    """
-    One ``queue-operation`` record that took a queued prompt out unread.
-
-    :param operation: ``"popAll"`` when Esc, Stop or Up moved queued prompts
-        back into the composer.
-    :param content: The queued prompt text, e.g. ``"Then summarize"``.
-    :param timestamp: Claude's ISO timestamp for the record, e.g.
-        ``"2026-11-05T09:45:15.794Z"``.
-    """
-
-    operation: str
-    content: str
-    timestamp: str
-
-
-@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -1252,8 +1235,6 @@ class TranscriptReadResult:
     :param record_items: Parsed items grouped by their complete source JSONL
         record, with the byte offset immediately after each record. Native
         child-transcript batching uses these boundaries for partial checkpoints.
-    :param queue_operations: Queued prompts Claude took out unread, in
-        transcript order; the forwarder reports them so their inputs settle.
     """
 
     line_cursor: int
@@ -1267,7 +1248,6 @@ class TranscriptReadResult:
     task_notifications: tuple[ClaudeTaskNotification, ...] = ()
     goal_state_observed: bool = False
     latest_goal_state: str | None = None
-    queue_operations: tuple[ClaudeQueueOperation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4265,7 +4245,6 @@ def read_transcript_items_since_with_position(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
-    queue_operations: list[ClaudeQueueOperation] = []
     task_notifications: list[ClaudeTaskNotification] = []
     goal_state_observed = False
     latest_goal_state: str | None = None
@@ -4319,9 +4298,6 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
-        queue_operation = _queue_operation_from_transcript_entry(entry)
-        if queue_operation is not None:
-            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -4351,7 +4327,6 @@ def read_transcript_items_since_with_position(
         task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
-        queue_operations=tuple(queue_operations),
     )
 
 
@@ -4493,7 +4468,6 @@ def read_transcript_items_from_offset(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
-    queue_operations: list[ClaudeQueueOperation] = []
     task_notifications: list[ClaudeTaskNotification] = []
     goal_state_observed = False
     latest_goal_state: str | None = None
@@ -4552,9 +4526,6 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
-        queue_operation = _queue_operation_from_transcript_entry(entry)
-        if queue_operation is not None:
-            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -4584,7 +4555,6 @@ def read_transcript_items_from_offset(
         task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
-        queue_operations=tuple(queue_operations),
     )
 
 
@@ -12479,30 +12449,6 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
     return _concrete_transcript_model(message.get("model"))
-
-
-def _queue_operation_from_transcript_entry(entry: _JsonObject) -> ClaudeQueueOperation | None:
-    """
-    Return the queue record of a prompt Claude took out of its queue unread.
-
-    ``popAll`` moves every queued prompt back into the composer (Esc, Stop or
-    Up), one record each.
-
-    :param entry: One decoded transcript JSONL record.
-    :returns: The operation, or ``None`` for any other record.
-    """
-    if entry.get("type") != "queue-operation":
-        return None
-    operation = entry.get("operation")
-    content = entry.get("content")
-    if operation != "popAll" or not isinstance(content, str):
-        return None
-    timestamp = entry.get("timestamp")
-    return ClaudeQueueOperation(
-        operation=operation,
-        content=_unwrap_pasted_content_markers(content),
-        timestamp=timestamp if isinstance(timestamp, str) else "",
-    )
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:

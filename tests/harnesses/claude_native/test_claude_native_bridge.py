@@ -1866,29 +1866,6 @@ def test_read_transcript_items_from_offset_parses_correlated_task_notification(
     assert "/private/tmp/worker.out" not in json.dumps(result.items[0].data)
 
 
-def test_transcript_reports_prompts_claude_took_out_of_its_queue_unread(tmp_path: Path) -> None:
-    def queue(operation: str, content: str, reason: str | None = None) -> str:
-        record = {"type": "queue-operation", "operation": operation, "content": content}
-        record |= {"timestamp": "2026-11-21T05:00:00.000Z"}
-        return json.dumps(record | ({"reason": reason} if reason else {}))
-
-    transcript_path = tmp_path / "session.jsonl"
-    wrapped = '<pasted_content id="1">\nsteer\n</pasted_content id="1">'
-    records = [
-        queue("enqueue", "steer"),
-        queue("remove", "steer", "absorbed_mid_turn"),
-        queue("popAll", wrapped),
-    ]
-    transcript_path.write_text("".join(f"{record}\n" for record in records), encoding="utf-8")
-
-    result = read_transcript_items_from_offset(
-        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
-    )
-
-    assert [(op.operation, op.content) for op in result.queue_operations] == [("popAll", "steer")]
-    assert result.items == []
-
-
 @pytest.mark.parametrize("operation", ["enqueue", "remove"])
 def test_task_notification_queue_bookkeeping_is_not_delivery(
     tmp_path: Path, operation: str

@@ -6293,64 +6293,6 @@ async def _settle_lost_runner_input(
         raise
 
 
-_QUEUE_TAKEN_INPUT_MESSAGES = {
-    "native_input_returned_to_composer": (
-        "Stop moved this message from Claude's queue back to its input box, so it was not sent."
-    ),
-}
-
-
-async def _settle_inputs_taken_from_queue(
-    conversation_store: ConversationStore, session_id: str, pending_ids: list[str], code: str
-) -> None:
-    """Settle claimed inputs Claude took out of its queue unread as not delivered."""
-    for pending_id in pending_ids:
-        await _settle_lost_runner_input(
-            conversation_store,
-            session_id,
-            pending_id,
-            code,
-            claim_outcome=False,
-            reported_error=ErrorData(
-                source="execution", code=code, message=_QUEUE_TAKEN_INPUT_MESSAGES[code]
-            ),
-        )
-
-
-async def _settle_queue_operations(
-    conversation_store: ConversationStore, session_id: str, data: Mapping[str, Any]
-) -> None:
-    """
-    Settle web inputs that Claude's queue records show it took out unread.
-
-    :param conversation_store: Store the settled inputs are recorded in.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :param data: ``external_queue_operations`` payload, e.g. ``{"operations":
-        [{"operation": "popAll", "content": "Then summarize"}]}``.
-    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload.
-    """
-    operations = data.get("operations")
-    if not isinstance(operations, list) or not all(
-        isinstance(operation, dict)
-        and isinstance(operation.get("operation"), str)
-        and isinstance(operation.get("content"), str)
-        for operation in operations
-    ):
-        raise OmnigentError(
-            "external_queue_operations requires data.operations entries with string "
-            "operation and content",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    for operation in operations:
-        if operation["operation"] == "popAll":
-            await _settle_inputs_taken_from_queue(
-                conversation_store,
-                session_id,
-                pending_inputs.mark_returned_to_composer(session_id, operation["content"]),
-                "native_input_returned_to_composer",
-            )
-
-
 _runner_input_lease_tasks: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
 
 
