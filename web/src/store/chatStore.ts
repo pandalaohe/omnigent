@@ -1896,6 +1896,33 @@ const interruptRequestsInFlight = new Set<string>();
 const inFlightSends = new Map<string, boolean>();
 const inFlightSendSessions = new Map<string, string>();
 
+/**
+ * Agent receipts that arrived before their send's POST named the pending id,
+ * keyed by pending id with the send's stable id. Applied when that POST
+ * returns, so the bubble stays untouched until it knows its own id.
+ */
+const earlyReceipts = new Map<string, string | undefined>();
+const MAX_EARLY_RECEIPTS = 64;
+
+function rememberEarlyReceipt(pendingId: string, stableId: string | undefined): void {
+  earlyReceipts.delete(pendingId);
+  earlyReceipts.set(pendingId, stableId);
+  const oldest = earlyReceipts.keys().next().value;
+  if (earlyReceipts.size > MAX_EARLY_RECEIPTS && oldest !== undefined) {
+    earlyReceipts.delete(oldest);
+  }
+}
+
+/** Remove and return the pending id of the early receipt for this send. */
+function takeEarlyReceiptForSend(stableId: string): string | undefined {
+  for (const [pendingId, receiptStableId] of earlyReceipts) {
+    if (receiptStableId !== stableId) continue;
+    earlyReceipts.delete(pendingId);
+    return pendingId;
+  }
+  return undefined;
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2149,6 +2176,7 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   startupReads.clear();
+  earlyReceipts.clear();
   queryClient = client;
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
     if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
@@ -3157,6 +3185,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // what releases this conversation's entry for eviction, since the
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
+        const receivedEarly =
+          postResult.pendingId !== undefined && earlyReceipts.delete(postResult.pendingId);
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId
@@ -3164,6 +3194,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                   ...p,
                   posted: true,
                   ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                  ...(receivedEarly ? { received: true } : {}),
                 }
               : p,
           ),
@@ -3244,9 +3275,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const ownBlocks =
         draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
       // The runner confirmed its terminal holds this send; only the mirror is pending.
-      const receivedByAgent = draftState.pendingUserMessages.some(
-        (p) => p.tempId === tempId && p.received === true,
-      );
+      // A receipt for an earlier attempt of the same stable id has the same text.
+      const earlyReceiptId = takeEarlyReceiptForSend(stableId);
+      const receivedByAgent =
+        earlyReceiptId !== undefined ||
+        draftState.pendingUserMessages.some((p) => p.tempId === tempId && p.received === true);
       let deliveredDespiteFailure =
         receivedByAgent ||
         inFlightSends.get(stableId) === true ||
@@ -3307,7 +3340,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: receivedByAgent
           ? s.pendingUserMessages.map((p) =>
-              p.tempId === tempId ? { ...p, stillSending: false } : p,
+              p.tempId === tempId
+                ? {
+                    ...p,
+                    stillSending: false,
+                    // The id lets a lapsed claim's settlement remove the bubble.
+                    ...(earlyReceiptId !== undefined
+                      ? { received: true, pendingId: p.pendingId ?? earlyReceiptId }
+                      : {}),
+                  }
+                : p,
             )
           : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
@@ -10239,23 +10281,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_sending": {
       if (sourceConversationId === null) break;
+      const matches = (p: PendingUserMessage) => (p.pendingId ?? p.tempId) === event.pendingId;
+      // The sender's bubble learns its pending id from the POST; hold the receipt until then.
+      if (
+        event.received === true &&
+        !(setterForState(sourceConversationId)?.pendingUserMessages.some(matches) ?? false)
+      ) {
+        rememberEarlyReceipt(event.pendingId, event.stableId);
+        break;
+      }
       setterFor(sourceConversationId)((s) => ({
         pendingUserMessages: s.pendingUserMessages.map((p) =>
-          // Before its POST returns, the sender's bubble is known only by its stable id.
-          ((p.pendingId ?? p.tempId) === event.pendingId ||
-            (event.stableId !== undefined && p.stableId === event.stableId)) &&
+          matches(p) &&
           (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
-            (event.received === true && !p.received) ||
-            (p.pendingId === undefined && p.tempId !== event.pendingId))
+            (event.received === true && !p.received))
             ? {
                 ...p,
                 sendingSinceMs: event.sinceMs ?? undefined,
                 ...(event.received === true ? { received: true } : {}),
-                // Bind the server id early so a reconnect before the POST returns
-                // still finds this bubble in the snapshot; tempId stays the React key.
-                ...(p.pendingId === undefined && p.tempId !== event.pendingId
-                  ? { pendingId: event.pendingId }
-                  : {}),
               }
             : p,
         ),
@@ -10263,6 +10306,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       break;
     }
     case "session_input_consumed": {
+      // A settled input's receipt must not reach a later attempt that reuses its id.
+      if (event.clearedPendingId) earlyReceipts.delete(event.clearedPendingId);
       if (event.itemType === "error" && event.clearedPendingId !== null) {
         applyToConversation((s) => ({
           pendingUserMessages: s.pendingUserMessages.filter(
