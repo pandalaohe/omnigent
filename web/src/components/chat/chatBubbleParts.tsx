@@ -237,14 +237,17 @@ export function buildPendingBubbles(
 ): Bubble[] {
   return pending.map((p) => {
     const author = p.author ?? selfAuthor;
-    // An input the agent accepted is no longer sending, though a turn may still queue it.
+    // An input the agent accepted is no longer sending, though a turn may still queue it;
+    // every device shows that from the server's flag, not this client's send-time status.
     const sendingSinceMs = p.received ? undefined : p.sendingSinceMs;
     return {
       kind: "user",
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
-      ...(p.sentMidTurn && sendingSinceMs === undefined ? { awaitingAgent: true } : {}),
+      ...((p.sentMidTurn && sendingSinceMs === undefined) || p.received
+        ? { awaitingAgent: true }
+        : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
       ...(sendingSinceMs === undefined ? {} : { sendingSinceMs }),
       content: p.content,

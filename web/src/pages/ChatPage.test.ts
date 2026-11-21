@@ -541,9 +541,10 @@ describe("buildPendingBubbles", () => {
     expect(plain.awaitingAgent).toBeUndefined();
   });
 
-  it("stops the sending timer once the agent received the input", () => {
+  it("swaps the sending timer for the agent note once the agent received the input", () => {
     const since = 1_753_900_000_000;
-    const [sending, midTurn, idle] = buildPendingBubbles(
+    // The sender's own bubble and a reload or second device (no send-time status).
+    const [sending, sender, replayed] = buildPendingBubbles(
       [
         { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since },
         { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since, received: true },
@@ -553,10 +554,10 @@ describe("buildPendingBubbles", () => {
     ) as Extract<Bubble, { kind: "user" }>[];
     expect(sending).toMatchObject({ sendingSinceMs: since });
     expect(sending!.awaitingAgent).toBeUndefined();
-    expect(midTurn).toMatchObject({ pending: true, awaitingAgent: true });
-    expect(midTurn!.sendingSinceMs).toBeUndefined();
-    expect(idle!.sendingSinceMs).toBeUndefined();
-    expect(idle!.awaitingAgent).toBeUndefined();
+    for (const bubble of [sender!, replayed!]) {
+      expect(bubble).toMatchObject({ pending: true, awaitingAgent: true });
+      expect(bubble.sendingSinceMs).toBeUndefined();
+    }
   });
 });
 

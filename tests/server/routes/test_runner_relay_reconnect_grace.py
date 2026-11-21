@@ -198,31 +198,65 @@ async def test_confirmed_mid_turn_paste_waits_for_its_late_mirror(
             assert received["since_ms"] is not None
         else:
             await collector.assert_no_event(within=0.05)
+        # Claude absorbs the queued paste only after a 25-minute step. Only the
+        # claiming runner's heartbeats renew it; a replacement never had the paste.
+        for now in range(60, 1501, 60):
+            await orchestration._reconcile_runner_input_leases(
+                store,
+                session_id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                set(),
+                runner_id=heartbeat_runner,
+            )
+        if case != "confirmed-running" or heartbeat_runner != "runner_a":
+            await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+            (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
+            assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+            return
+        assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
+        assert not store.list_items(session_id).data
+        # A reload or second device during the long step reads it as received.
         [entry] = pending_inputs.snapshot_for(session_id)
-        assert entry.get("received", False) is case.startswith("confirmed")
+        assert entry["received"] is True
         assert entry["sending_since_ms"] is not None
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        await orchestration._persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput.model_validate(
+                {
+                    "type": "external_conversation_item",
+                    "data": {
+                        "source_id": "claude-queued-steer",
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "steer"}],
+                        },
+                        "response_id": "resp_turn",
+                    },
+                }
+            ),
+            store,
+            created_by=None,
+        )
+        # The late mirror commits the send once and clears its bubble by id.
+        consumed = await collector.next_event()
+        while consumed["type"] != "session.input.consumed":
+            consumed = await collector.next_event()
+        assert consumed["data"]["cleared_pending_id"] == pending_id
+        assert not pending_inputs.has_pending(session_id)
+        [user] = store.list_items(session_id, type="message").data
+        assert user.id == consumed["data"]["item_id"]
+        while True:
+            try:
+                extra = await collector.next_event(timeout=0.05)
+            except TimeoutError:
+                break
+            assert extra["type"] != "session.input.consumed"
     finally:
         await collector.stop()
-    # Claude absorbs the queued paste only after a 25-minute step. Only the
-    # claiming runner's heartbeats renew it; a replacement never had the paste.
-    for now in range(60, 1501, 60):
-        await orchestration._reconcile_runner_input_leases(
-            store,
-            session_id,
-            {"active_pending_ids": [], "queued_pending_ids": []},
-            set(),
-            runner_id=heartbeat_runner,
-        )
-    if case != "confirmed-running" or heartbeat_runner != "runner_a":
-        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
-        (error,) = [item for item in store.list_items(session_id).data if item.type == "error"]
-        assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
-        return
-    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 720
-    assert not store.list_items(session_id).data
-    late_mirror = pending_inputs.resolve_matching_text(session_id, "steer")
-    assert late_mirror.matched is not None
-    assert late_mirror.matched.pending_id == pending_id
 
 
 def test_create_app_registers_the_mid_turn_busy_check(runtime_init, db_uri, tmp_path, monkeypatch):

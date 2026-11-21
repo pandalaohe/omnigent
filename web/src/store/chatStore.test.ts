@@ -48,7 +48,8 @@ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
-import { buildBubbles } from "@/lib/renderItems";
+import { buildBubbles, type Bubble } from "@/lib/renderItems";
+import { buildPendingBubbles } from "@/components/chat/chatBubbleParts";
 import {
   getSessionSlim,
   INITIAL_WINDOW_ITEMS,
@@ -732,6 +733,7 @@ function seedPendingInputs(
     created_by?: string;
     stable_id?: string;
     sending_since_ms?: number;
+    received?: boolean;
   }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
@@ -2115,6 +2117,23 @@ describe("chatStore — switchTo", () => {
     expect(state.pendingUserMessages).toEqual([
       { tempId: "pending_srv1", content: [{ type: "input_text", text: "queued msg" }] },
     ]);
+  });
+
+  it("replays a received paste as received on a reload or second device", async () => {
+    seedSession("conv_native", []);
+    const received = {
+      pending_id: "pending_received",
+      content: [{ type: "input_text", text: "queued in Claude" }],
+      sending_since_ms: 1710000000000,
+      received: true,
+    };
+    seedPendingInputs("conv_native", [received]);
+
+    await useChatStore.getState().switchTo("conv_native");
+
+    const [bubble] = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+    expect(bubble).toMatchObject({ itemId: "pending_received", awaitingAgent: true });
+    expect(bubble).not.toHaveProperty("sendingSinceMs");
   });
 
   it("replays the server send time for a native message waiting for delivery", async () => {
@@ -9191,20 +9210,29 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     useChatStore.setState({ conversationId: "conv_abc" });
   });
 
-  it("marks a received input while keeping its server send time", () => {
+  it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
     const since = 1_710_000_000_000;
-    const queued = { tempId: "tmp_steer", pendingId: "pending_steer", content: [] };
+    const content = [{ type: "input_text" as const, text: "steer" }];
+    const queued = { tempId: "tmp_steer", pendingId: "pending_steer", content };
     useChatStore.setState({
+      sessionStatus: "running",
       pendingUserMessages: [
         { ...queued, sentMidTurn: true },
         { ...queued, tempId: "tmp_other", pendingId: "pending_other" },
       ],
     });
+    const steerBubble = () =>
+      buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0] as Extract<
+        Bubble,
+        { kind: "user" }
+      >;
     handleSessionEvent({
       type: "session_input_sending",
       pendingId: "pending_steer",
       sinceMs: since,
     });
+    expect(steerBubble()).toMatchObject({ sendingSinceMs: since });
+    // The runner confirmed the paste while the turn keeps running.
     handleSessionEvent({
       type: "session_input_sending",
       pendingId: "pending_steer",
@@ -9218,8 +9246,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       sinceMs: since,
     });
     const [steer, other] = useChatStore.getState().pendingUserMessages;
+    // The send time stays for reconnect settlement; only the display changes.
     expect(steer).toMatchObject({ sendingSinceMs: since, received: true });
     expect(other!.received).toBeUndefined();
+    expect(steerBubble()).toMatchObject({ pending: true, awaitingAgent: true });
+    expect(steerBubble().sendingSinceMs).toBeUndefined();
+
+    // Claude absorbs it at its next step; the mirror commits it exactly once.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_steer",
+      itemType: "message",
+      clearedPendingId: "pending_steer",
+      data: { role: "user", content },
+    });
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["tmp_other"]);
   });
 
   describe("session.presence", () => {
