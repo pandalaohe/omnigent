@@ -9500,16 +9500,17 @@ def _submit_cross_line_tail(content: str) -> str:
     return tail if len(tail) >= _MIN_TAIL_NEEDLE_CHARS else ""
 
 
-def _clipped_draft_rows(pane: str) -> tuple[list[str], bool] | None:
+def _clipped_draft_rows(pane: str) -> tuple[list[str], bool, bool] | None:
     """Return a clipped draft's visible rows above the composer's actual closing rule.
 
     The draft is taller than the composer: its prompt row scrolled away, or the
     opening rule collapsed to ``─── ↑ N more ───``. Only a column-0 closing rule
-    without a dialog footer under it qualifies. A collapsed opening rule marks
-    the composer by itself; without one, the composer's mode footer must show,
-    which default permission mode under a custom status line does not draw.
+    without a dialog footer under it qualifies. Without the composer's mode
+    footer (default permission mode under a custom status line draws none), a
+    collapsed opening rule marks the composer, unless an overlay covers it.
 
-    :returns: ``(rows, collapsed)``, or ``None`` when the pane has no such composer.
+    :returns: ``(rows, collapsed, mode_footer)``, or ``None`` when the pane has
+        no such composer.
     """
     lines = pane.splitlines()
     rules = _composer_frame_rule_indices(lines)
@@ -9524,22 +9525,33 @@ def _clipped_draft_rows(pane: str) -> tuple[list[str], bool] | None:
     if opening_rule >= 0 and not collapsed:
         return None
     mode_footer = bool(footer) and footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts"))
-    if not collapsed and not mode_footer:
+    if not mode_footer and (
+        not collapsed
+        # A side chat or panel drawn under an older composer covers it.
+        or _btw_overlay_present(pane)
+        or _ESCAPE_DISMISS_HINT.search(" ".join(footer))
+    ):
         return None
     rows = [line for line in lines[opening_rule + 1 : closing_rule] if line.strip()]
     if not rows or any(not row.startswith("  ") for row in rows):
         return None
-    return rows, collapsed
+    return rows, collapsed, mode_footer
 
 
 def _clipped_draft_matches(pane: str, tail_needle: str) -> bool:
-    """Look for a clipped draft ending at the composer's actual closing rule."""
+    """Look for a clipped draft ending at the composer's actual closing rule.
+
+    Without a tail marker only a collapsed box over a mode footer counts; the
+    status-line layout needs the message's own text before an Enter.
+    """
     found = _clipped_draft_rows(pane)
     if found is None:
         return False
-    rows, collapsed = found
+    rows, collapsed, mode_footer = found
     target = _comparable_draft_text(tail_needle)
-    return _comparable_draft_text("".join(rows)).endswith(target) if target else collapsed
+    if target:
+        return _comparable_draft_text("".join(rows)).endswith(target)
+    return collapsed and mode_footer
 
 
 def _occupied_tall_draft(pane: str) -> bool:
