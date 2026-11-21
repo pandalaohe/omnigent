@@ -2598,8 +2598,9 @@ def create_runner_app(
     _input_execution_claims: dict[tuple[str, str], tuple[object, float, str]] = {}
     _pending_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     _abandoned_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
-    # Last refused receiver claim per session: (turn id, input id).
-    _refused_turn_inputs: dict[str, tuple[str, str]] = {}
+    # Refused receiver claims of live turns: (session id, turn id) -> input id.
+    _refused_turn_inputs: dict[tuple[str, str], str] = {}
+    app.state.refused_turn_inputs = _refused_turn_inputs
     _control_receipts: dict[tuple[str, str], bool] = {}
 
     async def _flush_control_receipts(session_id: str) -> None:
@@ -2844,7 +2845,7 @@ def create_runner_app(
                 and frame.claim.turn_id == _live_response_id.get(session_id)
             ):
                 # Recorded before the reply ends the turn; its stream end matches the input.
-                _refused_turn_inputs[session_id] = (frame.claim.turn_id, frame.claim.input_id)
+                _refused_turn_inputs[(session_id, frame.claim.turn_id)] = frame.claim.input_id
         reply = await harness_client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -5919,6 +5920,8 @@ def create_runner_app(
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         _turn_occurrences.pop(session_id, None)
+        for refused_key in [key for key in _refused_turn_inputs if key[0] == session_id]:
+            _refused_turn_inputs.pop(refused_key, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _turn_identities.pop(session_id, None)
@@ -11118,8 +11121,15 @@ def create_runner_app(
                     _held_refusal = None
                 if lifecycle_event is not None:
                     _publish_event(conv_id, lifecycle_event)
-                refused_input = _refused_turn_inputs.pop(conv_id, None)
-                admission_refused = refused_input == (_response_id, event_body.get("input_id"))
+                # Only this turn's own marker, so an older stream cannot take a newer one.
+                refused_input = (
+                    _refused_turn_inputs.pop((conv_id, _response_id), None)
+                    if _response_id is not None
+                    else None
+                )
+                admission_refused = refused_input is not None and refused_input == event_body.get(
+                    "input_id"
+                )
                 _on_proxy_stream_end(
                     conv_id,
                     error=lifecycle_error
@@ -11830,6 +11840,9 @@ def create_runner_app(
                 raise
 
             finally:
+                if _response_id is not None:
+                    # Every end of this turn drops its refusal marker, terminal or not.
+                    _refused_turn_inputs.pop((conv_id, _response_id), None)
                 # Dispatches outlive individual SSE frames, but belong to this turn.
                 _cancel_dispatch_tasks()
                 if _dispatch_tasks:

@@ -556,6 +556,62 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["terminal", "no_terminal"])
+async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end):
+    deadline = time.time() + 30
+    input_id, session_id = "f" * 32, "child"
+    newer = (session_id, "resp_newer")
+    claim = InputExecutionClaim(
+        input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
+    )
+
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/input-admission"):
+                return httpx.Response(
+                    200,
+                    json=InputExecutionReceipt(reason="input_closed").model_dump(),
+                    request=httpx.Request("POST", "http://server" + url),
+                )
+            return await super().post(url, **kwargs)
+
+    class Harness(_ScriptedHarnessClient):
+        async def post(self, url, *, json, timeout=None):
+            if end == "no_terminal" and json.get("type") == "input_execution_result":
+                # The receipt reply is lost, so the turn ends without a terminal frame.
+                raise httpx.ReadTimeout("receipt reply lost")
+            return await super().post(url, json=json, timeout=timeout)
+
+    event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
+    frames = [
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_multiturn"}}\n\n',
+        "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
+    ]
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(Harness(frames)), server_client=Server()
+    )
+    # A newer turn's marker, recorded before this older stream ends.
+    app.state.refused_turn_inputs[newer] = "b" * 32
+    async with _runner_test_client(app) as client:
+        await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "content": [{"type": "input_text", "text": "notice"}],
+                "input_id": input_id,
+                "input_admission_required": True,
+                "input_admission_deadline": deadline,
+            },
+        )
+    assert app.state.refused_turn_inputs == {newer: "b" * 32}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["accepted", "refused", "unknown", "superseded"])
 async def test_injection_reservation_releases_only_definite_refusal(db_uri, outcome):
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
