@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1683,54 +1684,89 @@ def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
     assert auth_target.read_text(encoding="utf-8") == "auth"
 
 
-_RETENTION_NOW = 2_000_000_000.0
+_RETENTION_TZ = timezone(timedelta(hours=8))
+
+
+def _utc8(*fields: int) -> float:
+    """Epoch seconds for a wall-clock time in the monthly archive's UTC+8."""
+    return datetime(*fields, tzinfo=_RETENTION_TZ).timestamp()
+
+
+_RETENTION_NOW = _utc8(2033, 5, 18, 12, 0)
 _DAY = 24 * 60 * 60
 
 
 def _make_session_bridge(
-    root: Path, name: str, *, session_id: str | None, owner_pid: int | None = 999999
+    root: Path,
+    name: str,
+    *,
+    session_id: str | None,
+    owner_pid: int | None = 999999,
+    active_at: float = _RETENTION_NOW - 60 * _DAY,
 ) -> Path:
-    """Create a bridge dir owned by *session_id* with a rollout and an old mtime."""
+    """Create a bridge dir owned by *session_id* whose files were last written at *active_at*."""
     bridge_dir = root / name
     rollout = bridge_dir / "codex-home" / "sessions" / "rollout-2026-11-01T00-00-00-t.jsonl"
     rollout.parent.mkdir(parents=True)
     rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    written = [rollout, bridge_dir]
     if owner_pid is not None:
         (bridge_dir / "owner.pid").write_text(str(owner_pid), encoding="utf-8")
+        written.append(bridge_dir / "owner.pid")
     if session_id is not None:
         (bridge_dir / "state.json").write_text(
             json.dumps({"session_id": session_id}), encoding="utf-8"
         )
-    # Recent mtimes everywhere: selection must come from session state alone.
-    for path in (rollout, bridge_dir):
-        os.utime(path, (_RETENTION_NOW, _RETENTION_NOW))
+    for path in written:
+        os.utime(path, (active_at, active_at))
     return bridge_dir
 
 
+def _archived(at: float, *, child: bool = False) -> codex_native_bridge.SessionRetentionState:
+    return codex_native_bridge.SessionRetentionState("archived", archived_at=int(at), child=child)
+
+
 @pytest.mark.parametrize(
-    ("answer", "removed"),
+    ("answer", "now", "active_at", "removed"),
     [
+        # Child sessions leave 14 days after their archive.
+        (_archived(_RETENTION_NOW - 14 * _DAY, child=True), _RETENTION_NOW, None, True),
+        (_archived(_RETENTION_NOW - 14 * _DAY + 60, child=True), _RETENTION_NOW, None, False),
+        # Main sessions (or unknown roles) also wait for the day-1 pack of their month.
+        (_archived(_RETENTION_NOW - 14 * _DAY), _RETENTION_NOW, None, False),
+        (_archived(_utc8(2033, 4, 10)), _utc8(2033, 5, 1, 2, 0), None, False),
+        (_archived(_utc8(2033, 4, 10)), _utc8(2033, 5, 1, 12, 0), None, False),
+        (_archived(_utc8(2033, 4, 10)), _utc8(2033, 5, 2, 2, 30), None, True),
+        (_archived(_utc8(2032, 12, 10)), _utc8(2033, 1, 2, 3, 0), None, True),
+        # A write after the archive moves the pack that covers it.
+        (_archived(_utc8(2033, 4, 10)), _utc8(2033, 5, 2, 3, 0), _utc8(2033, 5, 1), False),
+        (codex_native_bridge.SessionRetentionState("not_found"), _RETENTION_NOW, None, True),
         (
-            codex_native_bridge.SessionRetentionState(
-                "archived", archived_at=int(_RETENTION_NOW - 14 * _DAY)
-            ),
-            True,
-        ),
-        (codex_native_bridge.SessionRetentionState("not_found"), True),
-        (
-            codex_native_bridge.SessionRetentionState(
-                "archived", archived_at=int(_RETENTION_NOW - 14 * _DAY + 60)
-            ),
+            codex_native_bridge.SessionRetentionState("not_found"),
+            _RETENTION_NOW,
+            _utc8(2033, 5, 10),
             False,
         ),
-        (codex_native_bridge.SessionRetentionState("active"), False),
-        (codex_native_bridge.SessionRetentionState("unknown"), False),
-        (codex_native_bridge.SessionRetentionState("unknown", stop=True), False),
+        (codex_native_bridge.SessionRetentionState("active"), _RETENTION_NOW, None, False),
+        (codex_native_bridge.SessionRetentionState("unknown"), _RETENTION_NOW, None, False),
+        (
+            codex_native_bridge.SessionRetentionState("unknown", stop=True),
+            _RETENTION_NOW,
+            None,
+            False,
+        ),
     ],
     ids=[
-        "archived-14d",
-        "not-found",
-        "archived-under-14d",
+        "child-archived-14d",
+        "child-archived-under-14d",
+        "main-archived-14d-same-month",
+        "main-last-month-before-pack",
+        "main-last-month-within-margin",
+        "main-last-month-after-pack",
+        "main-december-after-january-pack",
+        "main-written-after-archive",
+        "not-found-packed",
+        "not-found-unpacked",
         "unarchived",
         "server-error",
         "unreachable",
@@ -1741,13 +1777,17 @@ def test_session_retention_removes_only_archived_or_missing_sessions(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     answer: codex_native_bridge.SessionRetentionState,
+    now: float,
+    active_at: float | None,
     removed: bool,
 ) -> None:
     root = tmp_path / "codex-native"
     root.mkdir()
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", root)
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
-    bridge_dir = _make_session_bridge(root, "b" * 32, session_id="sess-1")
+    bridge_dir = _make_session_bridge(
+        root, "b" * 32, session_id="sess-1", active_at=active_at or now - 120 * _DAY
+    )
     asked: list[str] = []
 
     def _lookup(session_id: str) -> codex_native_bridge.SessionRetentionState:
@@ -1755,9 +1795,7 @@ def test_session_retention_removes_only_archived_or_missing_sessions(
         return answer
 
     with caplog.at_level(logging.INFO, logger=codex_native_bridge.__name__):
-        counts = codex_native_bridge.prune_bridge_dirs_by_session_state(
-            _lookup, now=_RETENTION_NOW
-        )
+        counts = codex_native_bridge.prune_bridge_dirs_by_session_state(_lookup, now=now)
 
     assert asked == ["sess-1"]
     assert bridge_dir.exists() is not removed

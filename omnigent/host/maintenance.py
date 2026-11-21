@@ -749,24 +749,32 @@ def fetch_session_retention_state(
         return SessionRetentionState("active")
     archived_at = body.get("archived_at")
     if body.get("archived") is True and type(archived_at) is int:
-        return SessionRetentionState("archived", archived_at=archived_at)
+        return SessionRetentionState(
+            "archived", archived_at=archived_at, child=_reports_parent(body)
+        )
     return SessionRetentionState("unknown")
+
+
+def _reports_parent(row: Mapping[str, object]) -> bool:
+    """A child session names its parent; a missing or empty field counts as main."""
+    parent = row.get("parent_session_id")
+    return isinstance(parent, str) and bool(parent)
 
 
 def list_archived_session_times(
     client: httpx.Client,
     server_url: str,
     headers: Mapping[str, str],
-) -> dict[str, int]:
+) -> dict[str, tuple[int, bool]]:
     """Read the archive time of every archived session in a few list pages.
 
     Each row is the server's own record, so a hit is proof of the archive
     time; a miss proves nothing and is asked per session. A failed page
     keeps the rows already read.
 
-    :returns: Archive epoch seconds by session id.
+    :returns: ``(archive epoch seconds, has a parent)`` by session id.
     """
-    archived: dict[str, int] = {}
+    archived: dict[str, tuple[int, bool]] = {}
     after: str | None = None
     try:
         while True:
@@ -784,7 +792,7 @@ def list_archived_session_times(
             for row in page["data"]:
                 archived_at = row.get("archived_at")
                 if row.get("archived") is True and type(archived_at) is int:
-                    archived[str(row["id"])] = archived_at
+                    archived[str(row["id"])] = (archived_at, _reports_parent(row))
             cursor = page.get("last_id")
             if not page.get("has_more") or not isinstance(cursor, str) or cursor == after:
                 return archived
@@ -826,7 +834,8 @@ def retain_codex_session_dirs(
             if should_stop():
                 return SessionRetentionState("unknown", stop=True)
             if session_id in archived:
-                return SessionRetentionState("archived", archived_at=archived[session_id])
+                archived_at, child = archived[session_id]
+                return SessionRetentionState("archived", archived_at=archived_at, child=child)
             return fetch_session_retention_state(client, server_url, session_id, headers)
 
         return prune_bridge_dirs_by_session_state(_lookup, now=now, remove=remove)

@@ -21,6 +21,7 @@ import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -584,6 +585,11 @@ def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
 ARCHIVED_SESSION_RETENTION_SECONDS = 14 * 24 * 60 * 60
 #: Bridge dirs are named by a 32-hex digest (:func:`bridge_dir_for_bridge_id`).
 _BRIDGE_DIR_NAME = re.compile(r"[0-9a-f]{32}")
+#: The host's monthly session archive packs each past month's main-session
+#: rollouts, bucketed by file mtime in UTC+8, on day 1 at 02:30.
+_MONTHLY_ARCHIVE_TZ = timezone(timedelta(hours=8))
+#: Room for a pack still running, or caught up late, on day 1.
+_MONTHLY_ARCHIVE_MARGIN = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -596,11 +602,24 @@ class SessionRetentionState:
     :param archived_at: Archive time in epoch seconds, e.g. ``1795000000``.
     :param stop: Whether the server cannot answer at all, so the sweep asks
         nothing more this pass.
+    :param child: Whether the server reports a parent session; an unknown
+        role counts as a main session.
     """
 
     status: Literal["archived", "active", "not_found", "unknown"]
     archived_at: int | None = None
     stop: bool = False
+    child: bool = False
+
+
+def _monthly_archive_covers(last_write: float, now: float) -> bool:
+    """Return whether the monthly archive for *last_write*'s month has run, with margin."""
+    written = datetime.fromtimestamp(last_write, _MONTHLY_ARCHIVE_TZ)
+    year, month = (
+        (written.year + 1, 1) if written.month == 12 else (written.year, written.month + 1)
+    )
+    packed_at = datetime(year, month, 1, 2, 30, tzinfo=_MONTHLY_ARCHIVE_TZ)
+    return now >= (packed_at + _MONTHLY_ARCHIVE_MARGIN).timestamp()
 
 
 def _read_owner_marker(bridge_dir: Path) -> tuple[bool, int | None]:
@@ -644,10 +663,12 @@ def prune_bridge_dirs_by_session_state(
     A dir qualifies only when its name is a bridge digest, its ``owner.pid``
     names no live process, its ``state.json`` names the owning session, and
     *lookup* reports that session archived at least
-    :data:`ARCHIVED_SESSION_RETENTION_SECONDS` ago or not found. Any other
-    answer keeps the dir; directory mtimes are never consulted. Removal
-    re-checks the owner under the bridge's cleanup lock and logs the session
-    id and bytes.
+    :data:`ARCHIVED_SESSION_RETENTION_SECONDS` ago or not found. A main
+    session (or one whose role is unknown) also waits until the monthly
+    archive has packed its last write: the later of its archive time and the
+    dir's newest activity. Any other answer keeps the dir; activity times
+    only delay a removal, never select one. Removal re-checks the owner under
+    the bridge's cleanup lock and logs the session id and bytes.
 
     :param lookup: Returns the server's answer for one session id.
     :param now: Epoch seconds for the archive age; ``None`` uses the clock.
@@ -703,6 +724,16 @@ def prune_bridge_dirs_by_session_state(
         else:
             keep("recent_archive" if answer.status == "archived" else answer.status)
             continue
+        if not answer.child:
+            # A not-found session's role is unknown, so it counts as main too.
+            activity = _codex_newest_activity_time(entry)
+            if activity is None:
+                keep("no_activity")
+                continue
+            if not _monthly_archive_covers(max(activity, answer.archived_at or 0), now):
+                keep("unpacked")
+                continue
+            reason += ", monthly archive passed"
         if not remove:
             size = _bridge_dir_bytes(entry)
             counts["removable"] += 1

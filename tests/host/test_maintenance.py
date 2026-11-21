@@ -97,20 +97,32 @@ def test_host_janitor_adds_session_retention_for_its_server() -> None:
     [
         (
             200,
-            {"archived": True, "archived_at": 1_700_000_000},
-            ("archived", 1_700_000_000, False),
+            {"archived": True, "archived_at": 1_700_000_000, "parent_session_id": "sess-0"},
+            ("archived", 1_700_000_000, False, True),
         ),
-        (200, {"archived": False, "archived_at": None}, ("active", None, False)),
-        (200, {"archived": True, "archived_at": None}, ("unknown", None, False)),
-        (404, {"error": {"code": "not_found"}}, ("not_found", None, False)),
-        (404, {"detail": "Not Found"}, ("unknown", None, False)),
-        (403, {"error": {"code": "forbidden"}}, ("unknown", None, False)),
-        (401, {"error": {"code": "unauthorized"}}, ("unknown", None, True)),
-        (503, None, ("unknown", None, True)),
-        (None, None, ("unknown", None, True)),
+        (
+            200,
+            {"archived": True, "archived_at": 1_700_000_000, "parent_session_id": None},
+            ("archived", 1_700_000_000, False, False),
+        ),
+        (
+            200,
+            {"archived": True, "archived_at": 1_700_000_000},
+            ("archived", 1_700_000_000, False, False),
+        ),
+        (200, {"archived": False, "archived_at": None}, ("active", None, False, False)),
+        (200, {"archived": True, "archived_at": None}, ("unknown", None, False, False)),
+        (404, {"error": {"code": "not_found"}}, ("not_found", None, False, False)),
+        (404, {"detail": "Not Found"}, ("unknown", None, False, False)),
+        (403, {"error": {"code": "forbidden"}}, ("unknown", None, False, False)),
+        (401, {"error": {"code": "unauthorized"}}, ("unknown", None, True, False)),
+        (503, None, ("unknown", None, True, False)),
+        (None, None, ("unknown", None, True, False)),
     ],
     ids=[
-        "archived",
+        "archived-child",
+        "archived-main",
+        "archived-unknown-role",
         "unarchived",
         "archived-without-time",
         "not-found",
@@ -122,7 +134,9 @@ def test_host_janitor_adds_session_retention_for_its_server() -> None:
     ],
 )
 def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
-    status: int | None, body: dict[str, Any] | None, expected: tuple[str, int | None, bool]
+    status: int | None,
+    body: dict[str, Any] | None,
+    expected: tuple[str, int | None, bool, bool],
 ) -> None:
     requests: list[httpx.Request] = []
 
@@ -139,7 +153,7 @@ def test_fetch_session_retention_state_trusts_only_the_servers_own_answer(
             client, _SERVER, "sess-1", {"X-Test": "1"}
         )
 
-    assert (state.status, state.archived_at, state.stop) == expected
+    assert (state.status, state.archived_at, state.stop, state.child) == expected
     assert requests[0].url.path == "/v1/sessions/sess-1"
     assert requests[0].url.params["include_items"] == "false"
     assert requests[0].headers["X-Test"] == "1"
@@ -151,6 +165,12 @@ def test_list_archived_session_times_reads_every_page_and_keeps_rows_on_failure(
             "data": [
                 {"id": "sess-1", "archived": True, "archived_at": 1_700_000_000},
                 {"id": "sess-2", "archived": True, "archived_at": None},
+                {
+                    "id": "sess-4",
+                    "archived": True,
+                    "archived_at": 1_700_000_100,
+                    "parent_session_id": "sess-1",
+                },
             ],
             "has_more": True,
             "last_id": "sess-2",
@@ -172,7 +192,11 @@ def test_list_archived_session_times_reads_every_page_and_keeps_rows_on_failure(
     with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
         archived = maintenance.list_archived_session_times(client, _SERVER, {"X-Test": "1"})
 
-    assert archived == {"sess-1": 1_700_000_000, "sess-3": 1_700_000_500}
+    assert archived == {
+        "sess-1": (1_700_000_000, False),
+        "sess-4": (1_700_000_100, True),
+        "sess-3": (1_700_000_500, False),
+    }
     assert [request.url.params.get("after") for request in requests] == [None, "sess-2", "sess-3"]
     assert requests[0].url.params["archived_only"] == "true"
     assert requests[0].headers["X-Test"] == "1"
@@ -191,6 +215,8 @@ def test_retain_codex_session_dirs_asks_per_session_only_beyond_the_archive_list
         (bridge_dir / "state.json").write_text(
             f'{{"session_id": "{session_id}"}}', encoding="utf-8"
         )
+        # Last written well before both sessions' monthly archive.
+        os.utime(bridge_dir / "owner.pid", (_NOW - 60 * 24 * 3600,) * 2)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
     asked: list[tuple[str, str, dict[str, str]]] = []
@@ -204,7 +230,7 @@ def test_retain_codex_session_dirs_asks_per_session_only_beyond_the_archive_list
     monkeypatch.setattr(
         maintenance,
         "list_archived_session_times",
-        lambda _client, _server_url, _headers: {"sess-listed": int(_NOW - 15 * 24 * 3600)},
+        lambda _client, _server_url, _headers: {"sess-listed": (int(_NOW - 15 * 24 * 3600), True)},
     )
     monkeypatch.setattr(maintenance, "fetch_session_retention_state", _fetch)
 
