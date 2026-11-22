@@ -101,13 +101,14 @@ class _HistoryServerClient:
 class _CatchUpServerClient(_HistoryServerClient):
     """Return no history until the test exposes a missed user item."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, items_page: dict[str, Any] | None = None) -> None:
         self.expose_item = False
+        self.items_page = _ITEMS_PAGE if items_page is None else items_page
 
     async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
         del kwargs
         if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
-            page = _ITEMS_PAGE if self.expose_item else {"data": [], "has_more": False}
+            page = self.items_page if self.expose_item else {"data": [], "has_more": False}
             return self._Resp(page)
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
@@ -1012,14 +1013,33 @@ async def test_catch_up_replay_drops_forward_of_its_item() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "older_items",
+    [
+        pytest.param([], id="single-item"),
+        pytest.param(
+            [
+                {
+                    **_PENDING_USER_MESSAGE,
+                    "id": "msg_older",
+                    "content": [{"type": "input_text", "text": "older input"}],
+                }
+            ],
+            id="older-user-item",
+        ),
+    ],
+)
 async def test_catch_up_leaves_buffered_forward_for_fifo_drain(
     monkeypatch: pytest.MonkeyPatch,
+    older_items: list[dict[str, Any]],
 ) -> None:
     from omnigent.runner import session_history
     from omnigent.runner.app import _session_histories_ref
     from tests._helpers.polling import poll_until_async
 
-    server = _CatchUpServerClient()
+    server = _CatchUpServerClient(
+        items_page={**_ITEMS_PAGE, "data": [*older_items, _PENDING_USER_MESSAGE]}
+    )
     app, _pm, harness = _build_sdk_app(server)
     resolving_history = asyncio.Event()
     release_history = asyncio.Event()
@@ -1067,8 +1087,10 @@ async def test_catch_up_leaves_buffered_forward_for_fifo_drain(
                 release_history.set()
                 await asyncio.wait_for(scan, timeout=5)
 
-            assert SESSION_ID not in app.state.active_turns, "catch-up replayed queued D"
-            assert not _session_histories_ref[SESSION_ID], "catch-up exposed D before admission"
+            assert SESSION_ID not in app.state.active_turns, "catch-up replayed while D was queued"
+            assert [item["id"] for item in _session_histories_ref[SESSION_ID]] == [
+                item["id"] for item in older_items
+            ]
             await app.state.check_and_start_next_turn(SESSION_ID)
             await poll_until_async(
                 lambda: (

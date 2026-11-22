@@ -15034,8 +15034,10 @@ def create_runner_app(
                     for body in _session_message_buffers.get(session_id, ())
                     if isinstance(item_id := body.get("persisted_item_id"), str) and item_id
                 }
+                # Filtering queued messages must not promote an older input to replay.
+                replay_item = new_items[-1] if new_items else {}
+                replay_item_id = replay_item.get("id")
                 if queued_item_ids:
-                    all_new = [item for item in all_new if item.get("id") not in queued_item_ids]
                     new_items = [
                         item for item in new_items if item.get("id") not in queued_item_ids
                     ]
@@ -15044,8 +15046,11 @@ def create_runner_app(
                 )
                 if (
                     session_id not in _active_turns
-                    and new_items
-                    and new_items[-1].get("role") == "user"
+                    and replay_item.get("role") == "user"
+                    and (
+                        not isinstance(replay_item_id, str)
+                        or replay_item_id not in queued_item_ids
+                    )
                     and not (
                         _session_harness_name(session_id) in {"claude-sdk", "codex", "pi"}
                         and _trailing_sdk_peer_item(all_new)
