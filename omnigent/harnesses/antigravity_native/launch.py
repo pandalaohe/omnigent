@@ -44,7 +44,7 @@ from pathlib import Path
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
-from omnigent.util.reasoning_effort import ANTIGRAVITY_MODEL_EFFORT_CAPS, clamp_effort_for_model
+from omnigent.util.reasoning_effort import antigravity_model_effort_caps, clamp_effort_for_model
 
 _logger = logging.getLogger(__name__)
 
@@ -227,13 +227,12 @@ def build_agy_launch(
         argv.extend(["--conversation", conversation_id])
     if model is not None:
         base_model, suffix_effort = split_agy_effort_suffix(model)
+        caps = antigravity_model_effort_caps()
         if effort:
-            effort = clamp_effort_for_model(effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
+            effort = clamp_effort_for_model(effort, base_model, caps=caps)
             argv.extend(["--model", base_model])
         elif suffix_effort is not None:
-            clamped_suffix = clamp_effort_for_model(
-                suffix_effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS
-            )
+            clamped_suffix = clamp_effort_for_model(suffix_effort, base_model, caps=caps)
             argv.extend(
                 [
                     "--model",

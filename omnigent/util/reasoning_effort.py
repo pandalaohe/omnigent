@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
-from omnigent.models.model_fallbacks import (
-    ANTIGRAVITY_HIGH_CAP_MODELS,
-    ANTIGRAVITY_MEDIUM_CAP_MODELS,
-)
 
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 EFFORT_VALUES = frozenset(EFFORT_ORDER)
@@ -216,20 +213,34 @@ DEFAULT_MODEL_EFFORT_CAPS = ModelEffortCaps()
 # gateway table independently of agy's CLI catalog.
 _ANTIGRAVITY_ABOVE_HIGH: frozenset[str] = frozenset({"xhigh", "max", "ultra"})
 _ANTIGRAVITY_NON_MEDIUM: frozenset[str] = frozenset({"low", "high", "xhigh", "max", "ultra"})
-ANTIGRAVITY_MODEL_EFFORT_CAPS = ModelEffortCaps(
-    fallback=MappingProxyType(
-        {
-            **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, "high"),
-            **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium"),
-        }
-    ),
-    unsupported=MappingProxyType(
-        {
-            **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, _ANTIGRAVITY_ABOVE_HIGH),
-            **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM),
-        }
-    ),
-)
+
+
+@lru_cache(maxsize=1)
+def antigravity_model_effort_caps() -> ModelEffortCaps:
+    """Return per-model effort ceilings for Antigravity (``agy``) models.
+
+    Imported lazily because :mod:`omnigent.models.model_fallbacks` pulls in
+    ``provider_config`` → ``spec.parser`` → ``spec.validator`` → this module.
+    """
+    from omnigent.models.model_fallbacks import (
+        ANTIGRAVITY_HIGH_CAP_MODELS,
+        ANTIGRAVITY_MEDIUM_CAP_MODELS,
+    )
+
+    return ModelEffortCaps(
+        fallback=MappingProxyType(
+            {
+                **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, "high"),
+                **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium"),
+            }
+        ),
+        unsupported=MappingProxyType(
+            {
+                **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, _ANTIGRAVITY_ABOVE_HIGH),
+                **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM),
+            }
+        ),
+    )
 
 
 def model_effort_caps(caps: ModelEffortCaps | None = None) -> ModelEffortCaps:

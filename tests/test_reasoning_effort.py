@@ -17,7 +17,6 @@ import pytest
 from omnigent.util.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     ANTIGRAVITY_EFFORTS,
-    ANTIGRAVITY_MODEL_EFFORT_CAPS,
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
     DEFAULT_MODEL_EFFORT_CAPS,
@@ -25,6 +24,7 @@ from omnigent.util.reasoning_effort import (
     GEMINI_EFFORTS,
     PI_EFFORTS,
     ModelEffortCaps,
+    antigravity_model_effort_caps,
     clamp_effort_for_model,
     effort_for_model_switch,
     model_effort_caps,
@@ -275,7 +275,7 @@ def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
     model: str, effort: str
 ) -> None:
     """Gemini 4 Neon and Hydrogen keep every Antigravity effort including xhigh."""
-    assert clamp_effort_for_model(effort, model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS) == effort
+    assert clamp_effort_for_model(effort, model, caps=antigravity_model_effort_caps()) == effort
 
 
 @pytest.mark.parametrize(
@@ -293,24 +293,17 @@ def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
 @pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
 def test_antigravity_caps_clamp_above_high_for_high_only_models(model: str, effort: str) -> None:
     """Antigravity models capped at high never receive xhigh/max/ultra."""
-    assert clamp_effort_for_model(effort, model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS) == "high"
+    caps = antigravity_model_effort_caps()
+    assert clamp_effort_for_model(effort, model, caps=caps) == "high"
     for supported in ("low", "medium", "high"):
-        assert (
-            clamp_effort_for_model(supported, model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
-            == supported
-        )
+        assert clamp_effort_for_model(supported, model, caps=caps) == supported
 
 
 def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchanged() -> None:
     """GPT-OSS stays at medium on agy; non-AG default caps never clamp Claude 5.5."""
-    assert (
-        clamp_effort_for_model("xhigh", "gpt-oss-120b", caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
-        == "medium"
-    )
-    assert (
-        clamp_effort_for_model("medium", "gpt-oss-120b", caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
-        == "medium"
-    )
+    caps = antigravity_model_effort_caps()
+    assert clamp_effort_for_model("xhigh", "gpt-oss-120b", caps=caps) == "medium"
+    assert clamp_effort_for_model("medium", "gpt-oss-120b", caps=caps) == "medium"
     # Anthropic/Claude harnesses use the default table and must not lose xhigh/max on 5.5.
     assert clamp_effort_for_model("xhigh", "claude-opus-5-5") == "xhigh"
     assert clamp_effort_for_model("xhigh", "claude-sonnet-5-5") == "xhigh"
@@ -323,7 +316,4 @@ def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchang
         )
     )
     with patch("omnigent.runtime._globals._caps", new=SimpleNamespace(routing_settings=settings)):
-        assert (
-            clamp_effort_for_model("xhigh", "claude-opus-5-5", caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
-            == "high"
-        )
+        assert clamp_effort_for_model("xhigh", "claude-opus-5-5", caps=caps) == "high"

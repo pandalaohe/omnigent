@@ -2119,7 +2119,7 @@ def build_native_controls(
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
         from omnigent.util.reasoning_effort import (
-            ANTIGRAVITY_MODEL_EFFORT_CAPS,
+            antigravity_model_effort_caps,
             clamp_effort_for_model,
         )
 
@@ -2142,13 +2142,12 @@ def build_native_controls(
             raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
             effort = raw_effort if isinstance(raw_effort, str) else None
         base_model, suffix_effort = split_agy_effort_suffix(model.strip())
+        caps = antigravity_model_effort_caps()
         if effort:
-            effort = clamp_effort_for_model(effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
+            effort = clamp_effort_for_model(effort, base_model, caps=caps)
             selected = f"{base_model}-{effort}"
         elif suffix_effort is not None:
-            clamped_suffix = clamp_effort_for_model(
-                suffix_effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS
-            )
+            clamped_suffix = clamp_effort_for_model(suffix_effort, base_model, caps=caps)
             selected = (
                 f"{base_model}-{clamped_suffix}"
                 if clamped_suffix != suffix_effort
@@ -2194,7 +2193,7 @@ def build_native_controls(
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
         from omnigent.util.reasoning_effort import (
-            ANTIGRAVITY_MODEL_EFFORT_CAPS,
+            antigravity_model_effort_caps,
             clamp_effort_for_model,
         )
 
@@ -2216,7 +2215,7 @@ def build_native_controls(
         )
         if (
             base_model is not None
-            and clamp_effort_for_model(effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
+            and clamp_effort_for_model(effort, base_model, caps=antigravity_model_effort_caps())
             != effort
         ):
             return JSONResponse(
