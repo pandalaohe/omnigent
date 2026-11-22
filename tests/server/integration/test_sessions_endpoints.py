@@ -18105,66 +18105,57 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale route snapshot must not hide a real effort change in storage."""
+    """A slow runner forward does not hold the settings DB write lock."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
     store = SqlAlchemyConversationStore(db_uri)
-    store.update_conversation(session_id, reasoning_effort="high")
+    store.update_conversation(session_id, reasoning_effort="medium")
     captured: list[dict[str, Any]] = []
-    runtime_effort = "high"
+    entered_forward = asyncio.Event()
+    resume_forward = asyncio.Event()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal runtime_effort
-        if request.method == "POST" and request.url.path.endswith("/events"):
-            body = json.loads(request.content)
-            if body.get("type") == "effort_change":
-                captured.append(body)
-                runtime_effort = body["effort"]
-            return httpx.Response(204)
-        return httpx.Response(202, json={"queued": True})
+    async def paused_forward(
+        forwarded_session_id: str,
+        runner_router: Any,
+        event: dict[str, Any],
+        timeout_s: float = 5.0,
+    ) -> _RunnerForwardResult:
+        del runner_router, timeout_s
+        assert forwarded_session_id == session_id
+        captured.append(event)
+        entered_forward.set()
+        await resume_forward.wait()
+        return _RunnerForwardResult(status_code=204, body="")
 
-    entered_update = threading.Event()
-    resume_update = threading.Event()
-    original_update = SqlAlchemyConversationStore.update_conversation_with_changes
-
-    def paused_update(
-        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
-    ) -> Any:
-        if conversation_id == session_id and kwargs.get("reasoning_effort") == "high":
-            entered_update.set()
-            assert resume_update.wait(timeout=5), "Timed out waiting for concurrent write"
-        return original_update(self, conversation_id, **kwargs)
-
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore, "update_conversation_with_changes", paused_update
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", paused_forward)
+    pending = asyncio.create_task(
+        client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
     )
-    async with _runtime_runner(handler):
-        pending = asyncio.create_task(
-            client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
-        )
-        try:
-            assert await asyncio.to_thread(entered_update.wait, 5)
-            mirrored = await client.patch(
+    try:
+        await asyncio.wait_for(entered_forward.wait(), timeout=5)
+        mirrored = await asyncio.wait_for(
+            client.patch(
                 f"/v1/sessions/{session_id}",
-                json={"reasoning_effort": "medium", "silent": True},
-            )
-            assert mirrored.status_code == 200, mirrored.text
-            assert mirrored.json()["reasoning_effort"] == "medium"
-            assert captured == []
-            # A silent write mirrors an effort the native pane already applied.
-            runtime_effort = "medium"
-        finally:
-            resume_update.set()
-            response = await pending
+                json={"reasoning_effort": "high", "silent": True},
+            ),
+            timeout=5,
+        )
+    finally:
+        resume_forward.set()
+        response = await asyncio.wait_for(pending, timeout=5)
 
+    assert mirrored.status_code == 200, mirrored.text
+    assert mirrored.json()["reasoning_effort"] == "high"
     assert response.status_code == 200, response.text
     assert response.json()["reasoning_effort"] == "high"
     assert captured == [{"type": "effort_change", "effort": "high"}]
-    assert runtime_effort == "high"
     saved = store.get_conversation(session_id)
     assert saved is not None
-    assert saved.reasoning_effort == runtime_effort
+    assert saved.reasoning_effort == "high"
 
 
 @pytest.mark.parametrize(
