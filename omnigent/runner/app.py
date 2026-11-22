@@ -12435,10 +12435,15 @@ def create_runner_app(
                     )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
+                    delivery_attempt = input_attributes(message_body).get("delivery_attempt_id")
                     message_body["content"] = await _resolve_forwarded_message_content(
                         _raw_content,
                         session_id=conversation_id,
                         server_client=server_client,
+                        delivery_attempt_id=delivery_attempt
+                        if isinstance(delivery_attempt, str)
+                        and message_body.get("pending_input_claim_required") is True
+                        else None,
                     )
 
                 _peer_delivery: SDKPeerInput | None = None

@@ -183,6 +183,7 @@ async def _resolve_forwarded_message_content(
     *,
     session_id: str,
     server_client: httpx.AsyncClient,
+    delivery_attempt_id: str | None = None,
 ) -> list[_JsonObject]:
     """Resolve server-uploaded ``file_id`` blocks inside the runner.
 
@@ -196,14 +197,34 @@ async def _resolve_forwarded_message_content(
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
 
+    if delivery_attempt_id is not None and any(
+        isinstance(block, dict)
+        and block.get("type") == "input_text"
+        and isinstance(text := block.get("text"), str)
+        and text.strip()
+        for block in content
+    ):
+        delivery_attempt_id = None
     resolved: list[_JsonObject] = []
     changed = False
+    attachment_index = 0
     for block in content:
         replacement = None
+        is_attachment = isinstance(block, dict) and block.get("type") in (
+            "input_image",
+            "input_file",
+        )
         if isinstance(block, dict) and has_unresolved_file_id(block):
             replacement = await resolve_file_reference(
-                block, session_id=session_id, client=server_client
+                block,
+                session_id=session_id,
+                client=server_client,
+                delivery=(delivery_attempt_id, attachment_index)
+                if is_attachment and delivery_attempt_id is not None
+                else None,
             )
+        if is_attachment:
+            attachment_index += 1
         if replacement is None:
             resolved.append(block)
         else:
