@@ -136,7 +136,7 @@ import {
   forgetUnsentSend,
   peekQueuedSends,
   peekRestoredSend,
-  peekUnsentSend,
+  peekUnsentSends,
   rememberQueuedSends,
   rememberRestoredSend,
   rememberUnsentSend,
@@ -172,8 +172,8 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
-import { uploadFile } from "@/lib/filesApi";
-import { attachmentKey, classifyAttachment } from "@/lib/attachments";
+import { uploadFile, type FileUploadProgress } from "@/lib/filesApi";
+import { attachmentFilename, attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { mentionItemPath, mentionMarkerFor } from "@/lib/composerMentions";
 import { insertIntoQuestionCard } from "@/lib/questionCardInput";
 import {
@@ -511,7 +511,9 @@ export function hasPendingLocalMessage(tempConvId: string): boolean {
 
 /** Whether a first message is still held for startup; nothing queued may overtake it. */
 export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMessages">): boolean {
-  return state.pendingUserMessages.some((message) => message.initialDraft !== undefined);
+  return state.pendingUserMessages.some(
+    (message) => message.initialDraft !== undefined && !message.uploadProgress,
+  );
 }
 
 /** Keep a conversation's queued messages from sending until the user retries each one. */
@@ -691,22 +693,21 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** This message has not issued its event POST yet. */
+  beforePost?: boolean;
+  /** The attachment currently being uploaded for this pending bubble. */
+  uploadProgress?: PendingUploadProgress;
 }
 
 /**
- * Live progress of the attachment upload a send is currently running.
- *
- * Set while a file is transferring and cleared when it settles, so the
- * composer can show one "Uploading <name> — <n>%" row. Unset when nothing is
- * uploading.
+ * Live progress of the attachment upload for one pending bubble.
  */
-export interface UploadProgress {
+export interface PendingUploadProgress {
   filename: string;
-  /**
-   * Transfer fraction in [0, 1], or `null` when the transport cannot report
-   * progress (the authenticated fetch path); the composer then shows the
-   * upload without a percentage.
-   */
+  fileIndex: number;
+  fileCount: number;
+  loaded: number;
+  total: number | null;
   fraction: number | null;
 }
 
@@ -809,12 +810,6 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
-  /**
-   * The attachment upload a send is currently running, if any. One row for
-   * the whole send: uploads are sequential, so the newest progress event
-   * wins. Cleared when the upload settles (success or failure).
-   */
-  uploadProgress: UploadProgress | null;
   /**
    * Recent shell mirrors and the bubbles they settled. Retaining both client
    * and server ids protects later inputs from duplicate or legacy receipts.
@@ -1035,6 +1030,8 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
+    /** Replace the current composer when this draft is restored. */
+    replaceComposer?: boolean;
   } | null;
   pendingRetryStableId: string | null;
   /**
@@ -1421,10 +1418,12 @@ export interface ChatActions {
   /**
    * Steer EVERY queued message of a conversation, in queue (FIFO) order, so the
    * whole backlog reaches the running turn now instead of draining one per
-   * idle. Sends chain per conversation, so order is preserved. No-op when the
+   * idle. Files upload independently before joining the POST chain. No-op when the
    * conversation has nothing queued or no agent to send to.
    */
   steerAllQueuedMessages: (conversationId: string) => void;
+  /** Cancel an attachment upload and restore that message into its composer. */
+  cancelUploadingSend: (tempId: string) => void;
   /**
    * Drop and return all queued messages for a conversation. Called when a
    * conversation is deleted so its queue can't linger in memory (it would never
@@ -2032,6 +2031,8 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
 const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
+const cancelPendingUploads = new Map<string, () => void>();
+const queuedHeadUploads = new Set<string>();
 
 /**
  * Upload a file to a session and return its content block, reusing a prior
@@ -2039,20 +2040,16 @@ const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
  * a failed post (or a later file's upload failing) doesn't re-upload files
  * that already landed when the message is retried.
  */
-async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBlock> {
+async function uploadFileBlock(
+  sessionId: string,
+  file: File,
+  signal?: AbortSignal,
+  onProgress?: (progress: FileUploadProgress) => void,
+): Promise<ContentBlock> {
   const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
-  const progressName = file.name || "file";
-  const uploaded = await (async () => {
-    try {
-      return await uploadFile(sessionId, file, (fraction) => {
-        setterFor(sessionId)({ uploadProgress: { filename: progressName, fraction } });
-      });
-    } finally {
-      // Clear on both paths so a failed upload can't strand the row.
-      setterFor(sessionId)({ uploadProgress: null });
-    }
-  })();
+  signal?.throwIfAborted();
+  const uploaded = await uploadFile(sessionId, file, onProgress, signal);
   const block: ContentBlock =
     classifyAttachment(file) === "image"
       ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
@@ -2152,6 +2149,8 @@ export function initChatStore(client: QueryClient): void {
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
+  cancelPendingUploads.clear();
+  queuedHeadUploads.clear();
   startupReads.clear();
   queryClient = client;
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
@@ -2340,7 +2339,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
-  uploadProgress: null,
   settledShellInputs: [],
   btwSidechat: null,
   queuedMessages: [],
@@ -2579,6 +2577,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  cancelUploadingSend: (tempId) => cancelPendingUploads.get(tempId)?.(),
+
   clearQueuedMessages: (conversationId) => {
     const removed = get().queuedMessages.filter((m) => m.conversationId === conversationId);
     if (removed.length === 0) return removed;
@@ -2621,6 +2621,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (
       s.conversationId === null ||
       sideChatSettingsPending(s.conversationId) ||
+      queuedHeadUploads.has(s.conversationId) ||
       s.boundAgentId === null ||
       s.sessionStatus === "running" ||
       holdsInitialDraft(s)
@@ -2647,9 +2648,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // head-only guard would let it block this conversation's messages forever.
     const head = sendableQueuedHead(s.queuedMessages, s.conversationId);
     if (head === null) return;
-    // Remove it BEFORE the POST so a re-entrant flush can't double-send.
+    // The automatic queue still dispatches one message per turn, even when
+    // its head uploads without setting the conversation's send latch.
+    const uploading = (head.files?.length ?? 0) > 0;
+    if (uploading) queuedHeadUploads.add(head.conversationId);
     target.write({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
+    const send = s.send(
+      head.text,
+      head.agentId ?? s.boundAgentId,
+      head.files,
+      queuedSendOptions(head),
+    );
+    if (uploading) void send.finally(() => queuedHeadUploads.delete(head.conversationId));
   },
 
   flushBackgroundQueues: () => {
@@ -2661,7 +2671,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const candidateIds = new Set(
       s.queuedMessages
         .map((m) => m.conversationId)
-        .filter((id) => id !== s.conversationId && !entryDrainedQueues.has(id)),
+        .filter(
+          (id) =>
+            id !== s.conversationId && !entryDrainedQueues.has(id) && !queuedHeadUploads.has(id),
+        ),
     );
     if (candidateIds.size === 0) return;
 
@@ -2729,34 +2742,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           .finally(() => backgroundFlushInFlight.delete(conversationId));
         continue;
       }
-      // Join the SAME send chain the foreground path uses for this
-      // conversation. A queued message can hand off from the foreground flush
-      // (send() → its chain) to here the moment the user navigates away, and
-      // the two POST paths would otherwise race — a background postEvent could
-      // overtake a foreground send() still awaiting its chain slot, delivering
-      // out of FIFO order. Taking a slot here (wait before the upload/post,
-      // release in finally) serializes every POST to this conversation across
-      // both paths through one ordering primitive.
-      const { waitForPrior, releaseSend } = enterSendChain(conversationId);
-      // Upload any attachments, then post the message referencing their
-      // server-assigned file_ids — the same two-phase sequence send() runs
-      // (no combined endpoint exists: /resources/files stores the blob and
-      // returns an id, /events posts a message that points at that id). Both
-      // awaits sit under the one in-flight guard and the one catch, so a
-      // failure in either phase re-queues and backs off together.
-      //
-      // No optimistic bubble — we're not viewing this conversation; it
-      // re-hydrates from the snapshot on return. On failure re-queue at the
-      // head (preserving this conversation's FIFO order) and set a cooldown so
-      // the next trigger backs off instead of hammering a failing runner.
+      // Keep the background queue's guard and retry behavior. Only the POST
+      // takes a chain slot when its message has files to upload first.
+      const orderedParts = head.composerParts ?? legacyComposerParts(head.text, head.files ?? []);
+      let postChain = orderedParts.some((part) => part.type === "attachment")
+        ? undefined
+        : enterSendChain(conversationId);
       void (async () => {
-        await waitForPrior();
-        // Reuse prior successful uploads so cooldown-paced retries do not
-        // orphan blobs that already landed.
-        const orderedParts = head.composerParts ?? legacyComposerParts(head.text, head.files ?? []);
         const content = await composerPartsToContentBlocks(orderedParts, (file) =>
           uploadFileBlock(conversationId, file),
         );
+        postChain ??= enterSendChain(conversationId);
+        await postChain.waitForPrior();
         await postConversationEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
@@ -2781,9 +2778,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
-          // Hand the chain to the next POST (foreground or background) so it
-          // can start its own network work in submission order.
-          releaseSend();
+          postChain?.releaseSend();
         });
     }
   },
@@ -2949,13 +2944,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the bubble pending until the agent actually reads it.
     const sentMidTurn =
       targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
+    const orderedParts = opts?.composerParts ?? legacyComposerParts(text, files ?? []);
+    const attachmentCount = orderedParts.filter((part) => part.type === "attachment").length;
+    const hasAttachments = attachmentCount > 0;
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
-    if (!alreadyStreaming && !opensSideChat) {
+    const deferTurnLatch = hasAttachments && !opensSideChat;
+    let ownsTurnLatch = !alreadyStreaming && !opensSideChat && (!deferTurnLatch || !!initialDraft);
+    if (ownsTurnLatch) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
@@ -2981,17 +2981,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pendingSeq += 1;
       tempId = `pend_${pendingSeq}`;
     }
-    const orderedParts = opts?.composerParts ?? legacyComposerParts(text, files ?? []);
-    const content: MessageContentBlock[] = orderedParts.flatMap<MessageContentBlock>((part) => {
-      if (part.type === "text") {
-        return part.text ? [{ type: "input_text" as const, text: part.text }] : [];
-      }
-      const filename = part.file.name || "image.png";
-      const fileId = `pending:${attachmentKey(part.file)}`;
-      return classifyAttachment(part.file) === "image"
-        ? [{ type: "input_image" as const, file_id: fileId, filename }]
-        : [{ type: "input_file" as const, file_id: fileId, filename }];
-    });
+    const content = pendingComposerContent(text, files ?? [], orderedParts);
     const selfAuthor = getCurrentAuthorId();
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
@@ -3007,6 +2997,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
+                beforePost: true,
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -3029,12 +3020,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
 
-    // Take our place in THIS conversation's send chain: wait for its prior
-    // send's network work, then hand off to the next via `releaseSend` in the
-    // finally below. This serializes POSTs in submission order without delaying
-    // the optimistic bubble rendered above. The wait is bounded (see
-    // `enterSendChain`), so a stalled prior send can't queue this one forever.
+    // Serialize session binding first. Attachment uploads leave this chain after
+    // binding, then re-enter it only when their files are ready to POST.
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
+    let releaseCurrentSend: (() => void) | undefined = releaseSend;
+    let uploadController: AbortController | undefined;
 
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
@@ -3079,51 +3069,130 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         return true;
       }
 
-      const sendResult = await withStillSendingMark(sessionId, tempId, async () => {
-        // Upload any attached files and build the real content blocks with
-        // server-assigned file_ids (input_image for images, input_file
-        // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
-        // a prior successful upload of the same File so a retry after a
-        // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-        const serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
+      let serverContent: ContentBlock[];
+      const needsUpload = orderedParts.some(
+        (part) =>
+          part.type === "attachment" && !uploadedFileBlockCache.get(part.file)?.has(sessionId),
+      );
+      if (needsUpload) {
+        const write = setterFor(sessionId);
+        const updateProgress = (uploadProgress: PendingUploadProgress | undefined) =>
+          write((state) => ({
+            pendingUserMessages: state.pendingUserMessages.map((pending) =>
+              pending.tempId === tempId ? { ...pending, uploadProgress } : pending,
+            ),
+          }));
+        const controller = new AbortController();
+        uploadController = controller;
+        cancelPendingUploads.set(tempId, () => {
+          cancelPendingUploads.delete(tempId);
+          controller.abort();
+          forgetUnsentSend(sessionId, stableId);
+          forgetRestoredSend(sessionId);
+          write((state) => ({
+            restoredSendDraft: null,
+            pendingRetryStableId: null,
+            pendingUserMessages: state.pendingUserMessages.filter((p) => p.tempId !== tempId),
+            failedSendDraft: {
+              conversationId: sessionId,
+              text,
+              files: files ?? [],
+              composerParts: opts?.composerParts,
+              replyDraft: opts?.replyDraft,
+              replaceComposer: true,
+            },
+          }));
+        });
+        if (initialDraft && ownsTurnLatch) {
+          // The startup hold still belongs to Stop until POST; it no longer
+          // makes an idle conversation look busy once its upload begins.
+          write((state) =>
+            state.sessionStatus === "running"
+              ? {}
+              : {
+                  status: "idle",
+                  sendLatchedAt: null,
+                  sendLatchSeenRunning: null,
+                },
+          );
+          ownsTurnLatch = false;
+        }
+        releaseCurrentSend?.();
+        releaseCurrentSend = undefined;
+        let fileIndex = 0;
+        try {
+          serverContent = await composerPartsToContentBlocks(orderedParts, (file) => {
+            fileIndex += 1;
+            const report = (progress: FileUploadProgress) => {
+              if (controller.signal.aborted) return;
+              updateProgress({
+                filename: attachmentFilename(file),
+                fileIndex,
+                fileCount: attachmentCount,
+                ...progress,
+              });
+            };
+            if (!uploadedFileBlockCache.get(file)?.has(sessionId)) {
+              report({ loaded: 0, total: null, fraction: null });
+            }
+            return uploadFileBlock(sessionId, file, controller.signal, report);
+          });
+          if (controller.signal.aborted) return false;
+        } finally {
+          cancelPendingUploads.delete(tempId);
+          if (!controller.signal.aborted) updateProgress(undefined);
+        }
+        if (initialDraft && !initialSendPending()) return false;
+        const postChain = enterSendChain(sessionId);
+        releaseCurrentSend = postChain.releaseSend;
+        await postChain.waitForPrior();
+        if (initialDraft && !initialSendPending()) return false;
+      } else {
+        serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
           uploadFileBlock(sessionId, file),
         );
-        const fileBlocks = serverContent.filter(
-          (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
-            block.type === "input_image" || block.type === "input_file",
-        );
-        if (initialDraft && !initialSendPending()) return null;
+      }
 
-        // Promote "pending:<filename>" to real file_ids. Claude-native's
-        // session.input.consumed is text-only (transcript round-trip
-        // drops input_image blocks), so the consumed handler falls back
-        // to the pending file blocks — they must already carry real ids.
-        //
-        // Targets the session this send posted to, not the visible one: the
-        // upload can outlive a switch away, and leaving the bubble on
-        // `pending:<filename>` ids means the consumed fallback commits those
-        // placeholders as if they were real attachments.
-        if (fileBlocks.length > 0) {
-          setterFor(sessionId)((s) => ({
-            pendingUserMessages: s.pendingUserMessages.map((p) =>
-              p.tempId === tempId ? { ...p, content: serverContent } : p,
-            ),
-          }));
-        }
-
-        if (initialDraft) {
-          // From this point Interrupt belongs to the runner, not the local draft.
-          setterFor(sessionId)((s) => ({
-            pendingUserMessages: s.pendingUserMessages.map((p) =>
-              p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
-            ),
-            status: "streaming",
-            sendLatchedAt: Date.now(),
-            sendLatchSeenRunning: null,
-          }));
-          initialDispatched = true;
-        }
-        const postResult = await postConversationEvent(
+      const postingState = setterForState(sessionId);
+      const sentWhileRunning =
+        postingState?.isNativeTerminalSession === true && postingState.sessionStatus === "running";
+      if (hasAttachments) {
+        ownsTurnLatch =
+          !opensSideChat &&
+          postingState?.status !== "streaming" &&
+          postingState?.sessionStatus !== "running";
+      }
+      const latchNow = hasAttachments ? ownsTurnLatch : initialDraft !== undefined;
+      if (initialDraft) initialDispatched = true;
+      setterFor(sessionId)((state) => {
+        const pending = state.pendingUserMessages.find((message) => message.tempId === tempId);
+        // Receipts without IDs fall back to POST order. Keep uploading and
+        // binding messages after those ready for a receipt.
+        const rest = state.pendingUserMessages.filter((message) => message !== pending);
+        const next = rest.findIndex((message) => message.beforePost || message.initialDraft);
+        if (pending)
+          rest.splice(next < 0 ? rest.length : next, 0, {
+            ...pending,
+            beforePost: undefined,
+            initialDraft: undefined,
+            stableId,
+            content: serverContent,
+            ...(hasAttachments ? { sentMidTurn: sentWhileRunning } : {}),
+          });
+        return {
+          pendingUserMessages: rest,
+          ...(latchNow
+            ? {
+                status: "streaming",
+                ...(hasAttachments ? { activeResponse: null } : {}),
+                sendLatchedAt: Date.now(),
+                sendLatchSeenRunning: null,
+              }
+            : {}),
+        };
+      });
+      const postResult = await withStillSendingMark(sessionId, tempId, () =>
+        postConversationEvent(
           sessionId,
           {
             type: "message",
@@ -3134,11 +3203,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             },
           },
           { holdWhenHostOffline: true },
-        );
-        return { postResult };
-      });
-      if (sendResult === null) return false;
-      const { postResult } = sendResult;
+        ),
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -3152,7 +3218,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           const patch: Partial<ChatState> = {
             pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
           };
-          if (!alreadyStreaming) {
+          if (ownsTurnLatch) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
@@ -3200,7 +3266,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // agent never read it.
       return !postResult.denied && !(postResult.queued && postResult.forwarded === false);
     } catch (err) {
-      if (initialDraft && !initialDispatched && !initialSendPending()) return false;
+      if (uploadController?.signal.aborted) return false;
+      if (initialDraft && !initialDispatched && !uploadController && !initialSendPending())
+        return false;
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -3326,7 +3394,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
-      if (!alreadyStreaming) {
+      if (ownsTurnLatch) {
         if (!native && failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
@@ -3365,7 +3433,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
-      releaseSend();
+      releaseCurrentSend?.();
     }
   },
 
@@ -3514,18 +3582,26 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Upstream #8039: a first message still held locally (model selection or
     // native startup pending) is cancelled here and handed back to the
     // composer; it never reached the runner, so nothing is interrupted for it.
-    const initialDraft = state?.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
-    if (initialDraft && state) {
-      const draft = getSessionDraft(sessionId) ?? initialDraft;
-      setSessionDraft(sessionId, draft);
-      setterFor(sessionId)({
-        pendingUserMessages: [],
-        status: "idle",
-        sendLatchedAt: null,
-        failedSendDraft: { ...draft, conversationId: sessionId },
-      });
+    const initialPending = state?.pendingUserMessages.find((p) => p.initialDraft);
+    const initialDraft = initialPending?.initialDraft;
+    if (initialPending && initialDraft && state) {
       // What was queued behind it must not go first; it waits for an explicit retry.
       suspendQueuedMessages(sessionId);
+      const cancelUpload = cancelPendingUploads.get(initialPending.tempId);
+      if (cancelUpload) {
+        cancelUpload();
+      } else {
+        const draft = getSessionDraft(sessionId) ?? initialDraft;
+        setSessionDraft(sessionId, draft);
+        setterFor(sessionId)((current) => ({
+          pendingUserMessages: current.pendingUserMessages.filter(
+            (p) => p.tempId !== initialPending.tempId,
+          ),
+          status: "idle",
+          sendLatchedAt: null,
+          failedSendDraft: { ...draft, conversationId: sessionId },
+        }));
+      }
       // A local follow-up must not prevent Interrupt from stopping earlier work.
       if (
         state.activeResponse?.state !== "streaming" &&
@@ -8749,7 +8825,8 @@ export function takeFailedSendDraft(
   const delivered = committedItemProvesDelivery(state.blocks, failed);
   // Added after newer input, the text goes out as a new message.
   const appended = hasDraft && appendsRecovered && failed.recovered === true;
-  const restore = (!hasDraft || appended) && !delivered;
+  const forceReplace = failed.replaceComposer === true;
+  const restore = (!hasDraft || appended || forceReplace) && !delivered;
   const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
@@ -8901,21 +8978,21 @@ function unsentSendToRestore(
   conversationId: string,
   items: readonly ConversationItem[],
 ): ConversationState["failedSendDraft"] {
-  const unsent = peekUnsentSend(conversationId);
+  const unsent = peekUnsentSends(conversationId);
   // A send still open in this tab settles on its own.
-  if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
+  if (unsent.some((send) => inFlightSends.has(send.stableId))) return null;
   // Messages this page still queues aren't lost; only a reload empties the queue.
   const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
   const stored = peekQueuedSends(conversationId);
   const queued = stored.filter((send) => !queuedHere.has(send.stableId));
-  if (unsent === null && queued.length === 0) return null;
+  if (unsent.length === 0 && queued.length === 0) return null;
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
-  if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
+  for (const send of unsent) forgetUnsentSend(conversationId, send.stableId);
   if (queued.length > 0) {
     rememberQueuedSends(
       conversationId,
@@ -8923,7 +9000,7 @@ function unsentSendToRestore(
     );
   }
   const committedIds = committedSendIdsOf(items);
-  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
+  const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
     (send) => send.authorId === viewerId && !committedIds.has(send.stableId),
   );
@@ -9444,7 +9521,7 @@ function recoveredPendingInputPatch(
     settledShellInputs: s.settledShellInputs,
   };
   const eligible = (p: PendingUserMessage) =>
-    !p.initialDraft && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
+    !p.initialDraft && !p.beforePost && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
   for (const block of recovered) {
     if (isTerminalCommandInput(block) && block.ctx.itemId) {
       state = { ...state, ...settledShellInputPatch(state, block.ctx.itemId, block.input) };
@@ -10024,9 +10101,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // server won't emit session.input.consumed for denied inputs, so
       // it would otherwise linger in the transcript). The "Working…"
       // indicator is driven by session.status, not this.
-      applyToConversation({
-        pendingUserMessages: [],
-      });
+      applyToConversation((state) => ({
+        pendingUserMessages: state.pendingUserMessages.filter((p) => p.beforePost),
+      }));
       return;
     case "ui_open_file":
       emitUiOpenFile(event, sourceConversationId);
@@ -10167,8 +10244,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               };
             }
           }
-          // Clear ALL pending user messages on terminal status. Any
-          // message still pending when the session reaches idle was
+          // Clear dispatched pending user messages on terminal status. Any
+          // dispatched message still pending when the session reaches idle was
           // either consumed (input.consumed event raced ahead) or
           // denied by policy (no input.consumed fires). In both
           // cases, keeping it in pendingUserMessages would leave a
@@ -10190,7 +10267,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // via the POST `denied` response — so the idle-clear is never
           // needed for them and only races the round-trip.
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
-            patch.pendingUserMessages = [];
+            patch.pendingUserMessages = s.pendingUserMessages.filter((p) => p.beforePost);
           }
         }
         // Surface terminal-native failures carried only by session status.
@@ -10470,8 +10547,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
             return {};
           }
-          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
-            return {};
+          if (!pendingHead || pendingHead.initialDraft || pendingHead.beforePost) return {};
           if (!pendingMatchesConsumedEvent(event, s.pendingUserMessages[0]!)) return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
@@ -10524,7 +10600,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           alias ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
-          s.pendingUserMessages[0]?.initialDraft
+          pendingHead?.initialDraft ||
+          pendingHead?.beforePost
             ? undefined
             : s.pendingUserMessages[0];
         const matchedHead = head && pendingMatchesConsumedEvent(event, head) ? head : undefined;
@@ -10583,7 +10660,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // acknowledge a send, so they just render the block.
       applyToConversation((s) => {
         if (event.kind === "command" && hasCommittedItem(s.blocks, event.itemId)) return {};
-        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
+        const head = s.pendingUserMessages[0];
+        if (!head || head.initialDraft || head.beforePost) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
       });
@@ -10684,17 +10762,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     case "session_btw_sidechat":
       // Transient /btw sidechat overlay: show the question + answer in a
       // dismissable panel. Guard on active conversation so late events from
-      // switched-away streams don't hijack the UI. Clear pendingUserMessages
-      // and activeResponse (mirroring superseded behavior) to reset state.
-      applyToNamedConversation(event.conversationId, {
+      // switched-away streams don't hijack the UI. Reset the turn while
+      // keeping local sends that haven't reached the server.
+      applyToNamedConversation(event.conversationId, (state) => ({
         btwSidechat: {
           question: event.question,
           answer: event.answer,
           truncated: event.truncated,
         },
-        pendingUserMessages: [],
+        pendingUserMessages: state.pendingUserMessages.filter((p) => p.beforePost),
         activeResponse: null,
-      });
+      }));
       return;
     case "session_resource_changed":
       void queryClient?.invalidateQueries({

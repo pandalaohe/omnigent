@@ -818,7 +818,21 @@ describe("side-chat selection reply", () => {
       between ? "> First passage\n\nKeep answer\n\n> Second passage" : "",
       "agent_side",
       [file],
-      { pinnedConversationId: childId },
+      {
+        pinnedConversationId: childId,
+        ...(between
+          ? {
+              replyDraft: {
+                version: 1,
+                text: "",
+                quotes: [
+                  { before: "", text: "First passage" },
+                  { before: "Keep answer", text: "Second passage" },
+                ],
+              },
+            }
+          : {}),
+      },
     );
   });
 
@@ -1404,29 +1418,57 @@ describe("side chat composer attachments", () => {
     expect(screen.queryByText("clip.mp4")).toBeNull();
   });
 
-  it("shows the child's upload progress row while it uploads", () => {
+  it("puts upload progress on the child bubble", () => {
     renderPane(<SideChatPane childId={childId} />);
-
     act(() =>
       conversationRegistry.acquire(childId).setState({
-        uploadProgress: { filename: "clip.mp4", fraction: null },
+        pendingUserMessages: [
+          {
+            tempId: "uploading",
+            content: [{ type: "input_text", text: "see attached" }],
+            uploadProgress: {
+              filename: "clip.mp4",
+              fileIndex: 1,
+              fileCount: 1,
+              loaded: 42,
+              total: 100,
+              fraction: 0.42,
+            },
+          },
+        ],
       }),
     );
-    expect(screen.getByTestId("side-chat-upload-progress")).toHaveTextContent(
-      "Uploading clip.mp4…",
-    );
-
-    act(() =>
-      conversationRegistry.acquire(childId).setState({
-        uploadProgress: { filename: "clip.mp4", fraction: 0.42 },
-      }),
-    );
-    expect(screen.getByTestId("side-chat-upload-progress")).toHaveTextContent(
-      "Uploading clip.mp4 — 42%",
-    );
-
-    act(() => conversationRegistry.acquire(childId).setState({ uploadProgress: null }));
+    expect(screen.getByTestId("pending-upload-row")).toHaveTextContent("42%");
     expect(screen.queryByTestId("side-chat-upload-progress")).toBeNull();
+  });
+
+  it("returns a cancelled upload and quote to its side composer", () => {
+    const original = new File(["photo"], "photo.png", { type: "image/png" });
+    const newer = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      text: "Original side reply",
+      quotes: [{ before: "", text: "Original quote" }],
+    };
+    useChatStore.getState().updateSideChatComposer(childId, () => ({
+      text: "Newer side draft",
+      files: [newer],
+    }));
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        failedSendDraft: {
+          conversationId: childId,
+          text: serializeReplyDraft(replyDraft),
+          replyDraft,
+          files: [original],
+          replaceComposer: true,
+        },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Original side reply");
+    expect(screen.getByText("Original quote")).toBeInTheDocument();
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([original]);
   });
 });
 

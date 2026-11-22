@@ -103,6 +103,71 @@ it.each(["en-US", "zh-CN", "zh-TW"])(
   },
 );
 
+it("renders a compact pending upload row with truncation, progress, and Cancel", () => {
+  const cancelUploadingSend = vi.fn();
+  useChatStore.setState({ cancelUploadingSend });
+  render(
+    <BubbleView
+      bubble={{
+        kind: "user",
+        itemId: "pending_upload",
+        pending: true,
+        content: [{ type: "input_text", text: "look" }],
+        uploadProgress: {
+          filename: "an-extremely-long-attachment-name-that-must-truncate.png",
+          fileIndex: 2,
+          fileCount: 3,
+          loaded: 512,
+          total: 1024,
+          fraction: 0.5,
+        },
+      }}
+      isLastAssistant={false}
+    />,
+  );
+
+  const row = screen.getByTestId("pending-upload-row");
+  expect(row).toHaveTextContent("2/3");
+  expect(row.querySelector(".truncate")).toHaveAttribute(
+    "title",
+    "an-extremely-long-attachment-name-that-must-truncate.png",
+  );
+  expect(screen.getByRole("progressbar", { name: /Uploading an-extremely-long/ })).toHaveAttribute(
+    "aria-valuenow",
+    "50",
+  );
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: "Cancel upload of an-extremely-long-attachment-name-that-must-truncate.png",
+    }),
+  );
+  expect(cancelUploadingSend).toHaveBeenCalledWith("pending_upload");
+});
+
+it("shows bytes instead of a progress bar when the upload total is unknown", () => {
+  render(
+    <BubbleView
+      bubble={{
+        kind: "user",
+        itemId: "pending_bytes",
+        pending: true,
+        content: [{ type: "input_text", text: "upload" }],
+        uploadProgress: {
+          filename: "clip.mp4",
+          fileIndex: 1,
+          fileCount: 1,
+          loaded: 1_258_291,
+          total: null,
+          fraction: null,
+        },
+      }}
+      isLastAssistant={false}
+    />,
+  );
+  expect(screen.getByTestId("pending-upload-row")).toHaveTextContent("1.2 MB");
+  expect(screen.queryByRole("progressbar")).toBeNull();
+});
+
 describe("Mermaid diagram width", () => {
   it("uses the full chat column for a Mermaid fence", () => {
     const items = [

@@ -68,9 +68,10 @@ import type { Session } from "@/lib/types";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
   clearUnsentSends,
+  forgetUnsentSend,
   peekQueuedSends,
   peekRestoredSend,
-  peekUnsentSend,
+  peekUnsentSends,
   rememberQueuedSends,
   rememberRestoredSend,
   rememberUnsentSend,
@@ -592,6 +593,8 @@ function makeFakeSlotManager(
   };
 }
 
+const peekUnsentSend = (conversationId: string) => peekUnsentSends(conversationId).at(-1) ?? null;
+
 /**
  * Minimal XMLHttpRequest shim routing ``uploadFile`` through the fetch mock.
  *
@@ -611,14 +614,9 @@ class FetchBackedXHR {
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
   ontimeout: (() => void) | null = null;
-  onprogress: (() => void) | null = null;
-  onreadystatechange: (() => void) | null = null;
   timeout = 0;
   aborted = false;
-  upload: { onprogress: ((event: ProgressEvent) => void) | null; onload: (() => void) | null } = {
-    onprogress: null,
-    onload: null,
-  };
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   private headers = new Headers();
 
   constructor() {
@@ -7736,19 +7734,10 @@ describe("chatStore — send (file attachments)", () => {
     }
   });
 
-  it.each([
-    { phase: "60 seconds without upload progress", bodySent: false, timeoutMs: 60_000 },
-    { phase: "5 minutes without a first response", bodySent: true, timeoutMs: 300_000 },
-  ])("retains the native send for retry after $phase", async ({ bodySent, timeoutMs }) => {
-    vi.useFakeTimers();
-    onTestFinished(() => {
-      vi.useRealTimers();
-    });
+  it("lets a text send post while an attachment upload is still running", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
-      isNativeTerminalSession: true,
-      sessionStatus: "running",
     });
     let resolveUpload!: (response: Response) => void;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -7761,35 +7750,236 @@ describe("chatStore — send (file attachments)", () => {
     });
 
     const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
-    const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
-    try {
-      await vi.advanceTimersByTimeAsync(0);
-      const xhr = FetchBackedXHR.instances[0]!;
-      await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    const attachmentSend = useChatStore.getState().send("with image", "agent_xyz", [file]);
+    await tick();
+    const textSend = useChatStore.getState().send("later text", "agent_xyz");
+
+    await vi.waitFor(() => {
+      const posts = fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith("/v1/sessions/conv_existing/events") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(1);
+      expect(JSON.parse((posts[0]![1] as RequestInit).body as string).data.content).toEqual([
+        { type: "input_text", text: "later text" },
+      ]);
+    });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "committed_text",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "later text" }] },
+    });
+    handleSessionEvent({ type: "session_status", conversationId: "conv_existing", status: "idle" });
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { uploadProgress: { filename: "photo.png" } },
+    ]);
+
+    resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+    await Promise.all([attachmentSend, textSend]);
+    const posts = fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/v1/sessions/conv_existing/events") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(2);
+    expect(JSON.parse((posts[1]![1] as RequestInit).body as string).data.content).toContainEqual({
+      type: "input_image",
+      file_id: "file_photo",
+      filename: "photo.png",
+    });
+  });
+
+  it("starts a queued attachment at idle and keeps the next automatic send queued", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    let finishUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          finishUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore
+      .getState()
+      .enqueueMessage("queued image", [new File(["a"], "photo.png", { type: "image/png" })]);
+    useChatStore.getState().enqueueMessage("queued follow-up");
+    expect(FetchBackedXHR.instances).toHaveLength(0);
+
+    useChatStore.setState({ status: "idle", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().pendingUserMessages[0]?.uploadProgress).toBeDefined(),
+    );
+    useChatStore.getState().maybeFlushQueuedHead();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued follow-up"]);
+    finishUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().pendingUserMessages[0]?.posted).toBe(true),
+    );
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued follow-up"]);
+  });
+
+  it("posts attachment sends in upload completion order", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const uploadResolvers: ((response: Response) => void)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          uploadResolvers.push(resolve);
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const first = useChatStore
+      .getState()
+      .send("first", "agent_xyz", [new File(["a"], "first.png", { type: "image/png" })]);
+    const second = useChatStore
+      .getState()
+      .send("second", "agent_xyz", [new File(["b"], "second.png", { type: "image/png" })]);
+    await vi.waitFor(() => expect(uploadResolvers).toHaveLength(2));
+
+    uploadResolvers[1]!(mockResponse({ id: "file_second", name: "second.png" }));
+    await vi.waitFor(() => {
+      const posts = fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith("/v1/sessions/conv_existing/events") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(1);
+      expect(JSON.parse((posts[0]![1] as RequestInit).body as string).data.content).toContainEqual({
+        type: "input_image",
+        file_id: "file_second",
+        filename: "second.png",
+      });
+    });
+
+    uploadResolvers[0]!(mockResponse({ id: "file_first", name: "first.png" }));
+    await Promise.all([first, second]);
+    const posts = fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/v1/sessions/conv_existing/events") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(JSON.parse((posts[1]![1] as RequestInit).body as string).data.content).toContainEqual({
+      type: "input_image",
+      file_id: "file_first",
+      filename: "first.png",
+    });
+  });
+
+  it("cancels one attachment upload without posting and replaces the composer draft", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    onTestFinished(() => {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+    });
+    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+    const sendPromise = useChatStore.getState().send("replace me", "agent_xyz", [file]);
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().pendingUserMessages[0]?.uploadProgress).toBeDefined(),
+    );
+    expect(peekUnsentSend("conv_existing")?.text).toBe("replace me");
+    const tempId = useChatStore.getState().pendingUserMessages[0]!.tempId;
+    useChatStore.getState().cancelUploadingSend(tempId);
+    await sendPromise;
+
+    expect(peekUnsentSend("conv_existing")).toBeNull();
+    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+    expect(FetchBackedXHR.instances.at(-1)?.aborted).toBe(true);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "replace me",
+      files: [file],
+      replaceComposer: true,
+    });
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith("/v1/sessions/conv_existing/events") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+    resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+  });
+
+  it.each(["abort", "error"] as const)(
+    "returns a browser upload %s to Retry without a POST",
+    async (failure) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        isNativeTerminalSession: true,
+        sessionStatus: "running",
+      });
+      let resolveUpload!: (response: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+          return new Promise<Response>((resolve) => {
+            resolveUpload = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+      const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
+      await tick();
       expect(
         buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0],
       ).toMatchObject({
         pending: true,
-        stillSending: true,
+        uploadProgress: { filename: "photo.png", fileIndex: 1, fileCount: 1, fraction: 0.5 },
       });
 
-      if (bodySent) xhr.upload.onload?.();
-      const elapsedMs = bodySent ? 0 : SEND_STILL_SENDING_AFTER_MS;
-      await vi.advanceTimersByTimeAsync(timeoutMs - elapsedMs - 1);
-      expect(xhr.aborted).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(xhr.aborted).toBe(true);
-      await sendPromise;
-      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-      expect(useChatStore.getState().failedSendDraft).toMatchObject({
-        text: "look at this",
-        files: [file],
-      });
-      expect(useChatStore.getState().blocks.at(-1)).toMatchObject({ type: "error" });
-    } finally {
-      resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
-    }
-  });
+      try {
+        const xhr = FetchBackedXHR.instances.at(-1)!;
+        if (failure === "abort") xhr.abort();
+        else xhr.onerror?.();
+        await sendPromise;
+        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          text: "look at this",
+          files: [file],
+        });
+        expect(useChatStore.getState().blocks.at(-1)).toMatchObject({ type: "error" });
+        expect(
+          fetchMock.mock.calls.filter(
+            ([url, init]) =>
+              String(url).endsWith("/v1/sessions/conv_existing/events") &&
+              (init as RequestInit | undefined)?.method === "POST",
+          ),
+        ).toHaveLength(0);
+      } finally {
+        resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+      }
+    },
+  );
 
   it("keeps an inline attachment between the surrounding text blocks", async () => {
     useChatStore.setState({
@@ -7871,10 +8061,7 @@ describe("chatStore — send (file attachments)", () => {
     ]);
   });
 
-  it("exposes upload progress while the upload runs, then clears it", async () => {
-    // The composer's "Uploading <name> — <n>%" row reads this field; it must
-    // be set on the sending conversation while the transfer is in flight and
-    // cleared once the upload settles.
+  it("exposes upload progress on the pending message, then clears it", async () => {
     useChatStore.setState({
       conversationId: "conv_progress",
       abortController: new AbortController(),
@@ -7901,16 +8088,26 @@ describe("chatStore — send (file attachments)", () => {
     const file = new File(["bytes"], "clip.mp4", { type: "video/mp4" });
     const sendPromise = useChatStore.getState().send("watch this", "agent_xyz", [file]);
 
-    await vi.waitFor(() => {
-      expect(useChatStore.getState().uploadProgress).toEqual({
-        filename: "clip.mp4",
-        fraction: 0.5,
-      });
-    });
+    await vi.waitFor(() =>
+      expect(
+        buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0],
+      ).toMatchObject({
+        uploadProgress: {
+          filename: "clip.mp4",
+          fileIndex: 1,
+          fileCount: 1,
+          loaded: 1,
+          total: 2,
+          fraction: 0.5,
+        },
+      }),
+    );
 
     releaseUpload();
     await sendPromise;
-    expect(useChatStore.getState().uploadProgress).toBeNull();
+    expect(
+      buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0],
+    ).not.toHaveProperty("uploadProgress");
   });
 
   it("gives same-named attachments distinct optimistic ids", async () => {
@@ -26237,12 +26434,13 @@ describe("chatStore — client-side message queue", () => {
       useChatStore.getState().steerAllQueuedMessages("conv_abc");
       await vi.waitFor(() => expect(posted).toHaveLength(5));
       expect(posted.map((message) => message.text)).toEqual([
-        text,
         "second queued message",
+        text,
         text,
         "second queued message",
         "newer draft",
       ]);
+      expect(posted[1]!.stableId).toBe(original[0]!.stableId);
       expect(posted[2]!.stableId).toBe(original[0]!.stableId);
       expect(posted[3]!.stableId).toBe(original[1]!.stableId);
       expect(useChatStore.getState().queuedMessages).toEqual([]);
@@ -28399,6 +28597,23 @@ describe("a send cut off by a reload", () => {
       }
     },
   );
+
+  it("recovers unanswered overlapping uploads after reload and skips settled sends", async () => {
+    const session = "conv_reload";
+    seedSession(session, []);
+    const records = ["first upload", "text posted", "third upload"];
+    records.forEach((text, index) =>
+      rememberUnsentSend(session, { stableId: `send_${index}`, text, authorId: "user_a" }),
+    );
+    forgetUnsentSend(session, "send_1");
+    await useChatStore.getState().switchTo(session);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "first upload\n\nthird upload",
+      files: [],
+      recovered: true,
+    });
+    expect(peekUnsentSends(session)).toEqual([]);
+  });
 
   it("keeps each queued message for the next load until it leaves the queue", async () => {
     seedSession("conv_queue", []);

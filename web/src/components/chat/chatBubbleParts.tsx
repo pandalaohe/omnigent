@@ -64,6 +64,7 @@ import { parsePeerMessage } from "@/lib/peerMessage";
 import { parseAnnotationMessage } from "@/lib/annotationMessage";
 import { AnnotationCards } from "@/components/chat/AnnotationCards";
 import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
@@ -221,6 +222,69 @@ export function containsMermaidDiagram(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
+function formatUploadBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes;
+  let unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function PendingUploadRow({
+  progress,
+  tempId,
+}: {
+  progress: NonNullable<Extract<Bubble, { kind: "user" }>["uploadProgress"]>;
+  tempId: string;
+}) {
+  const cancelUploadingSend = useChatStore((state) => state.cancelUploadingSend);
+  const percent = progress.fraction === null ? null : Math.round(progress.fraction * 100);
+  return (
+    <div
+      className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-md border border-border/70 bg-background/45 px-2 py-1 text-xs text-muted-foreground"
+      data-testid="pending-upload-row"
+    >
+      <span className="min-w-0 flex-1 truncate" title={progress.filename}>
+        {progress.filename}
+      </span>
+      {progress.fileCount > 1 && (
+        <span className="shrink-0 tabular-nums">
+          {progress.fileIndex}/{progress.fileCount}
+        </span>
+      )}
+      {percent === null ? (
+        <span className="shrink-0 whitespace-nowrap">{formatUploadBytes(progress.loaded)}</span>
+      ) : (
+        <div className="flex w-20 shrink-0 items-center gap-1.5">
+          <Progress
+            value={percent}
+            aria-label={`Uploading ${progress.filename}`}
+            className="min-w-0 flex-1 bg-foreground/15"
+          />
+          <span className="shrink-0 tabular-nums">{percent}%</span>
+        </div>
+      )}
+      <Button
+        type="button"
+        variant="ghost"
+        size="xs"
+        className="ml-auto"
+        aria-label={`Cancel upload of ${progress.filename}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          cancelUploadingSend(tempId);
+        }}
+      >
+        Cancel
+      </Button>
+    </div>
+  );
+}
+
 /**
  * Build optimistic user bubbles from the pending-send queue.
  *
@@ -250,6 +314,7 @@ export function buildPendingBubbles(
         : {}),
       ...(p.stillSending && p.posted !== true && !p.received ? { stillSending: true } : {}),
       ...(sendingSinceMs === undefined ? {} : { sendingSinceMs }),
+      ...(p.uploadProgress ? { uploadProgress: p.uploadProgress } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -1289,6 +1354,9 @@ function UserBubble({
                 </>
               );
             })()}
+            {bubble.uploadProgress && (
+              <PendingUploadRow progress={bubble.uploadProgress} tempId={bubble.itemId} />
+            )}
           </MessageContent>
         </div>
         {bubble.undelivered && (

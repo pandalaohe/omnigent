@@ -213,7 +213,6 @@ import {
   hydrateLocalConversation,
   removeLocalConversation,
   setPendingInitialPrompt,
-  useChatStore,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -2855,9 +2854,6 @@ function NewChatLandingContent({
     pendingCaretRef.current = null;
     textareaRef.current?.setSelectionRange(pending.caret, pending.caret);
   });
-
-  // The server probe also supplies upload limits, with client defaults on older servers.
-  const uploadProgress = useChatStore((s) => s.uploadProgress);
 
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
@@ -8694,18 +8690,6 @@ function NewChatLandingContent({
                         data-testid="new-chat-landing-attachment-error"
                       >
                         {attachmentError}
-                      </ComposerFeedbackRow>
-                    )}
-                    {/* The first send's in-flight upload, one row for the
-                        batch. No percentage when the transport cannot report
-                        one (the embedded/Databricks fetch path). */}
-                    {uploadProgress !== null && (
-                      <ComposerFeedbackRow data-testid="new-chat-upload-progress">
-                        {uploadProgress.fraction === null
-                          ? `Uploading ${uploadProgress.filename}…`
-                          : `Uploading ${uploadProgress.filename} — ${Math.round(
-                              uploadProgress.fraction * 100,
-                            )}%`}
                       </ComposerFeedbackRow>
                     )}
                     {/* No own bg — the pill paints the surface. An explicit bg-card
