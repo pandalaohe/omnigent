@@ -1071,10 +1071,7 @@ export function TerminalView({
         <div className="flex items-center gap-2 border-t bg-background px-3 py-2">
           <div className="min-w-0 flex-1">
             <p role="status" className="text-xs text-muted-foreground">
-              {terminalPaste.review.text.split("\n").length} lines
-              {terminalPaste.review.repeatUntil > 0
-                ? " · Tap the paste key again within 3 seconds or use Paste"
-                : " · Review before pasting"}
+              {terminalPaste.review.text.split("\n").length} lines · Review before pasting
             </p>
             <pre className="overflow-hidden text-ellipsis whitespace-pre text-xs">
               {terminalPaste.review.text
