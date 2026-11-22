@@ -27,6 +27,7 @@ def app(runtime_init, db_uri, tmp_path):
     from omnigent.server.app import create_app
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
     return create_app(
         agent_store=get_agent_store(),
@@ -34,6 +35,7 @@ def app(runtime_init, db_uri, tmp_path):
         agent_cache=get_agent_cache(),
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
         file_store=SqlAlchemyFileStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
@@ -268,6 +270,38 @@ async def test_launch_selection_is_present_before_sandbox_launch(
     assert plain.json()["agent_id"] == source["agent_id"]
     summary = await client.get(f"/v1/sessions/{plain.json()['id']}/agent")
     assert summary.json()["mcp_servers"] == []
+
+
+@pytest.mark.parametrize("in_project", [False, True], ids=["standalone", "project"])
+@pytest.mark.parametrize("explicit_empty", [False, True], ids=["omitted", "all-off"])
+async def test_bundle_create_preserves_mcp_field_presence(
+    client, app, launch_registry, in_project, explicit_empty
+):
+    from omnigent.runtime import get_conversation_store
+
+    launch_registry.config.default_services = ["tracker"]
+    metadata = {}
+    if in_project:
+        project = app.state.project_store.create("a" * 32, "Registry project", None)
+        metadata["project_id"] = project.id
+    if explicit_empty:
+        metadata["mcp_registry_services"] = []
+
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={"bundle": ("agent.tar.gz", build_agent_bundle("launch"), "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["session_id"]
+    assert get_conversation_store().get_conversation(session_id).project_id == metadata.get(
+        "project_id"
+    )
+    summary = await client.get(f"/v1/sessions/{session_id}/agent")
+    assert summary.status_code == 200, summary.text
+    assert [server["name"] for server in summary.json()["mcp_servers"]] == (
+        [] if explicit_empty else ["tracker"]
+    )
 
 
 @pytest.mark.parametrize("upload", [False, True])

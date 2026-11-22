@@ -3329,7 +3329,7 @@ def register_core_routes(
             user_id,
             explicit_services=(
                 parsed_metadata.mcp_registry_services
-                if "mcp_registry_services" in parsed_metadata.model_fields_set
+                if "mcp_registry_services" in request_fields_set
                 else None
             ),
         )
