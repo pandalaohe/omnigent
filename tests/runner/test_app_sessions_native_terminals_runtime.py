@@ -6206,6 +6206,374 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "old_action",
+    [
+        "delete",
+        "cli_release",
+        "ensure",
+        "cleanup_first",
+        "restart",
+        "retry_write",
+        "lost_response",
+        "proxy_502",
+        "plain_503",
+        "different_pane",
+    ],
+)
+async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_action: str
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server as codex_app_server
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.executor import TurnComplete
+    from omnigent.runner import subagent_routing, turn_routing
+    from omnigent.runner.native import orchestration
+    from omnigent.terminals.registry import TerminalRegistry
+
+    old_id, new_id = "conv_codex_old", "conv_codex_new"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://server")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(old_id)
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id=old_id,
+        thread_id="thread_old",
+        socket_path="ws://127.0.0.1:9876",
+        codex_home=str(bridge_dir / "codex-home"),
+    )
+    codex_native_bridge.write_bridge_state(bridge_dir, state)
+    codex_native_bridge.update_active_child_turn(bridge_dir, "thread_child", turn_id="turn_child")
+    state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert state is not None
+    server = NullServerClient()
+    get = server.get
+
+    async def get_with_bridge_label(url: str, **kwargs: Any) -> Any:
+        if url.endswith("/labels"):
+            return httpx.Response(
+                200,
+                json={"labels": {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: old_id}},
+            )
+        return await get(url, **kwargs)
+
+    monkeypatch.setattr(server, "get", get_with_bridge_label)
+    terminals = TerminalRegistry()
+    pane = make_test_terminal_instance("codex", "main", tmp_path)
+    terminals._by_conversation[old_id] = {("codex", "main"): pane}
+    app = create_runner_app(server_client=server, terminal_registry=terminals)
+    await app.state.session_resource_registry.observe_auxiliary_terminal(
+        old_id, "codex", "main", pane, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    subagent = subagent_routing.ensure_session_router(
+        old_id, bridge_dir=bridge_dir, server_client=server
+    )
+    turn = turn_routing.ensure_session_turn_router(
+        old_id,
+        bridge_dir=bridge_dir,
+        server_client=server,
+        harness="codex-native",
+        routing_enabled=True,
+    )
+    assert subagent is not None and turn is not None
+    started = asyncio.Event()
+    cancelling = asyncio.Event()
+    finish_cancel = asyncio.Event()
+
+    async def supervise(**_kwargs: object) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if old_action == "cleanup_first":
+                cancelling.set()
+                await finish_cancel.wait()
+
+    close = AsyncMock()
+    backend = SimpleNamespace(
+        resident_incarnation_id="incarnation", close=close, exit_confirmed=True
+    )
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", supervise)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, old_id, backend)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_BRIDGE_DIRS, old_id, bridge_dir)
+    task = asyncio.create_task(
+        orchestration._codex_forward_known_thread(
+            session_id=old_id,
+            bridge_dir=bridge_dir,
+            codex_ws_url=state.socket_path,
+            thread_id=state.thread_id,
+            app_server=backend,
+            subagent_router=subagent,
+            turn_router=turn,
+        )
+    )
+    orchestration._register_auto_forwarder_task(old_id, task)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as runner:
+            if old_action == "cleanup_first":
+                deletion = asyncio.create_task(runner.delete(f"/v1/sessions/{old_id}"))
+                try:
+                    await asyncio.wait_for(cancelling.wait(), timeout=3)
+                    transfer = await runner.post(
+                        f"/v1/sessions/{old_id}/resources/terminals/terminal_codex_main/transfer",
+                        json={"target_session_id": new_id},
+                    )
+                    assert transfer.status_code == 409
+                    assert terminals.get_native(old_id, "codex", "main") is pane
+                    assert terminals.get_native(new_id, "codex", "main") is None
+                    assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+                finally:
+                    finish_cancel.set()
+                    assert (await deletion).status_code == 200
+                return
+
+            transfer_path = (
+                f"/v1/sessions/{old_id}/resources/terminals/terminal_codex_main/transfer"
+            )
+            rotates = old_action in {
+                "retry_write",
+                "lost_response",
+                "proxy_502",
+                "plain_503",
+                "different_pane",
+            }
+            if rotates:
+                persist_owner = codex_native_bridge.transfer_bridge_owner
+                write_attempts = 0
+                statuses: list[int] = []
+                creates: list[str] = []
+                transfer_requests: list[dict[str, Any]] = []
+
+                def fail_first_owner_write(path: Path, source: str, target: str) -> None:
+                    nonlocal write_attempts
+                    write_attempts += 1
+                    if old_action == "retry_write" and write_attempts == 1:
+                        raise OSError("temporary owner write failure")
+                    persist_owner(path, source, target)
+
+                async def through_runner(request: httpx.Request) -> httpx.Response:
+                    if request.method == "GET":
+                        if "/resources/terminals/" in request.url.path:
+                            response = await runner.get(request.url.path)
+                            return httpx.Response(response.status_code, json=response.json())
+                        return httpx.Response(200, json={"agent_id": "agent"})
+                    if request.url.path.endswith("/successor"):
+                        creates.append(request.url.path)
+                        return httpx.Response(200, json={"id": new_id})
+                    if request.url.path.endswith("/transfer"):
+                        assert request.url.path == transfer_path
+                        body = json.loads(request.content)
+                        transfer_requests.append(body)
+                        if old_action == "plain_503":
+                            return httpx.Response(503, text="unreadable runner reply")
+                        if old_action == "different_pane":
+                            persist_owner(bridge_dir, old_id, new_id)
+                            terminals._by_conversation[new_id] = {
+                                ("codex", "main"): make_test_terminal_instance(
+                                    "codex", "main", tmp_path
+                                )
+                            }
+                            return httpx.Response(502)
+                        response = await runner.post(transfer_path, json=body)
+                        statuses.append(response.status_code)
+                        if old_action == "retry_write" and len(statuses) == 1:
+                            assert terminals.get_native(old_id, "codex", "main") is pane
+                            assert terminals.get_native(new_id, "codex", "main") is None
+                            assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+                            assert response.json()["error"]["code"] == (
+                                "terminal_transfer_owner_write_failed"
+                            )
+                        if old_action in {"lost_response", "proxy_502"}:
+                            assert response.status_code == 200
+                            assert terminals.get_native(new_id, "codex", "main") is pane
+                            if old_action == "lost_response":
+                                raise httpx.ReadTimeout("transfer reply lost", request=request)
+                            return httpx.Response(502)
+                        return httpx.Response(response.status_code, json=response.json())
+                    return httpx.Response(200, json={})
+
+                with monkeypatch.context() as failing_write:
+                    failing_write.setattr(
+                        codex_native_bridge, "transfer_bridge_owner", fail_first_owner_write
+                    )
+                    async with httpx.AsyncClient(
+                        transport=httpx.MockTransport(through_runner), base_url="http://server"
+                    ) as client:
+                        rotation = codex_forwarder._create_thread_replacement_session(
+                            client=client,
+                            old_session_id=old_id,
+                            bridge_dir=bridge_dir,
+                            app_server_url=state.socket_path,
+                            new_thread_id="thread_new",
+                        )
+                        if old_action in {"plain_503", "different_pane"}:
+                            with pytest.raises(httpx.HTTPStatusError) as error:
+                                await rotation
+                            assert error.value.response.status_code == (
+                                503 if old_action == "plain_503" else 502
+                            )
+                            assert len(transfer_requests) == 1
+                            assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+                            return
+                        assert await rotation == new_id
+                if old_action == "retry_write":
+                    assert statuses == [500, 200]
+                    assert write_attempts == 2
+                else:
+                    assert statuses == [200]
+                    with monkeypatch.context() as successor:
+                        successor.setenv(
+                            codex_native_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, new_id
+                        )
+                        rpc = AsyncMock(return_value={"result": {"turn": {"id": "turn_new"}}})
+                        app_server = SimpleNamespace(request=rpc, close=AsyncMock())
+                        successor.setattr(
+                            codex_native_executor,
+                            "_connect_to_app_server",
+                            AsyncMock(return_value=app_server),
+                        )
+                        events = [
+                            event
+                            async for event in codex_native_executor.CodexNativeExecutor(
+                                bridge_dir=bridge_dir
+                            ).run_turn([{"role": "user", "content": "successor message"}], [], "")
+                        ]
+                    assert [type(event) for event in events] == [TurnComplete]
+                    assert [
+                        call.args[1]["threadId"]
+                        for call in rpc.await_args_list
+                        if call.args[0] == "turn/start"
+                    ] == ["thread_new"]
+                assert transfer_requests == [
+                    {"target_session_id": new_id, "expected_instance_id": pane.instance_id}
+                ] * len(statuses)
+                assert creates == [f"/v1/sessions/{old_id}/successor"]
+                assert terminals.get_native(new_id, "codex", "main") is pane
+            else:
+                transfer = await runner.post(transfer_path, json={"target_session_id": new_id})
+                assert transfer.status_code == 200
+
+            if old_action == "delete":
+                assert (await runner.delete(f"/v1/sessions/{old_id}")).status_code == 200
+            elif old_action == "cli_release":
+                await app.state.finish_cli_release(old_id)
+            elif old_action == "restart":
+                # A fresh runner can resolve the shared directory by label only.
+                with monkeypatch.context() as restarted:
+                    restarted.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {})
+                    restarted.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+                    restarted.setattr(orchestration, "_AUTO_FORWARDER_TASKS", {})
+                    fresh_app = create_runner_app(
+                        server_client=cast(httpx.AsyncClient, server),
+                        terminal_registry=TerminalRegistry(),
+                    )
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=fresh_app), base_url="http://runner"
+                    ) as fresh_runner:
+                        await fresh_app.state.finish_cli_release(old_id)
+                        assert "thread_child" in codex_native_bridge.read_active_child_turns(
+                            bridge_dir
+                        )
+                        assert (
+                            await fresh_runner.delete(f"/v1/sessions/{old_id}")
+                        ).status_code == 200
+                    assert (
+                        orchestration._codex_launch_bridge_id(old_id, old_id)
+                        == f"{old_id}-cleared"
+                    )
+                    assert orchestration._codex_launch_bridge_id(new_id, old_id) == old_id
+            elif old_action == "ensure":
+                config = orchestration._CodexNativeLaunchConfig(
+                    workspace=tmp_path,
+                    policy_server_url="http://server",
+                    terminal_launch_args=None,
+                    model_override=None,
+                    external_session_id=state.thread_id,
+                    fork_source_id=None,
+                    fork_source_external_id=None,
+                    fork_carry_history=False,
+                    bypass_sandbox=False,
+                    bridge_id=old_id,
+                )
+                monkeypatch.setattr(
+                    orchestration, "_codex_native_launch_config", AsyncMock(return_value=config)
+                )
+                monkeypatch.setattr(
+                    codex_app_server,
+                    "resolve_native_codex_launch",
+                    lambda **_: codex_app_server.NativeCodexLaunch(
+                        config_overrides=[], model=None, profile=None
+                    ),
+                )
+                monkeypatch.setattr(
+                    codex_app_server, "fresh_codex_launch_catalog", lambda **_: None
+                )
+                monkeypatch.setattr(
+                    "omnigent.inner.codex_executor._find_codex_cli", lambda: sys.executable
+                )
+                patch = AsyncMock(wraps=server.patch)
+                monkeypatch.setattr(server, "patch", patch)
+
+                def stop_before_spawn(path: Path) -> None:
+                    assert path == codex_native_bridge.bridge_dir_for_bridge_id(
+                        f"{old_id}-cleared"
+                    )
+                    raise RuntimeError("stop before spawning Codex")
+
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(codex_native_bridge, "clear_bridge_state", stop_before_spawn)
+                    with pytest.raises(RuntimeError, match="stop before spawning Codex"):
+                        await orchestration._auto_create_codex_terminal(
+                            old_id,
+                            app.state.session_resource_registry,
+                            lambda *_: None,
+                            server_client=server,
+                        )
+                assert patch.await_args.kwargs["json"]["labels"] == {
+                    codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: f"{old_id}-cleared"
+                }
+            assert not task.done()
+            close.assert_not_awaited()
+            assert codex_native_bridge.read_bridge_resource_owner(bridge_dir) == new_id
+            published = codex_native_bridge.read_bridge_state(bridge_dir)
+            if rotates:
+                assert published is not None
+                assert (published.session_id, published.thread_id) == (new_id, "thread_new")
+            else:
+                assert published == state
+            assert "thread_child" in codex_native_bridge.read_active_child_turns(bridge_dir)
+            assert orchestration._AUTO_CODEX_APP_SERVERS.get(new_id) is backend
+            assert orchestration._AUTO_CODEX_BRIDGE_DIRS.get(new_id) == bridge_dir
+            assert subagent.session_id == turn.session_id == new_id
+            assert subagent_routing._session_routers.get(new_id) is subagent
+            assert turn_routing._session_routers.get(new_id) is turn
+            assert old_id not in subagent_routing._session_routers
+            assert old_id not in turn_routing._session_routers
+            assert not subagent._closed and not turn._closed
+
+            assert (await runner.delete(f"/v1/sessions/{new_id}")).status_code == 200
+            assert task.cancelled()
+            close.assert_awaited_once()
+            assert new_id not in orchestration._AUTO_CODEX_APP_SERVERS
+            assert new_id not in orchestration._AUTO_CODEX_BRIDGE_DIRS
+            assert not bridge_dir.exists()
+            assert subagent._closed and turn._closed
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(subagent.close)
+        await asyncio.to_thread(turn.close)
+        for owner in (old_id, new_id):
+            orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(owner, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "tier,expected_args,tool_permission",
     [
         ("ask", (), "request-review"),

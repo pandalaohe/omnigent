@@ -736,6 +736,7 @@ class TurnRouter:
     token: str
     httpd: ThreadingHTTPServer
     _closed: bool = False
+    detached: bool = False
 
     def close(self) -> None:
         """Stop the server and remove its own advertisement.
@@ -781,7 +782,11 @@ def start_turn_router(
         the session ends.
     """
     token = secrets.token_urlsafe(32)
-    handler_cls = _handler_factory(session_id, token, resolver, loop, request_timeout_s)
+
+    def served_session_id() -> str:
+        return router.session_id
+
+    handler_cls = _handler_factory(served_session_id, token, resolver, loop, request_timeout_s)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     # Handler threads must not hold up ``close()``: the default joins every
     # in-flight request, stalling session teardown.
@@ -810,14 +815,13 @@ def start_turn_router(
 
 
 def _handler_factory(
-    session_id: str,
+    served_session_id: Callable[[], str],
     token: str,
     resolver: Resolver,
     loop: asyncio.AbstractEventLoop,
     request_timeout_s: float,
 ) -> type[BaseHTTPRequestHandler]:
     """Build the request handler class for one session's turn router."""
-    expected_path = ROUTE_PATH_TEMPLATE.format(session_id=urllib.parse.quote(session_id, safe=""))
     # Compared as bytes: ``compare_digest`` raises TypeError on a non-ASCII
     # str, and http.server decodes headers as latin-1.
     expected_auth = f"Bearer {token}".encode()
@@ -830,6 +834,10 @@ def _handler_factory(
             if not secrets.compare_digest(presented, expected_auth):
                 self._reject(401, "unauthorized")
                 return
+            session_id = served_session_id()
+            expected_path = ROUTE_PATH_TEMPLATE.format(
+                session_id=urllib.parse.quote(session_id, safe="")
+            )
             if _unquoted_path(self.path) != expected_path:
                 self._reject(404, "not found")
                 return
@@ -876,7 +884,9 @@ def _handler_factory(
             self.wfile.write(raw)
 
         def log_message(self, format: str, *args: Any) -> None:
-            _logger.debug("turn-router: " + format, *args, extra={"session_id": session_id})
+            _logger.debug(
+                "turn-router: " + format, *args, extra={"session_id": served_session_id()}
+            )
 
     return _Handler
 
@@ -1648,6 +1658,33 @@ def ensure_session_turn_router(
     return router
 
 
+def move_session_turn_router(router: TurnRouter, successor_session_id: str) -> None:
+    """Move the pane's first-turn endpoint without replacing the successor's router."""
+    with _lifecycle_lock:
+        if _session_routers.get(router.session_id) is router:
+            del _session_routers[router.session_id]
+            if successor_session_id in _session_routers:
+                router.detached = True
+            else:
+                _session_routers[successor_session_id] = router
+        elif not router.detached:
+            return
+        router.session_id = successor_session_id
+        try:
+            advertised = json.loads((router.bridge_dir / ADVERTISEMENT_FILE).read_text("utf-8"))
+            if isinstance(advertised, dict) and advertised.get("url") == router.url:
+                write_advertisement(
+                    router.bridge_dir,
+                    url=router.url,
+                    token=router.token,
+                    session_id=successor_session_id,
+                    filename=ADVERTISEMENT_FILE,
+                )
+        except (OSError, ValueError):
+            # A stale advertisement fails open and leaves the pane usable.
+            pass
+
+
 def shutdown_session_turn_router(session_id: str, router: TurnRouter | None = None) -> None:
     """Stop the turn router serving *session_id* and forget it.
 
@@ -1660,10 +1697,15 @@ def shutdown_session_turn_router(session_id: str, router: TurnRouter | None = No
         cannot close the router a re-create has since installed.
     """
     with _lifecycle_lock:
+        if router is not None:
+            session_id = router.session_id
         current = _session_routers.get(session_id)
         if router is not None and current is not router:
-            return
-        _session_routers.pop(session_id, None)
+            if not router.detached:
+                return
+            current = router
+        else:
+            _session_routers.pop(session_id, None)
     if current is None:
         return
     with contextlib.suppress(Exception):

@@ -2193,10 +2193,17 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, LEVEL_OWNER)
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
+        expected_instance_id = body.get("expected_instance_id") if isinstance(body, dict) else None
         if not isinstance(target_session_id, str) or not target_session_id:
             raise OmnigentError(
                 "'target_session_id' is required",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        if expected_instance_id is not None and (
+            not isinstance(expected_instance_id, str) or not expected_instance_id
+        ):
+            raise OmnigentError(
+                "'expected_instance_id' must be a non-empty string", code=ErrorCode.INVALID_INPUT
             )
         target = await _validate_session(target_session_id, request, LEVEL_OWNER)
 
@@ -2234,15 +2241,19 @@ def register_resources_routes(
                         scheduled_task_store=getattr(state, "scheduled_task_store", None),
                         archive_cleanup=getattr(state, "archive_close_coordinator", None),
                         runner_exit_reports=getattr(state, "runner_exit_reports", None),
+                        expected_instance_id=expected_instance_id,
                     )
                 )
             except (httpx.HTTPError, ConnectionError) as exc:
                 raise HTTPException(502, "Claude terminal transfer is unconfirmed") from exc
         else:
+            transfer_body = {"target_session_id": target_session_id}
+            if expected_instance_id is not None:
+                transfer_body["expected_instance_id"] = expected_instance_id
             status, payload = await _proxy_post_to_runner(
                 session_id,
                 path,
-                {"target_session_id": target_session_id},
+                transfer_body,
                 conv,
             )
         if status == 404:

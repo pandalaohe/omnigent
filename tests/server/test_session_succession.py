@@ -628,6 +628,48 @@ def _terminal_probe(url: str, terminal: dict[str, Any] | None) -> httpx.Response
     )
 
 
+@pytest.mark.parametrize("phase", ["unrecorded", "recorded", "committed"])
+async def test_requested_claude_transfer_rejects_different_expected_instance(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    old, new, path = await _prepare_claude_transfer(client, store)
+    pane = _transfer_test_terminal("current-pane")
+    if phase == "recorded":
+        record = succession_module._ClaudeTransferRecord(new, RUNNER_ID, "current-pane")
+        store.set_labels(old, {succession_module._CLAUDE_TRANSFER_RECORD: record.encode()})
+    elif phase == "committed":
+        await succession_module._save_claude_transfer_result(store, old, new, pane)
+        await succession_module.commit_succession_move(
+            store, old, new, uuid4().hex, reverse_of=False, allow_empty=True
+        )
+    before = store.get_conversation(old)
+    assert before is not None
+    receipt = store.get_succession(old, new)
+    source_terminal_path = path.removesuffix("/transfer")
+    get = AsyncMock(return_value=_terminal_probe(source_terminal_path, pane))
+    post = AsyncMock()
+    monkeypatch.setattr(runner, "get", get, raising=False)
+    monkeypatch.setattr(runner, "post", post)
+
+    response = await client.post(
+        path, json={"target_session_id": new, "expected_instance_id": "previous-pane"}
+    )
+
+    assert response.status_code == 409, response.text
+    post.assert_not_awaited()
+    if phase == "unrecorded":
+        get.assert_awaited_once_with(source_terminal_path, timeout=10.0)
+    else:
+        get.assert_not_awaited()
+    after = store.get_conversation(old)
+    assert after is not None and after.labels == before.labels
+    assert store.get_succession(old, new) == receipt
+
+
 def _wake_event(text: str, *, is_meta: bool = False) -> dict[str, Any]:
     return {
         "type": "message",

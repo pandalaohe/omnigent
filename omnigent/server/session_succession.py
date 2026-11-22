@@ -330,6 +330,7 @@ async def transfer_requested_claude_terminal(
     archive_cleanup: Any,
     runner_exit_reports: RunnerExitReports | None = None,
     recovery: _ClaudeTransferRecord | None = None,
+    expected_instance_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Commit only a move confirmed for the recorded terminal instance."""
     store = conversation_store
@@ -421,6 +422,11 @@ async def transfer_requested_claude_terminal(
         payload = _claude_transfer_result(old, new_id)
         try:
             if old.labels.get(SUCCEEDED_BY_LABEL_KEY) == new_id and payload is not None:
+                if (
+                    expected_instance_id is not None
+                    and _terminal_instance(payload) != expected_instance_id
+                ):
+                    return 409, conflict
                 receipt = await asyncio.to_thread(store.get_succession, old_id, new_id)
                 if receipt is None:
                     raise RuntimeError("Confirmed Claude transfer has no succession receipt")
@@ -430,6 +436,13 @@ async def transfer_requested_claude_terminal(
                     drive(receipt)
                 return 200, payload
             if recovery is not None and record != recovery:
+                return 409, conflict
+            if (
+                expected_instance_id is not None
+                and record is not None
+                and record.target == new_id
+                and record.instance != expected_instance_id
+            ):
                 return 409, conflict
             if record is not None and (
                 record.target != new_id or _terminal_instance(payload or {}) != record.instance
@@ -464,6 +477,8 @@ async def transfer_requested_claude_terminal(
                     instance = _terminal_instance(await _live_terminal(client, old_id))
                     if instance is None:
                         return 404, {}
+                    if expected_instance_id is not None and instance != expected_instance_id:
+                        return 409, conflict
                     record = _ClaudeTransferRecord(new_id, runner_id, instance)
                     await asyncio.to_thread(
                         store.set_labels,

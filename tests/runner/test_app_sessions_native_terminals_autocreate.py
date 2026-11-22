@@ -92,7 +92,7 @@ from omnigent.runtime.prompt import (
     child_session_question_instruction,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY, SUCCEEDS_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
@@ -6366,6 +6366,7 @@ class _CodexAutoCreateScenario:
     terminal_under: str | None
     bridge_id_label: str
     expect_auto_create: bool
+    succeeds: str | None = None
 
 
 class _CodexSnapshotServerClient:
@@ -6380,12 +6381,14 @@ class _CodexSnapshotServerClient:
     fails loudly instead of silently returning a mock.
     """
 
-    def __init__(self, bridge_id_label: str) -> None:
+    def __init__(self, bridge_id_label: str, succeeds: str | None) -> None:
         """
         :param bridge_id_label: Bridge id to report on the session's
             ``labels``, e.g. ``"bridge_shared"``.
+        :param succeeds: Predecessor recorded in the session's labels.
         """
         self._bridge_id_label = bridge_id_label
+        self._succeeds = succeeds
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         """
@@ -6398,6 +6401,8 @@ class _CodexSnapshotServerClient:
         """
         del kwargs
         labels = {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: self._bridge_id_label}
+        if self._succeeds is not None:
+            labels[SUCCEEDS_LABEL_KEY] = self._succeeds
 
         class _Response:
             """Minimal httpx-like response with the fields the runner reads."""
@@ -6547,6 +6552,15 @@ _CODEX_AUTO_CREATE_SCENARIOS = [
         terminal_under="3bb59abc6e20b834cbb2269f28880895",
         bridge_id_label="bridge_shared",
         expect_auto_create=False,
+        succeeds="3bb59abc6e20b834cbb2269f28880895",
+    ),
+    _CodexAutoCreateScenario(
+        case_id="old_session_rebind_creates",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under="3bb59abc6e20b834cbb2269f28880895",
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+        succeeds="conv_earlier_predecessor",
     ),
     # Fresh host-spawned session: own bridge, no recorded state, no terminal —
     # it must bootstrap its own Codex.
@@ -6574,6 +6588,7 @@ _CODEX_AUTO_CREATE_SCENARIOS = [
         terminal_under=None,
         bridge_id_label="bridge_shared",
         expect_auto_create=True,
+        succeeds="3bb59abc6e20b834cbb2269f28880895",
     ),
 ]
 
@@ -6685,7 +6700,7 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=_CodexSnapshotServerClient(  # type: ignore[arg-type]
-            scenario.bridge_id_label
+            scenario.bridge_id_label, scenario.succeeds
         ),
         terminal_registry=terminal_registry,
     )

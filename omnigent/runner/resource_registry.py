@@ -23,6 +23,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -668,10 +669,9 @@ class SessionResourceRegistry:
         # or stop outliving its turn. Set via
         # :meth:`set_session_background_publisher`.
         self._session_background_publisher: Callable[[str, bool], None] | None = None
-        # Optional callback ``(source_session_id, target_session_id) -> None``
-        # run synchronously when the Claude main pane changes owner. Set via
-        # :meth:`set_claude_terminal_transfer_listener`.
-        self._claude_terminal_transfer_listener: Callable[[str, str], None] | None = None
+        self._native_terminal_transfer_listeners: dict[
+            str, tuple[Callable[[str, str], None], Callable[[str, str, str | None], None] | None]
+        ] = {}
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -796,15 +796,24 @@ class SessionResourceRegistry:
         """
         self._session_background_publisher = publisher
 
-    def set_claude_terminal_transfer_listener(self, listener: Callable[[str, str], None]) -> None:
-        """Install the callback run when the Claude main pane moves to another session.
+    def set_native_terminal_transfer_listener(
+        self,
+        terminal_name: str,
+        listener: Callable[[str, str], None],
+        *,
+        prepare: Callable[[str, str, str | None], None] | None = None,
+    ) -> None:
+        """Install the callback run when a harness's main pane moves to another session.
 
         It runs before :meth:`transfer_terminal` first yields, so no other task
         observes the pane under its new owner before the callback has run.
 
+        :param terminal_name: Native terminal name, e.g. ``"codex"``.
         :param listener: Callable ``(source_session_id, target_session_id) -> None``.
+        :param prepare: Optional callback with the source, target and terminal role.
+            It can raise a conflict before the move.
         """
-        self._claude_terminal_transfer_listener = listener
+        self._native_terminal_transfer_listeners[terminal_name] = (listener, prepare)
 
     def set_terminal_exit_publisher(
         self,
@@ -2853,16 +2862,31 @@ class SessionResourceRegistry:
                 and entry.instance.instance_id != expected_instance_id
             ):
                 return None
+            listener, prepare = (None, None)
+            if entry.session_key == "main":
+                listener, prepare = self._native_terminal_transfer_listeners.get(
+                    entry.terminal_name, (None, None)
+                )
+            before_move = (
+                partial(
+                    prepare,
+                    source_session_id,
+                    target_session_id,
+                    self.terminal_resource_role(source_session_id, terminal_id),
+                )
+                if prepare is not None
+                else None
+            )
             moved = self._terminal_registry.transfer(
                 source_session_id,
                 target_session_id,
                 entry.terminal_name,
                 entry.session_key,
+                before_move=before_move,
             )
             if not moved:
                 return None
-            listener = self._claude_terminal_transfer_listener
-            if listener is not None and terminal_id == terminal_resource_id("claude", "main"):
+            if listener is not None:
                 listener(source_session_id, target_session_id)
             with self._lock:
                 role_registration = self._terminal_roles.pop(
