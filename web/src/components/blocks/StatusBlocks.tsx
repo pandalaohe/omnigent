@@ -530,12 +530,14 @@ export function ErrorBanner({
     setRetryError(null);
     try {
       await onRetry(actionableError);
-      setDismissed(true);
+      // Upload cards leave the transcript when the store completes the retry handoff.
+      if (actionableError.code !== ATTACHMENT_UPLOAD_FAILED) setDismissed(true);
     } catch (error) {
-      retryInFlightRef.current = false;
       setRetryError(
         `${retryLabel} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      retryInFlightRef.current = false;
       setRetrying(false);
     }
   };

@@ -1043,6 +1043,8 @@ export interface ConversationState {
     recovered?: boolean;
     /** Replace the current composer when this draft is restored. */
     replaceComposer?: boolean;
+    /** Called once the composer has taken the draft's text and files. */
+    onRestored?: () => void;
   } | null;
   pendingRetryStableId: string | null;
   /**
@@ -2080,10 +2082,20 @@ export async function retryFailedAttachmentSend(
   const files = composerAttachments(parts);
   if (restoreToComposer) {
     if (state.failedSendDraft) throw new Error("Wait for the previous draft to be restored");
-    setterFor(conversationId)((s) => ({
-      blocks: s.blocks.filter((block) => block !== card),
-      failedSendDraft: { conversationId, text, files, composerParts: parts, replyDraft },
-    }));
+    setterFor(conversationId)({
+      failedSendDraft: {
+        conversationId,
+        text,
+        files,
+        composerParts: parts,
+        replyDraft,
+        replaceComposer: true,
+        onRestored: () =>
+          setterFor(conversationId)((s) => ({
+            blocks: s.blocks.filter((block) => block !== card),
+          })),
+      },
+    });
     return;
   }
   const retryAgent = state.boundAgentId ?? agentId;
@@ -9587,11 +9599,15 @@ async function refetchRunnerBackedSessionState(
  * "can't dedupe by text".
  */
 function messageContentText(content: MessageContentBlock[]): string {
-  return content
-    .map((b) => (b.type === "input_text" || b.type === "output_text" ? b.text : ""))
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return normalizeMessageText(
+    content
+      .map((b) => (b.type === "input_text" || b.type === "output_text" ? b.text : ""))
+      .join(" "),
+  );
+}
+
+function normalizeMessageText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -10816,19 +10832,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // persistence for these (no `session.input.consumed` fires),
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      // until refresh. A skill receipt acknowledges its own posted command.
+      // Surfaced built-ins keep their FIFO acknowledgement.
       applyToConversation((s) => {
         if (event.kind === "command" && hasCommittedItem(s.blocks, event.itemId)) return {};
-        const posted = s.pendingUserMessages.filter((p) => !p.beforePost && !p.initialDraft);
         if (event.kind === "skill") {
-          const command = event.arguments ? `/${event.name} ${event.arguments}` : `/${event.name}`;
+          const posted = s.pendingUserMessages.filter((p) => !p.beforePost && !p.initialDraft);
+          const command = normalizeMessageText(`/${event.name} ${event.arguments}`);
           const skill =
             posted.find((p) => p.standaloneSkill && p.stableId === event.itemId) ??
-            posted.find((p) => p.standaloneSkill && messageContentText(p.content) === command);
-          if (skill)
-            return { pendingUserMessages: s.pendingUserMessages.filter((p) => p !== skill) };
+            posted.find(
+              (p) =>
+                p.content.every(
+                  (block) => block.type === "input_text" || block.type === "output_text",
+                ) && messageContentText(p.content) === command,
+            );
+          return skill
+            ? { pendingUserMessages: s.pendingUserMessages.filter((p) => p !== skill) }
+            : {};
         }
         const head = s.pendingUserMessages.find((p) => !p.standaloneSkill);
         if (!head || head.initialDraft || head.beforePost) return {};

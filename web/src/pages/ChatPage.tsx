@@ -4129,6 +4129,7 @@ function ComposerImpl(
     if (failed.replaceComposer) {
       attachmentsRef.current.restoreFiles(failed.files);
       clearError();
+      failed.onRestored?.();
     } else if (failed.files.length > 0) {
       attachmentsRef.current.replaceFiles(failed.files);
     }

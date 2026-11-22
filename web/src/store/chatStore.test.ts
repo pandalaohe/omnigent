@@ -6737,6 +6737,44 @@ describe("chatStore — sendSlashCommand", () => {
     );
   });
 
+  it("matches multiline skill receipts and leaves ordinary bubbles for message receipts", async () => {
+    const id = "conv_existing";
+    useChatStore.setState({ conversationId: id, abortController: new AbortController() });
+    const args = "first  second\nthird";
+    const skill = useChatStore.getState().sendSlashCommand("review", args, "agent_xyz");
+    const message = useChatStore.getState().send("ordinary follow-up", "agent_xyz");
+    const [skillBubble, messageBubble] = useChatStore.getState().pendingUserMessages;
+    await Promise.all([skill, message]);
+    const receipt = {
+      type: "slash_command" as const,
+      kind: "skill" as const,
+      name: "review",
+      output: null,
+      agentName: "agent",
+      itemId: "skill_receipt",
+      responseId: "skill_response",
+    };
+    handleSessionEvent({ ...receipt, arguments: args });
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      messageBubble!.tempId,
+    ]);
+    expect(useChatStore.getState().pendingUserMessages).not.toContainEqual(skillBubble);
+    handleSessionEvent({ ...receipt, itemId: "other_skill_receipt", arguments: "unmatched" });
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      messageBubble!.tempId,
+    ]);
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "message_receipt",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "ordinary follow-up" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().blocks).toContainEqual(
+      expect.objectContaining({ stableKey: messageBubble!.tempId, type: "user_message" }),
+    );
+  });
+
   it("sends empty arguments when the skill is invoked with no args", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",

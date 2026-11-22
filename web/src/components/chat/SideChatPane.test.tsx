@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import * as filesApi from "@/lib/filesApi";
+import { ATTACHMENT_UPLOAD_FAILED } from "@/lib/blocks";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
@@ -1469,6 +1470,54 @@ describe("side chat composer attachments", () => {
     expect(screen.getByTestId("side-chat-input")).toHaveValue("Original side reply");
     expect(screen.getByText("Original quote")).toBeInTheDocument();
     expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([original]);
+  });
+
+  it("replaces a newer side draft on rejected upload Retry before removing the card", async () => {
+    const photo = new File(["photo"], "photo.png", { type: "image/png" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      text: "Original reply",
+      quotes: [{ before: "", text: "Original quote" }],
+    };
+    useChatStore.getState().updateSideChatComposer(childId, () => ({
+      text: "Newer side draft",
+      files: [new File(["notes"], "notes.txt", { type: "text/plain" })],
+    }));
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      blocks: [
+        {
+          type: "error",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: "rejected" },
+          code: ATTACHMENT_UPLOAD_FAILED,
+          source: "",
+          message: "File exceeds the upload limit",
+          failedAttachmentSend: {
+            text: serializeReplyDraft(replyDraft),
+            replyDraft,
+            parts: [{ type: "attachment", file: photo }],
+            restoreToComposer: true,
+          },
+        },
+      ],
+    });
+    const onDismiss = vi.fn();
+    const unsubscribe = conversationRegistry.subscribe((id) => {
+      if (id === childId && entry.getState().blocks.length === 0) {
+        onDismiss(useChatStore.getState().sideChatComposers[childId]?.text);
+      }
+    });
+    try {
+      renderPane(<SideChatPane childId={childId} />);
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(onDismiss).toHaveBeenCalledWith("Original reply"));
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Original reply");
+      expect(screen.getByText("Original quote")).toBeInTheDocument();
+      expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([photo]);
+      expect(screen.queryByTestId("error-pill")).toBeNull();
+    } finally {
+      unsubscribe();
+    }
   });
 });
 

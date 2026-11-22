@@ -218,6 +218,32 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(true);
   });
 
+  it("keeps a failed upload retry through LRU pressure while evicting ordinary errors", () => {
+    const failed = registry.acquire("conv_failed");
+    const file = new File(["photo"], "photo.png", { type: "image/png" });
+    const retry = {
+      text: "A reply with a photo",
+      parts: [{ type: "attachment" as const, file }],
+      replyDraft: { version: 1 as const, text: "A reply", quotes: [{ before: "", text: "Quote" }] },
+    };
+    const error = {
+      type: "error" as const,
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: "failed_send" },
+      message: "Upload failed",
+      code: "attachment_upload_failed",
+      source: "",
+    };
+    failed.setState({ blocks: [{ ...error, failedAttachmentSend: retry }] });
+    registry.acquire("conv_ordinary").setState({ blocks: [error] });
+
+    expect(registry.evictLruEvictable()).toBe("conv_ordinary");
+    expect(registry.peek("conv_failed")?.getState().blocks).toEqual([
+      { ...error, failedAttachmentSend: retry },
+    ]);
+    failed.setState({ blocks: [] });
+    expect(registry.evictLruEvictable()).toBe("conv_failed");
+  });
+
   it("does evict an entry whose sends have all settled", () => {
     // Once the POST returns, the server can account for the message — the
     // navigate-back snapshot re-seeds it, so reclaiming its slot is safe.

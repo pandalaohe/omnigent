@@ -607,6 +607,7 @@ function SideChatComposer({
         files: failed.files,
       }));
       setAttachmentError(null);
+      failed.onRestored?.();
       return;
     }
     const { accepted, errors } = validateAttachments(
