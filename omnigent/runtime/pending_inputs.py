@@ -277,6 +277,7 @@ class DrainedInput:
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
     runner_claim_owner: str | None = None
+    inline_attachment_attempts: bool = False
 
 
 @dataclass
@@ -367,6 +368,8 @@ class _Entry:
     runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
+    # The claiming runner tags uploads that appear after authored text.
+    inline_attachment_attempts: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -544,6 +547,7 @@ def claim_runner_input(
     *,
     expected_attempt_id: str | None = None,
     runner_id: str | None = None,
+    inline_attachment_attempts: bool = False,
 ) -> bool:
     """Grant one runner attempt the right to paste while its lease is live."""
     with _lock:
@@ -564,6 +568,7 @@ def claim_runner_input(
             return False
         entry.runner_claim_id = claim_id
         entry.runner_claim_owner = runner_id
+        entry.inline_attachment_attempts = inline_attachment_attempts
         entry.last_runner_renewal = now
         entry.sending_since_ms = entry.input_enqueued_at_ms
         return True
@@ -1146,6 +1151,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
         runner_claim_owner=drained.runner_claim_owner,
+        inline_attachment_attempts=drained.inline_attachment_attempts,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1360,6 +1366,38 @@ def resolve_matching_text(
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
+            if claude_commands and not shell_command:
+                # Older claimed runners emit inline paths without attempt tags.
+                # Keep the old client's head/body fallback, but require paste
+                # confirmation and the complete composer layout from the mirror.
+                head = next(
+                    (
+                        entry
+                        for entry in entries.values()
+                        if not entry.held and not entry.interrupted
+                    ),
+                    None,
+                )
+                if (
+                    head is not None
+                    and head.agent_received
+                    and not head.inline_attachment_attempts
+                    and head.auto_retry is None
+                    and head.delivery_attempt_id is not None
+                    and _attachment_count(head.content)
+                    and _content_text(head.content).strip()
+                    and needs_attachment_attempt(head.content, head.delivery_attempt_id)
+                    and _matches_forwarded_blocks(head.content, exact_needle)
+                ):
+                    if hold:
+                        head.held = True
+                    else:
+                        _settle_locked(conversation_id, entries, head.pending_id)
+                    return MatchedDrain(
+                        matched=_drained_input(head),
+                        skipped=[],
+                        match_method="attachment_normalized_text",
+                    )
             return MatchedDrain(matched=None, skipped=[])
         # Look across match tiers. A literal attachment marker or a command's
         # injected prefix can also explain an otherwise exact mirror.
@@ -1533,6 +1571,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
         runner_claim_owner=entry.runner_claim_owner,
+        inline_attachment_attempts=entry.inline_attachment_attempts,
     )
 
 
