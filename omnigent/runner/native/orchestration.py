@@ -3599,27 +3599,29 @@ async def _auto_create_pi_terminal(
     binding_token = _runner_tunnel_binding_token_from_env()
     if binding_token:
         auth_headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
-    # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
-    # via pi.registerTool. Reuses the same schema set the claude-native /
-    # codex-native relay advertises, gated by the session's spec. Each tool's
-    # execute() round-trips through POST /v1/sessions/{id}/mcp, so the Pi agent
-    # can call Omnigent tools with centralized server-side policy enforcement
-    # — parity with the other native harnesses. Best-effort: a schema-build
-    # failure must not block the terminal launch, so fall back to no tools.
+    # Pi registers Omnigent tools at extension startup. Full-tier calls use
+    # the session MCP proxy; scoped tiers use the authenticated Pi relay.
     pi_tools: list[_JsonObject] = []
     try:
+        from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        spec_for_tools = _unwrap_resolved_spec(agent_spec)
         pi_tools = build_native_relay_tool_schemas(
-            spec_for_tools,
+            pi_spec,
             peer_messaging_enabled=peer_messaging_enabled,
             session_open_enabled=session_open_enabled,
         )
+        if server_client is not None and pi_spec is not None:
+            registry_servers = [
+                server for server in pi_spec.mcp_servers if server.transport == "registry"
+            ]
+            if registry_servers:
+                registry_spec = dataclasses.replace(pi_spec, mcp_servers=registry_servers)
+                mcp = await ProxyMcpManager(session_id, server_client).schemas_for(registry_spec)
+                pi_tools.extend(mcp.schemas)
     except Exception:
         _logger.warning(
-            "Failed to build pi-native tool schemas for session %s; "
-            "Pi will run with its built-in tools only",
+            "Failed to build pi-native tool schemas for session %s",
             session_id,
             exc_info=True,
         )

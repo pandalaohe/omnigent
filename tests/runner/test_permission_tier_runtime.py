@@ -2705,6 +2705,98 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         assert decision.reason == "Unknown tool schema"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier", "action"),
+    [("ask", "ASK"), ("accept-edits", "ASK"), ("auto", "DENY"), ("plan", "DENY")],
+)
+async def test_scoped_pi_registry_tool_reaches_gateway_after_authorization(tmp_path, tier, action):
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+    session_id = "session-a"
+    tool_name = "notes__search"
+    arguments = {"query": "hello"}
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
+    scope = runtime.open_pi_child_scope(session_id)
+    extension = runtime.path(session_id).parent / "omnigent_pi_native_extension.js"
+    _publish_scope(runtime, scope, [{"name": tool_name, "sourceInfo": {"path": str(extension)}}])
+    receipt = runtime.pi_origin_receipt(
+        session_id,
+        scope.credential,
+        call_id="registry-call",
+        name=tool_name,
+        arguments=arguments,
+        local_execution=False,
+    )
+    binding, decision = runtime.inspect(
+        session_id,
+        call_id=receipt.binding.call_id,
+        name=tool_name,
+        arguments=arguments,
+        expected_revision=3,
+        local_execution=False,
+        origin_receipt=receipt.token,
+    )
+    assert decision.action.value == action
+    authorized = runtime.authorize(
+        session_id,
+        call_id=binding.call_id,
+        name=tool_name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    assert authorized is (action == "ASK")
+    if not authorized:
+        return
+
+    requests = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"result": {"content": [{"type": "text", "text": "found"}]}}
+        )
+
+    spec = AgentSpec(
+        spec_version=1,
+        mcp_servers=[MCPServerConfig(name="notes", transport="registry")],
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(gateway), base_url="http://gateway.example"
+    ) as client:
+        proxy = ProxyMcpManager(session_id, client)
+        result = await PiScopeRelay(runtime, session_id).execute_rpc(
+            f"Bearer {scope.credential}",
+            json.dumps(
+                {
+                    "call_id": binding.call_id,
+                    "expected_revision": 3,
+                    "pi_origin_receipt": receipt.token,
+                    "arguments_digest": binding.arguments_digest,
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "operation_id": "mcpop_registry",
+                }
+            ),
+            lambda name, args: proxy.call_tool(spec, name, args),
+            {tool_name},
+        )
+
+    (request,) = requests
+    assert request.url.path == "/v1/mcp/notes"
+    assert request.headers["X-Omnigent-Session-Id"] == session_id
+    payload = json.loads(request.content)
+    assert payload["method"] == "tools/call"
+    assert payload["params"]["name"] == "search"
+    assert payload["params"]["arguments"] == arguments
+    assert payload["params"]["_omnigent_permission_call_id"] == binding.call_id
+    assert payload["params"]["_omnigent_pi_origin_receipt"] == receipt.token
+    assert result == {"result": "found"}
+
+
 @pytest.mark.parametrize(
     "tier,action,reason",
     [
