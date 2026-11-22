@@ -867,7 +867,7 @@ async def test_runner_posts_same_control_receipt_before_reply_and_recovers_lost_
                 "input_control": {"session_id": "child", "input_id": control_id},
             },
         )
-        assert interrupted.status_code == 204
+        assert interrupted.is_success, interrupted.text
         assert writes == [{"outcome": "accepted", "expected_version": 0}]
         response = await client.post(
             "/v1/sessions/child/events?stream=true",
@@ -966,11 +966,10 @@ async def test_cancelled_admission_is_closed_before_next_human_can_start(db_uri)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert (
-                await client.post(
-                    f"/v1/sessions/{journal.child}/events", json={"type": "interrupt"}
-                )
-            ).status_code == 204
+            interrupted = await client.post(
+                f"/v1/sessions/{journal.child}/events", json={"type": "interrupt"}
+            )
+            assert interrupted.is_success, interrupted.text
             harness._sse_frames = frames(new_id, "new-human-turn")
             accepted = await client.post(
                 f"/v1/sessions/{journal.child}/events?stream=true", json=body(new_id)

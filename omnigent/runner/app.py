@@ -7969,14 +7969,15 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
 
-    async def _cancel_inprocess_turn(conv_id: str) -> None:
+    async def _cancel_inprocess_turn(conv_id: str) -> bool:
+        """Request cancellation and report whether a live turn was found."""
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
         # the None sentinel — driven by the AP request's consumption of
         # proxy_stream, so the runner owns no cancellable Task). Both a live Task
         # and the sentinel have a live harness turn parked on a future, so the
         # interrupt must be forwarded for either.
         if conv_id not in _active_turns:
-            return
+            return False
         target = _active_turns.get(conv_id)
         turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         if isinstance(target, asyncio.Task) and target.done():
@@ -7984,7 +7985,7 @@ def create_runner_app(
             # ``conv in _active_turns`` liveness check (the buffer gate would strand
             # later messages) — sweep it, tokens included.
             _sweep_dead_turn_slot(conv_id, target)
-            return
+            return False
         _interrupted_sessions.add(conv_id)
         dispatch_owner = _turn_dispatch_cancellers.get(conv_id)
         dispatch_tasks = (
@@ -8001,6 +8002,7 @@ def create_runner_app(
         # ending proxy_stream.
         if isinstance(target, asyncio.Task):
             await _cancel_active_turn(conv_id, expected_task=target)
+        return True
 
     async def _resync_turn_state(
         conv_id: str, reason: str, *, owner_response_id: str | None = None
@@ -12789,8 +12791,12 @@ def create_runner_app(
             if _interrupt_resp is not None:
                 await _settle_control_input(body, _interrupt_resp)
                 return _interrupt_resp
-            await _cancel_inprocess_turn(conversation_id)
-            control_response = Response(status_code=204)
+            if await _cancel_inprocess_turn(conversation_id):
+                control_response = Response(status_code=204)
+            else:
+                control_response = JSONResponse(
+                    status_code=200, content={"interrupted": False, "reason": "idle"}
+                )
             await _settle_control_input(body, control_response)
             return control_response
 

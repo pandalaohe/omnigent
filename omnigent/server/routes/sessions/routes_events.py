@@ -478,8 +478,8 @@ async def _deliver_interrupt_once(
 ) -> bool:
     """Forward one interrupt and publish only after the runner accepts it.
 
-    :returns: ``True`` when the runner accepted and cancelled an active turn,
-        ``False`` when nothing was interrupted (e.g. already idle).
+    :returns: ``True`` when the runner accepted the interrupt request,
+        ``False`` when the runner reports a no-op or startup ended before dispatch.
     """
     # Read before the forward so a message sent after Stop stays live; marked
     # only if the interrupt lands, else the turn may still run them.
@@ -516,12 +516,11 @@ async def _deliver_interrupt_once(
         except (TypeError, ValueError):
             interrupt_result = None
         if isinstance(interrupt_result, dict) and interrupt_result.get("interrupted") is False:
-            # Runner authoritatively observed that the terminal had already
-            # settled before this delayed control arrived. Nothing was cancelled,
-            # so do not fence output or publish a false cancelled decoration.
+            # The runner reported no interrupt. Release the fence without
+            # marking pending inputs or publishing cancellation.
             _interrupt_fenced_sessions.discard(session_id)
             return False
-    # The runner accepted and cancelled the turn: flag the web inputs queued at
+    # The runner accepted the interrupt request: flag the web inputs queued at
     # the snapshot as interrupted so they don't look live in a later turn.
     pending_inputs.mark_interrupted(session_id, queued_pending_ids)
     if session_id not in _interrupt_fenced_sessions:
@@ -529,9 +528,8 @@ async def _deliver_interrupt_once(
         # control. That edge is authoritative; publishing interrupted now would
         # retroactively cancel the settled/new turn in connected clients.
         return True
-    # Only tell clients that the turn was interrupted after the runner confirms
-    # that the native bridge/app-server accepted the control and the original
-    # turn fence still identifies the same unsettled boundary.
+    # Publish the accepted interrupt only while the original turn fence still
+    # identifies the same unsettled boundary.
     _publish_interrupted(session_id)
     return True
 
