@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
+from omnigent.models.model_fallbacks import (
+    ANTIGRAVITY_HIGH_CAP_MODELS,
+    ANTIGRAVITY_MEDIUM_CAP_MODELS,
+)
 
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 EFFORT_VALUES = frozenset(EFFORT_ORDER)
@@ -30,7 +34,9 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
-ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
+# agy supports xhigh on Gemini 4 Neon / Hydrogen; models that top out lower
+# (e.g. Opus/Sonnet 5.5) are capped per model via ANTIGRAVITY_MODEL_EFFORT_CAPS.
+ANTIGRAVITY_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 # The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
 # exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
 # support is gated by the Copilot backend (``list_models()``).
@@ -140,6 +146,7 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
         EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
         EffortFamily.OPENAI: OPENAI_EFFORTS,
         EffortFamily.GEMINI: GEMINI_EFFORTS,
+        EffortFamily.ANTIGRAVITY: ANTIGRAVITY_EFFORTS,
         EffortFamily.COPILOT: COPILOT_EFFORTS,
         EffortFamily.PI: PI_EFFORTS,
         EffortFamily.CODEX_NATIVE: CODEX_NATIVE_EFFORTS,
@@ -201,6 +208,28 @@ class ModelEffortCaps:
 
 #: The caps every deployment gets unless its ``routing:`` block overrides them.
 DEFAULT_MODEL_EFFORT_CAPS = ModelEffortCaps()
+
+# agy serves several models that top out below ``xhigh`` (``agy models`` offers
+# ``xhigh`` only for Gemini 4 Neon / Hydrogen). Kept separate from
+# ``DEFAULT_MODEL_EFFORT_CAPS`` because Opus/Sonnet 5.5 support ``xhigh``/``max``
+# on Anthropic harnesses and because ``routing.effort_caps`` overrides the
+# gateway table independently of agy's CLI catalog.
+_ANTIGRAVITY_ABOVE_HIGH: frozenset[str] = frozenset({"xhigh", "max", "ultra"})
+_ANTIGRAVITY_NON_MEDIUM: frozenset[str] = frozenset({"low", "high", "xhigh", "max", "ultra"})
+ANTIGRAVITY_MODEL_EFFORT_CAPS = ModelEffortCaps(
+    fallback=MappingProxyType(
+        {
+            **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, "high"),
+            **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium"),
+        }
+    ),
+    unsupported=MappingProxyType(
+        {
+            **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, _ANTIGRAVITY_ABOVE_HIGH),
+            **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM),
+        }
+    ),
+)
 
 
 def model_effort_caps(caps: ModelEffortCaps | None = None) -> ModelEffortCaps:

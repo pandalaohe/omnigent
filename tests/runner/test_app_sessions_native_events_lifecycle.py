@@ -6282,6 +6282,87 @@ async def test_antigravity_control_dispatch_sends_one_command(
 
 
 @pytest.mark.parametrize(
+    ("snapshot_payload", "event", "expected_status", "expected_calls"),
+    [
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "xhigh"},
+            {"type": "model_change", "model": "claude-opus-5-5"},
+            200,
+            ["/model claude-opus-5-5-high"],
+        ),
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            {"type": "model_change", "model": "claude-opus-5-5", "effort": "xhigh"},
+            200,
+            ["/model claude-opus-5-5-high"],
+        ),
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            {"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
+            200,
+            ["/model gemini-4-hydrogen-xhigh"],
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "claude-opus-5-5",
+                "reasoning_effort": "high",
+            },
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "reasoning_effort": "high",
+            },
+            {"type": "effort_change", "effort": "xhigh"},
+            200,
+            ["/effort xhigh"],
+        ),
+    ],
+)
+async def test_antigravity_control_dispatch_guards_xhigh_per_model(
+    monkeypatch,
+    tmp_path,
+    isolate_antigravity_controls_launch,
+    snapshot_payload,
+    event,
+    expected_status,
+    expected_calls,
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+
+    async def snapshot(*args, **kwargs):
+        return snapshot_payload
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    calls = []
+
+    def command(_, text, **kwargs):
+        calls.append(text)
+        return "Effort set to xhigh" if text.startswith("/effort") else "Model set to ok"
+
+    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_xhigh", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post("/v1/sessions/conv_agy_xhigh/events", json=event)
+    assert response.status_code == expected_status, response.text
+    assert calls == expected_calls
+
+
+@pytest.mark.parametrize(
     "outcome", ["commit", "rollback", "prepare-failure", "rollback-failure", "snapshot-timeout"]
 )
 async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(

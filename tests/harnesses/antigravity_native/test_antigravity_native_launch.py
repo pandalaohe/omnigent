@@ -407,3 +407,49 @@ def test_launch_model_effort_pair(monkeypatch, model, effort, expected_model):
         assert argv[argv.index("--effort") + 1] == "medium"
     else:
         assert "--effort" not in argv
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_model", "expected_effort"),
+    [
+        ("gemini-4-hydrogen", "xhigh", "gemini-4-hydrogen", "xhigh"),
+        ("gemini-4-neon", "xhigh", "gemini-4-neon", "xhigh"),
+        ("gemini-4-hydrogen-high", "xhigh", "gemini-4-hydrogen", "xhigh"),
+        ("claude-opus-5-5", "xhigh", "claude-opus-5-5", "high"),
+        ("claude-opus-5-5-high", "xhigh", "claude-opus-5-5", "high"),
+        ("claude-sonnet-5-5", "xhigh", "claude-sonnet-5-5", "high"),
+        ("gemini-4-carbon", "xhigh", "gemini-4-carbon", "high"),
+        ("gemini-3.8-flash", "xhigh", "gemini-3.8-flash", "high"),
+        ("gpt-oss-120b", "xhigh", "gpt-oss-120b", "medium"),
+    ],
+)
+def test_launch_xhigh_allowed_for_gemini_4_and_clamped_for_capped_models(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    effort: str,
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(conversation_id=None, resume=False, model=model, effort=effort)
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert argv[argv.index("--effort") + 1] == expected_effort
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_model"),
+    [
+        ("claude-opus-5-5-xhigh", "claude-opus-5-5-high"),
+        ("claude-sonnet-5-5-xhigh", "claude-sonnet-5-5-high"),
+        ("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-xhigh"),
+    ],
+)
+def test_launch_suffixed_capped_model_never_passes_xhigh(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_model: str,
+) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(conversation_id=None, resume=False, model=model, effort=None)
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert "--effort" not in argv

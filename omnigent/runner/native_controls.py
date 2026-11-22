@@ -2118,6 +2118,10 @@ def build_native_controls(
             split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+        from omnigent.util.reasoning_effort import (
+            ANTIGRAVITY_MODEL_EFFORT_CAPS,
+            clamp_effort_for_model,
+        )
 
         if not model or not model.strip():
             return JSONResponse(
@@ -2137,9 +2141,21 @@ def build_native_controls(
         if not effort_set:
             raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
             effort = raw_effort if isinstance(raw_effort, str) else None
-        selected = (
-            split_agy_effort_suffix(model.strip())[0] + "-" + effort if effort else model.strip()
-        )
+        base_model, suffix_effort = split_agy_effort_suffix(model.strip())
+        if effort:
+            effort = clamp_effort_for_model(effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
+            selected = f"{base_model}-{effort}"
+        elif suffix_effort is not None:
+            clamped_suffix = clamp_effort_for_model(
+                suffix_effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS
+            )
+            selected = (
+                f"{base_model}-{clamped_suffix}"
+                if clamped_suffix != suffix_effort
+                else model.strip()
+            )
+        else:
+            selected = model.strip()
         try:
             await asyncio.to_thread(
                 run_agy_slash_command,
@@ -2163,6 +2179,8 @@ def build_native_controls(
                 _session_reasoning_effort[conv_id] = effort
             else:
                 _session_reasoning_effort.pop(conv_id, None)
+        elif effort:
+            _session_reasoning_effort[conv_id] = effort
         return JSONResponse(status_code=200, content={"model": selected})
 
     async def _handle_antigravity_native_effort_change(
@@ -2172,8 +2190,13 @@ def build_native_controls(
             ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             run_agy_slash_command,
+            split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+        from omnigent.util.reasoning_effort import (
+            ANTIGRAVITY_MODEL_EFFORT_CAPS,
+            clamp_effort_for_model,
+        )
 
         if not effort:
             return JSONResponse(
@@ -2184,6 +2207,24 @@ def build_native_controls(
         if snapshot is None:
             return JSONResponse(
                 status_code=503, content={"detail": "Could not fetch Antigravity effort settings"}
+            )
+        raw_model = snapshot.get("model_override")
+        base_model = (
+            split_agy_effort_suffix(raw_model.strip())[0]
+            if isinstance(raw_model, str) and raw_model.strip()
+            else None
+        )
+        if (
+            base_model is not None
+            and clamp_effort_for_model(effort, base_model, caps=ANTIGRAVITY_MODEL_EFFORT_CAPS)
+            != effort
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "antigravity_native_effort_unsupported",
+                    "detail": f"Effort {effort!r} is not supported by {base_model}",
+                },
             )
         raw_labels = snapshot.get("labels")
         labels = raw_labels if isinstance(raw_labels, dict) else {}

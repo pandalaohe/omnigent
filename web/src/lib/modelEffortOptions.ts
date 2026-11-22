@@ -48,7 +48,7 @@ export function effortLevelsFor(
         selected?.efforts ??
         selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
         [];
-      return ["low", "medium", "high"].filter((effort) => efforts.includes(effort));
+      return ["low", "medium", "high", "xhigh"].filter((effort) => efforts.includes(effort));
     }
     case "pi-native":
     case "pi":
