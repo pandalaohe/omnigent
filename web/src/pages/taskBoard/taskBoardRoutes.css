@@ -9,6 +9,7 @@
   color: var(--foreground);
   --rt-soft: color-mix(in srgb, var(--secondary) 62%, var(--background));
   --rt-line2: color-mix(in srgb, var(--border) 55%, transparent);
+  --rt-control-h: 32px;
 }
 .rt-toolbar,
 .rt-controls,
@@ -42,11 +43,24 @@
 .rt-presets button {
   display: grid;
   place-items: center;
-  min-width: 31px;
-  min-height: 31px;
+  min-width: var(--rt-control-h);
+  min-height: var(--rt-control-h);
   border-radius: 8px;
   background: var(--secondary);
   font: inherit;
+}
+/* Every toolbar control shares one height; grouped controls inset by 3px. */
+.rt-segment {
+  height: var(--rt-control-h);
+  padding: 3px;
+  background: var(--secondary);
+}
+.rt-segment > button {
+  min-height: 0;
+  padding: 0 10px;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
 }
 .rt-presets {
   gap: 2px;
@@ -57,7 +71,7 @@
 .rt-presets button {
   background: transparent;
   min-width: 0;
-  min-height: 25px;
+  min-height: calc(var(--rt-control-h) - 6px);
   padding: 0 10px;
   font-size: 12.5px;
 }
@@ -75,7 +89,7 @@
 .rt-zoom button {
   background: transparent;
   min-width: 27px;
-  min-height: 25px;
+  min-height: calc(var(--rt-control-h) - 6px);
 }
 .rt-help {
   border: 1px solid var(--border);
@@ -800,9 +814,15 @@
   .rt-future-stop {
     width: 100px;
   }
-  .rt-zoom button,
-  .rt-icon {
-    min-height: 36px;
+  .rt-routes {
+    --rt-control-h: 36px;
+  }
+  .rt-controls .rt-rows-toggle {
+    width: var(--rt-control-h);
+    padding: 0;
+  }
+  .rt-rows-toggle span {
+    display: none;
   }
   .rt-stop {
     min-width: 44px;
@@ -1105,16 +1125,19 @@
 }
 .rt-focus-toggle {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  width: 70px;
-  height: 31px;
+  gap: 5px;
+  height: var(--rt-control-h);
+  padding: 0 10px;
   border-radius: 8px;
   background: var(--secondary);
-  color: var(--muted-foreground);
+  color: color-mix(in srgb, var(--foreground) 90%, transparent);
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
 }
 .rt-focus-toggle[aria-pressed="true"] {
   background: var(--sidebar-active);
@@ -1272,10 +1295,6 @@
 }
 
 /* Attention view, pins and compact rows. */
-.rt-pins-toggle {
-  width: auto;
-  padding: 0 9px;
-}
 .rt-pins label span small {
   display: block;
   font-size: 11.5px;
@@ -1394,14 +1413,6 @@
   }
 }
 
-.rt-icon:has(> svg + *) {
-  width: auto;
-}
-.rt-controls .rt-icon {
-  width: auto;
-  padding: 0 8px;
-  gap: 5px;
-}
 .rt-legend-always {
   margin: 6px 0 12px;
   display: flex;
