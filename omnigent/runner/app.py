@@ -10564,6 +10564,7 @@ def create_runner_app(
                 conv,
                 explicit_bridge_dir=antigravity_bdir,
                 await_notify=False,
+                session_labels=antigravity_labels,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (

@@ -6,7 +6,6 @@ import httpx
 import pytest
 from jsonschema import validate
 
-from omnigent.harnesses.antigravity_native.bridge import _AGY_ENABLED_TOOLS
 from omnigent.harnesses.cursor_native.bridge import build_mcp_config
 from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
 from omnigent.runner.tool_dispatch import (
@@ -26,7 +25,6 @@ def test_restart_tool_registered_and_relayed(tmp_path):
     }
     assert name in _ALL_LOCAL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS
     assert name in build_mcp_config(tmp_path)["mcpServers"]["omnigent"]["autoApprove"]
-    assert name in _AGY_ENABLED_TOOLS
     validate({"host": "test"}, schemas[name]["parameters"])
 
 

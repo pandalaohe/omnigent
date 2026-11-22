@@ -1610,6 +1610,101 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 
 @pytest.mark.asyncio
+async def test_antigravity_first_turn_recovers_registry_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.mcp_selection import selected_mcp_spec
+
+    session_id = "conv_agy_registry"
+    bridge_id = "bridge_agy_registry"
+    labels = {
+        agy.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id,
+        "omnigent.mcp_service.tracker": "1",
+    }
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setattr(native_runtime, "_auto_create_antigravity_terminal", AsyncMock())
+    bridge_dir = agy.bridge_dir_for_bridge_id(bridge_id)
+    config_path = agy.write_mcp_config(bridge_dir)
+    relay_path = bridge_dir / _TOOL_RELAY_FILE
+    assert not relay_path.exists()
+    relay_started = asyncio.Event()
+    start_tool_relay = bridge.start_tool_relay
+
+    def record_relay_start(**kwargs):
+        relay = start_tool_relay(**kwargs)
+        if kwargs["bridge_dir"] == bridge_dir:
+            relay_started.set()
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", record_relay_start)
+
+    class GatewayClient(_SwitchableServerClient):
+        async def get(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            if url.endswith("/labels"):
+                return self._Response({"labels": labels})
+            return await super().get(url, **kwargs)
+
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            request = kwargs.get("json", {})
+            if url != "/v1/mcp/tracker":
+                return await super().post(url, **kwargs)
+            if request["method"] == "tools/list":
+                return self._Response(
+                    {"result": {"tools": [{"name": "status", "inputSchema": {"type": "object"}}]}}
+                )
+            assert request["method"] == "tools/call"
+            assert request["params"]["name"] == "status"
+            return self._Response({"result": {"content": [{"type": "text", "text": "open"}]}})
+
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+    app = _switch_app(
+        tmp_path,
+        GatewayClient("agy-agent"),
+        {"agy-agent": ResolvedSpec(spec=selected_mcp_spec(spec, labels), workdir=tmp_path)},
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        try:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "agy-agent",
+                    "content": [{"type": "input_text", "text": "Check ticket status"}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(relay_started.wait(), timeout=5.0)
+            assert relay_path.is_file()
+            server = json.loads(config_path.read_text())["mcpServers"]["omnigent"]
+            assert "enabledTools" not in server
+            async with (
+                asyncio.timeout(10),
+                stdio_client(StdioServerParameters(**server)) as (reader, writer),
+                ClientSession(reader, writer) as session,
+            ):
+                await session.initialize()
+                tools = await session.list_tools()
+                assert {"tracker__status", "list_comments"} <= {tool.name for tool in tools.tools}
+                result = await session.call_tool("tracker__status", {})
+                assert not result.isError
+                assert json.loads(result.content[0].text) == {"result": "open"}
+        finally:
+            await client.delete(f"/v1/sessions/{session_id}")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
 @pytest.mark.parametrize(
     "harness_name", ["claude-native", "kiro-native", "pi-native", "codex-native"]

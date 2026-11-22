@@ -8258,11 +8258,21 @@ async def _auto_create_antigravity_terminal(
     # _run_turn_bg first-turn fallback re-ensures this for any session whose
     # terminal was launched outside this path.
     if ensure_comment_relay is not None:
+        relay_labels = (
+            {
+                key: value
+                for key, value in labels.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            if isinstance(labels, dict)
+            else None
+        )
         await ensure_comment_relay(
             session_id,
             bridge_id=bridge_id,
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
+            session_labels=relay_labels,
         )
 
     _logger.info(

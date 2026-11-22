@@ -2423,7 +2423,7 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 
 
 def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
-    """build_mcp_config emits the shared serve-mcp relay command + enabledTools."""
+    """The shared relay supplies its own tool list."""
     config = build_mcp_config(tmp_path, python_executable="python-test")
     server = config["mcpServers"]["omnigent"]
     assert server["command"] == "python-test"
@@ -2435,14 +2435,7 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
         "--bridge-dir",
         str(tmp_path),
     ]
-    # agy's auto-approve allowlist is the enabledTools key (not cursor's autoApprove).
-    assert "sys_session_send" in server["enabledTools"]
-    assert "sys_os_shell" in server["enabledTools"]
-    assert "sys_terminal_launch" in server["enabledTools"]
-    assert "sys_list_models" in server["enabledTools"]
-    assert "sys_project_list" in server["enabledTools"]
-    assert "sys_session_update" in server["enabledTools"]
-    assert server["enabledTools"] == sorted(server["enabledTools"])
+    assert "enabledTools" not in server
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
@@ -2596,17 +2589,6 @@ def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
     first = (tmp_path / "bridge.json").read_text(encoding="utf-8")
     write_mcp_bridge_config(tmp_path)
     assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
-
-
-def test_agy_enabled_tools_match_native_relay_surface() -> None:
-    from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS, _OS_ENV_TOOLS
-
-    assert set(_mod._AGY_ENABLED_TOOLS) == set(_NATIVE_RELAY_BUILTIN_TOOLS | _OS_ENV_TOOLS)
-    assert sorted(_mod._AGY_ENABLED_TOOLS) == _mod._AGY_ENABLED_TOOLS
-    assert len(_mod._AGY_ENABLED_TOOLS) == len(set(_mod._AGY_ENABLED_TOOLS))
-    assert "ask_user_async" in _mod._AGY_ENABLED_TOOLS
-    assert "sys_read_inbox" in _mod._AGY_ENABLED_TOOLS
-    assert "sys_session_handover" in _mod._AGY_ENABLED_TOOLS
 
 
 def test_seed_isolated_agy_home_links_global_instructions_and_rules(

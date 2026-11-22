@@ -6,7 +6,6 @@ import httpx
 import pytest
 from jsonschema import validate
 
-from omnigent.harnesses.antigravity_native.bridge import _AGY_ENABLED_TOOLS
 from omnigent.harnesses.cursor_native.bridge import build_mcp_config
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
@@ -25,7 +24,6 @@ def test_registered_and_native_relay(tmp_path):
     }
     assert names <= _ALL_LOCAL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS
     assert names <= set(build_mcp_config(tmp_path)["mcpServers"]["omnigent"]["autoApprove"])
-    assert names <= set(_AGY_ENABLED_TOOLS)
     validate({"project_id": "project-a"}, schemas["sys_project_settings_read"]["parameters"])
     validate(
         {
@@ -92,7 +90,6 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
         manager.shutdown()
     assert names <= _ALL_LOCAL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS
     assert names <= set(build_mcp_config(tmp_path)["mcpServers"]["omnigent"]["autoApprove"])
-    assert names <= set(_AGY_ENABLED_TOOLS)
     seen = []
     proof = {
         "source_revision": "current",
