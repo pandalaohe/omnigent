@@ -544,16 +544,9 @@ def _summary_from_spec(spec: AgentSpec, name: str) -> MCPServerSummary:
 
 
 def _require_registry_service(request: Request, service_id: str, user_id: str | None) -> None:
-    from omnigent.server.auth import RESERVED_USER_LOCAL
-    from omnigent.server.routes.connections_base import ConnectionError
+    from omnigent.server.session_mcp_selection import require_registry_service
 
-    registry = getattr(request.app.state, "mcp_registry", None)
-    try:
-        if registry is None:
-            raise ConnectionError("MCP registry is not configured")
-        registry.service(service_id, user_id or RESERVED_USER_LOCAL)
-    except ConnectionError as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.FORBIDDEN) from exc
+    require_registry_service(getattr(request.app.state, "mcp_registry", None), service_id, user_id)
 
 
 def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:

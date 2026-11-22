@@ -47,8 +47,16 @@ def create_mcp_registry_router(
         ids = sorted(entry.id for entry in registry.services.values() if entry.permits(user_id))
         start = bisect_right(ids, after)
         page = ids[start : start + limit]
+        defaults = set()
         for service_id in page:
             entry = registry.services[service_id]
+            if service_id in registry.config.default_services:
+                try:
+                    registry.service(service_id, user_id)
+                except ConnectionError:
+                    pass
+                else:
+                    defaults.add(service_id)
             connected = entry.auth == "none"
             if entry.auth in {"github", "databricks"}:
                 store = getattr(request.app.state, f"{entry.auth}_store", None)
@@ -72,7 +80,7 @@ def create_mcp_registry_router(
                 }
             )
         return {
-            "data": data,
+            "data": [{**row, "default": row["id"] in defaults} for row in data],
             "next_cursor": page[-1] if start + len(page) < len(ids) else None,
         }
 

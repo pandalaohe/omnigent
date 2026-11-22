@@ -4505,8 +4505,14 @@ function ComposerImpl(
         const service = registryCatalog.services.find((s) => s.id === server.name);
         if (service) {
           row.description = service.description || row.description;
-          row.connection = service.connected ? "connected" : "sign-in-required";
-          if (!service.connected) {
+          const unavailable =
+            service.status === "unavailable" || (service.auth === "env" && !service.connected);
+          row.connection = unavailable
+            ? "unavailable"
+            : service.connected
+              ? "connected"
+              : "sign-in-required";
+          if (row.connection === "sign-in-required") {
             // A token or workspace URL has to be typed, which the panel has no room for.
             row.signIn =
               service.auth === "bearer" || service.auth === "databricks"

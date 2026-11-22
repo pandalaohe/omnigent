@@ -32,7 +32,9 @@ export function McpRegistryLaunchPicker({
   const selectedServices = catalog.services.filter((service) => selected.includes(service.id));
   const selectedCount =
     catalog.loading || catalog.error ? selected.length : selectedServices.length;
-  const needsSignInCount = selectedServices.filter((service) => !service.connected).length;
+  const needsSignInCount = selectedServices.filter(
+    (service) => !service.connected && service.auth !== "env" && service.status !== "unavailable",
+  ).length;
   return (
     <Popover open={open} onOpenChange={(next) => !authorizing && setOpen(next)}>
       <PopoverTrigger asChild>
@@ -74,8 +76,7 @@ export function McpRegistryLaunchPicker({
         <div className="shrink-0 border-b border-border px-3 py-2.5">
           <h3 className="text-sm font-medium">Tools for this session</h3>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Turn on the server-configured MCP services this session should use. You’ll be asked to
-            sign in when needed.
+            Choose which MCP services this session uses. You’ll be asked to sign in when needed.
           </p>
         </div>
         <McpRegistryPicker

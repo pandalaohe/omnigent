@@ -152,7 +152,13 @@ function ServiceConnection({
           <p className="text-sm text-muted-foreground">{service.description}</p>
         </div>
         <span className="text-xs text-muted-foreground">
-          {service.connected ? "Connected" : "Not connected"}
+          {service.auth === "env"
+            ? service.connected && service.status !== "unavailable"
+              ? "Configured by server"
+              : "Unavailable"
+            : service.connected
+              ? "Connected"
+              : "Not connected"}
         </span>
       </div>
       <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
@@ -162,7 +168,7 @@ function ServiceConnection({
             {service.connected ? "Update token" : "Connect"}
           </Button>
         )}
-        {service.auth === "oauth" && (
+        {service.auth === "oauth" && service.connect_provider !== null && (
           <Button asChild size="sm" variant="outline" disabled={busy}>
             <a
               aria-disabled={busy || undefined}
@@ -294,10 +300,12 @@ export function McpRegistryPicker({
 
   async function enable(service: RegistryService, workspaceUrl?: string) {
     clearError();
+    if (service.status === "unavailable") return;
     if (service.connected) {
       onToggle(service.id, true);
       return;
     }
+    if (service.auth === "env") return;
     if (service.auth === "databricks" && !workspaceUrl) {
       setWorkspaceService(service.id);
       return;
@@ -307,7 +315,7 @@ export function McpRegistryPicker({
     if (!attached.includes(service.id)) onToggle(service.id, true);
   }
 
-  const unavailable = attached.filter((id) => !services.some((s) => s.id === id));
+  const missingServices = attached.filter((id) => !services.some((s) => s.id === id));
   return (
     <div className="flex min-h-0 flex-col">
       {error && (
@@ -328,6 +336,9 @@ export function McpRegistryPicker({
       )}
       <ul className="min-h-0 overflow-y-auto py-1 empty:hidden">
         {services.map((service) => {
+          const configuredByServer = service.auth === "env";
+          const unavailable =
+            service.status === "unavailable" || (configuredByServer && !service.connected);
           const selected = attached.includes(service.id);
           const tokenNeeded = service.auth === "bearer" && !service.connected;
           const conflict = reservedNames?.includes(service.id);
@@ -341,42 +352,61 @@ export function McpRegistryPicker({
                     <span
                       className={cn(
                         "block text-xs",
-                        selected && !service.connected && authorizing !== service.id && !conflict
+                        selected &&
+                          !service.connected &&
+                          !configuredByServer &&
+                          authorizing !== service.id &&
+                          !conflict &&
+                          !unavailable
                           ? "text-amber-600 dark:text-amber-500"
                           : "text-muted-foreground",
                       )}
                     >
                       {conflict
                         ? "A custom server already uses this name"
-                        : authorizing === service.id
-                          ? "Authorizing…"
-                          : service.connected
-                            ? "Connected"
-                            : tokenNeeded
-                              ? "Connect your account in settings"
-                              : "Needs sign-in"}
+                        : unavailable
+                          ? "Unavailable"
+                          : configuredByServer
+                            ? "Configured by server"
+                            : authorizing === service.id
+                              ? "Authorizing…"
+                              : service.connected
+                                ? "Connected"
+                                : tokenNeeded
+                                  ? "Connect your account in settings"
+                                  : "Needs sign-in"}
                     </span>
                   </span>
                 </span>
                 <Switch
                   aria-label={service.title}
                   checked={selected}
-                  disabled={busy || authorizing !== null || conflict || (tokenNeeded && !selected)}
+                  disabled={
+                    busy ||
+                    authorizing !== null ||
+                    conflict ||
+                    unavailable ||
+                    (tokenNeeded && !selected)
+                  }
                   onCheckedChange={(next) =>
                     next ? void enable(service) : onToggle(service.id, false)
                   }
                 />
               </label>
-              {selected && !service.connected && !tokenNeeded && (
-                <Button
-                  size="sm"
-                  variant="link"
-                  disabled={busy || authorizing !== null}
-                  onClick={() => void enable(service)}
-                >
-                  Reconnect
-                </Button>
-              )}
+              {selected &&
+                !service.connected &&
+                !tokenNeeded &&
+                !configuredByServer &&
+                !unavailable && (
+                  <Button
+                    size="sm"
+                    variant="link"
+                    disabled={busy || authorizing !== null}
+                    onClick={() => void enable(service)}
+                  >
+                    Reconnect
+                  </Button>
+                )}
               {workspaceService === service.id && (
                 <div className="mt-3 space-y-2">
                   <Input
@@ -412,7 +442,7 @@ export function McpRegistryPicker({
           );
         })}
         {!loading &&
-          unavailable.map((id) => (
+          missingServices.map((id) => (
             <li key={id} className="px-3 py-1.5">
               <label className="flex items-center justify-between gap-3 text-sm">
                 <span className="min-w-0">

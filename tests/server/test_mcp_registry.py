@@ -42,6 +42,11 @@ def service(**kwargs) -> McpService:
     )
 
 
+def test_unknown_default_service_is_rejected():
+    with pytest.raises(ValueError, match="Unknown default MCP services: missing"):
+        McpRegistryConfig(services=[service()], default_services=["missing"])
+
+
 @pytest.fixture
 def registry(db_uri):
     return McpRegistry(
@@ -710,10 +715,22 @@ async def test_catalog_cursor_bounds_credential_reads_and_filters_services(db_ur
     entries = [service(id=f"service-{i:03}") for i in range(105)]
     entries.append(service(id="private-service", allowed_users=["bob"]))
     registry = McpRegistry(
-        McpRegistryConfig(services=list(reversed(entries))), CredentialStore(db_uri, _FakeCipher())
+        McpRegistryConfig(
+            services=list(reversed(entries)),
+            default_services=["service-001", "service-002", "private-service"],
+        ),
+        CredentialStore(db_uri, _FakeCipher()),
     )
     lookup = Mock(return_value=None)
     monkeypatch.setattr(registry.store, "get", lookup)
+    original_service = registry.service
+
+    def resolve(service_id, user_id):
+        if service_id == "service-002":
+            raise ConnectionError("MCP service is unavailable")
+        return original_service(service_id, user_id)
+
+    monkeypatch.setattr(registry, "service", resolve)
     app = FastAPI()
     app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
     async with httpx.AsyncClient(
@@ -731,6 +748,7 @@ async def test_catalog_cursor_bounds_credential_reads_and_filters_services(db_ur
             assert response.headers["cache-control"] == "no-store"
             data = response.json()
             assert len(data["data"]) == lookup.call_count == size
+            assert all(s["default"] is (s["id"] == "service-001") for s in data["data"])
             seen.extend(s["id"] for s in data["data"])
             cursor = data["next_cursor"]
         assert cursor is None

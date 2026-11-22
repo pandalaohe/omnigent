@@ -3321,18 +3321,18 @@ def register_core_routes(
             }
         )
 
-        if parsed_metadata.mcp_registry_services:
-            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
-            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+        from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
 
-            for service_id in parsed_metadata.mcp_registry_services:
-                _require_registry_service(request, service_id, user_id)
-            labels = {
-                **parsed_metadata.labels,
-                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
-            }
-            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
-            spec = selected_mcp_spec(spec, labels)
+        mcp_selection = resolve_session_mcp_selection(
+            getattr(request.app.state, "mcp_registry", None),
+            spec,
+            user_id,
+            explicit_services=(
+                parsed_metadata.mcp_registry_services
+                if "mcp_registry_services" in parsed_metadata.model_fields_set
+                else None
+            ),
+        )
 
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
@@ -3429,18 +3429,21 @@ def register_core_routes(
                         }
                     }
                 )
-        from omnigent.server.mcp_compatibility import (
-            registry_services,
-            require_registry_mcp_runtime,
-        )
+        from omnigent.mcp_selection import selected_mcp_spec
+        from omnigent.server.mcp_compatibility import registry_services
 
-        require_registry_mcp_runtime(
-            registry_services(spec),
+        mcp_selection = mcp_selection.for_runtime(
+            authored_services=registry_services(spec),
             host_id=parsed_metadata.host_id,
             runner_id=inherited_runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
         )
+        if mcp_selection.labels:
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"labels": {**parsed_metadata.labels, **mcp_selection.labels}}
+            )
+            spec = selected_mcp_spec(spec, mcp_selection.labels)
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -8255,6 +8258,19 @@ def register_core_routes(
         extra_labels: dict[str, str] = {
             CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
         }
+        if switching_agent:
+            from omnigent.server.session_mcp_selection import select_default_mcp_for_agent
+
+            selection = await select_default_mcp_for_agent(
+                getattr(request.app.state, "mcp_registry", None), base_agent, agent_cache, user_id
+            )
+            selection = selection.for_runtime(
+                host_id=source.host_id if continue_source else body.host_id,
+                runner_id=source.runner_id if body.side_chat else None,
+                host_registry=getattr(request.app.state, "host_registry", None),
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            )
+            extra_labels.update(selection.labels)
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":
@@ -8935,6 +8951,11 @@ def register_core_routes(
             )
             or key.startswith(MEMBER_LABEL_PREFIX)
         }
+        from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
+
+        continued_labels.update(
+            resolve_session_mcp_selection(None, None, user_id, source_labels=source.labels).labels
+        )
         # The successor binds the source's agent or a clone from the same
         # bundle, so the source agent's harness decides the Web UI mode. A
         # missing wrapper/ui pair renders a native continuation as plain chat

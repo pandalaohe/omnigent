@@ -2353,7 +2353,7 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
-  mcpRegistryServices: string[];
+  mcpRegistryServices?: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
   // attachments — the agent/host/workspace slots are discarded so the new
@@ -2918,6 +2918,7 @@ function NewChatLandingContent({
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
+    draftSelection: mcpRegistryDraftSelection,
     toggle: toggleMcpRegistryService,
     catalog: mcpRegistryCatalog,
     selectionError: mcpSelectionError,
@@ -3268,7 +3269,7 @@ function NewChatLandingContent({
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
-    mcpRegistryServices,
+    mcpRegistryServices: mcpRegistryDraftSelection,
     project: projectParam,
     message,
     sessionPrompt,
@@ -7403,7 +7404,7 @@ function NewChatLandingContent({
             };
           }
         }
-        if (mcpServicesForLaunch.length) {
+        if (mcpServicesForLaunch !== undefined) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
         // A config-seeded workspace is omitted on a `project_id` create so the
@@ -7493,7 +7494,7 @@ function NewChatLandingContent({
           // The dialog sends the agent it shows (the calling-defaults seed
           // included), so the server receives an explicit value.
           agent_id: effectiveAgentId,
-          ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
+          mcp_registry_services: mcpServicesForLaunch,
           ...(createProjectId !== null ? { project_id: createProjectId } : {}),
           ...(sandboxSelected
             ? {

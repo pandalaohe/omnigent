@@ -329,6 +329,8 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
             CODEX_SDK_APPROVAL_MODE_LABEL_KEY: "never",
             AUTO_HARNESS_LABEL_KEY: "1",
             "omnigent:agent-template-id": template_id,
+            "omnigent.mcp_service.tracker": "1",
+            "omnigent.mcp_service.disabled": "0",
             member_label_key("researcher"): '{"lead": false}',
             MEMBER_LOCK_LABEL_KEY: "true",
             CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
@@ -353,6 +355,8 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
         CODEX_SDK_APPROVAL_MODE_LABEL_KEY: "never",
         AUTO_HARNESS_LABEL_KEY: "1",
         "omnigent:agent-template-id": template_id,
+        "omnigent.mcp_service.tracker": "1",
+        "omnigent.mcp_service.disabled": "0",
         member_label_key("researcher"): '{"lead": false}',
         MEMBER_LOCK_LABEL_KEY: "true",
     }, "Only the allowlisted run-config labels may carry over"

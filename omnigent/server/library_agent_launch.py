@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
@@ -28,6 +28,10 @@ from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.schemas import CreatedSessionResponse, SessionCreateMetadata
 from omnigent.session_default_modes import apply_mode, valid_mode
+
+if TYPE_CHECKING:
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.mcp_registry import McpRegistry
 
 # Saved library Agent ids are minted as ``ca_<uuid>`` by the custom-agents
 # route; the web picker keys the same prefix. Nothing else starts with it.
@@ -161,6 +165,8 @@ async def launch_library_agent(
     master: dict | None = None,
     preferences_store: Any = None,
     catalog_store: Any = None,
+    mcp_registry: McpRegistry | None = None,
+    host_registry: HostRegistry | None = None,
 ) -> CreatedSessionResponse:
     """Create a session-scoped copy of an owner's saved Agent bundle.
 
@@ -212,6 +218,12 @@ async def launch_library_agent(
     permission_mode = launch.permission_mode
     launch_args: list[str] | None = None
     labels = library_agent_presentation_labels(spec=spec, host_bound=launch.host_id is not None)
+    from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
+
+    selection = resolve_session_mcp_selection(mcp_registry, spec, owner).for_runtime(
+        host_id=launch.host_id, host_registry=host_registry
+    )
+    labels.update(selection.labels)
     if permission_mode is not None and valid_mode(
         permission_mode, harness, "permission", "create"
     ):

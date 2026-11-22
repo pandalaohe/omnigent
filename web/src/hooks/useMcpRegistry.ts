@@ -79,17 +79,25 @@ export function useMcpRegistryCatalog(enabled = true) {
 
 /** Keep preferences intact until an explicit toggle; filter only the launch payload. */
 export function useMcpRegistrySelection(draft: string[] | undefined, enabled: boolean) {
-  const [selected, setSelected] = useState(() => draft ?? readLastMcpServices());
+  const [selection, setSelection] = useState(() => draft ?? readLastMcpServices());
   const catalog = useMcpRegistryCatalog(enabled);
+  const availableServices = catalog.services.filter(
+    (service) => service.status !== "unavailable" && (service.auth !== "env" || service.connected),
+  );
+  const defaults = availableServices
+    .filter((service) => service.default)
+    .map((service) => service.id);
+  const selected = selection ?? defaults;
   const toggle = (id: string, next: boolean) => {
-    setSelected((current) => {
-      const updated = next ? [...new Set([...current, id])] : current.filter((s) => s !== id);
+    setSelection((current) => {
+      const previous = current ?? defaults;
+      const updated = next ? [...new Set([...previous, id])] : previous.filter((s) => s !== id);
       writeLastMcpServices(updated);
       return updated;
     });
   };
   const selectionError =
-    enabled && selected.length > 0
+    enabled && selection && selection.length > 0
       ? catalog.loading
         ? "Loading MCP services…"
         : catalog.error
@@ -98,12 +106,13 @@ export function useMcpRegistrySelection(draft: string[] | undefined, enabled: bo
       : null;
   return {
     selected,
+    draftSelection: selection,
     toggle,
     catalog,
     selectionError,
     servicesForLaunch: enabled
-      ? selected.filter((id) => catalog.services.some((service) => service.id === id))
-      : [],
+      ? selection?.filter((id) => availableServices.some((service) => service.id === id))
+      : undefined,
   };
 }
 

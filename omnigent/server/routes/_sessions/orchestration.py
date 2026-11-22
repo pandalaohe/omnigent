@@ -16017,9 +16017,10 @@ async def _create_session_from_existing_agent_impl(
 
     inference_snapshot = None
     selection_spec = None
-    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+    from omnigent.server.mcp_compatibility import registry_services
+    from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
 
-    selected_registry_services = set(body.mcp_registry_services or [])
+    authored_registry_services: set[str] = set()
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -16049,7 +16050,7 @@ async def _create_session_from_existing_agent_impl(
                 "create-time model policy: agent %r failed to load", agent.name, exc_info=True
             )
             selection_spec = None
-        selected_registry_services.update(registry_services(selection_spec))
+        authored_registry_services = registry_services(selection_spec)
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
         from omnigent.server.routes.sandbox_inference import (
@@ -16139,23 +16140,15 @@ async def _create_session_from_existing_agent_impl(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-    registry_labels: dict[str, str] = {}
-    if body.mcp_registry_services:
-        from omnigent.mcp_selection import registry_selection_labels
-        from omnigent.server.routes.session_mcp_servers import _require_registry_service
-
-        if body.sub_agent_name:
-            raise OmnigentError(
-                "Named sub-agents use their authored MCP services",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if selection_spec is None:
-            raise OmnigentError(
-                "Cannot load the agent's MCP configuration", code=ErrorCode.INVALID_INPUT
-            )
-        for service_id in body.mcp_registry_services:
-            _require_registry_service(request, service_id, user_id)
-        registry_labels = registry_selection_labels(selection_spec, body.mcp_registry_services)
+    mcp_selection = resolve_session_mcp_selection(
+        getattr(request.app.state, "mcp_registry", None),
+        selection_spec,
+        user_id,
+        explicit_services=(
+            body.mcp_registry_services if "mcp_registry_services" in request_fields_set else None
+        ),
+        named_subagent=bool(body.sub_agent_name),
+    )
 
     # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
@@ -16197,8 +16190,8 @@ async def _create_session_from_existing_agent_impl(
         validate_create_harness_readiness,
     )
 
-    require_registry_mcp_runtime(
-        selected_registry_services,
+    mcp_selection = mcp_selection.for_runtime(
+        authored_services=authored_registry_services,
         host_id=body.host_id,
         runner_id=inherited_runner_id,
         host_registry=getattr(request.app.state, "host_registry", None),
@@ -16664,7 +16657,7 @@ async def _create_session_from_existing_agent_impl(
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
-    initial_labels.update(registry_labels)
+    initial_labels.update(mcp_selection.labels)
     if defer_host_preparation and inherited_runner_id is None:
         from omnigent.server.startup_registration import (
             STARTUP_CREATE_PREPARATION_LABEL_KEY,

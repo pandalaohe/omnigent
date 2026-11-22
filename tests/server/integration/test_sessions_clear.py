@@ -41,7 +41,7 @@ from omnigent.db.db_models import (
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import CAP_MCP_REGISTRY, HostHelloFrame
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -265,7 +265,7 @@ async def install_live_runner(
         return httpx.Response(201 if request.url.path == "/v1/sessions" else 200, json={})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://runner")
-    register_test_runner(app, _RUNNER_ID)
+    register_test_runner(app, _RUNNER_ID, capabilities=[CAP_MCP_REGISTRY])
     monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=client))
     monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
     monkeypatch.setattr(
@@ -460,7 +460,8 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     file_store.create("notes.txt", bytes=5, session_id=source_id)
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
-    store.set_labels(source_id, sandbox_labels)
+    selection_labels = {"omnigent.mcp_service.tracker": "1", "omnigent.mcp_service.disabled": "0"}
+    store.set_labels(source_id, {**sandbox_labels, **selection_labels})
     store.update_conversation(
         source_id, cost_control_mode_override="on", subagent_routing_override="on"
     )
@@ -500,6 +501,7 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert (fork.cost_control_mode_override, fork.subagent_routing_override) == ("on", "on")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
     assert fork.labels["team"] == "core"
+    assert {key: fork.labels.get(key) for key in selection_labels} == selection_labels
     # A relaunch of the shared sandbox still re-clones the repositories.
     assert {key: fork.labels.get(key) for key in sandbox_labels} == sandbox_labels
     assert read_managed_repo_workspaces(fork.labels) == repos

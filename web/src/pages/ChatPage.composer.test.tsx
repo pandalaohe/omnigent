@@ -4886,6 +4886,21 @@ describe("Composer MCP status command", () => {
     expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Sign-in required");
   });
 
+  it("shows unavailable server-configured MCPs without a sign-in action", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ ...trackerService, auth: "env", status: "unavailable", connect_provider: null }],
+    });
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent(
+        "Not available to your account",
+      ),
+    );
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  });
+
   it("reports a catalog that could not be read without hiding the rows", async () => {
     vi.mocked(registryRequest).mockReset();
     vi.mocked(registryRequest).mockRejectedValue(new Error("registry down"));

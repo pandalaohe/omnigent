@@ -131,11 +131,18 @@ class McpRegistryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     public_url: str | None = None
     services: list[McpService]
+    default_services: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_catalog(self) -> McpRegistryConfig:
-        if len({s.id for s in self.services}) != len(self.services):
+        service_ids = {s.id for s in self.services}
+        if len(service_ids) != len(self.services):
             raise ValueError("MCP service ids must be unique")
+        unknown_defaults = set(self.default_services) - service_ids
+        if unknown_defaults:
+            raise ValueError(
+                f"Unknown default MCP services: {', '.join(sorted(unknown_defaults))}"
+            )
         if any(s.oauth for s in self.services) and not self.public_url:
             raise ValueError("public_url is required for OAuth callbacks")
         if self.public_url:

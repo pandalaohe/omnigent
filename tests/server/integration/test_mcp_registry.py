@@ -204,8 +204,9 @@ async def test_legacy_discovery_preserves_runner_errors(
 
 
 @pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize("implicit", [False, True])
 async def test_launch_selection_is_present_before_sandbox_launch(
-    client, app, launch_registry, monkeypatch, upload
+    client, app, launch_registry, monkeypatch, upload, implicit
 ):
     from omnigent.runtime import get_agent_store, get_conversation_store
     from omnigent.server.managed_hosts import ManagedLaunchTracker, parse_sandbox_config
@@ -233,7 +234,11 @@ async def test_launch_selection_is_present_before_sandbox_launch(
     )
     app.state.host_store = object()
     app.state.managed_launches = ManagedLaunchTracker()
-    metadata = {"host_type": "managed", "mcp_registry_services": ["tracker", "tracker"]}
+    metadata = {"host_type": "managed"}
+    if implicit:
+        launch_registry.config.default_services = ["restricted", "tracker"]
+    else:
+        metadata["mcp_registry_services"] = ["tracker", "tracker"]
     if upload:
         response = await client.post(
             "/v1/sessions",
@@ -256,9 +261,13 @@ async def test_launch_selection_is_present_before_sandbox_launch(
     assert get_agent_store().get(source["agent_id"]).bundle_location == before_location
     original = await client.get(f"/v1/sessions/{source['id']}/agent")
     assert original.json()["mcp_servers"] == []
-    plain = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})
+    plain = await client.post(
+        "/v1/sessions", json={"agent_id": source["agent_id"], "mcp_registry_services": []}
+    )
     assert plain.status_code == 201, plain.text
     assert plain.json()["agent_id"] == source["agent_id"]
+    summary = await client.get(f"/v1/sessions/{plain.json()['id']}/agent")
+    assert summary.json()["mcp_servers"] == []
 
 
 @pytest.mark.parametrize("upload", [False, True])
@@ -365,6 +374,14 @@ async def test_launch_selection_does_not_replace_custom_mcp(client, launch_regis
         "/v1/sessions", json={"agent_id": source["agent_id"], "mcp_registry_services": ["tracker"]}
     )
     assert response.status_code == 409, response.text
+    launch_registry.config.default_services = ["tracker", "other"]
+    response = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})
+    assert response.status_code == 201, response.text
+    summary = await client.get(f"/v1/sessions/{response.json()['id']}/agent")
+    assert {(s["name"], s["transport"]) for s in summary.json()["mcp_servers"]} == {
+        ("tracker", "http"),
+        ("other", "registry"),
+    }
 
 
 async def test_gateway_reports_upstream_permission_failure(
@@ -505,7 +522,8 @@ async def test_selection_is_session_scoped_and_forks_follow_the_agent(client, la
     )
     assert conflict.status_code == 409, conflict.text
     target = await create_test_session(client, name="fork-target")
-    for fields, expected in [({}, ["tracker"]), ({"agent_id": target["agent_id"]}, [])]:
+    launch_registry.config.default_services = ["other"]
+    for fields, expected in [({}, ["tracker"]), ({"agent_id": target["agent_id"]}, ["other"])]:
         forked = await client.post(f"/v1/sessions/{sid}/fork", json=fields)
         assert forked.status_code == 201, forked.text
         summary = await client.get(f"/v1/sessions/{forked.json()['id']}/agent")
@@ -518,6 +536,7 @@ async def test_named_children_cannot_select_root_only_services(client, launch_re
     from tests.server.helpers import create_test_agent
 
     source = await create_test_agent(client, sub_agents=[{"name": "child"}])
+    launch_registry.config.default_services = ["tracker"]
     child = await client.post(
         "/v1/sessions",
         json={
@@ -527,6 +546,16 @@ async def test_named_children_cannot_select_root_only_services(client, launch_re
         },
     )
     assert child.status_code == 201, child.text
+    explicit = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["id"],
+            "parent_session_id": source["_session_id"],
+            "sub_agent_name": "child",
+            "mcp_registry_services": ["tracker"],
+        },
+    )
+    assert explicit.status_code == 400, explicit.text
     url = f"/v1/sessions/{child.json()['id']}/agent"
     assert (await client.get(url)).json()["mcp_registry_editable"] is False
     response = await client.post(
