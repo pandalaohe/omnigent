@@ -26,6 +26,12 @@ interface UploadResourcePayload {
   };
 }
 
+export interface FileUploadProgress {
+  loaded: number;
+  total: number | null;
+  fraction: number | null;
+}
+
 function uploadedFileFromResource(
   resource: UploadResourcePayload,
   file: File,
@@ -49,8 +55,8 @@ function uploadedFileFromResource(
  * upload goes through {@link authenticatedFetch} instead: that path owns the
  * slice-key routing, the wrong-replica retry and the 401 redirect, and the
  * XHR path cannot reproduce them. Progress is only reportable on the XHR
- * path, so `onProgress` receives `null` (unknown) on the fetch path and the
- * composer shows the upload without a percentage.
+ * path, so `onProgress` reports zero known bytes and an unknown total on the
+ * fetch path.
  *
  * HTTP failures are mapped through `apiErrorFromResponse`, so the server's
  * reason ("Unsupported attachment type …" for 415, the size cap for 413)
@@ -58,41 +64,53 @@ function uploadedFileFromResource(
  *
  * @param sessionId Destination session id.
  * @param file File to upload.
- * @param onProgress Optional callback with the upload fraction (0–1), or
- *     `null` when the transport cannot report one.
+ * @param onProgress Optional callback with bytes and the fraction when known.
+ * @param signal Optional cancellation signal for the in-flight request.
  * @returns The stored file's identity.
  */
 export async function uploadFile(
   sessionId: string,
   file: File,
-  onProgress?: (fraction: number | null) => void,
+  onProgress?: (progress: FileUploadProgress) => void,
+  signal?: AbortSignal,
 ): Promise<UploadedFile> {
+  signal?.throwIfAborted();
   const filename = attachmentFilename(file);
   const path = `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files`;
   const form = new FormData();
   form.append("file", file, filename);
 
   if (hasOmnigentHostFetcher() || isDatabricksWorkspace()) {
-    onProgress?.(null);
-    const res = await authenticatedFetch(path, { method: "POST", body: form });
+    onProgress?.({ loaded: 0, total: null, fraction: null });
+    const res = await authenticatedFetch(path, { method: "POST", body: form, signal });
     if (!res.ok) throw await apiErrorFromResponse(res);
     const resource = (await res.json()) as UploadResourcePayload;
     return uploadedFileFromResource(resource, file, filename);
   }
 
   const headers = await authenticatedRequestHeaders(path);
+  signal?.throwIfAborted();
   return new Promise<UploadedFile>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    const abortFromSignal = () => {
+      reject(signal?.reason);
+      xhr.abort();
+    };
+    const settle = () => signal?.removeEventListener("abort", abortFromSignal);
     xhr.open("POST", withBasePath(path));
     for (const [name, value] of headers.entries()) {
       xhr.setRequestHeader(name, value);
     }
     xhr.upload.onprogress = (event) => {
-      if (onProgress && event.lengthComputable && event.total > 0) {
-        onProgress(Math.min(1, event.loaded / event.total));
-      }
+      const total = event.lengthComputable && event.total > 0 ? event.total : null;
+      onProgress?.({
+        loaded: event.loaded,
+        total,
+        fraction: total === null ? null : Math.min(1, event.loaded / total),
+      });
     };
     xhr.onload = () => {
+      settle();
       const response = new Response(xhr.responseText, {
         status: xhr.status,
         statusText: xhr.statusText,
@@ -113,8 +131,21 @@ export async function uploadFile(
       }
       resolve(uploadedFileFromResource(resource, file, filename));
     };
-    xhr.onerror = () => reject(new Error("Network error while uploading the file"));
-    xhr.send(form);
+    xhr.onerror = () => {
+      settle();
+      reject(new Error("Network error while uploading the file"));
+    };
+    xhr.onabort = () => {
+      settle();
+      reject(new Error("File upload was aborted"));
+    };
+    signal?.addEventListener("abort", abortFromSignal, { once: true });
+    try {
+      xhr.send(form);
+    } catch (error) {
+      settle();
+      reject(error);
+    }
   });
 }
 

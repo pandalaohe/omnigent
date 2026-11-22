@@ -534,7 +534,7 @@ describe("buildPendingBubbles", () => {
 
   it("flags only mid-turn sends as awaiting the agent", () => {
     const [midTurn, plain] = buildPendingBubbles(
-      [{ ...pending[0]!, sentMidTurn: true }, pending[0]!],
+      [{ ...pending[0]!, sentMidTurn: true, posted: true }, pending[0]!],
       null,
     ) as [Extract<Bubble, { kind: "user" }>, Extract<Bubble, { kind: "user" }>];
     expect(midTurn.awaitingAgent).toBe(true);
@@ -546,8 +546,14 @@ describe("buildPendingBubbles", () => {
     // The sender's own bubble and a reload or second device (no send-time status).
     const [sending, sender, replayed] = buildPendingBubbles(
       [
-        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since },
-        { ...pending[0]!, sentMidTurn: true, sendingSinceMs: since, received: true },
+        { ...pending[0]!, sentMidTurn: true, posted: true, sendingSinceMs: since },
+        {
+          ...pending[0]!,
+          sentMidTurn: true,
+          posted: true,
+          sendingSinceMs: since,
+          received: true,
+        },
         { ...pending[0]!, sendingSinceMs: since, received: true },
       ],
       null,

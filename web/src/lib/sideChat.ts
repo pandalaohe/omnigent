@@ -58,15 +58,16 @@ export function usesNativeSideChatFork(harness: string | null | undefined): bool
 }
 
 /**
- * Whether `text` is a `/side <question>` command.
+ * Whether the input is a plain-text `/side <question>` command.
  *
- * Mirrors `side_chat_question_from_text` in
+ * Mirrors `side_chat_question_from_content` in
  * `omnigent/harnesses/codex_native/side_chat.py` — the two must agree, or the
  * text is either stranded in the parent chat or dropped entirely.
  */
-export function isSideChatCommand(text: string): boolean {
-  if (!text.startsWith(SIDE_CHAT_COMMAND_PREFIX)) return false;
-  return text.slice(SIDE_CHAT_COMMAND_PREFIX.length).trim().length > 0;
+export function isSideChatCommand(text: string, hasAttachments = false): boolean {
+  const typed = text.trimStart();
+  if (hasAttachments || !typed.startsWith(SIDE_CHAT_COMMAND_PREFIX)) return false;
+  return typed.slice(SIDE_CHAT_COMMAND_PREFIX.length).trim().length > 0;
 }
 
 /** Optional model and effort picks for a side chat’s first turn. */

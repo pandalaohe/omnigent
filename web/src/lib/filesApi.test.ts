@@ -30,6 +30,9 @@ class FakeXHR {
   responseText = "";
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  timeout = 0;
+  aborted = false;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   requestHeaders: Record<string, string> = {};
   sentBody: FormData | null = null;
@@ -60,6 +63,11 @@ class FakeXHR {
 
   fail() {
     this.onerror?.();
+  }
+
+  abort() {
+    this.aborted = true;
+    this.onabort?.();
   }
 }
 
@@ -131,19 +139,19 @@ describe("uploadFile", () => {
     const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"), onProgress);
     const xhr = await nextXhr();
 
-    // A total-less progress event carries no fraction and is ignored.
+    // A total-less progress event still reports the bytes sent.
     xhr.upload.onprogress?.({
       lengthComputable: false,
       loaded: 1,
       total: 0,
     } as ProgressEvent);
-    expect(onProgress).not.toHaveBeenCalled();
+    expect(onProgress).toHaveBeenCalledWith({ loaded: 1, total: null, fraction: null });
 
     xhr.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 10 } as ProgressEvent);
-    expect(onProgress).toHaveBeenCalledWith(0.5);
+    expect(onProgress).toHaveBeenCalledWith({ loaded: 5, total: 10, fraction: 0.5 });
     // Clamp a reported overflow (progress events are advisory).
     xhr.upload.onprogress?.({ lengthComputable: true, loaded: 12, total: 10 } as ProgressEvent);
-    expect(onProgress).toHaveBeenLastCalledWith(1);
+    expect(onProgress).toHaveBeenLastCalledWith({ loaded: 12, total: 10, fraction: 1 });
 
     xhr.respond(201, JSON.stringify({ id: "file_1" }));
     await promise;
@@ -187,6 +195,37 @@ describe("uploadFile", () => {
     xhr.fail();
     await expect(promise).rejects.toThrow("Network error");
   });
+
+  it("rejects when the upload is aborted", async () => {
+    const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+    const xhr = await nextXhr();
+    xhr.abort();
+    await expect(promise).rejects.toThrow("aborted");
+  });
+
+  it("aborts through the caller's cancellation signal", async () => {
+    const controller = new AbortController();
+    const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"), undefined, controller.signal);
+    const xhr = await nextXhr();
+    controller.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(xhr.aborted).toBe(true);
+  });
+
+  it("keeps a slow upload alive without a time limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const promise = uploadFile("s1", new File(["bytes"], "clip.mp4"));
+      const xhr = await nextXhr();
+      expect(xhr.timeout).toBe(0);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(xhr.aborted).toBe(false);
+      xhr.respond(201, JSON.stringify({ id: "file_1" }));
+      await expect(promise).resolves.toMatchObject({ id: "file_1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("uploadFile via the embedded host transport", () => {
@@ -214,10 +253,12 @@ describe("uploadFile via the embedded host transport", () => {
       bytes: 5,
       created_at: 0,
     });
-    // The fetch path cannot report transfer progress: the caller hears the
-    // upload started (null), never a fraction.
-    expect(onProgress).toHaveBeenCalledWith(null);
-    expect(onProgress).not.toHaveBeenCalledWith(expect.any(Number));
+    // The fetch path cannot report transfer progress, so it reports unknown
+    // bytes while the upload is in flight.
+    expect(onProgress).toHaveBeenCalledWith({ loaded: 0, total: null, fraction: null });
+    expect(onProgress).not.toHaveBeenCalledWith(
+      expect.objectContaining({ fraction: expect.any(Number) }),
+    );
   });
 
   it("uses authenticatedFetch on a Databricks workspace", async () => {

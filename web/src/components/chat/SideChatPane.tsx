@@ -55,7 +55,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
-  type UploadProgress,
   holdsInitialDraft,
   isCompactControl,
   rejectBusyCompact,
@@ -219,7 +218,6 @@ export function SideChatPane({
     boundAgentId,
     loadingConversation,
     conversationLoadError,
-    uploadProgress,
   } = state;
 
   // Hide the forked-in history: snapshot the item ids present once hydration
@@ -487,7 +485,6 @@ export function SideChatPane({
               <SideChatComposer
                 fullSession={fullSession}
                 childId={childId}
-                uploadProgress={uploadProgress}
                 harness={sessionHarness}
                 session={session}
                 settingsSession={pending ? draftSource : session}
@@ -518,7 +515,6 @@ export function SideChatPane({
 function SideChatComposer({
   fullSession,
   childId,
-  uploadProgress,
   harness,
   session,
   settingsSession,
@@ -533,7 +529,6 @@ function SideChatComposer({
 }: {
   fullSession: boolean;
   childId: string;
-  uploadProgress: UploadProgress | null;
   harness: string | null | undefined;
   session: Session | null | undefined;
   settingsSession: Session | null | undefined;
@@ -594,16 +589,27 @@ function SideChatComposer({
     errors.forEach((message) => toast.error(message));
   }, [attachmentPolicy, childId, info, updateComposer]);
   const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
-    fullSession ? childId : null,
+    pending ? null : childId,
   );
   useEffect(() => {
-    if (!fullSession || !failedSendDraft) return;
+    if (!failedSendDraft || (!fullSession && !failedSendDraft.replaceComposer)) return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
     const failed = takeFailedSendDraft(
       childId,
       !!(current.text.trim() || current.files.length || current.quotes?.length),
     );
     if (!failed) return;
+    if (failed.replaceComposer) {
+      const recalled = restoreReplyDraft(failed.text, failed.replyDraft);
+      updateComposer(childId, (composerDraft) => ({
+        ...composerDraft,
+        ...recalled,
+        files: failed.files,
+      }));
+      setAttachmentError(null);
+      failed.onRestored?.();
+      return;
+    }
     const { accepted, errors } = validateAttachments(
       failed.files,
       attachmentPolicy,
@@ -613,10 +619,10 @@ function SideChatComposer({
     updateComposer(childId, () => ({ text: failed.text, files: accepted }));
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;
-    const restored = entry.getState().restoredSendDraft;
-    if (restored)
+    const restoredSend = entry.getState().restoredSendDraft;
+    if (restoredSend)
       entry.setState({
-        restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
+        restoredSendDraft: { ...restoredSend, files: accepted, replyDraft: undefined },
         pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
       });
   }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy, info]);
@@ -986,7 +992,10 @@ function SideChatComposer({
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
     onSend();
-    void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
+    void send(message, agentId, outgoing, {
+      pinnedConversationId: childId,
+      ...(outgoing ? { replyDraft: snapshotReplyDraft({ quotes, text: trimmed }) } : {}),
+    }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
@@ -1126,8 +1135,7 @@ function SideChatComposer({
               />
             ),
           attachments:
-            !pending &&
-            (files.length > 0 || attachmentError !== null || uploadProgress !== null) ? (
+            !pending && (files.length > 0 || attachmentError !== null) ? (
               <>
                 {files.length > 0 && (
                   <ComposerAttachments
@@ -1137,15 +1145,6 @@ function SideChatComposer({
                 )}
                 {attachmentError !== null && (
                   <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
-                )}
-                {uploadProgress !== null && (
-                  <ComposerFeedbackRow data-testid="side-chat-upload-progress">
-                    {uploadProgress.fraction === null
-                      ? `Uploading ${uploadProgress.filename}…`
-                      : `Uploading ${uploadProgress.filename} — ${Math.round(
-                          uploadProgress.fraction * 100,
-                        )}%`}
-                  </ComposerFeedbackRow>
                 )}
               </>
             ) : undefined,

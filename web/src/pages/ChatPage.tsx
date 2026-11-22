@@ -226,7 +226,7 @@ import {
   tokenAt,
   tokenText,
 } from "@/lib/composerTokens";
-import type { ComposerDraftPart } from "@/lib/composerContent";
+import { composerPartsToText, type ComposerDraftPart } from "@/lib/composerContent";
 import { ComposerTokenBackdrop, hasTint } from "@/components/ComposerTokenBackdrop";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
@@ -1266,7 +1266,13 @@ export function ChatPage() {
       // matching gate in the store's send()). Only the native-fork harness
       // routes /side through send; generic /side is intercepted in the composer.
       const opensSideChat =
-        usesNativeSideChatFork(chat.sessionHarness) && isSideChatCommand(text.trim());
+        usesNativeSideChatFork(chat.sessionHarness) &&
+        isSideChatCommand(
+          composerParts ? composerPartsToText(composerParts) : text,
+          composerParts
+            ? composerParts.some((part) => part.type === "attachment")
+            : (files?.length ?? 0) > 0,
+        );
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -3042,7 +3048,6 @@ function ComposerImpl(
   // Attachment validation limits from the server probe (undefined on an
   // older server → the built-in ceilings).
   const serverInfo = useServerInfo();
-  const uploadProgress = useChatStore((s) => s.uploadProgress);
   const {
     draft,
     value,
@@ -3083,9 +3088,7 @@ function ComposerImpl(
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
   const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
-  const hasPendingInitialMessage = useChatStore((s) =>
-    s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
-  );
+  const waitingForInitialDispatch = useChatStore(holdsInitialDraft);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -4028,7 +4031,7 @@ function ComposerImpl(
     (!hasDraft ||
       hasPendingElicitation ||
       isTempConvId(conversationId) ||
-      hasPendingInitialMessage);
+      waitingForInitialDispatch);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,
@@ -4108,7 +4111,7 @@ function ComposerImpl(
     if (!failed) return;
     // The failed text carries expanded markers; bring its session tags back as tokens.
     const recalled = recallComposerDraft(failed.text, failed.replyDraft, failed);
-    if (hasNewerInput) {
+    if (hasNewerInput && failed.replaceComposer !== true) {
       const merged = mergeRecalledDraft(taggedMentionsRef.current, recalled);
       const joined = appendReplyDraft(draft, restoreReplyDraft(merged.text, merged.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
@@ -4123,9 +4126,23 @@ function ComposerImpl(
     textareaRef.current = tailTextareaRef.current;
     restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
     dirtyRef.current = true;
-    if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
+    if (failed.replaceComposer) {
+      attachmentsRef.current.restoreFiles(failed.files);
+      clearError();
+      failed.onRestored?.();
+    } else if (failed.files.length > 0) {
+      attachmentsRef.current.replaceFiles(failed.files);
+    }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, loadDraft, replaceText, draft]);
+  }, [
+    failedSendDraft,
+    conversationId,
+    settledConversationId,
+    loadDraft,
+    replaceText,
+    draft,
+    clearError,
+  ]);
 
   // Retract a restored failed-send draft once its send proves delivered (its
   // committed item arrived over the stream or a reconnect snapshot). Edits win:
@@ -5525,16 +5542,6 @@ function ComposerImpl(
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
-              )}
-              {/* The send's in-flight upload, one row for the whole batch.
-                  No percentage when the transport cannot report one (the
-                  embedded/Databricks fetch path). */}
-              {uploadProgress !== null && (
-                <ComposerFeedbackRow data-testid="composer-upload-progress">
-                  {uploadProgress.fraction === null
-                    ? `Uploading ${uploadProgress.filename}…`
-                    : `Uploading ${uploadProgress.filename} — ${Math.round(uploadProgress.fraction * 100)}%`}
-                </ComposerFeedbackRow>
               )}
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}

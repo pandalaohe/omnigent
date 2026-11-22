@@ -1,5 +1,7 @@
 import type { AssistantMessagePhase } from "./conversationItems";
+import type { ComposerDraftPart } from "./composerContent";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { StoredReplyDraft } from "./replyDraft";
 import type { TerminalAccessRequest } from "./terminalAccess";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -463,6 +465,8 @@ export interface ReasoningBlock {
 
 // ── Status ───────────────────────────────────────────────
 
+export const ATTACHMENT_UPLOAD_FAILED = "attachment_upload_failed";
+
 /**
  * An error during the response.
  *
@@ -497,6 +501,15 @@ export interface ErrorBlock {
    * native terminal, whose mirrored message carries no stable id.
    */
   unansweredSend?: { stableId: string; text?: string };
+  /** Client-only content for retrying an upload that never reached the message POST. */
+  failedAttachmentSend?: {
+    agentId?: string;
+    text: string;
+    parts: ComposerDraftPart[];
+    replyDraft?: StoredReplyDraft;
+    /** The server rejected the input itself, so let the user edit it before retrying. */
+    restoreToComposer?: true;
+  };
   /** A client-only card for a failure carried only by a `failed` session status. */
   fromSessionStatus?: true;
   deliveryAttemptId?: string;

@@ -64,6 +64,7 @@ import { parsePeerMessage } from "@/lib/peerMessage";
 import { parseAnnotationMessage } from "@/lib/annotationMessage";
 import { AnnotationCards } from "@/components/chat/AnnotationCards";
 import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
@@ -78,6 +79,7 @@ import { splitSessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
+  ATTACHMENT_UPLOAD_FAILED,
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
@@ -89,7 +91,12 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
+import {
+  retryFailedAttachmentSend,
+  useChatStore,
+  withoutFailedInputs,
+  type PendingUserMessage,
+} from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -102,6 +109,7 @@ import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routing
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { formatBytes } from "@/shell/fileStatusUtils";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
@@ -221,6 +229,57 @@ export function containsMermaidDiagram(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
+function PendingUploadRow({
+  progress,
+  tempId,
+}: {
+  progress: NonNullable<Extract<Bubble, { kind: "user" }>["uploadProgress"]>;
+  tempId: string;
+}) {
+  const cancelUploadingSend = useChatStore((state) => state.cancelUploadingSend);
+  const percent = progress.fraction === null ? null : Math.round(progress.fraction * 100);
+  return (
+    <div
+      className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-md border border-border/70 bg-background/45 px-2 py-1 text-xs text-muted-foreground"
+      data-testid="pending-upload-row"
+    >
+      <span className="min-w-0 flex-1 truncate" title={progress.filename}>
+        {progress.filename}
+      </span>
+      {progress.fileCount > 1 && (
+        <span className="shrink-0 tabular-nums">
+          {progress.fileIndex}/{progress.fileCount}
+        </span>
+      )}
+      {percent === null ? (
+        <span className="shrink-0 whitespace-nowrap">{formatBytes(progress.loaded)}</span>
+      ) : (
+        <div className="flex w-20 shrink-0 items-center gap-1.5">
+          <Progress
+            value={percent}
+            aria-label={`Uploading ${progress.filename}`}
+            className="min-w-0 flex-1 bg-foreground/15"
+          />
+          <span className="shrink-0 tabular-nums">{percent}%</span>
+        </div>
+      )}
+      <Button
+        type="button"
+        variant="ghost"
+        size="xs"
+        className="ml-auto"
+        aria-label={`Cancel upload of ${progress.filename}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          cancelUploadingSend(tempId);
+        }}
+      >
+        Cancel
+      </Button>
+    </div>
+  );
+}
+
 /**
  * Build optimistic user bubbles from the pending-send queue.
  *
@@ -245,11 +304,12 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
-      ...((p.sentMidTurn && sendingSinceMs === undefined) || p.received
+      ...((p.sentMidTurn && p.posted === true && sendingSinceMs === undefined) || p.received
         ? { awaitingAgent: true }
         : {}),
       ...(p.stillSending && p.posted !== true && !p.received ? { stillSending: true } : {}),
       ...(sendingSinceMs === undefined ? {} : { sendingSinceMs }),
+      ...(p.uploadProgress ? { uploadProgress: p.uploadProgress } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -1289,6 +1349,9 @@ function UserBubble({
                 </>
               );
             })()}
+            {bubble.uploadProgress && (
+              <PendingUploadRow progress={bubble.uploadProgress} tempId={bubble.itemId} />
+            )}
           </MessageContent>
         </div>
         {bubble.undelivered && (
@@ -1418,6 +1481,10 @@ function AssistantBubble({
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
+      if (item.code === ATTACHMENT_UPLOAD_FAILED) {
+        await retryFailedAttachmentSend(conversationId, item.itemId);
+        return;
+      }
       if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The

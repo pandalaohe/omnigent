@@ -1,9 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { ATTACHMENT_UPLOAD_FAILED, type ErrorBlock } from "@/lib/blocks";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
-import { useChatStore } from "@/store/chatStore";
+import { retryFailedAttachmentSend, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
@@ -47,6 +49,56 @@ const RATE_LIMIT_ERROR = [
 
 describe("ErrorBanner", () => {
   beforeEach(() => vi.mocked(copyText).mockClear());
+
+  it("releases a scoped failed upload's cache protection when its Retry card is dismissed", async () => {
+    conversationRegistry.clear();
+    const conversationId = "conv_failed_upload";
+    const card: ErrorBlock = {
+      type: "error",
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "",
+        itemId: "failed_upload",
+      },
+      message: "Upload failed",
+      source: "",
+      code: ATTACHMENT_UPLOAD_FAILED,
+      failedAttachmentSend: {
+        text: "Keep this until I dismiss it",
+        parts: [{ type: "attachment", file: new File(["photo"], "photo.png") }],
+        restoreToComposer: true,
+      },
+    };
+    const entry = conversationRegistry.acquire(conversationId);
+    entry.setState({ blocks: [card] });
+    conversationRegistry.acquire("conv_ordinary");
+    try {
+      render(
+        <ConversationScopeContext.Provider value={conversationId}>
+          <ErrorBanner
+            itemId={card.ctx.itemId}
+            message={card.message}
+            source={card.source}
+            code={card.code}
+            onRetry={(error) => retryFailedAttachmentSend(conversationId, error.itemId)}
+          />
+        </ConversationScopeContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+      expect(conversationRegistry.evictLruEvictable()).toBe("conv_ordinary");
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await screen.findByRole("button", { name: "Retry" });
+      expect(entry.getState().failedSendDraft?.text).toBe(card.failedAttachmentSend?.text);
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss error message" }));
+      expect(screen.queryByTestId("error-pill")).toBeNull();
+      expect(conversationRegistry.evictLruEvictable()).toBe(conversationId);
+    } finally {
+      conversationRegistry.clear();
+    }
+  });
 
   it("renders compact by default and expands labeled message content", () => {
     render(

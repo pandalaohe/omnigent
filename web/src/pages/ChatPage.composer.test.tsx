@@ -874,6 +874,46 @@ describe("Composer starting-session cancellation", () => {
       expect(textarea()).toHaveValue("corrected task");
     },
   );
+
+  it("sends a typed follow-up from the main button while the first message uploads", () => {
+    const mobileQuery = "(max-width: 767.98px)";
+    const mediaQuery = window.matchMedia(mobileQuery);
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === mobileQuery,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    setComposerState({
+      conversationId: "conv_first_upload",
+      sessionStatus: "idle",
+      pendingUserMessages: [
+        {
+          tempId: "pend_first_upload",
+          content: [{ type: "input_text", text: "first message" }],
+          initialDraft: { text: "first message", files: [] },
+          beforePost: true,
+          uploadProgress: {
+            filename: "photo.png",
+            fileIndex: 1,
+            fileCount: 1,
+            loaded: 1,
+            total: 2,
+            fraction: 0.5,
+          },
+        },
+      ],
+    });
+    const props = composerProps({ status: "idle", isWorking: true });
+    render(<Composer {...props} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+    fireEvent.change(textarea(), { target: { value: "follow-up" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(props.onSend).toHaveBeenCalledWith("follow-up", undefined);
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
 });
 
 describe("Composer growth layout", () => {
@@ -6780,6 +6820,42 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
+  it("replaces newer composer contents with the cancelled upload's reply and files", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Context", text: "Original quote" }],
+      text: "Original reply",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    const first = new File(["one"], "first.png", { type: "image/png" });
+    const second = new File(["two"], "second.png", { type: "image/png" });
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "Newer draft" } });
+    fireEvent.change(screen.getByTestId("composer-file-input"), {
+      target: { files: [new File(["new"], "new.png", { type: "image/png" })] },
+    });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text,
+          replyDraft,
+          files: [first, second],
+          replaceComposer: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("Original reply");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Original quote");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.slice(0, 3)).toEqual([
+      text,
+      [first, second],
+      replyDraft,
+    ]);
+  });
+
   it.each(["none", "failed", "delivered"])("retracts after a second send: %s", (secondSend) => {
     const stableId = "c".repeat(32);
     render(<Composer {...composerProps()} />);
@@ -9706,36 +9782,6 @@ describe("Composer attachment picker", () => {
     // Any file is attachable, so the picker must not filter by type.
     expect(input.accept).toBe("");
     expect(input.getAttribute("data-testid")).toBe("composer-file-input");
-  });
-
-  it("shows the upload progress row while an upload runs and drops it after", () => {
-    render(<Composer {...composerProps()} />);
-
-    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
-
-    act(() => {
-      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: 0.42 } });
-    });
-    const row = screen.getByTestId("composer-upload-progress");
-    expect(row).toHaveTextContent("Uploading clip.mp4 — 42%");
-
-    act(() => {
-      useChatStore.setState({ uploadProgress: null });
-    });
-    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
-  });
-
-  it("shows the upload row without a percentage when progress is unknown", () => {
-    render(<Composer {...composerProps()} />);
-
-    act(() => {
-      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: null } });
-    });
-    expect(screen.getByTestId("composer-upload-progress")).toHaveTextContent("Uploading clip.mp4…");
-
-    act(() => {
-      useChatStore.setState({ uploadProgress: null });
-    });
   });
 });
 

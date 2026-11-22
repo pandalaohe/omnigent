@@ -1,3 +1,4 @@
+import type { PendingUploadProgress } from "@/store/chatStore";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 import type { TerminalAccessRequest } from "./terminalAccess";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
@@ -203,6 +204,8 @@ export type Bubble =
       /** Pending input whose send request has not been answered for a while. */
       stillSending?: boolean;
       sendingSinceMs?: number;
+      /** Attachment upload progress for this pending user bubble. */
+      uploadProgress?: PendingUploadProgress;
       /** Saved startup message the server never delivered (the launch failed). */
       undelivered?: boolean;
       content: MessageContentBlock[];
@@ -2095,6 +2098,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       Boolean(a.stillSending) !== Boolean(b.stillSending) ||
       a.sendingSinceMs !== b.sendingSinceMs ||
+      a.uploadProgress !== b.uploadProgress ||
       Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||

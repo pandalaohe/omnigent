@@ -85,23 +85,36 @@ function write(records: Record<string, unknown>, key: string): void {
   }
 }
 
-/** Record a message about to be POSTed; the latest send per session wins. */
-export function rememberUnsentSend(conversationId: string, send: UnsentSend): void {
-  write({ ...read(UNSENT_SENDS_KEY, parseSend), [conversationId]: send }, UNSENT_SENDS_KEY);
+function parseUnsentSends(entry: unknown): UnsentSend[] | null {
+  if (Array.isArray(entry)) return parseQueue(entry);
+  const legacy = parseSend(entry);
+  return legacy === null ? null : [legacy];
 }
 
-/** Drop a session's record once this tab has seen that send settle. */
+/** Record a message while it is uploading or awaiting its POST response. */
+export function rememberUnsentSend(conversationId: string, send: UnsentSend): void {
+  const records = read(UNSENT_SENDS_KEY, parseUnsentSends);
+  const others = records[conversationId]?.filter((entry) => entry.stableId !== send.stableId) ?? [];
+  write({ ...records, [conversationId]: [...others, send] }, UNSENT_SENDS_KEY);
+}
+
+/** Drop only the send that settled. Other messages may still be uploading. */
 export function forgetUnsentSend(conversationId: string, stableId: string): void {
   if (pageHiding) return;
-  const sends = read(UNSENT_SENDS_KEY, parseSend);
-  if (sends[conversationId]?.stableId !== stableId) return;
-  const others = Object.entries(sends).filter(([id]) => id !== conversationId);
-  write(Object.fromEntries(others), UNSENT_SENDS_KEY);
+  const records = read(UNSENT_SENDS_KEY, parseUnsentSends);
+  const sends = records[conversationId];
+  if (!sends?.some((send) => send.stableId === stableId)) return;
+  const remaining = sends.filter((send) => send.stableId !== stableId);
+  const others = Object.entries(records).filter(([id]) => id !== conversationId);
+  write(
+    Object.fromEntries(remaining.length > 0 ? [...others, [conversationId, remaining]] : others),
+    UNSENT_SENDS_KEY,
+  );
 }
 
-/** The send this tab last left unanswered in a session, if any. */
-export function peekUnsentSend(conversationId: string): UnsentSend | null {
-  return read(UNSENT_SENDS_KEY, parseSend)[conversationId] ?? null;
+/** The messages this tab left unanswered in a session, in submission order. */
+export function peekUnsentSends(conversationId: string): UnsentSend[] {
+  return read(UNSENT_SENDS_KEY, parseUnsentSends)[conversationId] ?? [];
 }
 
 /** Record the messages a session's queue holds, in order; an empty list clears it. */

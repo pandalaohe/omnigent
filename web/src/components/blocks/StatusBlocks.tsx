@@ -40,9 +40,10 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { t } from "@/lib/autoRotationText";
+import { ATTACHMENT_UPLOAD_FAILED } from "@/lib/blocks";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink, SIGN_IN_EXPIRED_CODE } from "@/lib/sessionsApi";
-import { useChatStore } from "@/store/chatStore";
+import { clearFailedAttachmentSend, useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
@@ -123,6 +124,7 @@ const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
 const NEUTRAL_TONE_CODES = new Set(["budget_exhausted", COMPACTION_MODEL_FAILED_CODE]);
 
 const RETRYABLE_ERROR_CODES = new Set([
+  ATTACHMENT_UPLOAD_FAILED,
   "required_terminal_exited",
   "terminal_launch_failed",
   "runner_disconnected",
@@ -347,6 +349,7 @@ export function ErrorBanner({
   onRetry,
   relatedErrors = EMPTY_RELATED_ERRORS,
 }: ErrorBannerProps) {
+  const conversationId = useScopedConversationId();
   const workspaceMissing =
     code === "workspace_missing" ||
     relatedErrors.some((error) => error.code === "workspace_missing");
@@ -428,7 +431,9 @@ export function ErrorBanner({
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = !workspaceMissing && onRetry !== undefined && actionableError !== undefined;
   const retryLabel =
-    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+    actionableError &&
+    (actionableError.code === ATTACHMENT_UPLOAD_FAILED ||
+      CONTINUE_TURN_ERROR_CODES.has(actionableError.code))
       ? "Retry"
       : "Resume session";
 
@@ -465,7 +470,10 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+          {actionableError?.code === "rate_limit_exceeded" ||
+          actionableError?.code === ATTACHMENT_UPLOAD_FAILED
+            ? "Retrying"
+            : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -523,12 +531,14 @@ export function ErrorBanner({
     setRetryError(null);
     try {
       await onRetry(actionableError);
-      setDismissed(true);
+      // Upload cards leave the transcript when the store completes the retry handoff.
+      if (actionableError.code !== ATTACHMENT_UPLOAD_FAILED) setDismissed(true);
     } catch (error) {
-      retryInFlightRef.current = false;
       setRetryError(
         `${retryLabel} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      retryInFlightRef.current = false;
       setRetrying(false);
     }
   };
@@ -630,6 +640,9 @@ export function ErrorBanner({
             }
             onClick={(event) => {
               event.stopPropagation();
+              if (code === ATTACHMENT_UPLOAD_FAILED && conversationId && itemId) {
+                clearFailedAttachmentSend(conversationId, itemId);
+              }
               setDismissed(true);
             }}
             className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-foreground"
