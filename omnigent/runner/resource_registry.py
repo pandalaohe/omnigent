@@ -668,10 +668,7 @@ class SessionResourceRegistry:
         # or stop outliving its turn. Set via
         # :meth:`set_session_background_publisher`.
         self._session_background_publisher: Callable[[str, bool], None] | None = None
-        # Optional callback ``(source_session_id, target_session_id) -> None``
-        # run synchronously when the Claude main pane changes owner. Set via
-        # :meth:`set_claude_terminal_transfer_listener`.
-        self._claude_terminal_transfer_listener: Callable[[str, str], None] | None = None
+        self._native_terminal_transfer_listeners: dict[str, Callable[[str, str], None]] = {}
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -796,15 +793,18 @@ class SessionResourceRegistry:
         """
         self._session_background_publisher = publisher
 
-    def set_claude_terminal_transfer_listener(self, listener: Callable[[str, str], None]) -> None:
-        """Install the callback run when the Claude main pane moves to another session.
+    def set_native_terminal_transfer_listener(
+        self, terminal_name: str, listener: Callable[[str, str], None]
+    ) -> None:
+        """Install the callback run when a harness's main pane moves to another session.
 
         It runs before :meth:`transfer_terminal` first yields, so no other task
         observes the pane under its new owner before the callback has run.
 
+        :param terminal_name: Native terminal name, e.g. ``"codex"``.
         :param listener: Callable ``(source_session_id, target_session_id) -> None``.
         """
-        self._claude_terminal_transfer_listener = listener
+        self._native_terminal_transfer_listeners[terminal_name] = listener
 
     def set_terminal_exit_publisher(
         self,
@@ -2861,9 +2861,10 @@ class SessionResourceRegistry:
             )
             if not moved:
                 return None
-            listener = self._claude_terminal_transfer_listener
-            if listener is not None and terminal_id == terminal_resource_id("claude", "main"):
-                listener(source_session_id, target_session_id)
+            if entry.session_key == "main":
+                listener = self._native_terminal_transfer_listeners.get(entry.terminal_name)
+                if listener is not None:
+                    listener(source_session_id, target_session_id)
             with self._lock:
                 role_registration = self._terminal_roles.pop(
                     (source_session_id, terminal_id), None

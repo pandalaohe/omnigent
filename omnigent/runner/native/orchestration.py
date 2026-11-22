@@ -508,16 +508,97 @@ _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 _AUTO_CODEX_BRIDGE_DIRS: dict[str, Path] = {}
 
 
-def codex_native_bridge_dir(session_id: str) -> Path:
+@dataclasses.dataclass
+class _CodexForwarderOwner:
+    session_id: str
+    subagent_router: SubagentRouter | None
+    turn_router: TurnRouter | None
+
+
+_CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexForwarderOwner] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _track_codex_forwarder(
+    session_id: str, subagent_router: SubagentRouter | None, turn_router: TurnRouter | None
+) -> _CodexForwarderOwner:
+    owner = _CodexForwarderOwner(session_id, subagent_router, turn_router)
+    if (task := asyncio.current_task()) is not None:
+        _CODEX_FORWARDER_OWNERS[task] = owner
+    return owner
+
+
+def _rekey_codex_forwarder(old_session_id: str, new_session_id: str) -> None:
+    """Keep the Codex runtime with its main pane before the transfer first yields."""
+    if old_session_id == new_session_id:
+        return
+    task = _AUTO_FORWARDER_TASKS.get(old_session_id)
+    owner = _CODEX_FORWARDER_OWNERS.get(task) if task is not None else None
+    if task is None or owner is None or task.done():
+        return
+
+    del _AUTO_FORWARDER_TASKS[old_session_id]
+    owner.session_id = new_session_id
+    _register_auto_forwarder_task(new_session_id, task)
+    if (backend := _AUTO_CODEX_APP_SERVERS.pop(old_session_id, None)) is not None:
+        _AUTO_CODEX_APP_SERVERS[new_session_id] = backend
+    if (bridge_dir := _AUTO_CODEX_BRIDGE_DIRS.pop(old_session_id, None)) is not None:
+        _AUTO_CODEX_BRIDGE_DIRS[new_session_id] = bridge_dir
+    if owner.subagent_router is not None:
+        from omnigent.runner.subagent_routing import move_session_router
+
+        move_session_router(owner.subagent_router, new_session_id)
+    if owner.turn_router is not None:
+        from omnigent.runner.turn_routing import move_session_turn_router
+
+        move_session_turn_router(owner.turn_router, new_session_id)
+
+
+def _codex_bridge_registered_to_other_session(bridge_dir: Path, session_id: str) -> bool:
+    return any(
+        directory == bridge_dir and owner != session_id
+        for owner, directory in _AUTO_CODEX_BRIDGE_DIRS.items()
+    )
+
+
+def _codex_bridge_has_other_owner(bridge_dir: Path, session_id: str) -> bool:
+    """Recognize a transferred bridge before and after the new state is written."""
+    from omnigent.native.native_bridge_common import read_bridge_session_id
+
+    if _codex_bridge_registered_to_other_session(bridge_dir, session_id):
+        return True
+    try:
+        owner = read_bridge_session_id(bridge_dir)
+    except (OSError, ValueError, RecursionError):
+        # An unreadable or malformed state has no usable owner and can be rebuilt.
+        return False
+    return owner is not None and owner != session_id
+
+
+def _codex_launch_bridge_id(session_id: str, bridge_id: str) -> str:
+    from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
+
+    alternate = 0
+    while _codex_bridge_has_other_owner(bridge_dir_for_bridge_id(bridge_id), session_id):
+        bridge_id = f"{session_id}-cleared" + (f"-{alternate}" if alternate else "")
+        alternate += 1
+    return bridge_id
+
+
+def codex_native_bridge_dir(session_id: str, *, bridge_id: str | None = None) -> Path:
     """The bridge directory a session's Codex terminal was launched into.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_id: Persisted label used when no runner launch directory is known.
     :returns: The directory of the session's latest launch on this runner, else
         the session id's own directory.
     """
     from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
 
-    return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
+    return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(
+        bridge_id or session_id
+    )
 
 
 # Background OpenCode ``opencode serve`` instances for host-spawned
@@ -6313,6 +6394,7 @@ async def _auto_create_codex_terminal(
         resolve_native_codex_launch,
     )
     from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
         CodexNativeBridgeState,
         clear_bridge_state,
         codex_home_for_bridge_dir,
@@ -6331,9 +6413,7 @@ async def _auto_create_codex_terminal(
     )
     original_external_session_id = launch_config.external_session_id
     workspace = str(launch_config.workspace)
-    bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
-    socket_path = socket_path_for_bridge_dir(bridge_dir)
-    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    bridge_dir = codex_native_bridge_dir(session_id, bridge_id=launch_config.bridge_id)
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
@@ -6345,6 +6425,7 @@ async def _auto_create_codex_terminal(
         and forwarder is not None
         and not forwarder.done()
         and bridge_state is not None
+        and bridge_state.session_id == session_id
         and bridge_state.thread_id == launch_config.external_session_id
         and bridge_state.socket_path == app_server.listen_url
         and bridge_state.codex_home == str(app_server.codex_home)
@@ -6549,6 +6630,21 @@ async def _auto_create_codex_terminal(
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
+    requested_bridge_id = launch_config.bridge_id or session_id
+    bridge_id = _codex_launch_bridge_id(session_id, requested_bridge_id)
+    if bridge_id != requested_bridge_id and server_client is not None:
+        # The executor and the next successor must resolve this launch's private bridge.
+        response = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id}},
+            params={"include_usage": "false"},
+        )
+        response.raise_for_status()
+        if session_init is not None:
+            session_init.snapshot.labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
+    bridge_dir = prepare_bridge_dir(bridge_id)
+    socket_path = socket_path_for_bridge_dir(bridge_dir)
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
     clear_bridge_state(bridge_dir)
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a
@@ -7531,6 +7627,7 @@ async def _codex_discover_thread_and_forward(
         _RunnerDatabricksAuth,
     )
 
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
     if login_required:
         # The launch router already knows this TUI can only render the
         # sign-in screen: no provider routes the codex harness and Codex
@@ -7852,6 +7949,7 @@ async def _codex_discover_thread_and_forward(
         cancelled = True
         raise
     finally:
+        session_id = owner.session_id
         # Tear down the listener and the per-session app-server whenever
         # forwarding ends — discovery failed, the app-server connection dropped
         # (``supervise_forwarder`` returned), or the task was cancelled on
@@ -7888,9 +7986,11 @@ async def _codex_discover_thread_and_forward(
                     await event_client.close()
         finally:
             try:
-                await _shutdown_session_router_async(session_id, subagent_router)
+                if subagent_router is not None:
+                    await _shutdown_session_router_async(session_id, subagent_router)
             finally:
-                await _shutdown_session_turn_router_async(session_id, turn_router)
+                if turn_router is not None:
+                    await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _codex_forward_known_thread(
@@ -7937,6 +8037,7 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
     cancelled = False
     try:
         _bind_codex_inventory_client(
@@ -7960,6 +8061,7 @@ async def _codex_forward_known_thread(
         cancelled = True
         raise
     finally:
+        session_id = owner.session_id
         _logger.info(
             "Codex native input stopped",
             extra=debug_event(
@@ -7989,9 +8091,11 @@ async def _codex_forward_known_thread(
                     await client.close()
         finally:
             try:
-                await _shutdown_session_router_async(session_id, subagent_router)
+                if subagent_router is not None:
+                    await _shutdown_session_router_async(session_id, subagent_router)
             finally:
-                await _shutdown_session_turn_router_async(session_id, turn_router)
+                if turn_router is not None:
+                    await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _run_antigravity_reader(
@@ -11706,11 +11810,14 @@ async def _delete_native_bridge_dirs(
         claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         claude_bridge_dir(session_id),
     }
-    transferred_targets = {
-        antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
-        antigravity_bridge_dir(session_id),
+    codex_targets = {
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
+        codex_native_bridge_dir(session_id),
+    }
+    transferred_targets = codex_targets | {
+        antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        antigravity_bridge_dir(session_id),
     }
     owned_targets = claude_targets | transferred_targets
     history_targets = transferred_targets | {
@@ -11764,6 +11871,10 @@ async def _delete_native_bridge_dirs(
             )
             with lock as acquired:
                 if not acquired:
+                    continue
+                if bridge_target in codex_targets and _codex_bridge_registered_to_other_session(
+                    bridge_target, session_id
+                ):
                     continue
                 try:
                     if bridge_target in claude_targets:
@@ -11993,12 +12104,14 @@ async def _resolve_native_spawn_env(
         env = _typed_spawn_env(
             builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
         )
-        if agent.key == "codex" and provider.bridge_id_label_key not in labels:
+        if agent.key == "codex":
             from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_DIR_ENV_VAR
 
-            # When the label is unavailable, keep the executor on the directory
-            # this runner launched into.
-            env[CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] = str(codex_native_bridge_dir(session_id))
+            env[CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] = str(
+                codex_native_bridge_dir(
+                    session_id, bridge_id=labels.get(provider.bridge_id_label_key)
+                )
+            )
         return env
 
     return _typed_spawn_env(builder(session_id))

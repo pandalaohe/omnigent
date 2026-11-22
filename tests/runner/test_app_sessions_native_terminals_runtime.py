@@ -6205,6 +6205,173 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("old_action", ["delete", "cli_release", "ensure"])
+async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_action: str
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server as codex_app_server
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import subagent_routing, turn_routing
+    from omnigent.runner.native import orchestration
+    from omnigent.terminals.registry import TerminalRegistry
+
+    old_id, new_id = "conv_codex_old", "conv_codex_new"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://server")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(old_id)
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id=old_id,
+        thread_id="thread_old",
+        socket_path="ws://127.0.0.1:9876",
+        codex_home=str(bridge_dir / "codex-home"),
+    )
+    codex_native_bridge.write_bridge_state(bridge_dir, state)
+    codex_native_bridge.update_active_child_turn(bridge_dir, "thread_child", turn_id="turn_child")
+    state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert state is not None
+    server = NullServerClient()
+    terminals = TerminalRegistry()
+    terminals._by_conversation[old_id] = {
+        ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path)
+    }
+    app = create_runner_app(server_client=server, terminal_registry=terminals)
+    subagent = subagent_routing.ensure_session_router(
+        old_id, bridge_dir=bridge_dir, server_client=server
+    )
+    turn = turn_routing.ensure_session_turn_router(
+        old_id,
+        bridge_dir=bridge_dir,
+        server_client=server,
+        harness="codex-native",
+        routing_enabled=True,
+    )
+    assert subagent is not None and turn is not None
+    started = asyncio.Event()
+
+    async def supervise(**_kwargs: object) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    close = AsyncMock()
+    backend = SimpleNamespace(
+        resident_incarnation_id="incarnation", close=close, exit_confirmed=True
+    )
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", supervise)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, old_id, backend)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_BRIDGE_DIRS, old_id, bridge_dir)
+    task = asyncio.create_task(
+        orchestration._codex_forward_known_thread(
+            session_id=old_id,
+            bridge_dir=bridge_dir,
+            codex_ws_url=state.socket_path,
+            thread_id=state.thread_id,
+            app_server=backend,
+            subagent_router=subagent,
+            turn_router=turn,
+        )
+    )
+    orchestration._register_auto_forwarder_task(old_id, task)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as runner:
+            transfer = await runner.post(
+                f"/v1/sessions/{old_id}/resources/terminals/terminal_codex_main/transfer",
+                json={"target_session_id": new_id},
+            )
+            assert transfer.status_code == 200
+            # The forwarder publishes bridge state after the transfer RPC returns.
+            if old_action == "delete":
+                assert (await runner.delete(f"/v1/sessions/{old_id}")).status_code == 200
+            elif old_action == "cli_release":
+                await app.state.finish_cli_release(old_id)
+            else:
+                config = orchestration._CodexNativeLaunchConfig(
+                    workspace=tmp_path,
+                    policy_server_url="http://server",
+                    terminal_launch_args=None,
+                    model_override=None,
+                    external_session_id=state.thread_id,
+                    fork_source_id=None,
+                    fork_source_external_id=None,
+                    fork_carry_history=False,
+                    bypass_sandbox=False,
+                    bridge_id=old_id,
+                )
+                monkeypatch.setattr(
+                    orchestration, "_codex_native_launch_config", AsyncMock(return_value=config)
+                )
+                monkeypatch.setattr(
+                    codex_app_server,
+                    "resolve_native_codex_launch",
+                    lambda **_: codex_app_server.NativeCodexLaunch(
+                        config_overrides=[], model=None, profile=None
+                    ),
+                )
+                monkeypatch.setattr(
+                    codex_app_server, "fresh_codex_launch_catalog", lambda **_: None
+                )
+                monkeypatch.setattr(
+                    "omnigent.inner.codex_executor._find_codex_cli", lambda: sys.executable
+                )
+                patch = AsyncMock(wraps=server.patch)
+                monkeypatch.setattr(server, "patch", patch)
+
+                def stop_before_spawn(path: Path) -> None:
+                    assert path == codex_native_bridge.bridge_dir_for_bridge_id(
+                        f"{old_id}-cleared"
+                    )
+                    raise RuntimeError("stop before spawning Codex")
+
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(codex_native_bridge, "clear_bridge_state", stop_before_spawn)
+                    with pytest.raises(RuntimeError, match="stop before spawning Codex"):
+                        await orchestration._auto_create_codex_terminal(
+                            old_id,
+                            app.state.session_resource_registry,
+                            lambda *_: None,
+                            server_client=server,
+                        )
+                assert patch.await_args.kwargs["json"]["labels"] == {
+                    codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: f"{old_id}-cleared"
+                }
+            assert not task.done()
+            close.assert_not_awaited()
+            assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+            assert "thread_child" in codex_native_bridge.read_active_child_turns(bridge_dir)
+            assert orchestration._AUTO_CODEX_APP_SERVERS.get(new_id) is backend
+            assert orchestration._AUTO_CODEX_BRIDGE_DIRS.get(new_id) == bridge_dir
+            assert subagent.session_id == turn.session_id == new_id
+            assert subagent_routing._session_routers.get(new_id) is subagent
+            assert turn_routing._session_routers.get(new_id) is turn
+            assert old_id not in subagent_routing._session_routers
+            assert old_id not in turn_routing._session_routers
+            assert not subagent._closed and not turn._closed
+
+            codex_native_bridge.write_bridge_state(
+                bridge_dir, replace(state, session_id=new_id, thread_id="thread_new")
+            )
+            assert (await runner.delete(f"/v1/sessions/{new_id}")).status_code == 200
+            assert task.cancelled()
+            close.assert_awaited_once()
+            assert new_id not in orchestration._AUTO_CODEX_APP_SERVERS
+            assert new_id not in orchestration._AUTO_CODEX_BRIDGE_DIRS
+            assert not bridge_dir.exists()
+            assert subagent._closed and turn._closed
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(subagent.close)
+        await asyncio.to_thread(turn.close)
+        for owner in (old_id, new_id):
+            orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(owner, None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tier,expected_args,tool_permission",
     [

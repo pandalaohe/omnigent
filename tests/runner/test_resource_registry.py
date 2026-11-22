@@ -897,7 +897,9 @@ async def test_claude_forwarder_registration_follows_transferred_pane(
 
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    registry.set_native_terminal_transfer_listener(
+        "claude", orchestration._rekey_auto_forwarder_task
+    )
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
     router = subagent_routing.ensure_session_router(
@@ -994,7 +996,9 @@ async def test_claude_pane_without_a_router_leaves_other_routers_alone(
 
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    registry.set_claude_terminal_transfer_listener(orchestration._rekey_auto_forwarder_task)
+    registry.set_native_terminal_transfer_listener(
+        "claude", orchestration._rekey_auto_forwarder_task
+    )
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     terminal_registry._by_conversation.setdefault("conv_old", {})[("claude", "main")] = instance
     other_router = subagent_routing.ensure_session_router(
@@ -1031,7 +1035,7 @@ async def test_non_claude_transfer_does_not_move_fallback_bundle(
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     transfers: list[tuple[str, str]] = []
-    registry.set_claude_terminal_transfer_listener(lambda *ids: transfers.append(ids))
+    registry.set_native_terminal_transfer_listener("claude", lambda *ids: transfers.append(ids))
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     source_bundle = registry.claude_skill_bundle_dir("source")
     terminal_registry._by_conversation.setdefault("source", {})[("codex", "main")] = instance

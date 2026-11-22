@@ -3518,8 +3518,10 @@ def create_runner_app(
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
-    # The Claude transcript forwarder follows its pane onto a /clear successor.
-    resource_registry.set_claude_terminal_transfer_listener(_rekey_auto_forwarder_task)
+    resource_registry.set_native_terminal_transfer_listener("claude", _rekey_auto_forwarder_task)
+    resource_registry.set_native_terminal_transfer_listener(
+        "codex", _native_runtime._rekey_codex_forwarder
+    )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -6059,6 +6061,7 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+        await _native_runtime.teardown_codex_native_app_server(session_id)
 
         # The SDK harnesses' router is started here (not by a terminal launch
         # path), so this is its only teardown: without it the session leaks an
@@ -6398,12 +6401,14 @@ def create_runner_app(
                 conv_id,
             )
             return None, bridge_dir
-        if state.session_id != conv_id:
+        if (
+            state.session_id != conv_id
+            or _native_runtime._codex_bridge_registered_to_other_session(bridge_dir, conv_id)
+        ):
             _logger.warning(
-                "Codex-native %s skipped for %s: bridge belongs to %s.",
+                "Codex-native %s skipped for %s: bridge has a different owner.",
                 action,
                 conv_id,
-                state.session_id,
             )
             return None, bridge_dir
         return state, bridge_dir
@@ -6423,27 +6428,19 @@ def create_runner_app(
         """
         Bridge directory for a codex-native session.
 
-        Prefer the bridge id label, then the runner's latest launch directory,
-        so a failed label callback still reaches the directory the forwarder polls.
+        Prefer the runner's latest launch directory, then the bridge id label.
 
         :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
         :returns: The session's bridge directory.
         """
-        from omnigent.harnesses.codex_native.bridge import (
-            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-            bridge_dir_for_bridge_id,
-        )
+        from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 
         labels = await _session_labels_for_runner_spawn(
             server_client=server_client,
             session_id=conv_id,
         )
         bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-        return (
-            bridge_dir_for_bridge_id(bridge_id)
-            if bridge_id
-            else _native_runtime.codex_native_bridge_dir(conv_id)
-        )
+        return _native_runtime.codex_native_bridge_dir(conv_id, bridge_id=bridge_id)
 
     def _codex_goal_bridge_is_inactive(conv_id: str, state: CodexNativeBridgeState) -> bool:
         """Recognize an unloaded bridge without a recorded startup failure."""
@@ -10508,9 +10505,6 @@ def create_runner_app(
                 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
                 write_mcp_bridge_config,
             )
-            from omnigent.harnesses.codex_native.bridge import (
-                bridge_dir_for_bridge_id as codex_bridge_dir_for_id,
-            )
 
             codex_labels = await _session_labels_for_runner_spawn(
                 server_client=server_client,
@@ -10527,7 +10521,7 @@ def create_runner_app(
                 if response.status_code >= 300:
                     raise RuntimeError("Codex could not apply the selected speed before this turn")
             codex_bid = codex_labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-            codex_bdir = codex_bridge_dir_for_id(codex_bid or conv)
+            codex_bdir = _native_runtime.codex_native_bridge_dir(conv, bridge_id=codex_bid)
             write_mcp_bridge_config(codex_bdir)
             await _ensure_comment_relay_started(
                 conv,
@@ -15210,6 +15204,12 @@ def create_runner_app(
                 (current, getattr(current, "resident_incarnation_id", None), current_dir),
             )
         backend, incarnation, launch_dir = snapshot
+        if launch_dir is not None and _native_runtime._codex_bridge_registered_to_other_session(
+            launch_dir, session_id
+        ):
+            if _pending_codex_releases.get(session_id) is snapshot:
+                _pending_codex_releases.pop(session_id, None)
+            raise RuntimeError("Codex backend moved during CLI release")
         if (
             (current is not None and current is not backend)
             or (current_dir is not None and current_dir is not launch_dir)
@@ -15307,7 +15307,9 @@ def create_runner_app(
             from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
 
             # A stopped forwarder can leave its backend's resumable bridge state behind.
-            if codex_bridge_dir.is_dir():
+            if codex_bridge_dir.is_dir() and not _native_runtime._codex_bridge_has_other_owner(
+                codex_bridge_dir, session_id
+            ):
                 clear_active_child_turns(codex_bridge_dir)
             # Resume still needs native history, undelivered items and cached attachments.
             await _delete_native_bridge_dirs(
