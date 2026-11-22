@@ -1113,8 +1113,8 @@ async def _receive_loop(
         from omnigent.host.frames import HostRestartResultFrame
 
         if isinstance(frame, HostRestartResultFrame):
-            if frame.phase == "stopping":
-                host_registry.restarts.stopping(conn, frame)
+            if frame.phase in {"stopping", "failed"}:
+                host_registry.restarts.progress(conn, frame)
             else:
                 future = conn.pending_restarts.pop(frame.request_id, None)
                 if future is not None and not future.done():

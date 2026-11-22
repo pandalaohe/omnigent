@@ -146,7 +146,7 @@ async def test_restart_deadlines_and_notice_retry(monkeypatch, reconnect):
             drain_timeout_s=120,
             notify=notify,
         )
-    restarts.stopping(
+    restarts.progress(
         conn,
         HostRestartResultFrame(
             record.request_id, True, running_sessions=["requester"], phase="stopping"

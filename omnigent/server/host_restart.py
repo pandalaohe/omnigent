@@ -188,14 +188,18 @@ class HostRestarts:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def stopping(self, conn: HostConnection, result: HostRestartResultFrame) -> None:
+    def progress(self, conn: HostConnection, result: HostRestartResultFrame) -> None:
         record = self.active.get((conn.workspace_id, conn.host_id))
         if (
             record is not None
             and record.preview.conn is conn
             and record.request_id == result.request_id
+            and record.phase == "draining"
         ):
-            if record.phase == "draining":
+            if result.phase == "failed":
+                record.cut_sessions = []
+                self._finish(record, "failed", result.reason or "restart refused")
+            elif result.phase == "stopping":
                 record.phase = "stopping"
                 record.cut_sessions = list(result.running_sessions)
 

@@ -7247,6 +7247,7 @@ class HostProcess:
         """Acknowledge, drain and retire through run()'s normal teardown."""
         from omnigent.host.frames import HostRestartResultFrame
         from omnigent.host.restart import REQUESTER_GRACE_S, supervisor_kind
+        from omnigent.host.service import HostServiceError, launchd_service_launcher_prefix
 
         supervisor = await asyncio.to_thread(supervisor_kind)
         reason = "host is not supervised" if supervisor is None else None
@@ -7258,6 +7259,11 @@ class HostProcess:
             if reason is None:
                 reason = "could not read running sessions"
             running = []
+        if reason is None and supervisor == "launchd":
+            try:
+                await asyncio.to_thread(launchd_service_launcher_prefix)
+            except HostServiceError as exc:
+                reason = str(exc)
         result = HostRestartResultFrame(
             request_id=frame.request_id,
             accepted=reason is None,
@@ -7294,6 +7300,16 @@ class HostProcess:
                 running = ["unknown"]
         if frame.requested_by_session_id:
             await asyncio.sleep(REQUESTER_GRACE_S)
+        if supervisor == "launchd":
+            try:
+                await asyncio.to_thread(launchd_service_launcher_prefix)
+            except HostServiceError as exc:
+                self._restart_pending = False
+                result.accepted, result.reason = False, str(exc)
+                result.phase = "failed"
+                result.running_sessions = running
+                await self._send_text(ws, encode_host_frame(result))
+                return
         result.phase = "stopping"
         result.running_sessions = running
         with contextlib.suppress(Exception):

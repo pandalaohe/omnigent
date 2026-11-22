@@ -11743,7 +11743,8 @@ def host_enable(
         launchd_service_launcher_prefix,
     )
 
-    if not IS_WINDOWS and sys.platform == "darwin":
+    launchd = not IS_WINDOWS and sys.platform == "darwin"
+    if launchd:
         try:
             launchd_service_launcher_prefix()
         except HostServiceError as exc:
@@ -11773,6 +11774,11 @@ def host_enable(
                     stop_user_host_service(snapshot[0])
                 stop_host_tree(processes)
             except (HostServiceError, psutil.Error, OSError, RuntimeError) as exc:
+                raise click.ClickException(str(exc)) from exc
+        if launchd:
+            try:
+                launchd_service_launcher_prefix()
+            except HostServiceError as exc:
                 raise click.ClickException(str(exc)) from exc
         _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)

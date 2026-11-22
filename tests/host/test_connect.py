@@ -8544,6 +8544,58 @@ async def test_host_restart_previews_then_drains_without_signals(monkeypatch, dr
     assert inventory.await_count == (2 if not dry_run and not force else 1)
 
 
+@pytest.mark.parametrize("fault", ["missing", "not-executable", None])
+@pytest.mark.parametrize("after_ack", [False, True])
+async def test_launchd_restart_checks_launcher_before_admitting_and_stopping(
+    monkeypatch, tmp_path, fault, after_ack
+):
+    from omnigent.host.frames import HostRestartFrame
+
+    launcher = tmp_path / "launcher"
+    launcher.touch(mode=0o700)
+    (tmp_path / "config.yaml").write_text(f"host:\n  service_launcher: ['{launcher}']\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.host.restart.supervisor_kind", lambda: "launchd")
+    host = _host()
+    monkeypatch.setattr(host, "_restart_running_sessions", AsyncMock(return_value=[]))
+    abort = Mock()
+    monkeypatch.setattr(host, "_abort_live_tunnel", abort)
+
+    def break_launcher():
+        if fault == "missing":
+            launcher.unlink()
+        elif fault == "not-executable":
+            launcher.chmod(0o600)
+
+    frames = []
+
+    async def send(_ws, raw):
+        frames.append(decode_host_frame(raw))
+        if after_ack and len(frames) == 1:
+            assert frames[0].accepted
+            break_launcher()
+
+    monkeypatch.setattr(host, "_send_text", send)
+    if not after_ack:
+        break_launcher()
+    await host._dispatch_host_frame(object(), HostRestartFrame("restart", False, force=True))
+
+    assert host.restart_requested is (fault is None)
+    assert abort.call_count == int(fault is None)
+    if fault is None:
+        assert [(frame.phase, frame.accepted) for frame in frames] == [
+            ("draining", True),
+            ("stopping", True),
+        ]
+    else:
+        assert [(frame.phase, frame.accepted) for frame in frames] == (
+            [("draining", True), ("failed", False)] if after_ack else [("draining", False)]
+        )
+        assert "host.service_launcher" in frames[-1].reason
+        assert f"executable is missing or not executable: {launcher}" in frames[-1].reason
+        assert not host._restart_pending
+
+
 @pytest.mark.asyncio
 async def test_restart_ack_failure_releases_admission(monkeypatch):
     from omnigent.host.frames import HostRestartFrame

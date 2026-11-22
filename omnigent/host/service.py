@@ -28,6 +28,7 @@ SYSTEMD_UNIT = "omnigent-host.service"
 _LAUNCHD_UNLOAD_TIMEOUT = 10.0
 _LAUNCHD_UNLOAD_POLL_INTERVAL = 0.2
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class HostServiceError(RuntimeError):
@@ -106,9 +107,11 @@ def launchd_service_launcher_prefix() -> list[str]:
     if (
         not isinstance(prefix, list)
         or not prefix
-        or not all(isinstance(arg, str) and "\x00" not in arg for arg in prefix)
+        or not all(isinstance(arg, str) for arg in prefix)
     ):
         raise HostServiceError(f"{setting} must be a nonempty list of string arguments.")
+    if any(_CONTROL_CHAR_RE.search(arg) for arg in prefix):
+        raise HostServiceError(f"{setting} arguments must not contain control characters.")
     executable = os.path.expanduser(prefix[0])
     if not os.path.isabs(executable):
         raise HostServiceError(f"{setting} must start with an absolute executable path.")
