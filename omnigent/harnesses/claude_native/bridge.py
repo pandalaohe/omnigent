@@ -5697,7 +5697,7 @@ def _inject_user_message(
             return True
         if isinstance(exc, _ClaudeUnrecognizedDraftUnconfirmed) and receipt is None:
             try:
-                still_unconfirmed = _set_protected_draft(
+                final_receipt = _set_protected_draft(
                     bridge_dir,
                     owner.socket_path,
                     owner.tmux_target,
@@ -5713,7 +5713,7 @@ def _inject_user_message(
                     exc_info=True,
                 )
             else:
-                if not still_unconfirmed:
+                if final_receipt is True:
                     _record_accepted_input(bridge_dir, owner.check_owner)
                     delivery_diagnostics.record_details(verification="native_recorded")
                     return True
@@ -5935,6 +5935,15 @@ def _paste_and_submit(
     if owner is not None and not owner.wrote_paste and not _claim_passed():
         # The box can hide again after the readiness gate; nothing is claimed or typed yet.
         pane = _capture_pane(socket_path, tmux_target)
+        guessed = _passthrough_slash_command_name(text)
+        if (
+            has_unrecognized_protected_draft(bridge_dir)
+            and guessed is not None
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", guessed)
+        ):
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
+            if has_running_turn(bridge_dir):
+                raise _busy_pane_refusal(pane)
         if (
             pane.strip()
             and not _claude_prompt_rendered(pane)
@@ -9243,16 +9252,18 @@ def _set_protected_draft(
     unrecognized: bool = False,
     check_owner: Callable[[], None] | None = None,
     receipt_check: Callable[[], bool | None] | None = None,
-) -> bool:
-    """Persist a draft fence unless a matching receipt wins the metadata lock."""
+) -> bool | None:
+    """Return the final receipt state; persist a fence only while it remains unknown."""
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
     with _bridge_metadata_write_lock(bridge_dir):
         if check_owner is not None:
             check_owner()
-        if receipt_check is not None and receipt_check() is True:
-            return False
+        if receipt_check is not None:
+            receipt = receipt_check()
+            if receipt is not None:
+                return receipt
         if _tmux_input_identity(bridge_dir) != identity:
-            return True
+            return None
         state = _read_json_file(bridge_dir / _STATE_FILE)
         if protect:
             key = "unrecognized_draft_tmux" if unrecognized else "protected_draft_tmux"
@@ -9261,7 +9272,7 @@ def _set_protected_draft(
             state.pop("protected_draft_tmux", None)
             state.pop("unrecognized_draft_tmux", None)
         _write_json_file(bridge_dir / _STATE_FILE, state)
-    return True
+    return None
 
 
 def has_unrecognized_protected_draft(bridge_dir: Path) -> bool:
@@ -9979,6 +9990,8 @@ def _wait_for_claude_prompt_ready(
             message="Claude is waiting for an explicit answer; message not sent.",
             nothing_typed=True,
         )
+        if bridge_dir is not None and has_unrecognized_protected_draft(bridge_dir):
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
         polls += 1
         if pane.strip():
             last_nonempty = pane
@@ -9987,8 +10000,6 @@ def _wait_for_claude_prompt_ready(
         tall_draft = _occupied_tall_draft(pane)
         if tall_draft and not waited_on_tall_draft and bridge_dir is not None:
             # A torn capture during resize must not erase evidence of an occupied composer.
-            if has_unrecognized_protected_draft(bridge_dir):
-                _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
             _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
         if _claude_prompt_rendered(pane) and not tall_draft:
             if bridge_dir is not None:

@@ -7569,7 +7569,7 @@ def test_hook_receipt_while_marker_writer_waits_for_lock_confirms_delivery(
             assert release_hook.wait(timeout=5)
         original_write_json(path, payload)
 
-    def set_protected(*args: Any, **kwargs: Any) -> bool:
+    def set_protected(*args: Any, **kwargs: Any) -> bool | None:
         if kwargs.get("unrecognized") is True:
             marker_started.set()
         return original_set_protected(*args, **kwargs)
@@ -7608,6 +7608,92 @@ def test_hook_receipt_while_marker_writer_waits_for_lock_confirms_delivery(
         assert not hook.is_alive()
         assert not hook_errors
         assert delivery.result(timeout=5)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    assert "unrecognized_draft_tmux" not in state
+    assert mutations == ["paste"]
+
+
+def test_hook_mismatch_while_marker_writer_waits_for_lock_skips_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh non-matching receipt keeps delivery unconfirmed without a stale marker."""
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    bridge_dir, mutations, clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: pane,
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+        },
+    )
+    final_receipt_read = threading.Event()
+    hook_holds_lock = threading.Event()
+    release_hook = threading.Event()
+    marker_started = threading.Event()
+    hook_errors: list[BaseException] = []
+    original_read_receipt = bridge._MessagePane.read_receipt
+    original_write_json = bridge._write_json_file
+    original_set_protected = bridge._set_protected_draft
+
+    def read_receipt(owner: Any) -> bool | None:
+        result = original_read_receipt(owner)
+        if result is None and clock.monotonic() >= 2 and not final_receipt_read.is_set():
+            final_receipt_read.set()
+            assert hook_holds_lock.wait(timeout=5)
+        return result
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        if threading.current_thread().name == "late-hook" and path.name == bridge._STATE_FILE:
+            hook_holds_lock.set()
+            assert release_hook.wait(timeout=5)
+        original_write_json(path, payload)
+
+    def set_protected(*args: Any, **kwargs: Any) -> bool | None:
+        if kwargs.get("unrecognized") is True:
+            marker_started.set()
+        return original_set_protected(*args, **kwargs)
+
+    monkeypatch.setattr(bridge._MessagePane, "read_receipt", read_receipt)
+    monkeypatch.setattr(bridge, "_write_json_file", write_json)
+    monkeypatch.setattr(bridge, "_set_protected_draft", set_protected)
+
+    def write_hook() -> None:
+        try:
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "claude-session",
+                    "prompt": "a different prompt",
+                },
+            )
+        except BaseException as error:
+            hook_errors.append(error)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(
+            inject_user_message,
+            bridge_dir,
+            content=_STATUS_LINE_CLIPPED_CONTENT,
+            timeout_s=2,
+        )
+        assert final_receipt_read.wait(timeout=5)
+        hook = threading.Thread(target=write_hook, name="late-hook")
+        hook.start()
+        assert hook_holds_lock.wait(timeout=5)
+        assert marker_started.wait(timeout=5)
+        release_hook.set()
+        hook.join(timeout=5)
+        assert not hook.is_alive()
+        assert not hook_errors
+        with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+            delivery.result(timeout=5)
 
     state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
     assert "unrecognized_draft_tmux" not in state
@@ -7687,6 +7773,80 @@ def test_unrecognized_marker_wins_when_readiness_sees_clipped_after_empty_prefli
     state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
     if not both_markers:
         assert "protected_draft_tmux" not in state
+    assert sends == []
+
+
+def test_unrecognized_marker_refuses_unrecognized_readiness_frame_after_empty_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later unrecognized residue is refused before readiness can wait or repaint."""
+    bridge = claude_native_bridge
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    socket_path, target = str(_TEST_TMUX_SOCKET), "claude:0.0"
+    bridge._set_protected_draft(
+        bridge_dir,
+        socket_path,
+        target,
+        protect=True,
+        unrecognized=True,
+    )
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    assert not bridge._occupied_tall_draft(pane)
+    assert bridge._composer_box(pane) is None
+    sends = _fake_tmux(monkeypatch, [_composer_pane(), pane])
+
+    with pytest.raises(bridge.ClaudeMessageNotAccepted, match="previous send"):
+        inject_user_message(bridge_dir, content="Please read this next message.", timeout_s=2)
+
+    assert bridge.time.monotonic() == 0.0
+    assert sends == []
+
+
+def test_cleared_residue_guessed_skill_rechecks_busy_before_claim_or_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing residue restores the runner's guessed-skill busy queue."""
+    bridge = claude_native_bridge
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    socket_path, target = str(_TEST_TMUX_SOCKET), "claude:0.0"
+    bridge._set_protected_draft(
+        bridge_dir,
+        socket_path,
+        target,
+        protect=True,
+        unrecognized=True,
+    )
+    monkeypatch.setattr(bridge, "has_running_turn", lambda *_args, **_kwargs: True)
+    residue = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    sends = _fake_tmux(
+        monkeypatch,
+        [_composer_pane(), _composer_pane(), residue],
+    )
+    claims = 0
+
+    def claim(_deadline: float) -> Future[bool]:
+        nonlocal claims
+        claims += 1
+        result: Future[bool] = Future()
+        result.set_result(True)
+        return result
+
+    with bridge.message_readiness_budget(2, claim=claim):
+        with pytest.raises(bridge.ClaudeMessageNotAccepted, match="previous send"):
+            inject_user_message(bridge_dir, content="/my-skill do the work")
+
+    assert claims == 0
+    assert sends == []
+
+    sends = _fake_tmux(
+        monkeypatch,
+        [_composer_pane(), _composer_pane(), _composer_pane()],
+    )
+    with bridge.message_readiness_budget(2, claim=claim):
+        with pytest.raises(bridge.ClaudeInputBoxBusy):
+            inject_user_message(bridge_dir, content="/my-skill do the work")
+
+    assert claims == 0
     assert sends == []
 
 
