@@ -855,9 +855,7 @@ async def test_native_paste_claim_uses_bound_server_and_replies_to_harness(
         await _until(lambda: bool(harness.posted_bodies) and sid not in app.state.active_turns)
 
     assert harness.posted_bodies[0]["pending_input_claim_required"] is True
-    assert calls == [
-        {"claim_id": "c" * 32, "attempt_id": attempt_id, "inline_attachment_attempts": "true"}
-    ]
+    assert calls == [{"claim_id": "c" * 32, "attempt_id": attempt_id}]
     (result,) = [e for e in harness.patched_events if e["type"] == "input_execution_result"]
     assert result["result"]["state"] == ("accepted" if claimed else "refused")
 

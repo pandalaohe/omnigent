@@ -2790,7 +2790,6 @@ def create_runner_app(
                     params={
                         "claim_id": frame.claim_id,
                         "attempt_id": claim.delivery_attempt_id,
-                        "inline_attachment_attempts": "true",
                     },
                     timeout=min(5, max(0.001, deadline - time.time())),
                 )

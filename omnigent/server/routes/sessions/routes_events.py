@@ -6619,12 +6619,7 @@ def register_events_routes(
         "/sessions/{session_id}/pending-inputs/{pending_id}/claim", include_in_schema=False
     )
     async def claim_pending_native_input(
-        request: Request,
-        session_id: str,
-        pending_id: str,
-        claim_id: str,
-        attempt_id: str,
-        inline_attachment_attempts: bool = False,
+        request: Request, session_id: str, pending_id: str, claim_id: str, attempt_id: str
     ) -> dict[str, bool]:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or not _has_bound_runner_authority(request, conv):
@@ -6636,7 +6631,6 @@ def register_events_routes(
                 claim_id,
                 expected_attempt_id=attempt_id,
                 runner_id=conv.runner_id,
-                inline_attachment_attempts=inline_attachment_attempts,
             )
         }
 

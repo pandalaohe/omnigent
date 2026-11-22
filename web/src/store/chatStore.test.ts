@@ -12426,30 +12426,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
-    it("clears a received attachment input when the server names it from a legacy echo", () => {
-      const content: PendingUserMessage["content"] = [
-        { type: "input_text", text: "See this screenshot." },
-        { type: "input_image", file_id: "file_image" },
-        { type: "input_text", text: "Check the red dot." },
-      ];
-      const head = { tempId: "tmp_web", pendingId: "pending_web", content, received: true };
-      const later = { ...head, tempId: "tmp_later", pendingId: "pending_later" };
-      useChatStore.setState({ blocks: [], pendingUserMessages: [head, later] });
-
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: "legacy_item",
-        itemType: "message",
-        clearedPendingId: head.pendingId,
-        data: { role: "user", content },
-      });
-
-      expect(useChatStore.getState().pendingUserMessages).toEqual([later]);
-      expect(useChatStore.getState().blocks).toMatchObject([
-        { ctx: { itemId: "legacy_item" }, content },
-      ]);
-    });
-
     it.each([false, true])(
       "keeps a received input waiting when a mirror cannot name its send (already mirrored=%s)",
       (alreadyMirrored) => {

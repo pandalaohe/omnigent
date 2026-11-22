@@ -153,12 +153,8 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
         runner_managed=True,
     )
     read = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
-    assert pending_inputs.claim_runner_input(
-        conv.id, unread, "claim_unread", inline_attachment_attempts=True
-    )
-    assert pending_inputs.claim_runner_input(
-        conv.id, read, "claim_read", inline_attachment_attempts=True
-    )
+    assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
+    assert pending_inputs.claim_runner_input(conv.id, read, "claim_read")
 
     def respond(request: httpx.Request) -> httpx.Response:
         if "file_missing" in request.url.path:
@@ -288,9 +284,7 @@ async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
         {"type": "input_text", "text": after},
     ]
     unread = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
-    assert pending_inputs.claim_runner_input(
-        conv.id, unread, "claim_unread", inline_attachment_attempts=True
-    )
+    assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
     attempt = pending_inputs.delivery_attributes_for(conv.id, unread)["delivery_attempt_id"]
     path = f"/opt/work/attachments/{'c' * 32}/"
     marker = f"[Attached: {path}same-name.png]"
@@ -324,62 +318,6 @@ async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
     ]
     assert receipt["item_id"] == item_id
     assert receipt.get("cleared_pending_id") is None
-
-
-@pytest.mark.parametrize("runner", ["legacy-received", "legacy-claimed", "marker-capable"])
-@pytest.mark.asyncio
-async def test_untagged_inline_attachment_receipt_requires_legacy_runner_and_received_input(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, runner: str
-) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(title="Native", harness_override="claude-native")
-    publish = Mock()
-    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
-    content = [
-        {"type": "input_text", "text": "See this screenshot."},
-        {"type": "input_image", "file_id": "file_image", "filename": "status.png"},
-        {"type": "input_text", "text": "Check the red dot."},
-    ]
-    pending_id = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
-    assert pending_inputs.claim_runner_input(
-        conv.id, pending_id, "claim", inline_attachment_attempts=runner == "marker-capable"
-    )
-    if runner != "legacy-claimed":
-        attempt = str(
-            pending_inputs.delivery_attributes_for(conv.id, pending_id)["delivery_attempt_id"]
-        )
-        pending_inputs.mark_lifecycle(
-            conv.id,
-            _WEB_ID,
-            pending_id=pending_id,
-            delivery_attempt_id=attempt,
-            stage="native_turn_completed",
-            input_received=True,
-        )
-        assert pending_inputs.snapshot_for(conv.id)[0]["received"] is True
-    later = pending_inputs.record(
-        conv.id, [{"type": "input_text", "text": "Queued next."}], runner_managed=True
-    )
-    prompt = "See this screenshot.\n\n[Attached: /opt/work/status.png]\n\nCheck the red dot."
-
-    item_id, replay = await _persist_external_conversation_item(
-        conv.id, conv, _mirror(prompt), store
-    )
-
-    assert item_id and not replay
-    [receipt] = [
-        call.args[1]["data"]
-        for call in publish.call_args_list
-        if call.args[1]["type"] == "session.input.consumed"
-    ]
-    assert receipt["item_id"] == item_id
-    if runner == "legacy-received":
-        assert receipt["cleared_pending_id"] == pending_id
-        assert receipt["data"]["content"] == content
-        assert pending_inputs.pending_ids(conv.id) == [later]
-    else:
-        assert receipt.get("cleared_pending_id") is None
-        assert pending_inputs.pending_ids(conv.id) == [pending_id, later]
 
 
 @pytest.mark.parametrize("files", [("image",), ("zip",), ("zip", "image"), ("image", "zip")])
