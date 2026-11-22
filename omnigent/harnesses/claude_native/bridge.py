@@ -1224,6 +1224,31 @@ class ClaudeTaskNotification:
 
 
 @dataclass(frozen=True)
+class ClaudeQueueOperation:
+    """
+    One transcript queue or terminal-interrupt record used for input settlement.
+
+    :param operation: ``"popAll"`` when Stop, Esc or Up moved queued prompts
+        back into the composer, ``"enqueue"`` when a prompt entered Claude's
+        queue, or ``"interrupt"`` for Claude's own ``[Request interrupted by
+        user...]`` record.
+    :param content: The unwrapped prompt text for ``popAll``/``enqueue``, or
+        ``""`` for ``interrupt``.
+    :param timestamp: Claude's ISO timestamp for the record, e.g.
+        ``"2026-11-05T09:45:15.794Z"``.
+    :param native_session_id: Claude's transcript ``sessionId`` for causal
+        correlation with submit and Stop boundaries.
+    :param byte_offset: Byte offset of this JSONL record in the transcript.
+    """
+
+    operation: str
+    content: str
+    timestamp: str
+    native_session_id: str
+    byte_offset: int
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -1264,6 +1289,7 @@ class TranscriptReadResult:
     task_notifications: tuple[ClaudeTaskNotification, ...] = ()
     goal_state_observed: bool = False
     latest_goal_state: str | None = None
+    queue_operations: tuple[ClaudeQueueOperation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4262,6 +4288,7 @@ def read_transcript_items_since_with_position(
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
     task_notifications: list[ClaudeTaskNotification] = []
+    queue_operations: list[ClaudeQueueOperation] = []
     goal_state_observed = False
     latest_goal_state: str | None = None
     for record in read_result.records:
@@ -4314,6 +4341,11 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        queue_operation = _queue_operation_from_transcript_entry(
+            entry, byte_offset=record.byte_offset
+        )
+        if queue_operation is not None:
+            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -4343,6 +4375,7 @@ def read_transcript_items_since_with_position(
         task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
+        queue_operations=tuple(queue_operations),
     )
 
 
@@ -4485,6 +4518,7 @@ def read_transcript_items_from_offset(
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
     task_notifications: list[ClaudeTaskNotification] = []
+    queue_operations: list[ClaudeQueueOperation] = []
     goal_state_observed = False
     latest_goal_state: str | None = None
     for record in read_result.records:
@@ -4542,6 +4576,11 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        queue_operation = _queue_operation_from_transcript_entry(
+            entry, byte_offset=record.byte_offset
+        )
+        if queue_operation is not None:
+            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -4571,6 +4610,7 @@ def read_transcript_items_from_offset(
         task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
+        queue_operations=tuple(queue_operations),
     )
 
 
@@ -5533,6 +5573,11 @@ class _MessagePane:
             if transcript is not None and native_id is not None
             else None
         )
+        if self.transcript_boundary is not None:
+            delivery_diagnostics.record_submit_boundary(
+                self.transcript_boundary.native_session_id,
+                self.transcript_boundary.byte_offset,
+            )
         self.hook_boundary = capture_submit_boundary(
             self.bridge_dir / _HOOKS_FILE, native_id or ""
         )
@@ -6643,6 +6688,17 @@ def _unknown_command_rejection_appeared(
             return True
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     return False
+
+
+def capture_transcript_boundary(bridge_dir: Path) -> SubmitBoundary | None:
+    """Capture the current transcript end boundary for causal interrupt attribution."""
+    if not isinstance(bridge_dir, Path):
+        return None
+    transcript = read_transcript_path(bridge_dir)
+    native_id = read_claude_session_id(bridge_dir)
+    if transcript is None or native_id is None:
+        return None
+    return capture_submit_boundary(transcript, native_id)
 
 
 def inject_interrupt(
@@ -12529,6 +12585,78 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
     return _concrete_transcript_model(message.get("model"))
+
+
+_CLAUDE_TRANSCRIPT_INTERRUPT_RE = re.compile(
+    r"^\[Request interrupted by user(?: for tool use)?\]$"
+)
+
+
+def _queue_operation_from_transcript_entry(
+    entry: _JsonObject, *, byte_offset: int
+) -> ClaudeQueueOperation | None:
+    """Return a queue or native-interrupt record used for input settlement."""
+    if byte_offset < 0:
+        return None
+    native_session_id = entry.get("sessionId")
+    timestamp = entry.get("timestamp")
+    if (
+        not isinstance(native_session_id, str)
+        or not native_session_id
+        or not isinstance(timestamp, str)
+        or not timestamp
+    ):
+        return None
+    entry_type = entry.get("type")
+    if entry_type == "queue-operation":
+        operation = entry.get("operation")
+        if operation not in {"popAll", "enqueue"}:
+            return None
+        content = entry.get("content")
+        if not isinstance(content, str):
+            return None
+        text = _unwrap_pasted_content_markers(content).strip()
+        if not text:
+            return None
+        return ClaudeQueueOperation(
+            operation=operation,
+            content=text,
+            timestamp=timestamp,
+            native_session_id=native_session_id,
+            byte_offset=byte_offset,
+        )
+    if (
+        entry_type != "user"
+        or entry.get("isSidechain") is True
+        or entry.get("isMeta") is True
+        or entry.get("agentId")
+    ):
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if isinstance(content, list):
+        if not content or not all(
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            for block in content
+        ):
+            return None
+        content = "\n".join(str(block["text"]) for block in content)
+    if not isinstance(content, str):
+        return None
+    first_line = content.strip().split("\n", 1)[0]
+    if _CLAUDE_TRANSCRIPT_INTERRUPT_RE.match(first_line) is None:
+        return None
+    return ClaudeQueueOperation(
+        operation="interrupt",
+        content="",
+        timestamp=timestamp,
+        native_session_id=native_session_id,
+        byte_offset=byte_offset,
+    )
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:

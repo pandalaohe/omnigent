@@ -201,6 +201,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_PULL_REQUESTS_TYPE,
+    _EXTERNAL_QUEUE_OPERATIONS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -347,7 +348,10 @@ from omnigent.server.routes._sessions.orchestration import (
     _recover_side_chat_runner_via_source,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
+    _schedule_returned_input_settlement_retry,
     _session_is_moving,
+    _settle_inputs_taken_from_queue,
+    _settle_queue_operations,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -462,7 +466,7 @@ _RetryFlight = tuple[str, str | None]
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
     WorkspaceScopedCache()
 )
-_interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
+_interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[bool]] = WorkspaceScopedCache()
 
 # Leading text of the runner's sub-agent wake notice
 # (``omnigent.runner.app._format_subagent_wake_notice``).
@@ -475,8 +479,12 @@ async def _deliver_interrupt_once(
     runner_router: RunnerRouter | None,
     *,
     startup_cancelled_before_dispatch: bool = False,
-) -> None:
-    """Forward one interrupt and publish only after the runner accepts it."""
+) -> bool:
+    """Forward one interrupt and publish only after the runner accepts it.
+
+    :returns: ``True`` when the runner accepted and cancelled an active turn,
+        ``False`` when nothing was interrupted (e.g. already idle).
+    """
     # Read before the forward so a message sent after Stop stays live; marked
     # only if the interrupt lands, else the turn may still run them.
     queued_pending_ids = pending_inputs.pending_ids(session_id)
@@ -490,7 +498,7 @@ async def _deliver_interrupt_once(
         # so the turn's remaining output isn't dropped and a retry can forward.
         _interrupt_fenced_sessions.discard(session_id)
         if runner_result is None and startup_cancelled_before_dispatch:
-            return
+            return False
         if runner_result is None:
             message = (
                 "Interrupt was not delivered because no live runner was available. "
@@ -516,22 +524,33 @@ async def _deliver_interrupt_once(
             # settled before this delayed control arrived. Nothing was cancelled,
             # so do not fence output or publish a false cancelled decoration.
             _interrupt_fenced_sessions.discard(session_id)
-            return
+            return False
     # The runner accepted and cancelled the turn: flag the web inputs queued at
     # the snapshot as interrupted so they don't look live in a later turn.
-    pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+    raw_native_session_id = runner_result.headers.get("x-omnigent-native-session-id")
+    raw_offset = runner_result.headers.get("x-omnigent-transcript-byte-offset")
+    transcript_byte_offset: int | None = None
+    if isinstance(raw_offset, str) and raw_offset.isdigit():
+        transcript_byte_offset = int(raw_offset)
+    pending_inputs.mark_interrupted(
+        session_id,
+        queued_pending_ids,
+        native_session_id=raw_native_session_id if raw_native_session_id else None,
+        transcript_byte_offset=transcript_byte_offset,
+    )
     if session_id not in _interrupt_fenced_sessions:
         # A terminal or next-running edge won the race while Runner handled the
         # control. That edge is authoritative; publishing interrupted now would
         # retroactively cancel the settled/new turn in connected clients.
-        return
+        return True
     # Only tell clients that the turn was interrupted after the runner confirms
     # that the native bridge/app-server accepted the control and the original
     # turn fence still identifies the same unsettled boundary.
     _publish_interrupted(session_id)
+    return True
 
 
-def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> None:
+def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[bool]) -> None:
     """Drop a completed delivery task without cancelling shared delivery."""
     if _interrupt_delivery_tasks.get(session_id) is task:
         _interrupt_delivery_tasks.pop(session_id, None)
@@ -2447,6 +2466,7 @@ def register_events_routes(
         if body.type in {
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
         } and not _has_bound_runner_authority(request, conv):
             # Owner-authenticated local forwarders also report native settings.
             await _require_access_and_level(
@@ -2689,6 +2709,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_GOAL_STATE_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -3361,7 +3382,22 @@ def register_events_routes(
                     )
                 # Multiple clients share the same delivery result. Shield it so one
                 # disconnected request cannot cancel the interrupt for every waiter.
-                await asyncio.shield(delivery)
+                interrupted = await asyncio.shield(delivery)
+                if interrupted:
+                    # Claude's popAll records may have arrived before this interrupt landed.
+                    unsettled = await _settle_inputs_taken_from_queue(
+                        conversation_store,
+                        session_id,
+                        pending_inputs.returned_interrupted_ids(session_id),
+                        "native_input_returned_to_composer",
+                    )
+                    if unsettled:
+                        _schedule_returned_input_settlement_retry(
+                            conversation_store,
+                            session_id,
+                            unsettled,
+                            "native_input_returned_to_composer",
+                        )
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -5075,6 +5111,9 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_GOAL_STATE_TYPE:
             await _persist_external_goal_state(session_id, conv, body, conversation_store)
+            return {"queued": False}
+        if body.type == _EXTERNAL_QUEUE_OPERATIONS_TYPE:
+            await _settle_queue_operations(conversation_store, session_id, body.data)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id, existing_child = await _persist_subagent_start_with_archive_fence(

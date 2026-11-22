@@ -35,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
+    ClaudeQueueOperation,
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptCostLedger,
@@ -1093,6 +1094,17 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # Queue / terminal-interrupt records already accepted or abandoned after
+    # exhausting retries, keyed by (native_session_id, byte_offset, operation),
+    # so a stalled cursor re-read can never reset the retry cap.
+    posted_queue_operations: dict[tuple[str, int, str], None] = field(default_factory=dict)
+    # Queue / terminal-interrupt records read past forwarded items but not yet
+    # accepted by the server, retried after backoff.
+    unreported_queue_operations: dict[tuple[str, int, str], ClaudeQueueOperation] = field(
+        default_factory=dict
+    )
+    # Set once an older server rejects external_queue_operations as unknown.
+    queue_operations_unsupported: bool = False
 
 
 def _provider_usage_limits_should_post(
@@ -7505,7 +7517,7 @@ async def _forward_available_items(
     # awaited POSTs.
     cancelled = False
     try:
-        return await _forward_transcript_item_batch(
+        forwarded = await _forward_transcript_item_batch(
             client=client,
             session_id=session_id,
             bridge_dir=bridge_dir,
@@ -7516,6 +7528,17 @@ async def _forward_available_items(
             dedupe=dedupe,
             result=result,
         )
+        # After the items, gated to offsets strictly behind the forwarded cursor
+        # so any same-batch mirror of an absorbed prompt settles first.
+        await _post_external_queue_operations(
+            client,
+            session_id=session_id,
+            operations=result.queue_operations,
+            forwarded_byte_offset=forwarded.byte_offset,
+            dedupe=dedupe,
+            retry_tracker=retry_tracker,
+        )
+        return forwarded
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -7528,6 +7551,122 @@ async def _forward_available_items(
                 dedupe=dedupe,
                 result=result,
             )
+
+
+_MAX_POSTED_QUEUE_OPERATIONS = 256
+_QUEUE_OPERATIONS_RETRY_KEY = "queue_operations"
+# Failed posts before unreported queue records are dropped; their inputs then
+# settle when their lease ends, as without the report.
+_QUEUE_OPERATIONS_MAX_ATTEMPTS = 5
+
+
+def _rejects_unknown_event_type(resp: httpx.Response, event_type: str) -> bool:
+    """Whether an older server rejected *event_type* as an unknown event type."""
+    if resp.status_code != 400:
+        return False
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == "invalid_input"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith(f"Unknown event type: {event_type!r}.")
+    )
+
+
+def _record_done_queue_keys(
+    dedupe: _ForwardDedupeState, keys: Sequence[tuple[str, int, str]]
+) -> None:
+    for key in keys:
+        dedupe.posted_queue_operations[key] = None
+    while len(dedupe.posted_queue_operations) > _MAX_POSTED_QUEUE_OPERATIONS:
+        del dedupe.posted_queue_operations[next(iter(dedupe.posted_queue_operations))]
+
+
+async def _post_external_queue_operations(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    operations: tuple[ClaudeQueueOperation, ...],
+    forwarded_byte_offset: int | None,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """
+    Report Claude queue and terminal-interrupt records behind *forwarded_byte_offset*.
+
+    Only records strictly behind the forwarded item cursor are queued so any
+    absorbed-prompt mirror settles first. Unreported records wait in *dedupe*
+    and retry after backoff up to :data:`_QUEUE_OPERATIONS_MAX_ATTEMPTS`
+    failures; exhausted keys are marked done so a stalled transcript cursor can
+    never reset the cap.
+    """
+    if dedupe.queue_operations_unsupported:
+        return
+    if forwarded_byte_offset is not None:
+        for operation in operations:
+            if operation.byte_offset >= forwarded_byte_offset:
+                continue
+            key = (operation.native_session_id, operation.byte_offset, operation.operation)
+            if key not in dedupe.posted_queue_operations:
+                dedupe.unreported_queue_operations.setdefault(key, operation)
+    while len(dedupe.unreported_queue_operations) > _MAX_POSTED_QUEUE_OPERATIONS:
+        del dedupe.unreported_queue_operations[next(iter(dedupe.unreported_queue_operations))]
+    unreported = dict(dedupe.unreported_queue_operations)
+    if not unreported or retry_tracker.retry_delay_s(_QUEUE_OPERATIONS_RETRY_KEY) is not None:
+        return
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_queue_operations",
+                "data": {
+                    "operations": [
+                        {
+                            "operation": operation.operation,
+                            "content": operation.content,
+                            "timestamp": operation.timestamp,
+                            "native_session_id": operation.native_session_id,
+                            "byte_offset": operation.byte_offset,
+                        }
+                        for operation in unreported.values()
+                    ]
+                },
+            },
+        )
+        if _rejects_unknown_event_type(resp, "external_queue_operations"):
+            dedupe.queue_operations_unsupported = True
+            dedupe.unreported_queue_operations.clear()
+            retry_tracker.clear(_QUEUE_OPERATIONS_RETRY_KEY)
+            return
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(
+            _QUEUE_OPERATIONS_RETRY_KEY,
+            exc,
+            session_id=session_id,
+            max_transient_attempts=_QUEUE_OPERATIONS_MAX_ATTEMPTS,
+        )
+        if decision.exhausted:
+            _record_done_queue_keys(dedupe, list(unreported))
+            for key in unreported:
+                dedupe.unreported_queue_operations.pop(key, None)
+        _logger.warning(
+            "Failed to forward Claude queue operations; session=%s attempt=%s exhausted=%s",
+            session_id,
+            decision.attempts,
+            decision.exhausted,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    retry_tracker.clear(_QUEUE_OPERATIONS_RETRY_KEY)
+    _record_done_queue_keys(dedupe, list(unreported))
+    for key in unreported:
+        dedupe.unreported_queue_operations.pop(key, None)
 
 
 async def _forward_transcript_item_batch(

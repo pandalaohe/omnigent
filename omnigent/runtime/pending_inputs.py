@@ -121,6 +121,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from cachetools import TTLCache
@@ -275,6 +276,17 @@ class DrainedInput:
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
     runner_claim_owner: str | None = None
+    agent_received: bool = False
+    submit_native_session_id: str | None = None
+    submit_byte_offset: int | None = None
+    interrupted_at: float | None = None
+    interrupt_native_session_id: str | None = None
+    interrupt_byte_offset: int | None = None
+    last_enqueued_byte_offset: int | None = None
+    returned_native_session_id: str | None = None
+    returned_byte_offset: int | None = None
+    returned_timestamp_s: float | None = None
+    returned_at: float | None = None
 
 
 @dataclass
@@ -365,6 +377,20 @@ class _Entry:
     runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
+    # Pinned native transcript position right before this attempt was pasted.
+    submit_native_session_id: str | None = None
+    submit_byte_offset: int | None = None
+    # First Stop that interrupted this input (:func:`_now` clock and transcript boundary).
+    interrupted_at: float | None = None
+    interrupt_native_session_id: str | None = None
+    interrupt_byte_offset: int | None = None
+    # Highest transcript offset where a matching ``enqueue`` was observed for this input.
+    last_enqueued_byte_offset: int | None = None
+    # Highest transcript offset where ``popAll`` returned this input to the composer.
+    returned_native_session_id: str | None = None
+    returned_byte_offset: int | None = None
+    returned_timestamp_s: float | None = None
+    returned_at: float | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -379,6 +405,16 @@ _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] = (
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
 )
+# Recent native ``[Request interrupted by user...]`` transcript records per
+# session, keyed by ``(native_session_id, byte_offset)`` -> parsed UTC epoch.
+_terminal_interrupts: WorkspaceScopedCache[str, dict[tuple[str, int], float]] = (
+    WorkspaceScopedCache()
+)
+_MAX_TERMINAL_INTERRUPTS_PER_CONVERSATION = 64
+# Max arrival skew between Omnigent Stop and its ``popAll`` record.
+_STOP_POP_WINDOW_S = 30.0
+# Max Claude-clock delta between ``popAll`` and ``[Request interrupted by user...]``.
+_TERMINAL_ESC_POP_WINDOW_S = 15.0
 _lock = threading.Lock()
 
 # Optional check the server wires to its cached session status; called under
@@ -796,6 +832,8 @@ def mark_lifecycle(
     native_turn_id: str | None = None,
     lifecycle_response_id: str | None = None,
     input_received: bool = False,
+    native_session_id: str | None = None,
+    transcript_byte_offset: int | None = None,
 ) -> str | None:
     """
     Attach one identity-linked runner lifecycle edge to a queued input.
@@ -857,6 +895,14 @@ def mark_lifecycle(
                 and _now() - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
             ):
                 entry.agent_received = True
+                if (
+                    isinstance(native_session_id, str)
+                    and native_session_id
+                    and type(transcript_byte_offset) is int
+                    and transcript_byte_offset >= 0
+                ):
+                    entry.submit_native_session_id = native_session_id
+                    entry.submit_byte_offset = transcript_byte_offset
             return entry.pending_id
     return None
 
@@ -1078,7 +1124,13 @@ def pending_ids(conversation_id: str) -> list[str]:
         ]
 
 
-def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
+def mark_interrupted(
+    conversation_id: str,
+    ids: Iterable[str],
+    *,
+    native_session_id: str | None = None,
+    transcript_byte_offset: int | None = None,
+) -> None:
     """
     Flag entries the person cancelled by interrupting the session's turn.
 
@@ -1087,18 +1139,252 @@ def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
     of recording it as undelivered. Only entries still queued and unheld are
     flagged: one a mirror already took is settled, and one recorded after the
     ids were read (a message sent right after Stop) is not a cancelled one.
+    An entry already interrupted by an earlier Stop keeps that first Stop's
+    timestamp and transcript boundary so a later Stop cannot re-attribute it.
     Marking is per process, like the entries themselves.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param ids: Ids read with :func:`pending_ids` before the interrupt was
         forwarded, e.g. ``["pending_a1b2c3"]``.
+    :param native_session_id: Optional Claude transcript session id captured
+        before injecting the interrupt.
+    :param transcript_byte_offset: Optional transcript byte offset captured
+        before injecting the interrupt.
     """
+    valid_boundary = (
+        isinstance(native_session_id, str)
+        and bool(native_session_id)
+        and type(transcript_byte_offset) is int
+        and transcript_byte_offset >= 0
+    )
     with _lock:
+        now = _now()
         entries = _pending.get(conversation_id, {})
         for pending_id in ids:
             entry = entries.get(pending_id)
-            if entry is not None and not entry.held:
-                entry.interrupted = True
+            if entry is None or entry.held or entry.interrupted:
+                continue
+            entry.interrupted = True
+            entry.interrupted_at = now
+            if valid_boundary:
+                entry.interrupt_native_session_id = native_session_id
+                entry.interrupt_byte_offset = transcript_byte_offset
+
+
+def _parse_iso_timestamp_s(timestamp: str) -> float | None:
+    """Parse an aware ISO-8601 timestamp into UTC epoch seconds, else ``None``."""
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC).timestamp()
+
+
+def _queued_text_matches(entry: _Entry, text: str) -> bool:
+    """Whether Claude's queue record *text* matches this entry's paste."""
+    needle = _collapse_whitespace(text)
+    if not needle:
+        return False
+    own = _collapse_whitespace(_content_text(entry.content))
+    attachments = _attachment_count(entry.content)
+    if not own and attachments > 0:
+        attachment_delivery = attachment_delivery_identity(text)
+        if attachment_delivery is not None and attachment_delivery[1] is not None:
+            attempt_id, count = attachment_delivery
+            return entry.delivery_attempt_id == attempt_id and count == attachments
+        return False
+    return (
+        own == needle
+        or _matches_injected_prefix(entry, needle)
+        or (
+            attachments > 0
+            and bool(own)
+            and _collapse_whitespace(_strip_generated_markers(text, attachments)) == own
+        )
+    )
+
+
+def _entry_eligible_for_queue_op(
+    entry: _Entry, native_session_id: str, byte_offset: int, text: str
+) -> bool:
+    """Whether *entry* was confirmed pasted before *byte_offset* on the same transcript."""
+    return (
+        not entry.held
+        and entry.runner_claim_id is not None
+        and entry.agent_received
+        and entry.submit_native_session_id == native_session_id
+        and entry.submit_byte_offset is not None
+        and byte_offset >= entry.submit_byte_offset
+        and _queued_text_matches(entry, text)
+    )
+
+
+def _entry_settled_by_stop(entry: _Entry) -> bool:
+    """Whether an Omnigent Stop causally returned *entry* to Claude's composer."""
+    return (
+        entry.interrupted
+        and entry.interrupted_at is not None
+        and entry.interrupt_native_session_id is not None
+        and entry.interrupt_byte_offset is not None
+        and entry.returned_native_session_id == entry.interrupt_native_session_id
+        and entry.returned_byte_offset is not None
+        and entry.returned_byte_offset >= entry.interrupt_byte_offset
+        and (
+            entry.last_enqueued_byte_offset is None
+            or entry.returned_byte_offset > entry.last_enqueued_byte_offset
+        )
+        and entry.returned_at is not None
+        and abs(entry.returned_at - entry.interrupted_at) <= _STOP_POP_WINDOW_S
+    )
+
+
+def _entry_settled_by_terminal_esc(conversation_id: str, entry: _Entry) -> bool:
+    """Whether a native transcript interrupt paired with ``popAll`` returned *entry*."""
+    if (
+        entry.returned_native_session_id is None
+        or entry.returned_byte_offset is None
+        or entry.returned_timestamp_s is None
+        or entry.submit_native_session_id != entry.returned_native_session_id
+        or entry.submit_byte_offset is None
+    ):
+        return False
+    if (
+        entry.last_enqueued_byte_offset is not None
+        and entry.returned_byte_offset <= entry.last_enqueued_byte_offset
+    ):
+        return False
+    interrupts = _terminal_interrupts.get(conversation_id)
+    if not interrupts:
+        return False
+    for (esc_sid, esc_offset), esc_ts in interrupts.items():
+        if esc_sid != entry.submit_native_session_id:
+            continue
+        if esc_offset < entry.submit_byte_offset:
+            continue
+        if (
+            entry.last_enqueued_byte_offset is not None
+            and esc_offset < entry.last_enqueued_byte_offset
+        ):
+            continue
+        if abs(entry.returned_timestamp_s - esc_ts) <= _TERMINAL_ESC_POP_WINDOW_S:
+            return True
+    return False
+
+
+def apply_queue_operation(
+    conversation_id: str,
+    *,
+    operation: str,
+    content: str,
+    timestamp: str,
+    native_session_id: str,
+    byte_offset: int,
+) -> list[str]:
+    """
+    Apply one transcript queue or terminal-interrupt record and return settleable ids.
+
+    Every attribution requires positive attempt evidence (``agent_received``
+    plus the attempt's pinned ``(submit_native_session_id, submit_byte_offset)``)
+    so replays after any cache expiry or same-text retries at later transcript
+    offsets can never match a different attempt.
+    """
+    if (
+        not isinstance(native_session_id, str)
+        or not native_session_id
+        or type(byte_offset) is not int
+        or byte_offset < 0
+    ):
+        return []
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        entries = _pending.get(conversation_id, {})
+        if operation == "enqueue":
+            matches = [
+                candidate
+                for candidate in entries.values()
+                if _entry_eligible_for_queue_op(candidate, native_session_id, byte_offset, content)
+            ]
+            if len(matches) == 1:
+                entry = matches[0]
+                if (
+                    entry.last_enqueued_byte_offset is None
+                    or byte_offset > entry.last_enqueued_byte_offset
+                ):
+                    entry.last_enqueued_byte_offset = byte_offset
+                if (
+                    entry.returned_byte_offset is not None
+                    and entry.returned_byte_offset <= byte_offset
+                ):
+                    entry.returned_native_session_id = None
+                    entry.returned_byte_offset = None
+                    entry.returned_timestamp_s = None
+                    entry.returned_at = None
+            return []
+        if operation == "interrupt":
+            esc_ts = _parse_iso_timestamp_s(timestamp)
+            if esc_ts is None:
+                return []
+            interrupts = _terminal_interrupts.setdefault(conversation_id, {})
+            interrupts[(native_session_id, byte_offset)] = esc_ts
+            while len(interrupts) > _MAX_TERMINAL_INTERRUPTS_PER_CONVERSATION:
+                del interrupts[next(iter(interrupts))]
+            return [
+                entry.pending_id
+                for entry in entries.values()
+                if not entry.held and _entry_settled_by_terminal_esc(conversation_id, entry)
+            ]
+        if operation != "popAll":
+            return []
+        matches = [
+            candidate
+            for candidate in entries.values()
+            if _entry_eligible_for_queue_op(candidate, native_session_id, byte_offset, content)
+        ]
+        if len(matches) != 1:
+            return []
+        entry = matches[0]
+        if (
+            entry.last_enqueued_byte_offset is not None
+            and byte_offset <= entry.last_enqueued_byte_offset
+        ):
+            return []
+        ts_s = _parse_iso_timestamp_s(timestamp)
+        if entry.returned_byte_offset is None or byte_offset > entry.returned_byte_offset:
+            entry.returned_native_session_id = native_session_id
+            entry.returned_byte_offset = byte_offset
+            entry.returned_timestamp_s = ts_s
+            entry.returned_at = now
+        elif byte_offset < entry.returned_byte_offset:
+            return []
+        if _entry_settled_by_stop(entry) or _entry_settled_by_terminal_esc(conversation_id, entry):
+            return [entry.pending_id]
+        return []
+
+
+def returned_interrupted_ids(conversation_id: str) -> list[str]:
+    """Ids of inputs causally returned to Claude's composer by their own Stop."""
+    with _lock:
+        return [
+            pending_id
+            for pending_id, entry in _pending.get(conversation_id, {}).items()
+            if not entry.held and _entry_settled_by_stop(entry)
+        ]
+
+
+def is_returned_for_interrupt(conversation_id: str, pending_id: str) -> bool:
+    """Whether *pending_id* is still claimed and proven returned by Stop or terminal Esc."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None or entry.held or entry.runner_claim_id is None:
+            return False
+        return _entry_settled_by_stop(entry) or _entry_settled_by_terminal_esc(
+            conversation_id, entry
+        )
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:
@@ -1144,6 +1430,17 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
         runner_claim_owner=drained.runner_claim_owner,
+        agent_received=drained.agent_received,
+        submit_native_session_id=drained.submit_native_session_id,
+        submit_byte_offset=drained.submit_byte_offset,
+        interrupted_at=drained.interrupted_at,
+        interrupt_native_session_id=drained.interrupt_native_session_id,
+        interrupt_byte_offset=drained.interrupt_byte_offset,
+        last_enqueued_byte_offset=drained.last_enqueued_byte_offset,
+        returned_native_session_id=drained.returned_native_session_id,
+        returned_byte_offset=drained.returned_byte_offset,
+        returned_timestamp_s=drained.returned_timestamp_s,
+        returned_at=drained.returned_at,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1521,6 +1818,17 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
         runner_claim_owner=entry.runner_claim_owner,
+        agent_received=entry.agent_received,
+        submit_native_session_id=entry.submit_native_session_id,
+        submit_byte_offset=entry.submit_byte_offset,
+        interrupted_at=entry.interrupted_at,
+        interrupt_native_session_id=entry.interrupt_native_session_id,
+        interrupt_byte_offset=entry.interrupt_byte_offset,
+        last_enqueued_byte_offset=entry.last_enqueued_byte_offset,
+        returned_native_session_id=entry.returned_native_session_id,
+        returned_byte_offset=entry.returned_byte_offset,
+        returned_timestamp_s=entry.returned_timestamp_s,
+        returned_at=entry.returned_at,
     )
 
 
@@ -1705,3 +2013,4 @@ def reset_for_tests() -> None:
     with _lock:
         _pending.clear()
         _unconfirmed_input_texts.clear()
+        _terminal_interrupts.clear()

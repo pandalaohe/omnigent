@@ -1243,3 +1243,347 @@ async def test_an_unrecovered_stream_still_exhausts_its_grace(
         orchestration._session_status_cache.pop(session_id, None)
         orchestration._session_active_response_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+def _confirm_paste_with_boundary(
+    session_id: str,
+    pending_id: str,
+    *,
+    native_session_id: str = "native-1",
+    byte_offset: int = 100,
+) -> None:
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    orchestration._record_native_input_lifecycle(
+        session_id,
+        {
+            "type": "response.completed",
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+            "input_received": True,
+            "native_session_id": native_session_id,
+            "transcript_byte_offset": byte_offset,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order",
+    [
+        "stop-then-pop",
+        "pop-during-stop",
+        "up-arrow-then-stop",
+        "esc-pop-then-interrupt",
+        "esc-interrupt-then-pop",
+    ],
+)
+async def test_stop_and_terminal_esc_settle_returned_pastes_causally(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    """Stop and terminal Esc settle only causally attributed returned pastes."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    session_id = conv.id
+    now = 100.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pid = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "Then summarize"}], runner_managed=True
+    )
+    try:
+        assert pending_inputs.claim_runner_input(session_id, pid, "paste", runner_id="runner_a")
+        _confirm_paste_with_boundary(session_id, pid, byte_offset=100)
+        if order == "stop-then-pop":
+            pending_inputs.mark_interrupted(
+                session_id, [pid], native_session_id="native-1", transcript_byte_offset=150
+            )
+            now = 105.0
+            await orchestration._settle_queue_operations(
+                store,
+                session_id,
+                {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "Then summarize",
+                            "timestamp": "2026-11-21T05:00:05.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 160,
+                        }
+                    ]
+                },
+            )
+        elif order == "pop-during-stop":
+            # popAll lands before Stop's HTTP response returns; offset 160 >= Stop's 150.
+            await orchestration._settle_queue_operations(
+                store,
+                session_id,
+                {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "Then summarize",
+                            "timestamp": "2026-11-21T05:00:05.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 160,
+                        }
+                    ]
+                },
+            )
+            now = 101.0
+            pending_inputs.mark_interrupted(
+                session_id, [pid], native_session_id="native-1", transcript_byte_offset=150
+            )
+            await orchestration._settle_inputs_taken_from_queue(
+                store,
+                session_id,
+                pending_inputs.returned_interrupted_ids(session_id),
+                "native_input_returned_to_composer",
+            )
+        elif order == "up-arrow-then-stop":
+            # Up-arrow popped at 120 before Stop captured boundary 150.
+            await orchestration._settle_queue_operations(
+                store,
+                session_id,
+                {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "Then summarize",
+                            "timestamp": "2026-11-21T05:00:01.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 120,
+                        }
+                    ]
+                },
+            )
+            now = 105.0
+            pending_inputs.mark_interrupted(
+                session_id, [pid], native_session_id="native-1", transcript_byte_offset=150
+            )
+            await orchestration._settle_inputs_taken_from_queue(
+                store,
+                session_id,
+                pending_inputs.returned_interrupted_ids(session_id),
+                "native_input_returned_to_composer",
+            )
+        elif order == "esc-pop-then-interrupt":
+            await orchestration._settle_queue_operations(
+                store,
+                session_id,
+                {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "Then summarize",
+                            "timestamp": "2026-11-21T05:00:05.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 140,
+                        },
+                        {
+                            "operation": "interrupt",
+                            "content": "",
+                            "timestamp": "2026-11-21T05:00:05.050Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 150,
+                        },
+                    ]
+                },
+            )
+        else:
+            await orchestration._settle_queue_operations(
+                store,
+                session_id,
+                {
+                    "operations": [
+                        {
+                            "operation": "interrupt",
+                            "content": "",
+                            "timestamp": "2026-11-21T05:00:05.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 140,
+                        },
+                        {
+                            "operation": "popAll",
+                            "content": "Then summarize",
+                            "timestamp": "2026-11-21T05:00:05.080Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 150,
+                        },
+                    ]
+                },
+            )
+
+        errors = [item for item in store.list_items(session_id).data if item.type == "error"]
+        if order == "up-arrow-then-stop":
+            assert errors == []
+            assert pending_inputs.runner_input_is_claimed(session_id, pid)
+        else:
+            assert [err.data.model_dump()["code"] for err in errors] == [
+                "native_input_returned_to_composer"
+            ]
+            assert not pending_inputs.runner_input_is_claimed(session_id, pid)
+    finally:
+        pending_inputs.resolve(session_id, pid)
+
+
+@pytest.mark.asyncio
+async def test_same_text_retry_and_expired_dedupe_never_settle_newer_attempt(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    R2-B1 regression: replaying A's popAll after any dedupe expiry cannot settle
+    a same-text retry B, and shared-text concurrent claims stay unsettled.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    session_id = conv.id
+    now = 100.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+
+    first = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "continue"}], runner_managed=True
+    )
+    second: str | None = None
+    third: str | None = None
+    try:
+        assert pending_inputs.claim_runner_input(
+            session_id, first, "claim-1", runner_id="runner_a"
+        )
+        _confirm_paste_with_boundary(session_id, first, byte_offset=100)
+        pending_inputs.mark_interrupted(
+            session_id, [first], native_session_id="native-1", transcript_byte_offset=150
+        )
+        old_pop = {
+            "operations": [
+                {
+                    "operation": "popAll",
+                    "content": "continue",
+                    "timestamp": "2026-11-21T05:00:05.000Z",
+                    "native_session_id": "native-1",
+                    "byte_offset": 160,
+                }
+            ]
+        }
+        await orchestration._settle_queue_operations(store, session_id, old_pop)
+        assert not pending_inputs.runner_input_is_claimed(session_id, first)
+
+        # Advance far past the 600 s TTL and clear terminal interrupt cache.
+        now = 1000.0
+        pending_inputs._terminal_interrupts.clear()
+        second = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "continue"}], runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input(
+            session_id, second, "claim-2", runner_id="runner_a"
+        )
+        _confirm_paste_with_boundary(session_id, second, byte_offset=500)
+        pending_inputs.mark_interrupted(
+            session_id, [second], native_session_id="native-1", transcript_byte_offset=550
+        )
+        # Replaying A's old popAll must NOT settle B.
+        await orchestration._settle_queue_operations(store, session_id, old_pop)
+        assert pending_inputs.runner_input_is_claimed(session_id, second)
+
+        # Two simultaneously claimed same-text inputs: popAll is ambiguous and skips both.
+        third = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "continue"}], runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input(
+            session_id, third, "claim-3", runner_id="runner_a"
+        )
+        _confirm_paste_with_boundary(session_id, third, byte_offset=520)
+        await orchestration._settle_queue_operations(
+            store,
+            session_id,
+            {
+                "operations": [
+                    {
+                        "operation": "popAll",
+                        "content": "continue",
+                        "timestamp": "2026-11-21T05:15:05.000Z",
+                        "native_session_id": "native-1",
+                        "byte_offset": 560,
+                    }
+                ]
+            },
+        )
+        assert pending_inputs.runner_input_is_claimed(session_id, second)
+        assert pending_inputs.runner_input_is_claimed(session_id, third)
+    finally:
+        pending_inputs.resolve(session_id, first)
+        if second is not None:
+            pending_inputs.resolve(session_id, second)
+        if third is not None:
+            pending_inputs.resolve(session_id, third)
+
+
+@pytest.mark.asyncio
+async def test_transient_store_failure_recovers_on_both_pop_first_and_stop_first(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2-S2 regression: transient DB append failures retry and settle cleanly."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    session_id = conv.id
+    now = 100.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr(orchestration, "_RETURNED_INPUT_SETTLE_RETRY_DELAYS_S", (0.0,))
+
+    pid = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "retry persist"}], runner_managed=True
+    )
+    try:
+        assert pending_inputs.claim_runner_input(session_id, pid, "claim-db", runner_id="runner_a")
+        _confirm_paste_with_boundary(session_id, pid, byte_offset=100)
+        # popAll arrives first while Stop is in flight.
+        await orchestration._settle_queue_operations(
+            store,
+            session_id,
+            {
+                "operations": [
+                    {
+                        "operation": "popAll",
+                        "content": "retry persist",
+                        "timestamp": "2026-11-21T05:00:05.000Z",
+                        "native_session_id": "native-1",
+                        "byte_offset": 160,
+                    }
+                ]
+            },
+        )
+        pending_inputs.mark_interrupted(
+            session_id, [pid], native_session_id="native-1", transcript_byte_offset=150
+        )
+        real_append = store.append
+        fail_once = {"remaining": 1}
+
+        def flaky_append(*args: object, **kwargs: object):
+            if fail_once["remaining"] > 0:
+                fail_once["remaining"] -= 1
+                raise RuntimeError("transient db error")
+            return real_append(*args, **kwargs)
+
+        monkeypatch.setattr(store, "append", flaky_append)
+        unsettled = await orchestration._settle_inputs_taken_from_queue(
+            store,
+            session_id,
+            pending_inputs.returned_interrupted_ids(session_id),
+            "native_input_returned_to_composer",
+        )
+        assert unsettled == [pid]
+        assert pending_inputs.runner_input_is_claimed(session_id, pid)
+
+        # Scheduled retry settles the exact entry once DB recovers.
+        orchestration._schedule_returned_input_settlement_retry(
+            store, session_id, unsettled, "native_input_returned_to_composer"
+        )
+        await asyncio.gather(*list(orchestration._runner_input_lease_tasks))
+        assert not pending_inputs.runner_input_is_claimed(session_id, pid)
+        errors = [item for item in store.list_items(session_id).data if item.type == "error"]
+        assert [err.data.model_dump()["code"] for err in errors] == [
+            "native_input_returned_to_composer"
+        ]
+    finally:
+        pending_inputs.resolve(session_id, pid)

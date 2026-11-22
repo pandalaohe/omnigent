@@ -596,6 +596,8 @@ class TurnContext:
         self.provider_usage: dict[str, Any] | None = None
         # Set when the executor confirmed its native terminal holds the input.
         self.input_received = False
+        self.input_native_session_id: str | None = None
+        self.input_transcript_byte_offset: int | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -2411,6 +2413,10 @@ class HarnessApp:
                 response=response,
                 sequence_number=sequence,
                 input_received=True if ctx.input_received else None,
+                native_session_id=(ctx.input_native_session_id if ctx.input_received else None),
+                transcript_byte_offset=(
+                    ctx.input_transcript_byte_offset if ctx.input_received else None
+                ),
             )
         elif status_value == "failed":
             terminal = FailedEvent(

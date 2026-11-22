@@ -8,7 +8,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +66,37 @@ def set_stage(stage: str) -> None:
 _prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
     "claude_prompt_delivery_trace", default=None
 )
+
+
+@dataclass
+class _SubmitBoundarySink:
+    """Mutable holder shared across ``asyncio.to_thread`` for one submit attempt."""
+
+    boundary: tuple[str, int] | None = None
+
+
+_submit_boundary_sink: ContextVar[_SubmitBoundarySink | None] = ContextVar(
+    "claude_submit_boundary_sink", default=None
+)
+
+
+@contextlib.contextmanager
+def capture_submit_boundary_sink() -> Iterator[_SubmitBoundarySink]:
+    """Capture the transcript boundary recorded immediately before paste."""
+    sink = _SubmitBoundarySink()
+    token = _submit_boundary_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _submit_boundary_sink.reset(token)
+
+
+@_best_effort
+def record_submit_boundary(native_session_id: str, byte_offset: int) -> None:
+    """Store the transcript position pinned right before pasting this attempt."""
+    sink = _submit_boundary_sink.get()
+    if sink is not None and native_session_id and byte_offset >= 0:
+        sink.boundary = (native_session_id, byte_offset)
 
 
 @_best_effort

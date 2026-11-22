@@ -14,6 +14,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.bridge import (
     _SCROLLED_DRAFT_SURFACE,
     BRIDGE_DIR_ENV_VAR,
@@ -679,6 +680,7 @@ class ClaudeNativeExecutor(Executor):
         loop = asyncio.get_running_loop()
         delivery_claimed = False
         submit_confirmed = False
+        submit_boundary: tuple[str, int] | None = None
 
         async def claim_delivery(deadline: float) -> bool:
             nonlocal delivery_claimed
@@ -715,9 +717,11 @@ class ClaudeNativeExecutor(Executor):
                         owner: ClaudeDeliveryOwner | None = None
                         try:
                             owner = read_delivery_owner(self._bridge_dir)
-                            submit_confirmed = await self._inject_turn(
-                                text, notices, wanted_model, wanted_model_arg
-                            )
+                            with delivery_diagnostics.capture_submit_boundary_sink() as sink:
+                                submit_confirmed = await self._inject_turn(
+                                    text, notices, wanted_model, wanted_model_arg
+                                )
+                            submit_boundary = sink.boundary
                         except ClaudePromptTimeout as exc:
                             # The bridge classifies post-paste failures before they reach cleanup.
                             exited = isinstance(exc, ClaudeTerminalExited)
@@ -856,7 +860,13 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc))
             return
-        yield TurnComplete(response=None, input_received=delivery_claimed and submit_confirmed)
+        received = delivery_claimed and submit_confirmed
+        yield TurnComplete(
+            response=None,
+            input_received=received,
+            native_session_id=submit_boundary[0] if received and submit_boundary else None,
+            transcript_byte_offset=submit_boundary[1] if received and submit_boundary else None,
+        )
 
     async def _inject(self, operation: Callable[[], object]) -> object:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""

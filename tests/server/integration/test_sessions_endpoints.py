@@ -20264,3 +20264,166 @@ async def test_external_error_item_model_unavailable_card_live_and_after_reload(
         assert shown["message"] == item_data["message"]
         for field, value in card.items():
             assert shown.get(field) == value, (field, shown)
+
+
+@pytest.mark.asyncio
+async def test_stop_that_interrupted_nothing_never_settles_with_prior_stop_mark(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    R2-B2 regression: a later Stop returning interrupted=false must never settle
+    an earlier Stop's pending entry when an Up-arrow popAll arrives during Stop 2.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    pending_inputs.reset_for_tests()
+    now = 100.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    pid = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "absorbed earlier"}], runner_managed=True
+    )
+    attempt = str(pending_inputs.delivery_attributes_for(sid, pid)["delivery_attempt_id"])
+    assert pending_inputs.claim_runner_input(sid, pid, "claim-1", runner_id="runner_a")
+    pending_inputs.mark_lifecycle(
+        sid,
+        pending_id=pid,
+        delivery_attempt_id=attempt,
+        stage="native_turn_completed",
+        input_received=True,
+        native_session_id="native-1",
+        transcript_byte_offset=100,
+    )
+
+    try:
+        # Stop 1 genuinely interrupts at offset 150.
+        async def stop_one(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+            return _RunnerForwardResult(
+                status_code=204,
+                body="",
+                headers={
+                    "x-omnigent-native-session-id": "native-1",
+                    "x-omnigent-transcript-byte-offset": "150",
+                },
+            )
+
+        monkeypatch.setattr(sessions_routes, "_forward_session_change_to_runner", stop_one)
+        resp1 = await client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+        assert resp1.status_code == 202, resp1.text
+        sessions_routes._interrupt_fenced_sessions.discard(sid)
+
+        # >30 s later, Stop 2 starts; while waiting on runner, an Up-arrow popAll
+        # for a terminal-typed same-text message arrives; runner answers interrupted=false.
+        now = 160.0
+        stop2_waiting = asyncio.Event()
+        release_stop2 = asyncio.Event()
+
+        async def stop_two(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+            stop2_waiting.set()
+            await release_stop2.wait()
+            return _RunnerForwardResult(
+                status_code=200,
+                body=json.dumps({"interrupted": False, "reason": "idle"}),
+            )
+
+        monkeypatch.setattr(sessions_routes, "_forward_session_change_to_runner", stop_two)
+        stop2_task = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+        )
+        await asyncio.wait_for(stop2_waiting.wait(), timeout=5.0)
+        pop_resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "external_queue_operations",
+                "data": {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "absorbed earlier",
+                            "timestamp": "2026-11-21T05:01:00.000Z",
+                            "native_session_id": "native-1",
+                            "byte_offset": 250,
+                        }
+                    ]
+                },
+            },
+        )
+        assert pop_resp.status_code == 202, pop_resp.text
+        release_stop2.set()
+        resp2 = await stop2_task
+        assert resp2.status_code == 202, resp2.text
+
+        # Entry must remain claimed with no false delivery error card.
+        assert pending_inputs.runner_input_is_claimed(sid, pid)
+        items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+        assert [item for item in items if item["type"] == "error"] == []
+    finally:
+        sessions_routes._interrupt_fenced_sessions.discard(sid)
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_terminal_esc_queue_operations_route_settles_without_omnigent_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """F2 end-to-end: terminal Esc popAll + native interrupt settle via /events without Stop."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    pid = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "terminal esc steer"}], runner_managed=True
+    )
+    attempt = str(pending_inputs.delivery_attributes_for(sid, pid)["delivery_attempt_id"])
+    assert pending_inputs.claim_runner_input(sid, pid, "claim-esc", runner_id="runner_a")
+    pending_inputs.mark_lifecycle(
+        sid,
+        pending_id=pid,
+        delivery_attempt_id=attempt,
+        stage="native_turn_completed",
+        input_received=True,
+        native_session_id="native-esc",
+        transcript_byte_offset=100,
+    )
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "external_queue_operations",
+                "data": {
+                    "operations": [
+                        {
+                            "operation": "popAll",
+                            "content": "terminal esc steer",
+                            "timestamp": "2026-11-21T05:05:00.000Z",
+                            "native_session_id": "native-esc",
+                            "byte_offset": 140,
+                        },
+                        {
+                            "operation": "interrupt",
+                            "content": "",
+                            "timestamp": "2026-11-21T05:05:00.040Z",
+                            "native_session_id": "native-esc",
+                            "byte_offset": 150,
+                        },
+                    ]
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        assert not pending_inputs.runner_input_is_claimed(sid, pid)
+        items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+        errors = [item for item in items if item["type"] == "error"]
+        assert [item["code"] for item in errors] == ["native_input_returned_to_composer"]
+    finally:
+        pending_inputs.reset_for_tests()
