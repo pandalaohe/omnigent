@@ -48,7 +48,7 @@
   background: var(--secondary);
   font: inherit;
 }
-/* Desktop controls share one height; grouped controls inset by 3px. */
+/* Keep the same toolbar height for grouped and standalone controls. */
 .rt-segment {
   height: var(--rt-control-h);
   padding: 3px;
@@ -94,6 +94,18 @@
   background: transparent;
   min-width: 27px;
   min-height: calc(var(--rt-control-h) - 6px);
+}
+@media (min-width: 48rem) {
+  .rt-segment,
+  .rt-presets,
+  .rt-zoom {
+    padding-block: 0;
+  }
+  .rt-segment > button,
+  .rt-presets button,
+  .rt-zoom button {
+    min-height: var(--rt-control-h);
+  }
 }
 .rt-help {
   border: 1px solid var(--border);
