@@ -585,6 +585,11 @@ async def record_quota_exhaustion(
     input_generation: int | None = None,
 ) -> None:
     """Record a provider error for the session's server-selected owner and pool."""
+    # Codex can attach a separate approval request's failure to the model turn.
+    lowered = message.casefold()
+    if "approval review failed" in lowered or "model: codex-auto-review" in lowered:
+        return
+
     from omnigent.runner.launch_failure import provider_billing_refusal
     from omnigent.server.auth import RESERVED_USER_LOCAL
     from omnigent.server.session_choice import ProviderRefusal, provider_route

@@ -1202,6 +1202,103 @@ async def test_provider_quota_failure_blocks_pool_until_reset(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["external_session_status", "external_conversation_item"])
+@pytest.mark.parametrize("official_quota", ["exhausted", "reserve"])
+async def test_codex_reviewer_quota_does_not_close_krill_drain(
+    quota_runner, monkeypatch, event_type, official_quota
+):
+    from omnigent.server.session_choice import state_for
+    from tests.server.test_agent_quota import usage_report
+
+    env = quota_runner
+    owner = RESERVED_USER_LOCAL
+    reset = datetime.fromisoformat("2026-11-22T03:19:03+00:00").timestamp()
+    now = reset - 3600
+    monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: now)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex",
+    )
+    agent = env.agents[0]["id"]
+    env.settings["hosts"][HOST]["work"] = [
+        [
+            {
+                "links": [
+                    {"agent": agent, "model": "gpt-small", "meter": "codex-pro"},
+                    {"agent": agent, "model": "ccs-krill/gpt-small", "fallbackMode": "drain"},
+                ]
+            }
+        ]
+    ]
+    env.settings["limits"]["codex-pro"] = {"reserve": {"mode": "total", "window": "7d", "pct": 4}}
+    env.prefs.replace_session_choice(
+        owner, env.settings, env.prefs.session_choice(owner)["revision"]
+    )
+    state = state_for(env.app)
+    if official_quota == "exhausted":
+        state.exhausted[(owner, "codex-pro")] = reset
+    else:
+        quota = usage_report(
+            account_product="codex",
+            observed_at=now,
+            windows=[
+                {"id": "7d", "percent_used": 98, "window_minutes": 10080, "resets_at": reset}
+            ],
+        )
+        env.app.state.agent_quota_service.report_account(owner, "codex-pro", quota, now=now)
+
+    fallback = await create(env)
+    assert fallback.status_code == 201, fallback.text
+    child = fallback.json()
+    assert child["session_choice"]["pool"] == "krill"
+    assert child["session_choice"]["skipped"][0]["why"] == official_quota
+    drain = env.prefs.session_choice_snapshot(owner).locks
+    assert [lock.pool for lock in drain.values()] == ["krill"]
+    exhausted = state.exhausted.copy()
+
+    async def report(message, response_id):
+        if event_type == "external_session_status":
+            data = {"status": "failed", "output": message}
+        else:
+            data = {
+                "item_type": "error",
+                "item_data": {
+                    "message": message,
+                    "source": "execution",
+                    "code": "native_turn_error",
+                },
+                "source_id": response_id,
+            }
+        posted = await env.client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": event_type, "data": {**data, "response_id": response_id}},
+        )
+        assert posted.status_code == 202, posted.text
+
+    # Keep the nested CC Switch refusal from the runner error while omitting session metadata.
+    await report(
+        "Error: sub-agent turn failed: inner executor error: This content was flagged for "
+        "possible cybersecurity risk; approval review failed: unexpected status 403 Forbidden: "
+        "CC Switch local proxy failed while handling Codex endpoint /responses. "
+        "Provider: OpenAI Official; model: codex-auto-review; cause: Codex 官方额度保护 "
+        "(quota protection): 每周 (weekly): 98.00% ≥ 98%（重置 / reset: "
+        "2026-11-22T03:19:03+00:00）",
+        "reviewer-error",
+    )
+    assert (owner, "krill") not in state.exhausted
+    assert state.exhausted == exhausted
+    assert env.prefs.session_choice_snapshot(owner).locks == drain
+
+    following = await create(env)
+    assert following.status_code == 201, following.text
+    assert following.json()["session_choice"]["pool"] == "krill"
+
+    await report("Individual quota reached. Resets in 20m", "model-error")
+    assert state.exhausted[(owner, "krill")] == now + 1200
+    assert not env.prefs.session_choice_snapshot(owner).locks
+
+
+@pytest.mark.asyncio
 async def test_assistant_fallback_is_not_a_provider_quota_rejection(quota_runner):
     from omnigent.entities import MessageData, NewConversationItem
 
