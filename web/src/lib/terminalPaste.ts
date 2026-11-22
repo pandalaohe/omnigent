@@ -155,10 +155,21 @@ export function useTerminalPaste(
     request.session === sessionRef.current &&
     request.session.canPaste();
 
-  const send = (request: PasteRequest, text: string, enter: boolean) => {
+  const showReview = (request: PasteRequest, text: string) => {
+    const next = { request, text };
+    reviewRef.current = next;
+    setReview(next);
+  };
+
+  const send = (request: PasteRequest, text: string, enter: boolean, reviewOnRefusal = false) => {
     if (!isCurrent(request)) return;
+    const sent = request.session.paste(text, enter);
+    if (!sent && reviewOnRefusal && isCurrent(request)) {
+      showReview(request, text);
+      return;
+    }
     cancel();
-    if (!request.session.paste(text, enter)) {
+    if (!sent) {
       toast.error(NOT_CONNECTED);
       return;
     }
@@ -174,11 +185,9 @@ export function useTerminalPaste(
       cancel();
       toast.info("Clipboard is empty");
     } else if (hasLineBreakOrTab && !request.session.pastesBracketed()) {
-      const next = { request, text };
-      reviewRef.current = next;
-      setReview(next);
+      showReview(request, text);
     } else {
-      send(request, text, request.enter && !hasLineBreakOrTab);
+      send(request, text, request.enter && !hasLineBreakOrTab, hasLineBreakOrTab);
     }
   };
 
