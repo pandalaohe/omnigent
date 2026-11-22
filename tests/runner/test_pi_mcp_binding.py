@@ -13,11 +13,13 @@ from omnigent.entities import Conversation
 from omnigent.policies.types import PolicyResult
 from omnigent.runner.mcp_execution_registry import MCP_OPERATION_ID_PARAM
 from omnigent.runner.mcp_manager import RunnerMcpManager
-from omnigent.runner.pi_scope_relay import PiScopeRelay
+from omnigent.runner.pi_scope_relay import PiRpcExecutionError, PiScopeRelay
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_LABEL_KEY,
     PERMISSION_CAPABILITY_VALUE,
+    REGISTRY_TOOL_INSPECTION_HEADER,
     ConfirmedPermissionState,
     read_permission_state,
 )
@@ -49,6 +51,10 @@ from tests.server.routes.test_sessions_mcp_proxy_policy_retry import (
         "wrong-operation",
         "server-replay",
         "registry-replay",
+        "registry-auto",
+        "registry-auto-trailing",
+        "registry-auto-overlapping",
+        "registry-auto-deny",
         "advisor-replay",
         "elicitation-deny",
         "elicitation-allow",
@@ -59,10 +65,14 @@ from tests.server.routes.test_sessions_mcp_proxy_policy_retry import (
 async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
     tmp_path, monkeypatch, fault
 ):
-    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "ask")
+    registry_call = fault.startswith("registry-")
+    tier = "auto" if fault.startswith("registry-auto") else "ask"
+    overlapping = fault == "registry-auto-overlapping"
+    service_id = "fixture_" if overlapping or fault == "registry-auto-trailing" else "fixture"
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
     child = runtime.open_pi_child_scope("session-a")
     tool_name = (
-        "mcp__omnigent__sys_advise_models" if fault == "advisor-replay" else "fixture__echo"
+        "mcp__omnigent__sys_advise_models" if fault == "advisor-replay" else f"{service_id}__echo"
     )
     expected = runtime.pi_scopes.record(child.principal).expected
     _publish_scope(
@@ -87,8 +97,9 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
         expected_revision=3,
         origin_receipt=receipt.token,
         local_execution=False,
+        registry_tool=registry_call,
     )
-    assert decision.action.value == "ASK"
+    assert decision.action.value == ("ALLOW" if tier == "auto" else "ASK")
     assert runtime.authorize(
         "session-a",
         call_id=binding.call_id,
@@ -131,8 +142,25 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
             )
         ],
     )
-    if fault == "registry-replay":
-        spec.mcp_servers = [MCPServerConfig(name="fixture", transport="registry")]
+    registry = None
+    if registry_call:
+        selected = ["fixture", service_id] if overlapping else [service_id]
+        spec.mcp_servers = [MCPServerConfig(name=name, transport="registry") for name in selected]
+        registry = McpRegistry(
+            McpRegistryConfig(
+                services=[
+                    McpService(
+                        id=name,
+                        title="Fixture",
+                        url="https://mcp.example.com",
+                        auth="none",
+                        tools=["echo"],
+                    )
+                    for name in selected
+                ]
+            ),
+            None,
+        )
     state = runtime.state("session-a")
     conversation = Conversation(
         id="session-a",
@@ -143,16 +171,17 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
         agent_id="fixture-agent",
         workspace=state.workspace,
         labels={
-            **ConfirmedPermissionState("ask", 3, "ready").labels("pi-native"),
+            **ConfirmedPermissionState(tier, 3, "ready").labels("pi-native"),
             PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
         },
     )
     assert read_permission_state(conversation.labels, harness="pi-native").status == "ready"
     store = _StubConversationStore(conversation)
+    policy_denied = fault in ("policy-deny", "registry-auto-deny")
     engine = _FixedPolicyEngine(
         PolicyResult(
-            action=PolicyAction.DENY if fault == "policy-deny" else PolicyAction.ALLOW,
-            reason="fixture policy denied" if fault == "policy-deny" else "",
+            action=PolicyAction.DENY if policy_denied else PolicyAction.ALLOW,
+            reason="fixture policy denied" if policy_denied else "",
             data={"text": "changed"} if fault == "transformed" else None,
         )
     )
@@ -215,10 +244,12 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
         server_calls.append(values)
         return {"result": {"output": "echo: SCOPED_MCP_EXECUTED"}}
 
-    if fault == "registry-replay":
+    if registry_call:
         from omnigent.server import registry_gateway
 
-        async def execute_registry(_request, _conv, _config, _name, values, _user):
+        async def execute_registry(_request, _conv, config, name, values, _user):
+            assert config.name == service_id
+            assert name == tool_name
             return await execute_server(values)
 
         monkeypatch.setattr(registry_gateway, "execute_registry_tool", execute_registry)
@@ -260,6 +291,7 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
                             legacy_local_execution=body["local_execution"],
                         ),
                         origin_receipt=body.get("pi_origin_receipt"),
+                        registry_tool=request.headers.get(REGISTRY_TOOL_INSPECTION_HEADER) == "1",
                         **extra,
                     )
                     response = {
@@ -326,8 +358,13 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
 
             async def server_transport(request):
                 body = json.loads(request.content)
-                if fault == "registry-replay":
-                    body["params"]["name"] = "fixture__" + body["params"]["name"]
+                if overlapping:
+                    assert request.url.path == "/v1/sessions/session-a/mcp"
+                    assert body["params"]["name"] == tool_name
+                elif registry_call:
+                    assert request.url.path == f"/v1/mcp/{service_id}"
+                    assert body["params"]["name"] == "echo"
+                    body["params"]["name"] = f"{service_id}__echo"
                 if fault == "missing-operation":
                     body["params"].pop(MCP_OPERATION_ID_PARAM)
                 elif fault == "wrong-operation":
@@ -336,9 +373,9 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
                 server_options = {}
                 if fault == "server-replay":
                     server_options["execute_tool"] = execute_server
-                if fault == "registry-replay" or elicitation:
+                if registry_call or elicitation:
                     server_options["request"] = SimpleNamespace(
-                        app=SimpleNamespace(state=SimpleNamespace(mcp_registry=object()))
+                        app=SimpleNamespace(state=SimpleNamespace(mcp_registry=registry))
                     )
                 result = await sessions._handle_mcp_tools_call(
                     body["id"],
@@ -388,11 +425,19 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
                             dispatch,
                             {binding.name},
                         )
-                    except ValueError:
+                    except PiRpcExecutionError:
                         assert fault in ("wrong-name", "wrong-arguments")
                         assert server_requests == []
                     else:
-                        if fault in ("server-replay", "registry-replay", "advisor-replay"):
+                        assert fault not in ("wrong-name", "wrong-arguments")
+                        if fault in (
+                            "server-replay",
+                            "registry-replay",
+                            "registry-auto",
+                            "registry-auto-trailing",
+                            "registry-auto-overlapping",
+                            "advisor-replay",
+                        ):
                             assert "echo: SCOPED_MCP_EXECUTED" in result["result"], result
                             assert server_calls == [arguments]
                             assert execution_requests == []
@@ -416,6 +461,7 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
                             assert mcp_calls == ["fixture__echo"]
                         else:
                             assert "echo: SCOPED_MCP_EXECUTED" not in str(result)
+                            assert server_calls == []
                             assert execution_requests == []
                             assert mcp_calls == []
                     assert runtime.finish(

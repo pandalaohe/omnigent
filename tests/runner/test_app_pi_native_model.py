@@ -30,7 +30,7 @@ from omnigent.runner.native.orchestration import (
     _pi_native_model_from_spec,
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import seed_pi_permission_state
@@ -278,20 +278,13 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_selection", ["none", "authored", "registry"])
 async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mcp_selection: str,
 ) -> None:
-    """With no spec model, the provider's family default is used (unchanged).
-
-    Guards the ``None`` case: a spec without ``executor.model`` must leave
-    Pi on the provider default (``claude-sonnet-4-6`` here), not break the
-    launch.
-
-    :param tmp_path: Temp dir backing the pi-native bridge root.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """Launch with the provider default and only selected registry MCP tools."""
     import omnigent.harnesses.pi_native.bridge as pi_bridge
     import omnigent.harnesses.pi_native.credentials as creds
 
@@ -315,11 +308,11 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
 
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
-    class _SnapshotClient:
-        async def get(
-            self, url: str, *, timeout: float, params: dict[str, str] | None = None
-        ) -> httpx.Response:
-            del url, timeout
+    registry_requests: list[httpx.Request] = []
+    input_schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
             return httpx.Response(
                 200,
                 json={
@@ -327,8 +320,22 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
                     "terminal_launch_args": None,
                     "external_session_id": None,
                 },
-                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
+        registry_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search notes",
+                            "inputSchema": input_schema,
+                        }
+                    ]
+                }
+            },
+        )
 
     launched: dict[str, Any] = {}
 
@@ -360,15 +367,43 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
         name="pi-default",
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
+    if mcp_selection != "none":
+        spec.mcp_servers.append(
+            MCPServerConfig(name="authored", transport="http", url="https://mcp.example.com")
+        )
+    if mcp_selection == "registry":
+        spec.mcp_servers.append(MCPServerConfig(name="notes", transport="registry"))
 
     seed_pi_permission_state(workspace, session_id, "full")
-    await _auto_create_pi_terminal(
-        session_id,
-        _FakeResourceRegistry(),  # type: ignore[arg-type]
-        lambda _sid, _event: None,
-        server_client=_SnapshotClient(),  # type: ignore[arg-type]
-        agent_spec=spec,
-    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), base_url="http://ap.example"
+    ) as server_client:
+        await _auto_create_pi_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _event: None,
+            server_client=server_client,
+            agent_spec=ResolvedSpec(spec=spec, workdir=workspace),
+        )
+
+    config_file = Path(launched["env"][pi_bridge.PI_NATIVE_CONFIG_ENV_VAR])
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    tools = {tool["name"]: tool for tool in config["tools"]}
+    assert {"sys_os_read", "sys_os_write"} <= tools.keys()
+    assert "authored__search" not in tools
+    assert "sys_os_read" in config["planVisibleTools"]
+    assert "sys_os_write" not in config["planVisibleTools"]
+    assert "notes__search" not in config["planVisibleTools"]
+    if mcp_selection == "registry":
+        (request,) = registry_requests
+        assert request.url.path == "/v1/mcp/notes"
+        assert request.headers["X-Omnigent-Session-Id"] == session_id
+        assert json.loads(request.content)["method"] == "tools/list"
+        assert tools["notes__search"]["description"] == "Search notes"
+        assert tools["notes__search"]["parameters"] == input_schema
+    else:
+        assert not registry_requests
+        assert "notes__search" not in tools
 
     assert captured["model"] is None
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])

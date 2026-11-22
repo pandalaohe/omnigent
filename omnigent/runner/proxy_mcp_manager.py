@@ -205,7 +205,10 @@ class ProxyMcpManager:
                 name = schema.get("name")
                 if not isinstance(name, str):
                     continue
-                if service is None and name.split("__", 1)[0] in self._registry_services:
+                if service is None and any(
+                    name.startswith(registry_service + "__")
+                    for registry_service in self._registry_services
+                ):
                     continue
                 schemas.append(schema)
                 names.add(name)
@@ -361,10 +364,14 @@ class ProxyMcpManager:
         """Run one proxy call under an already-retained operation id."""
         request_id = 1
         retained_id = scoped.retained_operation_id if scoped else operation_id
-        service, separator, upstream_name = tool_name.partition("__")
-        managed = bool(separator and service in self._registry_services)
-        wire_name = upstream_name if managed else tool_name
-        url = f"/v1/mcp/{service}" if managed else self._mcp_url
+        registry_prefixes = [
+            service for service in self._registry_services if tool_name.startswith(service + "__")
+        ]
+        managed = bool(registry_prefixes)
+        # The session endpoint can resolve overlapping prefixes against the catalog.
+        service = registry_prefixes[0] if len(registry_prefixes) == 1 else None
+        wire_name = tool_name[len(service) + 2 :] if service is not None else tool_name
+        url = f"/v1/mcp/{service}" if service is not None else self._mcp_url
 
         def _record_failure(
             exc: BaseException | None,
@@ -477,7 +484,9 @@ class ProxyMcpManager:
                 resp = await self._omnigent_client.post(
                     url,
                     json=payload,
-                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                    headers={"X-Omnigent-Session-Id": self._session_id}
+                    if service is not None
+                    else {},
                     # Short connect timeout still fails fast on an unreachable
                     # server; the read timeout covers ordinary proxy request
                     # hangs. Sub-agent dispatch returns an async handle

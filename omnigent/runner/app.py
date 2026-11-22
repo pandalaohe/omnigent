@@ -286,7 +286,11 @@ from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
-from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY, TIER_HARNESSES
+from omnigent.server.permission_tiers import (
+    PERMISSION_STATE_LABEL_KEY,
+    REGISTRY_TOOL_INSPECTION_HEADER,
+    TIER_HARNESSES,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -13408,6 +13412,7 @@ def create_runner_app(
                     ),
                     origin_receipt=body.get("pi_origin_receipt"),
                     execution_operation_id=body.get("execution_operation_id"),
+                    registry_tool=request.headers.get(REGISTRY_TOOL_INSPECTION_HEADER) == "1",
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})

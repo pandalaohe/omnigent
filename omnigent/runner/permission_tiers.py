@@ -74,7 +74,7 @@ class PermissionTierRuntime:
         self._harnesses: dict[str, str] = {}
         self._leases: dict[str, dict[str, PermissionLease]] = {}
         self._inspected: dict[
-            str, dict[str, tuple[BoundToolCall, dict[str, object], bool, TierDecision]]
+            str, dict[str, tuple[BoundToolCall, dict[str, object], bool, TierDecision, bool]]
         ] = {}
         self._finished: dict[str, set[str]] = {}
         self._pi_control_paths: dict[str, set[str]] = {}
@@ -710,6 +710,8 @@ class PermissionTierRuntime:
         local_execution: bool,
         pi_scope: PiScopeRecord | None = None,
         native: tuple[NativeCallBinding, NativeSupport] | None = None,
+        *,
+        registry_tool: bool = False,
     ) -> TierDecision:
         if pi_scope:
             state = replace(state, workspace=pi_scope.admission.principal.canonical_cwd)
@@ -789,6 +791,7 @@ class PermissionTierRuntime:
             native_support=native[1] if native is not None else None,
             local_execution=eval_local_execution,
             agy_delegation_status=agy_delegation,
+            registry_tool_name=name if registry_tool else None,
         )
 
     def inspect(
@@ -802,6 +805,7 @@ class PermissionTierRuntime:
         local_execution: bool = True,
         origin_receipt: object = None,
         execution_operation_id: object = None,
+        registry_tool: bool = False,
     ) -> tuple[BoundToolCall, TierDecision]:
         state = self.state(session_id)
         if state is None or state.status != "ready" or state.revision != expected_revision:
@@ -821,12 +825,14 @@ class PermissionTierRuntime:
             raise ValueError("Tool call already finished")
         if execution_operation_id is not None:
             lease = self._leases.get(session_id, {}).get(call_id)
+            inspected = self._inspected.get(session_id, {}).get(call_id)
             if (
                 pi_scope is None
                 or not isinstance(execution_operation_id, str)
                 or lease is None
                 or lease.operation_id != execution_operation_id
                 or "rpc" not in lease.steps
+                or (inspected is not None and inspected[4] and not registry_tool)
                 or not self.matches_authorized_call(
                     session_id,
                     call_id=call_id,
@@ -846,14 +852,27 @@ class PermissionTierRuntime:
         )
         native = self._native_support(session_id, origin_receipt, arguments)
         decision = self._evaluate(
-            session_id, state, name, arguments, local_execution, pi_scope, native
+            session_id,
+            state,
+            name,
+            arguments,
+            local_execution,
+            pi_scope,
+            native,
+            registry_tool=registry_tool,
         )
         inspected = self._inspected.setdefault(session_id, {})
         prior = inspected.get(call_id)
         if prior is not None and prior[0] != binding:
             raise ValueError("Tool call binding changed")
         if decision.action != Verdict.DENY:
-            inspected[call_id] = (binding, saved_arguments, local_execution, decision)
+            inspected[call_id] = (
+                binding,
+                saved_arguments,
+                local_execution,
+                decision,
+                registry_tool,
+            )
         else:
             inspected.pop(call_id, None)
         return binding, decision
@@ -912,6 +931,7 @@ class PermissionTierRuntime:
                 inspected[2],
                 pi_scope,
                 self._native_support(session_id, origin_receipt, inspected[1]),
+                registry_tool=inspected[4],
             )
         except (OSError, ValueError, TypeError, KeyError):
             return False

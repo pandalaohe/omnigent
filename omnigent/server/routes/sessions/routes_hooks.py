@@ -2437,6 +2437,17 @@ def register_hooks_routes(
                 ),
                 media_type="application/json",
             )
+        origin_receipt = payload.get("pi_origin_receipt")
+        registry_tool = False
+        if (
+            isinstance(origin_receipt, str)
+            and "__" in name
+            and getattr(request.app.state, "mcp_registry", None) is not None
+        ):
+            from omnigent.server.registry_gateway import resolve_selected_registry_tool
+
+            spec = await asyncio.to_thread(_sf._load_agent_spec_for_session, conv, agent_store)
+            registry_tool = resolve_selected_registry_tool(request, spec, name) is not None
         inspection = await inspect_permission_call(
             conv,
             harness=harness,
@@ -2444,7 +2455,8 @@ def register_hooks_routes(
             arguments=arguments,
             call_id=data.get("call_id"),
             runner_router=runner_router,
-            origin_receipt=payload.get("pi_origin_receipt"),
+            origin_receipt=origin_receipt,
+            registry_tool=registry_tool,
         )
 
         def tier_response(reason: str) -> Response:

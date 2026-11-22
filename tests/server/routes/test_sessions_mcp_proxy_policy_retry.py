@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
@@ -313,6 +314,150 @@ async def test_tier_denial_precedes_allow_policy_and_forged_inline_retry(monkeyp
     assert "Unknown external tool" in _parse_rpc_error(response)["message"]
     assert len(requests) == 1
     assert executions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection", "approved", "remote"),
+    [
+        ("registry", True, True),
+        ("trailing-underscore", True, True),
+        ("gateway-trailing-underscore", True, True),
+        ("gateway-other-service", False, True),
+        ("ambiguous", False, True),
+        ("unlisted", False, True),
+        ("session-filtered", False, True),
+        ("none", False, False),
+        ("authored", False, False),
+    ],
+)
+async def test_mcp_proxy_only_attests_catalog_approved_session_tools(
+    monkeypatch, selection, approved, remote
+):
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        REGISTRY_TOOL_INSPECTION_HEADER,
+        BoundToolCall,
+        ConfirmedPermissionState,
+    )
+    from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+    conv = _make_conversation()
+    conv.harness_override = "antigravity-native"
+    conv.host_id = "host"
+    conv.labels.update(ConfirmedPermissionState("auto", 2, "ready").labels("antigravity-native"))
+    conv.labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    spec = AgentSpec(spec_version=1)
+    overlapping = selection in (
+        "trailing-underscore",
+        "gateway-trailing-underscore",
+        "gateway-other-service",
+        "ambiguous",
+    )
+    if selection == "authored":
+        spec.mcp_servers.append(
+            MCPServerConfig(name="notes", transport="http", url="https://notes.example.com/mcp")
+        )
+    elif selection != "none":
+        spec.mcp_servers.append(
+            MCPServerConfig(
+                name="notes",
+                transport="registry",
+                tools=["list"] if selection == "session-filtered" else None,
+            )
+        )
+    if overlapping:
+        spec.mcp_servers.append(MCPServerConfig(name="notes_", transport="registry"))
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *_: spec)
+    app = FastAPI()
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="notes",
+                    title="Notes",
+                    url="https://notes.example.com/mcp",
+                    auth="none",
+                    tools={"unlisted": ["list"], "ambiguous": ["_search"]}.get(
+                        selection, ["search", "list"]
+                    ),
+                ),
+                McpService(
+                    id="notes_",
+                    title="Other notes",
+                    url="https://other.example.com/mcp",
+                    auth="none",
+                    tools=["search"],
+                ),
+            ]
+        ),
+        None,
+    )
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["type"] == "permission_tier_inspect"
+        assert body["local_execution"] is not remote
+        assert (request.headers.get(REGISTRY_TOOL_INSPECTION_HEADER) == "1") is approved
+        binding = BoundToolCall.bind(
+            session_id=conv.id,
+            host_id="host",
+            call_id=body["call_id"],
+            name=body["name"],
+            arguments=body["arguments"],
+            tier_revision=2,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "session_id": conv.id,
+                "host_id": "host",
+                "call_id": binding.call_id,
+                "name": binding.name,
+                "arguments_digest": binding.arguments_digest,
+                "tier_revision": 2,
+                "permission_tiers_capability": "permission_tiers_v1",
+                "verdict": "DENY",
+                "reason": "test host refused the call",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(respond)
+    ) as client:
+
+        async def get_runner(*_, **__):
+            return client
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+        scope = {"type": "http", "app": app}
+        if selection.startswith("gateway-"):
+            scope["path_params"] = {
+                "service_id": "notes" if selection == "gateway-other-service" else "notes_"
+            }
+
+        async def execute(_arguments):
+            pytest.fail("The mocked runner denies every call before execution")
+
+        response = await _handle_mcp_tools_call(
+            rpc_id=1,
+            session_id=conv.id,
+            params={
+                "name": "notes___search" if overlapping else "notes__search",
+                "arguments": {"registry_tool": True},
+            },
+            conversation_store=_StubConversationStore(conv),
+            agent_store=_StubAgentStore(),
+            runner_router=None,
+            request=Request(scope),
+            execute_tool=execute if selection.startswith("gateway-") else None,
+        )
+    assert len(requests) == 1
+    assert json.loads(response.body)["error"]["message"] == "test host refused the call"
 
 
 @pytest.mark.asyncio

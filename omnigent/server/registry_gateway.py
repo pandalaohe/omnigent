@@ -26,6 +26,30 @@ def registry_user(actor: dict[str, str] | None) -> str:
     raise ConnectionError("An authenticated user is required for registry MCP services")
 
 
+def resolve_selected_registry_tool(
+    request: Request | None, spec: AgentSpec | None, name: str
+) -> tuple[MCPServerConfig, str] | None:
+    """Resolve a flat name only when one approved registry pair matches it."""
+    if "__" not in name or spec is None or request is None:
+        return None
+    registry: McpRegistry | None = getattr(request.app.state, "mcp_registry", None)
+    if registry is None:
+        return None
+    match: tuple[MCPServerConfig, str] | None = None
+    for config in spec.mcp_servers:
+        if config.transport != "registry":
+            continue
+        service = registry.services.get(config.name)
+        if service is None:
+            continue
+        for tool in service.tools:
+            if name == f"{config.name}__{tool}" and (config.tools is None or tool in config.tools):
+                if match is not None and (match[0].name, match[1]) != (config.name, tool):
+                    return None
+                match = config, tool
+    return match
+
+
 async def registry_tools(
     registry: McpRegistry,
     request: Request,
