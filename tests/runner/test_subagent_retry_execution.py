@@ -37,11 +37,16 @@ class _ScriptedAdmissionServer(NullServerClient):
     def __init__(self, *accepted_ids: str):
         self.accepted_ids = set(accepted_ids)
         self.claims: list[InputExecutionClaim] = []
+        self.resolutions: list[tuple[InputExecutionClaim, str]] = []
 
     async def post(self, url: str, **kwargs) -> NullServerClient._Response:
         if url.endswith("/input-admission"):
             claim = InputExecutionClaim.model_validate(kwargs["json"])
             self.claims.append(claim)
+            return self._AdmissionResponse(claim.input_id in self.accepted_ids)
+        if url.endswith("/input-admission/resolve"):
+            claim = InputExecutionClaim.model_validate(kwargs["json"])
+            self.resolutions.append((claim, kwargs["params"]["close"]))
             return self._AdmissionResponse(claim.input_id in self.accepted_ids)
         return await super().post(url, **kwargs)
 
@@ -603,6 +608,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
         server_client=cast(httpx.AsyncClient, server),
     )
+    monkeypatch.setitem(app.state.session_event_queues, session_id, asyncio.Queue())
     async with _runner_test_client(app) as client:
         response = await client.post(
             f"/v1/sessions/{session_id}/events?stream=true",
@@ -676,6 +682,7 @@ async def test_stop_background_turn_respects_opening_admission(monkeypatch, acce
         )
 
     monkeypatch.setattr(runner_app, "mark_subagent_work_terminal", record_terminal)
+    monkeypatch.setitem(runner_app._session_histories_ref, session_id, [])
 
     def claim_frame(claim_id, claimed_input):
         event = InputExecutionClaimEvent(
@@ -727,6 +734,7 @@ async def test_stop_background_turn_respects_opening_admission(monkeypatch, acce
         assert posted.status_code == 202, posted.text
         await asyncio.wait_for(waiting.wait(), timeout=5)
         assert [claim.input_id for claim in server.claims] == [input_id]
+        assert "input being stopped" in json.dumps(runner_app._session_histories_ref[session_id])
         stopped = await client.post(url, json={"type": "stop_session"})
         assert stopped.status_code == 204
         assert terminals == ([(session_id, "cancelled")] if accepted else [])
@@ -741,7 +749,10 @@ async def test_stop_background_turn_respects_opening_admission(monkeypatch, acce
                 json={**body, "content": [{"type": "input_text", "text": "legal follow-up"}]},
             )
             assert followup.status_code == 200, followup.text
-            assert "input being stopped" not in json.dumps(harness.posted_bodies[-1])
+            assert server.resolutions == [(server.claims[0], "true")]
+            assert "input being stopped" not in json.dumps(
+                runner_app._session_histories_ref[session_id]
+            )
 
 
 @pytest.mark.asyncio
@@ -878,9 +889,11 @@ async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_histor
         assert [(claim.input_id, claim.turn_id) for claim in server.claims] == [
             (input_id, f"resp_{input_id}") for input_id in expected_ids
         ]
-        followup = await client.post(url + "?stream=true", json=body("legal follow-up"))
-        assert followup.status_code == 200, followup.text
+        followup = await client.post(url, json=body("legal follow-up"))
+        assert followup.status_code == 202, followup.text
+        await poll_until_async(lambda: session_id not in app.state.active_turns, timeout_s=5)
         warm_history = json.dumps(harness.posted_bodies[-1])
+        assert "legal follow-up" in warm_history
         assert "buffered B" in warm_history
         assert "buffered C" not in warm_history
 
@@ -993,7 +1006,7 @@ async def test_pi_peer_admission_reports_only_its_own_proven_refusal(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["terminal", "no_terminal"])
-async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end):
+async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(monkeypatch, end):
     deadline = time.time() + 30
     input_id, session_id = "f" * 32, "child"
     newer = (session_id, "resp_newer", "b" * 32)
@@ -1029,6 +1042,7 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
     app = create_runner_app(
         process_manager=_FakeProcessManager(Harness(frames)), server_client=Server()
     )
+    monkeypatch.setitem(app.state.session_event_queues, session_id, asyncio.Queue())
     # A newer turn's marker, recorded before this older stream ends.
     app.state.refused_turn_inputs.add(newer)
     async with _runner_test_client(app) as client:
