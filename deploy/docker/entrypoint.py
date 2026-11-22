@@ -508,6 +508,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
 
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
+
+    mcp_registry = build_mcp_registry_from_env(database_url)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -537,6 +541,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )

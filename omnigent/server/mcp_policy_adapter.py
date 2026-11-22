@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, Response
 
@@ -21,6 +21,9 @@ from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.spec.types import MCPServerConfig
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.runner.routing import RunnerRouter
 
 
 @dataclass(frozen=True)
@@ -41,11 +44,13 @@ class McpPolicyAdapter:
         agent_store: AgentStore,
         auth_provider: AuthProvider | None,
         permission_store: PermissionStore | None,
+        runner_router: RunnerRouter,
     ) -> None:
         self.conversation_store = conversation_store
         self.agent_store = agent_store
         self.auth_provider = auth_provider
         self.permission_store = permission_store
+        self.runner_router = runner_router
 
     async def authorize(
         self, request: Request, session_id: str, service_id: str
@@ -121,7 +126,7 @@ class McpPolicyAdapter:
             {**params, "name": name},
             self.conversation_store,
             self.agent_store,
-            None,
+            self.runner_router,
             actor=context.policy_actor,
             credential_user=context.credential_user,
             request=request,

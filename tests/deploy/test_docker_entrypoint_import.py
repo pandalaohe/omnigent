@@ -329,6 +329,34 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
 
 
+def test_build_app_mounts_env_mcp_registry(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deploy.docker.entrypoint import build_app, run_migrations
+
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    registry_file = tmp_path / "mcp-registry.yaml"
+    registry_file.write_text(
+        "services:\n"
+        "  - id: tracker\n"
+        "    title: Tracker\n"
+        "    url: https://mcp.example.test/mcp\n"
+        "    auth: env\n"
+        "    token_env: TEST_DOCKER_MCP_BEARER\n"
+        "    tools: [read_ticket]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
+    monkeypatch.setenv("TEST_DOCKER_MCP_BEARER", "fake-docker-mcp-token")
+
+    run_migrations(database_url)
+    app = build_app().app
+
+    assert app.state.mcp_registry.store is None
+    assert app.state.mcp_registry.service("tracker", "local").auth == "env"
+    assert "/v1/mcp-registry/services" in {route.path for route in app.routes}
+
+
 def test_resolve_config_captures_s3_artifact_uri(
     _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
