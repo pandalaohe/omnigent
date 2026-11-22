@@ -127,7 +127,10 @@ from cachetools import TTLCache
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities.conversation import AutoRetryMetadata
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.inner.native_attachments import (
+    ATTACHMENT_MARKER_STRIP_PATTERN,
+    attachment_delivery_identity,
+)
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
 # A pending entry is evicted this many seconds after it was recorded
@@ -1267,11 +1270,38 @@ def resolve_matching_text(
     exact_needle = _collapse_whitespace(text)
     if not exact_needle:
         return MatchedDrain(matched=None, skipped=[])
+    attachment_delivery = (
+        attachment_delivery_identity(text) if claude_commands and not shell_command else None
+    )
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
+        if attachment_delivery is not None:
+            attempt_id, count = attachment_delivery
+            for pending_id, entry in entries.items():
+                if (
+                    entry.delivery_attempt_id == attempt_id
+                    and entry.runner_claim_id is not None
+                    and not entry.held
+                    and entry.auto_retry is None
+                    and _attachment_count(entry.content) == count
+                    and not _content_text(entry.content).strip()
+                ):
+                    if hold:
+                        entry.held = True
+                    else:
+                        _settle_locked(
+                            conversation_id, entries, pending_id, delivery_confirmed=True
+                        )
+                    return MatchedDrain(
+                        matched=_drained_input(entry),
+                        skipped=[],
+                        match_method="attachment_attempt",
+                    )
+            # A stale or incomplete attachment echo cannot consume a different entry.
+            return MatchedDrain(matched=None, skipped=[], match_method="attachment_attempt")
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()

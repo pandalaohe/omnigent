@@ -393,7 +393,33 @@ def mark_purged_attachments(text: str, session_id: str, purged: Mapping[str, str
     return _ATTACHED_PATH_RE.sub(_replace, text)
 
 
-def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
+_DELIVERY_FILENAME_PREFIX = "omnigent-upload-"
+_DELIVERY_ATTACHMENT_MARKER = re.compile(
+    r"\[Attached: (?:/|[A-Za-z]:[\\/]|\\\\)(?:[^\]\r\n]*[\\/])?attachments[\\/][0-9a-f]{32}[\\/]"
+    rf"{_DELIVERY_FILENAME_PREFIX}([0-9a-f]{{32}})-([0-9]+)-[^\]\\/\r\n]+\]"
+)
+
+
+def attachment_delivery_identity(text: str) -> tuple[str, int] | None:
+    """Recognize a complete, ordered series of one delivery attempt's attachment paths."""
+    if _DELIVERY_FILENAME_PREFIX not in text:
+        return None
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    attempt_id = None
+    for index, line in enumerate(lines):
+        match = _DELIVERY_ATTACHMENT_MARKER.fullmatch(line)
+        if match is None or match[2] != str(index) or attempt_id not in (None, match[1]):
+            return None
+        attempt_id = match[1]
+    return (attempt_id, len(lines)) if attempt_id is not None else None
+
+
+def materialize_attachment(
+    block: Mapping[str, object],
+    bridge_dir: Path,
+    *,
+    delivery: tuple[str, int] | None = None,
+) -> Path | None:
     """
     Decode an attachment into the session's cache outside the working directory.
 
@@ -406,6 +432,8 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :param delivery: Validated attempt ID and zero-based ordinal for a claimed
+        attachment-only prompt, whose transcript will have no text to match.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
@@ -416,6 +444,15 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
 
     if filename in (".", "..") or os.sep in filename:
         return None
+    if delivery is not None:
+        attempt_id, ordinal = delivery
+        prefix = f"{_DELIVERY_FILENAME_PREFIX}{attempt_id}-{ordinal}-"
+        filename = filename.replace("\\", "_")
+        # Leave room for the cache's collision suffix within the filename limit.
+        if len(os.fsencode(prefix + filename)) > 240:
+            mime = _data_uri_mime(block.get("image_url") or block.get("file_data"))
+            filename = f"attachment{_extension_for_mime(mime or '')}"
+        filename = prefix + filename
 
     attachments_dir = attachment_cache_dir(bridge_dir)
     try:
@@ -1117,7 +1154,9 @@ def unresolved_attachment_marker(block: Mapping[str, object]) -> str:
     return f"[Attachment {_MARKER_UNSAFE.sub('_', name)} could not be loaded]"
 
 
-def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> str:
+def attachment_reference_line(
+    block: Mapping[str, object], bridge_dir: Path, *, delivery: tuple[str, int] | None = None
+) -> str:
     """
     Materialize *block* and return the transcript line referencing it.
 
@@ -1128,10 +1167,11 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
     :param block: Attachment content block (see
         :func:`materialize_attachment`).
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param delivery: Attempt ID and attachment ordinal for echo correlation, when needed.
     :returns: ``"[Attached: <path>]"`` on success, else the visible
         marker from :func:`unresolved_attachment_marker`.
     """
-    path = materialize_attachment(block, bridge_dir)
+    path = materialize_attachment(block, bridge_dir, delivery=delivery)
     if path is not None:
         return f"[Attached: {path}]"
     return unresolved_attachment_marker(block)

@@ -5585,6 +5585,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
+                and match_method != "attachment_attempt"
                 and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
@@ -5633,7 +5634,7 @@ async def _persist_external_conversation_item_unlocked(
                 "normalized_text",
                 "attachment_normalized_text",
             ) and not (drained.uncertain or drained.interrupted)
-            delivery_confirmed = match_method == "input_id" or (
+            delivery_confirmed = match_method in ("input_id", "attachment_attempt") or (
                 match_method != "fifo_fallback"
                 and not (
                     matched.shared_text
@@ -5664,7 +5665,7 @@ async def _persist_external_conversation_item_unlocked(
                 and item.idempotency_key is None
                 and (
                     not prior_unconfirmed
-                    or match_method == "input_id"
+                    or match_method in ("input_id", "attachment_attempt")
                     or (
                         clean_exact_match
                         and not pending_inputs.matches_unconfirmed_input_text(
@@ -5683,7 +5684,12 @@ async def _persist_external_conversation_item_unlocked(
                 and item.stable_id != drained.stable_id
                 and item.idempotency_key is not None
                 and delivery_confirmed
-                and match_method in ("normalized_text", "attachment_normalized_text")
+                and match_method
+                in (
+                    "normalized_text",
+                    "attachment_normalized_text",
+                    "attachment_attempt",
+                )
                 and isinstance(item.data, MessageData)
             ):
                 item = item.model_copy(

@@ -1,11 +1,17 @@
 """A native mirror names the web send it delivered only when the pending-input link is exact."""
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
+from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import ConversationItem, MessageData
+from omnigent.harnesses.claude_native.bridge import _claim_message_delivery
+from omnigent.inner import claude_native_executor
+from omnigent.inner.executor import ExecutorConfig, TurnComplete
+from omnigent.native.input_diagnostics import input_delivery_scope
 from omnigent.runtime import pending_inputs
 from omnigent.server.routes._sessions.helpers import _publish_session_superseded
 from omnigent.server.routes._sessions.orchestration import (
@@ -93,6 +99,87 @@ async def test_text_matched_mirror_names_its_web_send(
     assert item.to_api_dict()["web_stable_id"] == _WEB_ID
     [receipt] = [receipt for receipt in receipts if receipt["item_id"] == item.id]
     assert receipt["data"]["web_stable_id"] == _WEB_ID
+
+
+@pytest.mark.asyncio
+async def test_claimed_claude_image_only_mirror_consumes_its_own_send(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        title="Native", labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE}
+    )
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.attachments_root", lambda: tmp_path / "attachments"
+    )
+    image = {"type": "input_image", "filename": "image.png", "file_id": "file_test_image"}
+    earlier = pending_inputs.record(conv.id, [{"type": "input_text", "text": "held input"}])
+    pending_id = pending_inputs.record(conv.id, [image], stable_id=_WEB_ID, runner_managed=True)
+    attrs = pending_inputs.delivery_attributes_for(conv.id, pending_id)
+    prompts: list[str] = []
+
+    async def claim(_deadline: float) -> bool:
+        return pending_inputs.claim_runner_input(conv.id, pending_id, "claim")
+
+    def inject(_bridge_dir: Path, *, content: str) -> bool:
+        _claim_message_delivery()
+        prompts.append(content)
+        return True
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    try:
+        with input_delivery_scope(attrs):
+            [result] = [
+                event
+                async for event in claude_native_executor.ClaudeNativeExecutor(tmp_path).run_turn(
+                    [
+                        {
+                            "role": "user",
+                            "content": [{**image, "image_url": "data:image/png;base64,AA=="}],
+                        }
+                    ],
+                    [],
+                    "",
+                    config=ExecutorConfig(claim_native_delivery=claim),
+                )
+            ]
+        assert isinstance(result, TurnComplete) and result.input_received
+        [prompt] = prompts
+        submitted = Path(prompt.removeprefix("[Attached: ").removesuffix("]"))
+        assert submitted.read_bytes() == b"\0"
+
+        mirror = _mirror(prompt, source_id="claude-image-record")
+        item_id, replay = await _persist_external_conversation_item(conv.id, conv, mirror, store)
+        assert item_id and not replay
+        item = store.get_item(conv.id, item_id)
+        assert item is not None and isinstance(item.data, MessageData)
+        assert item.data.content == [image]
+        assert item.to_api_dict()["web_stable_id"] == _WEB_ID
+        [receipt] = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1]["type"] == "session.input.consumed"
+        ]
+        assert receipt["data"]["web_stable_id"] == _WEB_ID
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [earlier]
+        assert await _persist_external_conversation_item(conv.id, conv, mirror, store) == (
+            item_id,
+            True,
+        )
+        assert not await _settle_lost_runner_input(
+            store, conv.id, pending_id, "native_input_lease_expired", expired=True
+        )
+        late_id, _ = await _persist_external_conversation_item(
+            conv.id, conv, _mirror(prompt, source_id="late-claude-image-record"), store
+        )
+        late = store.get_item(conv.id, late_id)
+        assert late is not None and "web_stable_id" not in late.to_api_dict()
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [earlier]
+    finally:
+        for entry in pending_inputs.snapshot_for(conv.id):
+            pending_inputs.resolve(conv.id, entry["pending_id"])
 
 
 @pytest.mark.parametrize(

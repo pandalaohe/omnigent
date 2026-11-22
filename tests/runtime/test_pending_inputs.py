@@ -920,6 +920,42 @@ def test_resolve_matching_text_drops_only_generated_leading_markers() -> None:
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("path_prefix", ["/opt/work/attachments/", "C:\\work\\attachments\\"])
+def test_claude_attachment_echo_requires_current_claim_and_complete_ordered_paths(
+    path_prefix: str,
+) -> None:
+    content = [
+        {"type": "input_image", "file_id": "file_one", "filename": "image.png"},
+        {"type": "input_image", "file_id": "file_two", "filename": "image.png"},
+    ]
+    pending_id = pending_inputs.record("conv_a", content, runner_managed=True)
+    attempt_id = pending_inputs.delivery_attributes_for("conv_a", pending_id)[
+        "delivery_attempt_id"
+    ]
+    separator = path_prefix[-1]
+    cache = f"{path_prefix}{'d' * 32}{separator}"
+    first = f"[Attached: {cache}omnigent-upload-{attempt_id}-0-image.png]"
+    second = f"[Attached: {cache}omnigent-upload-{attempt_id}-1-image.png]"
+    complete = f"{first}\n\n{second}"
+
+    assert (
+        pending_inputs.resolve_matching_text("conv_a", complete, claude_commands=True).matched
+        is None
+    )
+    assert pending_inputs.claim_runner_input("conv_a", pending_id, "claim")
+    for text in (first, f"{first}\n\n{first}", f"{second}\n\n{first}"):
+        assert (
+            pending_inputs.resolve_matching_text("conv_a", text, claude_commands=True).matched
+            is None
+        )
+    assert pending_inputs.resolve_matching_text("conv_a", complete).matched is None
+
+    result = pending_inputs.resolve_matching_text("conv_a", complete, claude_commands=True)
+    assert result.matched is not None and result.matched.pending_id == pending_id
+    assert result.matched.content == content
+    assert result.skipped == []
+
+
 def test_record_keeps_a_new_entry_when_every_other_entry_is_held() -> None:
     """A fresh record is never the eviction victim, even with the whole cap held."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION

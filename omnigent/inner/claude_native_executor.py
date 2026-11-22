@@ -80,6 +80,7 @@ from omnigent.inner.native_attachments import (
 from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 from omnigent.native.auto_retry import NativeRetryRejected, submission_scope
+from omnigent.native.input_diagnostics import current_input_attributes
 
 _logger = logging.getLogger(__name__)
 
@@ -617,7 +618,17 @@ class ClaudeNativeExecutor(Executor):
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(message=_STALE_SESSION_MESSAGE, undelivered=True)
             return
-        text = _latest_user_text(messages, self._bridge_dir)
+        claim_native_delivery = config.claim_native_delivery if config is not None else None
+        attempt_id = (
+            current_input_attributes().get("delivery_attempt_id")
+            if claim_native_delivery
+            else None
+        )
+        text = _latest_user_text(
+            messages,
+            self._bridge_dir,
+            attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+        )
         notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
@@ -664,7 +675,6 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
-        claim_native_delivery = config.claim_native_delivery if config is not None else None
         loop = asyncio.get_running_loop()
         delivery_claimed = False
         submit_confirmed = False
@@ -1220,7 +1230,9 @@ def _transcript_disk_full(bridge_dir: Path) -> bool:
         return False
 
 
-def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+def _latest_user_text(
+    messages: list[Message], bridge_dir: Path, *, attempt_id: str | None = None
+) -> str:
     """
     Return the latest user text from executor messages.
 
@@ -1230,16 +1242,19 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
 
     :param messages: Conversation history in executor message shape.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param attempt_id: Delivery attempt for a claimed web message.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"), bridge_dir)
+            return _content_to_text(message.get("content"), bridge_dir, attempt_id=attempt_id)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
+def _content_to_text(
+    content: EnqueuedContent, bridge_dir: Path, *, attempt_id: str | None = None
+) -> str:
     """
     Normalize executor content into plain text.
 
@@ -1253,13 +1268,23 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         contain ``input_image`` blocks with an ``image_url`` data URI
         or ``input_file`` blocks with a ``file_data`` data URI.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param attempt_id: Tag attachment paths only when authored text is absent.
     :returns: Plain text content with file-path references kept at their
         authored positions.
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        if attempt_id is not None and any(
+            isinstance(block, dict)
+            and block.get("type") == "input_text"
+            and isinstance(text := block.get("text"), str)
+            and text.strip()
+            for block in content
+        ):
+            attempt_id = None
         parts: list[str] = []
+        attachment_index = 0
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -1271,7 +1296,9 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                parts.append(attachment_reference_line(block, bridge_dir))
+                delivery = (attempt_id, attachment_index) if attempt_id is not None else None
+                parts.append(attachment_reference_line(block, bridge_dir, delivery=delivery))
+                attachment_index += 1
         return "\n\n".join(parts)
     return ""
 
