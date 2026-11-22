@@ -394,24 +394,41 @@ def mark_purged_attachments(text: str, session_id: str, purged: Mapping[str, str
 
 
 _DELIVERY_FILENAME_PREFIX = "omnigent-upload-"
+_DELIVERY_ATTEMPT = r"[0-9a-f]{32}"
+_DELIVERY_ORDINAL = r"[0-9]+"
 _DELIVERY_ATTACHMENT_MARKER = re.compile(
     r"\[Attached: (?:/|[A-Za-z]:[\\/]|\\\\)(?:[^\]\r\n]*[\\/])?attachments[\\/][0-9a-f]{32}[\\/]"
-    rf"{_DELIVERY_FILENAME_PREFIX}([0-9a-f]{{32}})-([0-9]+)-[^\]\\/\r\n]+\]"
+    rf"{_DELIVERY_FILENAME_PREFIX}(?P<cache_attempt>{_DELIVERY_ATTEMPT})-"
+    rf"(?P<cache_ordinal>{_DELIVERY_ORDINAL})-[^\]\\/\r\n]+\]"
+    rf"|(?:{_ATTACHED_PATH_RE.pattern}) \[{_DELIVERY_FILENAME_PREFIX}"
+    rf"(?P<path_attempt>{_DELIVERY_ATTEMPT})-(?P<path_ordinal>{_DELIVERY_ORDINAL})\]"
 )
 
 
-def attachment_delivery_identity(text: str) -> tuple[str, int] | None:
-    """Recognize a complete, ordered series of one delivery attempt's attachment paths."""
-    if _DELIVERY_FILENAME_PREFIX not in text:
+def attachment_delivery_identity(text: str) -> tuple[str, int | None] | None:
+    """Return the attempt and ordered count, or a count of None for an incomplete echo."""
+    found = _DELIVERY_ATTACHMENT_MARKER.search(text) if _DELIVERY_FILENAME_PREFIX in text else None
+    if found is None:
         return None
+    attempt_id = found["cache_attempt"] or found["path_attempt"]
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    attempt_id = None
     for index, line in enumerate(lines):
         match = _DELIVERY_ATTACHMENT_MARKER.fullmatch(line)
-        if match is None or match[2] != str(index) or attempt_id not in (None, match[1]):
-            return None
-        attempt_id = match[1]
-    return (attempt_id, len(lines)) if attempt_id is not None else None
+        if match is None or (
+            match["cache_attempt"] or match["path_attempt"],
+            match["cache_ordinal"] or match["path_ordinal"],
+        ) != (
+            attempt_id,
+            str(index),
+        ):
+            return attempt_id, None
+    return attempt_id, len(lines)
+
+
+def is_tagged_filesystem_attachment(text: str, attempt_id: str) -> bool:
+    """Distinguish the current attempt's runner-generated path line from authored text."""
+    match = _DELIVERY_ATTACHMENT_MARKER.fullmatch(text)
+    return match is not None and match["path_attempt"] == attempt_id
 
 
 def materialize_attachment(
@@ -1516,6 +1533,7 @@ async def resolve_file_reference(
     *,
     session_id: str,
     client: httpx.AsyncClient,
+    delivery: tuple[str, int] | None = None,
 ) -> list[dict[str, object]] | None:
     """
     Resolve one unresolved ``file_id`` block to its replacement blocks.
@@ -1529,6 +1547,7 @@ async def resolve_file_reference(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
+    :param delivery: Tag the resolved filesystem reference for an attachment-only Claude claim.
     :returns: The replacement blocks, or ``None`` when resolution failed, in
         which case the caller keeps the original block and a visible marker
         can surface downstream.
@@ -1550,7 +1569,12 @@ async def resolve_file_reference(
         )
         if path is None:
             return None
-        return [{"type": "input_text", "text": f"[Attached: {path}]"}]
+        reference = f"[Attached: {path}]"
+        if delivery is not None:
+            attempt_id, ordinal = delivery
+            # Tag the reference while keeping the file at its reusable path.
+            reference += f" [{_DELIVERY_FILENAME_PREFIX}{attempt_id}-{ordinal}]"
+        return [{"type": "input_text", "text": reference}]
     result = await resolve_file_id_block(block, session_id=session_id, client=client, meta=meta)
     if result is None:
         return None

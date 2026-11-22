@@ -1278,7 +1278,7 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        if attachment_delivery is not None:
+        if attachment_delivery is not None and attachment_delivery[1] is not None:
             attempt_id, count = attachment_delivery
             for pending_id, entry in entries.items():
                 if (
@@ -1300,8 +1300,6 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
-            # A stale or incomplete attachment echo cannot consume a different entry.
-            return MatchedDrain(matched=None, skipped=[], match_method="attachment_attempt")
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()
@@ -1324,6 +1322,9 @@ def resolve_matching_text(
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
+        if match_index is None and attachment_delivery is not None:
+            # A stale or incomplete echo cannot consume another entry by position.
+            return MatchedDrain(matched=None, skipped=[], match_method="attachment_attempt")
         if match_index is None and not shell_command:
             candidates = [
                 index
@@ -1356,8 +1357,8 @@ def resolve_matching_text(
             for index, (_pid, entry) in enumerate(ordered)
             if index != match_index
             and (
-                texts[index] == bare_needle
-                if shell_command
+                texts[index] == exact_needle
+                if shell_command or attachment_delivery is not None
                 else _bare_text(_content_text(entry.content)) == bare_needle
                 or _matches_injected_prefix(entry, exact_needle)
             )

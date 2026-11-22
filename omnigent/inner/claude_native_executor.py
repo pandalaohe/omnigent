@@ -76,6 +76,7 @@ from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
     attachment_reference_line,
     framework_notices,
+    is_tagged_filesystem_attachment,
 )
 from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
@@ -1280,6 +1281,7 @@ def _content_to_text(
             and block.get("type") == "input_text"
             and isinstance(text := block.get("text"), str)
             and text.strip()
+            and not is_tagged_filesystem_attachment(text, attempt_id)
             for block in content
         ):
             attempt_id = None
@@ -1294,6 +1296,10 @@ def _content_to_text(
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
+                    if attempt_id is not None and is_tagged_filesystem_attachment(
+                        text, attempt_id
+                    ):
+                        attachment_index += 1
                     parts.append(text)
             elif block_type in ("input_image", "input_file"):
                 delivery = (attempt_id, attachment_index) if attempt_id is not None else None
