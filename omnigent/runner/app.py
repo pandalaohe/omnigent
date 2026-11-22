@@ -15027,6 +15027,18 @@ def create_runner_app(
                 if not all_new:
                     continue
                 new_items = await _load_history_as_input(session_id, items=all_new)
+                # A forward can join the queue during either history await.
+                # Leave its history and admission metadata to the FIFO drain.
+                queued_item_ids = {
+                    item_id
+                    for body in _session_message_buffers.get(session_id, ())
+                    if isinstance(item_id := body.get("persisted_item_id"), str) and item_id
+                }
+                if queued_item_ids:
+                    all_new = [item for item in all_new if item.get("id") not in queued_item_ids]
+                    new_items = [
+                        item for item in new_items if item.get("id") not in queued_item_ids
+                    ]
                 _session_histories.setdefault(session_id, []).extend(
                     new_items,
                 )
