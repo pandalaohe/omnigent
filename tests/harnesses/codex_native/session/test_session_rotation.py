@@ -613,6 +613,76 @@ async def test_thread_replacement_requests_server_owned_successor(tmp_path: Path
     assert creates == ["/v1/sessions/old/successor"]
 
 
+@pytest.mark.asyncio
+async def test_thread_replacement_reply_delay_cannot_start_old_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+        transfer_bridge_owner,
+    )
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
+    )
+    monkeypatch.setenv(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_new")
+    rpc = AsyncMock(return_value={"turn": {"id": "turn_1"}})
+    app_server = SimpleNamespace(request=rpc, close=AsyncMock())
+    monkeypatch.setattr(
+        codex_native_executor, "_connect_to_app_server", AsyncMock(return_value=app_server)
+    )
+    transferred = asyncio.Event()
+    reply = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"agent_id": "agent"})
+        if request.url.path.endswith("/successor"):
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.url.path.endswith("/transfer"):
+            transfer_bridge_owner(tmp_path, "conv_old", "conv_new")
+            transferred.set()
+            await reply.wait()
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        rotation = asyncio.create_task(
+            codex_native_forwarder._create_thread_replacement_session(
+                client=client,
+                old_session_id="conv_old",
+                bridge_dir=tmp_path,
+                app_server_url="ws://127.0.0.1:9876",
+                new_thread_id="thread_new",
+            )
+        )
+        try:
+            await asyncio.wait_for(transferred.wait(), timeout=3)
+            [failure] = [
+                event
+                async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                    [{"role": "user", "content": "message for the new session"}], [], ""
+                )
+            ]
+            rpc.assert_not_awaited()
+            assert isinstance(failure, ExecutorError) and failure.undelivered
+            assert "session is no longer active" in failure.message
+        finally:
+            reply.set()
+            await rotation
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert (state.session_id, state.thread_id) == ("conv_new", "thread_new")
+
+
 @pytest.mark.parametrize(
     "thread_fields",
     [

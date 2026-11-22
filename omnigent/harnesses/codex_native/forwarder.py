@@ -3875,13 +3875,16 @@ async def _create_thread_replacement_session(
     external_resp.raise_for_status()
 
     terminal_id = terminal_resource_id("codex", "main")
-    transfer_resp = await client.post(
-        (
-            f"/v1/sessions/{url_component(old_session_id)}"
-            f"/resources/terminals/{url_component(terminal_id)}/transfer"
-        ),
-        json={"target_session_id": new_session_id},
+    transfer_path = (
+        f"/v1/sessions/{url_component(old_session_id)}"
+        f"/resources/terminals/{url_component(terminal_id)}/transfer"
     )
+    transfer_body = {"target_session_id": new_session_id}
+    transfer_resp = await client.post(transfer_path, json=transfer_body)
+    if transfer_resp.status_code == httpx.codes.SERVICE_UNAVAILABLE:
+        # The runner could not persist ownership before moving the pane.
+        await asyncio.sleep(0.1)
+        transfer_resp = await client.post(transfer_path, json=transfer_body)
     transfer_resp.raise_for_status()
 
     write_bridge_state(

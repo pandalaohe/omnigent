@@ -550,7 +550,10 @@ def _prepare_codex_forwarder_transfer(
     try:
         transfer_bridge_owner(bridge_dir, old_session_id, new_session_id)
     except OSError as exc:
-        raise RuntimeError("Unable to persist the transferred Codex bridge owner") from exc
+        raise OmnigentError(
+            "Unable to persist the transferred Codex bridge owner",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
 
 
 def _rekey_codex_forwarder(old_session_id: str, new_session_id: str) -> None:
@@ -588,12 +591,12 @@ def _codex_bridge_registered_to_other_session(bridge_dir: Path, session_id: str)
 
 def _codex_bridge_has_other_owner(bridge_dir: Path, session_id: str) -> bool:
     """Recognize an owner's live registration or its persisted bridge state."""
-    from omnigent.native.native_bridge_common import read_bridge_session_id
+    from omnigent.harnesses.codex_native.bridge import read_bridge_resource_owner
 
     if _codex_bridge_registered_to_other_session(bridge_dir, session_id):
         return True
     try:
-        owner = read_bridge_session_id(bridge_dir)
+        owner = read_bridge_resource_owner(bridge_dir)
     except (OSError, ValueError, RecursionError):
         # An unreadable or malformed state has no usable owner and can be rebuilt.
         return False
@@ -11786,6 +11789,7 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        read_bridge_resource_owner,
     )
     from omnigent.harnesses.codex_native.bridge import (
         bridge_dir_for_bridge_id as codex_bridge_dir,
@@ -11921,6 +11925,8 @@ async def _delete_native_bridge_dirs(
                             )
                             if owner is None:
                                 raise ValueError("ownership metadata has no session id")
+                    elif bridge_target in codex_targets:
+                        owner = read_bridge_resource_owner(bridge_target)
                     elif bridge_target in transferred_targets:
                         owner = read_bridge_session_id(bridge_target)
                     else:

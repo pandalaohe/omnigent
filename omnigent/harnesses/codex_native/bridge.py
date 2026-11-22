@@ -63,6 +63,8 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
 )
 
 _STATE_FILE = "state.json"
+# Survives runtime-state resets so a relaunched pane keeps its resource owner.
+_RESOURCE_OWNER_FILE = "resource-owner.json"
 _STATE_LOCK_FILE = "state.lock"
 _CONTEXT_CATALOG_FILE = "context_catalog.json"
 _STARTUP_ERROR_FILE = "startup_error.json"
@@ -1776,15 +1778,24 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     policy_allow_cache.invalidate(bridge_dir)
 
 
+def read_bridge_resource_owner(bridge_dir: Path) -> str | None:
+    """Read durable pane ownership, falling back to state for older bridges."""
+    owner = native_bridge_common.read_bridge_session_id(bridge_dir, filename=_RESOURCE_OWNER_FILE)
+    return owner if owner is not None else native_bridge_common.read_bridge_session_id(bridge_dir)
+
+
 def transfer_bridge_owner(
     bridge_dir: Path, source_session_id: str, target_session_id: str
 ) -> None:
-    """Persist pane ownership while leaving thread state for the forwarder to publish."""
+    """Persist pane ownership independently of the executor's session/thread binding."""
     with _bridge_state_lock(bridge_dir):
-        state = read_bridge_state(bridge_dir)
-        if state is None or state.session_id != source_session_id:
+        try:
+            owner = read_bridge_resource_owner(bridge_dir)
+        except (ValueError, RecursionError) as exc:
+            raise RuntimeError("The Codex bridge owner could not be verified") from exc
+        if owner != source_session_id:
             raise RuntimeError("The Codex bridge is no longer owned by the source session")
-        _write_bridge_state_unlocked(bridge_dir, replace(state, session_id=target_session_id))
+        _replace_bridge_record(bridge_dir, _RESOURCE_OWNER_FILE, {"session_id": target_session_id})
     policy_allow_cache.invalidate(bridge_dir)
 
 

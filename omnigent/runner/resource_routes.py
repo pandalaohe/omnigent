@@ -1231,6 +1231,11 @@ def register_resource_routes(
                 terminal_id=terminal_id,
                 expected_instance_id=expected_instance_id,
             )
+        except OmnigentError as exc:
+            return JSONResponse(
+                status_code=exc.http_status,
+                content={"error": {"code": exc.code, "message": exc.message}},
+            )
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=409,
