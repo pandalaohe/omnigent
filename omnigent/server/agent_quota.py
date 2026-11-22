@@ -2566,24 +2566,34 @@ class AgentQuotaService:
             written += 1
         return written
 
-    def context_line(self, context: QuotaContext) -> str:
-        now = time.time()
-        tiers, quotas = self.quotas(context, now=now)
+    def _fresh_source_rejections(
+        self, context: QuotaContext, now: float
+    ) -> dict[str, tuple[str | None, dict[str, Any]]]:
         workspace = current_workspace_id()
         with self._lock:
-            rejections = {
-                record["product"]: _source_rejection_text(rejection)
+            return {
+                key[2]: (record.get("product"), rejection)
                 for key, record in self._accounts.items()
                 if key[:2] == (workspace, context.owner_id)
                 and record.get("host_id") in {None, context.host_id}
-                and record.get("product")
                 and (rejection := record.get("quota_source_rejection")) is not None
                 and _fresh(rejection, now)
             }
+
+    def context_line(self, context: QuotaContext) -> str:
+        now = time.time()
+        tiers, quotas = self.quotas(context, now=now)
+        rejections = {
+            product: _source_rejection_text(observation)
+            for product, observation in self._fresh_source_rejections(context, now).values()
+            if product is not None
+        }
         return quota_line(quotas, tiers, now=now, source_rejections=rejections) or ""
 
     def session_choice_line(self, conversation: Conversation) -> str:
+        from omnigent.models.model_reference import canonical_pool
         from omnigent.runner.routing import routing_host_id
+        from omnigent.server.model_resolution import read_provider_groups
         from omnigent.server.session_choice import (
             active_on,
             choice_document,
@@ -2608,9 +2618,16 @@ class AgentQuotaService:
             if not active_on(settings, context.host_id or ""):
                 return ""
             text = generated_line(settings)
-            readings = self.pool_readings(context)
-            pools = dict.fromkeys(link.meter for link in ordered_links(settings) if link.meter)
             now = time.time()
+            readings = self.pool_readings(context, now=now)
+            rejected_pools = {}
+            if observations := self._fresh_source_rejections(context, now):
+                groups = read_provider_groups(self.preferences, context.owner_id)
+                rejected_pools = {
+                    canonical_pool(account, groups): observation
+                    for account, (_, observation) in observations.items()
+                }
+            pools = dict.fromkeys(link.meter for link in ordered_links(settings) if link.meter)
             floors = (
                 self.preferences.choice_floor_off(context.owner_id) if self.preferences else {}
             )
@@ -2619,7 +2636,10 @@ class AgentQuotaService:
             use_up = []
             for pool in pools:
                 reading = readings.get(pool)
-                if (
+                rejection = rejected_pools.get(pool)
+                if rejection is not None:
+                    quota.append(f"{pool} {_source_rejection_text(rejection)}")
+                elif (
                     reading is not None
                     and reading.freshness == "fresh"
                     and reading.state not in {"ok", "unknown"}
