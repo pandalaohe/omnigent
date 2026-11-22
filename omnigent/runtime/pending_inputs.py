@@ -1308,8 +1308,8 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
-        # The claimed Claude executor tags these uploads. Matching them by
-        # text alone would let a different terminal prompt settle the claim.
+        # Claude is the sender that claims pending prompts before pasting.
+        # Its tagged uploads require evidence even for a shell or slash echo.
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()
@@ -1317,9 +1317,7 @@ def resolve_matching_text(
             and entry.auto_retry is None
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
             and not (
-                claude_commands
-                and not shell_command
-                and entry.runner_claim_id is not None
+                entry.runner_claim_id is not None
                 and entry.delivery_attempt_id is not None
                 and _attachment_count(entry.content)
                 and needs_attachment_attempt(entry.content, entry.delivery_attempt_id)
