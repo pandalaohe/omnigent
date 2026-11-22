@@ -792,8 +792,10 @@ async def test_terminal_resource_role_moves_on_transfer(
     original = registry.terminal_registration_snapshot()
     transfer = terminal_registry.transfer
 
-    def transfer_before_role_update(*args: str) -> bool:
-        moved = transfer(*args)
+    def transfer_before_role_update(
+        *args: str, before_move: Callable[[], None] | None = None
+    ) -> bool:
+        moved = transfer(*args, before_move=before_move)
         during = registry.terminal_registration_snapshot()
         assert during is not None and len(during) == 1
         assert during[0].conversation_id == "conv_new"

@@ -3520,7 +3520,9 @@ def create_runner_app(
     resource_registry.set_session_background_publisher(_publish_session_background)
     resource_registry.set_native_terminal_transfer_listener("claude", _rekey_auto_forwarder_task)
     resource_registry.set_native_terminal_transfer_listener(
-        "codex", _native_runtime._rekey_codex_forwarder
+        "codex",
+        _native_runtime._rekey_codex_forwarder,
+        prepare=_native_runtime._prepare_codex_forwarder_transfer,
     )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:

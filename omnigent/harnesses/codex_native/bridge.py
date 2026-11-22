@@ -1776,6 +1776,18 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     policy_allow_cache.invalidate(bridge_dir)
 
 
+def transfer_bridge_owner(
+    bridge_dir: Path, source_session_id: str, target_session_id: str
+) -> None:
+    """Persist pane ownership while leaving thread state for the forwarder to publish."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or state.session_id != source_session_id:
+            raise RuntimeError("The Codex bridge is no longer owned by the source session")
+        _write_bridge_state_unlocked(bridge_dir, replace(state, session_id=target_session_id))
+    policy_allow_cache.invalidate(bridge_dir)
+
+
 def _validated_startup_timeout(value: object) -> float | None:
     """Return a bounded configured-command timeout, or ``None`` if invalid."""
     if (

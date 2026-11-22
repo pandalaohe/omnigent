@@ -529,6 +529,30 @@ def _track_codex_forwarder(
     return owner
 
 
+def _prepare_codex_forwarder_transfer(
+    old_session_id: str, new_session_id: str, terminal_role: str | None
+) -> None:
+    """Validate and persist a runner-owned Codex transfer before the pane moves."""
+    if terminal_role != CODEX_NATIVE_TERMINAL_ROLE:
+        return
+    from omnigent.harnesses.codex_native.bridge import transfer_bridge_owner
+
+    task = _AUTO_FORWARDER_TASKS.get(old_session_id)
+    bridge_dir = _AUTO_CODEX_BRIDGE_DIRS.get(old_session_id)
+    if (
+        task is None
+        or task.done()
+        or task.cancelling()
+        or task not in _CODEX_FORWARDER_OWNERS
+        or bridge_dir is None
+    ):
+        raise RuntimeError("The source Codex runtime is no longer available for transfer")
+    try:
+        transfer_bridge_owner(bridge_dir, old_session_id, new_session_id)
+    except OSError as exc:
+        raise RuntimeError("Unable to persist the transferred Codex bridge owner") from exc
+
+
 def _rekey_codex_forwarder(old_session_id: str, new_session_id: str) -> None:
     """Keep the Codex runtime with its main pane before the transfer first yields."""
     if old_session_id == new_session_id:
@@ -563,7 +587,7 @@ def _codex_bridge_registered_to_other_session(bridge_dir: Path, session_id: str)
 
 
 def _codex_bridge_has_other_owner(bridge_dir: Path, session_id: str) -> bool:
-    """Recognize a transferred bridge before and after the new state is written."""
+    """Recognize an owner's live registration or its persisted bridge state."""
     from omnigent.native.native_bridge_common import read_bridge_session_id
 
     if _codex_bridge_registered_to_other_session(bridge_dir, session_id):
@@ -12905,9 +12929,8 @@ async def _codex_native_terminal_arrives_via_transfer(
     auto-create, and a second ``codex:main`` makes the rotation's transfer
     409 — leaving the terminal (and its tmux status link) owned by the old
     session while the web session streams from the new one. The shared
-    bridge state still names the terminal-owning session at bind time
-    (rotation rewrites it only AFTER the transfer), detected here so the
-    caller skips auto-create and lets the transfer deliver the terminal.
+    bridge state still names the terminal-owning session at bind time.
+    Only that session's successor waits for the incoming terminal.
 
     :param server_client: Omnigent client to resolve the bridge id label;
         ``None`` can't confirm a rotation, so returns ``False``.
@@ -12916,8 +12939,8 @@ async def _codex_native_terminal_arrives_via_transfer(
         live ``codex:main`` terminal.
     :param session_labels: Labels supplied by the initialization envelope.
         ``None`` selects the legacy labels callback.
-    :returns: ``True`` when a different session on the same bridge owns a
-        live ``codex:main`` terminal (transfer inbound), else ``False``.
+    :returns: ``True`` when the recorded predecessor still owns the
+        shared bridge's ``codex:main`` terminal, else ``False``.
     """
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is None:
@@ -12932,6 +12955,7 @@ async def _codex_native_terminal_arrives_via_transfer(
     from omnigent.harnesses.codex_native.bridge import (
         read_bridge_state as read_codex_bridge_state,
     )
+    from omnigent.stores.conversation_store import SUCCEEDS_LABEL_KEY
 
     if session_labels is not None:
         labels = session_labels
@@ -12946,7 +12970,11 @@ async def _codex_native_terminal_arrives_via_transfer(
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
     state = read_codex_bridge_state(codex_bridge_dir_for_bridge_id(bridge_id))
     # Fresh bridge, or the new session is already active — nothing transfers in.
-    if state is None or state.session_id == session_id:
+    if (
+        state is None
+        or state.session_id == session_id
+        or labels.get(SUCCEEDS_LABEL_KEY) != state.session_id
+    ):
         return False
     return terminal_registry.get_native(state.session_id, "codex", "main") is not None
 

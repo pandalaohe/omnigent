@@ -776,6 +776,8 @@ class TerminalRegistry:
         target_conversation_id: str,
         terminal_name: str,
         session_key: str,
+        *,
+        before_move: Callable[[], None] | None = None,
     ) -> bool:
         """Move one terminal registry entry without closing tmux.
 
@@ -789,6 +791,7 @@ class TerminalRegistry:
             e.g. ``"conv_new"``.
         :param terminal_name: Terminal spec name, e.g. ``"claude"``.
         :param session_key: Terminal session key, e.g. ``"main"``.
+        :param before_move: Synchronous preparation after validation, before ownership changes.
         :returns: ``True`` when an entry was moved, ``False`` when the
             source entry did not exist.
         :raises RuntimeError: If the target conversation already has an
@@ -806,12 +809,14 @@ class TerminalRegistry:
                 return False
             if instance.elevated:
                 raise RuntimeError("admin terminals cannot be transferred")
-            target_slot = self._by_conversation.setdefault(target_conversation_id, {})
+            target_slot = self._by_conversation.get(target_conversation_id, {})
             if key in target_slot:
                 raise RuntimeError(
                     f"Terminal {terminal_name!r}:{session_key!r} already exists for "
                     f"conversation {target_conversation_id!r}"
                 )
+            if before_move is not None:
+                before_move()
 
             self._remember_uncertain_owner(
                 source_conversation_id, terminal_name, session_key, instance
@@ -820,6 +825,7 @@ class TerminalRegistry:
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
             target_slot[key] = instance
+            self._by_conversation[target_conversation_id] = target_slot
             self._remember_uncertain_owner(
                 target_conversation_id, terminal_name, session_key, instance
             )
