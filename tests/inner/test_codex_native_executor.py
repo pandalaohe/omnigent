@@ -566,7 +566,17 @@ async def test_delivery_does_not_submit_after_bridge_binding_changes(
         assert failure.preserve_session is True
         assert "changed" in failure.message
     assert all(method not in {"turn/start", "turn/steer"} for method, _ in RotatingClient.requests)
-    assert read_bridge_state(tmp_path) == replacement
+    expected_state = (
+        None
+        if replacement is None
+        else replace(
+            replacement,
+            active_turn_revision=(
+                0 if changed_field == "session_id" else original.active_turn_revision + 1
+            ),
+        )
+    )
+    assert read_bridge_state(tmp_path) == expected_state
 
 
 @pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "missing"])
@@ -682,7 +692,7 @@ async def test_live_resubmission_with_lost_reply_is_consumed_not_resent(
     draining_client, tmp_path: Path
 ) -> None:
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+    from omnigent.server.schemas import CreateResponseRequest, InjectionUnconfirmedEvent
 
     _seed_bridge(tmp_path, active_turn_id="turn_compact")
     state = read_bridge_state(tmp_path)
@@ -707,8 +717,8 @@ async def test_live_resubmission_with_lost_reply_is_consumed_not_resent(
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
 
-    # The consumed marker makes the runner drop its buffered copy instead of resending it.
-    assert [type(event) for event in ctx.emitted] == [InjectionConsumedEvent]
+    # The unconfirmed marker makes the runner drop its buffered copy without claiming delivery.
+    assert [type(event) for event in ctx.emitted] == [InjectionUnconfirmedEvent]
     assert ctx.emitted[0].injection_id == "inj_compact"
     assert draining_client.accepted_inputs == [[{"type": "text", "text": "queued input"}]]
 
@@ -1805,7 +1815,9 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     )
 
     assert [type(event) for event in events] == [TurnComplete]
-    assert read_bridge_state(tmp_path) == replacement
+    assert read_bridge_state(tmp_path) == replace(
+        replacement, active_turn_revision=initial.active_turn_revision + 1
+    )
 
 
 @pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
@@ -4102,7 +4114,7 @@ async def test_transport_failure_keeps_native_work_running(
     """A failed submission cannot interrupt existing work or resend accepted input."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
-    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+    from omnigent.server.schemas import CreateResponseRequest, InjectionUnconfirmedEvent
 
     method = "turn/start" if submission in {"turn/start", "binding-change"} else "turn/steer"
     requests: list[str] = []
@@ -4166,9 +4178,9 @@ async def test_transport_failure_keeps_native_work_running(
             ctx._push_injection(request.model_copy(update={"injection_id": "inj_delivery"}))
             watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
             try:
-                consumed = await asyncio.wait_for(ctx._event_queue.get(), timeout=5)
-                assert isinstance(consumed, InjectionConsumedEvent)
-                assert consumed.injection_id == "inj_delivery"
+                marker = await asyncio.wait_for(ctx._event_queue.get(), timeout=5)
+                assert isinstance(marker, InjectionUnconfirmedEvent)
+                assert marker.injection_id == "inj_delivery"
             finally:
                 watcher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
