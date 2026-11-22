@@ -1313,12 +1313,9 @@ def resolve_matching_text(
             else _collapse_whitespace(_content_text(entry.content))
             for _pid, entry in ordered
         ]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
-        # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then, for entries carrying attachments:
-        # the executor pastes one generated marker line per file block ahead
-        # of the text, so drop exactly that many from the mirror and compare
-        # with the entry's own text — typed marker-like text still counts.
+        # Try exact text before interpreting anything as a generated marker.
+        # Older executors put attachment markers first. Claude also writes
+        # them in composer block order when an upload sits between text spans.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
@@ -1335,6 +1332,7 @@ def resolve_matching_text(
             if match_index is not None:
                 match_method = "injected_prefix_text"
         marker_matches: list[int] = []
+        ordered_attachment_match = False
         if match_index is None:
             match_method = "attachment_normalized_text"
             for index, (_pid, entry) in enumerate(ordered):
@@ -1347,6 +1345,19 @@ def resolve_matching_text(
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
+            if match_index is None and claude_commands:
+                # An inline echo proves only the claimed prompt it matches.
+                # Do not choose between same-shape copies or settle older inputs.
+                ordered_matches = [
+                    index
+                    for index, (_pid, entry) in enumerate(ordered)
+                    if entry.runner_claim_id is not None
+                    and _attachment_count(entry.content)
+                    and _matches_forwarded_blocks(entry.content, exact_needle)
+                ]
+                if len(ordered_matches) == 1:
+                    match_index = ordered_matches[0]
+                    ordered_attachment_match = True
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Look across match tiers. A literal attachment marker or a command's
@@ -1369,7 +1380,7 @@ def resolve_matching_text(
         # unbounded append downstream. The matched entry itself always drains.
         skipped_entries = (
             []
-            if shell_command
+            if shell_command or ordered_attachment_match
             else [
                 (pid, entry)
                 for pid, entry in ordered[:match_index]
@@ -1539,14 +1550,18 @@ def _content_text(content: list[dict[str, Any]]) -> str:
 
 
 def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:
-    """Match recorded text and attachment markers in their forwarded block order."""
+    """Match a framework prefix followed by the recorded composer content."""
     if not entry.injected_prefix:
         return False
     prefix = _collapse_whitespace(entry.injected_prefix)
     if not mirror.startswith(prefix + " "):
         return False
-    remaining = mirror[len(prefix) :].lstrip()
-    for block in entry.content:
+    return _matches_forwarded_blocks(entry.content, mirror[len(prefix) :].lstrip())
+
+
+def _matches_forwarded_blocks(content: list[dict[str, Any]], remaining: str) -> bool:
+    """Match every text span and one generated marker per file in composer order."""
+    for block in content:
         if block.get("type") in _ATTACHMENT_BLOCK_TYPES:
             stripped = _strip_generated_markers(remaining, 1)
             if stripped == remaining:
