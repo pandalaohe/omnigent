@@ -14643,6 +14643,56 @@ async def test_interrupt_noop_after_terminal_idle_does_not_publish_cancellation(
         _interrupt_fenced_sessions.discard(session_id)
 
 
+@pytest.mark.asyncio
+async def test_interrupt_noop_returns_false_without_marking_pending_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle runner result leaves the queued input live and reports no interruption."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = "conv_interrupt_noop"
+    pending_inputs.reset_for_tests()
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "keep queued"}],
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input(
+        session_id,
+        pending_id,
+        "claim-1",
+        runner_id="runner_a",
+    )
+
+    async def _already_idle(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+        return _RunnerForwardResult(
+            status_code=200,
+            body='{"interrupted":false,"reason":"idle"}',
+        )
+
+    monkeypatch.setattr(
+        routes_events,
+        "_forward_session_change_to_runner",
+        _already_idle,
+    )
+    routes_events._interrupt_fenced_sessions.add(session_id)
+    try:
+        assert await routes_events._deliver_interrupt_once(session_id, None) is False
+        assert pending_inputs.pending_ids(session_id) == [pending_id]
+        assert pending_inputs.claim_runner_input(
+            session_id,
+            pending_id,
+            "claim-1",
+            runner_id="runner_a",
+        )
+        assert session_id not in routes_events._interrupt_fenced_sessions
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+        pending_inputs.reset_for_tests()
+
+
 async def test_terminal_edge_during_interrupt_delivery_wins_over_late_publish(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

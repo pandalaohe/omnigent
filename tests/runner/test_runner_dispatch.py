@@ -13595,6 +13595,23 @@ async def test_sdk_terminal_retains_owner_response_before_marker_cleanup(outcome
         subagent_work._session_inboxes_ref.pop(parent, None)
 
 
+@pytest.mark.asyncio
+async def test_interrupt_on_idle_inprocess_session_returns_noop() -> None:
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_idle_interrupt/events", json={"type": "interrupt"}
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"interrupted": False, "reason": "idle"}
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
