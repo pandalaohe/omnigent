@@ -1144,6 +1144,10 @@ async def _relay_startup_claim(
         _logger.warning("Startup claim reply failed for session %s", session_id)
 
 
+class _RefusedTurnCancelled(asyncio.CancelledError):
+    """The stream already finalized its refused opener before cancellation unwound."""
+
+
 class _ContextWindowOverflow(Exception):
     """
     Raised and caught inside ``proxy_stream`` when the harness reports a
@@ -7723,7 +7727,7 @@ def create_runner_app(
         )
         input_unrun = admission_refused or delivery_unknown
         if input_unrun and (entries := _admission_history_entries.get(conv_id)) is not None:
-            # The entire buffered batch was unrun. Match its inserted objects by identity.
+            # Remove only this turn's history entries, matched by object identity.
             history = _session_histories.get(conv_id)
             if history is not None:
                 skipped_ids = {id(entry) for entry in entries}
@@ -7755,7 +7759,7 @@ def create_runner_app(
             _desync_terminalized.pop(conv_id, None)
         if was_interrupted or cancelled:
             _interrupted_sessions.discard(conv_id)
-            if was_interrupted:
+            if was_interrupted and not admission_refused:
                 _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
@@ -8553,9 +8557,13 @@ def create_runner_app(
             # but the default non-native drain coalesces the whole buffer and
             # dispatches only the last body — burying a /compact behind a later
             # message and silently no-opping it (the runner already returned 200,
-            # so the server won't fall back). Drain one at a time (like native)
-            # whenever a /compact is buffered, so each lands as its own turn.
-            if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
+            # so the server won't fall back). Each input that needs final
+            # admission must also open its own turn, in queue order.
+            if (
+                _is_native_harness(session_id)
+                or any(_is_sdk_compact_body(b) for b in buf)
+                or any(b.get("input_admission_required") is True for b in buf)
+            ):
                 drained = [buf.pop(0)]
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
@@ -10040,6 +10048,8 @@ def create_runner_app(
                 # Re-raise so the streaming-phase handler (which publishes the
                 # error event) is never shadowed by the generic except below.
                 raise
+            except _RefusedTurnCancelled:
+                raise
             except asyncio.CancelledError as exc:
                 _logger.error(
                     "turn cancelled for %s: %s",
@@ -10637,6 +10647,8 @@ def create_runner_app(
         try:
             async for _chunk in response.body_iterator:
                 pass
+        except _RefusedTurnCancelled:
+            raise
         except asyncio.CancelledError:
             # Identity guard (same generation-ownership class as
             # _on_proxy_stream_end and the _run_turn_bg finally floor): the drain
@@ -12038,10 +12050,25 @@ def create_runner_app(
                 yield _encode_sse_event(terminal)
             except asyncio.CancelledError:
                 if conv_id in _desynced_sessions:
-                    # A respawn or model-switch resync tore the turn down: a kept refusal
-                    # still reports its message undelivered. Stop and interrupt don't cancel
-                    # this stream; they drop the message and finalization reports it.
+                    # A respawn or model-switch resync reports a held pane refusal as undelivered.
                     _report_held_refusal()
+                if (
+                    dispatch is not None
+                    and _active_turns.get(conv_id) is _asyncio.current_task()
+                    and _turn_bind_epoch.get(conv_id) == stream_epoch
+                    and _response_id is not None
+                    and _owns_live_turn()
+                    and _opening_admission_refused()
+                ):
+                    # Settle before this stream's cleanup drops the refusal and
+                    # the background drain releases its history tracking.
+                    _on_proxy_stream_end(
+                        conv_id,
+                        owner_response_id=_response_id,
+                        cancelled=True,
+                        admission_refused=True,
+                    )
+                    raise _RefusedTurnCancelled from None
                 raise
 
             finally:

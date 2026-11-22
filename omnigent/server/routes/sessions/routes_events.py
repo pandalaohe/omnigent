@@ -6534,6 +6534,35 @@ def register_events_routes(
             reason=reason,
         )
 
+    async def _persist_admitted_input(
+        session_id: str,
+        conv: Conversation,
+        body: InputExecutionClaim,
+        result: InputExecutionReceipt,
+    ) -> None:
+        receipt = result.receipt
+        if not result.accepted or receipt is None or receipt.kind not in {"retry", "wake"}:
+            return
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if harness in {"claude-native", "codex-native", "pi-native"}:
+            return
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=body.turn_id or "",
+                    stable_id=receipt.input_id,
+                    data=parse_item_data("message", receipt.payload["data"]),
+                )
+            ],
+        )
+        if not persisted[0].deduplicated:
+            _publish_input_consumed(session_id, persisted[0])
+
     @event_router.post("/sessions/{session_id}/input-admission", include_in_schema=False)
     async def input_execution_admission(
         request: Request, session_id: str, body: InputExecutionClaim
@@ -6567,30 +6596,7 @@ def register_events_routes(
             from omnigent.server.turn_recovery import reconcile_turn_recovery
 
             await reconcile_turn_recovery(conversation_store, conv)
-        if (
-            result.accepted
-            and result.receipt is not None
-            and (body.retry is not None or result.receipt.kind == "wake")
-        ):
-            harness = await asyncio.to_thread(
-                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
-            )
-            if harness not in {"claude-native", "codex-native", "pi-native"}:
-                payload = result.receipt.payload["data"]
-                persisted = await asyncio.to_thread(
-                    conversation_store.append,
-                    session_id,
-                    [
-                        NewConversationItem(
-                            type="message",
-                            response_id=body.turn_id or "",
-                            stable_id=body.input_id,
-                            data=parse_item_data("message", payload),
-                        )
-                    ],
-                )
-                if not persisted[0].deduplicated:
-                    _publish_input_consumed(session_id, persisted[0])
+        await _persist_admitted_input(session_id, conv, body, result)
         return result
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
@@ -6608,13 +6614,15 @@ def register_events_routes(
             # Reconcile the exact outcome or reservation through the admission
             # fences; a read-only lookup cannot revalidate its owner.
             return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.journal.resolve_execution,
             session_id,
             body,
             runner_id=conv.runner_id,
             close=close,
         )
+        await _persist_admitted_input(session_id, conv, body, result)
+        return result
 
     async def _control_receiver(request: Request, session_id: str):
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

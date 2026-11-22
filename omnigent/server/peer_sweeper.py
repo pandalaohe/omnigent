@@ -616,7 +616,7 @@ class PeerSweeper:
                 if not remaining:
                     return
                 joined = "\n".join(line for _peer_id, line in remaining)
-                request = self._synthetic_request(sender.id, app)
+                request = self._synthetic_request(sender.id, app, runtime_notice=True)
                 sender_owner = effective_owner_id(
                     sender, self._conversation_store, self._permission_store
                 )
