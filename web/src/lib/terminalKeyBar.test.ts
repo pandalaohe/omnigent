@@ -6,6 +6,7 @@ import {
   EMPTY_STICKY_MODIFIERS,
   MAX_PREFERENCE_ENVELOPE_BYTES,
   MAX_ROW_PAGES,
+  TERMINAL_KEY_HEIGHT_PX,
   barHeightPx,
   canonicalTerminalFields,
   canonicalizeBar,
@@ -382,16 +383,17 @@ describe("terminalKeyBar packing and height", () => {
       top: { keys: [key("a")], pinned: 0, enabled: true },
       bottom: { keys: [key("b")], pinned: 0, enabled: true },
     };
-    expect(barHeightPx(onePage, false)).toBe(93);
-    expect(barHeightPx(onePage, true)).toBe(47);
+    expect(TERMINAL_KEY_HEIGHT_PX).toBe(36);
+    expect(barHeightPx(onePage, false)).toBe(77);
+    expect(barHeightPx(onePage, true)).toBe(39);
     const paging: TerminalBar = {
       top: { keys: Array.from({ length: 13 }, (_, i) => key(`t${i}`)), pinned: 0, enabled: true },
       bottom: { keys: [key("b")], pinned: 0, enabled: true },
     };
-    expect(barHeightPx(paging, false)).toBe(119);
-    expect(barHeightPx(paging, true)).toBe(73);
+    expect(barHeightPx(paging, false)).toBe(103);
+    expect(barHeightPx(paging, true)).toBe(65);
     const bottomOff = { ...paging, bottom: { ...paging.bottom, enabled: false } };
-    expect(barHeightPx(bottomOff, false)).toBe(73);
+    expect(barHeightPx(bottomOff, false)).toBe(65);
   });
 });
 

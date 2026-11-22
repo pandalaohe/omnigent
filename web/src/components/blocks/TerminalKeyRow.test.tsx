@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_TERMINAL_KEY_ITEMS,
   EMPTY_STICKY_MODIFIERS,
+  TERMINAL_KEY_HEIGHT_PX,
   migrateLegacy,
   type TerminalBar,
   type TerminalStickyModifiers,
@@ -110,6 +111,24 @@ describe("TerminalKeyRow", () => {
       screen.getByRole("button", { name: "Bottom row: next page (1 of 2)" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Top row: next page/ })).toBeNull();
+  });
+
+  it("sizes keys and gap cells from the shared key height", () => {
+    const { sessionRef } = makeSessionMock();
+    render(
+      <TerminalKeyRow
+        sessionRef={sessionRef}
+        keyboardUp={false}
+        bar={barWith(wideRowKeys("k", 1))}
+      />,
+    );
+
+    const cells = [
+      ...screen.getByTestId("terminal-key-row").querySelectorAll<HTMLElement>("[data-key-id]"),
+      ...screen.getAllByTestId("terminal-key-gap"),
+    ];
+    expect(cells.length).toBeGreaterThan(1);
+    for (const cell of cells) expect(cell.style.height).toBe(`${TERMINAL_KEY_HEIGHT_PX}px`);
   });
 
   it("toggles a modifier once when a held pointer is released", () => {

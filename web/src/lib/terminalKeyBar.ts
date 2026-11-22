@@ -3,6 +3,8 @@ import type { ShortcutChord, ShortcutModifier } from "@/lib/keyboardShortcutPref
 export const ROW_CELLS = 12;
 export const MAX_ROW_PAGES = 5;
 export const PAGE_STRIP_PX = 26;
+/** One key row's height; the key buttons and `barHeightPx` both read it. */
+export const TERMINAL_KEY_HEIGHT_PX = 36;
 export const MAX_KEY_LABEL_LENGTH = 12;
 export const MAX_KEY_TEXT_LENGTH = 64;
 export const MAX_KEY_ID_LENGTH = 32;
@@ -822,7 +824,7 @@ export function barHeightPx(
   const topPages = packRow(bar.top).pages.length;
   const bottomPages = packRow(bar.bottom).pages.length;
   const pages = topPages > 1 || (bar.bottom.enabled && bottomPages > 1);
-  return lines * 44 + (lines - 1) * 2 + 3 + (pages ? PAGE_STRIP_PX : 0);
+  return lines * TERMINAL_KEY_HEIGHT_PX + (lines - 1) * 2 + 3 + (pages ? PAGE_STRIP_PX : 0);
 }
 
 function parseBar(value: unknown): TerminalBar | null {
