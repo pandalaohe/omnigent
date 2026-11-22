@@ -432,8 +432,11 @@ class _CapturedSessionEvent:
     body: dict[str, Any]
 
 
+@pytest.mark.parametrize(
+    "old_unbind_times_out", [False, True], ids=["normal", "old_unbind_timeout"]
+)
 def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, old_unbind_times_out: bool
 ) -> None:
     """
     Parent thread rotation clears unregistered child-thread markers.
@@ -473,10 +476,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
             _thread_started_event("thread_new"),
             _started_event("turn_new"),
             stale_child_approval,
+            _agent_message_event("turn_new", "item_new", "after handoff", thread_id="thread_new"),
         ]
     )
     session_events: list[_CapturedSessionEvent] = []
     hook_posts: list[dict[str, Any]] = []
+    pane_owner = "conv_old"
+    successor_pane_confirmed = False
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -485,6 +491,7 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         :param request: HTTP request from the forwarder.
         :returns: Fake AP response.
         """
+        nonlocal pane_owner, successor_pane_confirmed
         body = json.loads(request.content) if request.content else None
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
             return httpx.Response(
@@ -496,16 +503,35 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
                     "labels": {},
                 },
             )
+        if request.method == "GET" and request.url.path.endswith("/terminal_codex_main"):
+            if request.url.path.split("/")[3] != pane_owner:
+                return httpx.Response(404)
+            successor_pane_confirmed = pane_owner == "conv_new"
+            return httpx.Response(200, json={"metadata": {"instance_id": "original-pane"}})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path in {
             "/v1/sessions/conv_new",
             "/v1/sessions/conv_old",
         }:
+            if old_unbind_times_out and request.url.path == "/v1/sessions/conv_old":
+                assert body == {"runner_id": ""}
+                assert successor_pane_confirmed
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                assert (state.session_id, state.thread_id) == ("conv_new", "thread_new")
+                raise httpx.ReadTimeout("old runner unbind reply lost", request=request)
             return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
         if request.method == "POST" and request.url.path == (
             "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
         ):
+            assert body == {
+                "target_session_id": "conv_new",
+                "expected_instance_id": "original-pane",
+            }
+            pane_owner = "conv_new"
+            if old_unbind_times_out:
+                return httpx.Response(502)
             return httpx.Response(200, json={"id": "terminal_codex_main"})
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
             assert isinstance(body, dict)
@@ -545,6 +571,14 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
+    assert [
+        (event.session_id, event.body["data"]["item_data"]["content"][0]["text"])
+        for event in session_events
+        if event.body["type"] == "external_conversation_item"
+        and event.body["data"]["item_data"]["content"][0].get("text") == "after handoff"
+    ] == [("conv_new", "after handoff")]
+    if old_unbind_times_out:
+        assert "old_session=conv_old new_session=conv_new error=ReadTimeout" in caplog.text
     old_events = [event for event in session_events if event.session_id == "conv_old"]
     notice_types = {
         "external_background_work",

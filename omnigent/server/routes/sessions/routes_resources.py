@@ -2241,6 +2241,7 @@ def register_resources_routes(
                         scheduled_task_store=getattr(state, "scheduled_task_store", None),
                         archive_cleanup=getattr(state, "archive_close_coordinator", None),
                         runner_exit_reports=getattr(state, "runner_exit_reports", None),
+                        expected_instance_id=expected_instance_id,
                     )
                 )
             except (httpx.HTTPError, ConnectionError) as exc:

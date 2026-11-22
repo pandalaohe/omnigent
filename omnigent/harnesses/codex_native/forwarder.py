@@ -3925,19 +3925,29 @@ async def _create_thread_replacement_session(
         ),
     )
 
-    clear_resp = await client.patch(
-        f"/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
-    )
-    if clear_resp.status_code >= 400:
+    try:
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={"runner_id": ""},
+        )
+    except httpx.RequestError as exc:
         _logger.warning(
             "Failed to clear old codex-native runner binding after thread switch; "
-            "old_session=%s new_session=%s status=%s body=%s",
+            "old_session=%s new_session=%s error=%s",
             old_session_id,
             new_session_id,
-            clear_resp.status_code,
-            clear_resp.text,
+            type(exc).__name__,
         )
+    else:
+        if clear_resp.status_code >= 400:
+            _logger.warning(
+                "Failed to clear old codex-native runner binding after thread switch; "
+                "old_session=%s new_session=%s status=%s body=%s",
+                old_session_id,
+                new_session_id,
+                clear_resp.status_code,
+                clear_resp.text,
+            )
     return new_session_id
 
 
