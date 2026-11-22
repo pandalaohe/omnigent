@@ -109,7 +109,7 @@ async def test_text_matched_mirror_names_its_web_send(
     assert receipt["data"]["web_stable_id"] == _WEB_ID
 
 
-@pytest.mark.parametrize("attachment_kind", ["image", "file"])
+@pytest.mark.parametrize("attachment_kind", ["image", "file", "partial-failure"])
 @pytest.mark.asyncio
 async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_position(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, attachment_kind: str
@@ -131,21 +131,34 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
     )
     filename, mime = (
         ("status.png", "image/png")
-        if attachment_kind == "image"
+        if attachment_kind != "file"
         else ("status.zip", "application/zip")
     )
-    upload = {"type": f"input_{attachment_kind}", "file_id": "file_upload", "filename": filename}
-    content = [before, upload, after]
+    upload = {
+        "type": "input_file" if attachment_kind == "file" else "input_image",
+        "file_id": "file_upload",
+        "filename": filename,
+    }
+    other_uploads = (
+        [{"type": "input_image", "file_id": "file_missing", "filename": "missing.png"}]
+        if attachment_kind == "partial-failure"
+        else []
+    )
+    content = [before, upload, *other_uploads, after]
     older = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Unclaimed"}])
     # Same authored text and attachment position, but a different attempt and upload.
     unread = pending_inputs.record(
-        conv.id, [before, {**upload, "file_id": "file_unread"}, after], runner_managed=True
+        conv.id,
+        [before, {**upload, "file_id": "file_unread"}, *other_uploads, after],
+        runner_managed=True,
     )
     read = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
     assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
     assert pending_inputs.claim_runner_input(conv.id, read, "claim_read")
 
     def respond(request: httpx.Request) -> httpx.Response:
+        if "file_missing" in request.url.path:
+            return httpx.Response(404)
         if request.url.path.endswith("/content"):
             return httpx.Response(200, content=b"\0", headers={"Content-Type": mime})
         return httpx.Response(
@@ -163,6 +176,10 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
         _normalize_message_content(resolved), tmp_path, attempt_id=attempt
     )
     assert f"omnigent-upload-{attempt}-0" in prompt
+    if other_uploads:
+        assert (
+            f"[Attachment missing.png could not be loaded] [omnigent-upload-{attempt}-1]" in prompt
+        )
 
     queued = f'<pasted_content id="paste">\n{prompt}\n</pasted_content id="paste">'
     queue_record = {"type": "queue-operation", "sessionId": "claude-session", "content": queued}
@@ -247,26 +264,42 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
     assert receipts[1]["data"]["data"]["web_stable_id"] == _WEB_ID
 
 
-@pytest.mark.parametrize("tagged", [False, True])
+@pytest.mark.parametrize(
+    "echo",
+    ["inline", "foreign-attempt", "text-only", "leading-attachment", "wrong-failure-ordinal"],
+)
 @pytest.mark.asyncio
 async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, tagged: bool
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, echo: str
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Native", harness_override="claude-native")
     publish = Mock()
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    before = "See this screenshot."
+    after = "Check the red dot."
     content = [
-        {"type": "input_text", "text": "See this screenshot."},
+        {"type": "input_text", "text": before},
         {"type": "input_image", "file_id": "file_unread", "filename": "same-name.png"},
-        {"type": "input_text", "text": "Check the red dot."},
+        {"type": "input_text", "text": after},
     ]
     unread = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
     assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
+    attempt = pending_inputs.delivery_attributes_for(conv.id, unread)["delivery_attempt_id"]
     path = f"/opt/work/attachments/{'c' * 32}/"
-    if tagged:
-        path += f"omnigent-upload-{'d' * 32}-0-"
-    prompt = f"See this screenshot.\n\n[Attached: {path}same-name.png]\n\nCheck the red dot."
+    marker = f"[Attached: {path}same-name.png]"
+    prompt = {
+        "inline": f"{before}\n\n{marker}\n\n{after}",
+        "foreign-attempt": (
+            f"{before}\n\n[Attached: {path}omnigent-upload-{'d' * 32}-0-same-name.png]\n\n{after}"
+        ),
+        "text-only": f"{before}\n\n{after}",
+        "leading-attachment": f"{marker}\n\n{before}\n\n{after}",
+        "wrong-failure-ordinal": (
+            f"{before}\n\n[Attachment same-name.png could not be loaded] "
+            f"[omnigent-upload-{attempt}-1]\n\n{after}"
+        ),
+    }[echo]
 
     item_id, replay = await _persist_external_conversation_item(
         conv.id, conv, _mirror(prompt), store
@@ -274,13 +307,17 @@ async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
 
     assert item_id and not replay
     item = store.get_item(conv.id, item_id)
-    assert item is not None and "web_stable_id" not in item.to_api_dict()
+    assert item is not None and isinstance(item.data, MessageData)
+    assert item.data.content == [{"type": "input_text", "text": prompt}]
+    assert "web_stable_id" not in item.to_api_dict()
     assert pending_inputs.pending_ids(conv.id) == [unread]
-    assert all(
-        call.args[1]["data"].get("cleared_pending_id") is None
+    [receipt] = [
+        call.args[1]["data"]
         for call in publish.call_args_list
         if call.args[1]["type"] == "session.input.consumed"
-    )
+    ]
+    assert receipt["item_id"] == item_id
+    assert receipt.get("cleared_pending_id") is None
 
 
 @pytest.mark.parametrize("files", [("image",), ("zip",), ("zip", "image"), ("image", "zip")])

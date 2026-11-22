@@ -1184,7 +1184,6 @@ class ClaudeTranscriptItem:
     native_session_id: str | None = None
     retry_input_id: str | None = None
     retry_turn_id: str | None = None
-    is_mid_turn_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -13544,7 +13543,6 @@ def _attachment_transcript_items_from_entry(
         agent_message_candidate=_is_agent_notification_text(
             _unwrap_pasted_content_markers(prompt)
         ),
-        is_mid_turn_prompt=True,
     )
     return None, [item]
 

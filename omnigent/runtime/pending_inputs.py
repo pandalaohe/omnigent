@@ -130,6 +130,7 @@ from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     attachment_delivery_identity,
+    needs_attachment_attempt,
     strip_attachment_attempt_marker,
 )
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
@@ -1307,12 +1308,22 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
+        # The claimed Claude executor tags these uploads. Matching them by
+        # text alone would let a different terminal prompt settle the claim.
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()
             if not entry.held
             and entry.auto_retry is None
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
+            and not (
+                claude_commands
+                and not shell_command
+                and entry.runner_claim_id is not None
+                and entry.delivery_attempt_id is not None
+                and _attachment_count(entry.content)
+                and needs_attachment_attempt(entry.content, entry.delivery_attempt_id)
+            )
         ]
         texts = [
             _shell_command_text(entry.content)
