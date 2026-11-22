@@ -7248,7 +7248,7 @@ class HostProcess:
         from omnigent.host.frames import HostRestartResultFrame
         from omnigent.host.restart import REQUESTER_GRACE_S, supervisor_kind
 
-        supervisor = supervisor_kind()
+        supervisor = await asyncio.to_thread(supervisor_kind)
         reason = "host is not supervised" if supervisor is None else None
         if self._restart_pending and not frame.dry_run:
             reason = "restart pending"

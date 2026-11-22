@@ -27,23 +27,35 @@ def _capture_runs(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     return calls
 
 
-def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("prefixed", [False, True])
+def test_enable_launchd_user_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefixed: bool
+) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(service.os, "getuid", lambda: 501, raising=False)
     monkeypatch.setattr(service.sys, "executable", "/opt/omnigent/bin/python")
     calls = _capture_runs(monkeypatch)
+    prefix: list[str] = []
+    if prefixed:
+        launcher = tmp_path / "service launcher"
+        launcher.touch(mode=0o700)
+        prefix = [str(launcher), "--server", "launcher option", "--local"]
+        (tmp_path / "config.yaml").write_text(f"host:\n  service_launcher: {prefix!r}\n")
 
+    environment = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
     installed = service.enable_user_host_service(
         "https://example.com",
-        environment={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        environment=environment,
     )
 
     payload = plistlib.loads(installed.path.read_bytes())
     assert installed.path == tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
     assert payload["Label"] == "ai.omnigent.host"
     assert payload["ProgramArguments"] == [
+        *prefix,
         "/opt/omnigent/bin/python",
         "-P",
         "-m",
@@ -51,7 +63,8 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
         "--server",
         "https://example.com",
     ]
-    assert payload["EnvironmentVariables"]["PATH"] == "/usr/bin:/bin"
+    assert payload["EnvironmentVariables"] == environment
+    assert service.installed_user_host_service() == (installed, "https://example.com")
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
     assert "ProcessType" not in payload
     assert calls == [

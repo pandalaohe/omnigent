@@ -376,6 +376,34 @@ def _record_for(target: str) -> cli_module._HostDaemonRecord:
     )
 
 
+@pytest.mark.parametrize("launcher_exists", [False, True], ids=["missing", "not-executable"])
+def test_host_enable_rejects_unusable_launchd_launcher_before_replacing_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launcher_exists: bool
+) -> None:
+    target = "https://server.example.com"
+    launcher = tmp_path / "launcher"
+    if launcher_exists:
+        launcher.touch(mode=0o600)
+    (tmp_path / "config.yaml").write_text(f"host:\n  service_launcher: ['{launcher}']\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_module, "_ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_find_daemon_record", _record_for)
+
+    def _unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("An invalid launcher must not drain, terminate or replace the host")
+
+    monkeypatch.setattr(cli_module, "_wait_for_running_sessions", _unexpected)
+    monkeypatch.setattr(cli_module, "_terminate_daemon", _unexpected)
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _unexpected)
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target])
+
+    assert result.exit_code == 1, result.output
+    assert "host.service_launcher" in result.output
+    assert f"executable is missing or not executable: {launcher}" in result.output
+
+
 @pytest.mark.parametrize(
     ("args", "listings", "waits"),
     [
