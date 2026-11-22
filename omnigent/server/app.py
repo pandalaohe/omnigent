@@ -5065,7 +5065,9 @@ def create_app(
 
     app.include_router(
         create_mcp_gateway_router(
-            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+            McpPolicyAdapter(
+                conversation_store, agent_store, auth_provider, permission_store, runner_router
+            )
         ),
         prefix="/v1",
         tags=["mcp_gateway"],

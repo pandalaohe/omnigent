@@ -219,8 +219,143 @@ def test_invalid_public_callback_url_is_rejected(url):
         McpRegistryConfig(public_url=url, services=[])
 
 
+def test_env_catalog_without_cipher_and_personal_bearer_with_cipher(db_uri, tmp_path, monkeypatch):
+    from omnigent.server import mcp_registry
+
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
+    assert mcp_registry.build_mcp_registry_from_env(db_uri) is None
+    catalog = tmp_path / "mcp-registry.yaml"
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    catalog.write_text("unexpected: true\n")
+    with pytest.raises(ValidationError):
+        mcp_registry.build_mcp_registry_from_env(db_uri)
+
+    cipher = Mock(return_value=None)
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", cipher)
+    env_service = service(auth="env", token_env="TEST_SERVICE_KEY")
+    monkeypatch.setenv("TEST_SERVICE_KEY", "fake-default-authorization-token")
+    catalog.write_text(json.dumps({"services": [env_service.model_dump()]}))
+    registry = mcp_registry.build_mcp_registry_from_env(db_uri)
+    assert registry is not None and registry.store is None
+    assert registry.service("tracker", "alice").header == "Authorization"
+    cipher.assert_not_called()
+
+    catalog.write_text(json.dumps({"services": [service().model_dump()]}))
+    with pytest.raises(ValueError, match="cipher"):
+        mcp_registry.build_mcp_registry_from_env(db_uri)
+    cipher.return_value = _FakeCipher()
+    registry = mcp_registry.build_mcp_registry_from_env(db_uri)
+    assert registry is not None and isinstance(registry.store, CredentialStore)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (None, "synthetic-test-token"),
+        ("invalid-name", "synthetic-test-token"),
+        ("TEST_MCP_STARTUP_KEY", None),
+        ("TEST_MCP_STARTUP_KEY", ""),
+        ("TEST_MCP_STARTUP_KEY", "invalid key with spaces"),
+        ("TEST_MCP_STARTUP_KEY", "redacted"),
+        ("TEST_MCP_STARTUP_KEY", "01234567890123456789"),
+    ],
+)
+def test_unavailable_env_credential_is_local_to_service(name, value, monkeypatch, caplog):
+    if name:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    registry = McpRegistry(
+        McpRegistryConfig(
+            services=[service(auth="env", token_env=name), service(id="public", auth="none")]
+        ),
+        None,
+    )
+    with pytest.raises(ConnectionError, match="MCP service is unavailable for this user"):
+        registry.service("tracker", "alice")
+    assert registry.service("public", "alice").auth == "none"
+    assert "service=tracker" in caplog.text
+    assert "token_env=" in caplog.text
+    if name == "TEST_MCP_STARTUP_KEY":
+        assert "token_env=TEST_MCP_STARTUP_KEY" in caplog.text
+    if value:
+        assert value not in caplog.text
+
+
+def test_env_service_requires_opt_in_for_plaintext_and_a_valid_header():
+    with pytest.raises(ValidationError, match="require HTTPS"):
+        service(auth="env", token_env="TEST_SERVICE_KEY", url="http://mcp.example.test/mcp")
+    with pytest.raises(ValidationError):
+        service(auth="env", token_env="TEST_SERVICE_KEY", header="bad header")
+    assert service(
+        auth="env",
+        token_env="TEST_SERVICE_KEY",
+        url="http://mcp.example.test/mcp",
+        allow_http=True,
+    ).allow_http
+
+
 @pytest.mark.asyncio
-async def test_existing_provider_resolver_is_reused(registry):
+async def test_plaintext_env_credential_bypasses_environment_proxy(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.test:8080")
+    monkeypatch.setenv("http_proxy", "http://proxy.example.test:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    token = "fake-plaintext-test-token"
+    monkeypatch.setenv("TEST_MCP_PLAINTEXT_KEY", token)
+    entry = service(
+        auth="env",
+        token_env="TEST_MCP_PLAINTEXT_KEY",
+        url="http://mcp.example.test/mcp",
+        allow_http=True,
+    )
+    registry = McpRegistry(McpRegistryConfig(services=[entry]), None)
+    direct_requests, proxy_requests = [], []
+
+    def upstream(request):
+        direct_requests.append(request)
+        assert request.url == entry.url
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        message = json.loads(request.content)
+        if "id" not in message:
+            return httpx.Response(202)
+        if message["method"] == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "plaintext-test", "version": "1"},
+            }
+        else:
+            assert message["method"] == "tools/list"
+            result = {"tools": [{"name": "read_ticket", "inputSchema": {"type": "object"}}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    def proxy(request):
+        proxy_requests.append(request)
+        return httpx.Response(502)
+
+    # Swap the socket transports while keeping HTTPX's actual proxy selection.
+    monkeypatch.setattr(
+        httpx.AsyncClient, "_init_transport", lambda *_, **__: httpx.MockTransport(upstream)
+    )
+    monkeypatch.setattr(
+        httpx.AsyncClient, "_init_proxy_transport", lambda *_, **__: httpx.MockTransport(proxy)
+    )
+    async with httpx.AsyncClient() as client:
+        assert (await client.head(entry.url)).status_code == 502
+    assert len(proxy_requests) == 1
+    proxy_requests.clear()
+
+    tools = await registry.execute("tracker", "alice", SimpleNamespace())
+
+    assert [tool.name for tool in tools] == ["read_ticket"]
+    assert direct_requests
+    assert not proxy_requests
+
+
+@pytest.mark.asyncio
+async def test_github_provider_resolver_is_reused(registry):
     from omnigent.connections.github import GithubConnectionStore
     from omnigent.server.github_app import GitHubTokenSet
 
@@ -238,6 +373,29 @@ async def test_existing_provider_resolver_is_reused(registry):
             SimpleNamespace(github_store=store, github_client=None),
         )
         == "github-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_databricks_provider_resolver_is_reused(registry):
+    from omnigent.connections.databricks import DatabricksConnectionStore
+    from omnigent.server.databricks_app import DatabricksTokenSet
+
+    store = DatabricksConnectionStore(registry.store.storage_location, _FakeCipher())
+    store.upsert(
+        "alice",
+        workspace_host="https://data.example.test",
+        databricks_user="alice@example.test",
+        databricks_user_id="1",
+        tokens=DatabricksTokenSet("databricks-test-token", None, None, None, "all-apis"),
+    )
+    assert (
+        await registry.token(
+            service(auth="databricks"),
+            "alice",
+            SimpleNamespace(databricks_store=store, databricks_client=None),
+        )
+        == "databricks-test-token"
     )
 
 

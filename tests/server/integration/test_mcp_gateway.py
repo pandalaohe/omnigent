@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from mcp.types import CallToolResult, TextContent, Tool
 
 from omnigent.policies.types import PolicyResult
+from omnigent.runtime import get_conversation_store
+from omnigent.server.permission_tiers import (
+    PERMISSION_CAPABILITY_LABEL_KEY,
+    PERMISSION_CAPABILITY_VALUE,
+    BoundToolCall,
+    ConfirmedPermissionState,
+)
 from omnigent.server.routes._sessions import orchestration
 from omnigent.spec.types import Phase, PolicyAction
 from tests.server.helpers import create_test_session
@@ -127,6 +137,105 @@ async def test_gateway_withholds_restricted_result(client, backend, monkeypatch,
     backend.call_tool.assert_awaited_once()
 
 
+@pytest.mark.parametrize("backend", ["default"], indirect=True)
+@pytest.mark.parametrize("outcome", ["allow", "host_denies", "policy_denies", "suppress"])
+async def test_gateway_uses_bound_runner_for_remote_tier(
+    client, app, backend, monkeypatch, outcome
+):
+    session_id = await selected_session(client)
+    host_id = "11111111111111111111111111111111"
+    store = get_conversation_store()
+    store.set_host_id(session_id, host_id, workspace="/opt/work/gateway")
+    store.update_conversation(session_id, harness_override="pi")
+    store.set_labels(
+        session_id,
+        {
+            **ConfirmedPermissionState("auto", 2, "ready").labels("pi"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    seen = policy(
+        monkeypatch,
+        call_action=PolicyAction.DENY if outcome == "policy_denies" else PolicyAction.ALLOW,
+        result_action=PolicyAction.DENY if outcome == "suppress" else PolicyAction.ALLOW,
+    )
+    events = []
+
+    def runner_response(request):
+        assert request.url.path == f"/v1/sessions/{session_id}/events"
+        event = json.loads(request.content)
+        events.append(event["type"])
+        common = {
+            "session_id": session_id,
+            "host_id": host_id,
+            "call_id": event["call_id"],
+            "tier_revision": 2,
+            "permission_tiers_capability": PERMISSION_CAPABILITY_VALUE,
+        }
+        if event["type"] == "permission_tier_finish":
+            return httpx.Response(200, json={"finished": True})
+        if event["type"] == "permission_tier_authorize":
+            return httpx.Response(200, json={**common, "authorized": True})
+        assert event["type"] == "permission_tier_inspect"
+        assert event["local_execution"] is False
+        binding = BoundToolCall.bind(
+            session_id=session_id,
+            host_id=host_id,
+            call_id=event["call_id"],
+            name=event["name"],
+            arguments=event["arguments"],
+            tier_revision=2,
+        )
+        return httpx.Response(
+            200,
+            json={
+                **common,
+                "name": binding.name,
+                "arguments_digest": binding.arguments_digest,
+                "verdict": "DENY" if outcome == "host_denies" else "ALLOW",
+                "reason": "Execution host denied the tool" if outcome == "host_denies" else "",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://runner.test", transport=httpx.MockTransport(runner_response)
+    ) as runner:
+
+        def route(bound_session_id, *, conversation):
+            assert bound_session_id == session_id
+            assert conversation.host_id == host_id
+            return SimpleNamespace(client=runner)
+
+        monkeypatch.setattr(app.state.runner_router, "client_for_session_resources", route)
+        response = await rpc(client, session_id)
+
+    if outcome in {"host_denies", "policy_denies"}:
+        reason = (
+            "Execution host denied the tool" if outcome == "host_denies" else "Denied by policy"
+        )
+        assert reason in response.json()["error"]["message"]
+        assert events == ["permission_tier_inspect"]
+        assert [context.phase for context in seen] == (
+            [] if outcome == "host_denies" else [Phase.TOOL_CALL]
+        )
+        backend.call_tool.assert_not_awaited()
+    else:
+        assert events == [
+            "permission_tier_inspect",
+            "permission_tier_inspect",
+            "permission_tier_authorize",
+            "permission_tier_finish",
+        ]
+        assert [context.phase for context in seen] == [Phase.TOOL_CALL, Phase.TOOL_RESULT]
+        backend.call_tool.assert_awaited_once()
+        text = response.json()["result"]["content"][0]["text"]
+        if outcome == "suppress":
+            assert "Result" in text
+            assert "private ticket" not in text and "redacted ticket" not in text
+        else:
+            assert text == "redacted ticket"
+
+
 @pytest.mark.parametrize("backend", ["default", "custom"], indirect=True)
 @pytest.mark.parametrize("decision", ["accept", "decline"])
 async def test_gateway_approval_preserves_transformed_arguments(
@@ -173,6 +282,18 @@ async def test_gateway_requires_context_selection_and_allowed_tool(client, backe
     assert "not allowed" in denied.json()["error"]["message"]
     backend.call_tool.assert_not_awaited()
     backend.list_tools.assert_not_awaited()
+
+
+@pytest.mark.parametrize("backend", ["default"], indirect=True)
+async def test_gateway_reports_registry_absent(client, app, backend):
+    session_id = await selected_session(client)
+    app.state.mcp_registry = None
+
+    response = await rpc(client, session_id)
+
+    assert response.status_code == 404
+    assert "MCP gateway is not configured" in response.json()["detail"]
+    backend.call_tool.assert_not_awaited()
 
 
 @pytest.mark.parametrize("backend", ["custom"], indirect=True)

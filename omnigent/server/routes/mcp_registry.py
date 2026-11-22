@@ -50,7 +50,9 @@ def create_mcp_registry_router(
         for service_id in page:
             entry = registry.services[service_id]
             connected = entry.auth == "none"
-            if entry.auth in {"github", "databricks"}:
+            if entry.auth == "env":
+                connected = registry.is_available(entry)
+            elif entry.auth in {"github", "databricks"}:
                 store = getattr(request.app.state, f"{entry.auth}_store", None)
                 connected = (
                     store is not None and await asyncio.to_thread(store.get, user_id) is not None
@@ -60,17 +62,20 @@ def create_mcp_registry_router(
                     await asyncio.to_thread(registry.store.get, user_id, f"mcp:{entry.id}")
                     is not None
                 )
-            data.append(
-                {
-                    "id": entry.id,
-                    "title": entry.title,
-                    "description": entry.description,
-                    "auth": entry.auth,
-                    "connected": connected,
-                    "tools": entry.tools,
-                    "connect_provider": f"mcp-{entry.id}" if entry.oauth else entry.auth,
-                }
-            )
+            row = {
+                "id": entry.id,
+                "title": entry.title,
+                "description": entry.description,
+                "auth": entry.auth,
+                "connected": connected,
+                "tools": entry.tools,
+                "connect_provider": f"mcp-{entry.id}" if entry.oauth else entry.auth,
+            }
+            if entry.auth == "env":
+                row.update(
+                    status="configured" if connected else "unavailable", connect_provider=None
+                )
+            data.append(row)
         return {
             "data": data,
             "next_cursor": page[-1] if start + len(page) < len(ids) else None,

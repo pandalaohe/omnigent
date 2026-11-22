@@ -8,11 +8,15 @@ import hashlib
 import logging
 import math
 import os
+import re
 import secrets
 import time
 from builtins import ExceptionGroup
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlencode, urlsplit
 from weakref import WeakValueDictionary
 
@@ -20,14 +24,65 @@ import httpx
 import yaml
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
-from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError, build_secret_cipher
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
+_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_BEARER_VALUE = re.compile(r"[!-~]{16,}")
+_ENV_REQUEST = ContextVar("mcp_env_request", default=False)
+_Model = TypeVar("_Model", bound=BaseModel)
+
+
+@contextmanager
+def _suppress_credential_transport_logs() -> Iterator[None]:
+    # The SDK and HTTP stack can log unredacted bodies, headers and exceptions.
+    loggers = tuple(
+        logging.getLogger(name)
+        for name in (
+            None,  # mcp.shared.session logs directly to the root logger
+            "client",  # mcp.client.session
+            "mcp.client.streamable_http",
+            "httpx",
+            "httpcore.connection",
+            "httpcore.http11",
+            "httpcore.http2",
+            "httpcore.proxy",
+            "httpcore.socks",
+        )
+    )
+
+    def quiet(_record: logging.LogRecord) -> bool:
+        return not _ENV_REQUEST.get()
+
+    for logger in loggers:
+        logger.addFilter(quiet)
+    marker = _ENV_REQUEST.set(True)
+    try:
+        yield
+    finally:
+        _ENV_REQUEST.reset(marker)
+        for logger in loggers:
+            logger.removeFilter(quiet)
+
+
+def _redact_upstream(model: _Model, token: str) -> _Model:
+    def redact(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace(token, "[redacted]")
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, dict):
+            return {redact(key): redact(item) for key, item in value.items()}
+        return value
+
+    # Revalidate so redaction cannot emit a malformed MCP response.
+    model_type = cast("type[_Model]", type(model))
+    return model_type.model_validate(redact(model.model_dump(mode="json", by_alias=True)))
 
 
 class McpUpstreamError(ConnectionError):
@@ -93,8 +148,12 @@ class McpService(BaseModel):
     title: str
     description: str = ""
     url: str
-    auth: Literal["none", "bearer", "oauth", "github", "databricks"] = "bearer"
+    auth: Literal["none", "bearer", "oauth", "github", "databricks", "env"] = "bearer"
     oauth: OAuthConfig | None = None
+    token_env: str | None = Field(default=None, repr=False)
+    header: str = Field(
+        default="Authorization", pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$", repr=False
+    )
     allowed_users: list[str] | None = None
     tools: list[str] = Field(min_length=1)
     allow_http: bool = False
@@ -106,6 +165,8 @@ class McpService(BaseModel):
             raise ValueError("MCP service ids cannot contain the tool namespace separator '__'")
         if (self.auth == "oauth") != (self.oauth is not None):
             raise ValueError("oauth configuration is required only for auth=oauth")
+        if self.auth != "env" and (self.token_env is not None or self.header != "Authorization"):
+            raise ValueError("token_env and header are only supported for auth=env")
         urls = [self.url]
         if self.oauth:
             urls += [self.oauth.authorize_url, self.oauth.token_url]
@@ -189,10 +250,28 @@ class McpRegistry:
             raise ValueError(
                 "Set OMNIGENT_MCP_OAUTH_STATE_SECRET to at least 32 random characters"
             )
+        self._env_tokens: dict[str, SecretStr] = {}
+        for service in config.services:
+            if service.auth != "env":
+                continue
+            name = service.token_env
+            valid_name = name if name and _ENV_NAME.fullmatch(name) else None
+            value = os.environ.get(valid_name, "") if valid_name else ""
+            if _BEARER_VALUE.fullmatch(value) and any(char.isalpha() for char in value):
+                self._env_tokens[service.id] = SecretStr(value)
+            else:
+                _logger.warning(
+                    "Registry MCP service unavailable service=%s token_env=%s",
+                    service.id,
+                    valid_name or "<missing or invalid>",
+                )
+
+    def is_available(self, service: McpService) -> bool:
+        return service.auth != "env" or service.id in self._env_tokens
 
     def service(self, service_id: str, user_id: str) -> McpService:
         service = self.services.get(service_id)
-        if service is None or not service.permits(user_id):
+        if service is None or not service.permits(user_id) or not self.is_available(service):
             raise ConnectionError("MCP service is unavailable for this user")
         return service
 
@@ -318,13 +397,24 @@ class McpRegistry:
         service = self.service(service_id, user_id)
         if tool is not None and tool not in service.tools:
             raise ConnectionError("Tool is not allowed by the MCP registry")
-        token = await self.token(service, user_id, app_state)
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        env_credential = self._env_tokens.get(service.id)
+        env_token = env_credential.get_secret_value() if env_credential is not None else None
+        token = env_token or await self.token(service, user_id, app_state)
+        headers = {service.header: f"Bearer {token}"} if token else {}
+        log_scope = _suppress_credential_transport_logs() if env_token else nullcontext()
+        # The MCP SDK follows same-origin redirects using its client's redirect budget.
+        redirect_options: dict[str, Any] = {"max_redirects": 0} if env_token else {}
+        trust_env = not (env_token and urlsplit(service.url).scheme == "http")
         try:
-            async with asyncio.timeout(service.timeout):
+            with log_scope:
                 async with (
+                    asyncio.timeout(service.timeout),
                     httpx.AsyncClient(
-                        headers=headers, follow_redirects=False, timeout=service.timeout
+                        headers=headers,
+                        follow_redirects=False,
+                        timeout=service.timeout,
+                        trust_env=trust_env,
+                        **redirect_options,
                     ) as client,
                     streamable_http_client(service.url, http_client=client) as (
                         read,
@@ -335,7 +425,8 @@ class McpRegistry:
                 ):
                     await session.initialize()
                     if tool is not None:
-                        return await session.call_tool(tool, arguments or {})
+                        result = await session.call_tool(tool, arguments or {})
+                        return _redact_upstream(result, env_token) if env_token else result
                     tools = []
                     cursor = None
                     for _ in range(100):
@@ -343,7 +434,11 @@ class McpRegistry:
                         tools.extend(t for t in result.tools if t.name in service.tools)
                         cursor = result.nextCursor
                         if not cursor:
-                            return tools
+                            return (
+                                [_redact_upstream(tool, env_token) for tool in tools]
+                                if env_token
+                                else tools
+                            )
                     raise ConnectionError("MCP tool catalog exceeded the pagination limit")
         except ConnectionError:
             raise
@@ -357,6 +452,19 @@ class McpRegistry:
                 failure.status_code,
             )
             raise failure from None
+
+
+def build_mcp_registry_from_env(db_uri: str) -> McpRegistry | None:
+    """Build the operator catalog named by ``OMNIGENT_MCP_REGISTRY``, or ``None`` when unset."""
+    config = McpRegistryConfig.from_env()
+    if config is None:
+        return None
+    cipher = (
+        build_secret_cipher()
+        if any(service.auth in {"oauth", "bearer"} for service in config.services)
+        else None
+    )
+    return McpRegistry(config, CredentialStore(db_uri, cipher) if cipher else None)
 
 
 class McpOAuthHooks:
