@@ -26,6 +26,25 @@ def registry_user(actor: dict[str, str] | None) -> str:
     raise ConnectionError("An authenticated user is required for registry MCP services")
 
 
+def is_selected_registry_tool(request: Request | None, spec: AgentSpec | None, name: str) -> bool:
+    """Test the exact name against the operator catalog and session spec."""
+    service_id, separator, tool = name.partition("__")
+    if not separator or spec is None or request is None:
+        return False
+    registry: McpRegistry | None = getattr(request.app.state, "mcp_registry", None)
+    service = registry.services.get(service_id) if registry is not None else None
+    return (
+        service is not None
+        and tool in service.tools
+        and any(
+            config.transport == "registry"
+            and config.name == service_id
+            and (config.tools is None or tool in config.tools)
+            for config in spec.mcp_servers
+        )
+    )
+
+
 async def registry_tools(
     registry: McpRegistry,
     request: Request,

@@ -1234,9 +1234,11 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.runner.pi_scope_relay import PiScopeRelay
     from omnigent.server.auth import LEVEL_READ
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
     from omnigent.server.routes import sessions
     from omnigent.server.routes._auth_helpers import SessionAccess
     from omnigent.server.routes.sessions import routes_hooks
+    from omnigent.spec.types import AgentSpec, MCPServerConfig
     from tests.runner.conftest import _build_app_for_spec, _runner_client
     from tests.runner.native_helpers import _harness_spec
 
@@ -1252,7 +1254,20 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
     _publish_scope(
         runtime,
         child,
-        [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}],
+        [
+            {"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}},
+            *(
+                {
+                    "name": name,
+                    "sourceInfo": {
+                        "path": str(
+                            runtime.path("session-a").parent / "omnigent_pi_native_extension.js"
+                        )
+                    },
+                }
+                for name in ("notes__search", "notes__unlisted")
+            ),
+        ],
     )
     conv = Conversation(
         id="session-a",
@@ -1277,6 +1292,24 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
     router = APIRouter()
     routes_hooks.register_hooks_routes(router, conversation_store=store, agent_store=None)
     server = FastAPI()
+    server.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="notes",
+                    title="Notes",
+                    url="https://notes.example.com/mcp",
+                    auth="none",
+                    tools=["search"],
+                )
+            ]
+        ),
+        None,
+    )
+    registry_spec = AgentSpec(
+        spec_version=1, mcp_servers=[MCPServerConfig(name="notes", transport="registry")]
+    )
+    monkeypatch.setattr(sessions, "_load_agent_spec_for_session", lambda *_args: registry_spec)
     server.include_router(router, prefix="/v1")
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path)
 
@@ -1363,6 +1396,25 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         "session-a", binding.get("pi_origin_receipt")
                     )
                     assert receipt.principal == child.principal
+                    for name, expected in (
+                        ("notes__search", "POLICY_ACTION_UNSPECIFIED"),
+                        ("notes__unlisted", "POLICY_ACTION_DENY"),
+                    ):
+                        remote = await client.post(
+                            "/policies/evaluate",
+                            json={
+                                "event": {
+                                    "type": "PHASE_TOOL_CALL",
+                                    "data": {
+                                        "name": name,
+                                        "arguments": {"query": "hello"},
+                                        "call_id": name,
+                                    },
+                                }
+                            },
+                            headers=child_headers,
+                        )
+                        assert remote.json()["result"] == expected, remote.text
                     parent_response = await client.post(
                         "/policies/evaluate",
                         json=event,
@@ -2708,7 +2760,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tier", "action"),
-    [("ask", "ASK"), ("accept-edits", "ASK"), ("auto", "DENY"), ("plan", "DENY")],
+    [("ask", "ASK"), ("accept-edits", "ASK"), ("auto", "ALLOW"), ("plan", "DENY")],
 )
 async def test_scoped_pi_registry_tool_reaches_gateway_after_authorization(tmp_path, tier, action):
     from omnigent.runner.pi_scope_relay import PiScopeRelay
@@ -2738,6 +2790,7 @@ async def test_scoped_pi_registry_tool_reaches_gateway_after_authorization(tmp_p
         expected_revision=3,
         local_execution=False,
         origin_receipt=receipt.token,
+        registry_tool=True,
     )
     assert decision.action.value == action
     authorized = runtime.authorize(
@@ -2748,7 +2801,7 @@ async def test_scoped_pi_registry_tool_reaches_gateway_after_authorization(tmp_p
         expected_revision=3,
         origin_receipt=receipt.token,
     )
-    assert authorized is (action == "ASK")
+    assert authorized is (action != "DENY")
     if not authorized:
         return
 
@@ -2795,6 +2848,35 @@ async def test_scoped_pi_registry_tool_reaches_gateway_after_authorization(tmp_p
     assert payload["params"]["_omnigent_permission_call_id"] == binding.call_id
     assert payload["params"]["_omnigent_pi_origin_receipt"] == receipt.token
     assert result == {"result": "found"}
+
+
+@pytest.mark.parametrize(
+    ("tier", "action"),
+    [
+        ("full", "ALLOW"),
+        ("ask", "ASK"),
+        ("accept-edits", "ASK"),
+        ("auto", "ALLOW"),
+        ("plan", "DENY"),
+    ],
+)
+def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, action):
+    runtime = _runtime(tmp_path, tier)
+    for local_execution, registry_tool, expected in (
+        (False, True, action),
+        (False, False, "DENY" if tier == "auto" else action),
+        (True, True, "DENY" if tier == "auto" else action),
+    ):
+        _, decision = runtime.inspect(
+            "session-a",
+            call_id=f"{local_execution}:{registry_tool}",
+            name="notes__search",
+            arguments={"query": "hello"},
+            expected_revision=3,
+            local_execution=local_execution,
+            registry_tool=registry_tool,
+        )
+        assert decision.action.value == expected
 
 
 @pytest.mark.parametrize(

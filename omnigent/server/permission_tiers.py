@@ -23,6 +23,8 @@ PERMISSION_CAPABILITY_VALUE = "permission_tiers_v1"
 PERMISSION_RUNTIME_ID_LABEL_KEY = "omnigent.permission_tier.runtime_id"
 PERMISSION_PROTOCOL_HEADER = "X-Omnigent-Permission-Tiers"
 PERMISSION_PROTOCOL_VERSION = "1"
+# Sent only on a server-to-runner inspection after catalog and selection checks.
+REGISTRY_TOOL_INSPECTION_HEADER = "X-Omnigent-Registry-Tool-Inspection"
 TIER_HARNESSES = frozenset({"pi", "pi-native", "antigravity-native"})
 PERMISSION_LABEL_KEYS = frozenset(
     {

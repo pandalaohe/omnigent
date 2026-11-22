@@ -120,6 +120,7 @@ class TrustedHostContext:
     native_support: NativeSupport | None = None
     local_execution: bool = True
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing"
+    registry_tool_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -776,6 +777,8 @@ def _adapt_unbound_call(
         ):
             return native
         if not context.local_execution:
+            if name == context.registry_tool_name:
+                return ToolIntent(ToolKind.OTHER, name, digest, context, detail="registry-tool")
             return ToolIntent(
                 ToolKind.UNKNOWN,
                 name,

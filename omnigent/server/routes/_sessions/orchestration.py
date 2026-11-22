@@ -17524,6 +17524,7 @@ async def _handle_mcp_tools_call(
         inspect_permission_call,
     )
     from omnigent.server.permission_tiers import TIER_HARNESSES
+    from omnigent.server.registry_gateway import is_selected_registry_tool
 
     permission_harness = await asyncio.to_thread(_resolve_harness, conv, agent_store=agent_store)
     permission_call_id = params.get("_omnigent_permission_call_id") or operation_id
@@ -17536,6 +17537,9 @@ async def _handle_mcp_tools_call(
             for config in spec.mcp_servers
         )
     )
+    registry_tool = not tier_local_execution and is_selected_registry_tool(
+        request, spec, namespaced_name
+    )
     tier_inspection = await inspect_permission_call(
         conv,
         harness=permission_harness,
@@ -17546,6 +17550,7 @@ async def _handle_mcp_tools_call(
         local_execution=tier_local_execution,
         origin_receipt=params.get("_omnigent_pi_origin_receipt"),
         execution_operation_id=operation_id if pi_continuation else None,
+        registry_tool=registry_tool,
     )
     if tier_inspection.decision.action == Verdict.DENY:
         return _mcp_error_response(rpc_id, -32000, tier_inspection.decision.reason)
@@ -17745,6 +17750,7 @@ async def _handle_mcp_tools_call(
             local_execution=tier_local_execution,
             origin_receipt=params.get("_omnigent_pi_origin_receipt"),
             execution_operation_id=operation_id if pi_continuation else None,
+            registry_tool=registry_tool,
         )
     tier_decision = await authorize_permission_call(
         tier_inspection,
@@ -17981,6 +17987,7 @@ async def _handle_mcp_tools_call(
                 local_execution=tier_local_execution,
                 origin_receipt=params.get("_omnigent_pi_origin_receipt"),
                 execution_operation_id=operation_id if pi_continuation else None,
+                registry_tool=registry_tool,
             )
             retry_permission = await authorize_permission_call(
                 tier_inspection,

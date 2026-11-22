@@ -11,6 +11,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedSet
 from omnigent.permission_tiers import TierDecision, Verdict
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
+    REGISTRY_TOOL_INSPECTION_HEADER,
     TIER_HARNESSES,
     BoundToolCall,
     permission_execution_host_id,
@@ -59,6 +60,7 @@ async def inspect_permission_call(
     local_execution: bool = True,
     origin_receipt: object = None,
     execution_operation_id: object = None,
+    registry_tool: bool = False,
 ) -> InspectedPermissionCall:
     """Only the authenticated executing runner may supply filesystem facts."""
     if harness is None and any(
@@ -113,6 +115,7 @@ async def inspect_permission_call(
                     else {}
                 ),
             },
+            headers={REGISTRY_TOOL_INSPECTION_HEADER: "1"} if registry_tool else None,
             timeout=10.0,
         )
         response.raise_for_status()
