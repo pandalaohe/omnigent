@@ -6206,7 +6206,19 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "old_action", ["delete", "cli_release", "ensure", "cleanup_first", "restart", "retry_write"]
+    "old_action",
+    [
+        "delete",
+        "cli_release",
+        "ensure",
+        "cleanup_first",
+        "restart",
+        "retry_write",
+        "lost_response",
+        "proxy_502",
+        "plain_503",
+        "different_pane",
+    ],
 )
 async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_action: str
@@ -6215,6 +6227,8 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
 
     from omnigent.harnesses.codex_native import app_server as codex_app_server
     from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.executor import TurnComplete
     from omnigent.runner import subagent_routing, turn_routing
     from omnigent.runner.native import orchestration
     from omnigent.terminals.registry import TerminalRegistry
@@ -6321,36 +6335,65 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
             transfer_path = (
                 f"/v1/sessions/{old_id}/resources/terminals/terminal_codex_main/transfer"
             )
-            if old_action == "retry_write":
+            rotates = old_action in {
+                "retry_write",
+                "lost_response",
+                "proxy_502",
+                "plain_503",
+                "different_pane",
+            }
+            if rotates:
                 persist_owner = codex_native_bridge.transfer_bridge_owner
                 write_attempts = 0
                 statuses: list[int] = []
                 creates: list[str] = []
+                transfer_requests: list[dict[str, Any]] = []
 
                 def fail_first_owner_write(path: Path, source: str, target: str) -> None:
                     nonlocal write_attempts
                     write_attempts += 1
-                    if write_attempts == 1:
+                    if old_action == "retry_write" and write_attempts == 1:
                         raise OSError("temporary owner write failure")
                     persist_owner(path, source, target)
 
                 async def through_runner(request: httpx.Request) -> httpx.Response:
                     if request.method == "GET":
+                        if "/resources/terminals/" in request.url.path:
+                            response = await runner.get(request.url.path)
+                            return httpx.Response(response.status_code, json=response.json())
                         return httpx.Response(200, json={"agent_id": "agent"})
                     if request.url.path.endswith("/successor"):
                         creates.append(request.url.path)
                         return httpx.Response(200, json={"id": new_id})
                     if request.url.path.endswith("/transfer"):
                         assert request.url.path == transfer_path
-                        assert json.loads(request.content) == {"target_session_id": new_id}
-                        response = await runner.post(
-                            transfer_path, json={"target_session_id": new_id}
-                        )
+                        body = json.loads(request.content)
+                        transfer_requests.append(body)
+                        if old_action == "plain_503":
+                            return httpx.Response(503, text="unreadable runner reply")
+                        if old_action == "different_pane":
+                            persist_owner(bridge_dir, old_id, new_id)
+                            terminals._by_conversation[new_id] = {
+                                ("codex", "main"): make_test_terminal_instance(
+                                    "codex", "main", tmp_path
+                                )
+                            }
+                            return httpx.Response(502)
+                        response = await runner.post(transfer_path, json=body)
                         statuses.append(response.status_code)
-                        if len(statuses) == 1:
+                        if old_action == "retry_write" and len(statuses) == 1:
                             assert terminals.get_native(old_id, "codex", "main") is pane
                             assert terminals.get_native(new_id, "codex", "main") is None
                             assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+                            assert response.json()["error"]["code"] == (
+                                "terminal_transfer_owner_write_failed"
+                            )
+                        if old_action in {"lost_response", "proxy_502"}:
+                            assert response.status_code == 200
+                            assert terminals.get_native(new_id, "codex", "main") is pane
+                            if old_action == "lost_response":
+                                raise httpx.ReadTimeout("transfer reply lost", request=request)
+                            return httpx.Response(502)
                         return httpx.Response(response.status_code, json=response.json())
                     return httpx.Response(200, json={})
 
@@ -6361,18 +6404,54 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                     async with httpx.AsyncClient(
                         transport=httpx.MockTransport(through_runner), base_url="http://server"
                     ) as client:
-                        assert (
-                            await codex_forwarder._create_thread_replacement_session(
-                                client=client,
-                                old_session_id=old_id,
-                                bridge_dir=bridge_dir,
-                                app_server_url=state.socket_path,
-                                new_thread_id="thread_new",
-                            )
-                            == new_id
+                        rotation = codex_forwarder._create_thread_replacement_session(
+                            client=client,
+                            old_session_id=old_id,
+                            bridge_dir=bridge_dir,
+                            app_server_url=state.socket_path,
+                            new_thread_id="thread_new",
                         )
-                assert statuses == [503, 200]
-                assert write_attempts == 2
+                        if old_action in {"plain_503", "different_pane"}:
+                            with pytest.raises(httpx.HTTPStatusError) as error:
+                                await rotation
+                            assert error.value.response.status_code == (
+                                503 if old_action == "plain_503" else 502
+                            )
+                            assert len(transfer_requests) == 1
+                            assert codex_native_bridge.read_bridge_state(bridge_dir) == state
+                            return
+                        assert await rotation == new_id
+                if old_action == "retry_write":
+                    assert statuses == [503, 200]
+                    assert write_attempts == 2
+                else:
+                    assert statuses == [200]
+                    with monkeypatch.context() as successor:
+                        successor.setenv(
+                            codex_native_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, new_id
+                        )
+                        rpc = AsyncMock(return_value={"result": {"turn": {"id": "turn_new"}}})
+                        app_server = SimpleNamespace(request=rpc, close=AsyncMock())
+                        successor.setattr(
+                            codex_native_executor,
+                            "_connect_to_app_server",
+                            AsyncMock(return_value=app_server),
+                        )
+                        events = [
+                            event
+                            async for event in codex_native_executor.CodexNativeExecutor(
+                                bridge_dir=bridge_dir
+                            ).run_turn([{"role": "user", "content": "successor message"}], [], "")
+                        ]
+                    assert [type(event) for event in events] == [TurnComplete]
+                    assert [
+                        call.args[1]["threadId"]
+                        for call in rpc.await_args_list
+                        if call.args[0] == "turn/start"
+                    ] == ["thread_new"]
+                assert transfer_requests == [
+                    {"target_session_id": new_id, "expected_instance_id": pane.instance_id}
+                ] * len(statuses)
                 assert creates == [f"/v1/sessions/{old_id}/successor"]
                 assert terminals.get_native(new_id, "codex", "main") is pane
             else:
@@ -6462,7 +6541,7 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
             close.assert_not_awaited()
             assert codex_native_bridge.read_bridge_resource_owner(bridge_dir) == new_id
             published = codex_native_bridge.read_bridge_state(bridge_dir)
-            if old_action == "retry_write":
+            if rotates:
                 assert published is not None
                 assert (published.session_id, published.thread_id) == (new_id, "thread_new")
             else:

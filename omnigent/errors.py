@@ -257,6 +257,7 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    TERMINAL_TRANSFER_OWNER_WRITE_FAILED = "terminal_transfer_owner_write_failed"
     HOST_OFFLINE = "host_offline"
     WRONG_REPLICA = "wrong_replica"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
@@ -308,6 +309,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: 503,
     # 503 like RUNNER_UNAVAILABLE: the send succeeds once the host is back.
     ErrorCode.HOST_OFFLINE: 503,
     # 400, not 503: the request reached a replica that can't serve it, but the
@@ -374,6 +376,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A valid request the caller cannot fix by retry or re-input; the
     # deployment/host must change.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorCategory.CONFIG,
+    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: ErrorCategory.RUNNER,
     # The human's own machine is asleep or disconnected.
     ErrorCode.HOST_OFFLINE: ErrorCategory.USER,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
@@ -428,6 +431,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorImpact.TRANSIENT,
+    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: ErrorImpact.TRANSIENT,
     ErrorCode.HOST_OFFLINE: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
@@ -482,6 +486,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: ErrorPhase.ROUTING,
     ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,

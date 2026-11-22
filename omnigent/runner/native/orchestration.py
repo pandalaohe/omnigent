@@ -552,7 +552,7 @@ def _prepare_codex_forwarder_transfer(
     except OSError as exc:
         raise OmnigentError(
             "Unable to persist the transferred Codex bridge owner",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+            code=ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED,
         ) from exc
 
 
