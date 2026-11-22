@@ -17499,7 +17499,7 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
-    if not namespaced_name:
+    if not isinstance(namespaced_name, str) or not namespaced_name:
         return _mcp_error_response(rpc_id, -32000, "Missing tool name in tools/call params")
 
     # Session → agent → spec (needed for policy evaluation on both paths).
@@ -17524,21 +17524,35 @@ async def _handle_mcp_tools_call(
         inspect_permission_call,
     )
     from omnigent.server.permission_tiers import TIER_HARNESSES
-    from omnigent.server.registry_gateway import is_selected_registry_tool
+    from omnigent.server.registry_gateway import resolve_selected_registry_tool
 
     permission_harness = await asyncio.to_thread(_resolve_harness, conv, agent_store=agent_store)
     permission_call_id = params.get("_omnigent_permission_call_id") or operation_id
     if permission_call_id is None:
         permission_call_id = "mcp:" + uuid.uuid4().hex
-    tier_local_execution = permission_harness not in TIER_HARNESSES or (
-        execute_tool is None
-        and not any(
-            config.transport == "registry" and namespaced_name.startswith(config.name + "__")
-            for config in spec.mcp_servers
-        )
+    registry_available = (
+        request is not None and getattr(request.app.state, "mcp_registry", None) is not None
     )
-    registry_tool = not tier_local_execution and is_selected_registry_tool(
-        request, spec, namespaced_name
+    registry_namespace = (permission_harness in TIER_HARNESSES or registry_available) and any(
+        config.transport == "registry" and namespaced_name.startswith(config.name + "__")
+        for config in spec.mcp_servers
+    )
+    registry_match = resolve_selected_registry_tool(request, spec, namespaced_name)
+    registry_config = registry_match[0] if registry_match is not None else None
+    tier_local_execution = permission_harness not in TIER_HARNESSES or (
+        execute_tool is None and not registry_namespace
+    )
+    # The per-service gateway's explicit target must agree with the flat-name resolution.
+    registry_tool = (
+        not tier_local_execution
+        and registry_config is not None
+        and (
+            execute_tool is None
+            or (
+                request is not None
+                and request.path_params.get("service_id") == registry_config.name
+            )
+        )
     )
     tier_inspection = await inspect_permission_call(
         conv,
@@ -17554,6 +17568,15 @@ async def _handle_mcp_tools_call(
     )
     if tier_inspection.decision.action == Verdict.DENY:
         return _mcp_error_response(rpc_id, -32000, tier_inspection.decision.reason)
+    if (
+        execute_tool is None
+        and registry_namespace
+        and registry_config is None
+        and registry_available
+    ):
+        return _mcp_error_response(
+            rpc_id, -32000, "Registry MCP tool is not uniquely approved for this session"
+        )
 
     if is_retry:
         # ── Retry path: user has responded to the elicitation ────────
@@ -17764,16 +17787,6 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, tier_decision.reason)
     permission_execution_binding = tier_inspection.execution_binding()
 
-    registry_config = None
-    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
-        registry_config = next(
-            (
-                c
-                for c in spec.mcp_servers
-                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
-            ),
-            None,
-        )
     server_advisor = namespaced_name in (
         "sys_advise_models",
         "mcp__omnigent__sys_advise_models",

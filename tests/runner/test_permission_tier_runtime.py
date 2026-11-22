@@ -1265,7 +1265,12 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         )
                     },
                 }
-                for name in ("notes__search", "notes__unlisted")
+                for name in (
+                    "notes__search",
+                    "notes___search",
+                    "notes___overlap",
+                    "notes__unlisted",
+                )
             ),
         ],
     )
@@ -1300,14 +1305,24 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                     title="Notes",
                     url="https://notes.example.com/mcp",
                     auth="none",
-                    tools=["search"],
-                )
+                    tools=["search", "_overlap"],
+                ),
+                McpService(
+                    id="notes_",
+                    title="Other notes",
+                    url="https://other.example.com/mcp",
+                    auth="none",
+                    tools=["search", "overlap"],
+                ),
             ]
         ),
         None,
     )
     registry_spec = AgentSpec(
-        spec_version=1, mcp_servers=[MCPServerConfig(name="notes", transport="registry")]
+        spec_version=1,
+        mcp_servers=[
+            MCPServerConfig(name=name, transport="registry") for name in ("notes", "notes_")
+        ],
     )
     monkeypatch.setattr(sessions, "_load_agent_spec_for_session", lambda *_args: registry_spec)
     server.include_router(router, prefix="/v1")
@@ -1398,6 +1413,8 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                     assert receipt.principal == child.principal
                     for name, expected in (
                         ("notes__search", "POLICY_ACTION_UNSPECIFIED"),
+                        ("notes___search", "POLICY_ACTION_UNSPECIFIED"),
+                        ("notes___overlap", "POLICY_ACTION_DENY"),
                         ("notes__unlisted", "POLICY_ACTION_DENY"),
                     ):
                         remote = await client.post(

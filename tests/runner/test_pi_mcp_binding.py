@@ -52,6 +52,8 @@ from tests.server.routes.test_sessions_mcp_proxy_policy_retry import (
         "server-replay",
         "registry-replay",
         "registry-auto",
+        "registry-auto-trailing",
+        "registry-auto-overlapping",
         "registry-auto-deny",
         "advisor-replay",
         "elicitation-deny",
@@ -65,10 +67,12 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
 ):
     registry_call = fault.startswith("registry-")
     tier = "auto" if fault.startswith("registry-auto") else "ask"
+    overlapping = fault == "registry-auto-overlapping"
+    service_id = "fixture_" if overlapping or fault == "registry-auto-trailing" else "fixture"
     runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
     child = runtime.open_pi_child_scope("session-a")
     tool_name = (
-        "mcp__omnigent__sys_advise_models" if fault == "advisor-replay" else "fixture__echo"
+        "mcp__omnigent__sys_advise_models" if fault == "advisor-replay" else f"{service_id}__echo"
     )
     expected = runtime.pi_scopes.record(child.principal).expected
     _publish_scope(
@@ -140,17 +144,19 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
     )
     registry = None
     if registry_call:
-        spec.mcp_servers = [MCPServerConfig(name="fixture", transport="registry")]
+        selected = ["fixture", service_id] if overlapping else [service_id]
+        spec.mcp_servers = [MCPServerConfig(name=name, transport="registry") for name in selected]
         registry = McpRegistry(
             McpRegistryConfig(
                 services=[
                     McpService(
-                        id="fixture",
+                        id=name,
                         title="Fixture",
                         url="https://mcp.example.com",
                         auth="none",
                         tools=["echo"],
                     )
+                    for name in selected
                 ]
             ),
             None,
@@ -241,7 +247,9 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
     if registry_call:
         from omnigent.server import registry_gateway
 
-        async def execute_registry(_request, _conv, _config, _name, values, _user):
+        async def execute_registry(_request, _conv, config, name, values, _user):
+            assert config.name == service_id
+            assert name == tool_name
             return await execute_server(values)
 
         monkeypatch.setattr(registry_gateway, "execute_registry_tool", execute_registry)
@@ -350,9 +358,13 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
 
             async def server_transport(request):
                 body = json.loads(request.content)
-                if registry_call:
-                    assert request.url.path == "/v1/mcp/fixture"
-                    body["params"]["name"] = "fixture__" + body["params"]["name"]
+                if overlapping:
+                    assert request.url.path == "/v1/sessions/session-a/mcp"
+                    assert body["params"]["name"] == tool_name
+                elif registry_call:
+                    assert request.url.path == f"/v1/mcp/{service_id}"
+                    assert body["params"]["name"] == "echo"
+                    body["params"]["name"] = f"{service_id}__echo"
                 if fault == "missing-operation":
                     body["params"].pop(MCP_OPERATION_ID_PARAM)
                 elif fault == "wrong-operation":
@@ -422,6 +434,8 @@ async def test_scoped_call_reaches_real_mcp_without_replacing_its_lease(
                             "server-replay",
                             "registry-replay",
                             "registry-auto",
+                            "registry-auto-trailing",
+                            "registry-auto-overlapping",
                             "advisor-replay",
                         ):
                             assert "echo: SCOPED_MCP_EXECUTED" in result["result"], result

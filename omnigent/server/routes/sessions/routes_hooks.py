@@ -2444,10 +2444,10 @@ def register_hooks_routes(
             and "__" in name
             and getattr(request.app.state, "mcp_registry", None) is not None
         ):
-            from omnigent.server.registry_gateway import is_selected_registry_tool
+            from omnigent.server.registry_gateway import resolve_selected_registry_tool
 
             spec = await asyncio.to_thread(_sf._load_agent_spec_for_session, conv, agent_store)
-            registry_tool = is_selected_registry_tool(request, spec, name)
+            registry_tool = resolve_selected_registry_tool(request, spec, name) is not None
         inspection = await inspect_permission_call(
             conv,
             harness=harness,
