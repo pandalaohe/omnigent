@@ -43,7 +43,7 @@ import { t } from "@/lib/autoRotationText";
 import { ATTACHMENT_UPLOAD_FAILED } from "@/lib/blocks";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink, SIGN_IN_EXPIRED_CODE } from "@/lib/sessionsApi";
-import { useChatStore } from "@/store/chatStore";
+import { clearFailedAttachmentSend, useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
@@ -349,6 +349,7 @@ export function ErrorBanner({
   onRetry,
   relatedErrors = EMPTY_RELATED_ERRORS,
 }: ErrorBannerProps) {
+  const conversationId = useScopedConversationId();
   const workspaceMissing =
     code === "workspace_missing" ||
     relatedErrors.some((error) => error.code === "workspace_missing");
@@ -639,6 +640,9 @@ export function ErrorBanner({
             }
             onClick={(event) => {
               event.stopPropagation();
+              if (code === ATTACHMENT_UPLOAD_FAILED && conversationId && itemId) {
+                clearFailedAttachmentSend(conversationId, itemId);
+              }
               setDismissed(true);
             }}
             className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-foreground"

@@ -13429,6 +13429,61 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     });
+
+    it("matches a Claude-native short skill name to its qualified echo", () => {
+      const conversationId = "conv_claude";
+      const pending = (tempId: string, text: string) => ({
+        tempId,
+        posted: true,
+        content: [{ type: "input_text" as const, text }],
+      });
+      const ordinary = pending("ordinary", "ordinary follow-up");
+      const unrelated = pending("other_plugin", "/other-plugin:simplify the parser");
+      const short = pending("short", "/simplify the  parser");
+      const standalone = (tempId: string, text: string) => ({
+        ...pending(tempId, text),
+        standaloneSkill: true as const,
+      });
+      const bareSkill = standalone("bare_skill", "/simplify the parser");
+      const qualified = standalone("qualified", "/dev-productivity:simplify the parser");
+      useChatStore.setState({
+        conversationId,
+        sessionHarness: "claude-native",
+        isNativeTerminalSession: true,
+        pendingUserMessages: [ordinary, unrelated, bareSkill, short, qualified],
+      });
+      const receipt: StreamEvent = {
+        type: "slash_command",
+        kind: "skill",
+        name: "dev-productivity:simplify",
+        arguments: "the\nparser",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "qualified_receipt",
+        responseId: "qualified_response",
+      };
+      handleSessionEvent(receipt, conversationId);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        ordinary,
+        unrelated,
+        bareSkill,
+        short,
+      ]);
+      handleSessionEvent({ ...receipt, itemId: "short_receipt" }, conversationId);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, unrelated, bareSkill]);
+      handleSessionEvent({ ...receipt, name: "simplify", itemId: "bare_receipt" }, conversationId);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, unrelated]);
+      handleSessionEvent(
+        {
+          type: "session_input_consumed",
+          itemId: "message_receipt",
+          itemType: "message",
+          data: { role: "user", content: ordinary.content },
+        },
+        conversationId,
+      );
+      expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
+    });
   });
 
   describe("terminal_command (claude-native !cmd)", () => {

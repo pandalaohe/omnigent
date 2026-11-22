@@ -1045,6 +1045,8 @@ export interface ConversationState {
     replaceComposer?: boolean;
     /** Called once the composer has taken the draft's text and files. */
     onRestored?: () => void;
+    /** The upload card that requested this draft handoff. */
+    attachmentRetryCardId?: string;
   } | null;
   pendingRetryStableId: string | null;
   /**
@@ -2065,6 +2067,16 @@ function pendingForPost(
   return rest;
 }
 
+export function clearFailedAttachmentSend(conversationId: string, stableId: string): void {
+  setterFor(conversationId)((state) => ({
+    blocks: state.blocks.filter(
+      (block) =>
+        block.type !== "error" || !block.failedAttachmentSend || block.ctx.itemId !== stableId,
+    ),
+    ...(state.failedSendDraft?.attachmentRetryCardId === stableId ? { failedSendDraft: null } : {}),
+  }));
+}
+
 export async function retryFailedAttachmentSend(
   conversationId: string,
   stableId: string | null,
@@ -2090,17 +2102,15 @@ export async function retryFailedAttachmentSend(
         composerParts: parts,
         replyDraft,
         replaceComposer: true,
-        onRestored: () =>
-          setterFor(conversationId)((s) => ({
-            blocks: s.blocks.filter((block) => block !== card),
-          })),
+        attachmentRetryCardId: stableId,
+        onRestored: () => clearFailedAttachmentSend(conversationId, stableId),
       },
     });
     return;
   }
   const retryAgent = state.boundAgentId ?? agentId;
   if (!retryAgent) throw new Error("Wait for the session to load before retrying");
-  setterFor(conversationId)((s) => ({ blocks: s.blocks.filter((block) => block !== card) }));
+  clearFailedAttachmentSend(conversationId, stableId);
   await useChatStore.getState().send(text, retryAgent, files, {
     pinnedConversationId: conversationId,
     retryingUpload: true,
@@ -10839,14 +10849,23 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (event.kind === "skill") {
           const posted = s.pendingUserMessages.filter((p) => !p.beforePost && !p.initialDraft);
           const command = normalizeMessageText(`/${event.name} ${event.arguments}`);
+          // Claude's transcript qualifies plugin skills even when the composer used a short name.
+          const shortName = event.name.slice(event.name.lastIndexOf(":") + 1);
+          const shortCommand =
+            shortName !== event.name &&
+            (s.sessionHarness === "claude-native" || event.agentName === "claude-native-ui")
+              ? normalizeMessageText(`/${shortName} ${event.arguments}`)
+              : null;
+          const matchesCommand = (p: PendingUserMessage, text: string) =>
+            p.content.every(
+              (block) => block.type === "input_text" || block.type === "output_text",
+            ) && messageContentText(p.content) === text;
           const skill =
             posted.find((p) => p.standaloneSkill && p.stableId === event.itemId) ??
-            posted.find(
-              (p) =>
-                p.content.every(
-                  (block) => block.type === "input_text" || block.type === "output_text",
-                ) && messageContentText(p.content) === command,
-            );
+            posted.find((p) => matchesCommand(p, command)) ??
+            (shortCommand === null
+              ? undefined
+              : posted.find((p) => !p.standaloneSkill && matchesCommand(p, shortCommand)));
           return skill
             ? { pendingUserMessages: s.pendingUserMessages.filter((p) => p !== skill) }
             : {};
