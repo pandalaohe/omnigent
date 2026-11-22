@@ -416,9 +416,6 @@ def build_native_controls(
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
-    # A successful runner-issued /model switch makes the current readback stale
-    # until the current pane or a later turn confirms what the terminal now runs.
-    _antigravity_readback_before_model_switch: dict[str, str | None] = {}
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
@@ -1454,7 +1451,6 @@ def build_native_controls(
         from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
 
-        _antigravity_readback_before_model_switch.pop(conv_id, None)
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is None:
             return
@@ -2122,7 +2118,7 @@ def build_native_controls(
             split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
-        from omnigent.util.reasoning_effort import clamp_antigravity_effort
+        from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
         if not model or not model.strip():
             return JSONResponse(
@@ -2141,33 +2137,23 @@ def build_native_controls(
         )
         raw_options = snapshot.get("model_options")
         catalog_models = raw_options if isinstance(raw_options, list) else None
-        raw_readback = snapshot.get("llm_model")
-        readback_before_switch = (
-            raw_readback.strip()
-            if isinstance(raw_readback, str) and raw_readback.strip()
-            else None
-        )
         if not effort_set:
             raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
             effort = raw_effort if isinstance(raw_effort, str) else None
         base_model, suffix_effort = split_agy_effort_suffix(model.strip())
-        applied_effort: str | None = None
-        if effort:
-            applied_effort = clamp_antigravity_effort(
-                effort, base_model, catalog_models=catalog_models
-            )
-            selected = f"{base_model}-{applied_effort}"
-        elif suffix_effort is not None:
-            applied_effort = clamp_antigravity_effort(
-                suffix_effort, base_model, catalog_models=catalog_models
-            )
-            selected = (
-                f"{base_model}-{applied_effort}"
-                if applied_effort != suffix_effort
-                else model.strip()
-            )
-        else:
-            selected = model.strip()
+        requested_effort = effort or suffix_effort
+        applied_effort = clamp_antigravity_effort(
+            requested_effort, base_model, catalog_models=catalog_models
+        )
+        xhigh_requested = (
+            requested_effort is not None
+            and EFFORT_ALIASES.get(requested_effort, requested_effort) == "xhigh"
+        )
+        selected = (
+            f"{base_model}-{applied_effort}"
+            if effort or applied_effort != requested_effort
+            else model.strip()
+        )
         try:
             await asyncio.to_thread(
                 run_agy_slash_command,
@@ -2186,16 +2172,15 @@ def build_native_controls(
                     ),
                 },
             )
-        _antigravity_readback_before_model_switch[conv_id] = readback_before_switch
-        if effort_set:
-            if applied_effort:
-                _session_reasoning_effort[conv_id] = applied_effort
+        if xhigh_requested and applied_effort:
+            _session_reasoning_effort[conv_id] = applied_effort
+        elif effort_set:
+            if effort:
+                _session_reasoning_effort[conv_id] = effort
             else:
                 _session_reasoning_effort.pop(conv_id, None)
-        elif applied_effort:
-            _session_reasoning_effort[conv_id] = applied_effort
         reply: dict[str, object] = {"model": selected}
-        if applied_effort is not None:
+        if xhigh_requested:
             reply["effort"] = applied_effort
         return JSONResponse(status_code=200, content=reply)
 
@@ -2209,7 +2194,7 @@ def build_native_controls(
             run_agy_slash_command,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
-        from omnigent.util.reasoning_effort import clamp_antigravity_effort
+        from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
         if not effort:
             return JSONResponse(
@@ -2226,47 +2211,28 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(
             labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         )
-        # The runner's own successful /model switch is newer than a readback that
-        # cannot advance until another turn emits usage data. Otherwise trust only
-        # the terminal readback, never the requested model_override. With neither
-        # confirmation source, fail closed so standalone xhigh is refused.
-        raw_confirmed = snapshot.get("llm_model")
-        readback_model = (
-            raw_confirmed.strip()
-            if isinstance(raw_confirmed, str) and raw_confirmed.strip()
-            else None
-        )
-        confirmed_model = readback_model
-        if conv_id in _antigravity_readback_before_model_switch:
-            readback_before_switch = _antigravity_readback_before_model_switch[conv_id]
+        effort = EFFORT_ALIASES.get(effort, effort)
+        if effort == "xhigh":
             try:
-                pane_model = await asyncio.to_thread(confirmed_agy_model_from_pane, bridge_dir)
+                confirmed_model = await asyncio.to_thread(
+                    confirmed_agy_model_from_pane, bridge_dir
+                )
             except (RuntimeError, OSError):
-                pane_model = None
-            if pane_model is not None:
-                confirmed_model = pane_model
-                _antigravity_readback_before_model_switch[conv_id] = readback_model
-            elif readback_model is not None and readback_model != readback_before_switch:
-                confirmed_model = readback_model
-                _antigravity_readback_before_model_switch.pop(conv_id, None)
-            else:
-                # The old readback cannot prove the model still selected in the
-                # current pane, so fail closed until either source advances.
                 confirmed_model = None
-        raw_options = snapshot.get("model_options")
-        catalog_models = raw_options if isinstance(raw_options, list) else None
-        if (
-            clamp_antigravity_effort(effort, confirmed_model, catalog_models=catalog_models)
-            != effort
-        ):
-            target = confirmed_model or "unconfirmed Antigravity model"
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "antigravity_native_effort_unsupported",
-                    "detail": f"Effort {effort!r} is not supported by {target}",
-                },
-            )
+            raw_options = snapshot.get("model_options")
+            catalog_models = raw_options if isinstance(raw_options, list) else None
+            if (
+                clamp_antigravity_effort(effort, confirmed_model, catalog_models=catalog_models)
+                != effort
+            ):
+                target = confirmed_model or "unconfirmed Antigravity model"
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "antigravity_native_effort_unsupported",
+                        "detail": f"Effort {effort!r} is not supported by {target}",
+                    },
+                )
         try:
             await asyncio.to_thread(
                 run_agy_slash_command,

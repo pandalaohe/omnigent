@@ -4529,7 +4529,7 @@ def test_agy_slash_command_requires_fresh_confirmation(
         "_agy_control_pane",
         lambda _: agy_controls_captures["model-effort"],
     )
-    assert _mod.confirmed_agy_model_from_pane(tmp_path) == "Claude Sonnet 5.5 (Medium)"
+    assert _mod.confirmed_agy_model_from_pane(tmp_path) == "Claude Sonnet 5.5"
 
 
 def test_agy_agent_mode_cycles_captured_footers(tmp_path, monkeypatch, agy_controls_captures):

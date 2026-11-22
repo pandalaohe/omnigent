@@ -24,7 +24,6 @@ from omnigent.util.reasoning_effort import (
     GEMINI_EFFORTS,
     PI_EFFORTS,
     ModelEffortCaps,
-    antigravity_model_effort_caps,
     clamp_antigravity_effort,
     clamp_effort_for_model,
     effort_for_model_switch,
@@ -271,12 +270,12 @@ def test_efforts_for_harness_resolves_aliases() -> None:
 
 
 @pytest.mark.parametrize("model", ["gemini-4-neon", "gemini-4-hydrogen"])
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+@pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
 def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
     model: str, effort: str
 ) -> None:
-    """Gemini 4 Neon and Hydrogen keep every Antigravity effort including xhigh."""
-    assert clamp_antigravity_effort(effort, model) == effort
+    """Gemini 4 Neon and Hydrogen support xhigh and its aliases."""
+    assert clamp_antigravity_effort(effort, model) == "xhigh"
 
 
 @pytest.mark.parametrize(
@@ -295,16 +294,11 @@ def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
 def test_antigravity_caps_clamp_above_high_for_high_only_models(model: str, effort: str) -> None:
     """Antigravity models capped at high never receive xhigh/max/ultra."""
     assert clamp_antigravity_effort(effort, model) == "high"
-    for supported in ("low", "medium", "high"):
-        assert clamp_antigravity_effort(supported, model) == supported
 
 
 def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchanged() -> None:
-    """GPT-OSS stays at medium on agy; non-AG default caps never clamp Claude 5.5."""
-    caps = antigravity_model_effort_caps()
+    """GPT-OSS xhigh falls back to medium; default caps leave Claude 5.5 alone."""
     assert clamp_antigravity_effort("xhigh", "gpt-oss-120b") == "medium"
-    assert clamp_antigravity_effort("medium", "gpt-oss-120b") == "medium"
-    assert clamp_effort_for_model("xhigh", "gpt-oss-120b", caps=caps) == "medium"
     # Anthropic/Claude harnesses use the default table and must not lose xhigh/max on 5.5.
     assert clamp_effort_for_model("xhigh", "claude-opus-5-5") == "xhigh"
     assert clamp_effort_for_model("xhigh", "claude-sonnet-5-5") == "xhigh"
@@ -318,6 +312,19 @@ def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchang
     )
     with patch("omnigent.runtime._globals._caps", new=SimpleNamespace(routing_settings=settings)):
         assert clamp_antigravity_effort("xhigh", "claude-opus-5-5") == "high"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_antigravity_clamp_preserves_ordinary_efforts(effort: str) -> None:
+    assert clamp_antigravity_effort(effort, "gpt-oss-120b") == effort
+    assert (
+        clamp_antigravity_effort(
+            effort,
+            "claude-opus-5-5",
+            catalog_models=[{"id": "claude-opus-5-5", "efforts": ["high"]}],
+        )
+        == effort
+    )
 
 
 def test_antigravity_clamp_fails_closed_for_unknown_and_omitted_model_and_honors_catalog() -> None:

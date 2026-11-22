@@ -6282,10 +6282,18 @@ async def test_antigravity_control_dispatch_sends_one_command(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_payload", "event", "expected_status", "expected_calls", "expected_body"),
+    (
+        "snapshot_payload",
+        "footer",
+        "event",
+        "expected_status",
+        "expected_calls",
+        "expected_body",
+    ),
     [
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "xhigh"},
+            "",
             {"type": "model_change", "model": "claude-opus-5-5"},
             200,
             ["/model claude-opus-5-5-high"],
@@ -6293,6 +6301,7 @@ async def test_antigravity_control_dispatch_sends_one_command(
         ),
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            "",
             {"type": "model_change", "model": "claude-opus-5-5", "effort": "xhigh"},
             200,
             ["/model claude-opus-5-5-high"],
@@ -6300,20 +6309,20 @@ async def test_antigravity_control_dispatch_sends_one_command(
         ),
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            "",
             {"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
             200,
             ["/model gemini-4-hydrogen-xhigh"],
             {"model": "gemini-4-hydrogen-xhigh", "effort": "xhigh"},
         ),
-        # P1-2: live /effort checks confirmed llm_model, not requested model_override.
         (
             {
                 "labels": {},
                 "terminal_launch_args": [],
                 "model_override": "gemini-4-hydrogen",
-                "llm_model": "Claude Opus 5.5 (High)",
                 "reasoning_effort": "high",
             },
+            "Claude Opus 5.5 · high",
             {"type": "effort_change", "effort": "xhigh"},
             400,
             [],
@@ -6324,15 +6333,14 @@ async def test_antigravity_control_dispatch_sends_one_command(
                 "labels": {},
                 "terminal_launch_args": [],
                 "model_override": "claude-opus-5-5",
-                "llm_model": "Gemini 4 Hydrogen (High)",
                 "reasoning_effort": "high",
             },
+            "Gemini 4 Hydrogen · high",
             {"type": "effort_change", "effort": "xhigh"},
             200,
             ["/effort xhigh"],
             {"effort": "xhigh"},
         ),
-        # P1-2 + P2-3: unconfirmed terminal model refuses standalone xhigh.
         (
             {
                 "labels": {},
@@ -6340,6 +6348,7 @@ async def test_antigravity_control_dispatch_sends_one_command(
                 "model_override": "gemini-4-hydrogen",
                 "reasoning_effort": "high",
             },
+            "",
             {"type": "effort_change", "effort": "xhigh"},
             400,
             [],
@@ -6350,7 +6359,6 @@ async def test_antigravity_control_dispatch_sends_one_command(
             {
                 "labels": {},
                 "terminal_launch_args": [],
-                "llm_model": "Gemini 5 Next (High)",
                 "model_options": [
                     {
                         "id": "gemini-5-next",
@@ -6360,6 +6368,7 @@ async def test_antigravity_control_dispatch_sends_one_command(
                 ],
                 "reasoning_effort": "high",
             },
+            "Gemini 5 Next · high",
             {"type": "effort_change", "effort": "xhigh"},
             200,
             ["/effort xhigh"],
@@ -6369,9 +6378,9 @@ async def test_antigravity_control_dispatch_sends_one_command(
             {
                 "labels": {},
                 "terminal_launch_args": [],
-                "llm_model": "Gemini 5 Next (High)",
                 "reasoning_effort": "high",
             },
+            "Gemini 5 Next · high",
             {"type": "effort_change", "effort": "xhigh"},
             400,
             [],
@@ -6384,6 +6393,7 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
     tmp_path,
     isolate_antigravity_controls_launch,
     snapshot_payload,
+    footer,
     event,
     expected_status,
     expected_calls,
@@ -6393,6 +6403,7 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
     from omnigent.runner.native import orchestration
 
     monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(agy, "_agy_control_pane", lambda _: f"? for shortcuts    {footer}")
 
     async def snapshot(*args, **kwargs):
         return snapshot_payload
@@ -6488,6 +6499,56 @@ async def test_antigravity_effort_uses_last_successful_model_switch_before_new_t
         "/model gemini-4-hydrogen-xhigh",
         "/effort xhigh",
     ]
+
+
+async def test_antigravity_effort_uses_footer_after_first_manual_model_switch(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    footer = "accept-edits · Claude Opus 5.5 · high"
+    calls = []
+
+    def command(_, text, **kwargs):
+        calls.append(text)
+        return "Effort set to xhigh"
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy,
+        "_agy_control_pane",
+        lambda _: f"⎿  Model set to Gemini 4 Hydrogen (High)\n? for shortcuts    {footer}\n",
+    )
+    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_manual", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        url = "/v1/sessions/conv_agy_manual/events"
+        refused = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        footer = "model unavailable"
+        unconfirmed = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        footer = "plan · Gemini 4 Hydrogen · high"
+        allowed = await client.post(url, json={"type": "effort_change", "effort": "max"})
+
+    assert refused.status_code == 400, refused.text
+    assert "Claude Opus 5.5" in refused.json()["detail"]
+    assert unconfirmed.status_code == 400, unconfirmed.text
+    assert allowed.status_code == 200, allowed.text
+    assert calls == ["/effort xhigh"]
 
 
 @pytest.mark.parametrize(

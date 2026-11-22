@@ -32,8 +32,8 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
-# agy supports xhigh on Gemini 4 Neon / Hydrogen; models that top out lower
-# (e.g. Opus/Sonnet 5.5) are capped per model via ANTIGRAVITY_MODEL_EFFORT_CAPS.
+# agy supports xhigh on Gemini 4 Neon / Hydrogen; clamp_antigravity_effort
+# checks model support when xhigh is requested.
 ANTIGRAVITY_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 # The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
 # exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
@@ -212,9 +212,7 @@ DEFAULT_MODEL_EFFORT_CAPS = ModelEffortCaps()
 # ``DEFAULT_MODEL_EFFORT_CAPS`` because Opus/Sonnet 5.5 support ``xhigh``/``max``
 # on Anthropic harnesses and because ``routing.effort_caps`` overrides the
 # gateway table independently of agy's CLI catalog.
-_ANTIGRAVITY_ABOVE_HIGH: frozenset[str] = frozenset({"xhigh", "max", "ultra"})
-_ANTIGRAVITY_NON_MEDIUM: frozenset[str] = frozenset({"low", "high", "xhigh", "max", "ultra"})
-_ANTIGRAVITY_LADDER: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+_ANTIGRAVITY_XHIGH_FALLBACK_ORDER = ("xhigh", "high", "medium", "low")
 _ANTIGRAVITY_DISPLAY_EFFORT_RE = re.compile(
     r"\s*\((?:low|medium|high|xhigh|max)\)$", re.IGNORECASE
 )
@@ -255,30 +253,25 @@ def _antigravity_row_efforts(row: Mapping[str, object]) -> frozenset[str] | None
 
 
 @lru_cache(maxsize=1)
-def antigravity_model_effort_caps() -> ModelEffortCaps:
-    """Return per-model effort ceilings for Antigravity (``agy``) models.
+def _antigravity_static_xhigh_efforts() -> dict[str, str]:
+    """Return verified xhigh or fallback efforts by normalized agy model identity.
 
     Imported lazily because :mod:`omnigent.models.model_fallbacks` pulls in
     ``provider_config`` → ``spec.parser`` → ``spec.validator`` → this module.
     """
-    from omnigent.models.model_fallbacks import ANTIGRAVITY_MEDIUM_CAP_MODELS
-
-    return ModelEffortCaps(
-        fallback=MappingProxyType(
-            dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium")
-        ),
-        unsupported=MappingProxyType(
-            dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM)
-        ),
+    from omnigent.models.model_fallbacks import (
+        ANTIGRAVITY_MEDIUM_CAP_MODELS,
+        ANTIGRAVITY_XHIGH_MODELS,
     )
 
-
-@lru_cache(maxsize=1)
-def _antigravity_xhigh_identities() -> frozenset[str]:
-    """Return normalized identities of agy models verified to offer ``xhigh``."""
-    from omnigent.models.model_fallbacks import ANTIGRAVITY_XHIGH_MODELS
-
-    return frozenset(_antigravity_model_identity(m) for m in ANTIGRAVITY_XHIGH_MODELS.model_ids)
+    return {
+        **dict.fromkeys(
+            map(_antigravity_model_identity, ANTIGRAVITY_XHIGH_MODELS.model_ids), "xhigh"
+        ),
+        **dict.fromkeys(
+            map(_antigravity_model_identity, ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids), "medium"
+        ),
+    }
 
 
 def clamp_antigravity_effort(
@@ -287,7 +280,7 @@ def clamp_antigravity_effort(
     *,
     catalog_models: Iterable[Mapping[str, object]] | None = None,
 ) -> str | None:
-    """Clamp an Antigravity *effort* fail-closed against *model* and *catalog_models*.
+    """Clamp an Antigravity xhigh request (including aliases) by model.
 
     ``xhigh`` (and higher aliases ``max``/``ultra``) is allowed only when the
     resolved model is known to offer ``xhigh`` — either because its row in
@@ -297,12 +290,11 @@ def clamp_antigravity_effort(
     highest/nearest rung the model supports, such as ``"medium"`` for
     medium-only models).
     """
-    if effort is None:
-        return None
+    if effort is None or EFFORT_ALIASES.get(effort, effort) != "xhigh":
+        return effort
     identity = (
         _antigravity_model_identity(model) if isinstance(model, str) and model.strip() else ""
     )
-    matched_row: Mapping[str, object] | None = None
     if identity and catalog_models is not None:
         for row in catalog_models:
             if not isinstance(row, Mapping):
@@ -313,45 +305,13 @@ def clamp_antigravity_effort(
                 isinstance(row_display, str)
                 and _antigravity_model_identity(row_display) == identity
             ):
-                matched_row = row
-                break
-    resolved_model: str | None = None
-    if matched_row is not None and isinstance(matched_row.get("id"), str) and matched_row["id"]:
-        resolved_model = str(matched_row["id"])
-    elif isinstance(model, str) and model.strip():
-        resolved_model = re.sub(r"[\s.]+", "-", _strip_antigravity_effort_suffix(model).lower())
-
-    clamped = clamp_effort_for_model(effort, resolved_model, caps=antigravity_model_effort_caps())
-    assert clamped is not None
-
-    if matched_row is not None:
-        row_efforts = _antigravity_row_efforts(matched_row)
-        offered = (
-            [level for level in _ANTIGRAVITY_LADDER if level in row_efforts]
-            if row_efforts is not None
-            else []
-        )
-        if clamped in _ANTIGRAVITY_ABOVE_HIGH:
-            if "xhigh" in offered:
-                return "xhigh"
-            return offered[-1] if offered else "high"
-        if row_efforts is not None:
-            if not offered:
-                return clamped
-            if clamped in offered:
-                return clamped
-            if clamped in _ANTIGRAVITY_LADDER:
-                target = _ANTIGRAVITY_LADDER.index(clamped)
-                return min(
-                    offered, key=lambda value: abs(_ANTIGRAVITY_LADDER.index(value) - target)
-                )
-        return clamped
-
-    if clamped in _ANTIGRAVITY_ABOVE_HIGH:
-        if identity and identity in _antigravity_xhigh_identities():
-            return "xhigh"
-        return "high"
-    return clamped
+                offered = _antigravity_row_efforts(row)
+                if offered:
+                    for level in _ANTIGRAVITY_XHIGH_FALLBACK_ORDER:
+                        if level in offered:
+                            return level
+                return "high"
+    return _antigravity_static_xhigh_efforts().get(identity, "high")
 
 
 def model_effort_caps(caps: ModelEffortCaps | None = None) -> ModelEffortCaps:

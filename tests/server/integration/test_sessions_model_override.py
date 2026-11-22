@@ -1261,3 +1261,86 @@ async def test_patch_antigravity_clamped_effort_keeps_newer_silent_write(
         for event in published
         if event.get("type") == "session.reasoning_effort"
     ] == ["high"]
+
+
+async def test_terminal_effort_report_claims_write_lock_before_antigravity_patch(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A report already in flight serializes its commit and event with a later PATCH."""
+    from omnigent.runtime import get_conversation_store, session_stream
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.server.routes.sessions import routes_core
+
+    agent = await create_test_agent(client)
+    sid = (await _create_session(client, agent["id"]))["id"]
+    store = get_conversation_store()
+    store.set_labels(sid, {"omnigent.wrapper": "antigravity-native-ui"})
+    store.set_runner_id(sid, "runner_agy")
+
+    entered_report = threading.Event()
+    release_report = threading.Event()
+    real_update = type(store).update_conversation
+
+    def paused_update(self: Any, conversation_id: str, **kwargs: Any) -> Any:
+        if conversation_id == sid and kwargs.get("reasoning_effort") == "medium":
+            entered_report.set()
+            assert release_report.wait(timeout=5), "Timed out before the terminal report commit"
+        return real_update(self, conversation_id, **kwargs)
+
+    patch_saw_report_lock = asyncio.get_running_loop().create_future()
+    get_settings_change = routes_core._live_settings_change
+
+    def observe_patch_lock(session_id: str):
+        change = get_settings_change(session_id)
+        if session_id == sid and not patch_saw_report_lock.done():
+            patch_saw_report_lock.set_result(change.write_lock.locked())
+        return change
+
+    async def confirm_clamped_effort(*args: Any, **kwargs: Any) -> _RunnerForwardResult:
+        return _RunnerForwardResult(
+            status_code=200,
+            body=json.dumps({"model": "claude-opus-5-5-high", "effort": "high"}),
+        )
+
+    published: list[str] = []
+
+    def capture_event(session_id: str, event: dict[str, Any]) -> None:
+        if session_id == sid and event["type"] == "session.reasoning_effort":
+            published.append(event["reasoning_effort"])
+
+    monkeypatch.setattr(type(store), "update_conversation", paused_update)
+    monkeypatch.setattr(routes_core, "_live_settings_change", observe_patch_lock)
+    monkeypatch.setattr(
+        sessions_facade, "_forward_session_change_to_runner", confirm_clamped_effort
+    )
+    monkeypatch.setattr(session_stream, "publish", capture_event)
+
+    report = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "medium"},
+            },
+        )
+    )
+    switch = None
+    try:
+        assert await asyncio.to_thread(entered_report.wait, 5)
+        switch = asyncio.create_task(
+            client.patch(
+                f"/v1/sessions/{sid}",
+                json={"model_override": "claude-opus-5-5", "reasoning_effort": "xhigh"},
+            )
+        )
+        assert await asyncio.wait_for(patch_saw_report_lock, timeout=5)
+    finally:
+        release_report.set()
+        reported = await asyncio.wait_for(report, timeout=5)
+        switched = await asyncio.wait_for(switch, timeout=5) if switch is not None else None
+
+    assert reported.status_code == 202, reported.text
+    assert switched is not None and switched.status_code == 200
+    assert store.get_conversation(sid).reasoning_effort == "high"
+    assert published == ["medium", "high"]

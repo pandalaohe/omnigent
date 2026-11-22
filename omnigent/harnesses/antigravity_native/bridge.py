@@ -2636,7 +2636,6 @@ def parse_agy_agent_mode(pane: str) -> str | None:
 
 
 _AGY_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
-_AGY_MODEL_CONFIRMATION_RE = re.compile(r"^\s*⎿\s+Model set to\s+(.+?)\s*$", re.MULTILINE)
 
 
 def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
@@ -2656,18 +2655,15 @@ def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
 
 
 def confirmed_agy_model_from_pane(bridge_dir: Path) -> str | None:
-    """Return the latest model the current idle agy pane confirms.
-
-    The visible pane is tied to the bridge's current tmux target, so a terminal
-    replacement cannot inherit an older runner-side model cache. A missing or
-    scrolled-off confirmation is unknown rather than a reason to trust one.
-    """
+    """Read the current model from the idle footer, including after manual switches."""
     pane = _require_agy_idle(bridge_dir)
-    matches = list(_AGY_MODEL_CONFIRMATION_RE.finditer(pane))
-    if not matches:
-        return None
-    model = matches[-1].group(1).strip()
-    return model or None
+    line = pane.rstrip().rsplit("\n", 1)[-1]
+    footer = line.split(_AGY_IDLE_MARKER, 1)[1].strip()
+    footer = footer.removeprefix("accept-edits · ").removeprefix("plan · ")
+    model, sep, effort = footer.rpartition(" · ")
+    if sep and effort in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        return model.strip() or None
+    return None
 
 
 @_bounded_control(60.0)
