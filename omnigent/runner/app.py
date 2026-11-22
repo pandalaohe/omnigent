@@ -12725,6 +12725,20 @@ def create_runner_app(
                             },
                         )
 
+                if _peer_delivery is None and (
+                    queued := _session_message_buffers.get(conversation_id)
+                ):
+                    # This POST can hold the ingest slot while a finished turn's
+                    # drain waits for it. Leave the queue head to that drain.
+                    queued.append(message_body)
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "buffered",
+                            "detail": "Message buffered behind queued input.",
+                        },
+                    )
+
                 # Joint-agent routing: a message naming non-lead members becomes
                 # this turn's obligations, and the lead's input gains the note
                 # telling it to dispatch each with sys_session_send. Ordinary

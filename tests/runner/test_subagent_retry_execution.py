@@ -553,6 +553,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
 ):
     from omnigent.runner import app as runner_app
     from omnigent.runner.subagent_work import _SubagentDeliveryAck
+    from omnigent.runtime.harnesses._scaffold import _format_sse_event
 
     terminals, started = [], []
 
@@ -563,17 +564,8 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
     monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
     monkeypatch.setattr(runner_app, "mark_subagent_work_terminal", record_terminal)
     monkeypatch.setattr(runner_app, "mark_subagent_work_started", started.append)
-    deadline = float(int(time.time()) + 30)
+    deadline = int(time.time()) + 30.1234567
     input_id, session_id = "f" * 32, "child"
-    claim = InputExecutionClaim(
-        input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
-    )
-
-    event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
-    # An unregistered steered input is refused at the receiver without a server call.
-    steer = InputExecutionClaimEvent(
-        claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
-    )
     status = "failed" if opening == "sender" else "completed"
     terminal = {
         "type": f"response.{status}",
@@ -584,18 +576,28 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             "code": "RuntimeError",
             "message": "Input execution admission refused",
         }
-    frames = [
-        'event: response.created\ndata: {"type":"response.created",'
-        '"response":{"id":"resp_multiturn"}}\n\n',
-        "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
-        *(
-            ["event: input.execution.claim\ndata: " + json.dumps(steer.model_dump()) + "\n\n"]
-            if steered
-            else []
-        ),
-        f"event: response.{status}\ndata: {json.dumps(terminal)}\n\n",
-    ]
-    harness = _ScriptedHarnessClient(frames)
+
+    class Harness(_ScriptedHarnessClient):
+        def stream(self, method, url, *, json, timeout):
+            if json.get("input_admission_required") is True:
+                claim = InputExecutionClaim(
+                    input_id=json["input_id"],
+                    turn_id="resp_multiturn",
+                    admission_deadline=json["input_admission_deadline"],
+                )
+                opener = InputExecutionClaimEvent(claim_id="opener", claim=claim)
+                self._sse_frames = [_sse_text_turn("")[0], _format_sse_event(opener).decode()]
+                if steered:
+                    # An unregistered steered input is refused without a server call.
+                    steer = InputExecutionClaimEvent(
+                        claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
+                    )
+                    self._sse_frames.append(_format_sse_event(steer).decode())
+                self._sse_frames.append(terminal_frame)
+            return super().stream(method, url, json=json, timeout=timeout)
+
+    terminal_frame = f"event: response.{status}\ndata: {json.dumps(terminal)}\n\n"
+    harness = Harness([])
     server = _ScriptedAdmissionServer(*([input_id] if opening == "accepted" else []))
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
@@ -615,7 +617,18 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
                 **({"stable_id": input_id} if opening == "sender" else {}),
             },
         )
-        assert [claim.input_id for claim in server.claims] == [input_id]
+        assert [(claim.input_id, claim.admission_deadline) for claim in server.claims] == [
+            (input_id, deadline)
+        ]
+        replies = [
+            (event["claim_id"], event["result"]["state"])
+            for event in harness.patched_events
+            if event.get("type") == "input_execution_result"
+        ]
+        assert replies == [
+            ("opener", "accepted" if opening == "accepted" else "refused"),
+            *([("steer", "refused")] if steered else []),
+        ]
         if opening != "accepted":
             harness._sse_frames = _sse_text_turn("accepted")
             await client.post(
@@ -732,13 +745,29 @@ async def test_stop_background_turn_respects_opening_admission(monkeypatch, acce
 
 
 @pytest.mark.asyncio
-async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_history():
+@pytest.mark.parametrize("later_post", [False, True], ids=["buffered-pair", "post-during-drain"])
+async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_history(
+    monkeypatch, later_post
+):
+    from omnigent.runner import app as runner_app
     from tests._helpers.polling import poll_until_async
 
     session_id = "buffered-admissions"
-    accepted_id, refused_id = uuid4().hex, uuid4().hex
+    accepted_id, refused_id, later_id = (uuid4().hex for _ in range(3))
     deadline = float(int(time.time()) + 30)
     started, release = asyncio.Event(), asyncio.Event()
+    started_b, release_b = asyncio.Event(), asyncio.Event()
+    resolving_d, release_d = asyncio.Event(), asyncio.Event()
+
+    resolve_content = runner_app._resolve_forwarded_message_content
+
+    async def resolve_after_b(content, **kwargs):
+        if content == [{"type": "input_text", "text": "later D"}]:
+            resolving_d.set()
+            await release_d.wait()
+        return await resolve_content(content, **kwargs)
+
+    monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", resolve_after_b)
 
     class Harness(_ScriptedHarnessClient):
         @contextlib.asynccontextmanager
@@ -760,23 +789,25 @@ async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_histor
                 self._sse_frames = [
                     created,
                     "event: input.execution.claim\ndata: " + claim.model_dump_json() + "\n\n",
-                    *([delta] if input_id == accepted_id else []),
+                    *([delta] if input_id != refused_id else []),
                     completed,
                 ]
             else:
                 self._sse_frames = [created, delta, completed]
             async with super().stream(method, url, json=json, timeout=timeout) as response:
-                if len(self.posted_bodies) == 1:
+                first = len(self.posted_bodies) == 1
+                if first or (later_post and input_id == accepted_id):
                     frames = response.aiter_text
+                    entered, unblock = (started, release) if first else (started_b, release_b)
 
-                    async def hold_opening_turn():
+                    async def hold_turn():
                         async for frame in frames():
                             yield frame
                             if frame == created:
-                                started.set()
-                                await release.wait()
+                                entered.set()
+                                await unblock.wait()
 
-                    response.aiter_text = hold_opening_turn
+                    response.aiter_text = hold_turn
                 yield response
 
     def body(text):
@@ -788,29 +819,54 @@ async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_histor
         }
 
     harness = Harness([])
-    server = _ScriptedAdmissionServer(accepted_id)
+    server = _ScriptedAdmissionServer(accepted_id, later_id)
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
         server_client=cast(httpx.AsyncClient, server),
     )
     url = f"/v1/sessions/{session_id}/events"
     async with _runner_test_client(app) as client:
+
+        async def post_admitted(input_id, text):
+            return await client.post(
+                url,
+                json={
+                    **body(text),
+                    "input_id": input_id,
+                    "input_admission_required": True,
+                    "input_admission_deadline": deadline,
+                },
+            )
+
         assert (await client.post(url, json=body("opening input"))).status_code == 202
         try:
             await asyncio.wait_for(started.wait(), timeout=5)
             for input_id, text in [(accepted_id, "buffered B"), (refused_id, "buffered C")]:
-                buffered = await client.post(
-                    url,
-                    json={
-                        **body(text),
-                        "input_id": input_id,
-                        "input_admission_required": True,
-                        "input_admission_deadline": deadline,
-                    },
-                )
+                buffered = await post_admitted(input_id, text)
                 assert buffered.json()["status"] == "buffered"
         finally:
             release.set()
+        if later_post:
+            post_d = None
+            try:
+                await asyncio.wait_for(started_b.wait(), timeout=5)
+                turn_b = app.state.active_turns[session_id]
+                post_d = asyncio.create_task(post_admitted(later_id, "later D"))
+                await asyncio.wait_for(resolving_d.wait(), timeout=5)
+                release_b.set()
+                await asyncio.wait_for(asyncio.shield(turn_b), timeout=5)
+                # D owns the ingest slot. B has freed the turn slot, and C is waiting.
+                assert session_id not in app.state.active_turns
+                assert [
+                    item["input_id"] for item in app.state.session_message_buffers[session_id]
+                ] == [refused_id]
+            finally:
+                release_b.set()
+                release_d.set()
+                if post_d is not None:
+                    response_d = await asyncio.wait_for(post_d, timeout=5)
+            assert response_d.status_code == 202
+            assert response_d.json()["status"] == "buffered"
         await poll_until_async(
             lambda: (
                 not app.state.session_message_buffers.get(session_id)
@@ -818,9 +874,9 @@ async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_histor
             ),
             timeout_s=5,
         )
+        expected_ids = [accepted_id, refused_id, *([later_id] if later_post else [])]
         assert [(claim.input_id, claim.turn_id) for claim in server.claims] == [
-            (accepted_id, f"resp_{accepted_id}"),
-            (refused_id, f"resp_{refused_id}"),
+            (input_id, f"resp_{input_id}") for input_id in expected_ids
         ]
         followup = await client.post(url + "?stream=true", json=body("legal follow-up"))
         assert followup.status_code == 200, followup.text
