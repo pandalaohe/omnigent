@@ -157,10 +157,19 @@ async def test_env_credential_is_confined_to_upstream_http(
     caplog.set_level(logging.DEBUG)
     monkeypatch.setenv(_ENV_NAME, "fake-env-change-after-startup")
     calls = []
+    redirect_target_requests = []
+    redirects = {
+        "cross_origin_307": (307, f"https://redirect.example.test/redirected/{_ENV_TOKEN}"),
+        "same_origin_307": (307, f"/redirected/{_ENV_TOKEN}"),
+        "same_origin_308": (308, f"/redirected/{_ENV_TOKEN}"),
+    }
     mode = "result"
 
     def upstream(request):
         # Use the real MCP SDK with a transport double for the upstream.
+        if request.url.path.startswith("/redirected/"):
+            redirect_target_requests.append(request)
+            return httpx.Response(418)
         assert request.url.host == "mcp.example.test"
         assert request.headers[expected_header] == f"Bearer {_ENV_TOKEN}"
         if expected_header != "Authorization":
@@ -195,10 +204,9 @@ async def test_env_credential_is_confined_to_upstream_http(
             assert method == "tools/call"
             if mode == "failure":
                 raise httpx.ConnectError(f"Connection failed: {_ENV_TOKEN}", request=request)
-            if mode == "redirect":
-                return httpx.Response(
-                    307, headers={"Location": f"https://redirect.example.test/{_ENV_TOKEN}"}
-                )
+            if mode in redirects:
+                status, location = redirects[mode]
+                return httpx.Response(status, headers={"Location": location})
             if mode == "rpc_error":
                 return httpx.Response(
                     200,
@@ -276,7 +284,7 @@ async def test_env_credential_is_confined_to_upstream_http(
         (gateway, "read_ticket"),
         (f"/v1/sessions/{session_id}/mcp", "tracker__read_ticket"),
     ):
-        for outcome in ("result", "failure", "redirect", "rpc_error"):
+        for outcome in ("result", "failure", *redirects, "rpc_error"):
             mode = outcome
             payload = await rpc(path, "tools/call", {"name": name})
             if mode == "result":
@@ -284,14 +292,16 @@ async def test_env_credential_is_confined_to_upstream_http(
                 assert (
                     payload["result"]["content"][0]["text"] == "Error with [redacted]: [redacted]"
                 )
+            elif mode in redirects:
+                assert not redirect_target_requests
+                assert f"HTTP {redirects[mode][0]}" in payload["error"]["message"]
             else:
                 expected = {
                     "failure": "transport failed",
-                    "redirect": "HTTP 307",
                     "rpc_error": "MCP request failed",
                 }[mode]
                 assert expected in payload["error"]["message"]
-    assert calls.count("tools/call") == 8
+    assert calls.count("tools/call") == 12
     assert _ENV_TOKEN not in caplog.text
     assert _ENV_HEADER not in caplog.text
     assert _ENV_NAME not in caplog.text

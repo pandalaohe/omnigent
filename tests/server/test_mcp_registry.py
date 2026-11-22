@@ -256,6 +256,8 @@ def test_env_catalog_without_cipher_and_personal_bearer_with_cipher(db_uri, tmp_
         ("TEST_MCP_STARTUP_KEY", None),
         ("TEST_MCP_STARTUP_KEY", ""),
         ("TEST_MCP_STARTUP_KEY", "invalid key with spaces"),
+        ("TEST_MCP_STARTUP_KEY", "redacted"),
+        ("TEST_MCP_STARTUP_KEY", "01234567890123456789"),
     ],
 )
 def test_unavailable_env_credential_is_local_to_service(name, value, monkeypatch, caplog):
@@ -275,6 +277,8 @@ def test_unavailable_env_credential_is_local_to_service(name, value, monkeypatch
     assert registry.service("public", "alice").auth == "none"
     assert "service=tracker" in caplog.text
     assert "token_env=" in caplog.text
+    if name == "TEST_MCP_STARTUP_KEY":
+        assert "token_env=TEST_MCP_STARTUP_KEY" in caplog.text
     if value:
         assert value not in caplog.text
 
@@ -290,6 +294,64 @@ def test_env_service_requires_opt_in_for_plaintext_and_a_valid_header():
         url="http://mcp.example.test/mcp",
         allow_http=True,
     ).allow_http
+
+
+@pytest.mark.asyncio
+async def test_plaintext_env_credential_bypasses_environment_proxy(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.test:8080")
+    monkeypatch.setenv("http_proxy", "http://proxy.example.test:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    token = "fake-plaintext-test-token"
+    monkeypatch.setenv("TEST_MCP_PLAINTEXT_KEY", token)
+    entry = service(
+        auth="env",
+        token_env="TEST_MCP_PLAINTEXT_KEY",
+        url="http://mcp.example.test/mcp",
+        allow_http=True,
+    )
+    registry = McpRegistry(McpRegistryConfig(services=[entry]), None)
+    direct_requests, proxy_requests = [], []
+
+    def upstream(request):
+        direct_requests.append(request)
+        assert request.url == entry.url
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        message = json.loads(request.content)
+        if "id" not in message:
+            return httpx.Response(202)
+        if message["method"] == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "plaintext-test", "version": "1"},
+            }
+        else:
+            assert message["method"] == "tools/list"
+            result = {"tools": [{"name": "read_ticket", "inputSchema": {"type": "object"}}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    def proxy(request):
+        proxy_requests.append(request)
+        return httpx.Response(502)
+
+    # Swap the socket transports while keeping HTTPX's actual proxy selection.
+    monkeypatch.setattr(
+        httpx.AsyncClient, "_init_transport", lambda *_, **__: httpx.MockTransport(upstream)
+    )
+    monkeypatch.setattr(
+        httpx.AsyncClient, "_init_proxy_transport", lambda *_, **__: httpx.MockTransport(proxy)
+    )
+    async with httpx.AsyncClient() as client:
+        assert (await client.head(entry.url)).status_code == 502
+    assert len(proxy_requests) == 1
+    proxy_requests.clear()
+
+    tools = await registry.execute("tracker", "alice", SimpleNamespace())
+
+    assert [tool.name for tool in tools] == ["read_ticket"]
+    assert direct_requests
+    assert not proxy_requests
 
 
 @pytest.mark.asyncio

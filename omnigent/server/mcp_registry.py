@@ -33,7 +33,7 @@ from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
 _ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
-_BEARER_VALUE = re.compile(r"[!-~]+")
+_BEARER_VALUE = re.compile(r"[!-~]{16,}")
 _ENV_REQUEST = ContextVar("mcp_env_request", default=False)
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -257,7 +257,7 @@ class McpRegistry:
             name = service.token_env
             valid_name = name if name and _ENV_NAME.fullmatch(name) else None
             value = os.environ.get(valid_name, "") if valid_name else ""
-            if _BEARER_VALUE.fullmatch(value):
+            if _BEARER_VALUE.fullmatch(value) and any(char.isalpha() for char in value):
                 self._env_tokens[service.id] = SecretStr(value)
             else:
                 _logger.warning(
@@ -402,12 +402,19 @@ class McpRegistry:
         token = env_token or await self.token(service, user_id, app_state)
         headers = {service.header: f"Bearer {token}"} if token else {}
         log_scope = _suppress_credential_transport_logs() if env_token else nullcontext()
+        # The MCP SDK follows same-origin redirects using its client's redirect budget.
+        redirect_options: dict[str, Any] = {"max_redirects": 0} if env_token else {}
+        trust_env = not (env_token and urlsplit(service.url).scheme == "http")
         try:
             with log_scope:
                 async with (
                     asyncio.timeout(service.timeout),
                     httpx.AsyncClient(
-                        headers=headers, follow_redirects=False, timeout=service.timeout
+                        headers=headers,
+                        follow_redirects=False,
+                        timeout=service.timeout,
+                        trust_env=trust_env,
+                        **redirect_options,
                     ) as client,
                     streamable_http_client(service.url, http_client=client) as (
                         read,
