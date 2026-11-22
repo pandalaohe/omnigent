@@ -62,6 +62,7 @@ export interface UsageAccountView {
   renews_at: number | null;
   state: string;
   reason: string | null;
+  quota_source_rejection?: { last_valid_at: number | null; reason: string | null } | null;
   deciding_window: string | null;
   pace_pct: number | null;
   read_at: number | null;

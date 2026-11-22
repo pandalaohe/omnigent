@@ -1,7 +1,27 @@
 // Text and colour for the Usage board's readings. The server already decided
 // pace and state (``omnigent/quota_pace.py``); nothing here recomputes them.
 
-import type { UsageWindowView } from "./usageBoardData";
+import type { UsageAccountView, UsageWindowView } from "./usageBoardData";
+
+export function quotaSourceRejectionLabel(account: UsageAccountView): string | null {
+  const rejection = account.quota_source_rejection;
+  if (!rejection) return null;
+  const chinese = typeof navigator !== "undefined" && /^zh\b/i.test(navigator.language);
+  const time = formatFullDate(rejection.last_valid_at);
+  return [
+    chinese ? "来源拒收" : "Source rejected",
+    chinese
+      ? time
+        ? `上次有效读数 ${time}`
+        : "无有效读数"
+      : time
+        ? `Last valid reading ${time}`
+        : "No valid reading",
+    rejection.reason,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
 
 /** The one colour reading a ring, a tile or a chip may take. */
 export type UsageTone = "ok" | "warn" | "crit" | "mute";

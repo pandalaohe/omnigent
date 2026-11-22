@@ -1008,6 +1008,93 @@ def test_restart_hydrates_accounts_and_native_readings(db_uri, usage_enabled):
     assert "codex" not in second.quotas(QuotaContext(OWNER, HOST), now=NOW)[1]
 
 
+@pytest.mark.parametrize("last_valid_at", [NOW, None], ids=["retained", "cold"])
+def test_quota_source_rejection_is_durable_and_display_only(db_uri, monkeypatch, last_valid_at):
+    first = service_with_store(db_uri)
+    context = QuotaContext(OWNER, None)
+    account_id = "gemini"
+    accepted = UsageReportV2.model_validate(
+        usage_report(account_product="antigravity").model_dump(exclude_none=True)
+        | {"schema_version": 2, "fresh_until": NOW + 60}
+    )
+    first.report_account(
+        OWNER, "claude-gpt", accepted.model_copy(update={"product": None}), now=NOW
+    )
+    if last_valid_at is not None:
+        first.report_account(OWNER, account_id, accepted, now=NOW)
+    baseline = first.quotas(context, now=NOW + 2)
+    baseline_pools = first.pool_readings(context, now=NOW + 2)
+
+    def verify_rejection(observed):
+        first.report_account(
+            OWNER,
+            account_id,
+            UsageReportV2(
+                schema_version=2,
+                observed_at=observed,
+                fresh_until=observed + 10,
+                product="antigravity",
+                quota_source_rejection={"last_valid_at": last_valid_at, "reason": "reset_changed"},
+            ),
+            now=observed,
+        )
+
+    verify_rejection(NOW + 1)
+    verify_rejection(NOW + 2)
+    assert first.quotas(context, now=NOW + 2) == baseline
+    assert first.pool_readings(context, now=NOW + 2) == baseline_pools
+
+    restarted = service_with_store(db_uri)
+    overview = restarted.overview(OWNER, now=NOW + 3)
+    gemini = account(overview, account_id)
+    assert gemini.reason == "source_rejected"
+    assert gemini.state == "unknown"
+    assert gemini.read_at == last_valid_at
+    assert gemini.age_s == (3 if last_valid_at is not None else None)
+    assert gemini.quota_source_rejection.reason == "reset_changed"
+    assert gemini.windows == [] and gemini.pace_pct is None and gemini.deciding_window is None
+    assert account(overview, "claude-gpt").windows[0].percent_used == 40
+    monkeypatch.setattr("omnigent.server.agent_quota.time.time", lambda: NOW + 3)
+    assert "antigravity: source rejected" in restarted.context_line(context)
+
+    # A repeated or stale accepted reading does not remove rejection metadata.
+    if last_valid_at is not None:
+        restarted.report_account(OWNER, account_id, accepted, now=NOW + 4)
+        assert (
+            account(restarted.overview(OWNER, now=NOW + 4), account_id).reason == "source_rejected"
+        )
+    after_expiry = restarted.overview(OWNER, now=NOW + 13)
+    assert all(item.quota_source_rejection is None for item in after_expiry.accounts)
+
+    # A fresh accepted reading clears the status before expiry as well.
+    restarted.report_account(
+        OWNER, account_id, accepted.model_copy(update={"observed_at": NOW + 5}), now=NOW + 5
+    )
+    recovered = account(restarted.overview(OWNER, now=NOW + 5), account_id)
+    assert recovered.quota_source_rejection is None
+    assert recovered.windows[0].percent_used == 40
+
+
+async def test_quota_source_rejection_route_requires_status_only_report(db_uri):
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(service_with_store(db_uri), auth_provider=None, host_store=None),
+        prefix="/v1",
+    )
+    body = {"schema_version": 2, "observed_at": time.time(), "quota_source_rejection": {}}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/gemini"
+        assert (await client.put(path, json=body | {"windows": []})).status_code == 422
+        assert (await client.put(path, json=body)).status_code == 200
+        accounts = (await client.get("/v1/me/usage")).json()["accounts"]
+        tile = next(item for item in accounts if item["id"] == "gemini")
+        assert tile["reason"] == "source_rejected"
+        assert tile["quota_source_rejection"] == {"last_valid_at": None, "reason": None}
+        assert tile["windows"] == [] and tile["read_at"] is None
+
+
 def test_linked_account_restart_restores_routing_projection(db_uri):
     store = UsageSnapshotStore(db_uri)
     first = service_with_store(db_uri, store)

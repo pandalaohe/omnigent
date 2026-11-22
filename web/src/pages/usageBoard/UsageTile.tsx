@@ -33,6 +33,7 @@ import {
   formatTileAmount,
   splitPercentReading,
   formatTimeLeft,
+  quotaSourceRejectionLabel,
   windowName,
   stateTone,
 } from "./usageBoardFormat";
@@ -172,7 +173,7 @@ export function UsageTile({
             </span>
           ) : null}
         </div>
-        {stale ? <ReadingButton account={account} /> : null}
+        {stale || account.quota_source_rejection ? <ReadingButton account={account} /> : null}
       </div>
     );
   }
@@ -387,6 +388,8 @@ export function UsageTile({
 
 /** The state of the reading: how old it is when it is not current. */
 function ReadingButton({ account }: { account: UsageAccountView }) {
+  const rejection = quotaSourceRejectionLabel(account);
+  if (rejection) return <span className="usage-caption min-w-0 break-words">{rejection}</span>;
   if (account.freshness === "fresh") return null;
   const label = account.age_s === null ? "Not read" : `Last read ${formatAge(account.age_s)} ago`;
   return (
@@ -401,6 +404,8 @@ function tileLabel(
   picks: { group: UsageWindowGroup; window: UsageAccountView["windows"][number] | null }[],
   stale: boolean,
 ): string {
+  const rejection = quotaSourceRejectionLabel(account);
+  if (rejection) return `${account.display_name}. ${rejection}`;
   const parts = picks.map(({ window }) => {
     if (!window) return "no reading";
     if (window.percent_used !== null) {

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { PinIcon } from "lucide-react";
 import type { UsageAccountView, UsageWindowView } from "@/pages/usageBoard/usageBoardData";
+import { quotaSourceRejectionLabel } from "@/pages/usageBoard/usageBoardFormat";
 import type { BoardPreferences } from "./taskBoardPreferences";
 import { BoardPager } from "./TaskBoardRoutes";
 import { formatDate, formatNumber, t } from "./taskBoardText";
@@ -239,9 +240,13 @@ export function TaskBoardQuotaPanel({
               <article key={account.id}>
                 <b>{account.display_name}</b>
                 <small>
-                  {t(account.state === "paused" ? "quota.paused" : "quota.stale")}
-                  {account.read_at != null &&
-                    ` · ${formatDate(account.read_at * 1000, { month: "2-digit", day: "2-digit" })}`}
+                  {quotaSourceRejectionLabel(account) ?? (
+                    <>
+                      {t(account.state === "paused" ? "quota.paused" : "quota.stale")}
+                      {account.read_at != null &&
+                        ` · ${formatDate(account.read_at * 1000, { month: "2-digit", day: "2-digit" })}`}
+                    </>
+                  )}
                 </small>
               </article>
             ))}
