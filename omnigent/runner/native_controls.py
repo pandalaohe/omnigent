@@ -2184,13 +2184,16 @@ def build_native_controls(
             reply["effort"] = applied_effort
         return JSONResponse(status_code=200, content=reply)
 
+    class _AntigravityEffortUnsupportedError(Exception):
+        """Raised inside slash-command validation when the pane model rejects xhigh."""
+
     async def _handle_antigravity_native_effort_change(
         conv_id: str, effort: str | None
     ) -> Response:
         from omnigent.harnesses.antigravity_native.bridge import (
             ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
-            confirmed_agy_model_from_pane,
+            parse_agy_footer_model,
             run_agy_slash_command,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
@@ -2212,34 +2215,50 @@ def build_native_controls(
             labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         )
         effort = EFFORT_ALIASES.get(effort, effort)
+        validate_baseline: Callable[[str], None] | None = None
         if effort == "xhigh":
-            try:
-                confirmed_model = await asyncio.to_thread(
-                    confirmed_agy_model_from_pane, bridge_dir
-                )
-            except (RuntimeError, OSError):
-                confirmed_model = None
             raw_options = snapshot.get("model_options")
             catalog_models = raw_options if isinstance(raw_options, list) else None
-            if (
-                clamp_antigravity_effort(effort, confirmed_model, catalog_models=catalog_models)
-                != effort
-            ):
-                target = confirmed_model or "unconfirmed Antigravity model"
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "antigravity_native_effort_unsupported",
-                        "detail": f"Effort {effort!r} is not supported by {target}",
-                    },
-                )
+
+            def _require_xhigh_model(pane: str) -> None:
+                confirmed_model = parse_agy_footer_model(pane)
+                if (
+                    clamp_antigravity_effort(
+                        effort, confirmed_model, catalog_models=catalog_models
+                    )
+                    != effort
+                ):
+                    target = confirmed_model or "unconfirmed Antigravity model"
+                    raise _AntigravityEffortUnsupportedError(
+                        f"Effort {effort!r} is not supported by {target}"
+                    )
+
+            validate_baseline = _require_xhigh_model
         try:
-            await asyncio.to_thread(
-                run_agy_slash_command,
-                bridge_dir,
-                f"/effort {effort}",
-                expect=f"Effort set to {effort}",
-                timeout_s=3.0,
+            if validate_baseline is not None:
+                await asyncio.to_thread(
+                    run_agy_slash_command,
+                    bridge_dir,
+                    f"/effort {effort}",
+                    expect=f"Effort set to {effort}",
+                    timeout_s=3.0,
+                    validate_baseline=validate_baseline,
+                )
+            else:
+                await asyncio.to_thread(
+                    run_agy_slash_command,
+                    bridge_dir,
+                    f"/effort {effort}",
+                    expect=f"Effort set to {effort}",
+                    timeout_s=3.0,
+                )
+        except _AntigravityEffortUnsupportedError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "antigravity_native_effort_unsupported",
+                    "detail": str(exc),
+                },
             )
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(

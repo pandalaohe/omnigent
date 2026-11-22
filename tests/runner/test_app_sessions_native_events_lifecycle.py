@@ -6348,9 +6348,22 @@ async def test_antigravity_control_dispatch_sends_one_command(
                 "model_override": "gemini-4-hydrogen",
                 "reasoning_effort": "high",
             },
-            "",
+            "model unavailable",
             {"type": "effort_change", "effort": "xhigh"},
             400,
+            [],
+            None,
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "reasoning_effort": "high",
+            },
+            "",
+            {"type": "effort_change", "effort": "xhigh"},
+            503,
             [],
             None,
         ),
@@ -6403,19 +6416,26 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
     from omnigent.runner.native import orchestration
 
     monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
-    monkeypatch.setattr(agy, "_agy_control_pane", lambda _: f"? for shortcuts    {footer}")
+    monkeypatch.setattr(
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    calls = []
+    pane_footer = (
+        footer or "Gemini 4 Hydrogen · high" if event["type"] == "model_change" else footer
+    )
+
+    def control_pane(_):
+        if not calls:
+            return f"? for shortcuts    {pane_footer}"
+        return "Effort set to xhigh" if calls[-1].startswith("/effort") else "Model set to ok"
+
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", lambda *a, **kw: calls.append(kw["content"]))
 
     async def snapshot(*args, **kwargs):
         return snapshot_payload
 
     monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
-    calls = []
-
-    def command(_, text, **kwargs):
-        calls.append(text)
-        return "Effort set to xhigh" if text.startswith("/effort") else "Model set to ok"
-
-    monkeypatch.setattr(agy, "run_agy_slash_command", command)
     app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
     async with _runner_client(app, permission_harness="antigravity-native") as client:
         created = await client.post(
@@ -6439,8 +6459,11 @@ async def test_antigravity_effort_uses_last_successful_model_switch_before_new_t
     from omnigent.runner.native import orchestration
 
     monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
     current_readback = "Gemini 4 Hydrogen (High)"
-    current_pane_model = "Claude Opus 5.5 (High)"
+    current_footer = "Claude Opus 5.5 · high"
 
     async def snapshot(*args, **kwargs):
         return {
@@ -6451,16 +6474,27 @@ async def test_antigravity_effort_uses_last_successful_model_switch_before_new_t
         }
 
     monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
-    monkeypatch.setattr(
-        agy, "confirmed_agy_model_from_pane", lambda _bridge_dir: current_pane_model
-    )
     calls = []
+    pending_confirm: list[str | None] = [None]
 
-    def command(_, text, **kwargs):
+    def control_pane(_):
+        if pending_confirm[0] is not None:
+            reply = pending_confirm[0]
+            pending_confirm[0] = None
+            return reply
+        return f"? for shortcuts    {current_footer}"
+
+    def paste_and_submit(*args, **kwargs):
+        text = kwargs["content"]
         calls.append(text)
-        return "Model set to Claude Opus 5.5 (High)"
+        pending_confirm[0] = (
+            "Effort set to xhigh"
+            if text.startswith("/effort")
+            else "Model set to Claude Opus 5.5 (High)"
+        )
 
-    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", paste_and_submit)
     app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
     async with _runner_client(app, permission_harness="antigravity-native") as client:
         created = await client.post(
@@ -6479,12 +6513,12 @@ async def test_antigravity_effort_uses_last_successful_model_switch_before_new_t
             "/v1/sessions/conv_agy_no_turn/events",
             json={"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
         )
-        current_pane_model = "Gemini 4 Hydrogen (Xhigh)"
+        current_footer = "Gemini 4 Hydrogen · xhigh"
         allowed = await client.post(
             "/v1/sessions/conv_agy_no_turn/events",
             json={"type": "effort_change", "effort": "xhigh"},
         )
-        current_pane_model = "Claude Opus 5.5 (High)"
+        current_footer = "Claude Opus 5.5 · high"
         refused_manual_switch = await client.post(
             "/v1/sessions/conv_agy_no_turn/events",
             json={"type": "effort_change", "effort": "xhigh"},
@@ -6517,19 +6551,26 @@ async def test_antigravity_effort_uses_footer_after_first_manual_model_switch(
 
     footer = "accept-edits · Claude Opus 5.5 · high"
     calls = []
+    pending_confirm: list[str | None] = [None]
 
-    def command(_, text, **kwargs):
-        calls.append(text)
-        return "Effort set to xhigh"
+    def control_pane(_):
+        if pending_confirm[0] is not None:
+            reply = pending_confirm[0]
+            pending_confirm[0] = None
+            return reply
+        return f"⎿  Model set to Gemini 4 Hydrogen (High)\n? for shortcuts    {footer}\n"
+
+    def paste_and_submit(*args, **kwargs):
+        calls.append(kwargs["content"])
+        pending_confirm[0] = "Effort set to xhigh"
 
     monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
     monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
-        agy,
-        "_agy_control_pane",
-        lambda _: f"⎿  Model set to Gemini 4 Hydrogen (High)\n? for shortcuts    {footer}\n",
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
     )
-    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", paste_and_submit)
 
     app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
     async with _runner_client(app, permission_harness="antigravity-native") as client:
@@ -6549,6 +6590,75 @@ async def test_antigravity_effort_uses_footer_after_first_manual_model_switch(
     assert unconfirmed.status_code == 400, unconfirmed.text
     assert allowed.status_code == 200, allowed.text
     assert calls == ["/effort xhigh"]
+
+
+async def test_antigravity_xhigh_refuses_hydrogen_to_opus_switch_within_3s_budget(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    """P1/P2: Hydrogen -> Opus reads never send /effort xhigh and stay in the 3 s budget."""
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy,
+        "read_tmux_info",
+        lambda _: {"socket_path": "/tmp/example/tmux.sock", "tmux_target": "main"},
+    )
+
+    panes = [
+        "> \n? for shortcuts    Gemini 4 Hydrogen · high\n",
+        "> \n? for shortcuts    Claude Opus 5.5 · high\n",
+    ]
+    capture_index = [0]
+    tmux_calls: list[tuple[list[str], float]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        tmux_calls.append((cmd, float(timeout)))
+        if "capture-pane" in cmd:
+            pane = panes[min(capture_index[0], len(panes) - 1)]
+            capture_index[0] += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(agy.subprocess, "run", fake_run)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_race", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        url = "/v1/sessions/conv_agy_race/events"
+        raced = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        single_read_start = len(tmux_calls)
+        already_opus = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+
+    assert raced.status_code == 400, raced.text
+    assert "Claude Opus 5.5" in raced.json()["detail"]
+    assert already_opus.status_code == 400, already_opus.text
+    assert tmux_calls
+    assert all(timeout <= 3.0 for _, timeout in tmux_calls)
+    assert not any(
+        "load-buffer" in cmd or "paste-buffer" in cmd or cmd[-1] == "Enter"
+        for cmd, _ in tmux_calls
+    )
+    # When the first capture already shows Opus, no extra capture or key send occurs.
+    assert len(tmux_calls) - single_read_start == 1
+    assert "capture-pane" in tmux_calls[single_read_start][0]
 
 
 @pytest.mark.parametrize(

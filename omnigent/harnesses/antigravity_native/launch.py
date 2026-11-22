@@ -45,7 +45,7 @@ from pathlib import Path
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
-from omnigent.util.reasoning_effort import clamp_antigravity_effort
+from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -184,9 +184,14 @@ def should_skip_permissions(
     return headless
 
 
+def _is_xhigh_effort(effort: str | None) -> bool:
+    """Return whether *effort* is ``xhigh`` or one of its higher aliases."""
+    return effort is not None and EFFORT_ALIASES.get(effort, effort) == "xhigh"
+
+
 def _extract_model_and_effort_from_extra_args(
     extra_args: tuple[str, ...],
-) -> tuple[str | None, str | None, tuple[str, ...], bool]:
+) -> tuple[str | None, str | None, tuple[str, ...], bool, bool]:
     """Strip ``--model`` and ``--effort`` (split or ``=`` forms) from *extra_args*.
 
     Stops parsing flags at ``--`` so positional arguments are preserved verbatim.
@@ -197,6 +202,7 @@ def _extract_model_and_effort_from_extra_args(
     remaining: list[str] = []
     skip_permissions_seen = False
     csrf_token_seen = False
+    xhigh_seen = False
     idx = 0
     while idx < len(extra_args):
         arg = extra_args[idx]
@@ -207,6 +213,8 @@ def _extract_model_and_effort_from_extra_args(
             if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
                 val = extra_args[idx + 1]
                 extracted_model = val if val else None
+                if val and _is_xhigh_effort(split_agy_effort_suffix(val)[1]):
+                    xhigh_seen = True
                 idx += 2
                 continue
             idx += 1
@@ -214,12 +222,16 @@ def _extract_model_and_effort_from_extra_args(
         if arg.startswith("--model="):
             val = arg.partition("=")[2]
             extracted_model = val if val else None
+            if val and _is_xhigh_effort(split_agy_effort_suffix(val)[1]):
+                xhigh_seen = True
             idx += 1
             continue
         if arg == "--effort":
             if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
                 val = extra_args[idx + 1]
                 extracted_effort = val if val else None
+                if _is_xhigh_effort(val):
+                    xhigh_seen = True
                 idx += 2
                 continue
             idx += 1
@@ -227,6 +239,8 @@ def _extract_model_and_effort_from_extra_args(
         if arg.startswith("--effort="):
             val = arg.partition("=")[2]
             extracted_effort = val if val else None
+            if _is_xhigh_effort(val):
+                xhigh_seen = True
             idx += 1
             continue
         if arg == _SKIP_PERMISSIONS_FLAG:
@@ -247,7 +261,7 @@ def _extract_model_and_effort_from_extra_args(
             idx += 2
             continue
         idx += 1
-    return extracted_model, extracted_effort, tuple(remaining), csrf_token_seen
+    return extracted_model, extracted_effort, tuple(remaining), csrf_token_seen, xhigh_seen
 
 
 def build_agy_launch(
@@ -311,12 +325,27 @@ def build_agy_launch(
         extra_effort,
         remaining_extra_args,
         csrf_token_seen,
+        extra_has_xhigh,
     ) = _extract_model_and_effort_from_extra_args(extra_args)
-    launch = resolve_native_antigravity_launch(
-        model=extra_model if extra_model is not None else model
+    model_suffix = split_agy_effort_suffix(model)[1] if model is not None else None
+    rewrite_model_and_effort = (
+        _is_xhigh_effort(effort) or _is_xhigh_effort(model_suffix) or extra_has_xhigh
     )
-    final_model = launch.model
-    final_effort = extra_effort if extra_effort is not None else effort
+    launch = resolve_native_antigravity_launch(
+        model=extra_model if rewrite_model_and_effort and extra_model is not None else model
+    )
+    if (
+        not rewrite_model_and_effort
+        and launch.model is not None
+        and _is_xhigh_effort(split_agy_effort_suffix(launch.model)[1])
+    ):
+        rewrite_model_and_effort = True
+        if extra_model is not None:
+            launch = NativeAntigravityLaunch(
+                auth_mode=launch.auth_mode,
+                model=extra_model,
+                extra_env=launch.extra_env,
+            )
     argv: list[str] = [agy_binary_path()]
     if not csrf_token_seen:
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
@@ -326,6 +355,29 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
+    if not rewrite_model_and_effort:
+        if launch.model is not None:
+            argv.extend(
+                [
+                    "--model",
+                    split_agy_effort_suffix(launch.model)[0] if effort else launch.model,
+                ]
+            )
+        if effort is not None:
+            argv.extend(["--effort", effort])
+        skip_permissions_seen = False
+        for idx, arg in enumerate(extra_args):
+            if arg == "--":
+                argv.extend(extra_args[idx:])
+                break
+            if arg == _SKIP_PERMISSIONS_FLAG:
+                if skip_permissions_seen:
+                    continue
+                skip_permissions_seen = True
+            argv.append(arg)
+        return argv, launch.extra_env
+    final_model = launch.model
+    final_effort = extra_effort if extra_effort is not None else effort
     if final_model is not None:
         base_model, suffix_effort = split_agy_effort_suffix(final_model)
         if final_effort:

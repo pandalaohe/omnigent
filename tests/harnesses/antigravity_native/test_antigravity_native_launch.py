@@ -619,3 +619,50 @@ def test_launch_catalog_row_must_explicitly_offer_xhigh(
         ],
     )
     assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_launch_ordinary_effort_passthrough_preserves_base_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary efforts keep base argv bytes and positions on the passthrough path."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen-high",
+        effort=None,
+        extra_args=("--effort=low",),
+    )
+    assert argv[0] == "agy"
+    assert argv[1].startswith("--csrf_token=")
+    assert argv[2:] == ["--model", "gemini-4-hydrogen-high", "--effort=low"]
+
+
+@pytest.mark.parametrize(
+    ("model", "extra_args", "expected_model", "expected_effort"),
+    [
+        ("claude-opus-5-5-high", ("--effort=max",), "claude-opus-5-5", "high"),
+        ("claude-opus-5-5-high", ("--effort=ultra",), "claude-opus-5-5", "high"),
+        ("gemini-4-hydrogen-high", ("--effort=max",), "gemini-4-hydrogen", "xhigh"),
+    ],
+)
+def test_launch_rewrites_xhigh_aliases_in_extra_args(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    extra_args: tuple[str, ...],
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    """xhigh aliases in extra_args still trigger model/effort rewrite and clamping."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model=model,
+        effort=None,
+        extra_args=extra_args,
+    )
+    assert sum(arg == "--model" or arg.startswith("--model=") for arg in argv) == 1
+    assert sum(arg == "--effort" or arg.startswith("--effort=") for arg in argv) == 1
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert argv[argv.index("--effort") + 1] == expected_effort
