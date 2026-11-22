@@ -1475,6 +1475,7 @@ export function TaskBoardRoutes({
     >
       <div className="rt-toolbar">
         <Segmented
+          className="rt-segment"
           label={t("routes.mode")}
           value={mode}
           onChange={(value) => {
@@ -1553,6 +1554,7 @@ export function TaskBoardRoutes({
             </>
           )}
           <Segmented
+            className="rt-segment"
             label={t("routes.scope")}
             value={settings.scope}
             onChange={(scope) => {
@@ -1579,7 +1581,7 @@ export function TaskBoardRoutes({
           </button>
           <button
             type="button"
-            className="rt-icon"
+            className="rt-focus-toggle rt-rows-toggle"
             aria-pressed={compact}
             aria-label={t(compact ? "routes.rowsFinal" : "routes.rowsCompact")}
             title={t(compact ? "routes.rowsFinal" : "routes.rowsCompact")}
@@ -1588,8 +1590,9 @@ export function TaskBoardRoutes({
               setOpen(null);
             }}
           >
-            {compact ? <Rows3Icon size={16} /> : <Rows4Icon size={16} />}
-            {t("routes.rowsCompact")}
+            {compact ? <Rows3Icon size={14} /> : <Rows4Icon size={14} />}
+            <span className="rt-rows-label">{t("routes.rowsCompact")}</span>
+            <span className="rt-rows-label-short">{t("routes.rowsCompactShort")}</span>
           </button>
           <button
             type="button"
