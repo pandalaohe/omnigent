@@ -29,12 +29,15 @@ export function McpRegistryLaunchPicker({
     },
     [onAuthorizingChange],
   );
-  const selectedServices = catalog.services.filter((service) => selected.includes(service.id));
+  const selectedServices = catalog.services.filter(
+    (service) =>
+      selected.includes(service.id) &&
+      service.status !== "unavailable" &&
+      (service.auth !== "env" || service.connected),
+  );
   const selectedCount =
     catalog.loading || catalog.error ? selected.length : selectedServices.length;
-  const needsSignInCount = selectedServices.filter(
-    (service) => !service.connected && service.auth !== "env" && service.status !== "unavailable",
-  ).length;
+  const needsSignInCount = selectedServices.filter((service) => !service.connected).length;
   return (
     <Popover open={open} onOpenChange={(next) => !authorizing && setOpen(next)}>
       <PopoverTrigger asChild>

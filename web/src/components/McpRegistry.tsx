@@ -385,8 +385,7 @@ export function McpRegistryPicker({
                     busy ||
                     authorizing !== null ||
                     conflict ||
-                    unavailable ||
-                    (tokenNeeded && !selected)
+                    ((unavailable || tokenNeeded) && !selected)
                   }
                   onCheckedChange={(next) =>
                     next ? void enable(service) : onToggle(service.id, false)
@@ -407,7 +406,7 @@ export function McpRegistryPicker({
                     Reconnect
                   </Button>
                 )}
-              {workspaceService === service.id && (
+              {service.auth === "databricks" && !unavailable && workspaceService === service.id && (
                 <div className="mt-3 space-y-2">
                   <Input
                     aria-label="Databricks workspace URL"

@@ -1236,6 +1236,39 @@ describe("McpServersSection", () => {
     expect(screen.getByRole("button", { name: "Edit slack" })).toBeEnabled();
   });
 
+  it("can remove an attached unavailable env service without offering sign-in", async () => {
+    versionEnv.enabledConnections = ["mcp"];
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        {
+          id: "tracker",
+          title: "Work tracker",
+          connected: false,
+          auth: "env",
+          status: "unavailable",
+          connect_provider: null,
+        },
+      ],
+    });
+    renderButtonWithSession(
+      {
+        ...AGENT_WITH_BOTH,
+        mcp_registry_editable: true,
+        mcp_servers: [...AGENT_WITH_BOTH.mcp_servers!, { name: "tracker", transport: "registry" }],
+      },
+      "conv_mcp",
+    );
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = within(screen.getByRole("dialog"));
+    const toggle = await dialog.findByRole("switch", { name: "Work tracker" });
+    expect(toggle).toBeChecked();
+    expect(dialog.getByText("Unavailable")).toBeVisible();
+    expect(dialog.queryByRole("button", { name: /sign in|connect/i })).toBeNull();
+    fireEvent.click(toggle);
+    expect(deleteMcpMutate).toHaveBeenCalledWith("tracker", expect.anything());
+  });
+
   it("creates an HTTP MCP server from the manager dialog", () => {
     renderContent("conv_mcp");
 

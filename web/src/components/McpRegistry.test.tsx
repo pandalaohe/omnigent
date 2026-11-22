@@ -49,6 +49,30 @@ beforeEach(() => {
 });
 
 describe("MCP account connections", () => {
+  it("shows operator-configured services without personal connection actions", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        { ...service, auth: "env", status: "unavailable", connect_provider: null },
+        {
+          ...service,
+          id: "wiki",
+          title: "Wiki",
+          auth: "env",
+          status: "configured",
+          connected: true,
+          connect_provider: null,
+        },
+      ],
+    });
+    renderConnections();
+    expect(await screen.findByText("Unavailable")).toBeVisible();
+    expect(screen.getByText("Configured by server")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: /^(connect|reconnect|disconnect|update token)$/i }),
+    ).toBeNull();
+    expect(screen.queryByRole("link", { name: /^(connect|reconnect)$/i })).toBeNull();
+  });
+
   it("waits for viewer identity and drops the cached page on a server switch", async () => {
     scope.viewer = null;
     vi.mocked(registryRequest).mockImplementation(async (path) => ({

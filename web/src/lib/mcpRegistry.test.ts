@@ -104,3 +104,13 @@ it("requires a Databricks workspace and includes it in the existing provider flo
   controller.abort();
   await assertion;
 });
+
+it("rejects personal sign-in for an env service before opening a popup", async () => {
+  await expect(
+    authorizeRegistryService(
+      { ...service, auth: "env", status: "unavailable", connect_provider: null, connected: false },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow("configured by your server operator");
+  expect(window.open).not.toHaveBeenCalled();
+});

@@ -927,7 +927,8 @@ describe("NewChatLandingScreen create flow", () => {
   );
 
   it("restores remembered MCPs on a fresh draft and launches only available services without opening the picker", async () => {
-    writeLastMcpServices(["tracker", "removed"]);
+    const remembered = ["tracker", "wiki", "removed"];
+    writeLastMcpServices(remembered);
     let finish!: (value: unknown) => void;
     vi.mocked(registryRequest).mockReturnValue(
       new Promise((resolve) => {
@@ -942,16 +943,30 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     typeMessage("Use my remembered tools");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    expect(screen.getByRole("button", { name: "MCP services: 2 selected" })).toBeVisible();
-    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
-    await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
+    expect(screen.getByRole("button", { name: "MCP services: 3 selected" })).toBeVisible();
+    expect(readLastMcpServices()).toEqual(remembered);
+    await act(async () =>
+      finish({
+        data: [
+          { id: "tracker", title: "Tracker", connected: true },
+          {
+            id: "wiki",
+            title: "Wiki",
+            connected: false,
+            auth: "env",
+            status: "unavailable",
+            connect_provider: null,
+          },
+        ],
+      }),
+    );
     expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
     expect(
       JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
     ).toMatchObject({ mcp_registry_services: ["tracker"] });
-    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+    expect(readLastMcpServices()).toEqual(remembered);
   });
 
   it.each(["retry", "opt out"])(
