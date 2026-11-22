@@ -770,14 +770,19 @@ class PermissionTierRuntime:
                 if read_path_arg is None or isinstance(arguments.get(read_path_arg), str):
                     eval_local_execution = True
         agy_delegation: Literal["proven", "missing", "failed"] = "missing"
-        if (
-            state.tier != "full"
-            and self._harnesses.get(session_id) == "antigravity-native"
-            and name == "invoke_subagent"
-        ):
-            from omnigent.harnesses.antigravity_native.delegation_proof import delegation_status
+        readable_control_file = None
+        if state.tier != "full" and self._harnesses.get(session_id) == "antigravity-native":
+            bridge_dir = self._paths[session_id].parent
+            if name == "invoke_subagent":
+                from omnigent.harnesses.antigravity_native.delegation_proof import (
+                    delegation_status,
+                )
 
-            agy_delegation = delegation_status(self._paths[session_id].parent)
+                agy_delegation = delegation_status(bridge_dir)
+            elif local_execution and name in ("view_file", "read_file"):
+                from omnigent.harnesses.antigravity_native.guard import relay_schema_read
+
+                readable_control_file = relay_schema_read(bridge_dir, state, name, arguments)
         return evaluate_host_tool(
             state,
             name,
@@ -789,6 +794,7 @@ class PermissionTierRuntime:
             native_support=native[1] if native is not None else None,
             local_execution=eval_local_execution,
             agy_delegation_status=agy_delegation,
+            readable_control_file=readable_control_file,
         )
 
     def inspect(

@@ -1610,13 +1610,18 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 
 @pytest.mark.asyncio
-async def test_antigravity_first_turn_recovers_registry_relay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "launch", ["first-turn", "explicit", "wrong-directory", "labels-unavailable"]
+)
+async def test_antigravity_registry_relay_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch: str
 ) -> None:
+    import click
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
     from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.harnesses.antigravity_native.main import _launch_antigravity_terminal
     from omnigent.mcp_selection import selected_mcp_spec
 
     session_id = "conv_agy_registry"
@@ -1646,6 +1651,8 @@ async def test_antigravity_first_turn_recovers_registry_relay(
     class GatewayClient(_SwitchableServerClient):
         async def get(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
             if url.endswith("/labels"):
+                if launch == "labels-unavailable":
+                    raise httpx.ConnectError("session labels unavailable")
                 return self._Response({"labels": labels})
             return await super().get(url, **kwargs)
 
@@ -1665,27 +1672,60 @@ async def test_antigravity_first_turn_recovers_registry_relay(
         spec_version=1,
         executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
     )
+    launch_roles = []
+
+    class ResourceRegistry(_StubResourceRegistry):
+        async def launch_auxiliary_terminal(self, **kwargs: Any) -> SessionResourceView:
+            assert "tracker__status" in _relay_tool_names(relay_path)
+            launch_roles.append(kwargs["resource_role"])
+            kwargs.pop("agent_tier")
+            return await super().launch_auxiliary_terminal(**kwargs)
+
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = _switch_app(
         tmp_path,
         GatewayClient("agy-agent"),
         {"agy-agent": ResolvedSpec(spec=selected_mcp_spec(spec, labels), workdir=tmp_path)},
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        resource_registry=ResourceRegistry(tmp_path),
+        process_manager=process_manager,
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://runner"
     ) as client:
         try:
-            response = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "agy-agent",
-                    "content": [{"type": "input_text", "text": "Check ticket status"}],
-                },
-            )
-            assert response.status_code == 202, response.text
-            await asyncio.wait_for(relay_started.wait(), timeout=5.0)
+            if launch == "first-turn":
+                response = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "agy-agent",
+                        "content": [{"type": "input_text", "text": "Check ticket status"}],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                await asyncio.wait_for(relay_started.wait(), timeout=5.0)
+            else:
+                gemini_dir = agy.agy_gemini_dir(bridge_dir)
+                if launch == "wrong-directory":
+                    gemini_dir = gemini_dir.parent / "unverified"
+                request = _launch_antigravity_terminal(
+                    client,
+                    session_id,
+                    argv=["agy", f"--gemini_dir={gemini_dir}"],
+                    env={},
+                    command="agy",
+                )
+                if launch != "explicit":
+                    status = 409 if launch == "wrong-directory" else 503
+                    with pytest.raises(click.ClickException, match=rf"\({status}\)"):
+                        await request
+                    assert launch_roles == []
+                    assert not relay_path.exists()
+                    return
+                await request
+                assert launch_roles == [None]
+                assert process_manager.get_client_calls == []
             assert relay_path.is_file()
             server = json.loads(config_path.read_text())["mcpServers"]["omnigent"]
             assert "enabledTools" not in server

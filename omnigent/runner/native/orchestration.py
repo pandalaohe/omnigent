@@ -8037,6 +8037,48 @@ async def _run_antigravity_reader(
 _AGY_CONFIRMED_PERMISSION_TIERS: dict[Path, str] = {}
 
 
+async def _ensure_antigravity_comment_relay(
+    session_id: str,
+    labels: Mapping[str, str],
+    ensure_comment_relay: _EnsureCommentRelay,
+    *,
+    launch_args: Sequence[str] | None = None,
+) -> Path:
+    """Prepare the labelled relay for first-turn recovery or an explicit CLI pane."""
+    from omnigent.harnesses.antigravity_native.bridge import (
+        AGY_PERMISSION_TIER_LABEL_KEY,
+        AGY_PERMISSION_TIERS,
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        agy_gemini_dir,
+        bridge_dir_for_bridge_id,
+        reassert_agy_permission_tier,
+        write_mcp_bridge_config,
+    )
+
+    bridge_dir = bridge_dir_for_bridge_id(
+        labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
+    )
+    if launch_args is not None:
+        gemini_flags = [
+            arg for arg in launch_args if arg == "--gemini_dir" or arg.startswith("--gemini_dir=")
+        ]
+        if gemini_flags != [f"--gemini_dir={agy_gemini_dir(bridge_dir)}"]:
+            raise ValueError("Antigravity terminal does not use the session's Gemini directory")
+
+    # A confirmed live switch or rollback can supersede the create-time label.
+    tier = _AGY_CONFIRMED_PERMISSION_TIERS.get(bridge_dir.resolve())
+    if tier is None:
+        label_tier = labels.get(AGY_PERMISSION_TIER_LABEL_KEY)
+        tier = label_tier if label_tier in AGY_PERMISSION_TIERS else None
+    if tier is not None:
+        reassert_agy_permission_tier(bridge_dir, tier)
+    write_mcp_bridge_config(bridge_dir)
+    await ensure_comment_relay(
+        session_id, explicit_bridge_dir=bridge_dir, await_notify=False, session_labels=labels
+    )
+    return bridge_dir
+
+
 async def _auto_create_antigravity_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
