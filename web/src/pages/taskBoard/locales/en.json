@@ -397,6 +397,7 @@
   "routes.pinsMore_other": "{{count}} more match; type more to narrow.",
   "routes.pinsHint": "Pinned tasks and groups always show in By order, and in By time while inside the window. Kept in this browser; untick to unpin.",
   "routes.rowsCompact": "Compact rows",
+  "routes.rowsCompactShort": "Compact",
   "routes.rowsFinal": "Taller rows",
   "routes.stops": "{{count}} stops",
   "detail.closedLead": "This task is closed.",

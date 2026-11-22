@@ -28,8 +28,7 @@
 }
 .rt-controls {
   margin-left: auto;
-  gap: 8px;
-  flex-wrap: nowrap;
+  justify-content: flex-end;
 }
 .rt-routes button {
   cursor: pointer;
@@ -49,7 +48,7 @@
   background: var(--secondary);
   font: inherit;
 }
-/* Every toolbar control shares one height; grouped controls inset by 3px. */
+/* Desktop controls share one height; grouped controls inset by 3px. */
 .rt-segment {
   height: var(--rt-control-h);
   padding: 3px;
@@ -64,6 +63,7 @@
 }
 .rt-presets {
   gap: 2px;
+  flex-wrap: nowrap;
   background: var(--secondary);
   border-radius: 8px;
   padding: 3px;
@@ -75,13 +75,17 @@
   padding: 0 10px;
   font-size: 12.5px;
 }
-.rt-presets button[aria-pressed="true"] {
+.rt-presets button[aria-pressed="true"],
+.rt-rows-toggle[aria-pressed="true"] {
   background: var(--primary-cta);
   color: var(--primary-cta-foreground);
+}
+.rt-presets button[aria-pressed="true"] {
   font-weight: 600;
 }
 .rt-zoom {
   gap: 2px;
+  flex-wrap: nowrap;
   padding: 3px;
   background: var(--secondary);
   border-radius: 8px;
@@ -744,6 +748,17 @@
 .tb-page:has(.rt-routes) > .tb-scheduled {
   display: none;
 }
+.rt-rows-toggle .rt-rows-label-short {
+  display: none;
+}
+@media (width < 48rem) {
+  .rt-segment {
+    height: auto;
+  }
+  .rt-segment > button {
+    min-height: 44px;
+  }
+}
 @media (max-width: 620px) {
   .rt-toolbar {
     align-items: flex-start;
@@ -751,9 +766,7 @@
   .rt-controls {
     gap: 7px;
     width: 100%;
-    flex-wrap: wrap;
     margin-left: 0;
-    justify-content: flex-end;
   }
   .rt-presets {
     order: 0;
@@ -817,12 +830,14 @@
   .rt-routes {
     --rt-control-h: 36px;
   }
-  .rt-controls .rt-rows-toggle {
-    width: var(--rt-control-h);
-    padding: 0;
+  .rt-zoom button {
+    min-height: 36px;
   }
-  .rt-rows-toggle span {
+  .rt-rows-toggle .rt-rows-label {
     display: none;
+  }
+  .rt-rows-toggle .rt-rows-label-short {
+    display: inline;
   }
   .rt-stop {
     min-width: 44px;
@@ -1139,7 +1154,7 @@
   line-height: 1;
   white-space: nowrap;
 }
-.rt-focus-toggle[aria-pressed="true"] {
+.rt-focus-toggle:not(.rt-rows-toggle)[aria-pressed="true"] {
   background: var(--sidebar-active);
   color: var(--sidebar-active-foreground);
 }

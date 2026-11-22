@@ -1591,7 +1591,8 @@ export function TaskBoardRoutes({
             }}
           >
             {compact ? <Rows3Icon size={14} /> : <Rows4Icon size={14} />}
-            <span>{t("routes.rowsCompact")}</span>
+            <span className="rt-rows-label">{t("routes.rowsCompact")}</span>
+            <span className="rt-rows-label-short">{t("routes.rowsCompactShort")}</span>
           </button>
           <button
             type="button"
