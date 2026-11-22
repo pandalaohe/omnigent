@@ -209,9 +209,10 @@ class _StubResourceRegistry:
         resource_role: str | None = None,
         elevated: bool = False,
         origin: str = "harness",
+        agent_tier: Literal["off", "read", "read_write"] | None = None,
     ) -> SessionResourceView:
         """Return an auxiliary terminal resource view for a fake instance."""
-        del elevated, origin
+        del elevated, origin, agent_tier
         return await self._launch(
             session_id=session_id,
             terminal_name=terminal_name,

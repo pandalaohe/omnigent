@@ -141,13 +141,13 @@ async def test_create_pending_handle_returns_before_proxy_cap(
 ) -> None:
     from omnigent.runner import subagent_work, tool_dispatch
 
-    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_FINALIZE_TIMEOUT_S", 0.01, raising=False)
-    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_DELIVERY_TIMEOUT_S", 0.05, raising=False)
-    monkeypatch.setattr(tool_dispatch, "_INITIAL_MESSAGE_LABEL_RETRY_DELAY_S", 0.0, raising=False)
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_FINALIZE_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(tool_dispatch, "_INITIAL_MESSAGE_LABEL_RETRY_DELAY_S", 0.0)
     creates = 0
     label_attempts = 0
     labels: dict[str, str] = {}
-    delivered = asyncio.Event()
+    posted_input_ids: list[str] = []
+    outcome_attempts_done = asyncio.Event()
 
     async def api(request: httpx.Request) -> httpx.Response:
         nonlocal creates, label_attempts
@@ -155,23 +155,26 @@ async def test_create_pending_handle_returns_before_proxy_cap(
             return httpx.Response(200, json={"id": "proxy_parent", "labels": labels})
         if request.method == "PATCH":
             patch = json.loads(request.content).get("labels", {})
-            outcome = json.loads(patch.get("omnigent.initial_message", "{}"))
-            final = outcome.get("status") in {"sent", "failed"} or "detail" in outcome
-            if final:
+            initial_message = patch.get("omnigent.initial_message")
+            is_outcome = initial_message is not None and json.loads(initial_message) != {
+                "status": "pending"
+            }
+            if is_outcome:
                 label_attempts += 1
                 if label_attempts <= label_failures:
                     if label_attempts == 3:
-                        delivered.set()
+                        outcome_attempts_done.set()
                     return httpx.Response(503, text="label store unavailable")
             labels.update(patch)
-            if final:
-                delivered.set()
+            if is_outcome:
+                outcome_attempts_done.set()
             return httpx.Response(200, json={})
         if request.url.path == "/v1/sessions":
             creates += 1
             return httpx.Response(201, json={"id": "proxy_child"})
         read_budget = request.extensions["timeout"]["read"]
         assert read_budget is not None and read_budget >= DEFAULT_ASK_TIMEOUT
+        posted_input_ids.append(json.loads(request.content)["data"]["stable_id"])
         await asyncio.sleep(2.5)
         if message_status == "timeout":
             raise httpx.ReadTimeout("", request=request)
@@ -222,7 +225,7 @@ async def test_create_pending_handle_returns_before_proxy_cap(
                 assert info["conversation_id"] == "proxy_child"
                 assert info["initial_message"]["status"] == "pending"
                 assert creates == 1
-                await asyncio.wait_for(delivered.wait(), 5)
+                await asyncio.wait_for(outcome_attempts_done.wait(), 5)
                 status = json.loads(
                     await tool_dispatch.execute_tool(
                         tool_name="sys_session_get_info",
@@ -237,11 +240,14 @@ async def test_create_pending_handle_returns_before_proxy_cap(
                     else ("sent" if message_status == 202 else "failed")
                 )
                 assert status["initial_message"]["status"] == expected
+                assert len(posted_input_ids) == 1
+                assert posted_input_ids[0]
                 assert label_attempts == min(label_failures + 1, 3)
                 if label_failures == 3:
                     assert "Failed to record first-message outcome" in caplog.text
                 elif message_status == "timeout":
-                    assert "ReadTimeout" in status["initial_message"]["detail"]
+                    assert status["initial_message"]["error"] == "delivery_unknown"
+                    assert status["initial_message"]["input_id"] == posted_input_ids[0]
             finally:
                 subagent_work.unregister_subagent_work_for_session("proxy_child")
                 subagent_work.unregister_child_session("proxy_child")
