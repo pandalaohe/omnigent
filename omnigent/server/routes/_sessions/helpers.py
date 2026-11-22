@@ -30,7 +30,6 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from datetime import UTC
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, cast
@@ -6137,7 +6136,6 @@ class _RunnerForwardResult:
 
     status_code: int
     body: str
-    headers: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 def _require_external_status_forward(
@@ -9352,11 +9350,7 @@ async def _forward_session_change_to_runner_impl(
             resp.text,
             extra={"session_id": session_id},
         )
-    return _RunnerForwardResult(
-        status_code=resp.status_code,
-        body=resp.text,
-        headers={key.lower(): value for key, value in resp.headers.items()},
-    )
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:

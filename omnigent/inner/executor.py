@@ -229,9 +229,6 @@ class TurnComplete(ExecutorEvent):
     # A native terminal holds the claimed input this turn delivered, with
     # evidence of its submit; it may still queue it behind a running turn.
     input_received: bool = False
-    # Pinned native transcript position right before paste, when available.
-    native_session_id: str | None = None
-    transcript_byte_offset: int | None = None
 
 
 class ToolCallStatus(str, enum.Enum):

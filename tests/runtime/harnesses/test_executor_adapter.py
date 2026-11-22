@@ -4599,15 +4599,7 @@ async def test_turn_complete_input_receipt_reaches_response_completed(
     ctx = TurnContext(
         response_id="resp_paste", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
     )
-    adapter._translate_event(
-        TurnComplete(
-            response=None,
-            input_received=input_received,
-            native_session_id="native-1",
-            transcript_byte_offset=256,
-        ),
-        ctx,
-    )
+    adapter._translate_event(TurnComplete(response=None, input_received=input_received), ctx)
     run_task = asyncio.create_task(asyncio.sleep(0))
     await run_task
 
@@ -4617,5 +4609,3 @@ async def test_turn_complete_input_receipt_reaches_response_completed(
     assert payload["type"] == "response.completed"
     # Only a receipt the executor confirmed rides on the wire; none is omitted.
     assert payload.get("input_received") is (True if input_received else None)
-    assert payload.get("native_session_id") == ("native-1" if input_received else None)
-    assert payload.get("transcript_byte_offset") == (256 if input_received else None)

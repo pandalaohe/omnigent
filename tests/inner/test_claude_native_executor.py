@@ -2611,16 +2611,8 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
     assert mutations == ["paste"]
     if outcome in {"matching-hook", "transcript-and-prompt", "transcript-only", "queued-mid-turn"}:
         assert receipt_written and now < 3.0
-        # Claude's own record of the claimed paste is submit evidence, pinned
-        # to the pre-paste transcript boundary.
-        assert events == [
-            TurnComplete(
-                response=None,
-                input_received=True,
-                native_session_id=native_id,
-                transcript_byte_offset=0,
-            )
-        ]
+        # Claude's own record of the claimed paste is submit evidence.
+        assert events == [TurnComplete(response=None, input_received=True)]
         monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *_: None)
         # Same gate the runner uses for FIFO when the working pane cannot report its turn.
         assert claude_bridge.has_running_turn(

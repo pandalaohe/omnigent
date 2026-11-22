@@ -1623,12 +1623,6 @@ class ExecutorAdapter(HarnessApp):
                 ctx.provider_usage = event.usage
             if event.input_received:
                 ctx.input_received = True
-                if (
-                    event.native_session_id is not None
-                    and event.transcript_byte_offset is not None
-                ):
-                    ctx.input_native_session_id = event.native_session_id
-                    ctx.input_transcript_byte_offset = event.transcript_byte_offset
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

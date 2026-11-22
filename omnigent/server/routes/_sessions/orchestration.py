@@ -6054,8 +6054,6 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "interrupted_or_lifecycle"
     # Only the claiming attempt's own submit evidence marks the input received.
     input_received = event_type == "response.completed" and event.get("input_received") is True
-    raw_native_session_id = event.get("native_session_id") if input_received else None
-    raw_byte_offset = event.get("transcript_byte_offset") if input_received else None
     matched = pending_inputs.mark_lifecycle(
         session_id,
         stable_id if isinstance(stable_id, str) else None,
@@ -6069,12 +6067,6 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         native_turn_id=native_turn_id if isinstance(native_turn_id, str) else None,
         lifecycle_response_id=response_id if isinstance(response_id, str) else None,
         input_received=input_received,
-        native_session_id=(
-            raw_native_session_id if isinstance(raw_native_session_id, str) else None
-        ),
-        transcript_byte_offset=(
-            raw_byte_offset if type(raw_byte_offset) is int and raw_byte_offset >= 0 else None
-        ),
     )
     # The agent may hold a received input queued for a whole turn; stop showing it as sending.
     received = (
@@ -6355,141 +6347,6 @@ async def _settle_lost_runner_input(
     except asyncio.CancelledError:
         task.add_done_callback(lambda done: _log_detached_mirror_persist(session_id, done))
         raise
-
-
-_QUEUE_TAKEN_INPUT_MESSAGES = {
-    "native_input_returned_to_composer": (
-        "This message was returned to Claude's input box unread. It was not delivered."
-    ),
-}
-_RETURNED_INPUT_SETTLE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 15.0)
-
-
-async def _settle_inputs_taken_from_queue(
-    conversation_store: ConversationStore, session_id: str, pending_ids: list[str], code: str
-) -> list[str]:
-    """
-    Settle claimed inputs Claude took out of its queue unread as not delivered.
-
-    :returns: Ids still claimed because their settlement did not land, e.g.
-        after a transient store failure; a retry settles the same entries.
-    """
-    unsettled: list[str] = []
-    for pending_id in pending_ids:
-        settled = await _settle_lost_runner_input(
-            conversation_store,
-            session_id,
-            pending_id,
-            code,
-            claim_outcome=False,
-            reported_error=ErrorData(
-                source="execution", code=code, message=_QUEUE_TAKEN_INPUT_MESSAGES[code]
-            ),
-        )
-        if not settled and pending_inputs.runner_input_is_claimed(session_id, pending_id):
-            unsettled.append(pending_id)
-    return unsettled
-
-
-def _schedule_returned_input_settlement_retry(
-    conversation_store: ConversationStore,
-    session_id: str,
-    pending_ids: list[str],
-    code: str,
-) -> None:
-    """Retry a Stop-time returned-input settlement after a transient store error."""
-    if not pending_ids:
-        return
-
-    async def _retry() -> None:
-        remaining = list(pending_ids)
-        for delay_s in _RETURNED_INPUT_SETTLE_RETRY_DELAYS_S:
-            await asyncio.sleep(delay_s)
-            still_eligible = [
-                pending_id
-                for pending_id in remaining
-                if pending_inputs.is_returned_for_interrupt(session_id, pending_id)
-            ]
-            if not still_eligible:
-                return
-            remaining = await _settle_inputs_taken_from_queue(
-                conversation_store, session_id, still_eligible, code
-            )
-            if not remaining:
-                return
-
-    task = asyncio.create_task(_retry())
-    _runner_input_lease_tasks.add(task)
-
-    def _done(done: asyncio.Task[None]) -> None:
-        _runner_input_lease_tasks.discard(done)
-        if not done.cancelled() and done.exception() is not None:
-            _logger.warning(
-                "Returned-input settlement retry failed for session=%s: %r",
-                session_id,
-                done.exception(),
-                extra={"session_id": session_id},
-            )
-
-    task.add_done_callback(_done)
-
-
-async def _settle_queue_operations(
-    conversation_store: ConversationStore, session_id: str, data: Mapping[str, Any]
-) -> None:
-    """
-    Settle web inputs that Claude's transcript queue/interrupt records prove returned.
-
-    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload, and
-        ``INTERNAL_ERROR`` when a matched input could not be settled so the
-        forwarder retries the batch.
-    """
-    operations = data.get("operations")
-    if not isinstance(operations, list) or not all(
-        isinstance(operation, dict)
-        and isinstance(operation.get("operation"), str)
-        and isinstance(operation.get("content"), str)
-        and isinstance(operation.get("timestamp", ""), str)
-        and isinstance(operation.get("native_session_id", ""), str)
-        and (
-            "byte_offset" not in operation
-            or (type(operation.get("byte_offset")) is int and operation["byte_offset"] >= 0)
-        )
-        for operation in operations
-    ):
-        raise OmnigentError(
-            "external_queue_operations requires data.operations entries with string "
-            "operation, content, timestamp, native_session_id and non-negative int byte_offset",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    unsettled: list[str] = []
-    for operation in operations:
-        op_name = operation["operation"]
-        if op_name not in {"popAll", "enqueue", "interrupt"}:
-            continue
-        byte_offset = operation.get("byte_offset")
-        if type(byte_offset) is not int or byte_offset < 0:
-            continue
-        settle_ids = pending_inputs.apply_queue_operation(
-            session_id,
-            operation=op_name,
-            content=operation["content"],
-            timestamp=operation.get("timestamp", ""),
-            native_session_id=operation.get("native_session_id", ""),
-            byte_offset=byte_offset,
-        )
-        if settle_ids:
-            unsettled += await _settle_inputs_taken_from_queue(
-                conversation_store,
-                session_id,
-                settle_ids,
-                "native_input_returned_to_composer",
-            )
-    if unsettled:
-        raise OmnigentError(
-            "Could not record a message returned to Claude's input box; retry the record.",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
 
 
 _runner_input_lease_tasks: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
@@ -19342,9 +19199,6 @@ __all__ = [
     "_run_managed_wake",
     "_runner_reject_detail",
     "_schedule_deferred_elicitation_clear",
-    "_schedule_returned_input_settlement_retry",
-    "_settle_inputs_taken_from_queue",
-    "_settle_queue_operations",
     "_spawn_archive_fence",
     "_spawn_archive_stop",
     "_spawn_gateway_backed",

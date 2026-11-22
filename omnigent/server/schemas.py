@@ -5839,8 +5839,6 @@ class CompletedEvent(_SSEEventBase):
     type: Literal["response.completed"]
     response: ResponseObject
     input_received: bool | None = None
-    native_session_id: str | None = None
-    transcript_byte_offset: int | None = None
 
 
 class FailedEvent(_SSEEventBase):

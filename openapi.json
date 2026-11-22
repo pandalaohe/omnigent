@@ -4070,18 +4070,6 @@
             "description": "`True` when a native terminal holds the claimed input this turn delivered, with evidence of its submit; omitted otherwise.",
             "title": "Input Received"
           },
-          "native_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Native Session Id"
-          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"completed\"`."
@@ -4098,19 +4086,6 @@
             ],
             "default": null,
             "title": "Sequence Number"
-          },
-          "transcript_byte_offset": {
-            "anyOf": [
-              {
-                "format": "int64",
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Transcript Byte Offset"
           },
           "type": {
             "const": "response.completed",

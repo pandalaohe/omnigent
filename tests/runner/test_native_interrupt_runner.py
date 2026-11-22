@@ -1062,45 +1062,6 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
 
 
 @pytest.mark.asyncio
-async def test_claude_interrupt_attaches_transcript_boundary_headers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An active Claude interrupt returns the pre-interrupt transcript boundary on 204."""
-    import omnigent.harnesses.claude_native.bridge as claude_bridge
-    from omnigent.runner.native import interrupt as interrupt_mod
-
-    bridge_dir = tmp_path / "bridge"
-    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
-    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
-    bridge_dir.mkdir()
-    transcript = tmp_path / "native.jsonl"
-    line = '{"type":"user","sessionId":"native-1","message":{"role":"user","content":"hi"}}\n'
-    transcript.write_text(line, encoding="utf-8")
-    claude_bridge.record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "native-1",
-            "transcript_path": str(transcript),
-        },
-    )
-
-    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
-        return f"bid-{session_id}"
-
-    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
-    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda _bid: bridge_dir)
-    monkeypatch.setattr(claude_bridge, "inject_interrupt", lambda *_a, **_k: None)
-
-    runner, _captured = _make_runner()
-    resp = await runner.interrupt("claude-native", "conv_cl")
-
-    assert isinstance(resp, Response) and resp.status_code == 204
-    assert resp.headers["X-Omnigent-Native-Session-Id"] == "native-1"
-    assert resp.headers["X-Omnigent-Transcript-Byte-Offset"] == str(len(line.encode("utf-8")))
-
-
-@pytest.mark.asyncio
 async def test_claude_interrupt_skips_stale_stop_after_terminal_turns_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

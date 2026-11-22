@@ -791,7 +791,6 @@ class NativeInterruptRunner:
         """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
-            capture_transcript_boundary,
             has_pending_user_prompt,
             inject_interrupt,
         )
@@ -827,7 +826,6 @@ class NativeInterruptRunner:
                     status_code=200,
                     content={"interrupted": False, "reason": "idle"},
                 )
-        boundary = await asyncio.to_thread(capture_transcript_boundary, bridge_dir)
         try:
             await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
         except RuntimeError as exc:
@@ -841,11 +839,7 @@ class NativeInterruptRunner:
                 },
             )
         self._defer_parent_wake_after_native_interrupt(conv_id)
-        headers: dict[str, str] = {}
-        if boundary is not None:
-            headers["X-Omnigent-Native-Session-Id"] = boundary.native_session_id
-            headers["X-Omnigent-Transcript-Byte-Offset"] = str(boundary.byte_offset)
-        return Response(status_code=204, headers=headers)
+        return Response(status_code=204)
 
     def _is_pane_less_subagent_mirror(
         self, conv_id: str, *, bridge_id: str
