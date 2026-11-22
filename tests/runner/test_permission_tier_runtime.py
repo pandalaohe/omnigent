@@ -18,6 +18,7 @@ from omnigent.permission_tiers import (
     NativeSupport,
     NativeSupportStatus,
     PermissionTier,
+    Verdict,
 )
 from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
@@ -192,6 +193,84 @@ def _runtime(
     runtime._paths[state.session_id] = path
     runtime._harnesses[state.session_id] = "antigravity-native"
     return runtime
+
+
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
+def test_agy_schema_read_rechecks_advertisement_on_authorize(tmp_path, tier):
+    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+
+    runtime = _runtime(tmp_path, tier)
+    bridge_dir = tmp_path / "bridge"
+    schema = agy_gemini_dir(bridge_dir) / "antigravity-cli/mcp/omnigent/tracker__status.json"
+    schema.parent.mkdir(parents=True)
+    schema.write_text("{}")
+    manifest = bridge_dir / "tool_relay.json"
+    relay = {"session_id": "session-a", "permission_tiers_v1": True}
+    manifest.write_text(json.dumps({**relay, "tools": [{"name": "tracker__status"}]}))
+    binding, verdict = runtime.inspect(
+        "session-a",
+        call_id="agy-hook:read-schema",
+        name="view_file",
+        arguments={"AbsolutePath": str(schema)},
+        expected_revision=3,
+    )
+    assert verdict.action == Verdict.ALLOW
+    manifest.write_text(json.dumps({**relay, "tools": []}))
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["unadvertised", "bridge-state", "write", "edit", "delete", "traversal", "symlink"]
+)
+def test_agy_schema_read_does_not_expand_bridge_permissions(tmp_path, case):
+    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+
+    runtime = _runtime(tmp_path, "auto")
+    bridge_dir = tmp_path / "bridge"
+    schema = agy_gemini_dir(bridge_dir) / "antigravity-cli/mcp/omnigent/tracker__status.json"
+    schema.parent.mkdir(parents=True)
+    schema.write_text("{}")
+    (bridge_dir / "tool_relay.json").write_text(
+        json.dumps(
+            {
+                "session_id": "session-a",
+                "permission_tiers_v1": True,
+                "tools": [{"name": "tracker__status"}],
+            }
+        )
+    )
+    unadvertised = schema.with_name("stale.json")
+    unadvertised.write_text("{}")
+    (schema.parent / "nested").mkdir()
+    if case == "symlink":
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}")
+        schema.unlink()
+        schema.symlink_to(outside)
+    calls = {
+        "unadvertised": ("view_file", {"AbsolutePath": str(unadvertised)}),
+        "bridge-state": ("view_file", {"AbsolutePath": str(bridge_dir / "permission_state.json")}),
+        "write": ("write_file", {"Path": str(schema), "Content": "new"}),
+        "edit": ("edit_file", {"Path": str(schema), "Target": "{}", "Replacement": "new"}),
+        "delete": ("run_command", {"CommandLine": f'rm "{schema}"'}),
+        "traversal": (
+            "view_file",
+            {"AbsolutePath": str(schema.parent / "nested/.." / schema.name)},
+        ),
+        "symlink": ("view_file", {"AbsolutePath": str(schema)}),
+    }
+    name, arguments = calls[case]
+    _, verdict = runtime.inspect(
+        "session-a", call_id="agy-hook:bridge", name=name, arguments=arguments, expected_revision=3
+    )
+    assert verdict.action == Verdict.DENY
+    assert verdict.rule_id == "control-path"
 
 
 def test_stopped_agy_guard_cannot_receive_a_late_approval(tmp_path):

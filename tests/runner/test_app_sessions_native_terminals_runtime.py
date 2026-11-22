@@ -3871,8 +3871,10 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_parent", [False, True])
+@pytest.mark.parametrize("existing_home", [False, True], ids=["fresh-home", "existing-home"])
 async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     has_parent: bool,
+    existing_home: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3937,12 +3939,24 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     stale_bridge = bridge_mod.prepare_bridge_dir(session_id)
     write_agent_instructions_preamble(stale_bridge, "STALE-STARTUP")
+    iso_gemini = bridge_mod.agy_gemini_dir(stale_bridge)
+    settings = iso_gemini / "antigravity-cli" / "settings.json"
+    mcp_config = iso_gemini / "config" / "mcp_config.json"
+    user_permissions = {"allow": ["mcp(other/*)"], "deny": ["mcp(other/write)"]}
+    if existing_home:
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": user_permissions}))
+        mcp_config.parent.mkdir(parents=True)
+        mcp_config.write_text(
+            json.dumps({"mcpServers": {"omnigent": {"enabledTools": ["sys_list_models"]}}})
+        )
 
     captured_spec: dict[str, Any] = {}
 
     snapshot = {
         "workspace": str(tmp_path / "workspace"),
         "parent_session_id": "parent" if has_parent else None,
+        "labels": {"omnigent.mcp_service.tracker": "1", "invalid": 42},
     }
 
     class _SnapshotServerClient:
@@ -3993,17 +4007,15 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     text = (bridge_mod.agy_gemini_dir(bridge_dir) / "AGENTS.md").read_text()
     assert text.count(child_session_question_instruction(False)) == int(has_parent)
     assert read_agent_instructions_preamble(bridge_dir) is None
-    iso_home = bridge_mod.agy_home_dir(bridge_dir)
-    iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
 
     # 1) The relay starter was invoked for this session's bridge dir.
     assert len(relay_calls) == 1
     assert relay_calls[0]["session_id"] == session_id
     assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
     assert relay_calls[0]["await_notify"] is False
+    assert relay_calls[0]["session_labels"] == {"omnigent.mcp_service.tracker": "1"}
 
     # 2) The relay mcp_config.json landed in the ISOLATED agy HOME, not ~/.gemini.
-    mcp_config = iso_home / ".gemini" / "config" / "mcp_config.json"
     assert mcp_config.is_file()
     payload = json.loads(mcp_config.read_text(encoding="utf-8"))
     server = payload["mcpServers"]["omnigent"]
@@ -4014,7 +4026,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
         "serve-mcp",
     ]
     assert str(bridge_dir) in server["args"]
-    assert "sys_session_create" in server["enabledTools"]
+    assert "enabledTools" not in server
     # The bridge token the shared relay needs was written into the bridge dir.
     assert (bridge_dir / "bridge.json").is_file()
 
@@ -4024,16 +4036,17 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert "HOME" not in captured_spec["env"]
     assert captured_spec["env"]["AGY_ENV"] == "1"
 
-    # 4) The session workspace is pre-trusted AND the feedback survey is disabled
-    #    in the SAME isolated settings.json agy reads under --gemini_dir (#1598 +
-    #    #1494), proving the trust seed and the survey-disable compose in the
-    #    isolated dir without one clobbering the other (the rebase conflict point).
-    settings = iso_gemini / "antigravity-cli" / "settings.json"
+    # 4) Workspace trust, survey settings, and permissions compose in the isolated home.
     assert settings.is_file()
     settings_data = json.loads(settings.read_text(encoding="utf-8"))
     workspace_key = str((tmp_path / "workspace").resolve())
     assert workspace_key in settings_data.get("trustedWorkspaces", [])
     assert settings_data.get("showFeedbackSurvey") is False
+    assert settings_data["permissions"] == (
+        {**user_permissions, "allow": [*user_permissions["allow"], "mcp(omnigent/*)"]}
+        if existing_home
+        else {"allow": ["mcp(omnigent/*)"]}
+    )
 
 
 @pytest.mark.asyncio

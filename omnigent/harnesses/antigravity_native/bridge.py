@@ -338,88 +338,6 @@ _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_SERVER_NAME = "omnigent"
-# agy only exposes relay tools named in this per-server allowlist, so it must name
-# the whole native relay surface; a test keeps the two equal.
-_AGY_ENABLED_TOOLS = [
-    "ask_user_async",
-    "browser_click",
-    "browser_fill_saved_login",
-    "browser_navigate",
-    "browser_screenshot",
-    "browser_snapshot",
-    "browser_type",
-    "hindsight_recall",
-    "hindsight_reflect",
-    "hindsight_retain",
-    "list_comments",
-    "load_skill",
-    "open_in_panel",
-    "read_skill_file",
-    "sys_add_policy",
-    "sys_advise_models",
-    "sys_agent_download",
-    "sys_agent_get",
-    "sys_agent_list",
-    "sys_approval_answer",
-    "sys_call_async",
-    "sys_cancel_async",
-    "sys_cancel_task",
-    "sys_child_cap",
-    "sys_child_checkin",
-    "sys_flow_cancel",
-    "sys_flow_list",
-    "sys_flow_start",
-    "sys_host_load",
-    "sys_host_restart",
-    "sys_instruction_layer_update",
-    "sys_instruction_layers_read",
-    "sys_list_models",
-    "sys_os_edit",
-    "sys_os_read",
-    "sys_os_shell",
-    "sys_os_write",
-    "sys_policy_registry",
-    "sys_project_list",
-    "sys_project_settings_read",
-    "sys_project_settings_update",
-    "sys_quota_floor",
-    "sys_read_inbox",
-    "sys_scheduled_task_create",
-    "sys_scheduled_task_delete",
-    "sys_scheduled_task_list",
-    "sys_scheduled_task_update",
-    "sys_session_archive",
-    "sys_session_choice_read",
-    "sys_session_choice_update",
-    "sys_session_close",
-    "sys_session_create",
-    "sys_session_get_history",
-    "sys_session_get_info",
-    "sys_session_get_startup_observation_v1",
-    "sys_session_handover",
-    "sys_session_list",
-    "sys_session_message",
-    "sys_session_open",
-    "sys_session_rename",
-    "sys_session_send",
-    "sys_session_share",
-    "sys_session_unarchive",
-    "sys_session_update",
-    "sys_standing_approval",
-    "sys_standing_approval_read",
-    "sys_standing_pass",
-    "sys_terminal_close",
-    "sys_terminal_launch",
-    "sys_terminal_list",
-    "sys_terminal_read",
-    "sys_terminal_request_access",
-    "sys_terminal_send",
-    "sys_timer_cancel",
-    "sys_timer_set",
-    "ui_open_file",
-    "update_comment",
-]
-
 # Only account and installation markers are copied, never OAuth token files.
 # macOS/Windows use the OS keyring through the real HOME; Linux file-stored tokens
 # are not copied, so those sessions sign in on their own.
@@ -652,9 +570,9 @@ def build_mcp_config(
     """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
 
     Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.build_mcp_config`
-    but emits agy's per-server MCP schema (lowercase ``command`` / ``args`` /
-    ``env`` keys plus ``enabledTools``, agy's tool-exposure allowlist — verified
-    against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
+    but emits agy's ``command``, ``args``, and ``env`` under ``mcpServers``.
+    Omitting ``enabledTools`` leaves discovery to the relay's ``tools/list``.
+    :func:`apply_agy_permission_tier` grants the isolated MCP permission.
     The server command is the SAME shared relay claude/codex/cursor use:
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
@@ -685,7 +603,6 @@ def build_mcp_config(
                     "--bridge-dir",
                     str(bridge_dir),
                 ],
-                "enabledTools": list(_AGY_ENABLED_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                     # Pin the relay to the RUNNER's real home and data dir so its

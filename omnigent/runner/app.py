@@ -10535,15 +10535,8 @@ def create_runner_app(
                 await_notify=False,
             )
         elif harness_name == "antigravity-native":
-            from omnigent.harnesses.antigravity_native.bridge import (
-                AGY_PERMISSION_TIER_LABEL_KEY,
-                AGY_PERMISSION_TIERS,
-                ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-                reassert_agy_permission_tier,
-                write_mcp_bridge_config,
-            )
-            from omnigent.harnesses.antigravity_native.bridge import (
-                bridge_dir_for_bridge_id as antigravity_bridge_dir_for_id,
+            from omnigent.runner.native.orchestration import (
+                _ensure_antigravity_comment_relay,
             )
 
             antigravity_labels = await _session_labels_for_runner_spawn(
@@ -10551,23 +10544,8 @@ def create_runner_app(
                 session_id=conv,
                 required=True,
             )
-            antigravity_bid = antigravity_labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
-            antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
-            from omnigent.runner.native.orchestration import _AGY_CONFIRMED_PERMISSION_TIERS
-
-            # The confirmed record wins: a live switch or rollback can settle
-            # on a tier the create-time label never saw.
-            tier = _AGY_CONFIRMED_PERMISSION_TIERS.get(antigravity_bdir.resolve())
-            if tier is None:
-                label_tier = antigravity_labels.get(AGY_PERMISSION_TIER_LABEL_KEY)
-                tier = label_tier if label_tier in AGY_PERMISSION_TIERS else None
-            if tier is not None:
-                reassert_agy_permission_tier(antigravity_bdir, tier)
-            write_mcp_bridge_config(antigravity_bdir)
-            await _ensure_comment_relay_started(
-                conv,
-                explicit_bridge_dir=antigravity_bdir,
-                await_notify=False,
+            await _ensure_antigravity_comment_relay(
+                conv, antigravity_labels, _ensure_comment_relay_started
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (

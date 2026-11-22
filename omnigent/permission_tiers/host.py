@@ -149,6 +149,7 @@ def evaluate_host_tool(
     local_execution: bool = True,
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing",
     registry_tool_name: str | None = None,
+    readable_control_file: tuple[str, str] | None = None,
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
     try:
@@ -167,6 +168,7 @@ def evaluate_host_tool(
             local_execution=local_execution,
             agy_delegation_status=agy_delegation_status,
             registry_tool_name=registry_tool_name,
+            readable_control_file=readable_control_file,
         )
         intent = adapt_tool_call(name, arguments, context)
         return decide_tier(state.tier, intent, load_rules())

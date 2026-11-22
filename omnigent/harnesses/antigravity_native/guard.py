@@ -22,6 +22,7 @@ from omnigent.permission_tiers import (
     decide_tier,
     load_rules,
     normalize_permission_tier,
+    resolve_local_path,
 )
 from omnigent.permission_tiers.host import (
     HOST_PERMISSION_STATE_FILE,
@@ -214,13 +215,49 @@ def _delegated_bridge_call(payload: Mapping[str, object], relay: Mapping[str, ob
     args = _object(call.get("args"))
     if args.get("ServerName") != "omnigent":
         return False
-    tool = args.get("ToolName")
+    return _advertised_tool(relay, args.get("ToolName"))
+
+
+def _advertised_tool(relay: Mapping[str, object], tool: object) -> bool:
     tools = relay.get("tools")
     return (
         isinstance(tool, str)
         and isinstance(tools, list)
         and any(isinstance(entry, dict) and entry.get("name") == tool for entry in tools)
     )
+
+
+def relay_schema_read(
+    bridge_dir: Path,
+    state: HostPermissionState,
+    name: str,
+    arguments: Mapping[str, object],
+    *,
+    relay: Mapping[str, object] | None = None,
+) -> tuple[str, str] | None:
+    """Bind an agy native read to one advertised schema in this session's bridge."""
+    path_arg = {"view_file": "AbsolutePath", "read_file": "Path"}.get(name)
+    raw = arguments.get(path_arg) if path_arg else None
+    if not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    schema_subdir = Path("agy-home", ".gemini", "antigravity-cli", "mcp", "omnigent")
+    if path.suffix != ".json" or ".." in path.parts:
+        return None
+    try:
+        resolved_bridge = Path(resolve_local_path(str(bridge_dir)).path)
+        expected_parent = resolved_bridge / schema_subdir
+        if path.parent not in (bridge_dir / schema_subdir, expected_parent):
+            return None
+        resolved = resolve_local_path(raw)
+        if resolved.kind != "file" or Path(resolved.path) != expected_parent / path.name:
+            return None
+        manifest = _relay_config(bridge_dir, state) if relay is None else relay
+        if _advertised_tool(manifest, path.stem):
+            return str(bridge_dir), resolved.path
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -299,7 +336,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     *control_paths(tier_file.parent),
                 ),
             )
-            if _object(payload.get("toolCall")).get("name") == "invoke_subagent":
+            call = _object(payload.get("toolCall"))
+            name = call.get("name")
+            if isinstance(name, str):
+                context = replace(
+                    context,
+                    readable_control_file=relay_schema_read(
+                        tier_file.parent, state, name, _object(call.get("args")), relay=relay
+                    ),
+                )
+            if name == "invoke_subagent":
                 context = replace(
                     context, agy_delegation_status=delegation_status(tier_file.parent)
                 )

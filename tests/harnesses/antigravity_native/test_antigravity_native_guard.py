@@ -90,6 +90,42 @@ def test_control_writes_cannot_be_approved(state, tier):
     assert "[control-path]" in result["reason"]
 
 
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
+@pytest.mark.parametrize(
+    "read_tool,argument", [("view_file", "AbsolutePath"), ("read_file", "Path")]
+)
+def test_native_guard_leases_advertised_schema_read(
+    tmp_path, state, monkeypatch, capsys, tier, read_tool, argument
+):
+    from dataclasses import replace
+
+    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+
+    state = replace(state, tier=tier)
+    bridge_dir = tmp_path / "bridge"
+    schema = agy_gemini_dir(bridge_dir) / "antigravity-cli/mcp/omnigent/tracker__status.json"
+    schema.parent.mkdir(parents=True)
+    schema.write_text("{}")
+    tier_file = bridge_dir / "permission_tier"
+    tier_file.write_text(tier + "\n")
+    write_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE, state)
+    relay = {"tools": [{"name": "tracker__status"}]}
+    monkeypatch.setattr(guard, "_confirmed_relay", lambda *_: relay)
+    seen = []
+
+    def relay_post(_relay, route, event):
+        seen.append((route, event["event"]["data"]["arguments"]))
+        return {"result": "POLICY_ACTION_ALLOW"}
+
+    arguments = {argument: str(schema)}
+    request = {**payload(read_tool, arguments), "conversationId": "test-cascade", "stepIdx": 1}
+    monkeypatch.setattr(guard, "_relay_post", relay_post)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request)))
+    assert guard.main(["--tier-file", str(tier_file)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"decision": "allow"}
+    assert seen == [("/policies/evaluate", arguments)]
+
+
 def test_unknown_mcp_is_not_a_verified_bridge(state):
     call = payload(
         "call_mcp_tool", {"ServerName": "omnigent", "ToolName": "custom", "Arguments": {}}

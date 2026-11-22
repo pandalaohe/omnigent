@@ -38,6 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
+    native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
 from omnigent.runner.app_support import (
@@ -843,6 +844,13 @@ def register_resource_routes(
                 tmux_start_on_attach=bool(spec.get("tmux_start_on_attach", False)),
             )
         bridge_inject = bool(body.get("bridge_inject_dir"))
+        explicit_agy_launch = (
+            terminal_name == "antigravity"
+            and session_key == "main"
+            and bool(body.get("ensure_native_terminal"))
+            and bool(spec)
+            and not bridge_inject
+        )
         bridge_id = session_id
         # Set only when this launch installed the relay, so a failure rolls
         # back what it started and leaves a relay that was already serving
@@ -862,6 +870,37 @@ def register_resource_routes(
                 launched_relay = relay_after.relay
 
         try:
+            if explicit_agy_launch:
+                from omnigent.runner.native.orchestration import (
+                    _ensure_antigravity_comment_relay,
+                    _session_labels_for_runner_spawn,
+                )
+
+                if (
+                    agent_spec is None
+                    or native_coding_agent_for_harness(
+                        agent_spec.executor.config.get("harness") or agent_spec.executor.type
+                    )
+                    != _ensure_agent
+                ):
+                    raise ValueError("Antigravity terminal requires an Antigravity session")
+                try:
+                    labels = await _session_labels_for_runner_spawn(
+                        server_client=server_client, session_id=session_id, required=True
+                    )
+                except HTTPException as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code, content={"detail": exc.detail}
+                    )
+                relay_before = _session_comment_relays.get(session_id)
+                agy_bridge = await _ensure_antigravity_comment_relay(
+                    session_id, labels, _ensure_comment_relay_started, launch_args=env_spec.args
+                )
+                relay_after = _session_comment_relays.get(session_id)
+                if relay_after is None or relay_after.bridge_dir != agy_bridge:
+                    raise RuntimeError("Antigravity session relay is unavailable")
+                if relay_before is None or relay_before.relay is not relay_after.relay:
+                    launched_relay = relay_after.relay
             launch_method = (
                 resource_registry.launch_required_terminal
                 if bridge_inject

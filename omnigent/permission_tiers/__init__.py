@@ -121,6 +121,7 @@ class TrustedHostContext:
     local_execution: bool = True
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing"
     registry_tool_name: str | None = None
+    readable_control_file: tuple[str, str] | None = None  # (owning control, resolved file)
 
 
 @dataclass(frozen=True)
@@ -2542,6 +2543,12 @@ def _control_refusal(
     target = intent.target
     if intent.kind == ToolKind.READ and target is not None:
         recursive = intent.name in _RECURSIVE_READS
+        if (
+            not recursive
+            and target.kind == "file"
+            and context.readable_control_file == (original, target.path)
+        ):
+            return ""
         try:
             typed = _absolute(intent.target_text, context) if intent.target_text else ""
         except ValueError:

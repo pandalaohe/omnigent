@@ -1682,13 +1682,8 @@ async def _launch_antigravity_terminal(
         # metadata. None of that is owned by antigravity teardown, and
         # antigravity derives its working status from the RPC reader's
         # ``external_session_status`` edges, not PTY activity.
-        # ``ensure_native_terminal`` is allowlisted the same
-        # way but the runner's claude/codex ``ensure`` branches are gated on
-        # those terminal names, so for ``antigravity`` it falls through to the
-        # plain generic launch with no Claude side effects. The antigravity
-        # harness reads its bridge dir from its own spawn env
-        # (``build_antigravity_native_spawn_env``), so no terminal-launch bridge
-        # injection is needed.
+        # The runner prepares the session's labelled agy relay before launching
+        # this explicit spec. The CLI still owns the pane and its tmux metadata.
         "ensure_native_terminal": True,
     }
     resp = await client.post(
