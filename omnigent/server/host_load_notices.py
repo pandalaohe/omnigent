@@ -222,7 +222,7 @@ class HostLoadNotices:
         delivery.level, delivery.at, delivery.pending = level, now, False
         result = await asyncio.wait_for(
             self._post_event(
-                PeerSweeper._synthetic_request(parent_id, app),
+                PeerSweeper._synthetic_request(parent_id, app, runtime_notice=True),
                 parent_id,
                 SessionEventInput(
                     type="message",

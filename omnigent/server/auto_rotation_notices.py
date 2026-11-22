@@ -228,7 +228,7 @@ class AutoRotationNotices:
                     return
                 owner = await asyncio.to_thread(self._owner_for, fresh)
                 result = await self._post(
-                    PeerSweeper._synthetic_request(session_id, self._app),
+                    PeerSweeper._synthetic_request(session_id, self._app, runtime_notice=True),
                     session_id,
                     SessionEventInput(
                         type="message",
@@ -298,7 +298,7 @@ class AutoRotationNotices:
             return
         retry.prompted = True
         await self._post(
-            PeerSweeper._synthetic_request(session_id, self._app),
+            PeerSweeper._synthetic_request(session_id, self._app, runtime_notice=True),
             session_id,
             SessionEventInput(
                 type="message",

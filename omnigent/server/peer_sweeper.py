@@ -675,7 +675,7 @@ class PeerSweeper:
                 )
 
     @staticmethod
-    def _synthetic_request(session_id: str, app: Any) -> Request:
+    def _synthetic_request(session_id: str, app: Any, *, runtime_notice: bool = False) -> Request:
         """Build the one synthetic ``Request`` the events path needs.
 
         No inbound HTTP request drives a sweeper tick or a route-triggered
@@ -694,6 +694,7 @@ class PeerSweeper:
                 "root_path": "",
                 "client": None,
                 "server": None,
+                "state": {"runtime_notice": runtime_notice},
             }
         )
 

@@ -361,6 +361,7 @@ class _Entry:
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
+    runtime_notice: bool = False
     # Runner id that claimed this input; only its heartbeats renew a confirmed paste.
     runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
@@ -451,6 +452,7 @@ def record(
     auto_retry: AutoRetryMetadata | None = None,
     runner_managed: bool = False,
     peer_message_id: str | None = None,
+    runtime_notice: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -506,6 +508,7 @@ def record(
             auto_retry=auto_retry,
             last_runner_renewal=_now() if runner_managed else None,
             peer_message_id=peer_message_id,
+            runtime_notice=runtime_notice,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -924,6 +927,22 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         else:
             _settle_locked(conversation_id, entries, pending_id)
         return _drained_input(entry)
+
+
+def discard_refused_notice(conversation_id: str, pending_id: str, attempt_id: str) -> None:
+    """Retire the named server notice before its lease can create a send error."""
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        entry = entries.get(pending_id)
+        if (
+            entry is not None
+            and entry.runtime_notice
+            and entry.delivery_attempt_id == attempt_id
+            and not entry.held
+            and entry.runner_claim_id is None
+            and not entry.agent_received
+        ):
+            _settle_locked(conversation_id, entries, pending_id)
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:

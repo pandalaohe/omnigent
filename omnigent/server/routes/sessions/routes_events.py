@@ -2233,6 +2233,7 @@ def register_events_routes(
                 "input_generation",
                 "_input_admission_required",
                 "_final_wake",
+                "_runtime_notice",
                 "input_admission_deadline",
             ):
                 body.data.pop(key, None)
@@ -2253,6 +2254,10 @@ def register_events_routes(
                 request.app.state, "subagent_retry_admission", None
             ) is not None:
                 body.data["_input_admission_required"] = True
+                if isinstance(request, Request) and getattr(
+                    request.state, "runtime_notice", False
+                ):
+                    body.data["_runtime_notice"] = True
         opens_codex_side_chat = body.type == "message" and await _opens_codex_side_chat(conv, body)
         if (
             body.type == "message"
@@ -6572,7 +6577,7 @@ def register_events_routes(
             )
             if harness not in {"claude-native", "codex-native", "pi-native"}:
                 payload = result.receipt.payload["data"]
-                await asyncio.to_thread(
+                persisted = await asyncio.to_thread(
                     conversation_store.append,
                     session_id,
                     [
@@ -6584,6 +6589,8 @@ def register_events_routes(
                         )
                     ],
                 )
+                if not persisted[0].deduplicated:
+                    _publish_input_consumed(session_id, persisted[0])
         return result
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)

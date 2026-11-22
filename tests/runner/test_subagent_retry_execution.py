@@ -5,6 +5,7 @@ import contextlib
 import json
 import threading
 import time
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
@@ -231,6 +232,34 @@ async def test_native_definite_refusal_finalizes_once_without_attempt(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_retry_input_consumed_requires_final_admission(db_uri):
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.stores.test_subagent_retry_execution import _prepared
+    from tests.stores.test_subagent_retry_store import _journal
+
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+    journal.conversations.update_conversation(journal.child, harness_override="claude-sdk")
+    _, claim = _prepared(journal)
+    with patch("omnigent.runtime.session_stream.publish") as publish:
+        async with _receiver(journal, True) as (receive, _):
+            wrong = claim.model_copy(update={"input_id": uuid4().hex})
+            assert (await receive(wrong)).state == "refused"
+            assert journal.conversations.list_items(journal.child).data == []
+            assert not any(
+                call.args[1]["type"] == "session.input.consumed" for call in publish.call_args_list
+            )
+            assert (await receive(claim)).state == "accepted"
+            assert (await receive(claim)).state == "accepted"
+        consumed = [
+            event["data"]["item_id"]
+            for (_, event), _ in publish.call_args_list
+            if event["type"] == "session.input.consumed"
+        ]
+        assert consumed == [claim.input_id]
+    assert len(journal.conversations.list_items(journal.child).data) == 1
 
 
 @pytest.mark.asyncio
@@ -479,11 +508,11 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
-@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize("opening", ["accepted", "notice", "sender"])
 # A steered input's refusal in the same response must not change the opener's outcome.
 @pytest.mark.parametrize("steered", [False, True])
 async def test_refused_turn_input_ends_turn_without_failure_or_result(
-    monkeypatch, native, accepted, steered
+    monkeypatch, native, opening, steered
 ):
     from omnigent.runner import app as runner_app
     from omnigent.runner.subagent_work import _SubagentDeliveryAck
@@ -508,7 +537,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             if url.endswith("/input-admission"):
                 receipt = (
                     InputExecutionReceipt(state="accepted", reason="accepted")
-                    if accepted
+                    if opening == "accepted"
                     else InputExecutionReceipt(reason="input_closed")
                 )
                 return httpx.Response(
@@ -523,6 +552,16 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
     steer = InputExecutionClaimEvent(
         claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
     )
+    status = "failed" if opening == "sender" else "completed"
+    terminal = {
+        "type": f"response.{status}",
+        "response": {"id": "resp_multiturn", "status": status},
+    }
+    if opening == "sender":
+        terminal["response"]["error"] = {
+            "code": "RuntimeError",
+            "message": "Input execution admission refused",
+        }
     frames = [
         'event: response.created\ndata: {"type":"response.created",'
         '"response":{"id":"resp_multiturn"}}\n\n',
@@ -532,8 +571,7 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
             if steered
             else []
         ),
-        'event: response.completed\ndata: {"type":"response.completed",'
-        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
+        f"event: response.{status}\ndata: {json.dumps(terminal)}\n\n",
     ]
     harness = _ScriptedHarnessClient(frames)
     app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
@@ -548,23 +586,142 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
                 "input_id": input_id,
                 "input_admission_required": True,
                 "input_admission_deadline": deadline,
+                **({"stable_id": input_id} if opening == "sender" else {}),
             },
         )
+        if opening != "accepted":
+            harness._sse_frames = _sse_text_turn("accepted")
+            await client.post(
+                f"/v1/sessions/{session_id}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "test",
+                    "content": [{"type": "input_text", "text": "legal follow-up"}],
+                },
+            )
+            assert "[System: host load] notice" not in json.dumps(harness.posted_bodies[-1])
     assert response.status_code == 200
     queue = app.state.session_event_queues.get(session_id)
-    statuses = []
+    statuses, skips = [], []
     while queue is not None and not queue.empty():
         published = queue.get_nowait()
         if published.get("type") == "session.status":
             statuses.append(published.get("status"))
+        if published.get("input_execution_skipped"):
+            skips.append(published["input_execution_skipped"])
     assert "failed" not in statuses
     if not native:
         assert statuses[-1:] == ["idle"]
-    if accepted:
-        assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
-    else:
-        assert (started, terminals) == ([], [])
+    assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
+    assert skips == ([] if opening == "accepted" else ["refused"])
     assert app.state.refused_turn_inputs == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "same_attempt", "outcome"),
+    [
+        ("input_closed", True, "refused"),
+        ("input_expired", True, "unknown"),
+        ("input_identity_conflict", True, "unknown"),
+        ("input_closed", False, "unknown"),
+    ],
+)
+async def test_pi_peer_admission_reports_only_its_own_proven_refusal(
+    reason, same_attempt, outcome
+):
+    deadline = time.time() + 30
+    peer_id, attempt_id = uuid4().hex, uuid4().hex
+    input_id = attempt_id if same_attempt else uuid4().hex
+    session_id = f"child-{attempt_id}"
+    claim = InputExecutionClaimEvent(
+        claim_id="claim",
+        claim=InputExecutionClaim(
+            input_id=input_id, turn_id="resp_peer", admission_deadline=deadline
+        ),
+    )
+    receipt = asyncio.Future()
+    exits = []
+    closed = (
+        RetryInput(
+            input_id=input_id,
+            chain_id=None,
+            target_id=session_id,
+            kind="human",
+            attempt=0,
+            state="closed",
+            payload={},
+            version=0,
+            turn_id="resp_peer",
+            input_generation=None,
+            reason={"code": "acceptance_unknown"},
+        )
+        if reason == "input_closed"
+        else None
+    )
+
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/input-admission"):
+                return httpx.Response(
+                    200,
+                    json=InputExecutionReceipt(reason=reason, receipt=closed).model_dump(),
+                    request=httpx.Request("POST", "http://server" + url),
+                )
+            body = kwargs.get("json", {})
+            if body.get("type") == "sdk_peer_delivery_receipt" and not receipt.done():
+                receipt.set_result(body["data"])
+            if body.get("type") == "external_session_status":
+                exits.append(body)
+            return await super().post(url, **kwargs)
+
+    frames = [
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_peer"}}\n\n',
+        f"event: input.execution.claim\ndata: {claim.model_dump_json()}\n\n",
+        'event: response.failed\ndata: {"type":"response.failed",'
+        '"response":{"id":"resp_peer","status":"failed",'
+        '"error":{"code":"RuntimeError","message":"Input execution admission refused"}}}\n\n',
+    ]
+    harness = _ScriptedHarnessClient(_sse_text_turn("ready"))
+    app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
+    async with _runner_test_client(app) as client:
+        ready = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "harness_override": "pi",
+                "content": [{"type": "input_text", "text": "start Pi"}],
+            },
+        )
+        assert ready.status_code == 200, ready.text
+        harness._sse_frames = frames
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "harness_override": "pi",
+                "content": [{"type": "input_text", "text": "peer input"}],
+                "input_id": input_id,
+                "input_admission_required": True,
+                "input_admission_deadline": deadline,
+                "peer_delivery": {"peer_id": peer_id, "attempt_id": attempt_id},
+                "peer_delivery_start": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        result = await asyncio.wait_for(receipt, timeout=2)
+    assert (result["peer_id"], result["attempt_id"], result["outcome"]) == (
+        peer_id,
+        attempt_id,
+        outcome,
+    )
+    assert exits == []
 
 
 @pytest.mark.asyncio
@@ -608,7 +765,7 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
     # A newer turn's marker, recorded before this older stream ends.
     app.state.refused_turn_inputs.add(newer)
     async with _runner_test_client(app) as client:
-        await client.post(
+        response = await client.post(
             f"/v1/sessions/{session_id}/events?stream=true",
             json={
                 "type": "message",
@@ -621,6 +778,8 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
             },
         )
     assert app.state.refused_turn_inputs == {newer}
+    assert '"input_execution_skipped": "refused"' in response.text
+    assert "response.failed" not in response.text
 
 
 @pytest.mark.asyncio
