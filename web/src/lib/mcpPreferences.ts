@@ -1,16 +1,16 @@
 // Browser preference shared with managed deployments; stores service names, never credentials.
 const STORAGE_KEY = "omnigent:last-mcp-services";
 
-export function readLastMcpServices(): string[] {
-  if (typeof window === "undefined") return [];
+export function readLastMcpServices(): string[] | undefined {
+  if (typeof window === "undefined") return undefined;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
+    if (!raw) return undefined;
     const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
+    if (!Array.isArray(parsed)) return undefined;
     return parsed.filter((v): v is string => typeof v === "string");
   } catch {
-    return [];
+    return undefined;
   }
 }
 

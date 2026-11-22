@@ -29,7 +29,12 @@ export function McpRegistryLaunchPicker({
     },
     [onAuthorizingChange],
   );
-  const selectedServices = catalog.services.filter((service) => selected.includes(service.id));
+  const selectedServices = catalog.services.filter(
+    (service) =>
+      selected.includes(service.id) &&
+      service.status !== "unavailable" &&
+      (service.auth !== "env" || service.connected),
+  );
   const selectedCount =
     catalog.loading || catalog.error ? selected.length : selectedServices.length;
   const needsSignInCount = selectedServices.filter((service) => !service.connected).length;
@@ -74,8 +79,7 @@ export function McpRegistryLaunchPicker({
         <div className="shrink-0 border-b border-border px-3 py-2.5">
           <h3 className="text-sm font-medium">Tools for this session</h3>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Turn on the server-configured MCP services this session should use. You’ll be asked to
-            sign in when needed.
+            Choose which MCP services this session uses. You’ll be asked to sign in when needed.
           </p>
         </div>
         <McpRegistryPicker

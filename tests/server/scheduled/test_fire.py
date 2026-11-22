@@ -34,6 +34,7 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
+from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
     worktree_root_fingerprint,
@@ -54,6 +55,7 @@ from omnigent.server.scheduled.source_session import (
     run_prompt_text,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
@@ -3254,6 +3256,48 @@ async def test_continue_without_a_session_creates_one_and_keeps_it() -> None:
     [(task_id, session_id)] = store.adopted
     assert task_id == "task_1"
     assert [conv.id for conv in launched] == [session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_agent", [None, "ag_1", "ag_source"])
+async def test_fired_session_resolves_defaults_only_for_a_new_agent(
+    source_agent: str | None,
+) -> None:
+    registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://mcp.example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    allowed_users=["owner"],
+                )
+            ],
+            default_services=["tracker"],
+        ),
+        None,
+    )
+    source = _FakeConversation(
+        id="conv_source", agent_id=source_agent or "ag_1", labels={"omnigent.mcp_service.old": "0"}
+    )
+    conv_store = _ExistingConversationStore(source)
+    task = _task(user_id="owner", source_session_id=source.id if source_agent else None)
+    cache = Mock(load=Mock(return_value=SimpleNamespace(spec=AgentSpec(spec_version=1))))
+    deps = _deps(FakeScheduledTaskStore(), conversation_store=conv_store, agent_cache=cache)
+    deps.app_state = SimpleNamespace(mcp_registry=registry)
+
+    await fire_mod._create_session_resources(deps, task, labels={})
+
+    if source_agent is None:
+        assert conv_store.created[0]["labels"]["omnigent.mcp_service.tracker"] == "1"
+    else:
+        (fork,) = conv_store.forked
+        assert ("omnigent.mcp_service.old" in fork["dropped_label_keys"]) is (
+            source_agent != "ag_1"
+        )
+        assert ("omnigent.mcp_service.tracker" in fork["extra_labels"]) is (source_agent != "ag_1")
 
 
 @pytest.mark.asyncio

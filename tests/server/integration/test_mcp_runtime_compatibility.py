@@ -29,9 +29,18 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("upload", [False, True])
-@pytest.mark.parametrize("capable,selected", [(False, True), (False, False), (True, True)])
+@pytest.mark.parametrize(
+    "capable,selection",
+    [
+        (False, "explicit"),
+        (False, "none"),
+        (True, "explicit"),
+        (False, "default"),
+        (True, "default"),
+    ],
+)
 async def test_create_checks_host_before_persistence(
-    client, app, launch_registry, register_worktree_host, monkeypatch, upload, capable, selected
+    client, app, launch_registry, register_worktree_host, monkeypatch, upload, capable, selection
 ):
     capture = register_worktree_host(capabilities=[CAP_MCP_REGISTRY] if capable else [])
     source = await create_test_session(client)
@@ -41,8 +50,10 @@ async def test_create_checks_host_before_persistence(
     metadata = {
         "host_id": _HOST_ID,
         "workspace": _SOURCE_REPO,
-        "mcp_registry_services": ["tracker"] if selected else [],
     }
+    launch_registry.config.default_services = ["tracker"]
+    if selection != "default":
+        metadata["mcp_registry_services"] = ["tracker"] if selection == "explicit" else []
     if not upload:
         metadata["git"] = {"branch_name": "registry-check"}
     if upload:
@@ -55,7 +66,7 @@ async def test_create_checks_host_before_persistence(
         response = await client.post(
             "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
         )
-    if selected and not capable:
+    if selection == "explicit" and not capable:
         assert response.status_code == 503, response.text
         assert response.json()["error"]["code"] == ErrorCode.RUNNER_CAPABILITY_MISMATCH
         assert "restart the host and session runner" in response.text
@@ -65,6 +76,11 @@ async def test_create_checks_host_before_persistence(
     else:
         assert response.status_code == 201, response.text
         assert len(capture.launches) == 1
+        session_id = response.json()["session_id" if upload else "id"]
+        labels = store.get_conversation(session_id).labels
+        assert (labels.get("omnigent.mcp_service.tracker") == "1") is (
+            capable and selection != "none"
+        )
 
 
 async def test_reconnect_refuses_before_changing_binding(

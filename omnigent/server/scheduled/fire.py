@@ -1785,6 +1785,8 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
         master=await load_master(task.user_id, deps.preferences_store, warnings=warnings),
         preferences_store=deps.preferences_store,
         catalog_store=deps.catalog_store,
+        mcp_registry=getattr(deps.app_state, "mcp_registry", None),
+        host_registry=deps.host_registry,
     )
     conv: Conversation | None = await asyncio.to_thread(
         deps.conversation_store.get_conversation, result.session_id
@@ -2061,6 +2063,22 @@ async def _create_session_resources(
             launch_args = _validate_terminal_launch_args(launch_args)
     workspace = task.workspace
     labels = {**labels, **permission_labels}
+    registry = getattr(deps.app_state, "mcp_registry", None)
+    if (
+        registry is not None
+        and registry.config.default_services
+        and not library_agent
+        and task.source_session_id is None
+    ):
+        from omnigent.server.session_mcp_selection import select_default_mcp_for_agent
+
+        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        selection = await select_default_mcp_for_agent(
+            registry, agent, deps.agent_cache, task.user_id
+        )
+        labels.update(
+            selection.for_runtime(host_id=task.host_id, host_registry=deps.host_registry).labels
+        )
     worktree = None
     if task.base_branch is not None:
         if task.execution_target != "connected_host" or not task.host_id or not workspace:
@@ -2216,6 +2234,15 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
+    if agent_changed:
+        from omnigent.server.session_mcp_selection import select_default_mcp_for_agent
+
+        selection = await select_default_mcp_for_agent(
+            getattr(deps.app_state, "mcp_registry", None), agent, deps.agent_cache, task.user_id
+        )
+        labels.update(
+            selection.for_runtime(host_id=task.host_id, host_registry=deps.host_registry).labels
+        )
     if source is not None:
         source_agent = (
             agent

@@ -7,8 +7,8 @@ afterEach(() => {
 });
 
 describe("mcpPreferences", () => {
-  it("returns an empty array when nothing is stored", () => {
-    expect(readLastMcpServices()).toEqual([]);
+  it("returns undefined when nothing is stored", () => {
+    expect(readLastMcpServices()).toBeUndefined();
   });
 
   it("round-trips a written selection", () => {
@@ -28,14 +28,14 @@ describe("mcpPreferences", () => {
     expect(readLastMcpServices()).toEqual(["system.ai.slack"]);
   });
 
-  it("treats a non-array JSON value as empty", () => {
+  it("treats a non-array JSON value as unset", () => {
     localStorage.setItem("omnigent:last-mcp-services", JSON.stringify({ foo: "bar" }));
-    expect(readLastMcpServices()).toEqual([]);
+    expect(readLastMcpServices()).toBeUndefined();
   });
 
-  it("treats malformed JSON as empty", () => {
+  it("treats malformed JSON as unset", () => {
     localStorage.setItem("omnigent:last-mcp-services", "not json");
-    expect(readLastMcpServices()).toEqual([]);
+    expect(readLastMcpServices()).toBeUndefined();
   });
 
   it("filters out non-string entries", () => {
@@ -54,6 +54,6 @@ describe("mcpPreferences", () => {
       throw new Error("access denied");
     });
     expect(() => writeLastMcpServices(["system.ai.github"])).not.toThrow();
-    expect(readLastMcpServices()).toEqual([]);
+    expect(readLastMcpServices()).toBeUndefined();
   });
 });

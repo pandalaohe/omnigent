@@ -344,6 +344,8 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
     client: httpx.AsyncClient, library_server: _LibraryServer
 ) -> None:
     """A ``ca_`` fire copies the bundle into an ``ag_`` agent with the overrides."""
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+
     agent_id = await _create_agent(client)
     task_id = await _create_library_task(
         client,
@@ -357,7 +359,25 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
     async def _dispatch(conv: Any, task: Any) -> None:
         dispatched.append(conv)
 
-    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=_dispatch)
+    deps = _fire_deps(library_server)
+    deps.app_state = library_server.app.state
+    deps.app_state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    allowed_users=[_OWNER],
+                )
+            ],
+            default_services=["tracker"],
+        ),
+        None,
+    )
+    on_fire = build_on_fire(deps, launch_dispatch=_dispatch)
     await on_fire(0, task_id)
     await _drain()
 
@@ -371,6 +391,8 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
     session = library_server.conversations.get_conversation(conv.id)
     assert session is not None
     assert session.labels[_TEMPLATE_LABEL] == agent_id
+    assert conv.labels["omnigent.mcp_service.tracker"] == "1"
+    assert session.labels["omnigent.mcp_service.tracker"] == "1"
     assert session.labels["omnigent.ui"] == "terminal"
     assert session.model_override == "model-one"
     assert session.reasoning_effort == "high"

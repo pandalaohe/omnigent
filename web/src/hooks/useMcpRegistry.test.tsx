@@ -1,7 +1,8 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { authorizeRegistryService, type RegistryService } from "@/lib/mcpRegistry";
-import { useRegistrySignIn } from "./useMcpRegistry";
+import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+import { useMcpRegistrySelection, useRegistrySignIn } from "./useMcpRegistry";
 
 vi.mock("@/lib/mcpRegistry", () => ({
   registryRequest: vi.fn(),
@@ -23,6 +24,34 @@ const wiki: RegistryService = {
   title: "Wiki",
   connect_provider: "mcp-wiki",
 };
+
+describe("useMcpRegistrySelection", () => {
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it.each(["remembered", "draft"])(
+    "excludes an unavailable env selection from a %s launch",
+    async (source) => {
+      const previousSelection = ["wiki"];
+      if (source === "remembered") writeLastMcpServices(previousSelection);
+      vi.mocked(registryRequest).mockResolvedValue({
+        data: [{ ...wiki, auth: "env", status: "unavailable", connect_provider: null }, tracker],
+      });
+      const { result } = renderHook(() =>
+        useMcpRegistrySelection(source === "draft" ? previousSelection : undefined, true),
+      );
+      await waitFor(() => expect(result.current.catalog.loading).toBe(false));
+      expect(result.current.selectionError).toBeNull();
+      expect(result.current.selected).toEqual(previousSelection);
+      expect(result.current.servicesForLaunch).toEqual([]);
+      act(() => result.current.toggle("wiki", false));
+      expect(result.current.selected).toEqual([]);
+      expect(readLastMcpServices()).toEqual([]);
+    },
+  );
+});
 
 /** A popup that resolves when the test says so and, like the real one, rejects on abort. */
 function pendingPopup() {

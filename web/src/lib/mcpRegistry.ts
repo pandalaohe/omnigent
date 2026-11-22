@@ -4,12 +4,14 @@ import { databricksConnectUrl } from "./databricksIntegration";
 
 export interface RegistryService {
   id: string;
+  default?: boolean;
   title: string;
   description: string;
-  auth: "none" | "bearer" | "oauth" | "github" | "databricks";
+  auth: "none" | "bearer" | "oauth" | "github" | "databricks" | "env";
   connected: boolean;
+  status?: "configured" | "unavailable";
   tools: string[];
-  connect_provider: string;
+  connect_provider: string | null;
 }
 
 export async function registryRequest<T>(path = "", init?: RequestInit): Promise<T> {
@@ -26,6 +28,10 @@ export function authorizeRegistryService(
   signal: AbortSignal,
   workspace?: string,
 ) {
+  const provider = service.connect_provider;
+  if (service.auth === "env" || provider === null) {
+    return Promise.reject(new Error("This MCP service is configured by your server operator."));
+  }
   if (service.auth === "databricks" && !workspace?.trim()) {
     return Promise.reject(new Error("Enter your Databricks workspace URL."));
   }
@@ -34,7 +40,7 @@ export function authorizeRegistryService(
     service.auth === "databricks"
       ? databricksConnectUrl(workspace!.trim(), returnTo)
       : withBasePath(
-          `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
+          `/v1/connections/${encodeURIComponent(provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
         );
   const popup = window.open("about:blank", "_blank", "popup,width=600,height=720");
   if (!popup) return Promise.reject(new Error("Allow pop-ups to connect this account."));
@@ -59,7 +65,7 @@ export function authorizeRegistryService(
       try {
         const location = new URL(popup.location.href);
         if (location.origin !== window.location.origin || location.pathname !== returnTo) return;
-        const status = location.searchParams.get(service.connect_provider);
+        const status = location.searchParams.get(provider);
         if (status === "connected") finish();
         else if (status === "error") finish("Sign-in failed. Please try again.");
       } catch {
