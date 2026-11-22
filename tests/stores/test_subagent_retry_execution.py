@@ -685,7 +685,11 @@ async def test_actual_scaffold_parks_at_receipt_before_calling_the_executor(acce
     task = asyncio.create_task(
         harness._guarded_run_turn(
             CreateResponseRequest(
-                model="test", input=[], input_id="input", input_admission_required=True
+                model="test",
+                input=[],
+                input_id="input",
+                input_stable_id="sender-input",
+                input_admission_required=True,
             ),
             ctx,
         )
