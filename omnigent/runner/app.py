@@ -8197,13 +8197,15 @@ def create_runner_app(
             input_box_reads_clear,
         )
 
-        if has_unrecognized_protected_draft(bridge_dir):
+        if has_pending_user_prompt(bridge_dir):
+            return True
+        if has_unrecognized_protected_draft(bridge_dir) and not claude_pane_ready(
+            bridge_dir, require_empty=True
+        ):
             # The bridge already knows the same pane holds an unconfirmed paste.
             # Let its normal undelivered refusal settle this input instead of
             # leaving it in the ordinary busy-pane queue.
             return False
-        if has_pending_user_prompt(bridge_dir):
-            return True
         # Claude Code runs a queued slash command only at turn end, after the bridge
         # stops watching for "Unknown command"; a guessed skill waits for an idle pane.
         # An unknown turn state does not hold it, so an idle pane is never blocked.

@@ -5696,14 +5696,27 @@ def _inject_user_message(
             delivery_diagnostics.record_details(verification="native_recorded")
             return True
         if isinstance(exc, _ClaudeUnrecognizedDraftUnconfirmed) and receipt is None:
-            _set_protected_draft(
-                bridge_dir,
-                owner.socket_path,
-                owner.tmux_target,
-                protect=True,
-                unrecognized=True,
-                check_owner=owner.check_owner,
-            )
+            try:
+                still_unconfirmed = _set_protected_draft(
+                    bridge_dir,
+                    owner.socket_path,
+                    owner.tmux_target,
+                    protect=True,
+                    unrecognized=True,
+                    check_owner=owner.check_owner,
+                    receipt_check=owner.read_receipt,
+                )
+            except OSError:
+                delivery_diagnostics.record_details(unrecognized_draft_marker_write_failed=True)
+                _logger.warning(
+                    "Could not persist the unrecognized Claude draft marker",
+                    exc_info=True,
+                )
+            else:
+                if not still_unconfirmed:
+                    _record_accepted_input(bridge_dir, owner.check_owner)
+                    delivery_diagnostics.record_details(verification="native_recorded")
+                    return True
         if isinstance(exc, ClaudeDeliveryUnconfirmed):
             raise
         detail = (
@@ -9229,13 +9242,17 @@ def _set_protected_draft(
     protect: bool,
     unrecognized: bool = False,
     check_owner: Callable[[], None] | None = None,
-) -> None:
+    receipt_check: Callable[[], bool | None] | None = None,
+) -> bool:
+    """Persist a draft fence unless a matching receipt wins the metadata lock."""
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
     with _bridge_metadata_write_lock(bridge_dir):
         if check_owner is not None:
             check_owner()
+        if receipt_check is not None and receipt_check() is True:
+            return False
         if _tmux_input_identity(bridge_dir) != identity:
-            return
+            return True
         state = _read_json_file(bridge_dir / _STATE_FILE)
         if protect:
             key = "unrecognized_draft_tmux" if unrecognized else "protected_draft_tmux"
@@ -9244,6 +9261,7 @@ def _set_protected_draft(
             state.pop("protected_draft_tmux", None)
             state.pop("unrecognized_draft_tmux", None)
         _write_json_file(bridge_dir / _STATE_FILE, state)
+    return True
 
 
 def has_unrecognized_protected_draft(bridge_dir: Path) -> bool:
@@ -9265,7 +9283,7 @@ def _require_protected_draft_clear(
     if pane is None:
         pane = _capture_pane(socket_path, tmux_target)
     if not _chat_composer_empty(pane):
-        if not clipped:
+        if unrecognized:
             # Unlike an ordinary clipped draft, this refusal must bypass the executor's hold.
             raise ClaudeMessageNotAccepted(
                 "Claude Code may still have a draft from the previous send. The message was "
@@ -9969,6 +9987,8 @@ def _wait_for_claude_prompt_ready(
         tall_draft = _occupied_tall_draft(pane)
         if tall_draft and not waited_on_tall_draft and bridge_dir is not None:
             # A torn capture during resize must not erase evidence of an occupied composer.
+            if has_unrecognized_protected_draft(bridge_dir):
+                _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
             _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
         if _claude_prompt_rendered(pane) and not tall_draft:
             if bridge_dir is not None:

@@ -7529,6 +7529,91 @@ def test_late_receipt_does_not_leave_an_unrecognized_draft_marker(
     assert mutations == ["paste"]
 
 
+def test_hook_receipt_while_marker_writer_waits_for_lock_confirms_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker decision re-reads a hook receipt under the metadata lock."""
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    bridge_dir, mutations, clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: pane,
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+        },
+    )
+    final_receipt_read = threading.Event()
+    hook_holds_lock = threading.Event()
+    release_hook = threading.Event()
+    marker_started = threading.Event()
+    hook_errors: list[BaseException] = []
+    original_read_receipt = bridge._MessagePane.read_receipt
+    original_write_json = bridge._write_json_file
+    original_set_protected = bridge._set_protected_draft
+
+    def read_receipt(owner: Any) -> bool | None:
+        result = original_read_receipt(owner)
+        if result is None and clock.monotonic() >= 2 and not final_receipt_read.is_set():
+            final_receipt_read.set()
+            assert hook_holds_lock.wait(timeout=5)
+        return result
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        if threading.current_thread().name == "late-hook" and path.name == bridge._STATE_FILE:
+            hook_holds_lock.set()
+            assert release_hook.wait(timeout=5)
+        original_write_json(path, payload)
+
+    def set_protected(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("unrecognized") is True:
+            marker_started.set()
+        return original_set_protected(*args, **kwargs)
+
+    monkeypatch.setattr(bridge._MessagePane, "read_receipt", read_receipt)
+    monkeypatch.setattr(bridge, "_write_json_file", write_json)
+    monkeypatch.setattr(bridge, "_set_protected_draft", set_protected)
+
+    def write_hook() -> None:
+        try:
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "claude-session",
+                    "prompt": _STATUS_LINE_CLIPPED_CONTENT,
+                },
+            )
+        except BaseException as error:
+            hook_errors.append(error)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(
+            inject_user_message,
+            bridge_dir,
+            content=_STATUS_LINE_CLIPPED_CONTENT,
+            timeout_s=2,
+        )
+        assert final_receipt_read.wait(timeout=5)
+        hook = threading.Thread(target=write_hook, name="late-hook")
+        hook.start()
+        assert hook_holds_lock.wait(timeout=5)
+        assert marker_started.wait(timeout=5)
+        release_hook.set()
+        hook.join(timeout=5)
+        assert not hook.is_alive()
+        assert not hook_errors
+        assert delivery.result(timeout=5)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    assert "unrecognized_draft_tmux" not in state
+    assert mutations == ["paste"]
+
+
 def test_unrecognized_draft_marker_keeps_the_first_windows_last_usable_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7573,6 +7658,67 @@ def test_unrecognized_draft_marker_precedes_clipped_recognition_after_resize(
     state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
     assert "protected_draft_tmux" not in state
     assert sends == []
+
+
+@pytest.mark.parametrize("both_markers", [False, True], ids=["residue-only", "both-markers"])
+def test_unrecognized_marker_wins_when_readiness_sees_clipped_after_empty_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    both_markers: bool,
+) -> None:
+    """Readiness cannot turn the residue fence into the ordinary clipped hold."""
+    bridge = claude_native_bridge
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    socket_path, target = str(_TEST_TMUX_SOCKET), "claude:0.0"
+    bridge._set_protected_draft(
+        bridge_dir,
+        socket_path,
+        target,
+        protect=True,
+        unrecognized=True,
+    )
+    if both_markers:
+        bridge._set_protected_draft(bridge_dir, socket_path, target, protect=True)
+    sends = _fake_tmux(monkeypatch, [_composer_pane(), _STATUS_LINE_CLIPPED_PANE])
+
+    with pytest.raises(bridge.ClaudeMessageNotAccepted, match="previous send"):
+        inject_user_message(bridge_dir, content="Please read this next message.", timeout_s=2)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    if not both_markers:
+        assert "protected_draft_tmux" not in state
+    assert sends == []
+
+
+def test_unrecognized_marker_write_failure_preserves_delivery_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A state-file failure cannot replace an ambiguous pasted-message outcome."""
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: pane,
+    )
+    original_write_json = bridge._write_json_file
+
+    def fail_marker_write(path: Path, payload: dict[str, object]) -> None:
+        if "unrecognized_draft_tmux" in payload:
+            raise OSError("simulated marker persistence failure")
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(bridge, "_write_json_file", fail_marker_write)
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed, match="did not confirm"),
+    ):
+        inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT, timeout_s=2)
+
+    assert "Could not persist the unrecognized Claude draft marker" in caplog.text
+    assert mutations == ["paste"]
 
 
 def test_unrecognized_paste_observation_excludes_echoes_and_dialogs() -> None:

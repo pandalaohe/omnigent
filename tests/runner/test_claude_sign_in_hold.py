@@ -1065,6 +1065,52 @@ async def test_unrecognized_draft_residue_bypasses_the_busy_queue_to_fail_undeli
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "pane", "prompt_pending"),
+    [
+        pytest.param("follow-up", _HIDDEN_BOX_RUNNING_PANE, True, id="pending-prompt"),
+        pytest.param("/my-skill", _RUNNING_TURN_PANE, False, id="cleared-before-skill"),
+    ],
+)
+async def test_unrecognized_residue_gate_preserves_prompt_and_skill_waits(
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    pane: str,
+    prompt_pending: bool,
+) -> None:
+    """The residue exception applies only while its draft still blocks ordinary input."""
+    app, harness, _server = _build_app([_DELIVERED])
+    sid = uuid.uuid4().hex
+    socket_path = Path("/tmp/example/tmux.sock")
+    target = "claude:0.0"
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=socket_path,
+        tmux_target=target,
+    )
+    claude_native_bridge._set_protected_draft(
+        bridge_dir,
+        str(socket_path),
+        target,
+        protect=True,
+        unrecognized=True,
+    )
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda *_: prompt_pending)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: pane)
+
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message(message))
+        assert reply.json()["status"] == "buffered"
+        assert not harness.posted_bodies
+        assert [m["content"][0]["text"] for m in app.state.session_message_buffers[sid]] == [
+            message
+        ]
+
+
+@pytest.mark.asyncio
 async def test_message_a_busy_pane_refused_goes_back_to_the_queue_instead_of_failing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
