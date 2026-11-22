@@ -8193,9 +8193,15 @@ def create_runner_app(
             claude_pane_ready,
             has_pending_user_prompt,
             has_running_turn,
+            has_unrecognized_protected_draft,
             input_box_reads_clear,
         )
 
+        if has_unrecognized_protected_draft(bridge_dir):
+            # The bridge already knows the same pane holds an unconfirmed paste.
+            # Let its normal undelivered refusal settle this input instead of
+            # leaving it in the ordinary busy-pane queue.
+            return False
         if has_pending_user_prompt(bridge_dir):
             return True
         # Claude Code runs a queued slash command only at turn end, after the bridge

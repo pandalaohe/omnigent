@@ -1002,6 +1002,66 @@ _BUSY_REFUSED = [
         }
     ),
 ]
+_UNRECOGNIZED_DRAFT_REFUSED = [
+    _sse({"type": "response.created", "response": {"id": "resp_residue"}}),
+    _sse(
+        {
+            "type": "response.failed",
+            "response": {"status": "failed"},
+            "error": {
+                "code": "RuntimeError",
+                "message": (
+                    "Claude Code may still have a draft from the previous send. "
+                    "The message was not delivered."
+                ),
+                "undelivered": True,
+            },
+        }
+    ),
+]
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_draft_residue_bypasses_the_busy_queue_to_fail_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The existing harness refusal settles this input instead of queueing it forever."""
+    app, harness, _server = _build_app([_UNRECOGNIZED_DRAFT_REFUSED])
+    sid = uuid.uuid4().hex
+    socket_path = Path("/tmp/example/tmux.sock")
+    target = "claude:0.0"
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=socket_path,
+        tmux_target=target,
+    )
+    claude_native_bridge._set_protected_draft(
+        bridge_dir,
+        str(socket_path),
+        target,
+        protect=True,
+        unrecognized=True,
+    )
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_, **__: _HIDDEN_BOX_RUNNING_PANE,
+    )
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 1)
+
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert reply.json()["status"] == "accepted"
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+
+    events = _published(app, sid)
+    [failure] = [event for event in events if event.get("type") == "response.failed"]
+    assert failure["error"]["undelivered"] is True
+    assert not app.state.session_message_buffers.get(sid)
+    assert sid not in app.state.claude_prompt_waiters
 
 
 @pytest.mark.asyncio

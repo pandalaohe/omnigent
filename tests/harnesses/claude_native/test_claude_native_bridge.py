@@ -7261,6 +7261,10 @@ _SLASH_MENU_PANE = (
             id="cleared-before-enter",
         ),
         pytest.param(
+            lambda n, content: _composer_pane(content) if n == 1 else "",
+            id="torn-captures-before-enter",
+        ),
+        pytest.param(
             lambda n, content: _composer_pane(content) if n == 1 else _SLASH_MENU_PANE,
             id="slash-menu-before-enter",
         ),
@@ -7481,6 +7485,94 @@ def test_next_send_refuses_an_unrecognized_leftover_paste_without_typing(
     visible = _composer_pane()
     assert inject_user_message(bridge_dir, content=next_message, timeout_s=3)
     assert mutations == ["paste", "paste", "submit"]
+
+
+def test_late_receipt_does_not_leave_an_unrecognized_draft_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt winning the final race leaves no marker to block the next send."""
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    transcript = tmp_path / "session.jsonl"
+    record = {
+        "type": "user",
+        "sessionId": "claude-session",
+        "uuid": "user-1",
+        "message": {"role": "user", "content": _STATUS_LINE_CLIPPED_CONTENT},
+    }
+
+    def write_receipt(now: float) -> None:
+        # The wait reads receipts before each capture. Writing on its last usable
+        # capture makes the outer final receipt decision observe it.
+        if now >= 1.9 and not transcript.exists():
+            transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: pane,
+        on_capture=write_receipt,
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript),
+        },
+    )
+
+    assert inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT, timeout_s=2)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    assert "unrecognized_draft_tmux" not in state
+    assert mutations == ["paste"]
+
+
+def test_unrecognized_draft_marker_keeps_the_first_windows_last_usable_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torn final capture cannot erase the matching residue seen just before it."""
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda capture, _now: pane if capture == 1 else "",
+    )
+
+    with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT, timeout_s=2)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    assert state["unrecognized_draft_tmux"] == {
+        "socket_path": str(_TEST_TMUX_SOCKET),
+        "tmux_target": "claude:0.0",
+    }
+    assert mutations == ["paste"]
+
+
+def test_unrecognized_draft_marker_precedes_clipped_recognition_after_resize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resize must not turn a fail-fast residue into the ordinary draft hold."""
+    bridge = claude_native_bridge
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    bridge._set_protected_draft(
+        bridge_dir,
+        str(_TEST_TMUX_SOCKET),
+        "claude:0.0",
+        protect=True,
+        unrecognized=True,
+    )
+    sends = _fake_tmux(monkeypatch, [_STATUS_LINE_CLIPPED_PANE])
+
+    with pytest.raises(bridge.ClaudeMessageNotAccepted, match="previous send"):
+        inject_user_message(bridge_dir, content="Please read this next message.", timeout_s=2)
+
+    state = bridge._read_json_file(bridge_dir / bridge._STATE_FILE)
+    assert "protected_draft_tmux" not in state
+    assert sends == []
 
 
 def test_unrecognized_paste_observation_excludes_echoes_and_dialogs() -> None:
