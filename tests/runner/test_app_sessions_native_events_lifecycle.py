@@ -3385,7 +3385,8 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
             json={"type": "interrupt"},
         )
 
-    assert int_resp.status_code == 204, int_resp.text
+    assert int_resp.status_code == 200, int_resp.text
+    assert int_resp.json() == {"interrupted": False, "reason": "idle"}
 
 
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):
