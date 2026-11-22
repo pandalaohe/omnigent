@@ -1954,7 +1954,7 @@ class ConversationStore(ABC):
         attempted: Conversation,
         restore_effort: bool = True,
         restore_model: bool = False,
-    ) -> None:
+    ) -> bool:
         """Restore a refused effort update without overwriting a newer selection.
 
         Each setting is compared and restored atomically. When ``restore_model``
@@ -1967,6 +1967,7 @@ class ConversationStore(ABC):
         :param restore_effort: Whether the refused effort needs rollback; false when
             a newer write already replaced it.
         :param restore_model: Whether the unforwarded model change also needs rollback.
+        :returns: ``True`` when at least one matching setting was restored.
         """
         ...
 

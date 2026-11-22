@@ -339,6 +339,11 @@ def test_antigravity_clamp_fails_closed_for_unknown_and_omitted_model_and_honors
             "displayName": "Gemini 4 Hydrogen",
             "efforts": ["low", "medium", "high"],
         },
+        {
+            "id": "gemini-4-neon",
+            "displayName": "Gemini 4 Neon",
+            "efforts": ["max"],
+        },
     ]
     assert clamp_antigravity_effort("xhigh", "gemini-5-unseen", catalog_models=catalog) == "xhigh"
     assert (
@@ -347,3 +352,18 @@ def test_antigravity_clamp_fails_closed_for_unknown_and_omitted_model_and_honors
     )
     # When the live catalog explicitly omits xhigh for a model, the catalog wins.
     assert clamp_antigravity_effort("xhigh", "gemini-4-hydrogen", catalog_models=catalog) == "high"
+    assert clamp_antigravity_effort("xhigh", "gemini-4-neon", catalog_models=catalog) == "high"
+    assert (
+        clamp_antigravity_effort(
+            "xhigh",
+            "gemini-4-hydrogen",
+            catalog_models=[
+                {
+                    "id": "gemini-4-hydrogen",
+                    "displayName": "Gemini 4 Hydrogen",
+                    "efforts": [],
+                }
+            ],
+        )
+        == "high"
+    )

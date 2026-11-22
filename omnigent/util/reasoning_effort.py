@@ -324,12 +324,20 @@ def clamp_antigravity_effort(
     clamped = clamp_effort_for_model(effort, resolved_model, caps=antigravity_model_effort_caps())
     assert clamped is not None
 
-    row_efforts = _antigravity_row_efforts(matched_row) if matched_row is not None else None
-    if row_efforts is not None:
-        offered = [level for level in _ANTIGRAVITY_LADDER if level in row_efforts]
-        if offered:
-            if clamped in _ANTIGRAVITY_ABOVE_HIGH:
-                return "xhigh" if "xhigh" in offered else offered[-1]
+    if matched_row is not None:
+        row_efforts = _antigravity_row_efforts(matched_row)
+        offered = (
+            [level for level in _ANTIGRAVITY_LADDER if level in row_efforts]
+            if row_efforts is not None
+            else []
+        )
+        if clamped in _ANTIGRAVITY_ABOVE_HIGH:
+            if "xhigh" in offered:
+                return "xhigh"
+            return offered[-1] if offered else "high"
+        if row_efforts is not None:
+            if not offered:
+                return clamped
             if clamped in offered:
                 return clamped
             if clamped in _ANTIGRAVITY_LADDER:

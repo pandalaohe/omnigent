@@ -4524,6 +4524,12 @@ def test_agy_slash_command_requires_fresh_confirmation(
         == "⎿  Model set to Claude Sonnet 5.5 (Medium)"
     )
     assert commands == ["/model claude-sonnet-5-5-medium"]
+    monkeypatch.setattr(
+        _mod,
+        "_agy_control_pane",
+        lambda _: agy_controls_captures["model-effort"],
+    )
+    assert _mod.confirmed_agy_model_from_pane(tmp_path) == "Claude Sonnet 5.5 (Medium)"
 
 
 def test_agy_agent_mode_cycles_captured_footers(tmp_path, monkeypatch, agy_controls_captures):

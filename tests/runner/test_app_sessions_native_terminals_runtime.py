@@ -6229,6 +6229,13 @@ async def test_auto_create_antigravity_applies_server_tier_and_effort(
 
     calls: list[dict[str, Any]] = []
     session_id = "agy-tier-test"
+    model_options = [
+        {
+            "id": "gemini-4-hydrogen",
+            "displayName": "Gemini 4 Hydrogen",
+            "efforts": ["low", "medium", "high"],
+        }
+    ]
     await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -6236,12 +6243,14 @@ async def test_auto_create_antigravity_applies_server_tier_and_effort(
         snapshot={
             "labels": {bridge_mod.AGY_PERMISSION_TIER_LABEL_KEY: tier},
             "reasoning_effort": "high",
+            "model_options": model_options,
         },
         candidate_ports=[],
         build_agy_launch_calls=calls,
     )
     assert calls[0]["extra_args"] == expected_args
     assert calls[0]["effort"] == "high"
+    assert calls[0]["catalog_models"] == model_options
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
     canonical_tier = "auto" if tier.startswith("auto-") else tier
     assert (bridge_dir / "permission_tier").read_text() == canonical_tier + "\n"

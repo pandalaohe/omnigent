@@ -8281,6 +8281,8 @@ async def _auto_create_antigravity_terminal(
         arg for arg in terminal_launch_args if arg != "--dangerously-skip-permissions"
     )
     effort = snapshot.get("reasoning_effort")
+    raw_model_options = snapshot.get("model_options")
+    catalog_models = raw_model_options if isinstance(raw_model_options, list) else None
     argv, launch_env = await asyncio.to_thread(
         build_agy_launch,
         conversation_id=external_session_id if resume else None,
@@ -8289,6 +8291,7 @@ async def _auto_create_antigravity_terminal(
         extra_args=persisted_args + tuple(agy_tier_launch_args(tier)),
         effort=effort if isinstance(effort, str) and effort else None,
         log_dir=bridge_dir,
+        catalog_models=catalog_models,
     )
     env_overrides.update(launch_env)
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]

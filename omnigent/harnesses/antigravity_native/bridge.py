@@ -2636,6 +2636,7 @@ def parse_agy_agent_mode(pane: str) -> str | None:
 
 
 _AGY_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
+_AGY_MODEL_CONFIRMATION_RE = re.compile(r"^\s*⎿\s+Model set to\s+(.+?)\s*$", re.MULTILINE)
 
 
 def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
@@ -2652,6 +2653,21 @@ def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
     if match is None:
         return slug, None
     return slug[: match.start()], match.group(1)
+
+
+def confirmed_agy_model_from_pane(bridge_dir: Path) -> str | None:
+    """Return the latest model the current idle agy pane confirms.
+
+    The visible pane is tied to the bridge's current tmux target, so a terminal
+    replacement cannot inherit an older runner-side model cache. A missing or
+    scrolled-off confirmation is unknown rather than a reason to trust one.
+    """
+    pane = _require_agy_idle(bridge_dir)
+    matches = list(_AGY_MODEL_CONFIRMATION_RE.finditer(pane))
+    if not matches:
+        return None
+    model = matches[-1].group(1).strip()
+    return model or None
 
 
 @_bounded_control(60.0)

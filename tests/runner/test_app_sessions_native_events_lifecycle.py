@@ -6418,6 +6418,78 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
         assert response.json() == expected_body
 
 
+async def test_antigravity_effort_uses_last_successful_model_switch_before_new_turn(
+    monkeypatch,
+    tmp_path,
+    isolate_antigravity_controls_launch,
+):
+    """A stale Hydrogen readback cannot allow xhigh after switching to Opus."""
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    current_readback = "Gemini 4 Hydrogen (High)"
+    current_pane_model = "Claude Opus 5.5 (High)"
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": current_readback,
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(
+        agy, "confirmed_agy_model_from_pane", lambda _bridge_dir: current_pane_model
+    )
+    calls = []
+
+    def command(_, text, **kwargs):
+        calls.append(text)
+        return "Model set to Claude Opus 5.5 (High)"
+
+    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_no_turn", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        switched = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "model_change", "model": "claude-opus-5-5", "effort": "high"},
+        )
+        raised = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+        switched_back = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
+        )
+        current_pane_model = "Gemini 4 Hydrogen (Xhigh)"
+        allowed = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+        current_pane_model = "Claude Opus 5.5 (High)"
+        refused_manual_switch = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+    assert switched.status_code == 200, switched.text
+    assert raised.status_code == 400, raised.text
+    assert switched_back.status_code == 200, switched_back.text
+    assert allowed.status_code == 200, allowed.text
+    assert refused_manual_switch.status_code == 400, refused_manual_switch.text
+    assert calls == [
+        "/model claude-opus-5-5-high",
+        "/model gemini-4-hydrogen-xhigh",
+        "/effort xhigh",
+    ]
+
+
 @pytest.mark.parametrize(
     "outcome", ["commit", "rollback", "prepare-failure", "rollback-failure", "snapshot-timeout"]
 )

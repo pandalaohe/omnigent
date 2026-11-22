@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import secrets
 import shutil
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,6 +61,28 @@ _AGY_INSTALL_HINT = (
     "Install agy via the Antigravity installer script:\n"
     "  curl -fsSL https://antigravity.google/cli/install.sh | bash\n"
     "Then restart your shell so ~/.local/bin is on PATH."
+)
+# Value-taking options reported by ``agy --help`` plus the two hidden options
+# Omnigent owns. Their following token stays opaque even when it resembles one
+# of the model/effort flags extracted below.
+_AGY_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--conversation",
+        "--csrf_token",
+        "--effort",
+        "--gemini_dir",
+        "--input-format",
+        "--json-schema",
+        "--log-file",
+        "--mode",
+        "--model",
+        "--output-format",
+        "--print-timeout",
+        "--project",
+        "--settings",
+    }
 )
 
 
@@ -163,7 +186,7 @@ def should_skip_permissions(
 
 def _extract_model_and_effort_from_extra_args(
     extra_args: tuple[str, ...],
-) -> tuple[str | None, str | None, tuple[str, ...]]:
+) -> tuple[str | None, str | None, tuple[str, ...], bool]:
     """Strip ``--model`` and ``--effort`` (split or ``=`` forms) from *extra_args*.
 
     Stops parsing flags at ``--`` so positional arguments are preserved verbatim.
@@ -172,6 +195,8 @@ def _extract_model_and_effort_from_extra_args(
     extracted_model: str | None = None
     extracted_effort: str | None = None
     remaining: list[str] = []
+    skip_permissions_seen = False
+    csrf_token_seen = False
     idx = 0
     while idx < len(extra_args):
         arg = extra_args[idx]
@@ -179,7 +204,7 @@ def _extract_model_and_effort_from_extra_args(
             remaining.extend(extra_args[idx:])
             break
         if arg == "--model":
-            if idx + 1 < len(extra_args):
+            if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
                 val = extra_args[idx + 1]
                 extracted_model = val if val else None
                 idx += 2
@@ -192,7 +217,7 @@ def _extract_model_and_effort_from_extra_args(
             idx += 1
             continue
         if arg == "--effort":
-            if idx + 1 < len(extra_args):
+            if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
                 val = extra_args[idx + 1]
                 extracted_effort = val if val else None
                 idx += 2
@@ -204,9 +229,25 @@ def _extract_model_and_effort_from_extra_args(
             extracted_effort = val if val else None
             idx += 1
             continue
+        if arg == _SKIP_PERMISSIONS_FLAG:
+            if not skip_permissions_seen:
+                remaining.append(arg)
+                skip_permissions_seen = True
+            idx += 1
+            continue
+        if arg == "--csrf_token" or arg.startswith("--csrf_token="):
+            csrf_token_seen = True
         remaining.append(arg)
+        if (
+            arg in _AGY_OPTIONS_WITH_VALUE
+            and idx + 1 < len(extra_args)
+            and extra_args[idx + 1] != "--"
+        ):
+            remaining.append(extra_args[idx + 1])
+            idx += 2
+            continue
         idx += 1
-    return extracted_model, extracted_effort, tuple(remaining)
+    return extracted_model, extracted_effort, tuple(remaining), csrf_token_seen
 
 
 def build_agy_launch(
@@ -217,6 +258,7 @@ def build_agy_launch(
     effort: str | None = None,
     extra_args: tuple[str, ...] = (),
     log_dir: Path | None = None,
+    catalog_models: Iterable[Mapping[str, object]] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Build the argv and environment overrides for an agy launch.
 
@@ -253,6 +295,8 @@ def build_agy_launch(
     :param extra_args: Additional raw CLI args appended after all generated
         flags, e.g. ``("--print-timeout", "30")``.
     :param log_dir: Private directory for this launch's RPC discovery log.
+    :param catalog_models: Optional agy model-catalog snapshot used to require
+        explicit per-model ``xhigh`` support when a row is present.
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
@@ -262,18 +306,19 @@ def build_agy_launch(
     :raises OmnigentError: When saved credentials need repair through setup.
     :raises RuntimeError: When the agy executable cannot be found.
     """
-    extra_model, extra_effort, remaining_extra_args = _extract_model_and_effort_from_extra_args(
-        extra_args
-    )
+    (
+        extra_model,
+        extra_effort,
+        remaining_extra_args,
+        csrf_token_seen,
+    ) = _extract_model_and_effort_from_extra_args(extra_args)
     launch = resolve_native_antigravity_launch(
         model=extra_model if extra_model is not None else model
     )
     final_model = launch.model
     final_effort = extra_effort if extra_effort is not None else effort
     argv: list[str] = [agy_binary_path()]
-    if not any(
-        arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in remaining_extra_args
-    ):
+    if not csrf_token_seen:
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if log_dir is not None:
         argv.append(f"--log-file={log_dir / f'agy-{secrets.token_hex(16)}.log'}")
@@ -284,10 +329,14 @@ def build_agy_launch(
     if final_model is not None:
         base_model, suffix_effort = split_agy_effort_suffix(final_model)
         if final_effort:
-            final_effort = clamp_antigravity_effort(final_effort, base_model)
+            final_effort = clamp_antigravity_effort(
+                final_effort, base_model, catalog_models=catalog_models
+            )
             argv.extend(["--model", base_model])
         elif suffix_effort is not None:
-            clamped_suffix = clamp_antigravity_effort(suffix_effort, base_model)
+            clamped_suffix = clamp_antigravity_effort(
+                suffix_effort, base_model, catalog_models=catalog_models
+            )
             argv.extend(
                 [
                     "--model",
@@ -299,11 +348,9 @@ def build_agy_launch(
         else:
             argv.extend(["--model", final_model])
     elif final_effort:
-        final_effort = clamp_antigravity_effort(final_effort, None)
+        final_effort = clamp_antigravity_effort(final_effort, None, catalog_models=catalog_models)
     if final_effort is not None:
         argv.extend(["--effort", final_effort])
-    for arg in remaining_extra_args:
-        if arg != _SKIP_PERMISSIONS_FLAG or arg not in argv:
-            argv.append(arg)
+    argv.extend(remaining_extra_args)
 
     return argv, launch.extra_env

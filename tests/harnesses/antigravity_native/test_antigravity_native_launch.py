@@ -535,6 +535,49 @@ def test_launch_extra_args_stops_parsing_flags_after_double_dash(
     assert argv[sep:] == ["--", "--effort=max"]
 
 
+def test_launch_extra_args_preserves_values_that_look_like_owned_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supported option's value is never reinterpreted as model or effort."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="claude-opus-5-5",
+        effort="high",
+        extra_args=("--log-file", "--effort=xhigh"),
+    )
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[-2:] == ["--log-file", "--effort=xhigh"]
+
+
+def test_launch_extra_args_preserves_double_dash_after_missing_owned_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing effort value cannot consume ``--`` or parse its tail."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen",
+        effort="high",
+        extra_args=(
+            "--effort",
+            "--",
+            "--model=claude-opus-5-5",
+            _SKIP_FLAG,
+            _SKIP_FLAG,
+        ),
+    )
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[argv.index("--") :] == [
+        "--",
+        "--model=claude-opus-5-5",
+        _SKIP_FLAG,
+        _SKIP_FLAG,
+    ]
+
+
 @pytest.mark.parametrize(
     ("model", "expected_effort"),
     [
@@ -555,3 +598,24 @@ def test_launch_fails_closed_for_omitted_or_unknown_model_at_xhigh(
         assert "--model" not in argv
     else:
         assert argv[argv.index("--model") + 1] == model
+
+
+def test_launch_catalog_row_must_explicitly_offer_xhigh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matched live catalog row overrides the static Hydrogen fallback."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen",
+        effort="xhigh",
+        catalog_models=[
+            {
+                "id": "gemini-4-hydrogen",
+                "displayName": "Gemini 4 Hydrogen",
+                "efforts": ["low", "medium", "high"],
+            }
+        ],
+    )
+    assert argv[argv.index("--effort") + 1] == "high"

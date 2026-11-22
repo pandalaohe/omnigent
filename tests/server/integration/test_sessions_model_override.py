@@ -10,7 +10,9 @@ runner-path forwarding is verified here by stubbing
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from typing import Any
 from unittest.mock import patch
 
@@ -1101,3 +1103,161 @@ async def test_patch_antigravity_clamped_model_switch_persists_applied_effort(
     assert len(forwarded) == 2
     assert forwarded[1]["type"] == "effort_change"
     assert forwarded[1]["effort"] == "xhigh"
+
+
+async def test_patch_antigravity_clamped_effort_keeps_newer_silent_write(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed AG model reply cannot overwrite or publish over a newer effort."""
+    from omnigent.runtime import get_conversation_store, session_stream
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    store = get_conversation_store()
+    store.set_labels(sid, {"omnigent.wrapper": "antigravity-native-ui"})
+    store.set_runner_id(sid, "runner_agy")
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_forward(
+        session_id: str,
+        runner_router: Any,
+        event: dict[str, Any],
+        timeout_s: float = 5.0,
+    ) -> _RunnerForwardResult:
+        del session_id, runner_router, timeout_s
+        assert event["type"] == "model_change"
+        entered.set()
+        await release.wait()
+        return _RunnerForwardResult(
+            status_code=200,
+            body=json.dumps({"model": "claude-opus-5-5-high", "effort": "high"}),
+        )
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _fake_forward)
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda _session_id, event: published.append(dict(event)),
+    )
+
+    pending = asyncio.create_task(
+        client.patch(
+            f"/v1/sessions/{sid}",
+            json={"model_override": "claude-opus-5-5", "reasoning_effort": "xhigh"},
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        newer = await client.patch(
+            f"/v1/sessions/{sid}",
+            json={"reasoning_effort": "medium", "silent": True},
+        )
+        assert newer.status_code == 200, newer.text
+    finally:
+        release.set()
+        switched = await asyncio.wait_for(pending, timeout=5.0)
+
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["reasoning_effort"] == "medium"
+    assert store.get_conversation(sid).reasoning_effort == "medium"
+    assert not any(
+        event.get("type") == "session.reasoning_effort" and event.get("reasoning_effort") == "high"
+        for event in published
+    )
+
+    # A silent same-value write that starts after the ordering check must wait
+    # through both the conditional DB commit and its stream publication.
+    session2 = await _create_session(client, agent["id"])
+    sid2 = session2["id"]
+    store.set_labels(sid2, {"omnigent.wrapper": "antigravity-native-ui"})
+    store.set_runner_id(sid2, "runner_agy")
+    published.clear()
+
+    async def _second_forward(
+        session_id: str,
+        runner_router: Any,
+        event: dict[str, Any],
+        timeout_s: float = 5.0,
+    ) -> _RunnerForwardResult:
+        del session_id, runner_router, timeout_s
+        assert event["type"] == "model_change"
+        return _RunnerForwardResult(
+            status_code=200,
+            body=json.dumps({"model": "claude-opus-5-5-high", "effort": "high"}),
+        )
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _second_forward)
+    store_type = type(store)
+    real_restore = store_type.restore_session_settings_if_matches
+    real_get = store_type.get_conversation
+    entered_restore = threading.Event()
+    release_restore = threading.Event()
+    restore_committed = threading.Event()
+    entered_latest = threading.Event()
+    release_latest = threading.Event()
+    latest_blocked = False
+
+    def _paused_restore(self: Any, conversation_id: str, **kwargs: Any) -> bool:
+        if conversation_id != sid2:
+            return real_restore(self, conversation_id, **kwargs)
+        entered_restore.set()
+        assert release_restore.wait(timeout=5), "Timed out before conditional effort write-back"
+        committed = real_restore(self, conversation_id, **kwargs)
+        restore_committed.set()
+        return committed
+
+    def _paused_get(self: Any, conversation_id: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal latest_blocked
+        if conversation_id == sid2 and restore_committed.is_set() and not latest_blocked:
+            latest_blocked = True
+            entered_latest.set()
+            assert release_latest.wait(timeout=5), "Timed out before effort publication"
+        return real_get(self, conversation_id, *args, **kwargs)
+
+    monkeypatch.setattr(store_type, "restore_session_settings_if_matches", _paused_restore)
+    monkeypatch.setattr(store_type, "get_conversation", _paused_get)
+
+    pending2 = asyncio.create_task(
+        client.patch(
+            f"/v1/sessions/{sid2}",
+            json={"model_override": "claude-opus-5-5", "reasoning_effort": "xhigh"},
+        )
+    )
+    newer2: asyncio.Task[httpx.Response] | None = None
+    try:
+        assert await asyncio.to_thread(entered_restore.wait, 5)
+        newer2 = asyncio.create_task(
+            client.patch(
+                f"/v1/sessions/{sid2}",
+                json={"reasoning_effort": "xhigh", "silent": True},
+            )
+        )
+        release_restore.set()
+        assert await asyncio.to_thread(entered_latest.wait, 5)
+        assert not newer2.done()
+    finally:
+        release_restore.set()
+        release_latest.set()
+        switched2 = await asyncio.wait_for(pending2, timeout=5.0)
+        newer_response = (
+            await asyncio.wait_for(newer2, timeout=5.0) if newer2 is not None else None
+        )
+
+    assert switched2.status_code == 200, switched2.text
+    assert switched2.json()["reasoning_effort"] == "high"
+    assert newer_response is not None
+    assert newer_response.status_code == 200, newer_response.text
+    assert newer_response.json()["reasoning_effort"] == "xhigh"
+    assert store.get_conversation(sid2).reasoning_effort == "xhigh"
+    assert [
+        event.get("reasoning_effort")
+        for event in published
+        if event.get("type") == "session.reasoning_effort"
+    ] == ["high"]
