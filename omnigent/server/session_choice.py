@@ -1695,10 +1695,13 @@ class ChoiceState:
             exhausted[identity] = max(exhausted.get(identity, 0), until)
         for (user, pool), until in exhausted.items():
             if user == owner and until > now:
+                reported = readings.get(pool)
+                if reported is not None and reported.quota_source_rejection is not None:
+                    continue
                 result[pool] = UsageAccountView(
                     id=pool,
                     kind="account",
-                    display_name=readings[pool].display_name if pool in readings else pool,
+                    display_name=reported.display_name if reported is not None else pool,
                     state="exhausted",
                     reason="provider_quota_reached",
                     freshness="fresh",

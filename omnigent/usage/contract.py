@@ -324,7 +324,8 @@ class UsageReportV2(_ReportFields):
     def validate_sections(self) -> UsageReportV2:
         rejection = self.quota_source_rejection
         if rejection is not None and (
-            self.model_fields_set & {"windows", "balances", "activity", "pinned_window"}
+            self.model_fields_set
+            & {"windows", "balances", "activity", "pinned_window", "pool_relation"}
             or self.status != "available"
             or (rejection.last_valid_at is not None and rejection.last_valid_at > self.observed_at)
         ):

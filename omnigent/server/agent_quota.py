@@ -137,6 +137,21 @@ def _source_rejection_text(rejection: dict[str, Any]) -> str:
     return f"source rejected ({detail})"
 
 
+def _clear_source_rejection(
+    record: dict[str, Any], report: UsageReport | UsageReportV2, now: float
+) -> None:
+    rejection = record.get("quota_source_rejection")
+    if (
+        rejection
+        and report.status == "available"
+        and report.observed_at > (rejection.get("last_valid_at") or rejection["first_verified_at"])
+        and _fresh({"captured_at": report.observed_at, "fresh_until": report.fresh_until}, now)
+        and any(window.resets_at is None or window.resets_at > now for window in report.windows)
+    ):
+        record.pop("quota_source_rejection", None)
+        record.pop("quota_source_only", None)
+
+
 def _safe_id(value: object, fallback: str) -> str:
     text = re.sub(r"[^A-Za-z0-9_-]", "-", str(value or fallback)).strip("-")
     return (text or fallback)[:32]
@@ -807,18 +822,8 @@ class AgentQuotaService:
                     "fresh_until": report.fresh_until,
                     "first_verified_at": previous_rejection.get("first_verified_at", observed),
                 }
-        elif (
-            previous_rejection
-            and windows_changed
-            and report.status == "available"
-            and any(
-                window.resets_at is None or window.resets_at > now for window in report.windows
-            )
-            and _fresh({"captured_at": observed, "fresh_until": report.fresh_until}, now)
-            and observed
-            > (previous_rejection.get("last_valid_at") or previous_rejection["first_verified_at"])
-        ):
-            record.pop("quota_source_rejection", None)
+        elif windows_changed:
+            _clear_source_rejection(record, report, now)
         stored.setdefault("windows", [])
         stored.setdefault("balances", [])
         if "pinned_window" in fields:
@@ -983,6 +988,7 @@ class AgentQuotaService:
                 record["report"] = report.stored()
                 record["read_at"] = observed
                 record["fresh_until"] = report.fresh_until
+                _clear_source_rejection(record, report, now)
                 marks = dict(record.get("reset_marks") or {})
                 for window in report.windows:
                     span = window_start(window, now)
