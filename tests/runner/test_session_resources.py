@@ -169,7 +169,11 @@ class _CapturingResourceRegistry:
         self._session_background_publisher = publisher
 
     def set_native_terminal_transfer_listener(
-        self, terminal_name: str, listener: Callable[[str, str], None]
+        self,
+        terminal_name: str,
+        listener: Callable[[str, str], None],
+        *,
+        prepare: Callable[[str, str, str | None], None] | None = None,
     ) -> None:
         """Accept native terminal-transfer listeners without retaining them."""
 
