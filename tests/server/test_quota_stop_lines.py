@@ -109,7 +109,7 @@ async def test_renamed_pool_limits_tiles_floors_and_stop_scan_agree(
     overview = env.service.overview(RESERVED_USER_LOCAL, now=env.now)
     account = next(account for account in overview.accounts if account.id == "account-a")
     account.id = pool
-    monkeypatch.setattr(env.service, "overview", lambda owner, *, now: overview)
+    monkeypatch.setattr(env.service, "overview", lambda owner, **_kwargs: overview)
     assert stopped_line(env.app, env.conv).state == "stop"
     lines = (await client.get("/v1/me/usage/lines")).json()["tiles"]
     assert raw_pool not in lines and lines[pool]["state"] == "stop"
