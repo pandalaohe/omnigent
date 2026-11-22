@@ -103,6 +103,7 @@ import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routing
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { formatBytes } from "@/shell/fileStatusUtils";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
@@ -222,18 +223,6 @@ export function containsMermaidDiagram(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
-function formatUploadBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB"];
-  let value = bytes;
-  let unit = -1;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
 function PendingUploadRow({
   progress,
   tempId,
@@ -257,7 +246,7 @@ function PendingUploadRow({
         </span>
       )}
       {percent === null ? (
-        <span className="shrink-0 whitespace-nowrap">{formatUploadBytes(progress.loaded)}</span>
+        <span className="shrink-0 whitespace-nowrap">{formatBytes(progress.loaded)}</span>
       ) : (
         <div className="flex w-20 shrink-0 items-center gap-1.5">
           <Progress

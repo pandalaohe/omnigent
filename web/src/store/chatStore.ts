@@ -250,6 +250,8 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /** Preserve the background queue's own retry and cooldown policy. */
+  backgroundQueue?: boolean;
   /** Exact visual composer order. Omitted by legacy text/files callers. */
   composerParts?: ComposerDraftPart[];
   stableId?: string;
@@ -2622,6 +2624,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       s.conversationId === null ||
       sideChatSettingsPending(s.conversationId) ||
       queuedHeadUploads.has(s.conversationId) ||
+      backgroundFlushInFlight.has(s.conversationId) ||
       s.boundAgentId === null ||
       s.sessionStatus === "running" ||
       holdsInitialDraft(s)
@@ -2727,8 +2730,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
       if (head === undefined || head.requiresRetry) continue;
       if (waitsForHost(get().queuedMessages, conversationId)) continue;
-      const compactAgentId = head.agentId ?? local?.boundAgentId;
-      if (head.command === "compact" && !compactAgentId) continue;
+      const agentId = head.agentId ?? local?.boundAgentId;
+      if (head.command === "compact" && !agentId) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
@@ -2738,16 +2741,43 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (head.command === "compact") {
         conversationRegistry.acquire(conversationId);
         void s
-          .send(head.text, compactAgentId!, head.files, queuedSendOptions(head))
+          .send(head.text, agentId!, head.files, queuedSendOptions(head))
           .finally(() => backgroundFlushInFlight.delete(conversationId));
         continue;
       }
-      // Keep the background queue's guard and retry behavior. Only the POST
-      // takes a chain slot when its message has files to upload first.
+      const requeue = () => {
+        backgroundFlushCooldownUntil.set(conversationId, Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS);
+        setActive((state) => {
+          const index = state.queuedMessages.findIndex((m) => m.conversationId === conversationId);
+          const at = index === -1 ? state.queuedMessages.length : index;
+          return {
+            queuedMessages: [
+              ...state.queuedMessages.slice(0, at),
+              head,
+              ...state.queuedMessages.slice(at),
+            ],
+          };
+        });
+      };
       const orderedParts = head.composerParts ?? legacyComposerParts(head.text, head.files ?? []);
-      let postChain = orderedParts.some((part) => part.type === "attachment")
-        ? undefined
-        : enterSendChain(conversationId);
+      const hasAttachments = orderedParts.some((part) => part.type === "attachment");
+      if (hasAttachments && agentId) {
+        // Keep the bubble and its Cancel action available if the user returns
+        // to this conversation before the queued upload completes.
+        conversationRegistry.acquire(conversationId);
+        void s
+          .send(head.text, agentId, head.files, {
+            composerParts: head.composerParts,
+            replyDraft: head.replyDraft,
+            stableId: head.stableId,
+            pinnedConversationId: conversationId,
+            backgroundQueue: true,
+            onError: requeue,
+          })
+          .finally(() => backgroundFlushInFlight.delete(conversationId));
+        continue;
+      }
+      let postChain = hasAttachments ? undefined : enterSendChain(conversationId);
       void (async () => {
         const content = await composerPartsToContentBlocks(orderedParts, (file) =>
           uploadFileBlock(conversationId, file),
@@ -2759,23 +2789,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           data: { role: "user", content, stable_id: head.stableId },
         });
       })()
-        .catch(() => {
-          backgroundFlushCooldownUntil.set(
-            conversationId,
-            Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
-          );
-          setActive((st) => {
-            const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
-            const at = idx === -1 ? st.queuedMessages.length : idx;
-            return {
-              queuedMessages: [
-                ...st.queuedMessages.slice(0, at),
-                head,
-                ...st.queuedMessages.slice(at),
-              ],
-            };
-          });
-        })
+        .catch(requeue)
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
           postChain?.releaseSend();
@@ -3202,7 +3216,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               stable_id: stableId,
             },
           },
-          { holdWhenHostOffline: true },
+          { holdWhenHostOffline: !opts?.backgroundQueue },
         ),
       );
       // Policy denied the input — the server returned immediately

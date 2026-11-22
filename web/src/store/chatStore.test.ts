@@ -7881,7 +7881,7 @@ describe("chatStore — send (file attachments)", () => {
     });
   });
 
-  it("cancels one attachment upload without posting and replaces the composer draft", async () => {
+  it("cancels an attachment batch without posting and replaces the composer draft", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -7889,6 +7889,9 @@ describe("chatStore — send (file attachments)", () => {
     let resolveUpload!: (response: Response) => void;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        const file = init?.body instanceof FormData ? init.body.get("file") : null;
+        if (file instanceof File && file.name === "first.png")
+          return mockResponse({ id: "file_first", name: file.name });
         return new Promise<Response>((resolve) => {
           resolveUpload = resolve;
         });
@@ -7899,10 +7902,16 @@ describe("chatStore — send (file attachments)", () => {
     onTestFinished(() => {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
     });
-    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
-    const sendPromise = useChatStore.getState().send("replace me", "agent_xyz", [file]);
+    const files = ["first.png", "second.png", "third.png"].map(
+      (name) => new File(["fake-bytes"], name, { type: "image/png" }),
+    );
+    const sendPromise = useChatStore.getState().send("replace me", "agent_xyz", files);
     await vi.waitFor(() =>
-      expect(useChatStore.getState().pendingUserMessages[0]?.uploadProgress).toBeDefined(),
+      expect(useChatStore.getState().pendingUserMessages[0]?.uploadProgress).toMatchObject({
+        filename: "second.png",
+        fileIndex: 2,
+        fileCount: 3,
+      }),
     );
     expect(peekUnsentSend("conv_existing")?.text).toBe("replace me");
     const tempId = useChatStore.getState().pendingUserMessages[0]!.tempId;
@@ -7915,7 +7924,7 @@ describe("chatStore — send (file attachments)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     expect(useChatStore.getState().failedSendDraft).toMatchObject({
       text: "replace me",
-      files: [file],
+      files,
       replaceComposer: true,
     });
     expect(
@@ -7925,7 +7934,8 @@ describe("chatStore — send (file attachments)", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(0);
-    resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
+    expect(FetchBackedXHR.instances).toHaveLength(2);
+    resolveUpload(mockResponse({ id: "file_second", name: "second.png" }));
   });
 
   it.each(["abort", "error"] as const)(
@@ -27178,6 +27188,54 @@ describe("chatStore — background cross-session flush", () => {
       file_id: "file_bg_dedupe",
       filename: "shot.png",
     });
+  });
+
+  it("keeps a background queue upload cancellable when the conversation is opened", async () => {
+    seedSession("conv_upload", []);
+    seedConversationsCache([conv("conv_upload", "idle")]);
+    const file = new File(["picture"], "photo.png", { type: "image/png" });
+    useChatStore.setState({
+      conversationId: "conv_other",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "queued image",
+          conversationId: "conv_upload",
+          agentId: "agent_xyz",
+          files: [file],
+        },
+      ],
+    });
+    let answer!: (response: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          answer = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.getState().flushBackgroundQueues();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    await useChatStore.getState().switchTo("conv_upload");
+    const [bubble] = useChatStore.getState().pendingUserMessages;
+    expect(bubble?.uploadProgress?.filename).toBe(file.name);
+    useChatStore.getState().cancelUploadingSend(bubble!.tempId);
+    answer(mockResponse({ id: "file_photo", name: file.name }));
+    await tick();
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.queuedMessages).toEqual([]);
+    expect(state.failedSendDraft).toMatchObject({
+      text: "queued image",
+      files: [file],
+      replaceComposer: true,
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+      ),
+    ).toBe(false);
   });
 
   it("serializes a background flush behind an in-flight foreground send to the SAME conversation", async () => {
