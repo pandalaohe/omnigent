@@ -2312,6 +2312,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "input_admission_required": True,
                 "input_id": forwarded_event["input_id"],
                 "input_admission_deadline": forwarded_event["input_admission_deadline"],
+                **({"pending_input_claim_required": True} if harness == "claude-native" else {}),
             },
         },
     ]
