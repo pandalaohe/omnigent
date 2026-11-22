@@ -6422,7 +6422,7 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                             return
                         assert await rotation == new_id
                 if old_action == "retry_write":
-                    assert statuses == [503, 200]
+                    assert statuses == [500, 200]
                     assert write_attempts == 2
                 else:
                     assert statuses == [200]

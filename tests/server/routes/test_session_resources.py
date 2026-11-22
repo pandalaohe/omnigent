@@ -2317,14 +2317,14 @@ async def test_transfer_terminal_copies_worktree_onto_a_hostless_row(
             "tunnel closed before request completed",
         ),
         (
-            503,
+            500,
             {
                 "error": {
                     "code": ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED,
                     "message": "Unable to persist the transferred Codex bridge owner",
                 }
             },
-            503,
+            500,
             ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED,
             "Unable to persist the transferred Codex bridge owner",
         ),

@@ -3955,7 +3955,7 @@ async def _read_terminal_instance_id(client: httpx.AsyncClient, path: str) -> st
 
 
 def _is_pre_move_owner_write_failure(response: httpx.Response) -> bool:
-    if response.status_code != httpx.codes.SERVICE_UNAVAILABLE:
+    if response.status_code != httpx.codes.INTERNAL_SERVER_ERROR:
         return False
     try:
         payload = response.json()

@@ -309,7 +309,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
-    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: 503,
+    ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: 500,
     # 503 like RUNNER_UNAVAILABLE: the send succeeds once the host is back.
     ErrorCode.HOST_OFFLINE: 503,
     # 400, not 503: the request reached a replica that can't serve it, but the
