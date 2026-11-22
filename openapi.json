@@ -9704,6 +9704,47 @@
         "title": "QuotaReportWindow",
         "type": "object"
       },
+      "QuotaSourceRejection": {
+        "properties": {
+          "last_valid_at": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "gt": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Valid At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "QuotaSourceRejection",
+        "type": "object"
+      },
       "ReadStatePutRequest": {
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/sessions/{session_id}/read-state`.\n\nSets the *calling user's* read tracking for one session. Mirrors the\ntwo values the web client keeps per session: a \"last seen\" wall-clock\nbaseline (seconds since epoch) and an explicit \"marked unread\"\noverride. The unread dot shows when `updated_at > last_seen` and the\nsession is finished; `unread` separately pins the override so the\nthread the user is *viewing* (or a running one) still surfaces the dot\nwhere the automatic \"seen\" logic would otherwise suppress it.",
@@ -19680,6 +19721,16 @@
             ],
             "title": "Product"
           },
+          "quota_source_rejection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuotaSourceRejection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_at": {
             "anyOf": [
               {
@@ -28806,6 +28857,52 @@
                             ],
                             "title": "Product"
                           },
+                          "quota_source_rejection": {
+                            "anyOf": [
+                              {
+                                "properties": {
+                                  "last_valid_at": {
+                                    "anyOf": [
+                                      {
+                                        "anyOf": [
+                                          {
+                                            "type": "number"
+                                          },
+                                          {
+                                            "type": "integer"
+                                          }
+                                        ],
+                                        "gt": 0
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ],
+                                    "title": "Last Valid At"
+                                  },
+                                  "reason": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 128,
+                                        "minLength": 1,
+                                        "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ],
+                                    "title": "Reason"
+                                  }
+                                },
+                                "title": "QuotaSourceRejection",
+                                "type": "object"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "renews_at": {
                             "anyOf": [
                               {
@@ -30518,6 +30615,52 @@
                           }
                         ],
                         "title": "Product"
+                      },
+                      "quota_source_rejection": {
+                        "anyOf": [
+                          {
+                            "properties": {
+                              "last_valid_at": {
+                                "anyOf": [
+                                  {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "integer"
+                                      }
+                                    ],
+                                    "gt": 0
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ],
+                                "title": "Last Valid At"
+                              },
+                              "reason": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 128,
+                                    "minLength": 1,
+                                    "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ],
+                                "title": "Reason"
+                              }
+                            },
+                            "title": "QuotaSourceRejection",
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
                       },
                       "renews_at": {
                         "anyOf": [

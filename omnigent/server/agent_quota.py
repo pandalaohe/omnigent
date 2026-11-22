@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -68,6 +68,7 @@ from omnigent.usage.contract import (
     AnalysisParentTotal,
     AnalysisSpan,
     PoolTotalView,
+    QuotaSourceRejection,
     UsageAccountView,
     UsageAnalysisView,
     UsageHostView,
@@ -121,6 +122,34 @@ def _fresh(snapshot: dict[str, Any], now: float) -> bool:
         and not isinstance(fresh_until, bool)
         and now <= fresh_until
     )
+
+
+def _source_rejection_text(rejection: dict[str, Any]) -> str:
+    observed = rejection.get("last_valid_at")
+    detail = (
+        f"last valid {datetime.fromtimestamp(observed, UTC):%Y-%m-%d %H:%M} UTC"
+        if observed is not None
+        else "no valid reading"
+    )
+    reason = rejection.get("reason")
+    if reason and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}", reason):
+        detail += f", {reason}"
+    return f"source rejected ({detail})"
+
+
+def _clear_source_rejection(
+    record: dict[str, Any], report: UsageReport | UsageReportV2, now: float
+) -> None:
+    rejection = record.get("quota_source_rejection")
+    if (
+        rejection
+        and report.status == "available"
+        and report.observed_at > (rejection.get("last_valid_at") or rejection["first_verified_at"])
+        and _fresh({"captured_at": report.observed_at, "fresh_until": report.fresh_until}, now)
+        and any(window.resets_at is None or window.resets_at > now for window in report.windows)
+    ):
+        record.pop("quota_source_rejection", None)
+        record.pop("quota_source_only", None)
 
 
 def _safe_id(value: object, fallback: str) -> str:
@@ -496,7 +525,11 @@ class AgentQuotaService:
                         self.snapshot_store.write_in_session(
                             session, owner, self._account_key(account_id), result[1]
                         )
-                    if self.quota_closing_store is not None and report.status == "available":
+                    if (
+                        self.quota_closing_store is not None
+                        and report.status == "available"
+                        and report.quota_source_rejection is None
+                    ):
                         assert session is not None
                         self.quota_closing_store.record_in_session(
                             session,
@@ -697,17 +730,28 @@ class AgentQuotaService:
             ):
                 raise UsageAccountLimitError("at most 32 usage accounts per owner")
         record = previous or {"schema_version": 1, "account_id": account_id, "report_log": []}
+        if report.quota_source_rejection is None:
+            record.pop("quota_source_only", None)
+        elif previous is None:
+            record["quota_source_only"] = True
         record.setdefault(
             "activity_schema_version", (record.get("report") or {}).get("schema_version", 1)
         )
-        record["last_report_at"] = max(
-            observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
-        )
+        if report.quota_source_rejection is None:
+            record["last_report_at"] = max(
+                observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
+            )
         stored = dict(record.get("report") or {})
         # Activity lives in usage_hours; old v1 payloads need not satisfy v2 validation.
         stored.pop("activity", None)
-        stored.update(schema_version=2, observed_at=observed)
+        stored.update(schema_version=2)
+        if report.quota_source_rejection is None:
+            stored["observed_at"] = observed
+        else:
+            stored.setdefault("observed_at", observed)
         fields = report.model_fields_set
+        if report.quota_source_rejection is not None and not record.get("quota_source_only"):
+            fields = set()
         data = report.model_dump(mode="json")
         for name in fields - {
             "windows",
@@ -716,6 +760,7 @@ class AgentQuotaService:
             "status",
             "observed_at",
             "fresh_until",
+            "quota_source_rejection",
         }:
             if name != "pool_relation" or data[name] is not None:
                 stored[name] = data[name]
@@ -727,7 +772,7 @@ class AgentQuotaService:
                 record["product"] = account_id
         record["host_id"] = stored.get("host_id") or record.get("host_id")
         source = report.source or (event or {}).get("source") or record.get("source") or source
-        if source is not None:
+        if source is not None and report.quota_source_rejection is None:
             record["source"] = str(source)[:64]
             record["source_at"] = observed
             stored["source"] = record["source"]
@@ -764,6 +809,21 @@ class AgentQuotaService:
                 windows_changed = True
                 record.update(section)
         record["sections"] = sections
+        previous_rejection = record.get("quota_source_rejection") or {}
+        rejection = report.quota_source_rejection
+        if rejection is not None:
+            last_valid = rejection.last_valid_at
+            if observed >= (previous_rejection.get("captured_at") or 0) and (
+                record.get("read_at") or 0
+            ) <= (last_valid if last_valid is not None else observed):
+                record["quota_source_rejection"] = {
+                    **rejection.model_dump(),
+                    "captured_at": observed,
+                    "fresh_until": report.fresh_until,
+                    "first_verified_at": previous_rejection.get("first_verified_at", observed),
+                }
+        elif windows_changed:
+            _clear_source_rejection(record, report, now)
         stored.setdefault("windows", [])
         stored.setdefault("balances", [])
         if "pinned_window" in fields:
@@ -928,6 +988,7 @@ class AgentQuotaService:
                 record["report"] = report.stored()
                 record["read_at"] = observed
                 record["fresh_until"] = report.fresh_until
+                _clear_source_rejection(record, report, now)
                 marks = dict(record.get("reset_marks") or {})
                 for window in report.windows:
                     span = window_start(window, now)
@@ -1256,7 +1317,12 @@ class AgentQuotaService:
         return payload
 
     def overview(
-        self, owner: str, *, now: float | None = None, include_marks: bool = True
+        self,
+        owner: str,
+        *,
+        now: float | None = None,
+        include_marks: bool = True,
+        display_source_rejections: bool = True,
     ) -> UsageOverview:
         now = time.time() if now is None else now
         tiers, quotas = self._quotas(QuotaContext(owner, None), now=now, all_hosts=True)
@@ -1267,6 +1333,13 @@ class AgentQuotaService:
                 (key[2], deepcopy(record))
                 for key, record in self._accounts.items()
                 if key[:2] == (workspace, owner)
+                and (
+                    not record.get("quota_source_only")
+                    or (
+                        display_source_rejections
+                        and _fresh(record.get("quota_source_rejection") or {}, now)
+                    )
+                )
             ]
             display_records = [
                 (key[2], key[3], deepcopy(record))
@@ -1307,6 +1380,29 @@ class AgentQuotaService:
                 _logger.warning("Could not read usage error marks", exc_info=True)
         if self.event_store is not None:
             self.event_store.record_quota_tiers(owner, accounts, tiers, now)
+        if display_source_rejections:
+            records = dict(account_records)
+            for account in accounts:
+                record = records.get(account.id, {})
+                observation = record.get("quota_source_rejection")
+                if observation is None or not _fresh(observation, now):
+                    continue
+                rejection = QuotaSourceRejection.model_validate(observation)
+                account.quota_source_rejection = rejection
+                account.state = "unknown"
+                account.reason = "source_rejected"
+                account.pace_pct = None
+                account.deciding_window = None
+                account.windows = []
+                account.hosts = []
+                account.period = None
+                account.read_at = rejection.last_valid_at
+                account.age_s = (
+                    max(0.0, now - rejection.last_valid_at)
+                    if rejection.last_valid_at is not None
+                    else None
+                )
+                account.freshness = "old" if account.read_at is not None else "none"
         return UsageOverview(
             generated_at=now,
             tiers=asdict(tiers),
@@ -2021,7 +2117,9 @@ class AgentQuotaService:
         groups = read_provider_groups(self.preferences, context.owner_id)
         return {
             canonical_pool(tile.id, groups): tile
-            for tile in self.overview(context.owner_id, now=now).accounts
+            for tile in self.overview(
+                context.owner_id, now=now, display_source_rejections=False
+            ).accounts
         }
 
     def _native_account(
@@ -2474,13 +2572,34 @@ class AgentQuotaService:
             written += 1
         return written
 
+    def _fresh_source_rejections(
+        self, context: QuotaContext, now: float
+    ) -> dict[str, tuple[str | None, dict[str, Any]]]:
+        workspace = current_workspace_id()
+        with self._lock:
+            return {
+                key[2]: (record.get("product"), rejection)
+                for key, record in self._accounts.items()
+                if key[:2] == (workspace, context.owner_id)
+                and record.get("host_id") in {None, context.host_id}
+                and (rejection := record.get("quota_source_rejection")) is not None
+                and _fresh(rejection, now)
+            }
+
     def context_line(self, context: QuotaContext) -> str:
         now = time.time()
         tiers, quotas = self.quotas(context, now=now)
-        return quota_line(quotas, tiers, now=now) or ""
+        rejections = {
+            product: _source_rejection_text(observation)
+            for product, observation in self._fresh_source_rejections(context, now).values()
+            if product is not None
+        }
+        return quota_line(quotas, tiers, now=now, source_rejections=rejections) or ""
 
     def session_choice_line(self, conversation: Conversation) -> str:
+        from omnigent.models.model_reference import canonical_pool
         from omnigent.runner.routing import routing_host_id
+        from omnigent.server.model_resolution import read_provider_groups
         from omnigent.server.session_choice import (
             active_on,
             choice_document,
@@ -2505,9 +2624,16 @@ class AgentQuotaService:
             if not active_on(settings, context.host_id or ""):
                 return ""
             text = generated_line(settings)
-            readings = self.pool_readings(context)
-            pools = dict.fromkeys(link.meter for link in ordered_links(settings) if link.meter)
             now = time.time()
+            readings = self.pool_readings(context, now=now)
+            rejected_pools = {}
+            if observations := self._fresh_source_rejections(context, now):
+                groups = read_provider_groups(self.preferences, context.owner_id)
+                rejected_pools = {
+                    canonical_pool(account, groups): observation
+                    for account, (_, observation) in observations.items()
+                }
+            pools = dict.fromkeys(link.meter for link in ordered_links(settings) if link.meter)
             floors = (
                 self.preferences.choice_floor_off(context.owner_id) if self.preferences else {}
             )
@@ -2516,7 +2642,10 @@ class AgentQuotaService:
             use_up = []
             for pool in pools:
                 reading = readings.get(pool)
-                if (
+                rejection = rejected_pools.get(pool)
+                if rejection is not None:
+                    quota.append(f"{pool} {_source_rejection_text(rejection)}")
+                elif (
                     reading is not None
                     and reading.freshness == "fresh"
                     and reading.state not in {"ok", "unknown"}

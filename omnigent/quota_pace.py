@@ -227,12 +227,20 @@ def rate_limit_quota(snapshot: object, *, now: float) -> AgentQuota:
     return unknown
 
 
-def quota_line(quotas: Mapping[str, AgentQuota], tiers: QuotaTiers, now: float) -> str | None:
-    if not quotas or _number(now) is None:
+def quota_line(
+    quotas: Mapping[str, AgentQuota],
+    tiers: QuotaTiers,
+    now: float,
+    source_rejections: Mapping[str, str] | None = None,
+) -> str | None:
+    if _number(now) is None or not (quotas or source_rejections):
         return None
+    source_rejections = source_rejections or {}
     parts = []
     for product, quota in quotas.items():
-        if quota.state == "unknown" or quota.pace_pct is None or quota.deciding_window is None:
+        if product in source_rejections:
+            parts.append(f"{product}: {source_rejections[product]}")
+        elif quota.state == "unknown" or quota.pace_pct is None or quota.deciding_window is None:
             parts.append(f"{product}: unknown")
         elif quota.state == "exhausted":
             parts.append(f"{product}: exhausted ({quota.deciding_window})")
@@ -241,6 +249,11 @@ def quota_line(quotas: Mapping[str, AgentQuota], tiers: QuotaTiers, now: float) 
             left = f", resets in {window.time_left_s / 3600:.1f}h" if window else ""
             detail = f"{quota.pace_pct:g}% pace ({quota.deciding_window}{left})"
             parts.append(f"{product}: {quota.state} {detail}")
+    parts.extend(
+        f"{product}: {source_rejections[product]}"
+        for product in source_rejections
+        if product not in quotas
+    )
     floor = "" if tiers.floor_pct is None else f", floor <{tiers.floor_pct:g}% remaining"
     return (
         "Quota now (pace = remaining ÷ time left vs plan average; unknown = ok): "

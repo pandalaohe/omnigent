@@ -302,6 +302,13 @@ class UsageReport(_ReportFields):
         return self
 
 
+class QuotaSourceRejection(BaseModel):
+    last_valid_at: Annotated[_Number, Field(gt=0)] | None = None
+    reason: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$"
+    )
+
+
 class UsageReportV2(_ReportFields):
     schema_version: Literal[2]
     windows: Annotated[list[UsageWindow], Field(max_length=16)] = Field(default_factory=list)
@@ -311,9 +318,18 @@ class UsageReportV2(_ReportFields):
     source: str | None = Field(default=None, max_length=64)
     # Optional: an older reporter omits it, which never erases a stored relation.
     pool_relation: PoolRelationClaim | None = None
+    quota_source_rejection: QuotaSourceRejection | None = None
 
     @model_validator(mode="after")
     def validate_sections(self) -> UsageReportV2:
+        rejection = self.quota_source_rejection
+        if rejection is not None and (
+            self.model_fields_set
+            & {"windows", "balances", "activity", "pinned_window", "pool_relation"}
+            or self.status != "available"
+            or (rejection.last_valid_at is not None and rejection.last_valid_at > self.observed_at)
+        ):
+            raise ValueError("a quota source rejection must be a status-only report")
         for section in (self.windows, self.balances):
             ids = [item.id for item in section]
             if len(ids) != len(set(ids)):
@@ -374,6 +390,7 @@ class UsageAccountView(BaseModel):
     renews_at: float | None = None
     state: str
     reason: str | None = None
+    quota_source_rejection: QuotaSourceRejection | None = None
     deciding_window: str | None = None
     pace_pct: float | None = None
     read_at: float | None = None

@@ -81,6 +81,29 @@ it("keeps independent pool links inside a single account tile, with a main ring 
   expect(open).toHaveBeenCalledWith("Pool B");
 });
 
+it.each(["std", "mini"] as const)("labels cold source rejection in the %s tile", (density) => {
+  const account = usageBoardData().accounts[0];
+  mount(
+    <UsageTile
+      account={{
+        ...account,
+        windows: [],
+        read_at: null,
+        age_s: null,
+        freshness: "none",
+        quota_source_rejection: { last_valid_at: null, reason: "Reset change rejected" },
+      }}
+      density={density}
+      pinnedWindowId={undefined}
+      renewal={null}
+      onOpen={() => {}}
+    />,
+  );
+  expect(
+    screen.getByText("Source rejected · No valid reading · Reset change rejected"),
+  ).toBeVisible();
+});
+
 it("keeps navigation and the tools outside the matched tile composition", () => {
   const name = "Long account name with multiple segments and meaningful suffix";
   mount(
