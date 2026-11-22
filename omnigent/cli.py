@@ -6110,6 +6110,7 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
     from omnigent.host.service import (
         HostServiceError,
         installed_user_host_service,
+        launchd_service_launcher_prefix,
         start_user_host_service,
         stop_user_host_service,
     )
@@ -6122,6 +6123,11 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
         with _upgrade_windows_host_service(snapshot, force=force):
             yield
         return
+    if snapshot is not None and snapshot[0].kind == "launchd":
+        try:
+            launchd_service_launcher_prefix()
+        except HostServiceError as exc:
+            raise click.ClickException(str(exc)) from exc
     _drain_and_stop_local_server(force=force)
     if snapshot is None:
         yield
@@ -11721,6 +11727,19 @@ def host_enable(
             non_interactive=non_interactive or not _stdin_is_tty(),
         )
 
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        launchd_service_launcher_prefix,
+    )
+
+    launchd = not IS_WINDOWS and sys.platform == "darwin"
+    if launchd:
+        try:
+            launchd_service_launcher_prefix()
+        except HostServiceError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
@@ -11746,10 +11765,13 @@ def host_enable(
                 stop_host_tree(processes)
             except (HostServiceError, psutil.Error, OSError, RuntimeError) as exc:
                 raise click.ClickException(str(exc)) from exc
+        if launchd:
+            try:
+                launchd_service_launcher_prefix()
+            except HostServiceError as exc:
+                raise click.ClickException(str(exc)) from exc
         _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
-
-    from omnigent.host.service import HostServiceError, enable_user_host_service
 
     try:
         environment = _build_host_daemon_env(server_url=resolved_server)

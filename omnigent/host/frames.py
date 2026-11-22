@@ -436,7 +436,7 @@ class HostRestartFrame:
 
 @dataclass
 class HostRestartResultFrame:
-    """Admission result, or the host's transition from draining to stopping."""
+    """Admission result, or the host's transition from draining to stopping or failed."""
 
     request_id: str
     accepted: bool

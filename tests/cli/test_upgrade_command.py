@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -188,6 +190,90 @@ def test_upgrade_preserves_enabled_service(
         assert installed.path.read_bytes() == original
     if outcome in {"refresh-failure", "write-failure", "spawn-failure"}:
         assert "Failed to refresh the host user service" in result.output
+
+
+@pytest.mark.parametrize("usable", [True, False], ids=["configured", "missing"])
+def test_up_validates_and_rerenders_launchd_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, usable: bool
+) -> None:
+    from omnigent import cli as cli_module
+    from omnigent.host import service
+
+    launcher = tmp_path / "service launcher"
+    previous_prefix = []
+    if usable:
+        launcher.touch(mode=0o700)
+        previous_prefix = [str(launcher)]
+    (tmp_path / "config.yaml").write_text(f"host:\n  service_launcher: ['{launcher}']\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    installed = service.HostService(
+        "launchd", tmp_path / "service.plist", service.LAUNCHD_LABEL, tmp_path / "service.log"
+    )
+    original = service._launchd_payload(
+        installed,
+        command=[
+            *previous_prefix,
+            "/opt/old/bin/python",
+            "-P",
+            "-m",
+            "omnigent.host.service_entry",
+            "--local",
+        ],
+        environment={"PATH": "/old/bin"},
+    )
+    installed.path.write_bytes(original)
+    monkeypatch.setattr(service, "_service_for_current_platform", lambda: installed)
+    monkeypatch.setattr(service, "_current_uid", lambda: 501)
+    monkeypatch.setattr(service, "_record_service", lambda _: None)
+    monkeypatch.setattr(cli_module, "_find_daemon_record", lambda _: None)
+    monkeypatch.setattr(cli_module, "_build_host_daemon_env", lambda **_: {"PATH": "/new/bin"})
+    events: list[str] = []
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "launchctl":
+            events.append(argv[1])
+            return subprocess.CompletedProcess(argv, int(argv[1] == "print"), "", "")
+        assert argv[1:6] == ["-P", "-m", "omnigent", "host", "enable"]
+        events.append("refresh")
+        refresh = CliRunner().invoke(cli_module.host_enable, argv[6:])
+        assert refresh.exit_code == 0, refresh.output
+        return subprocess.CompletedProcess(argv, refresh.exit_code, refresh.output, "")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+    monkeypatch.setattr(
+        cli_module, "_drain_and_stop_local_server", lambda **_: events.append("drain")
+    )
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command", lambda *_: events.append("install") or 0
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", "b" * 40)
+    )
+
+    result = CliRunner().invoke(cli, ["up", "--force"])
+
+    assert result.exit_code == int(not usable), result.output
+    if usable:
+        assert events == [
+            "drain",
+            "bootout",
+            "print",
+            "install",
+            "refresh",
+            "bootout",
+            "bootstrap",
+        ]
+        payload = plistlib.loads(installed.path.read_bytes())
+        assert payload["ProgramArguments"] == [str(launcher), *service._service_command(None)]
+        assert payload["EnvironmentVariables"] == {"PATH": "/new/bin"}
+        assert service.installed_user_host_service() == (installed, None)
+    else:
+        assert "host.service_launcher" in result.output
+        assert events == []
+        assert installed.path.read_bytes() == original
 
 
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])

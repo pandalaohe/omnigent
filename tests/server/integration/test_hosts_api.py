@@ -1339,7 +1339,8 @@ async def test_launch_runner_404_unknown_host(
     assert resp.status_code == 404
 
 
-async def test_restart_round_trip_over_fake_tunnel(host_api_app):
+@pytest.mark.parametrize("launcher_failed", [False, True])
+async def test_restart_round_trip_over_fake_tunnel(host_api_app, launcher_failed):
     from unittest.mock import AsyncMock
 
     from omnigent.host.frames import CAP_HOST_RESTART, HostRestartFrame, HostRestartResultFrame
@@ -1404,35 +1405,50 @@ async def test_restart_round_trip_over_fake_tunnel(host_api_app):
         request_id = response.json()["request_id"]
         status_path = f"/v1/hosts/{_HOST_ID}/restart/{request_id}"
         assert (await client.get(status_path)).json()["phase"] == "draining"
+        phase = "failed" if launcher_failed else "stopping"
+        reason = (
+            "host.service_launcher executable is missing or not executable: /opt/work/launcher"
+            if launcher_failed
+            else None
+        )
         await comm.send_input(
             {
                 "type": "websocket.receive",
                 "text": encode_host_frame(
-                    HostRestartResultFrame(frame.request_id, True, phase="stopping")
+                    HostRestartResultFrame(
+                        frame.request_id, not launcher_failed, reason, phase=phase
+                    )
                 ),
             }
         )
         for _ in range(100):
-            if (await client.get(status_path)).json()["phase"] == "stopping":
+            if (await client.get(status_path)).json()["phase"] == phase:
                 break
             await asyncio.sleep(0.01)
-        assert (await client.get(status_path)).json()["phase"] == "stopping"
-        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-        await comm.wait(timeout=budget(2))
-        assert (await client.get(status_path)).json()["phase"] == "waiting_reconnect"
-        new_comm = await _connect_host(
-            app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=2
-        )
-        assert (await client.get(status_path)).json()["phase"] == "done"
+        status = (await client.get(status_path)).json()
+        assert status["phase"] == phase
+        if launcher_failed:
+            assert status["reason"] == reason
+            assert status["offline_seconds"] is None
+            assert status["cut_sessions"] == []
+            assert registry.restarts.active == {}
+        else:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(2))
+            assert (await client.get(status_path)).json()["phase"] == "waiting_reconnect"
+            comm = await _connect_host(
+                app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=2
+            )
+            assert (await client.get(status_path)).json()["phase"] == "done"
         for _ in range(100):
             if post_event.await_count:
                 break
             await asyncio.sleep(0.01)
         assert post_event.await_args.kwargs["acting_user_id"] is None
         assert post_event.await_args.args[1] == requester.id
-        assert "done" in post_event.await_args.args[2].data["content"][0]["text"]
-        await new_comm.send_input({"type": "websocket.disconnect", "code": 1000})
-        await new_comm.wait(timeout=budget(2))
+        assert (reason or "done") in post_event.await_args.args[2].data["content"][0]["text"]
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2))
     await registry.restarts.shutdown()
 
 

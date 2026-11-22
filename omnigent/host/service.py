@@ -7,6 +7,7 @@ import platform
 import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import yaml
+
+from omnigent.config import global_config_path, load_global_config
 from omnigent.process_logging import data_dir
 
 LAUNCHD_LABEL = "ai.omnigent.host"
@@ -24,6 +28,7 @@ SYSTEMD_UNIT = "omnigent-host.service"
 _LAUNCHD_UNLOAD_TIMEOUT = 10.0
 _LAUNCHD_UNLOAD_POLL_INTERVAL = 0.2
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class HostServiceError(RuntimeError):
@@ -84,6 +89,35 @@ def _service_command(server_url: str | None) -> list[str]:
     """Build the persistent service entry-point command."""
     mode = ["--server", server_url] if server_url else ["--local"]
     return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
+
+
+def launchd_service_launcher_prefix() -> list[str]:
+    """Read and validate the host owner's optional launchd argv prefix."""
+    path = global_config_path()
+    try:
+        config = load_global_config(path)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise HostServiceError(f"Cannot read host service configuration from {path}.") from exc
+    host = config.get("host") if isinstance(config, dict) else None
+    if not isinstance(host, dict) or "service_launcher" not in host:
+        return []
+
+    prefix = host["service_launcher"]
+    setting = f"host.service_launcher in {path}"
+    if (
+        not isinstance(prefix, list)
+        or not prefix
+        or not all(isinstance(arg, str) for arg in prefix)
+    ):
+        raise HostServiceError(f"{setting} must be a nonempty list of string arguments.")
+    if any(_CONTROL_CHAR_RE.search(arg) for arg in prefix):
+        raise HostServiceError(f"{setting} arguments must not contain control characters.")
+    executable = os.path.expanduser(prefix[0])
+    if not os.path.isabs(executable):
+        raise HostServiceError(f"{setting} must start with an absolute executable path.")
+    if shutil.which(executable) is None:
+        raise HostServiceError(f"{setting} executable is missing or not executable: {executable}")
+    return [executable, *prefix[1:]]
 
 
 def _clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
@@ -318,7 +352,7 @@ def enable_user_host_service(
     if service.kind == "launchd":
         content = _launchd_payload(
             service,
-            command=command,
+            command=[*launchd_service_launcher_prefix(), *command],
             environment=clean_environment,
         )
         _enable_launchd(service, content)
@@ -413,6 +447,13 @@ def installed_user_host_service() -> tuple[HostService, str | None] | None:
             command = payload.get("ProgramArguments", [])
             if not isinstance(command, list) or not all(isinstance(p, str) for p in command):
                 raise ValueError("Expected program arguments")
+            # The service mode is always at the end, after any launcher flags.
+            if command[-2:-1] == ["--server"]:
+                target = command[-1]
+            elif command[-1:] == ["--local"]:
+                target = None
+            else:
+                raise ValueError("Expected a host service mode")
         else:
             for line in content.decode().splitlines():
                 if line.startswith("ExecStart="):
@@ -422,7 +463,7 @@ def installed_user_host_service() -> tuple[HostService, str | None] | None:
                         for part in shlex.split(line[len("ExecStart=") :])
                     ]
                     break
-        target = None if "--local" in command else command[command.index("--server") + 1]
+            target = None if "--local" in command else command[command.index("--server") + 1]
     except (OSError, ValueError, IndexError, plistlib.InvalidFileException) as exc:
         raise HostServiceError(
             f"Cannot read the target of the installed host service {service.path}."

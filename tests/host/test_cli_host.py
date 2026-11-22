@@ -377,6 +377,48 @@ def _record_for(target: str) -> cli_module._HostDaemonRecord:
 
 
 @pytest.mark.parametrize(
+    "failure", ["missing", "not-executable", "removed-during-drain", "\x00", "\x01", "\n"]
+)
+def test_host_enable_rejects_unusable_launchd_launcher_before_replacing_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    target = "https://server.example.com"
+    launcher = tmp_path / "launcher"
+    controls = ("\x00", "\x01", "\n")
+    if failure != "missing":
+        launcher.touch(mode=0o600 if failure == "not-executable" else 0o700)
+    prefix = [str(launcher), failure] if failure in controls else [str(launcher)]
+    (tmp_path / "config.yaml").write_text(f"host:\n  service_launcher: {json.dumps(prefix)}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_module, "_ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_find_daemon_record", _record_for)
+
+    def _unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("An invalid launcher must not drain, terminate or replace the host")
+
+    if failure == "removed-during-drain":
+        monkeypatch.setattr(cli_module, "_daemon_owner_is_live", lambda _: True)
+        monkeypatch.setattr(
+            cli_module, "_wait_for_running_sessions", lambda *a, **k: launcher.unlink()
+        )
+    else:
+        monkeypatch.setattr(cli_module, "_wait_for_running_sessions", _unexpected)
+    monkeypatch.setattr(cli_module, "_record_daemon_stop_requested", _unexpected)
+    monkeypatch.setattr(cli_module, "_terminate_daemon", _unexpected)
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _unexpected)
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target])
+
+    assert result.exit_code == 1, result.output
+    assert "host.service_launcher" in result.output
+    if failure in controls:
+        assert "arguments must not contain control characters" in result.output
+    else:
+        assert f"executable is missing or not executable: {launcher}" in result.output
+
+
+@pytest.mark.parametrize(
     ("args", "listings", "waits"),
     [
         pytest.param([], [2, 1, 0], True, id="waits-for-running-turns"),
