@@ -472,14 +472,21 @@ async def test_idle_edge_without_pending_rotation_injects_nothing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("succession_status", ["done", "pending", "noop", "retired"])
-async def test_pi_rpc_turn_end_releases_only_after_succession(succession_status: str) -> None:
+@pytest.mark.parametrize("refused", [False, True])
+async def test_pi_rpc_turn_end_releases_only_after_succession(
+    succession_status: str, refused: bool
+) -> None:
     server = _RotationServerClient(harness="pi", succession_status=succession_status)
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = _build_app(server, manager)
     async with _runner_client(app, permission_harness="pi") as client:
         await _seed_session(client)
         runner_app.record_pending_rotation(CONV_ID)
-        app.state.on_proxy_stream_end(CONV_ID)
+        app.state.on_proxy_stream_end(
+            CONV_ID,
+            admission_refused=refused,
+            error={"message": "Input execution admission refused"} if refused else None,
+        )
         deadline = asyncio.get_running_loop().time() + 2.0
         while not server.succession and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)

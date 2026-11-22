@@ -2240,7 +2240,7 @@ def register_peer_routes(
             return "deferred"
         try:
             result = await post_event_impl(
-                PeerSweeper._synthetic_request(parent_id, child_idle._app),
+                PeerSweeper._synthetic_request(parent_id, child_idle._app, runtime_notice=True),
                 parent_id,
                 SessionEventInput(
                     type="message",

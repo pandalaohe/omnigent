@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import threading
@@ -343,6 +344,82 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
         "session.subagent.returned",
     ]
     assert items[-1].data.resource["status"] == outcome
+
+
+@pytest.mark.parametrize("real_turn_first", [False, True])
+@pytest.mark.asyncio
+async def test_skipped_admission_does_not_count_as_returned_activity(db_uri, real_turn_first):
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, title="worker")
+    release = asyncio.Event()
+    release.set()
+    events = [
+        {"type": "response.in_progress", "response": {"id": "notice"}},
+        {
+            "type": "response.completed",
+            "response": {"id": "notice"},
+            "input_execution_skipped": "refused",
+        },
+        {"type": "session.status", "status": "idle"},
+    ]
+    if real_turn_first:
+        events[:0] = [
+            {"type": "response.in_progress", "response": {"id": "real"}},
+            {"type": "response.completed", "response": {"id": "real"}},
+        ]
+    await _relay_runner_stream_once(child.id, _ScriptedRunnerClient(release, events), store)
+    returned = store.list_items(parent.id, type="resource_event").data
+    assert len(returned) == int(real_turn_first)
+    if real_turn_first:
+        assert returned[0].data.resource["status"] == "completed"
+        key = hashlib.sha256(f"{child.id}:returned:real".encode()).hexdigest()[:32]
+        assert returned[0].response_id == f"subagent_{key}"
+
+
+@pytest.mark.parametrize("case", ["notice", "another_attempt", "user", "claimed", "unknown"])
+@pytest.mark.asyncio
+async def test_native_relay_discards_only_the_refused_runtime_notice(db_uri, case):
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation(harness_override="claude-native")
+    pending_id = pending_inputs.record(
+        session.id,
+        [{"type": "input_text", "text": "queued input"}],
+        runtime_notice=case != "user",
+        runner_managed=True,
+    )
+    attempt = pending_inputs.delivery_attributes_for(session.id, pending_id)["delivery_attempt_id"]
+    if case == "claimed":
+        assert pending_inputs.claim_runner_input(session.id, pending_id, "claim")
+    release = asyncio.Event()
+    release.set()
+    await _relay_runner_stream_once(
+        session.id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {"type": "response.in_progress", "response": {"id": "turn"}},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "turn"},
+                    "input_execution_skipped": "unknown" if case == "unknown" else "refused",
+                    "pending_id": pending_id,
+                    "delivery_attempt_id": "a" * 32 if case == "another_attempt" else attempt,
+                },
+            ],
+        ),
+        store,
+    )
+    assert (pending_inputs.runner_lease_remaining(session.id, pending_id) is None) == (
+        case == "notice"
+    )
+    assert store.list_items(session.id, type="error").data == []
+    pending_inputs.resolve(session.id, pending_id)
 
 
 @pytest.mark.parametrize(

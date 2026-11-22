@@ -18045,7 +18045,7 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
-async def test_unknown_admission_does_not_fail_independent_native_execution(monkeypatch, native):
+async def test_unknown_admission_does_not_fail_the_session(monkeypatch, native):
     from omnigent.runner import app as runner_app
 
     monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
@@ -18065,9 +18065,9 @@ async def test_unknown_admission_does_not_fail_independent_native_execution(monk
     events = []
     while not queue.empty():
         events.append(queue.get_nowait())
-    assert any(
-        e.get("type") == "session.status" and e.get("status") == "failed" for e in events
-    ) is (not native)
+    assert [e.get("status") for e in events if e.get("type") == "session.status"] == (
+        [] if native else ["idle"]
+    )
     app.state.session_event_queues.pop("child", None)
 
 

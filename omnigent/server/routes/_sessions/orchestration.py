@@ -10448,6 +10448,7 @@ async def _forward_event_to_runner(
         )
     runner_body.pop("input_generation", None)
     runner_body.pop("_input_admission_required", None)
+    runner_body.pop("_runtime_notice", None)
     if body.data.get("_input_admission_required") is True:
         runner_body["input_admission_required"] = True
         runner_body["input_id"] = persisted_items[0].id
@@ -10919,6 +10920,8 @@ async def _forward_event_to_runner(
             )
         if (
             not sdk_peer
+            and retry_guard is None
+            and final_input is None
             and startup_attempt is None
             and not (startup_context is not None and startup_context.recovery_id is not None)
         ):
@@ -11599,6 +11602,7 @@ async def _dispatch_session_event_to_runner_impl(
                     content,
                     created_by=created_by,
                     stable_id=web_stable_id,
+                    runtime_notice=body.data.get("_runtime_notice") is True,
                     background_titles_enabled=background_titles_enabled,
                     admission_id=usage_admission["admission_id"] if usage_admission else None,
                     auto_retry=(
@@ -12862,7 +12866,11 @@ async def _relay_runner_stream_once(
 
                     if evt_type == "session.status":
                         status = event.get("status", "")
-                        if status in {"idle", "failed"} and pending_subagent_return_id is not None:
+                        if (
+                            status in {"idle", "failed"}
+                            and current_response_id is None
+                            and pending_subagent_return_id is not None
+                        ):
                             await record_subagent_activity(
                                 session_id,
                                 "returned",
@@ -13014,7 +13022,6 @@ async def _relay_runner_stream_once(
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
                         _turn_start_s = time.monotonic()
-                        pending_subagent_return_id = None
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
@@ -13166,11 +13173,14 @@ async def _relay_runner_stream_once(
                         # still persists the sentinel, not the denied text.
                         if _deny_reason is not None and text_acc:
                             _llm_response_denied_turns[session_id] = _deny_reason
-                        pending_subagent_return_id = current_response_id
-                        pending_subagent_return_status = {
-                            "response.failed": "failed",
-                            "response.cancelled": "cancelled",
-                        }.get(evt_type, "completed")
+                        # A skipped opener cannot replace an executed turn that
+                        # was waiting for the final idle edge of a buffered drain.
+                        if event.get("input_execution_skipped") not in ("refused", "unknown"):
+                            pending_subagent_return_id = current_response_id
+                            pending_subagent_return_status = {
+                                "response.failed": "failed",
+                                "response.cancelled": "cancelled",
+                            }.get(evt_type, "completed")
 
                     delivery_identity = _native_delivery_error_identity(event)
                     error_item = _error_item_from_sse(
@@ -13180,6 +13190,17 @@ async def _relay_runner_stream_once(
                     )
                     pending_id = event.get("pending_id")
                     attempt_id = event.get("delivery_attempt_id")
+                    if (
+                        evt_type == "response.completed"
+                        and event.get("input_execution_skipped") == "refused"
+                        and event.get("input_received") is not True
+                        and isinstance(pending_id, str)
+                        and isinstance(attempt_id, str)
+                    ):
+                        async with _native_mirror_lock(session_id):
+                            pending_inputs.discard_refused_notice(
+                                session_id, pending_id, attempt_id
+                            )
                     reason_code = (
                         _native_input_reason_code(event) if evt_type == "response.failed" else ""
                     )

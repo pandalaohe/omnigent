@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -100,13 +101,14 @@ class _HistoryServerClient:
 class _CatchUpServerClient(_HistoryServerClient):
     """Return no history until the test exposes a missed user item."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, items_page: dict[str, Any] | None = None) -> None:
         self.expose_item = False
+        self.items_page = _ITEMS_PAGE if items_page is None else items_page
 
     async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
         del kwargs
         if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
-            page = _ITEMS_PAGE if self.expose_item else {"data": [], "has_more": False}
+            page = self.items_page if self.expose_item else {"data": [], "has_more": False}
             return self._Resp(page)
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
@@ -1008,6 +1010,103 @@ async def test_catch_up_replay_drops_forward_of_its_item() -> None:
     assert len(harness.posted_bodies) == 1, (
         f"catch-up replay ran the harness {len(harness.posted_bodies)} times"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "older_items",
+    [
+        pytest.param([], id="single-item"),
+        pytest.param(
+            [
+                {
+                    **_PENDING_USER_MESSAGE,
+                    "id": "msg_older",
+                    "content": [{"type": "input_text", "text": "older input"}],
+                }
+            ],
+            id="older-user-item",
+        ),
+    ],
+)
+async def test_catch_up_leaves_buffered_forward_for_fifo_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    older_items: list[dict[str, Any]],
+) -> None:
+    from omnigent.runner import session_history
+    from omnigent.runner.app import _session_histories_ref
+    from tests._helpers.polling import poll_until_async
+
+    server = _CatchUpServerClient(
+        items_page={**_ITEMS_PAGE, "data": [*older_items, _PENDING_USER_MESSAGE]}
+    )
+    app, _pm, harness = _build_sdk_app(server)
+    resolving_history = asyncio.Event()
+    release_history = asyncio.Event()
+    resolve = session_history._resolve_forwarded_message_content
+
+    async def hold_history(content: list[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
+        resolving_history.set()
+        await release_history.wait()
+        return await resolve(content, **kwargs)
+
+    earlier = {
+        "type": "message",
+        "role": "user",
+        "agent_id": AGENT_ID,
+        "content": [{"type": "input_text", "text": "queued first"}],
+        "persisted_item_id": "msg_first",
+    }
+    later = {
+        **earlier,
+        "content": _PENDING_USER_MESSAGE["content"],
+        "persisted_item_id": _PENDING_USER_MESSAGE["id"],
+        "input_id": "d" * 32,
+        "input_admission_required": True,
+        "input_admission_deadline": time.time() + 30,
+    }
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True)
+        )
+        assert init.status_code == 201, init.text
+        _session_histories_ref[SESSION_ID] = []
+        # The old turn freed its slot, with C waiting for the drain to take it.
+        app.state.session_message_buffers[SESSION_ID] = [earlier]
+        server.expose_item = True
+        monkeypatch.setattr(session_history, "_resolve_forwarded_message_content", hold_history)
+        try:
+            scan = asyncio.create_task(app.state.catch_up_scan())
+            try:
+                await asyncio.wait_for(resolving_history.wait(), timeout=5)
+                forward = await client.post(f"/v1/sessions/{SESSION_ID}/events", json=later)
+                assert forward.status_code == 202, forward.text
+                assert forward.json()["status"] == "buffered"
+            finally:
+                release_history.set()
+                await asyncio.wait_for(scan, timeout=5)
+
+            assert SESSION_ID not in app.state.active_turns, "catch-up replayed while D was queued"
+            assert [item["id"] for item in _session_histories_ref[SESSION_ID]] == [
+                item["id"] for item in older_items
+            ]
+            await app.state.check_and_start_next_turn(SESSION_ID)
+            await poll_until_async(
+                lambda: (
+                    not app.state.session_message_buffers.get(SESSION_ID)
+                    and SESSION_ID not in app.state.active_turns
+                ),
+                timeout_s=5,
+            )
+            assert [body["persisted_item_id"] for body in harness.posted_bodies] == [
+                earlier["persisted_item_id"],
+                later["persisted_item_id"],
+            ]
+            assert harness.posted_bodies[-1]["input_id"] == later["input_id"]
+            assert harness.posted_bodies[-1]["input_admission_required"] is True
+        finally:
+            _session_histories_ref.pop(SESSION_ID, None)
 
 
 @pytest.mark.asyncio
