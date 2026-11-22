@@ -7439,6 +7439,63 @@ def test_status_line_clipped_pane_reads_as_a_clipped_draft() -> None:
     assert bridge._clipped_draft_rows(_persons_btw_over(_STATUS_LINE_CLIPPED_PANE)) is None
 
 
+def test_next_send_refuses_an_unrecognized_leftover_paste_without_typing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    assert not bridge._occupied_tall_draft(pane)
+    assert bridge._composer_box(pane) is None
+    next_message = "Please read this next message."
+    visible = pane
+    bridge_dir, mutations, clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: _composer_pane(next_message) if mutations.count("paste") > 1 else visible,
+    )
+    commands: list[str] = []
+    run = subprocess.run
+
+    def record_writes(cmd: list[str], **kwargs: Any) -> Any:
+        commands.extend(op for op in ("send-keys", "load-buffer", "paste-buffer") if op in cmd)
+        return run(cmd, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", record_writes)
+    with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=_STATUS_LINE_CLIPPED_CONTENT, timeout_s=2)
+
+    assert clock.now == pytest.approx(2, abs=0.3)
+    assert mutations == ["paste"]
+    commands.clear()
+    before_retry = clock.now
+    with pytest.raises(bridge.ClaudeMessageNotAccepted, match="draft"):
+        inject_user_message(bridge_dir, content=next_message, timeout_s=3)
+    with pytest.raises(bridge.ClaudeMessageNotAccepted, match="draft"):
+        bridge.inject_slash_command(bridge_dir, command="/model sonnet", wait_for_startup=True)
+
+    assert clock.now - before_retry < 0.6
+    assert commands == []
+    assert mutations == ["paste"]
+
+    # Once the person clears the composer, a new attempt can paste and submit normally.
+    visible = _composer_pane()
+    assert inject_user_message(bridge_dir, content=next_message, timeout_s=3)
+    assert mutations == ["paste", "paste", "submit"]
+
+
+def test_unrecognized_paste_observation_excludes_echoes_and_dialogs() -> None:
+    bridge = claude_native_bridge
+    pane = _STATUS_LINE_CLIPPED_PANE.split("\n", 2)[-1]
+    tail = bridge._submit_tail_needle(_STATUS_LINE_CLIPPED_CONTENT)
+
+    assert bridge._unrecognized_paste_left_in_composer(pane, tail)
+    assert not bridge._unrecognized_paste_left_in_composer(pane, "unrelated paste tail")
+    assert not bridge._unrecognized_paste_left_in_composer(f"{pane}\n{_composer_pane()}", tail)
+    assert not bridge._unrecognized_paste_left_in_composer(
+        f"{pane}\nEnter to confirm · Esc to cancel", tail
+    )
+
+
 def test_inject_user_message_submits_the_status_line_clipped_draft_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

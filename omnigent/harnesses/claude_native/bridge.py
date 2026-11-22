@@ -6198,6 +6198,7 @@ def _wait_for_unobserved_paste(
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
     another_prompt_observed = False
+    pane = ""
     while time.monotonic() < deadline:
         _check_injection_cancelled()
         if not owns_paste():
@@ -6235,10 +6236,39 @@ def _wait_for_unobserved_paste(
                 )
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if (
+        not another_prompt_observed
+        and _unrecognized_paste_left_in_composer(pane, tail_needle)
+        and owns_paste()
+    ):
+        _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True, unrecognized=True)
     delivery_diagnostics.record_details(verification="unconfirmed_paste")
     raise ClaudeDeliveryUnconfirmed(
         "Claude did not confirm this pasted message. It may already be queued or running. "
         "Inspect the terminal before retrying."
+    )
+
+
+def _unrecognized_paste_left_in_composer(pane: str, tail_needle: str) -> bool:
+    """Match a paste before a lone closing rule, for protecting the draft only."""
+    target = _comparable_draft_text(tail_needle)
+    lines = pane.splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    if not target or len(rules) != 1 or _box_rule_start(lines[rules[0]]) != 0:
+        return False
+    closing = rules[0]
+    rows = [line for line in lines[:closing] if line.strip()]
+    footer = [line.strip() for line in lines[closing + 1 :] if line.strip()]
+    return (
+        bool(rows)
+        and all(row.startswith("  ") for row in rows)
+        and _comparable_draft_text("".join(rows)).endswith(target)
+        and not _occupied_tall_draft(pane)
+        and not _claude_prompt_rendered(pane)
+        and not any(_DIALOG_FOOTER_RE.search(line) for line in footer)
+        and not _history_search_footer_shown(pane)
+        and not _btw_overlay_present(pane)
+        and _terminal_dialog_headline(pane) is None
     )
 
 
@@ -9169,7 +9199,12 @@ def _chat_composer_empty(pane: str) -> bool:
 
 
 def _set_protected_draft(
-    bridge_dir: Path, socket_path: str, tmux_target: str, *, protect: bool
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    protect: bool,
+    unrecognized: bool = False,
 ) -> None:
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
     with _bridge_metadata_write_lock(bridge_dir):
@@ -9177,22 +9212,33 @@ def _set_protected_draft(
             return
         state = _read_json_file(bridge_dir / _STATE_FILE)
         if protect:
-            state["protected_draft_tmux"] = identity
+            key = "unrecognized_draft_tmux" if unrecognized else "protected_draft_tmux"
+            state[key] = identity
         else:
             state.pop("protected_draft_tmux", None)
+            state.pop("unrecognized_draft_tmux", None)
         _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def _require_protected_draft_clear(
     bridge_dir: Path, socket_path: str, tmux_target: str, *, pane: str | None = None
 ) -> bool:
-    """Fence a previously clipped draft until the same pane shows an empty chat composer."""
+    """Protect a leftover draft until the same pane shows an empty chat composer."""
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
-    if _read_json_file(bridge_dir / _STATE_FILE).get("protected_draft_tmux") != identity:
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    clipped = state.get("protected_draft_tmux") == identity
+    unrecognized = state.get("unrecognized_draft_tmux") == identity
+    if not clipped and not unrecognized:
         return False
     if pane is None:
         pane = _capture_pane(socket_path, tmux_target)
     if not _chat_composer_empty(pane):
+        if not clipped:
+            # Unlike an ordinary clipped draft, this refusal must bypass the executor's hold.
+            raise ClaudeMessageNotAccepted(
+                "Claude Code may still have a draft from the previous send. The message was "
+                "not delivered. Open the terminal and review the draft before resending."
+            )
         raise ClaudeInputBoxOccupied(
             "Claude Code's input box still holds a draft. Clear it in the terminal to continue.",
             surface=_SCROLLED_DRAFT_SURFACE,
