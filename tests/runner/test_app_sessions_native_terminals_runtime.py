@@ -6335,7 +6335,8 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                     restarted.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
                     restarted.setattr(orchestration, "_AUTO_FORWARDER_TASKS", {})
                     fresh_app = create_runner_app(
-                        server_client=server, terminal_registry=TerminalRegistry()
+                        server_client=cast(httpx.AsyncClient, server),
+                        terminal_registry=TerminalRegistry(),
                     )
                     async with httpx.AsyncClient(
                         transport=httpx.ASGITransport(app=fresh_app), base_url="http://runner"
