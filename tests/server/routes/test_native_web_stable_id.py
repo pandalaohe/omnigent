@@ -109,9 +109,10 @@ async def test_text_matched_mirror_names_its_web_send(
     assert receipt["data"]["web_stable_id"] == _WEB_ID
 
 
+@pytest.mark.parametrize("attachment_kind", ["image", "file"])
 @pytest.mark.asyncio
 async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_position(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, attachment_kind: str
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(
@@ -121,16 +122,49 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
     before = {"type": "input_text", "text": "See this screenshot."}
     after = {"type": "input_text", "text": "Check the red dot."}
-    image = {"type": "input_image", "file_id": "file_image", "filename": "status.png"}
-    content = [before, image, after]
-    # Same authored text, but the image sits elsewhere in the still-queued send.
-    unread = pending_inputs.record(conv.id, [before, after, image], runner_managed=True)
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.attachments_root", lambda: tmp_path / "attachments"
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.attachment_cache_dir",
+        lambda _bridge_dir: tmp_path / "attachments" / ("c" * 32),
+    )
+    filename, mime = (
+        ("status.png", "image/png")
+        if attachment_kind == "image"
+        else ("status.zip", "application/zip")
+    )
+    upload = {"type": f"input_{attachment_kind}", "file_id": "file_upload", "filename": filename}
+    content = [before, upload, after]
+    older = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Unclaimed"}])
+    # Same authored text and attachment position, but a different attempt and upload.
+    unread = pending_inputs.record(
+        conv.id, [before, {**upload, "file_id": "file_unread"}, after], runner_managed=True
+    )
     read = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
     assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
     assert pending_inputs.claim_runner_input(conv.id, read, "claim_read")
 
-    queued = '<pasted_content id="paste">\nSee this screenshot.\n\n[Attached: /tmp/status.png]'
-    queued += '\n\nCheck the red dot.\n</pasted_content id="paste">'
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"\0", headers={"Content-Type": mime})
+        return httpx.Response(
+            200, json={"name": filename, "content_type": mime, "metadata": {"bytes": 1}}
+        )
+
+    attempt = str(pending_inputs.delivery_attributes_for(conv.id, read)["delivery_attempt_id"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="https://test"
+    ) as client:
+        resolved = await _resolve_forwarded_message_content(
+            content, session_id=conv.id, server_client=client, delivery_attempt_id=attempt
+        )
+    prompt = claude_native_executor._content_to_text(
+        _normalize_message_content(resolved), tmp_path, attempt_id=attempt
+    )
+    assert f"omnigent-upload-{attempt}-0" in prompt
+
+    queued = f'<pasted_content id="paste">\n{prompt}\n</pasted_content id="paste">'
     queue_record = {"type": "queue-operation", "sessionId": "claude-session", "content": queued}
 
     def assistant(uuid: str, text: str) -> dict[str, Any]:
@@ -160,7 +194,7 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
         )
         for item in first.items:
             await _post_external_conversation_item(client, session_id=conv.id, item=item)
-        assert pending_inputs.pending_ids(conv.id) == [unread, read]
+        assert pending_inputs.pending_ids(conv.id) == [older, unread, read]
 
         records = [
             {
@@ -197,7 +231,7 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
         for item in second.items:
             await _post_external_conversation_item(client, session_id=conv.id, item=item)
 
-    assert pending_inputs.pending_ids(conv.id) == [unread]
+    assert pending_inputs.pending_ids(conv.id) == [older, unread]
     persisted = store.list_items(conv.id, order="asc").data
     assert len(persisted) == 3
     receipts = [call.args[1] for call in publish.call_args_list]
@@ -211,6 +245,42 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
     assert receipts[1]["data"]["cleared_pending_id"] == read
     assert receipts[1]["data"]["data"]["content"] == content
     assert receipts[1]["data"]["data"]["web_stable_id"] == _WEB_ID
+
+
+@pytest.mark.parametrize("tagged", [False, True])
+@pytest.mark.asyncio
+async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, tagged: bool
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    content = [
+        {"type": "input_text", "text": "See this screenshot."},
+        {"type": "input_image", "file_id": "file_unread", "filename": "same-name.png"},
+        {"type": "input_text", "text": "Check the red dot."},
+    ]
+    unread = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
+    assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
+    path = f"/opt/work/attachments/{'c' * 32}/"
+    if tagged:
+        path += f"omnigent-upload-{'d' * 32}-0-"
+    prompt = f"See this screenshot.\n\n[Attached: {path}same-name.png]\n\nCheck the red dot."
+
+    item_id, replay = await _persist_external_conversation_item(
+        conv.id, conv, _mirror(prompt), store
+    )
+
+    assert item_id and not replay
+    item = store.get_item(conv.id, item_id)
+    assert item is not None and "web_stable_id" not in item.to_api_dict()
+    assert pending_inputs.pending_ids(conv.id) == [unread]
+    assert all(
+        call.args[1]["data"].get("cleared_pending_id") is None
+        for call in publish.call_args_list
+        if call.args[1]["type"] == "session.input.consumed"
+    )
 
 
 @pytest.mark.parametrize("files", [("image",), ("zip",), ("zip", "image"), ("image", "zip")])

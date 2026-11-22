@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1815,16 +1815,6 @@ async def forward_claude_transcript_to_session(
                             dedupe=dedupe,
                             force=(previous_state is not None and previous_state != state),
                         )
-                        # Read deltas first for the lowest-latency preview. The
-                        # runtime reconciler handles either delta/item order.
-                        delta_state = await _forward_available_deltas(
-                            client=client,
-                            session_id=current_session_id,
-                            bridge_dir=bridge_dir,
-                            state=delta_state,
-                            seen_keys=seen_delta_keys,
-                            batch_capability=delta_batch_capability,
-                        )
                         # Mint a pending token for any PreCompact that first
                         # became visible THIS poll, before the transcript items
                         # phase (which consumes the isCompactSummary completion
@@ -1839,7 +1829,7 @@ async def forward_claude_transcript_to_session(
                         hooks_cutoff_byte_offset = (
                             hooks_file.stat().st_size if hooks_file.is_file() else None
                         )
-                        state = await _forward_available_items(
+                        state, delta_state = await _forward_items_and_deltas(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
@@ -1849,6 +1839,9 @@ async def forward_claude_transcript_to_session(
                             compaction_retry_tracker=compaction_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
+                            delta_state=delta_state,
+                            seen_delta_keys=seen_delta_keys,
+                            delta_batch_capability=delta_batch_capability,
                         )
                         hook_state = await _forward_available_status_events(
                             client=client,
@@ -7444,6 +7437,7 @@ async def _forward_available_items(
     dedupe: _ForwardDedupeState,
     compaction_retry_tracker: _PostRetryTracker | None = None,
     skip_user_messages: bool = False,
+    post_previews: Callable[[TranscriptReadResult, str | None], Awaitable[None]] | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -7459,6 +7453,7 @@ async def _forward_available_items(
         compaction snapshot reads; ``retry_tracker`` when omitted.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
+    :param post_previews: Flush deltas at poll start and before their known final item.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -7483,6 +7478,8 @@ async def _forward_available_items(
         dedupe.pending_settled_response_id,
         dedupe.pending_settled_at,
     )
+    if post_previews is not None:
+        await post_previews(result, None)
     if result.goal_state_observed and result.byte_offset >= dedupe.observed_goal_byte_offset:
         dedupe.observed_goal_state = result.latest_goal_state
         dedupe.observed_goal_state_known = True
@@ -7515,6 +7512,7 @@ async def _forward_available_items(
             skip_user_messages=skip_user_messages,
             dedupe=dedupe,
             result=result,
+            post_previews=post_previews,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -7541,6 +7539,7 @@ async def _forward_transcript_item_batch(
     skip_user_messages: bool,
     dedupe: _ForwardDedupeState,
     result: TranscriptReadResult,
+    post_previews: Callable[[TranscriptReadResult, str | None], Awaitable[None]] | None = None,
 ) -> TranscriptForwardState:
     """
     Forward one poll's already-read transcript items and advance the cursor.
@@ -7561,6 +7560,7 @@ async def _forward_transcript_item_batch(
         by the sub-agent watcher).
     :param dedupe: Shared per-session dedupe state; mutated in place.
     :param result: This poll's already-read transcript items.
+    :param post_previews: Flush a deferred preview before its final item.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -7711,6 +7711,8 @@ async def _forward_transcript_item_batch(
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
+        if post_previews is not None:
+            await post_previews(result, item.source_id)
         try:
             item = await asyncio.to_thread(correlate_retry_input, bridge_dir, session_id, item)
             await _post_external_conversation_item(
@@ -8550,6 +8552,139 @@ async def _post_delta_batch(
         batch_capability.supported = True
 
 
+def _preview_after_mid_turn_prompt(
+    deltas: Sequence[ClaudeMessageDelta],
+    items: Sequence[ClaudeTranscriptItem],
+    seen_sources: Collection[str],
+) -> tuple[int, str] | None:
+    """Find a complete new preview that unambiguously belongs after a queued prompt.
+
+    MessageDisplay IDs are absent from the transcript. A complete, contiguous
+    tail preview and its unique exact assistant item in this read are the only
+    cases we can place without moving earlier or still-streaming previews.
+    """
+    if not deltas or not deltas[-1].final or not any(item.is_mid_turn_prompt for item in items):
+        return None
+    message_id = deltas[-1].message_id
+    start = len(deltas) - 1
+    while start and deltas[start - 1].message_id == message_id:
+        start -= 1
+    if any(delta.message_id == message_id for delta in deltas[:start]) or any(
+        delta.index != index or (delta.final and index != len(deltas) - start - 1)
+        for index, delta in enumerate(deltas[start:])
+    ):
+        return None
+    text = "".join(delta.delta for delta in deltas[start:])
+    earlier_text: dict[str, str] = {}
+    for delta in deltas[:start]:
+        earlier_text[delta.message_id] = earlier_text.get(delta.message_id, "") + delta.delta
+    if not text or text in earlier_text.values():
+        return None
+    matches = [
+        index
+        for index, item in enumerate(items)
+        if item.item_type == "message"
+        and item.data.get("role") == "assistant"
+        and item.data.get("content") == [{"type": "output_text", "text": text}]
+    ]
+    if len(matches) != 1:
+        return None
+    [match] = matches
+    target = items[match].source_id
+    prompt = next(
+        (
+            item
+            for item in reversed(items[:match])
+            if item.item_type == "message"
+            and item.data.get("role") == "user"
+            and item.data.get("is_meta") is not True
+        ),
+        None,
+    )
+    if (
+        target not in seen_sources
+        and prompt is not None
+        and prompt.is_mid_turn_prompt
+        and prompt.source_id not in seen_sources
+    ):
+        return start, target
+    return None
+
+
+async def _forward_items_and_deltas(
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    agent_name: str,
+    state: TranscriptForwardState,
+    retry_tracker: _PostRetryTracker,
+    compaction_retry_tracker: _PostRetryTracker,
+    skip_user_messages: bool,
+    dedupe: _ForwardDedupeState,
+    delta_state: DeltaForwardState,
+    seen_delta_keys: dict[tuple[str, int], None],
+    delta_batch_capability: _SessionEventBatchCapability,
+) -> tuple[TranscriptForwardState, DeltaForwardState]:
+    if skip_user_messages:
+        delta_state = await _forward_available_deltas(
+            client=client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            state=delta_state,
+            seen_keys=seen_delta_keys,
+            batch_capability=delta_batch_capability,
+        )
+    # Read the previews first. Most still go out before transcript items.
+    delta_read = (
+        await asyncio.to_thread(
+            read_message_deltas_from_offset, bridge_dir, delta_state.byte_offset
+        )
+        if not skip_user_messages and (bridge_dir / MESSAGE_DELTAS_FILE).exists()
+        else None
+    )
+    remaining = (
+        [d for d in delta_read.deltas if (d.message_id, d.index) not in seen_delta_keys]
+        if delta_read is not None
+        else []
+    )
+    target: str | None = None
+
+    async def post_previews(result: TranscriptReadResult, before: str | None) -> None:
+        nonlocal remaining, target
+        if not remaining or (before is not None and before != target):
+            return
+        split = (
+            None
+            if before is not None
+            else _preview_after_mid_turn_prompt(remaining, result.items, state.seen_source_ids)
+        )
+        count, target = split if split is not None else (len(remaining), None)
+        await _post_available_deltas(
+            client, session_id, remaining[:count], seen_delta_keys, delta_batch_capability
+        )
+        remaining = remaining[count:]
+
+    state = await _forward_available_items(
+        client=client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        agent_name=agent_name,
+        state=state,
+        retry_tracker=retry_tracker,
+        compaction_retry_tracker=compaction_retry_tracker,
+        skip_user_messages=skip_user_messages,
+        dedupe=dedupe,
+        post_previews=post_previews if remaining else None,
+    )
+    # If transcript delivery stopped before the final item, drop the deferred
+    # best-effort preview. The durable transcript still retries in order.
+    if delta_read is not None and delta_read.byte_offset != delta_state.byte_offset:
+        delta_state = DeltaForwardState(byte_offset=delta_read.byte_offset)
+        await _write_delta_forward_state_async(bridge_dir, delta_state)
+    return state, delta_state
+
+
 async def _forward_available_deltas(
     *,
     client: httpx.AsyncClient,
@@ -8593,8 +8728,25 @@ async def _forward_available_deltas(
     )
     if result.byte_offset == state.byte_offset and not result.deltas:
         return state
-    if batch_capability is None:
-        batch_capability = _SessionEventBatchCapability()
+    await _post_available_deltas(
+        client,
+        session_id,
+        result.deltas,
+        seen_keys,
+        batch_capability or _SessionEventBatchCapability(),
+    )
+    updated = DeltaForwardState(byte_offset=result.byte_offset)
+    await _write_delta_forward_state_async(bridge_dir, updated)
+    return updated
+
+
+async def _post_available_deltas(
+    client: httpx.AsyncClient,
+    session_id: str,
+    deltas: Sequence[ClaudeMessageDelta],
+    seen_keys: dict[tuple[str, int], None],
+    batch_capability: _SessionEventBatchCapability,
+) -> None:
     pending: list[ClaudeMessageDelta] = []
     pending_bytes = 2  # JSON array brackets
 
@@ -8620,7 +8772,7 @@ async def _forward_available_deltas(
         pending = []
         pending_bytes = 2
 
-    for delta in result.deltas:
+    for delta in deltas:
         key = (delta.message_id, delta.index)
         if key in seen_keys:
             continue
@@ -8638,9 +8790,6 @@ async def _forward_available_deltas(
         if pending_bytes >= _MAX_DELTA_BATCH_BYTES:
             await flush()
     await flush()
-    updated = DeltaForwardState(byte_offset=result.byte_offset)
-    await _write_delta_forward_state_async(bridge_dir, updated)
-    return updated
 
 
 async def _post_external_session_usage(

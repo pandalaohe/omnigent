@@ -12426,21 +12426,27 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
-    it("keeps a received input waiting when a mirror cannot name its send", () => {
-      const content = [{ type: "input_text" as const, text: "Use metric units." }];
-      const pending = { tempId: "tmp_web", pendingId: "pending_web", content, received: true };
-      useChatStore.setState({ blocks: [], pendingUserMessages: [pending] });
+    it.each([false, true])(
+      "keeps a received input waiting when a mirror cannot name its send (already mirrored=%s)",
+      (alreadyMirrored) => {
+        const content = [{ type: "input_text" as const, text: "Use metric units." }];
+        const pending = { tempId: "tmp_web", pendingId: "pending_web", content, received: true };
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "terminal_item",
+          itemType: "message",
+          data: { role: "user", content },
+        };
+        useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+        if (alreadyMirrored) handleSessionEvent(event);
+        useChatStore.setState({ pendingUserMessages: [pending] });
 
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: "terminal_item",
-        itemType: "message",
-        data: { role: "user", content },
-      });
+        handleSessionEvent(event);
 
-      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
-      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["terminal_item"]);
-    });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+        expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["terminal_item"]);
+      },
+    );
 
     it.each([false, true])(
       "does not consume an unsent model-switch draft (already mirrored=%s)",
@@ -24276,7 +24282,10 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       pendingUserMessages: [read, unread],
     });
     const { sink, controller, manual } = startPump(id);
-    sink.push(messageDone("prior_1", "resp_prior", "Working on it."));
+    sink.push(nativeDelta("prior", 0, "Working on it.", true));
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["live:prior"]);
+    sink.push(messageDone("prior_1", "resp_prior", "Working on it.", "prior"));
     await tick();
     sink.push(messageDone("prior_2", "resp_prior", "This also happened before the steer."));
     await tick();

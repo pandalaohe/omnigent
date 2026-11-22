@@ -27,7 +27,7 @@ import shutil
 import stat
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import ModuleType
@@ -431,6 +431,36 @@ def is_tagged_filesystem_attachment(text: str, attempt_id: str) -> bool:
     return match is not None and match["path_attempt"] == attempt_id
 
 
+def needs_attachment_attempt(content: Sequence[object], attempt_id: str) -> bool:
+    """Tag attachment-only prompts and uploads that follow authored text."""
+    has_text = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        text = block.get("text") if kind == "input_text" else None
+        if kind in ("input_image", "input_file") or (
+            isinstance(text, str) and is_tagged_filesystem_attachment(text, attempt_id)
+        ):
+            if has_text:
+                return True
+        elif isinstance(text, str) and text.strip():
+            has_text = True
+    return not has_text
+
+
+def strip_attachment_attempt_marker(text: str, attempt_id: str, ordinal: int) -> str | None:
+    """Strip one leading attachment reference if it proves this attempt and ordinal."""
+    match = _DELIVERY_ATTACHMENT_MARKER.match(text)
+    if match is None or (
+        match["cache_attempt"] or match["path_attempt"],
+        match["cache_ordinal"] or match["path_ordinal"],
+    ) != (attempt_id, str(ordinal)):
+        return None
+    rest = text[match.end() :]
+    return rest.lstrip() if not rest or rest[0].isspace() else None
+
+
 def materialize_attachment(
     block: Mapping[str, object],
     bridge_dir: Path,
@@ -449,8 +479,7 @@ def materialize_attachment(
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
-    :param delivery: Validated attempt ID and zero-based ordinal for a claimed
-        attachment-only prompt, whose transcript will have no text to match.
+    :param delivery: Validated attempt ID and zero-based attachment ordinal.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
@@ -1547,7 +1576,7 @@ async def resolve_file_reference(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
-    :param delivery: Tag the resolved filesystem reference for an attachment-only Claude claim.
+    :param delivery: Tag the resolved filesystem reference for a Claude claim.
     :returns: The replacement blocks, or ``None`` when resolution failed, in
         which case the caller keeps the original block and a visible marker
         can surface downstream.

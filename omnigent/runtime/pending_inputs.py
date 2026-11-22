@@ -130,6 +130,7 @@ from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     attachment_delivery_identity,
+    strip_attachment_attempt_marker,
 )
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -1278,7 +1279,7 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        if attachment_delivery is not None and attachment_delivery[1] is not None:
+        if attachment_delivery is not None:
             attempt_id, count = attachment_delivery
             for pending_id, entry in entries.items():
                 if (
@@ -1286,8 +1287,14 @@ def resolve_matching_text(
                     and entry.runner_claim_id is not None
                     and not entry.held
                     and entry.auto_retry is None
-                    and _attachment_count(entry.content) == count
-                    and not _content_text(entry.content).strip()
+                    and _attachment_count(entry.content) > 0
+                    and (
+                        _matches_forwarded_blocks(
+                            entry.content, exact_needle, attempt_id=attempt_id
+                        )
+                        if _content_text(entry.content).strip()
+                        else _attachment_count(entry.content) == count
+                    )
                 ):
                     if hold:
                         entry.held = True
@@ -1314,8 +1321,7 @@ def resolve_matching_text(
             for _pid, entry in ordered
         ]
         # Try exact text before interpreting anything as a generated marker.
-        # Older executors put attachment markers first. Claude also writes
-        # them in composer block order when an upload sits between text spans.
+        # Older executors put untagged attachment markers first.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
@@ -1332,7 +1338,6 @@ def resolve_matching_text(
             if match_index is not None:
                 match_method = "injected_prefix_text"
         marker_matches: list[int] = []
-        ordered_attachment_match = False
         if match_index is None:
             match_method = "attachment_normalized_text"
             for index, (_pid, entry) in enumerate(ordered):
@@ -1345,19 +1350,6 @@ def resolve_matching_text(
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
-            if match_index is None and claude_commands:
-                # An inline echo proves only the claimed prompt it matches.
-                # Do not choose between same-shape copies or settle older inputs.
-                ordered_matches = [
-                    index
-                    for index, (_pid, entry) in enumerate(ordered)
-                    if entry.runner_claim_id is not None
-                    and _attachment_count(entry.content)
-                    and _matches_forwarded_blocks(entry.content, exact_needle)
-                ]
-                if len(ordered_matches) == 1:
-                    match_index = ordered_matches[0]
-                    ordered_attachment_match = True
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Look across match tiers. A literal attachment marker or a command's
@@ -1380,7 +1372,7 @@ def resolve_matching_text(
         # unbounded append downstream. The matched entry itself always drains.
         skipped_entries = (
             []
-            if shell_command or ordered_attachment_match
+            if shell_command
             else [
                 (pid, entry)
                 for pid, entry in ordered[:match_index]
@@ -1559,14 +1551,22 @@ def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:
     return _matches_forwarded_blocks(entry.content, mirror[len(prefix) :].lstrip())
 
 
-def _matches_forwarded_blocks(content: list[dict[str, Any]], remaining: str) -> bool:
+def _matches_forwarded_blocks(
+    content: list[dict[str, Any]], remaining: str, *, attempt_id: str | None = None
+) -> bool:
     """Match every text span and one generated marker per file in composer order."""
+    ordinal = 0
     for block in content:
         if block.get("type") in _ATTACHMENT_BLOCK_TYPES:
-            stripped = _strip_generated_markers(remaining, 1)
-            if stripped == remaining:
+            stripped = (
+                strip_attachment_attempt_marker(remaining, attempt_id, ordinal)
+                if attempt_id is not None
+                else _strip_generated_markers(remaining, 1)
+            )
+            if stripped is None or stripped == remaining:
                 return False
             remaining = stripped
+            ordinal += 1
         elif block.get("type") in {"input_text", "text", "output_text"}:
             expected = _collapse_whitespace(block.get("text", ""))
             if not expected:
