@@ -226,7 +226,7 @@ import {
   tokenAt,
   tokenText,
 } from "@/lib/composerTokens";
-import type { ComposerDraftPart } from "@/lib/composerContent";
+import { composerPartsToText, type ComposerDraftPart } from "@/lib/composerContent";
 import { ComposerTokenBackdrop, hasTint } from "@/components/ComposerTokenBackdrop";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
@@ -1266,7 +1266,13 @@ export function ChatPage() {
       // matching gate in the store's send()). Only the native-fork harness
       // routes /side through send; generic /side is intercepted in the composer.
       const opensSideChat =
-        usesNativeSideChatFork(chat.sessionHarness) && isSideChatCommand(text.trim());
+        usesNativeSideChatFork(chat.sessionHarness) &&
+        isSideChatCommand(
+          composerParts ? composerPartsToText(composerParts) : text,
+          composerParts
+            ? composerParts.some((part) => part.type === "attachment")
+            : (files?.length ?? 0) > 0,
+        );
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -3082,9 +3088,7 @@ function ComposerImpl(
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
   const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
-  const hasPendingInitialMessage = useChatStore((s) =>
-    s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
-  );
+  const waitingForInitialDispatch = useChatStore(holdsInitialDraft);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -4027,7 +4031,7 @@ function ComposerImpl(
     (!hasDraft ||
       hasPendingElicitation ||
       isTempConvId(conversationId) ||
-      hasPendingInitialMessage);
+      waitingForInitialDispatch);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,

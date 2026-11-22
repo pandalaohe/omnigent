@@ -874,6 +874,46 @@ describe("Composer starting-session cancellation", () => {
       expect(textarea()).toHaveValue("corrected task");
     },
   );
+
+  it("sends a typed follow-up from the main button while the first message uploads", () => {
+    const mobileQuery = "(max-width: 767.98px)";
+    const mediaQuery = window.matchMedia(mobileQuery);
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === mobileQuery,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    setComposerState({
+      conversationId: "conv_first_upload",
+      sessionStatus: "idle",
+      pendingUserMessages: [
+        {
+          tempId: "pend_first_upload",
+          content: [{ type: "input_text", text: "first message" }],
+          initialDraft: { text: "first message", files: [] },
+          beforePost: true,
+          uploadProgress: {
+            filename: "photo.png",
+            fileIndex: 1,
+            fileCount: 1,
+            loaded: 1,
+            total: 2,
+            fraction: 0.5,
+          },
+        },
+      ],
+    });
+    const props = composerProps({ status: "idle", isWorking: true });
+    render(<Composer {...props} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+    fireEvent.change(textarea(), { target: { value: "follow-up" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(props.onSend).toHaveBeenCalledWith("follow-up", undefined);
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
 });
 
 describe("Composer growth layout", () => {

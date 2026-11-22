@@ -79,6 +79,7 @@ import { splitSessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
+  ATTACHMENT_UPLOAD_FAILED,
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
@@ -90,7 +91,12 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
+import {
+  retryFailedAttachmentSend,
+  useChatStore,
+  withoutFailedInputs,
+  type PendingUserMessage,
+} from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -1475,6 +1481,10 @@ function AssistantBubble({
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
+      if (item.code === ATTACHMENT_UPLOAD_FAILED) {
+        await retryFailedAttachmentSend(conversationId, item.itemId);
+        return;
+      }
       if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The

@@ -49,7 +49,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles, type Bubble } from "@/lib/renderItems";
-import { buildPendingBubbles } from "@/components/chat/chatBubbleParts";
+import { BubbleView, buildPendingBubbles } from "@/components/chat/chatBubbleParts";
 import {
   getSessionSlim,
   INITIAL_WINDOW_ITEMS,
@@ -130,6 +130,7 @@ import {
   takeFailedSendDraft,
   restoredSendDraftUnchanged,
   consumePendingInitialPrompt,
+  ensureConversationStreamed,
   handleSessionEvent,
   hydrateLocalConversation,
   isStaleCompletedResponse,
@@ -139,6 +140,7 @@ import {
   invalidateCodexPermissionReadback,
   pumpStreamEvents,
   retryConversationLoad,
+  retryFailedAttachmentSend,
   SEND_STILL_SENDING_AFTER_MS,
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
@@ -685,6 +687,7 @@ beforeEach(() => {
     status: "idle",
     sessionStatus: "idle",
     isNativeTerminalSession: false,
+    failedSendDraft: null,
     loadingConversation: false,
     conversationLoadError: null,
     costControlModeOverride: null,
@@ -5248,6 +5251,50 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(posts).toHaveLength(1);
   });
 
+  it("keeps a reused first-message upload when a follow-up finishes its turn", async () => {
+    const id = "conv_real";
+    seedSession(id);
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const files = [new File(["bytes"], "first.png", { type: "image/png" })];
+    const begun = beginLocalConversation("first", files)!;
+    hydrateLocalConversation(
+      begun.tempConvId,
+      id,
+      "agent_xyz",
+      "first",
+      files,
+      begun.pendingMsgTempId,
+      null,
+      noopNavigate,
+    );
+    await vi.waitFor(() => expect(resolveUpload).toBeDefined());
+    await useChatStore.getState().send("follow-up", "agent_xyz");
+    handleSessionEvent({ type: "session_status", conversationId: id, status: "running" }, id);
+    handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" }, id);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      begun.pendingMsgTempId,
+    ]);
+    resolveUpload(mockResponse({ id: "file_first", name: "first.png" }));
+    await settle();
+    const posts = fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string).data.content);
+    expect(posts).toEqual([
+      [{ type: "input_text", text: "follow-up" }],
+      expect.arrayContaining([
+        { type: "input_image", file_id: "file_first", filename: "first.png" },
+      ]),
+    ]);
+  });
+
   it("binds an accepted managed first input without posting or retaining an unsent draft", async () => {
     seedSession("conv_real");
     const { tempConvId, pendingMsgTempId } = beginLocalConversation("saved on server", undefined)!;
@@ -6653,6 +6700,43 @@ describe("chatStore — sendSlashCommand", () => {
     });
   });
 
+  it("matches id-less message and standalone skill receipts to their own bubbles", async () => {
+    const id = "conv_existing";
+    useChatStore.setState({ conversationId: id, abortController: new AbortController() });
+    const message = useChatStore.getState().send("normal text", "agent_xyz");
+    const skill = useChatStore.getState().sendSlashCommand("review", "this", "agent_xyz");
+    const [messageBubble, skillBubble] = useChatStore.getState().pendingUserMessages;
+    await Promise.all([message, skill]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      messageBubble!.tempId,
+      skillBubble!.tempId,
+    ]);
+    // The skill receipt can arrive while the earlier message is still unacknowledged.
+    handleSessionEvent({
+      type: "slash_command",
+      kind: "skill",
+      name: "review",
+      arguments: "this",
+      output: null,
+      agentName: "agent",
+      itemId: "skill_receipt",
+      responseId: "skill_response",
+    });
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      messageBubble!.tempId,
+    ]);
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "message_receipt",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "normal text" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().blocks).toContainEqual(
+      expect.objectContaining({ stableKey: messageBubble!.tempId, type: "user_message" }),
+    );
+  });
+
   it("sends empty arguments when the skill is invoked with no args", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -7792,6 +7876,136 @@ describe("chatStore — send (file attachments)", () => {
     });
   });
 
+  it("drains the idle queue after cancelling its uploading head", async () => {
+    const id = "conv_existing";
+    useChatStore.setState({
+      conversationId: id,
+      abortController: new AbortController(),
+      boundAgentId: "agent_xyz",
+      sessionStatus: "running",
+    });
+    let releaseUpload!: (response: Response) => void;
+    const posted: unknown[] = [];
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          releaseUpload = resolve;
+        });
+      }
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        posted.push(JSON.parse(init.body as string).data.content);
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "head.png", { type: "image/png" });
+    useChatStore.getState().enqueueMessage("queue head", [file]);
+    useChatStore.getState().enqueueMessage("next in queue");
+    handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" }, id);
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.waitFor(() => expect(releaseUpload).toBeDefined());
+
+    const [head] = useChatStore.getState().pendingUserMessages;
+    expect(posted).toEqual([]);
+    useChatStore.getState().cancelUploadingSend(head!.tempId);
+    await vi.waitFor(() =>
+      expect(posted).toEqual([[{ type: "input_text", text: "next in queue" }]]),
+    );
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "queue head",
+      files: [file],
+      replaceComposer: true,
+    });
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    releaseUpload(mockResponse({ id: "file_cancelled" }));
+  });
+
+  it("keeps a side-chat upload cancellable through a cold rebind", async () => {
+    const id = "conv_side";
+    seedSession(id);
+    useChatStore.setState({ conversationId: "conv_main" });
+    await ensureConversationStreamed(id);
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "side.png", { type: "image/png" });
+    const send = useChatStore.getState().send("side draft", "agent_xyz", [file], {
+      pinnedConversationId: id,
+    });
+    await vi.waitFor(() => expect(resolveUpload).toBeDefined());
+    const firstEntry = conversationRegistry.peek(id)!;
+    const [pending] = firstEntry.getState().pendingUserMessages;
+    firstEntry.getState().abortController?.abort();
+    firstEntry.setState({ abortController: null });
+    await ensureConversationStreamed(id);
+    const rebound = conversationRegistry.peek(id)!;
+    expect(rebound.getState().pendingUserMessages[0]).toMatchObject({
+      tempId: pending!.tempId,
+      uploadProgress: { filename: "side.png" },
+    });
+    const xhr = FetchBackedXHR.instances.at(-1)!;
+    xhr.upload.onprogress?.({ lengthComputable: true, loaded: 3, total: 4 } as ProgressEvent);
+    expect(rebound.getState().pendingUserMessages[0]?.uploadProgress?.fraction).toBe(0.75);
+    useChatStore.getState().cancelUploadingSend(pending!.tempId);
+    expect(await send).toBe(false);
+    expect(rebound.getState().pendingUserMessages).toEqual([]);
+    expect(rebound.getState().failedSendDraft).toMatchObject({ text: "side draft", files: [file] });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(xhr.aborted).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/sessions/${id}/events`)),
+    ).toBe(false);
+    resolveUpload(mockResponse({ id: "file_cancelled" }));
+  });
+
+  it("uploads attachment-bearing Codex /side as a main message and still forks plain /side", async () => {
+    const id = "conv_existing";
+    useChatStore.setState({
+      conversationId: id,
+      abortController: new AbortController(),
+      sessionHarness: "codex-native",
+    });
+    let resolveUpload!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "question.png", { type: "image/png" });
+    const text = "/side explain the picture";
+    const send = useChatStore.getState().send(text, "agent_xyz", [file]);
+    await vi.waitFor(() => expect(resolveUpload).toBeDefined());
+    const [bubble] = useChatStore.getState().pendingUserMessages;
+    expect(bubble?.uploadProgress?.filename).toBe(file.name);
+    expect(useChatStore.getState().awaitingSideChatFor).toBeNull();
+    resolveUpload(mockResponse({ id: "picture", name: file.name }));
+    expect(await send).toBe(true);
+
+    const plainSend = useChatStore.getState().send("/side explain", "agent_xyz");
+    expect(useChatStore.getState().awaitingSideChatFor).toBe(id);
+    expect(useChatStore.getState().pendingUserMessages.map((pending) => pending.tempId)).toEqual([
+      bubble!.tempId,
+    ]);
+    expect(await plainSend).toBe(true);
+    const posts = fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string).data.content);
+    expect(posts).toEqual([
+      [
+        { type: "input_image", file_id: "picture", filename: file.name },
+        { type: "input_text", text },
+      ],
+      [{ type: "input_text", text: "/side explain" }],
+    ]);
+  });
+
   it("starts a queued attachment at idle and keeps the next automatic send queued", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -7938,58 +8152,120 @@ describe("chatStore — send (file attachments)", () => {
     resolveUpload(mockResponse({ id: "file_second", name: "second.png" }));
   });
 
-  it.each(["abort", "error"] as const)(
-    "returns a browser upload %s to Retry without a POST",
-    async (failure) => {
-      useChatStore.setState({
-        conversationId: "conv_existing",
-        abortController: new AbortController(),
-        isNativeTerminalSession: true,
-        sessionStatus: "running",
-      });
-      let resolveUpload!: (response: Response) => void;
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
-          return new Promise<Response>((resolve) => {
-            resolveUpload = resolve;
-          });
-        }
-        return defaultFetchHandler(input, init);
-      });
-
-      const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
-      const sendPromise = useChatStore.getState().send("look at this", "agent_xyz", [file]);
-      await tick();
-      expect(
-        buildPendingBubbles(useChatStore.getState().pendingUserMessages, null)[0],
-      ).toMatchObject({
-        pending: true,
-        uploadProgress: { filename: "photo.png", fileIndex: 1, fileCount: 1, fraction: 0.5 },
-      });
-
-      try {
-        const xhr = FetchBackedXHR.instances.at(-1)!;
-        if (failure === "abort") xhr.abort();
-        else xhr.onerror?.();
-        await sendPromise;
-        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-        expect(useChatStore.getState().failedSendDraft).toMatchObject({
-          text: "look at this",
-          files: [file],
+  it("retries overlapping browser upload failures from their own cards after switching chats", async () => {
+    const id = "conv_existing";
+    useChatStore.setState({
+      conversationId: id,
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+    });
+    const pendingUploads = new Map<string, (response: Response) => void>();
+    const uploadNames: string[] = [];
+    const posts: unknown[] = [];
+    let retrying = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/v1/sessions/${id}/resources/files`)) {
+        if (!(init?.body instanceof FormData)) throw new Error("Expected an attachment upload");
+        const name = (init.body.get("file") as File).name;
+        uploadNames.push(name);
+        if (retrying || name === "cached.png") return mockResponse({ id: `file_${name}`, name });
+        return new Promise<Response>((resolve) => {
+          pendingUploads.set(name, resolve);
         });
-        expect(useChatStore.getState().blocks.at(-1)).toMatchObject({ type: "error" });
-        expect(
-          fetchMock.mock.calls.filter(
-            ([url, init]) =>
-              String(url).endsWith("/v1/sessions/conv_existing/events") &&
-              (init as RequestInit | undefined)?.method === "POST",
-          ),
-        ).toHaveLength(0);
-      } finally {
-        resolveUpload(mockResponse({ id: "file_photo", name: "photo.png" }));
       }
-    },
-  );
+      if (url.endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST")
+        posts.push(JSON.parse(init.body as string).data);
+      return defaultFetchHandler(input, init);
+    });
+    const [cached, first, second] = ["cached.png", "first.png", "second.png"].map(
+      (name) => new File(["bytes"], name, { type: "image/png" }),
+    ) as [File, File, File];
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Original quote" }],
+      text: "first reply",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    const firstSend = useChatStore.getState().send(text, "agent_xyz", [cached, first], {
+      stableId: "first_send",
+      replyDraft,
+      composerParts: [
+        { type: "attachment", file: cached },
+        { type: "text", text },
+        { type: "attachment", file: first },
+      ],
+    });
+    await vi.waitFor(() => expect(pendingUploads.has(first.name)).toBe(true));
+    const firstXhr = FetchBackedXHR.instances.at(-1)!;
+    const secondSend = useChatStore.getState().send("second text", "agent_xyz", [second], {
+      stableId: "second_send",
+    });
+    await vi.waitFor(() => expect(pendingUploads.has(second.name)).toBe(true));
+    const secondXhr = FetchBackedXHR.instances.at(-1)!;
+    await useChatStore.getState().switchTo("conv_other");
+    firstXhr.abort();
+    secondXhr.onerror?.();
+    await Promise.all([firstSend, secondSend]);
+    for (const resolve of pendingUploads.values()) resolve(mockResponse({ id: "unused" }));
+    expect(posts).toEqual([]);
+    expect(useChatStore.getState().blocks).toEqual([]);
+
+    await useChatStore.getState().switchTo(id);
+    const state = useChatStore.getState();
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks).toContainEqual(
+      expect.objectContaining({
+        ctx: expect.objectContaining({ itemId: "first_send" }),
+        failedAttachmentSend: expect.objectContaining({ replyDraft }),
+      }),
+    );
+    const view = render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        buildBubbles(state.blocks, null).map((bubble, index) =>
+          createElement(BubbleView, { bubble, key: index, isLastAssistant: false }),
+        ),
+      ),
+    );
+    try {
+      const [retryFirst, retrySecond] = view.getAllByRole("button", { name: "Retry" });
+      retrying = true;
+      fireEvent.click(retrySecond!);
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      fireEvent.click(retryFirst!);
+      await vi.waitFor(() => expect(posts).toHaveLength(2));
+      expect(posts).toEqual([
+        expect.objectContaining({
+          stable_id: "second_send",
+          content: [
+            { type: "input_image", file_id: "file_second.png", filename: "second.png" },
+            { type: "input_text", text: "second text" },
+          ],
+        }),
+        expect.objectContaining({
+          stable_id: "first_send",
+          content: [
+            { type: "input_image", file_id: "file_cached.png", filename: "cached.png" },
+            { type: "input_text", text },
+            { type: "input_image", file_id: "file_first.png", filename: "first.png" },
+          ],
+        }),
+      ]);
+      expect(uploadNames).toEqual([
+        "cached.png",
+        "first.png",
+        "second.png",
+        "second.png",
+        "first.png",
+      ]);
+    } finally {
+      view.unmount();
+    }
+  });
 
   it("keeps an inline attachment between the surrounding text blocks", async () => {
     useChatStore.setState({
@@ -8432,10 +8708,7 @@ describe("chatStore — send (file attachments)", () => {
     expect(uploads).toBe(1);
   });
 
-  it("hands the message back for retry when the upload is rejected", async () => {
-    // A 415 on an unsupported attachment must not swallow the typed text: the
-    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
-    // left holding it. The banner carries the server's reason, not "415".
+  it("keeps the rejected upload's text and the server's reason in its retry card", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -8461,17 +8734,20 @@ describe("chatStore — send (file attachments)", () => {
     const state = useChatStore.getState();
     // Optimistic bubble rolled back — the send never reached the server.
     expect(state.pendingUserMessages).toEqual([]);
-    expect(state.failedSendDraft).toEqual({
-      conversationId: "conv_existing",
-      text: "summarize these photos",
-      files: [zip],
-      stableId: expect.any(String),
-      // A 415 carries no Omnigent error code: the message was never sent.
-      serverRefused: false,
+    expect(state.blocks.at(-1)).toMatchObject({
+      failedAttachmentSend: {
+        text: "summarize these photos",
+        parts: expect.arrayContaining([{ type: "attachment", file: zip }]),
+      },
     });
     const error = state.blocks.at(-1) as { type: string; message: string };
     expect(error.type).toBe("error");
     expect(error.message).toContain("Unsupported attachment type 'application/zip'");
+    await retryFailedAttachmentSend("conv_existing", state.blocks.at(-1)!.ctx.itemId);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "summarize these photos",
+      files: [zip],
+    });
   });
 
   it("keeps quote provenance client-side and returns it with a failed send", async () => {
@@ -26495,9 +26771,18 @@ describe("chatStore — client-side message queue", () => {
         const failed = useChatStore.getState().queuedMessages[1]!;
         useChatStore.getState().steerAllQueuedMessages("conv_abc");
         await vi.waitFor(() => expect(posted).toContain("third"));
-        expect(useChatStore.getState().queuedMessages).toEqual([
-          { ...failed, requiresRetry: true },
-        ]);
+        const state = useChatStore.getState();
+        if (phase === "upload") {
+          expect(state.queuedMessages).toEqual([]);
+          expect(state.blocks).toContainEqual(
+            expect.objectContaining({
+              ctx: expect.objectContaining({ itemId: failed.stableId }),
+              failedAttachmentSend: expect.objectContaining({ text: failed.text }),
+            }),
+          );
+        } else {
+          expect(state.queuedMessages).toEqual([{ ...failed, requiresRetry: true }]);
+        }
         expect(useChatStore.getState().failedSendDraft).toBeNull();
       },
     );
@@ -27095,9 +27380,7 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
-  it("re-queues the message when the attachment upload fails", async () => {
-    // A failure in the upload phase must re-queue + cool down exactly like a
-    // failed POST — the guard spans upload and post together.
+  it("keeps a failed background upload on its own card without re-queuing the message", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     let events = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -27114,7 +27397,14 @@ describe("chatStore — background cross-session flush", () => {
     useChatStore.setState({
       conversationId: "conv_active",
       queuedMessages: [
-        { queueId: "q_1", text: "with-image", conversationId: "conv_bg", files: [file] },
+        {
+          queueId: "q_1",
+          stableId: "background_send",
+          text: "with-image",
+          conversationId: "conv_bg",
+          agentId: "agent_xyz",
+          files: [file],
+        },
       ],
     });
 
@@ -27122,9 +27412,15 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
 
-    // Upload failed → no message posted, and the item is re-queued to retry.
+    // The failure belongs to the background chat and can't automatically resend.
     expect(events).toBe(0);
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["with-image"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(conversationRegistry.peek("conv_bg")?.getState().blocks).toContainEqual(
+      expect.objectContaining({
+        ctx: expect.objectContaining({ itemId: "background_send" }),
+        failedAttachmentSend: expect.objectContaining({ text: "with-image" }),
+      }),
+    );
   });
 
   it("does not re-upload an attachment when a retry follows a post-phase failure", async () => {
