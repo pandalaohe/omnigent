@@ -6282,37 +6282,57 @@ async def test_antigravity_control_dispatch_sends_one_command(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_payload", "event", "expected_status", "expected_calls"),
+    ("snapshot_payload", "event", "expected_status", "expected_calls", "expected_body"),
     [
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "xhigh"},
             {"type": "model_change", "model": "claude-opus-5-5"},
             200,
             ["/model claude-opus-5-5-high"],
+            {"model": "claude-opus-5-5-high", "effort": "high"},
         ),
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
             {"type": "model_change", "model": "claude-opus-5-5", "effort": "xhigh"},
             200,
             ["/model claude-opus-5-5-high"],
+            {"model": "claude-opus-5-5-high", "effort": "high"},
         ),
         (
             {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
             {"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
             200,
             ["/model gemini-4-hydrogen-xhigh"],
+            {"model": "gemini-4-hydrogen-xhigh", "effort": "xhigh"},
+        ),
+        # P1-2: live /effort checks confirmed llm_model, not requested model_override.
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "llm_model": "Claude Opus 5.5 (High)",
+                "reasoning_effort": "high",
+            },
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
         ),
         (
             {
                 "labels": {},
                 "terminal_launch_args": [],
                 "model_override": "claude-opus-5-5",
+                "llm_model": "Gemini 4 Hydrogen (High)",
                 "reasoning_effort": "high",
             },
             {"type": "effort_change", "effort": "xhigh"},
-            400,
-            [],
+            200,
+            ["/effort xhigh"],
+            {"effort": "xhigh"},
         ),
+        # P1-2 + P2-3: unconfirmed terminal model refuses standalone xhigh.
         (
             {
                 "labels": {},
@@ -6321,8 +6341,41 @@ async def test_antigravity_control_dispatch_sends_one_command(
                 "reasoning_effort": "high",
             },
             {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
+        ),
+        # P2-3: catalog-advertised xhigh model is allowed; catalog without xhigh fails closed.
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "llm_model": "Gemini 5 Next (High)",
+                "model_options": [
+                    {
+                        "id": "gemini-5-next",
+                        "displayName": "Gemini 5 Next",
+                        "efforts": ["low", "medium", "high", "xhigh"],
+                    }
+                ],
+                "reasoning_effort": "high",
+            },
+            {"type": "effort_change", "effort": "xhigh"},
             200,
             ["/effort xhigh"],
+            {"effort": "xhigh"},
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "llm_model": "Gemini 5 Next (High)",
+                "reasoning_effort": "high",
+            },
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
         ),
     ],
 )
@@ -6334,6 +6387,7 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
     event,
     expected_status,
     expected_calls,
+    expected_body,
 ):
     from omnigent.harnesses.antigravity_native import bridge as agy
     from omnigent.runner.native import orchestration
@@ -6360,6 +6414,8 @@ async def test_antigravity_control_dispatch_guards_xhigh_per_model(
         response = await client.post("/v1/sessions/conv_agy_xhigh/events", json=event)
     assert response.status_code == expected_status, response.text
     assert calls == expected_calls
+    if expected_body is not None:
+        assert response.json() == expected_body
 
 
 @pytest.mark.parametrize(

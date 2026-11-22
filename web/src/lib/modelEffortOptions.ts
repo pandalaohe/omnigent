@@ -15,6 +15,31 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
+const AGY_DISPLAY_EFFORT_SUFFIX_RE = /\s*\((?:low|medium|high|xhigh|max)\)$/i;
+const AGY_SLUG_EFFORT_SUFFIX_RE = /-(?:low|medium|high|xhigh|max)$/i;
+
+function normalizeAntigravityModelKey(value: string): string {
+  const withoutDisplayEffort = value.trim().replace(AGY_DISPLAY_EFFORT_SUFFIX_RE, "");
+  const withoutSlugEffort = withoutDisplayEffort.replace(AGY_SLUG_EFFORT_SUFFIX_RE, "");
+  return withoutSlugEffort.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function findAntigravityModelRow(
+  rows: readonly NativeModelOption[],
+  model: string | null | undefined,
+): NativeModelOption | undefined {
+  if (!model) return undefined;
+  const exact = rows.find((row) => row.id === model);
+  if (exact) return exact;
+  const target = normalizeAntigravityModelKey(model);
+  if (!target) return undefined;
+  return rows.find(
+    (row) =>
+      normalizeAntigravityModelKey(row.id) === target ||
+      (row.displayName != null && normalizeAntigravityModelKey(row.displayName) === target),
+  );
+}
+
 export function effortLevelsFor(
   harness: string | null | undefined,
   rows: readonly NativeModelOption[],
@@ -43,7 +68,7 @@ export function effortLevelsFor(
       // its `supportedReasoningEfforts` — rather than a fixed ladder.
       return codexEffortLevelsForModel(rows, model);
     case "antigravity-native": {
-      const selected = rows.find((row) => row.id === model);
+      const selected = findAntigravityModelRow(rows, model);
       const efforts =
         selected?.efforts ??
         selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??

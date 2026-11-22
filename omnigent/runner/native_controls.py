@@ -2118,10 +2118,7 @@ def build_native_controls(
             split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
-        from omnigent.util.reasoning_effort import (
-            antigravity_model_effort_caps,
-            clamp_effort_for_model,
-        )
+        from omnigent.util.reasoning_effort import clamp_antigravity_effort
 
         if not model or not model.strip():
             return JSONResponse(
@@ -2138,19 +2135,25 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(
             labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         )
+        raw_options = snapshot.get("model_options")
+        catalog_models = raw_options if isinstance(raw_options, list) else None
         if not effort_set:
             raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
             effort = raw_effort if isinstance(raw_effort, str) else None
         base_model, suffix_effort = split_agy_effort_suffix(model.strip())
-        caps = antigravity_model_effort_caps()
+        applied_effort: str | None = None
         if effort:
-            effort = clamp_effort_for_model(effort, base_model, caps=caps)
-            selected = f"{base_model}-{effort}"
+            applied_effort = clamp_antigravity_effort(
+                effort, base_model, catalog_models=catalog_models
+            )
+            selected = f"{base_model}-{applied_effort}"
         elif suffix_effort is not None:
-            clamped_suffix = clamp_effort_for_model(suffix_effort, base_model, caps=caps)
+            applied_effort = clamp_antigravity_effort(
+                suffix_effort, base_model, catalog_models=catalog_models
+            )
             selected = (
-                f"{base_model}-{clamped_suffix}"
-                if clamped_suffix != suffix_effort
+                f"{base_model}-{applied_effort}"
+                if applied_effort != suffix_effort
                 else model.strip()
             )
         else:
@@ -2174,13 +2177,16 @@ def build_native_controls(
                 },
             )
         if effort_set:
-            if effort:
-                _session_reasoning_effort[conv_id] = effort
+            if applied_effort:
+                _session_reasoning_effort[conv_id] = applied_effort
             else:
                 _session_reasoning_effort.pop(conv_id, None)
-        elif effort:
-            _session_reasoning_effort[conv_id] = effort
-        return JSONResponse(status_code=200, content={"model": selected})
+        elif applied_effort:
+            _session_reasoning_effort[conv_id] = applied_effort
+        reply: dict[str, object] = {"model": selected}
+        if applied_effort is not None:
+            reply["effort"] = applied_effort
+        return JSONResponse(status_code=200, content=reply)
 
     async def _handle_antigravity_native_effort_change(
         conv_id: str, effort: str | None
@@ -2189,13 +2195,9 @@ def build_native_controls(
             ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             run_agy_slash_command,
-            split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
-        from omnigent.util.reasoning_effort import (
-            antigravity_model_effort_caps,
-            clamp_effort_for_model,
-        )
+        from omnigent.util.reasoning_effort import clamp_antigravity_effort
 
         if not effort:
             return JSONResponse(
@@ -2207,22 +2209,28 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503, content={"detail": "Could not fetch Antigravity effort settings"}
             )
-        raw_model = snapshot.get("model_override")
-        base_model = (
-            split_agy_effort_suffix(raw_model.strip())[0]
-            if isinstance(raw_model, str) and raw_model.strip()
+        # Validate against the confirmed terminal model (``llm_model``, populated
+        # only from confirmed readback), never the requested ``model_override``:
+        # a terminal-side /model switch changes what agy is actually running.
+        # When unconfirmed, fail closed so standalone xhigh is refused.
+        raw_confirmed = snapshot.get("llm_model")
+        confirmed_model = (
+            raw_confirmed.strip()
+            if isinstance(raw_confirmed, str) and raw_confirmed.strip()
             else None
         )
+        raw_options = snapshot.get("model_options")
+        catalog_models = raw_options if isinstance(raw_options, list) else None
         if (
-            base_model is not None
-            and clamp_effort_for_model(effort, base_model, caps=antigravity_model_effort_caps())
+            clamp_antigravity_effort(effort, confirmed_model, catalog_models=catalog_models)
             != effort
         ):
+            target = confirmed_model or "unconfirmed Antigravity model"
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": "antigravity_native_effort_unsupported",
-                    "detail": f"Effort {effort!r} is not supported by {base_model}",
+                    "detail": f"Effort {effort!r} is not supported by {target}",
                 },
             )
         raw_labels = snapshot.get("labels")

@@ -44,7 +44,7 @@ from pathlib import Path
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
-from omnigent.util.reasoning_effort import antigravity_model_effort_caps, clamp_effort_for_model
+from omnigent.util.reasoning_effort import clamp_antigravity_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -161,6 +161,54 @@ def should_skip_permissions(
     return headless
 
 
+def _extract_model_and_effort_from_extra_args(
+    extra_args: tuple[str, ...],
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """Strip ``--model`` and ``--effort`` (split or ``=`` forms) from *extra_args*.
+
+    Stops parsing flags at ``--`` so positional arguments are preserved verbatim.
+    When repeated, the last occurrence wins, matching CLI flag semantics.
+    """
+    extracted_model: str | None = None
+    extracted_effort: str | None = None
+    remaining: list[str] = []
+    idx = 0
+    while idx < len(extra_args):
+        arg = extra_args[idx]
+        if arg == "--":
+            remaining.extend(extra_args[idx:])
+            break
+        if arg == "--model":
+            if idx + 1 < len(extra_args):
+                val = extra_args[idx + 1]
+                extracted_model = val if val else None
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("--model="):
+            val = arg.partition("=")[2]
+            extracted_model = val if val else None
+            idx += 1
+            continue
+        if arg == "--effort":
+            if idx + 1 < len(extra_args):
+                val = extra_args[idx + 1]
+                extracted_effort = val if val else None
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("--effort="):
+            val = arg.partition("=")[2]
+            extracted_effort = val if val else None
+            idx += 1
+            continue
+        remaining.append(arg)
+        idx += 1
+    return extracted_model, extracted_effort, tuple(remaining)
+
+
 def build_agy_launch(
     *,
     conversation_id: str | None,
@@ -214,10 +262,18 @@ def build_agy_launch(
     :raises OmnigentError: When saved credentials need repair through setup.
     :raises RuntimeError: When the agy executable cannot be found.
     """
-    launch = resolve_native_antigravity_launch(model=model)
-    model = launch.model
+    extra_model, extra_effort, remaining_extra_args = _extract_model_and_effort_from_extra_args(
+        extra_args
+    )
+    launch = resolve_native_antigravity_launch(
+        model=extra_model if extra_model is not None else model
+    )
+    final_model = launch.model
+    final_effort = extra_effort if extra_effort is not None else effort
     argv: list[str] = [agy_binary_path()]
-    if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
+    if not any(
+        arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in remaining_extra_args
+    ):
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if log_dir is not None:
         argv.append(f"--log-file={log_dir / f'agy-{secrets.token_hex(16)}.log'}")
@@ -225,25 +281,28 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
-    if model is not None:
-        base_model, suffix_effort = split_agy_effort_suffix(model)
-        caps = antigravity_model_effort_caps()
-        if effort:
-            effort = clamp_effort_for_model(effort, base_model, caps=caps)
+    if final_model is not None:
+        base_model, suffix_effort = split_agy_effort_suffix(final_model)
+        if final_effort:
+            final_effort = clamp_antigravity_effort(final_effort, base_model)
             argv.extend(["--model", base_model])
         elif suffix_effort is not None:
-            clamped_suffix = clamp_effort_for_model(suffix_effort, base_model, caps=caps)
+            clamped_suffix = clamp_antigravity_effort(suffix_effort, base_model)
             argv.extend(
                 [
                     "--model",
-                    f"{base_model}-{clamped_suffix}" if clamped_suffix != suffix_effort else model,
+                    f"{base_model}-{clamped_suffix}"
+                    if clamped_suffix != suffix_effort
+                    else final_model,
                 ]
             )
         else:
-            argv.extend(["--model", model])
-    if effort is not None:
-        argv.extend(["--effort", effort])
-    for arg in extra_args:
+            argv.extend(["--model", final_model])
+    elif final_effort:
+        final_effort = clamp_antigravity_effort(final_effort, None)
+    if final_effort is not None:
+        argv.extend(["--effort", final_effort])
+    for arg in remaining_extra_args:
         if arg != _SKIP_PERMISSIONS_FLAG or arg not in argv:
             argv.append(arg)
 

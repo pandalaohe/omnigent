@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -213,6 +214,44 @@ DEFAULT_MODEL_EFFORT_CAPS = ModelEffortCaps()
 # gateway table independently of agy's CLI catalog.
 _ANTIGRAVITY_ABOVE_HIGH: frozenset[str] = frozenset({"xhigh", "max", "ultra"})
 _ANTIGRAVITY_NON_MEDIUM: frozenset[str] = frozenset({"low", "high", "xhigh", "max", "ultra"})
+_ANTIGRAVITY_LADDER: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+_ANTIGRAVITY_DISPLAY_EFFORT_RE = re.compile(
+    r"\s*\((?:low|medium|high|xhigh|max)\)$", re.IGNORECASE
+)
+_ANTIGRAVITY_SLUG_EFFORT_RE = re.compile(r"-(?:low|medium|high|xhigh|max)$", re.IGNORECASE)
+
+
+def _strip_antigravity_effort_suffix(model: str) -> str:
+    """Strip a trailing agy display-name or slug effort suffix."""
+    without_display = _ANTIGRAVITY_DISPLAY_EFFORT_RE.sub("", model.strip())
+    return _ANTIGRAVITY_SLUG_EFFORT_RE.sub("", without_display).strip()
+
+
+def _antigravity_model_identity(model: str) -> str:
+    """Fold an agy model id or display name into a comparison key."""
+    base = _strip_antigravity_effort_suffix(model)
+    return re.sub(r"[^a-z0-9]", "", _bare_model(base))
+
+
+def _antigravity_row_efforts(row: Mapping[str, object]) -> frozenset[str] | None:
+    """Extract advertised effort values from one agy catalog row."""
+    raw = row.get("efforts")
+    if isinstance(raw, (list, tuple)):
+        levels = frozenset(v for v in raw if isinstance(v, str) and v)
+        if levels:
+            return levels
+    supported = row.get("supportedReasoningEfforts")
+    if isinstance(supported, (list, tuple)):
+        levels = frozenset(
+            item["reasoningEffort"]
+            for item in supported
+            if isinstance(item, Mapping)
+            and isinstance(item.get("reasoningEffort"), str)
+            and item["reasoningEffort"]
+        )
+        if levels:
+            return levels
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -222,25 +261,89 @@ def antigravity_model_effort_caps() -> ModelEffortCaps:
     Imported lazily because :mod:`omnigent.models.model_fallbacks` pulls in
     ``provider_config`` → ``spec.parser`` → ``spec.validator`` → this module.
     """
-    from omnigent.models.model_fallbacks import (
-        ANTIGRAVITY_HIGH_CAP_MODELS,
-        ANTIGRAVITY_MEDIUM_CAP_MODELS,
-    )
+    from omnigent.models.model_fallbacks import ANTIGRAVITY_MEDIUM_CAP_MODELS
 
     return ModelEffortCaps(
         fallback=MappingProxyType(
-            {
-                **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, "high"),
-                **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium"),
-            }
+            dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, "medium")
         ),
         unsupported=MappingProxyType(
-            {
-                **dict.fromkeys(ANTIGRAVITY_HIGH_CAP_MODELS.model_ids, _ANTIGRAVITY_ABOVE_HIGH),
-                **dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM),
-            }
+            dict.fromkeys(ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids, _ANTIGRAVITY_NON_MEDIUM)
         ),
     )
+
+
+@lru_cache(maxsize=1)
+def _antigravity_xhigh_identities() -> frozenset[str]:
+    """Return normalized identities of agy models verified to offer ``xhigh``."""
+    from omnigent.models.model_fallbacks import ANTIGRAVITY_XHIGH_MODELS
+
+    return frozenset(_antigravity_model_identity(m) for m in ANTIGRAVITY_XHIGH_MODELS.model_ids)
+
+
+def clamp_antigravity_effort(
+    effort: str | None,
+    model: str | None,
+    *,
+    catalog_models: Iterable[Mapping[str, object]] | None = None,
+) -> str | None:
+    """Clamp an Antigravity *effort* fail-closed against *model* and *catalog_models*.
+
+    ``xhigh`` (and higher aliases ``max``/``ultra``) is allowed only when the
+    resolved model is known to offer ``xhigh`` — either because its row in
+    *catalog_models* advertises ``xhigh``, or (when no catalog row matches) its
+    normalized identity is in :data:`ANTIGRAVITY_XHIGH_MODELS`. Any other or
+    unknown model, including ``model=None``, fails closed to ``"high"`` (or the
+    highest/nearest rung the model supports, such as ``"medium"`` for
+    medium-only models).
+    """
+    if effort is None:
+        return None
+    identity = (
+        _antigravity_model_identity(model) if isinstance(model, str) and model.strip() else ""
+    )
+    matched_row: Mapping[str, object] | None = None
+    if identity and catalog_models is not None:
+        for row in catalog_models:
+            if not isinstance(row, Mapping):
+                continue
+            row_id = row.get("id")
+            row_display = row.get("displayName")
+            if (isinstance(row_id, str) and _antigravity_model_identity(row_id) == identity) or (
+                isinstance(row_display, str)
+                and _antigravity_model_identity(row_display) == identity
+            ):
+                matched_row = row
+                break
+    resolved_model: str | None = None
+    if matched_row is not None and isinstance(matched_row.get("id"), str) and matched_row["id"]:
+        resolved_model = str(matched_row["id"])
+    elif isinstance(model, str) and model.strip():
+        resolved_model = re.sub(r"[\s.]+", "-", _strip_antigravity_effort_suffix(model).lower())
+
+    clamped = clamp_effort_for_model(effort, resolved_model, caps=antigravity_model_effort_caps())
+    assert clamped is not None
+
+    row_efforts = _antigravity_row_efforts(matched_row) if matched_row is not None else None
+    if row_efforts is not None:
+        offered = [level for level in _ANTIGRAVITY_LADDER if level in row_efforts]
+        if offered:
+            if clamped in _ANTIGRAVITY_ABOVE_HIGH:
+                return "xhigh" if "xhigh" in offered else offered[-1]
+            if clamped in offered:
+                return clamped
+            if clamped in _ANTIGRAVITY_LADDER:
+                target = _ANTIGRAVITY_LADDER.index(clamped)
+                return min(
+                    offered, key=lambda value: abs(_ANTIGRAVITY_LADDER.index(value) - target)
+                )
+        return clamped
+
+    if clamped in _ANTIGRAVITY_ABOVE_HIGH:
+        if identity and identity in _antigravity_xhigh_identities():
+            return "xhigh"
+        return "high"
+    return clamped
 
 
 def model_effort_caps(caps: ModelEffortCaps | None = None) -> ModelEffortCaps:

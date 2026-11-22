@@ -25,6 +25,7 @@ from omnigent.util.reasoning_effort import (
     PI_EFFORTS,
     ModelEffortCaps,
     antigravity_model_effort_caps,
+    clamp_antigravity_effort,
     clamp_effort_for_model,
     effort_for_model_switch,
     model_effort_caps,
@@ -275,7 +276,7 @@ def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
     model: str, effort: str
 ) -> None:
     """Gemini 4 Neon and Hydrogen keep every Antigravity effort including xhigh."""
-    assert clamp_effort_for_model(effort, model, caps=antigravity_model_effort_caps()) == effort
+    assert clamp_antigravity_effort(effort, model) == effort
 
 
 @pytest.mark.parametrize(
@@ -293,17 +294,17 @@ def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
 @pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
 def test_antigravity_caps_clamp_above_high_for_high_only_models(model: str, effort: str) -> None:
     """Antigravity models capped at high never receive xhigh/max/ultra."""
-    caps = antigravity_model_effort_caps()
-    assert clamp_effort_for_model(effort, model, caps=caps) == "high"
+    assert clamp_antigravity_effort(effort, model) == "high"
     for supported in ("low", "medium", "high"):
-        assert clamp_effort_for_model(supported, model, caps=caps) == supported
+        assert clamp_antigravity_effort(supported, model) == supported
 
 
 def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchanged() -> None:
     """GPT-OSS stays at medium on agy; non-AG default caps never clamp Claude 5.5."""
     caps = antigravity_model_effort_caps()
+    assert clamp_antigravity_effort("xhigh", "gpt-oss-120b") == "medium"
+    assert clamp_antigravity_effort("medium", "gpt-oss-120b") == "medium"
     assert clamp_effort_for_model("xhigh", "gpt-oss-120b", caps=caps) == "medium"
-    assert clamp_effort_for_model("medium", "gpt-oss-120b", caps=caps) == "medium"
     # Anthropic/Claude harnesses use the default table and must not lose xhigh/max on 5.5.
     assert clamp_effort_for_model("xhigh", "claude-opus-5-5") == "xhigh"
     assert clamp_effort_for_model("xhigh", "claude-sonnet-5-5") == "xhigh"
@@ -316,4 +317,33 @@ def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchang
         )
     )
     with patch("omnigent.runtime._globals._caps", new=SimpleNamespace(routing_settings=settings)):
-        assert clamp_effort_for_model("xhigh", "claude-opus-5-5", caps=caps) == "high"
+        assert clamp_antigravity_effort("xhigh", "claude-opus-5-5") == "high"
+
+
+def test_antigravity_clamp_fails_closed_for_unknown_and_omitted_model_and_honors_catalog() -> None:
+    """Omitted or unseen AG models fail closed to high; catalog advertising xhigh allows it."""
+    assert clamp_antigravity_effort("xhigh", None) == "high"
+    assert clamp_antigravity_effort("high", None) == "high"
+    assert clamp_antigravity_effort("xhigh", "gemini-5-unseen") == "high"
+    assert clamp_antigravity_effort("xhigh", "unconfirmed") == "high"
+    assert clamp_antigravity_effort("xhigh", "Gemini 4 Hydrogen (High)") == "xhigh"
+    assert clamp_antigravity_effort("xhigh", "Claude Opus 5.5 (High)") == "high"
+    catalog = [
+        {
+            "id": "gemini-5-unseen",
+            "displayName": "Gemini 5 Unseen",
+            "efforts": ["low", "medium", "high", "xhigh"],
+        },
+        {
+            "id": "gemini-4-hydrogen",
+            "displayName": "Gemini 4 Hydrogen",
+            "efforts": ["low", "medium", "high"],
+        },
+    ]
+    assert clamp_antigravity_effort("xhigh", "gemini-5-unseen", catalog_models=catalog) == "xhigh"
+    assert (
+        clamp_antigravity_effort("xhigh", "Gemini 5 Unseen (High)", catalog_models=catalog)
+        == "xhigh"
+    )
+    # When the live catalog explicitly omits xhigh for a model, the catalog wins.
+    assert clamp_antigravity_effort("xhigh", "gemini-4-hydrogen", catalog_models=catalog) == "high"

@@ -1040,3 +1040,64 @@ async def test_bundled_child_create_survives_a_failed_notify_read(
     child = await client.get(f"/v1/sessions/{created['session_id']}")
     assert child.status_code == 200, child.text
     assert child.json()["parent_session_id"] == parent_id
+
+
+async def test_patch_antigravity_clamped_model_switch_persists_applied_effort(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clamped effort from a live AG /model switch is persisted back on the server."""
+    import json
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    store = get_conversation_store()
+    store.set_labels(sid, {"omnigent.wrapper": "antigravity-native-ui"})
+    store.set_runner_id(sid, "runner_agy")
+
+    forwarded: list[dict[str, Any]] = []
+
+    async def _fake_forward(
+        session_id: str,
+        runner_router: Any,
+        event: dict[str, Any],
+        timeout_s: float = 5.0,
+    ) -> _RunnerForwardResult:
+        del session_id, runner_router, timeout_s
+        forwarded.append(dict(event))
+        if event.get("type") == "model_change":
+            return _RunnerForwardResult(
+                status_code=200,
+                body=json.dumps({"model": "claude-opus-5-5-high", "effort": "high"}),
+            )
+        return _RunnerForwardResult(
+            status_code=200,
+            body=json.dumps({"effort": event.get("effort")}),
+        )
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _fake_forward)
+
+    # Combined model + effort switch: Opus clamps xhigh -> high on the runner.
+    switched = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "claude-opus-5-5", "reasoning_effort": "xhigh"},
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["reasoning_effort"] == "high"
+    assert store.get_conversation(sid).reasoning_effort == "high"
+    assert forwarded[0]["type"] == "model_change"
+
+    # Re-submitting xhigh is NOT skipped as unchanged because high was persisted.
+    retried = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"reasoning_effort": "xhigh"},
+    )
+    assert retried.status_code == 200, retried.text
+    assert len(forwarded) == 2
+    assert forwarded[1]["type"] == "effort_change"
+    assert forwarded[1]["effort"] == "xhigh"

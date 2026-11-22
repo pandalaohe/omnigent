@@ -7488,6 +7488,31 @@ def register_core_routes(
                     "The terminal did not confirm the settings change. The previous selection has been restored.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
+            if agy_native and _model_forward is not None:
+                confirmed_effort = _runner_reply_field(_model_forward.body, "effort")
+                if (
+                    isinstance(confirmed_effort, str)
+                    and confirmed_effort in EFFORT_VALUES
+                    and confirmed_effort != updated.reasoning_effort
+                ):
+                    reconciled = await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        reasoning_effort=confirmed_effort,
+                    )
+                    if reconciled is not None:
+                        updated = reconciled
+                    from omnigent.runtime import session_stream
+                    from omnigent.server.schemas import SessionReasoningEffortEvent
+
+                    session_stream.publish(
+                        session_id,
+                        SessionReasoningEffortEvent(
+                            type="session.reasoning_effort",
+                            conversation_id=session_id,
+                            reasoning_effort=confirmed_effort,
+                        ).model_dump(),
+                    )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
             # omnigent.ui, which chat-first SDK terminal-view sessions like
