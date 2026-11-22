@@ -2611,14 +2611,17 @@ def _agy_control_pane(bridge_dir: Path) -> str:
     return _capture_pane(info["socket_path"], info["tmux_target"])
 
 
-def _require_agy_idle(bridge_dir: Path) -> str:
-    pane = _agy_control_pane(bridge_dir)
+def _require_idle_pane(pane: str) -> str:
     mode = parse_agy_agent_mode(pane)
     if mode is None and _AGY_ACTIVE_MARKER in pane:
         raise RuntimeError("Antigravity is busy; wait for the active turn to finish")
     if mode is None:
         raise RuntimeError(f"Antigravity input is not idle; pane: {_format_pane_debug_tail(pane)}")
     return pane
+
+
+def _require_agy_idle(bridge_dir: Path) -> str:
+    return _require_idle_pane(_agy_control_pane(bridge_dir))
 
 
 def parse_agy_config_row(pane: str, row: str) -> str | None:
@@ -2693,7 +2696,7 @@ def run_agy_slash_command(
             info["socket_path"],
             info["tmux_target"],
             content=command,
-            validate_baseline=validate_baseline,
+            validate_baseline=lambda pane: validate_baseline(_require_idle_pane(pane)),
         )
     else:
         _paste_and_submit(bridge_dir, info["socket_path"], info["tmux_target"], content=command)

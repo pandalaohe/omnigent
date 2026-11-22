@@ -6661,6 +6661,70 @@ async def test_antigravity_xhigh_refuses_hydrogen_to_opus_switch_within_3s_budge
     assert "capture-pane" in tmux_calls[single_read_start][0]
 
 
+async def test_antigravity_xhigh_returns_503_when_pane_turns_busy_before_paste(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy,
+        "read_tmux_info",
+        lambda _: {"socket_path": "/tmp/example/tmux.sock", "tmux_target": "main"},
+    )
+
+    panes = [
+        "> \n? for shortcuts    Gemini 4 Hydrogen · high\n",
+        "> \nesc to cancel\n",
+    ]
+    capture_index = [0]
+    tmux_calls: list[tuple[list[str], float]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        tmux_calls.append((cmd, float(timeout)))
+        if "capture-pane" in cmd:
+            pane = panes[min(capture_index[0], len(panes) - 1)]
+            capture_index[0] += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(agy.subprocess, "run", fake_run)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_busy_race", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            "/v1/sessions/conv_agy_busy_race/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "antigravity_native_effort_failed"
+    assert tmux_calls
+    assert all(timeout <= 3.0 for _, timeout in tmux_calls)
+    assert not any(
+        "load-buffer" in cmd or "paste-buffer" in cmd or cmd[-1] == "Enter"
+        for cmd, _ in tmux_calls
+    )
+
+
 @pytest.mark.parametrize(
     "outcome", ["commit", "rollback", "prepare-failure", "rollback-failure", "snapshot-timeout"]
 )
