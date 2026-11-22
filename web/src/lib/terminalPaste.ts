@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { toast } from "sonner";
 import type { TerminalSession } from "@/components/blocks/TerminalSession";
 import type { ClipboardOp } from "./terminalKeys";
 
 const HOST_CLIPBOARD_MAX_BYTES = 256 * 1024;
 const HOST_REPLY_TIMEOUT_MS = 5000;
-const PASTE_REPEAT_MS = 3000;
 const NOT_CONNECTED = "Not connected";
 const HOST_FAILURES: Readonly<Record<string, string>> = {
   "read-only": "Read-only terminal",
@@ -121,8 +120,6 @@ interface PasteRequest extends TerminalPasteOptions {
 interface PasteReview {
   request: PasteRequest;
   text: string;
-  bracketed: boolean;
-  repeatUntil: number;
 }
 
 /** Use the same normalization and confirmation for every clipboard source. */
@@ -152,30 +149,27 @@ export function useTerminalPaste(
     return () => requestRef.current?.controller.abort();
   }, [scope, active, readOnly, cancel]);
 
-  useEffect(() => {
-    if (!review?.repeatUntil) return;
-    const timer = setTimeout(
-      () => {
-        if (reviewRef.current !== review) return;
-        const expired = { ...review, repeatUntil: 0 };
-        reviewRef.current = expired;
-        setReview(expired);
-      },
-      Math.max(0, review.repeatUntil - performance.now()),
-    );
-    return () => clearTimeout(timer);
-  }, [review]);
-
   const isCurrent = (request: PasteRequest) =>
     requestRef.current === request &&
     !request.controller.signal.aborted &&
     request.session === sessionRef.current &&
     request.session.canPaste();
 
-  const send = (request: PasteRequest, text: string, enter: boolean) => {
+  const showReview = (request: PasteRequest, text: string) => {
+    const next = { request, text };
+    reviewRef.current = next;
+    setReview(next);
+  };
+
+  const send = (request: PasteRequest, text: string, enter: boolean, reviewOnRefusal = false) => {
     if (!isCurrent(request)) return;
+    const sent = request.session.paste(text, enter);
+    if (!sent && reviewOnRefusal && isCurrent(request)) {
+      showReview(request, text);
+      return;
+    }
     cancel();
-    if (!request.session.paste(text, enter)) {
+    if (!sent) {
       toast.error(NOT_CONNECTED);
       return;
     }
@@ -186,22 +180,14 @@ export function useTerminalPaste(
     if (!isCurrent(request)) return;
     setShowPasteBox(false);
     const text = stripPasteControlCharacters(raw).replace(/\n+$/, "");
+    const hasLineBreakOrTab = /[\n\t]/.test(text);
     if (!text) {
       cancel();
       toast.info("Clipboard is empty");
-    } else if (/[\n\t]/.test(text)) {
-      const next = {
-        request,
-        text,
-        bracketed: request.session.pastesBracketed(),
-        repeatUntil: 0,
-      };
-      if (next.bracketed && request.keyId !== undefined)
-        next.repeatUntil = performance.now() + PASTE_REPEAT_MS;
-      reviewRef.current = next;
-      setReview(next);
+    } else if (hasLineBreakOrTab && !request.session.pastesBracketed()) {
+      showReview(request, text);
     } else {
-      send(request, text, request.enter);
+      send(request, text, request.enter && !hasLineBreakOrTab, hasLineBreakOrTab);
     }
   };
 
@@ -228,11 +214,8 @@ export function useTerminalPaste(
       pending.request.source === source &&
       isCurrent(pending.request)
     ) {
-      if (!pending.bracketed || !session.pastesBracketed()) return;
-      if (performance.now() <= pending.repeatUntil) {
-        send(pending.request, pending.text, false);
-        return;
-      }
+      // Leave the current preview in place when its paste key is tapped again.
+      return;
     }
 
     cancel();

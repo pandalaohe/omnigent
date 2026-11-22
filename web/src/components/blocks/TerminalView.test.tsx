@@ -2449,45 +2449,138 @@ describe("terminal clipboard paste", () => {
     expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("ab", false);
   });
 
-  it.each([true, false])("confirms multiline input with bracketed mode=%s", async (bracketed) => {
+  it.each([
+    { source: "key bar", op: "paste", options: { enter: true, keyId: "paste" }, native: false },
+    {
+      source: "host clipboard",
+      op: "pasteHost",
+      options: { enter: true, keyId: "host" },
+      native: false,
+    },
+    { source: "native paste", op: "paste", options: { enter: false }, native: true },
+  ] as const)(
+    "pastes bracketed multiline input from $source immediately without Enter",
+    async ({ op, options, native }) => {
+      const text = "a\r\nb\r\n";
+      vi.stubGlobal("navigator", { clipboard: { readText: async () => text } });
+      const { terminal } = await openTerminal();
+      terminal.readHostClipboard.mockResolvedValue({ text });
+      await act(async () => terminal.onClipboardAction?.(op, options, native ? text : undefined));
+      expect(screen.queryByText("Review before pasting", { exact: false })).not.toBeInTheDocument();
+      expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("a\nb", false);
+    },
+  );
+
+  it("requires the review button for multiline input without bracketed mode", async () => {
     const readText = vi.fn(async () => "a\r\nb\r\n");
     vi.stubGlobal("navigator", { clipboard: { readText } });
     const { terminal } = await openTerminal();
-    terminal.pastesBracketed.mockReturnValue(bracketed);
+    terminal.pastesBracketed.mockReturnValue(false);
     const tap = () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" });
     await act(async () => tap());
     expect(screen.getByRole("status")).toHaveTextContent("2 lines");
     expect(terminal.paste).not.toHaveBeenCalled();
     await act(async () => tap());
     expect(readText).toHaveBeenCalledTimes(1);
-    if (!bracketed) {
-      expect(terminal.paste).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
-    }
+    expect(terminal.paste).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
     expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("a\nb", false);
   });
 
-  it("uses the paste box when clipboard access fails and reviews tabs", async () => {
-    vi.stubGlobal("navigator", {
-      clipboard: {
-        readText: async () => {
-          throw new Error("denied");
-        },
-      },
-    });
-    const { terminal } = await openTerminal();
-    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
-    fireEvent.change(screen.getByLabelText("Text to paste"), { target: { value: "go\there" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
-    expect(screen.getByText("go⇥here")).toBeInTheDocument();
-    expect(terminal.paste).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
-    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("go\there", false);
-  });
+  it.each(["a\nb", "a\tb"])(
+    "keeps bracketed paste %j available for confirmation after IME composition",
+    async (text) => {
+      vi.stubGlobal("navigator", { clipboard: { readText: async () => text } });
+      const error = vi.spyOn(toast, "error");
+      const { terminal } = await openTerminal();
+      terminal.paste.mockReturnValueOnce(false);
 
-  it("drops both a queued review and a delayed host reply when the terminal changes", async () => {
+      await act(async () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" }));
+
+      expect(terminal.paste).toHaveBeenCalledExactlyOnceWith(text, false);
+      expect(screen.getByRole("status")).toHaveTextContent("Review before pasting");
+      expect(error).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+
+      expect(terminal.paste.mock.calls).toEqual([
+        [text, false],
+        [text, false],
+      ]);
+      expect(screen.queryByText("Review before pasting", { exact: false })).not.toBeInTheDocument();
+      expect(error).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { text: "a\nb", disconnect: true, enter: false },
+    { text: "a", disconnect: false, enter: true },
+  ])(
+    "keeps the refusal toast for $text with disconnect=$disconnect",
+    async ({ text, disconnect, enter }) => {
+      vi.stubGlobal("navigator", { clipboard: { readText: async () => text } });
+      const error = vi.spyOn(toast, "error");
+      const { terminal } = await openTerminal();
+      terminal.paste.mockImplementationOnce(() => {
+        if (disconnect) terminal.canPaste.mockReturnValue(false);
+        return false;
+      });
+
+      await act(async () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" }));
+
+      expect(terminal.paste).toHaveBeenCalledExactlyOnceWith(text, enter);
+      expect(error).toHaveBeenCalledExactlyOnceWith("Not connected");
+      expect(screen.queryByText("Review before pasting", { exact: false })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([true, false])(
+    "pastes tabs from the fallback box with bracketed mode=%s",
+    async (bracketed) => {
+      vi.stubGlobal("navigator", {
+        clipboard: {
+          readText: async () => {
+            throw new Error("denied");
+          },
+        },
+      });
+      const { terminal } = await openTerminal();
+      terminal.pastesBracketed.mockReturnValue(bracketed);
+      await act(async () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" }));
+      fireEvent.change(screen.getByLabelText("Text to paste"), { target: { value: "go\there" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
+      if (bracketed) {
+        expect(screen.queryByText("go⇥here")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByText("go⇥here")).toBeInTheDocument();
+        expect(terminal.paste).not.toHaveBeenCalled();
+        fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+      }
+      expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("go\there", false);
+    },
+  );
+
+  it("clears the visible paste review without sending when the terminal changes", async () => {
     vi.stubGlobal("navigator", { clipboard: { readText: async () => "a\nb" } });
     const { terminal, rerender } = await openTerminal();
+    terminal.pastesBracketed.mockReturnValue(false);
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines");
+
+    rerender(<TerminalView sessionId="conv_paste" terminalId="terminal_b" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const other = terminalSessionMock.instances[1];
+    act(() => other.onState({ kind: "connected" }));
+
+    expect(screen.queryByText("Review before pasting", { exact: false })).not.toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(other.paste).not.toHaveBeenCalled();
+  });
+
+  it("drops a delayed host reply when the terminal changes", async () => {
+    vi.stubGlobal("navigator", { clipboard: { readText: async () => "a\nb" } });
+    const { terminal, rerender } = await openTerminal();
+    terminal.pastesBracketed.mockReturnValue(false);
     await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
     expect(screen.getByRole("status")).toHaveTextContent("2 lines");
     let reply: (result: { text: string }) => void = () => {};
