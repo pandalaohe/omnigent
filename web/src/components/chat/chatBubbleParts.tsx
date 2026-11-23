@@ -2479,7 +2479,7 @@ export function LatestTurnSpacer({
   // Cancel any pending capture-retry frame when the surface unmounts.
   useEffect(() => () => cancelAnimationFrame(captureFrameRef.current), []);
 
-  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
+  return <div ref={spacerRef} aria-hidden data-latest-turn-spacer style={{ flexShrink: 0 }} />;
 }
 
 /**

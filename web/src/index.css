@@ -1290,6 +1290,10 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   );
 }
 
+[data-question-card-scroll-held] [data-latest-turn-spacer] {
+  min-height: var(--question-card-spacer-floor, 0px);
+}
+
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
  * Keep it below the overlaid glass header after programmatic navigation. */
 .turn-fold-row {

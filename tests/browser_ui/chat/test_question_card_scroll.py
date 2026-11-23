@@ -51,6 +51,9 @@ def test_editing_card_holds_position_and_reveals_the_caret(
     page.set_viewport_size({"width": width, "height": 844})
     chat = chat_session_contract
     chat.harness = "claude-native"
+    chat.contract.json(
+        f"/v1/sessions/{chat.session_id}/host-terminals", {"terminals": [], "complete": True}
+    )
     chat.set_items(
         [
             message_item("card-request", "user", "Explain the plan.", response_id="card-turn"),

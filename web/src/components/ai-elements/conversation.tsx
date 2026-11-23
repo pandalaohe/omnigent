@@ -91,6 +91,16 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
           el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
         cancelAnimationFrame(resumeFrame.current);
         resumeFrame.current = 0;
+        // The latest-turn spacer normally shrinks as output fills it. Keep
+        // its starting height available so that shrink cannot clamp the
+        // scrollTop needed to offset growth above the card.
+        const spacer = content.querySelector("[data-latest-turn-spacer]");
+        if (spacer) {
+          el.style.setProperty(
+            "--question-card-spacer-floor",
+            `${spacer.getBoundingClientRect().height}px`,
+          );
+        }
         el.setAttribute(QUESTION_CARD_HOLD, "");
       }
       cards.current.add(card);
@@ -106,6 +116,7 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
         if (cards.current.size > 0) return;
         anchor.current = null;
         el.removeAttribute(QUESTION_CARD_HOLD);
+        el.style.removeProperty("--question-card-spacer-floor");
         if (!resumeFollow.current) return;
         // Let a submitted card's replacement render before restoring follow.
         resumeFrame.current = requestAnimationFrame(() => {
