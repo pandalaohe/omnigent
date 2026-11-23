@@ -1253,10 +1253,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
      * it reaches the composer stack (session bar, card, quota line). */
     --chat-composer-fade-start: calc(100% - max(64px, var(--session-composer-height, 0px)) - 8px);
     --chat-composer-fade-end: calc(100% - max(64px, var(--session-composer-height, 0px)) + 24px);
+    --chat-header-fade-end: calc(var(--omnigent-safe-top) + 84px);
     --chat-edge-fade: linear-gradient(
       to bottom,
       transparent calc(var(--omnigent-safe-top) + 44px),
-      black calc(var(--omnigent-safe-top) + 84px),
+      black var(--chat-header-fade-end),
       black var(--chat-composer-fade-start),
       transparent var(--chat-composer-fade-end)
     );
@@ -1266,6 +1267,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 
   /* A pinned plan or banner already clears the header: fade only into the composer. */
   .session-chat-transcript.chat-transcript-pinned > [role="log"] {
+    --chat-header-fade-end: 0px;
     --chat-edge-fade: linear-gradient(
       to bottom,
       black var(--chat-composer-fade-start),
@@ -1280,6 +1282,18 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   [data-chat-surface] .chat-conversation-content {
     padding-bottom: calc(var(--session-composer-height, 0px) + 1.5rem);
   }
+}
+
+/* Some mobile keyboards shrink only the visual viewport. Give the focused
+ * question answer enough scroll range to clear that additional overlap. */
+[data-chat-surface] [data-question-card-scroll-held] > .chat-conversation-content {
+  padding-bottom: calc(
+    1.5rem + var(--session-composer-height, 0px) + var(--question-card-keyboard-room, 0px)
+  );
+}
+
+[data-question-card-scroll-held] [data-latest-turn-spacer] {
+  min-height: var(--question-card-spacer-floor, 0px);
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").

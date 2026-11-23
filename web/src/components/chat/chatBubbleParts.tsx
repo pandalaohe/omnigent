@@ -104,7 +104,11 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { CONVERSATION_RESUME_SCROLL_EVENT } from "@/components/ai-elements/conversation";
+import {
+  CONVERSATION_RESUME_SCROLL_EVENT,
+  isQuestionCardScrollHeld,
+  pauseQuestionCardScroll,
+} from "@/components/ai-elements/conversation";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -1724,7 +1728,11 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
 
   useLayoutEffect(() => {
     if (nonce === 0) return;
-    scrollRef?.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    const el = scrollRef?.current;
+    if (el) {
+      pauseQuestionCardScroll(el);
+      el.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    }
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollRef, scrollToBottom]);
@@ -1809,7 +1817,8 @@ export function KeepBottomOnResize({
     // Growth is answered only while the lock is live and no selection is being
     // dragged: a history page landing above the reader releases the lock first,
     // and the library holds its own correction under a selection.
-    const lockLive = () => state.isAtBottom && !state.escapedFromLock && !isSelecting();
+    const lockLive = () =>
+      state.isAtBottom && !state.escapedFromLock && !isQuestionCardScrollHeld(el) && !isSelecting();
     // Target the library's park position (one pixel short) so the settle is
     // identical whether our write or the library's lands last.
     const pin = () => {
@@ -2475,7 +2484,7 @@ export function LatestTurnSpacer({
   // Cancel any pending capture-retry frame when the surface unmounts.
   useEffect(() => () => cancelAnimationFrame(captureFrameRef.current), []);
 
-  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
+  return <div ref={spacerRef} aria-hidden data-latest-turn-spacer style={{ flexShrink: 0 }} />;
 }
 
 /**
@@ -2607,6 +2616,7 @@ export function JumpToTopButton({
     try {
       // Release StickToBottom's bottom-lock so prepend-driven scrolls bail
       // instead of yanking the view back to the bottom.
+      pauseQuestionCardScroll(el);
       stopScroll();
       state.isAtBottom = false;
       state.escapedFromLock = true;
