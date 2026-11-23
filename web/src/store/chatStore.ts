@@ -60,6 +60,7 @@ import {
   isTerminalCommandInput,
   LIVE_ITEM_PREFIX,
   PENDING_FILE_PREFIX,
+  slashCommandEchoItemId,
   structuredErrorFields,
 } from "@/lib/blocks";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
@@ -7126,7 +7127,6 @@ async function rehydrateWindowOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = committedSendIdsOf(fresh.items);
   const deliveryProof = confirmedWebSendIds(settlementItems);
-  const persistedSendIds = new Set(deliveryProof);
   for (const stableId of deliveryProof) {
     freshItemIds.add(stableId);
     recordInFlightNativeDelivery(id, stableId);
@@ -7160,7 +7160,7 @@ async function rehydrateWindowOnReconnect(
     const pendingPatch = recoveredPendingInputPatch(
       s,
       settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
-      persistedSendIds,
+      settlementItems,
       pendingAtReconnectStart,
       session.pendingInputs,
     );
@@ -7340,7 +7340,6 @@ async function reconcileOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = committedSendIdsOf(items);
   const deliveryProof = confirmedWebSendIds(items);
-  const persistedSendIds = new Set(deliveryProof);
   for (const stableId of deliveryProof) recordInFlightNativeDelivery(id, stableId);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
@@ -7364,7 +7363,7 @@ async function reconcileOnReconnect(
       recoveredPendingInputPatch(
         s,
         settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
-        persistedSendIds,
+        items,
         pendingAtReconnectStart,
         session.pendingInputs,
       ),
@@ -9705,24 +9704,46 @@ function withoutPersistedPendingSends(
   return messages.filter((pending) => !pending.stableId || !persistedSendIds.has(pending.stableId));
 }
 
-// Named receipts can be recovered even if the user item is already on screen.
+// Use persisted order even when a named receipt was already shown or hidden.
+function* recoveredInputReceipts(
+  history: ConversationItem[],
+  recovered: AnyBlock[],
+): Iterable<string | AnyBlock> {
+  const recoveredById = new Map(recovered.map((block) => [block.ctx.itemId, block]));
+  for (const item of history) {
+    if (isMessageItem(item) && item.role === "user" && typeof item.web_stable_id === "string") {
+      yield item.web_stable_id;
+      continue;
+    }
+    if (item.type === "slash_command") {
+      const echo = recoveredById.get(slashCommandEchoItemId(item.id));
+      if (echo) yield echo;
+    }
+    const block = recoveredById.get(item.id);
+    if (block) yield block;
+  }
+}
+
 function recoveredPendingInputPatch(
   s: PendingInputState,
   recovered: AnyBlock[],
-  persistedSendIds: ReadonlySet<string>,
+  history: ConversationItem[],
   pendingAtReconnectStart: Set<string>,
   serverInputs: PendingInput[] | undefined,
 ): PendingInputState {
   const pendingById = pendingInputsById(serverInputs);
+  // Hold named entries in their queue positions until their receipt is visited.
+  const persistedSendIds = new Set(confirmedWebSendIds(history));
   const isStillPending = (p: PendingUserMessage | undefined) =>
     p !== undefined && pendingById.has(p.pendingId ?? p.tempId);
   let state: PendingInputState = {
     pendingUserMessages: syncPendingSendTimes(
-      withoutPersistedPendingSends(s.pendingUserMessages, persistedSendIds).filter(
+      s.pendingUserMessages.filter(
         (p) =>
           serverInputs === undefined ||
           !pendingAtReconnectStart.has(p.tempId) ||
           p.sendingSinceMs === undefined ||
+          (p.stableId !== undefined && persistedSendIds.has(p.stableId)) ||
           isStillPending(p),
       ),
       pendingById,
@@ -9731,7 +9752,11 @@ function recoveredPendingInputPatch(
   };
   const eligible = (p: PendingUserMessage) =>
     !p.initialDraft && !p.beforePost && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
-  for (const block of recovered) {
+  for (const block of recoveredInputReceipts(history, recovered)) {
+    if (typeof block === "string") {
+      state.pendingUserMessages = state.pendingUserMessages.filter((p) => p.stableId !== block);
+      continue;
+    }
     if (isTerminalCommandInput(block) && block.ctx.itemId) {
       state = { ...state, ...settledShellInputPatch(state, block.ctx.itemId, block.input) };
       continue;
@@ -9742,11 +9767,7 @@ function recoveredPendingInputPatch(
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && messageContentText(p.content) === text,
       );
-    } else if (
-      block.type === "user_message" &&
-      !block.ctx.webStableId &&
-      !isSystemUserContent(block.content)
-    ) {
+    } else if (block.type === "user_message" && !isSystemUserContent(block.content)) {
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && block.ctx.itemId && (p.stableId ?? p.tempId) === block.ctx.itemId,
       );

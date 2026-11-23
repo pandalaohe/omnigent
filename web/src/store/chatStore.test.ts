@@ -20075,18 +20075,20 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   it.each([
-    { alreadyShown: false, unreadOnServer: false },
-    { alreadyShown: true, unreadOnServer: true },
+    { alreadyShown: false, unreadOnServer: false, terminalBefore: false },
+    { alreadyShown: true, unreadOnServer: true, terminalBefore: false },
+    { alreadyShown: false, unreadOnServer: false, terminalBefore: true },
   ])(
-    "uses a persisted native send id to settle only its bubble on reconnect ($alreadyShown, $unreadOnServer)",
-    async ({ alreadyShown, unreadOnServer }) => {
+    "uses a persisted native send id to settle only its bubble on reconnect (shown=$alreadyShown, on server=$unreadOnServer, earlier terminal input=$terminalBefore)",
+    async ({ alreadyShown, unreadOnServer, terminalBefore }) => {
       const id = "conv_native_plain_text_receipt";
       const before = userMessage("before_receipt_gap", "before the gap");
+      const settledText = terminalBefore ? "continue the build" : "same prompt";
       const settled = {
         tempId: "settled-bubble",
         pendingId: "pending-settled",
         stableId: "a".repeat(32),
-        content: [{ type: "input_text" as const, text: "same prompt" }],
+        content: [{ type: "input_text" as const, text: settledText }],
         posted: true,
         sentMidTurn: true,
       };
@@ -20095,13 +20097,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         tempId: "unread-bubble",
         pendingId: "pending-unread",
         stableId: "b".repeat(32),
+        content: [{ type: "input_text" as const, text: "same prompt" }],
       };
       const committed = {
-        ...userMessage("native_plain_text_turn", "same prompt"),
+        ...userMessage("native_plain_text_turn", settledText),
         web_stable_id: settled.stableId,
       };
       const reply = assistantMessage("native_plain_text_turn", "the reply");
-      seedSession(id, alreadyShown ? [before, committed, reply] : [before]);
+      const terminal = userMessage("earlier_terminal_turn", "same prompt");
+      const history = [before, ...(terminalBefore ? [terminal] : []), committed, reply];
+      seedSession(id, alreadyShown ? history : [before]);
       seedPendingInputs(
         id,
         unreadOnServer
@@ -20114,14 +20119,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         conversationId: id,
         abortController: controller,
         isNativeTerminalSession: true,
-        blocks: itemsToBlocks(alreadyShown ? [before, committed, reply] : [before]),
-        pendingUserMessages: [unread, settled],
+        blocks: itemsToBlocks(alreadyShown ? history : [before]),
+        pendingUserMessages: terminalBefore ? [settled, unread] : [unread, settled],
       });
 
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       expect(sinks).toHaveLength(1);
-      seedSessionItems(id, [before, committed, reply]);
+      seedSessionItems(id, history);
       sinks[0]!.error();
       await drainAsync();
       expect(sinks).toHaveLength(2);
@@ -20130,11 +20135,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       sinks[1]!.close();
       await drainAsync(2);
       await loop;
-      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
-        before.id,
-        committed.id,
-        reply.id,
-      ]);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(
+        history.map((item) => item.id),
+      );
       expect(useChatStore.getState().pendingUserMessages).toEqual([unread]);
     },
   );
