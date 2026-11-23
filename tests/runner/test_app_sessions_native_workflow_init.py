@@ -378,8 +378,10 @@ async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> 
 
 
 @pytest.mark.asyncio
-async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
-    """A label-shape harness (codex) reads its bridge id from session labels."""
+async def test_resolve_native_spawn_env_label_builder_reads_bridge_id(tmp_path: Path) -> None:
+    """Codex passes the label to its builder and resolves the executor bridge directory."""
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+
     captured: dict[str, Any] = {}
 
     def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
@@ -394,9 +396,9 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     transport = httpx.MockTransport(_labels_handler)
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            "omnigent.harnesses.codex_native.bridge.build_codex_native_spawn_env", _fake_build
-        )
+        mp.setattr(codex_bridge, "build_codex_native_spawn_env", _fake_build)
+        mp.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+        expected_bridge_dir = codex_bridge.bridge_dir_for_bridge_id("bridge_xyz")
         async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "codex-native",
@@ -405,7 +407,10 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
                 optional_labels=None,
             )
 
-    assert env == {"CODEX_BRIDGE": "bridge_xyz"}
+    assert env == {
+        "CODEX_BRIDGE": "bridge_xyz",
+        codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR: str(expected_bridge_dir),
+    }
     assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
 
 
