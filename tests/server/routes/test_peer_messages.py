@@ -263,7 +263,9 @@ def _claim_runner_event(
     )
     peer_id = pending_inputs.peer_message_id_for(receiver.id, event["pending_id"])
     assert peer_id is not None
-    assert peer_sweeper.mark_peer_copy_claimed(peer_env["peer_store"], receiver.id, peer_id)
+    assert peer_sweeper.mark_peer_copy_claimed(
+        peer_env["peer_store"], receiver.id, peer_id, event["delivery_attempt_id"]
+    )
 
 
 def _delivery_errors(peer_env: dict[str, Any], receiver: Conversation) -> list[Any]:
@@ -533,7 +535,10 @@ async def test_claimed_peer_copy_whose_reply_was_lost_waits_for_its_mirror(
         assert (result["disposition"], result["reason"]) == ("queued", "uncertain"), result
         stored = peer_env["peer_store"].get(result["peer_id"])
         assert stored is not None
-        assert (stored.state, stored.reason) == ("delivering", "native_claimed")
+        assert (stored.state, stored.reason) == (
+            "delivering",
+            f"native_claimed:{events[0]['delivery_attempt_id']}",
+        )
         assert await _mirror_runner_event(peer_env, receiver, events[0])
         assert peer_env["peer_store"].get(stored.id).state == "delivered"
         assert len(events) == 1
@@ -2829,6 +2834,51 @@ async def test_list_receiver_records(
         )
         assert listed.status_code == 200, listed.text
         assert sent.json()["peer_id"] in [r["peer_id"] for r in listed.json()["data"]]
+    finally:
+        peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
+
+
+async def test_held_claimed_record_is_not_released_for_a_resend(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Hold and release keep a copy a runner may already have pasted from forwarding."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    now = int(time.time())
+    mark = "native_claimed:" + "c" * 32
+    record = peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="ref-held-claimed",
+            text="claimed copy",
+            state="queued",
+            reason=mark,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "hold"})
+    try:
+        sweeper = peer_env["app"].state.peer_sweeper
+        sweeper._app = peer_env["app"]
+        await sweeper._process_due(record, now)
+        held = peer_env["peer_store"].get(record.id)
+        assert held is not None
+        assert (held.state, held.reason) == ("held", mark)
+        released = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages/{record.id}/action",
+            json={"action": "release"},
+            headers=_headers(ALICE, None),
+        )
+        assert released.status_code == 409, released.text
+        after = peer_env["peer_store"].get(record.id)
+        assert after is not None
+        assert (after.state, after.reason) == ("held", mark)
+        await sweeper._process_due(after, now)
+        assert [call for call in peer_env["fake"].calls if call["session_id"] == receiver.id] == []
     finally:
         peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
 

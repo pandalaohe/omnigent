@@ -52,13 +52,14 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.routes.sessions.routes_peer import (
     _NATIVE_ATTEMPT_REASON_PREFIX,
-    _NATIVE_CLAIMED_REASON,
+    _NATIVE_CLAIMED_REASON_PREFIX,
     _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     _PEER_RELEASED_REASON,
     _first_text_block,
     _native_attempt_id,
+    _native_claimed,
     _needs_native_peer_receipt,
     _peer_envelope_msg_id,
     _released_peer_reason,
@@ -129,30 +130,36 @@ def settle_from_mirrored_envelope(
     return store.transition(peer_id, "delivered", None, ("delivering",))
 
 
-def mark_peer_copy_claimed(store: PeerMessageStore, session_id: str, peer_id: str) -> bool:
-    """Durably record that the receiver's Claude runner may paste this copy.
+def mark_peer_copy_claimed(
+    store: PeerMessageStore, session_id: str, peer_id: str, attempt_id: str
+) -> bool:
+    """Durably record that one delivery attempt's runner may paste this copy.
 
     The caller's in-memory claim already pinned the entry, attempt and claim
-    id, so an existing mark belongs to the same paste. A record the sweeper
-    already reverted, ended or never had takes no mark.
+    id. Only the first attempt to mark the record may paste; a forward the
+    sweeper re-sent carries another attempt id and is refused. A record the
+    sweeper already reverted, ended or never had takes no mark.
 
-    :returns: Whether the record now carries the mark.
+    :returns: Whether the record now carries this attempt's mark.
     """
+    mark = f"{_NATIVE_CLAIMED_REASON_PREFIX}{attempt_id}"
     record = store.get(peer_id)
     if not _legacy_delivering(record, session_id):
         return False
     assert record is not None
-    if record.reason == _NATIVE_CLAIMED_REASON:
-        return True
-    if store.transition(peer_id, "delivering", _NATIVE_CLAIMED_REASON, ("delivering",)):
+    if _native_claimed(record.reason):
+        return record.reason == mark
+    if store.transition(
+        peer_id,
+        "delivering",
+        mark,
+        ("delivering",),
+        exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
+    ):
         return True
     # An identical same-second rewrite can report no changed row.
     current = store.get(peer_id)
-    return (
-        current is not None
-        and current.state == "delivering"
-        and current.reason == _NATIVE_CLAIMED_REASON
-    )
+    return current is not None and current.state == "delivering" and current.reason == mark
 
 
 def _legacy_delivering(record: SessionPeerMessage | None, session_id: str) -> bool:
@@ -487,7 +494,7 @@ class PeerSweeper:
             record.id,
             attempt_reason,
             (origin_state,),
-            exclude_reason=_NATIVE_CLAIMED_REASON,
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
         if not moved:
             # Lost the CAS race — another tick (or the inline route) already
@@ -612,7 +619,7 @@ class PeerSweeper:
             _PEER_RELEASED_REASON if _released_peer_reason(record.reason) else reason,
             ("delivering",),
             expected_reason=expected_reason,
-            exclude_reason=_NATIVE_CLAIMED_REASON,
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
         _logger.warning(
             "Peer sweeper reverted delivering record %s to %s (%s)",
@@ -965,7 +972,7 @@ class PeerSweeper:
             # would re-send a copy still on its way. Expiry above still
             # ends the record.
             return
-        if record.reason == _NATIVE_CLAIMED_REASON:
+        if _native_claimed(record.reason):
             # The runner may have pasted this copy and Claude may have run it;
             # a resend could run it twice, so it ends here unconfirmed.
             moved = await asyncio.to_thread(
@@ -974,7 +981,7 @@ class PeerSweeper:
                 "failed",
                 "delivery_uncertain",
                 ("delivering",),
-                expected_reason=_NATIVE_CLAIMED_REASON,
+                expected_reason=record.reason,
                 notice=True,
             )
             if moved:
@@ -993,7 +1000,7 @@ class PeerSweeper:
             "pending",
             None,
             ("delivering",),
-            exclude_reason=_NATIVE_CLAIMED_REASON,
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
 
 

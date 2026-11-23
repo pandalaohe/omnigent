@@ -136,13 +136,15 @@ class _FakePeerStore(PeerMessageStore):
         reason: str | None,
         expected_states: tuple[str, ...],
         *,
-        exclude_reason: str | None = None,
+        exclude_reason_prefix: str | None = None,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
             if row is None or row.state not in expected_states:
                 return False
-            if exclude_reason is not None and row.reason == exclude_reason:
+            if exclude_reason_prefix is not None and (row.reason or "").startswith(
+                exclude_reason_prefix
+            ):
                 return False
             if any(
                 older.id != row.id
@@ -189,7 +191,7 @@ class _FakePeerStore(PeerMessageStore):
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
-        exclude_reason: str | None = None,
+        exclude_reason_prefix: str | None = None,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
@@ -199,7 +201,9 @@ class _FakePeerStore(PeerMessageStore):
                 return False
             if expected_reason is not None and row.reason != expected_reason:
                 return False
-            if exclude_reason is not None and row.reason == exclude_reason:
+            if exclude_reason_prefix is not None and (row.reason or "").startswith(
+                exclude_reason_prefix
+            ):
                 return False
             row.state = state
             if reason is not None:
@@ -1885,11 +1889,11 @@ async def test_stale_snapshot_never_resends_a_copy_claimed_after_it_was_read(
         store, conv_store, _TrueStateScript(), _DeliverScript(), post_event, now=now
     )
     stale = _row(store, record.id)
-    assert mark_peer_copy_claimed(store, receiver.id, record.id)
+    assert mark_peer_copy_claimed(store, receiver.id, record.id, "a" * 32)
 
     await sweeper._reconcile_one(stale, now, age_from=created)
     claimed = _row(store, record.id)
-    assert (claimed.state, claimed.reason) == ("delivering", "native_claimed")
+    assert (claimed.state, claimed.reason) == ("delivering", "native_claimed:" + "a" * 32)
 
     # The live row ends once, unconfirmed, with one notice; nothing is resent.
     await sweeper._reconcile_stale_delivering(now)
@@ -1903,7 +1907,7 @@ async def test_stale_snapshot_never_resends_a_copy_claimed_after_it_was_read(
 async def test_a_claimed_record_waiting_in_pending_is_never_forwarded_again(
     harness: _Harness,
 ) -> None:
-    record = harness.seed_record(state="pending", reason="native_claimed")
+    record = harness.seed_record(state="pending", reason="native_claimed:" + "a" * 32)
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "pending"
     assert harness.deliver.calls == []
@@ -1915,10 +1919,12 @@ async def test_claim_mark_is_refused_once_the_sweeper_reverted_the_record(
     from omnigent.server.peer_sweeper import mark_peer_copy_claimed
 
     reverted = harness.seed_record(state="pending")
-    assert not mark_peer_copy_claimed(harness.store, "receiver", reverted.id)
+    attempt = "a" * 32
+    assert not mark_peer_copy_claimed(harness.store, "receiver", reverted.id, attempt)
     assert _row(harness.store, reverted.id).reason is None
     held = harness.seed_record(state="delivering")
-    assert mark_peer_copy_claimed(harness.store, "receiver", held.id)
-    # The same paste asking again keeps its grant.
-    assert mark_peer_copy_claimed(harness.store, "receiver", held.id)
-    assert not mark_peer_copy_claimed(harness.store, "other-receiver", held.id)
+    assert mark_peer_copy_claimed(harness.store, "receiver", held.id, attempt)
+    # The same paste asking again keeps its grant; another attempt does not get one.
+    assert mark_peer_copy_claimed(harness.store, "receiver", held.id, attempt)
+    assert not mark_peer_copy_claimed(harness.store, "receiver", held.id, "b" * 32)
+    assert not mark_peer_copy_claimed(harness.store, "other-receiver", held.id, attempt)

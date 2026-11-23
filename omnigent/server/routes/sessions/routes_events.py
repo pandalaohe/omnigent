@@ -6682,7 +6682,7 @@ def register_events_routes(
             # A peer copy may paste only once its record durably says so; a
             # claimed record is never resent.
             marked = await asyncio.to_thread(
-                mark_peer_copy_claimed, peer_message_store, session_id, peer_id
+                mark_peer_copy_claimed, peer_message_store, session_id, peer_id, attempt_id
             )
         except Exception:
             _logger.warning(

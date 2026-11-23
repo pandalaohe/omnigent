@@ -127,8 +127,14 @@ _PEER_INBOUND_REFUSE = "refuse"
 # re-hold it while the receiver's inbound policy is still ``hold``.
 _PEER_RELEASED_REASON = "released"
 _NATIVE_ATTEMPT_REASON_PREFIX = "native_attempt:"
-# A Claude runner claimed (may have pasted) this copy; it is never resent.
-_NATIVE_CLAIMED_REASON = "native_claimed"
+# A Claude runner claimed (may have pasted) this copy under the suffixed
+# delivery attempt; it is never resent.
+_NATIVE_CLAIMED_REASON_PREFIX = "native_claimed:"
+
+
+def _native_claimed(reason: str | None) -> bool:
+    """Whether a peer record carries a Claude runner's paste claim."""
+    return reason is not None and reason.startswith(_NATIVE_CLAIMED_REASON_PREFIX)
 
 
 def _native_attempt_id(reason: str | None) -> str | None:
@@ -927,7 +933,7 @@ def _public_peer_reason(record: SessionPeerMessage) -> str | None:
             if record.state == "delivering"
             else None
         )
-    if _native_attempt_id(record.reason) is not None or record.reason == _NATIVE_CLAIMED_REASON:
+    if _native_attempt_id(record.reason) is not None or _native_claimed(record.reason):
         return "awaiting_native_receipt" if record.state == "delivering" else None
     return record.reason
 
@@ -2109,7 +2115,14 @@ def register_peer_routes(
                 _PEER_RELEASED_REASON,
                 ("held",),
                 relay_depth=0,
+                exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
             )
+            if not moved and _native_claimed(record.reason):
+                # A runner may already have pasted this copy; releasing it would resend it.
+                raise OmnigentError(
+                    f"Peer message {peer_id!r} may already have reached its receiver",
+                    code=ErrorCode.CONFLICT,
+                )
             if not moved:
                 raise OmnigentError(
                     f"Peer message {peer_id!r} is {record.state}, not held",
