@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/randomUUID";
 import { canonicalTerminalFields } from "@/lib/terminalKeyBar";
 import {
   applyTerminalKeyboardChanges,
@@ -160,6 +161,7 @@ function isCurrentPreferenceGeneration(generation: number): boolean {
 let refreshListenersInstalled = false;
 let lastFocusRefreshAt = 0;
 const pendingTimers = new Map<UserPreferenceNamespace, number>();
+const patchScheduleSequences = new Map<UserPreferenceNamespace, number>();
 const lastAcknowledged = new Map<UserPreferenceNamespace, string>();
 // Last known Server value per namespace: a permanently rejected patch (HTTP
 // 422) restores local state from here instead of retrying.
@@ -364,9 +366,11 @@ function mobileSyncValue(value: unknown): unknown | null {
   });
 }
 
+type QueuedKeyboardChange = TerminalKeyboardChange & { queueId?: string };
+
 interface TerminalKeyboardPatch {
   defaults: Record<string, unknown>;
-  changes: TerminalKeyboardChange[];
+  changes: QueuedKeyboardChange[];
 }
 
 function splitMobilePatch(value: unknown) {
@@ -377,6 +381,12 @@ function splitMobilePatch(value: unknown) {
 
 function sameKeyboardField(first: TerminalKeyboardChange, second: TerminalKeyboardChange) {
   return first.platform === second.platform && first.field === second.field;
+}
+
+function withQueueIds(changes: QueuedKeyboardChange[]): QueuedKeyboardChange[] {
+  return changes.map((change) =>
+    change.queueId === undefined ? { ...change, queueId: randomUUID() } : change,
+  );
 }
 
 function mergeMobilePatch(previous: unknown, value: unknown): unknown {
@@ -391,7 +401,10 @@ function mergeMobilePatch(previous: unknown, value: unknown): unknown {
     return {
       ...prior.fields,
       ...fields,
-      terminal_keyboard: { ...keyboard, changes: [...otherChanges, ...keyboard.changes] },
+      terminal_keyboard: {
+        ...keyboard,
+        changes: withQueueIds([...otherChanges, ...keyboard.changes]),
+      },
     };
   }
   const normalized = mobileSyncValue({
@@ -402,7 +415,10 @@ function mergeMobilePatch(previous: unknown, value: unknown): unknown {
         : fields.terminalKeyboard,
   });
   return prior.keyboard && normalized && fields.terminalKeyboard === undefined
-    ? { ...(normalized as object), terminal_keyboard: prior.keyboard }
+    ? {
+        ...(normalized as object),
+        terminal_keyboard: { ...prior.keyboard, changes: withQueueIds(prior.keyboard.changes) },
+      }
     : normalized;
 }
 
@@ -430,7 +446,8 @@ function pendingMobilePatch(current: unknown, acknowledged: unknown): unknown {
   const sent = splitMobilePatch(acknowledged);
   const changes = latest.keyboard?.changes.filter(
     (change) =>
-      !sent.keyboard?.changes.some((saved) => JSON.stringify(saved) === JSON.stringify(change)),
+      change.queueId === undefined ||
+      !sent.keyboard?.changes.some((saved) => saved.queueId === change.queueId),
   );
   const { terminalKeyboard, ...latestFields } = latest.fields;
   const { terminalKeyboard: sentKeyboard, ...sentFields } = sent.fields;
@@ -451,12 +468,9 @@ function pendingMobilePatch(current: unknown, acknowledged: unknown): unknown {
   return Object.keys(fields).length ? fields : null;
 }
 
-function withoutTerminalKeyboardChange(current: unknown, rejected: TerminalKeyboardChange) {
+function withoutTerminalKeyboardChange(current: unknown, rejectedId: string) {
   const { fields, keyboard } = splitMobilePatch(current);
-  // An edit to the same field made during the request may have a different value.
-  const changes = keyboard?.changes.filter(
-    (change) => JSON.stringify(change) !== JSON.stringify(rejected),
-  );
+  const changes = keyboard?.changes.filter((change) => change.queueId !== rejectedId);
   if (changes?.length) return { ...fields, terminal_keyboard: { ...keyboard, changes } };
   return Object.keys(fields).length ? fields : null;
 }
@@ -641,6 +655,7 @@ function cancelPreferenceActivity(): void {
   for (const waiter of patchWaiters) waiter.finish(new Error("The account or server changed."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
+  patchScheduleSequences.clear();
   patchesAfterFlight.clear();
   inFlightPatches.clear();
   lastAcknowledged.clear();
@@ -820,9 +835,13 @@ function schedulePatch(
   attempt: number,
 ): void {
   const generation = syncGeneration;
+  // A replay supersedes the older request as soon as it is scheduled.
+  const sequence = (patchScheduleSequences.get(namespace) ?? 0) + 1;
+  patchScheduleSequences.set(namespace, sequence);
   const fetcher = preferenceFetcher;
   const existing = pendingTimers.get(namespace);
   if (existing !== undefined) window.clearTimeout(existing);
+  patchesAfterFlight.delete(namespace);
   pendingTimers.set(
     namespace,
     window.setTimeout(() => {
@@ -846,7 +865,17 @@ function schedulePatch(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(
               mobile?.keyboard
-                ? { value: mobile.fields, terminal_keyboard: mobile.keyboard }
+                ? {
+                    value: mobile.fields,
+                    terminal_keyboard: {
+                      ...mobile.keyboard,
+                      changes: mobile.keyboard.changes.map(({ platform, field, value }) => ({
+                        platform,
+                        field,
+                        value,
+                      })),
+                    },
+                  }
                 : { value: syncValue },
             ),
           });
@@ -859,14 +888,14 @@ function schedulePatch(
             if (terminalKeyboard && detail === "Invalid preferences payload") {
               // A rolled-back server rejects the extra request field. Leave the
               // dirty records for the next refresh or connection to replay.
-              cancelQueuedPatch(namespace);
+              if (patchScheduleSequences.get(namespace) === sequence) cancelQueuedPatch(namespace);
               return;
             }
             const rejected =
               detail?.code === "terminal_keyboard_conflict" &&
               Number.isInteger(detail.change_index) &&
               typeof detail.message === "string"
-                ? mobile?.keyboard?.changes[detail.change_index]
+                ? mobile?.keyboard?.changes[detail.change_index]?.queueId
                 : undefined;
             const reason = rejected ? detail.message : detail;
             settlePatchWaiters(
@@ -1120,6 +1149,7 @@ export function resetUserPreferencesSyncForTests(): void {
   for (const waiter of patchWaiters) waiter.finish(new Error("Settings sync reset."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
+  patchScheduleSequences.clear();
   patchesAfterFlight.clear();
   inFlightPatches.clear();
   lastAcknowledged.clear();

@@ -214,9 +214,51 @@ else:
     expect(readTerminalKeyboardPreferences()).toEqual(keyboard);
   });
 
-  it.each([false, true])(
-    "drops only the rejected binding and retries the rest (newer binding queued: %s)",
-    async (newerBinding) => {
+  it.each(["before", "after"])(
+    "preserves a refreshed replay whose timer fires %s the late old-server rejection",
+    async (order) => {
+      vi.useFakeTimers();
+      const mobile = mobileValue();
+      const envelope = { version: 1, settings: { mobile_assistant: mobile } };
+      const change = { platform: "linux", field: "pasteBoxMode", value: "always" } as const;
+      const keyboard = { v: 1, pasteBoxMode: { linux: "always" } };
+      let finishOldPatch!: (response: Response) => void;
+      const fetcher = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              finishOldPatch = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(Response.json({ user_id: "alice", preferences: envelope }))
+        .mockResolvedValueOnce(
+          Response.json({
+            ...envelope,
+            settings: { mobile_assistant: { ...mobile, terminalKeyboard: keyboard } },
+          }),
+        );
+      await initializeUserPreferencesSync(envelope, fetcher, "alice");
+      expect(writeTerminalKeyboardChange(change)).toBe("saved");
+      await vi.advanceTimersByTimeAsync(251);
+      await refreshUserPreferencesFromServer();
+      if (order === "before") await vi.advanceTimersByTimeAsync(251);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+
+      finishOldPatch(Response.json({ detail: "Invalid preferences payload" }, { status: 422 }));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(251);
+      const patchPath = "/v1/me/preferences/mobile_assistant";
+      expect(fetcher.mock.calls.map(([path]) => path)).toEqual([patchPath, "/v1/me", patchPath]);
+      expect(JSON.parse(fetcher.mock.calls[2][1].body).terminal_keyboard.changes).toEqual([change]);
+      expect(isUserPreferenceNamespaceDirty("mobile_assistant")).toBe(false);
+      expect(readTerminalKeyboardPreferences()).toEqual(keyboard);
+    },
+  );
+
+  it.each([null, "F9", "F8"])(
+    "drops only the rejected binding and retries the rest (newer binding: %s)",
+    async (newerCode) => {
       vi.useFakeTimers();
       const mobile = mobileValue();
       const envelope = { version: 1, settings: { mobile_assistant: mobile } };
@@ -229,9 +271,9 @@ else:
       const replacement: TerminalKeyboardChange = {
         platform: "macos",
         field: "lineStart",
-        value: [{ code: "F9", modifiers: [] }],
+        value: [{ code: newerCode ?? "F9", modifiers: [] }],
       };
-      const accepted = newerBinding ? [paste, replacement] : [paste];
+      const accepted = newerCode ? [paste, replacement] : [paste];
       let reject!: (response: Response) => void;
       const fetcher = vi
         .fn()
@@ -248,7 +290,7 @@ else:
       await vi.advanceTimersByTimeAsync(251);
       const payload = JSON.parse(fetcher.mock.calls[0][1].body);
       expect(payload.terminal_keyboard.changes).toEqual([paste, conflicting]);
-      if (newerBinding) expect(writeTerminalKeyboardChange(replacement)).toBe("saved");
+      if (newerCode) expect(writeTerminalKeyboardChange(replacement)).toBe("saved");
 
       const message = "That shortcut is already used by Delete to start of line.";
       const listener = vi.fn();
@@ -267,7 +309,7 @@ else:
       const local = readTerminalKeyboardPreferences();
       expect(local.pasteBoxMode).toEqual({ linux: "always" });
       expect(local.bindings?.lineStart?.platformOverrides?.macos).toEqual(
-        newerBinding ? replacement.value : undefined,
+        newerCode ? replacement.value : undefined,
       );
     },
   );
