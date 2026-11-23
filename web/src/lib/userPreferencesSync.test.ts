@@ -70,6 +70,7 @@ describe("terminal bar preference synchronization", () => {
     vi.useFakeTimers();
     const terminalKeyboard: TerminalKeyboardPreferences = {
       v: 1,
+      pasteBoxMode: { macos: "never", windows: "always" },
       modifierMap: { macos: { ctrl: "ctrl", alt: "cmd", meta: "alt" } },
       bindings: {
         lineStart: {

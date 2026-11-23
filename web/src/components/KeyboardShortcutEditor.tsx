@@ -1,5 +1,5 @@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
 import { Kbd, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
@@ -16,14 +16,17 @@ import { SettingRow } from "@/components/SettingsFields";
 import { SessionNavigationSettings } from "@/components/SessionNavigationSettings";
 import { useMobileAssistantPreferences } from "@/lib/mobileAssistantPreferences";
 import {
+  DEFAULT_TERMINAL_PASTE_BOX_MODE,
   defaultTerminalModifierMap,
   readTerminalKeyboardPreferences,
   terminalBindingsFor,
+  terminalPasteBoxModeFor,
   TERMINAL_BINDING_IDS,
   TERMINAL_BINDINGS,
   writeTerminalKeyboardPreferences,
   type TerminalBindingId,
   type TerminalKeyboardPreferences,
+  type TerminalPasteBoxMode,
 } from "@/lib/terminalKeyboardPreferences";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
@@ -85,6 +88,11 @@ const TERMINAL_PHYSICAL_NAMES = {
   linux: { ctrl: "Ctrl", alt: "Alt", meta: "Super" },
 } satisfies Record<ShortcutPlatform, Record<keyof ModifierMap, string>>;
 const TERMINAL_SELECT_CLASS = "h-9 rounded-md border border-border bg-background px-2 text-ui";
+const TERMINAL_PASTE_BOX_LABELS = {
+  always: "Always",
+  whenBlocked: "When clipboard is blocked",
+  never: "Never",
+} satisfies Record<TerminalPasteBoxMode, string>;
 
 function remappedTerminalBindingLabels(
   binding: ShortcutChord,
@@ -132,7 +140,7 @@ function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardPrefer
   if (result === "saved") return null;
   if (result === "too-large")
     return "Too large to sync. Your preferences would exceed the 64 KiB limit.";
-  return "Could not save terminal shortcuts.";
+  return "Could not save terminal keyboard settings.";
 }
 
 type RecordingTarget =
@@ -204,6 +212,7 @@ export function KeyboardShortcutEditor() {
   useMobileAssistantPreferences();
   const terminalPreferences = readTerminalKeyboardPreferences();
   const [terminalPlatform, setTerminalPlatform] = useState(currentShortcutPlatform);
+  const pasteBoxDescriptionId = useId();
   const [editingCustomMap, setEditingCustomMap] = useState(false);
   const [recording, setRecording] = useState<RecordingTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -261,6 +270,13 @@ export function KeyboardShortcutEditor() {
         "Swap Alt and Cmd",
         "Custom",
       ].some((value) => normalizeSearch(value).includes(query)));
+  const pasteBoxMode = terminalPasteBoxModeFor(terminalPreferences, terminalPlatform);
+  const matchesPasteBox =
+    (!changedOnly || pasteBoxMode !== DEFAULT_TERMINAL_PASTE_BOX_MODE) &&
+    (!query ||
+      ["Terminal paste box", ...Object.values(TERMINAL_PASTE_BOX_LABELS)].some((value) =>
+        normalizeSearch(value).includes(query),
+      ));
   const terminalRows = TERMINAL_BINDING_IDS.filter((id) => {
     const binding = terminalPreferences.bindings?.[id];
     if (changedOnly && !binding?.common && !binding?.platformOverrides?.[terminalPlatform])
@@ -725,7 +741,7 @@ export function KeyboardShortcutEditor() {
           </ul>
         </details>
       ))}
-      {(matchesTerminalMap || terminalRows.length > 0) && (
+      {(matchesTerminalMap || matchesPasteBox || terminalRows.length > 0) && (
         <details
           open={query || changedOnly ? true : undefined}
           className="mb-2 rounded-xl border border-border bg-card px-3 py-2 last:mb-0"
@@ -736,9 +752,9 @@ export function KeyboardShortcutEditor() {
         >
           <summary className="cursor-pointer select-none text-ui font-medium">Terminal</summary>
           <p className="mt-2 text-sm text-muted-foreground">
-            Applies to hardware keys while the terminal has focus. Physical Cmd+C, Cmd+V, Cmd+K and
-            Cmd+R keep their usual behavior with By name. The browser or system can reserve
-            shortcuts such as Cmd+N and Win combinations.
+            Applies to hardware keys while the terminal has focus. Physical Cmd+C, Cmd+K and Cmd+R
+            keep their usual behavior with By name. The browser or system can reserve shortcuts such
+            as Cmd+N and Win combinations.
           </p>
           <label className="mt-2 flex flex-wrap items-center justify-between gap-2 text-ui">
             Client platform
@@ -808,6 +824,37 @@ export function KeyboardShortcutEditor() {
                   ))}
                 </div>
               )}
+            </div>
+          )}
+          {matchesPasteBox && (
+            <div className="border-b border-border/60 py-2">
+              <label className="flex flex-wrap items-center justify-between gap-2 text-ui">
+                Paste box
+                <select
+                  aria-describedby={pasteBoxDescriptionId}
+                  className={TERMINAL_SELECT_CLASS}
+                  value={pasteBoxMode}
+                  onChange={(event) => {
+                    stopRecording();
+                    saveTerminalPreferences({
+                      ...terminalPreferences,
+                      pasteBoxMode: {
+                        ...terminalPreferences.pasteBoxMode,
+                        [terminalPlatform]: event.target.value as TerminalPasteBoxMode,
+                      },
+                    });
+                  }}
+                >
+                  {Object.entries(TERMINAL_PASTE_BOX_LABELS).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p id={pasteBoxDescriptionId} className="mt-1 text-xs text-muted-foreground">
+                Choose when a terminal paste shortcut or button opens an editable text box.
+              </p>
             </div>
           )}
           {terminalRows.length > 0 && (

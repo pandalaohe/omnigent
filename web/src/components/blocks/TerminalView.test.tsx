@@ -32,6 +32,10 @@ import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
+import {
+  writeTerminalKeyboardPreferences,
+  type TerminalPasteBoxMode,
+} from "@/lib/terminalKeyboardPreferences";
 import type { ConnectionState } from "./TerminalSession";
 import type { TerminalClipboardAction } from "@/lib/terminalPaste";
 import type { TerminalTouchSelectionOptions } from "@/lib/terminalTouchSelection";
@@ -2419,6 +2423,15 @@ describe("TerminalView phone key rows", () => {
 describe("terminal clipboard paste", () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  function mockClipboard(mode: TerminalPasteBoxMode, readable: boolean, text = "c\x1blipboard") {
+    const readText = readable
+      ? vi.fn().mockResolvedValue(text)
+      : vi.fn().mockRejectedValue(new Error("denied"));
+    vi.stubGlobal("navigator", { platform: "Win32", clipboard: { readText } });
+    writeTerminalKeyboardPreferences({ v: 1, pasteBoxMode: { windows: mode } });
+    return readText;
+  }
+
   async function openTerminal(readOnly = false) {
     const view = render(
       <TerminalView sessionId="conv_paste" terminalId="terminal_a" readOnly={readOnly} />,
@@ -2438,15 +2451,93 @@ describe("terminal clipboard paste", () => {
     expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("make", enter);
   });
 
-  it("normalizes native paste data without attempting an async clipboard read", async () => {
-    const readText = vi.fn().mockRejectedValue(new Error("denied"));
-    vi.stubGlobal("navigator", { clipboard: { readText } });
+  const modes: TerminalPasteBoxMode[] = ["always", "whenBlocked", "never"];
+  it.each(modes.flatMap((mode) => [true, false].map((readable) => ({ mode, readable }))))(
+    "uses native paste data in $mode mode with clipboard readable=$readable",
+    async ({ mode, readable }) => {
+      const readText = mockClipboard(mode, readable);
+      const { terminal } = await openTerminal();
+      await act(async () =>
+        terminal.onClipboardAction?.("paste", { enter: false }, "a\x1bb\r\n\r\n"),
+      );
+      expect(readText).not.toHaveBeenCalled();
+      expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("ab", false);
+      expect(screen.queryByRole("dialog", { name: "Paste into terminal" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    { mode: "always", readable: true, outcome: "box" },
+    { mode: "always", readable: false, outcome: "box" },
+    { mode: "whenBlocked", readable: true, outcome: "direct" },
+    { mode: "whenBlocked", readable: false, outcome: "box" },
+    { mode: "never", readable: true, outcome: "direct" },
+    { mode: "never", readable: false, outcome: "error" },
+  ] as const)(
+    "uses $outcome for a paste shortcut in $mode mode with clipboard readable=$readable",
+    async ({ mode, readable, outcome }) => {
+      const readText = mockClipboard(mode, readable, "clipboard text");
+      const error = vi.spyOn(toast, "error");
+      const { terminal } = await openTerminal();
+      await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+      expect(readText).toHaveBeenCalledOnce();
+
+      if (outcome === "box") {
+        const input = screen.getByRole("textbox", { name: "Text to paste" });
+        expect(input).toHaveValue(readable ? "clipboard text" : "");
+        expect(terminal.paste).not.toHaveBeenCalled();
+        fireEvent.change(input, { target: { value: "edited text" } });
+        fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
+        expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("edited text", false);
+      } else if (outcome === "direct") {
+        expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("clipboard text", false);
+      } else {
+        expect(terminal.paste).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't read the clipboard. Use your browser's Paste command.",
+        );
+      }
+      expect(screen.queryByRole("dialog", { name: "Paste into terminal" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    { mode: "always", nativeText: undefined },
+    { mode: "never", nativeText: "line one\nline two" },
+  ] as const)("keeps the multiline review in $mode mode", async ({ mode, nativeText }) => {
+    mockClipboard(mode, true, "line one\nline two");
     const { terminal } = await openTerminal();
-    await act(async () =>
-      terminal.onClipboardAction?.("paste", { enter: false }, "a\x1bb\r\n\r\n"),
+    terminal.pastesBracketed.mockReturnValue(false);
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }, nativeText));
+    if (mode === "always") {
+      fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
+    }
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines · Review before pasting");
+    expect(terminal.paste).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("line one\nline two", false);
+  });
+
+  it("drops a delayed clipboard read after switching terminals in Always mode", async () => {
+    const readText = mockClipboard("always", true);
+    let reply: (text: string) => void = () => {};
+    readText.mockReturnValue(
+      new Promise((resolve) => {
+        reply = resolve;
+      }),
     );
-    expect(readText).not.toHaveBeenCalled();
-    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("ab", false);
+    const { terminal, rerender } = await openTerminal();
+    act(() => terminal.onClipboardAction?.("paste", { enter: false }));
+
+    rerender(<TerminalView sessionId="conv_paste" terminalId="terminal_b" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const other = terminalSessionMock.instances[1];
+    act(() => other.onState({ kind: "connected" }));
+    await act(async () => reply("stale text"));
+
+    expect(screen.queryByRole("dialog", { name: "Paste into terminal" })).not.toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(other.paste).not.toHaveBeenCalled();
   });
 
   it.each([

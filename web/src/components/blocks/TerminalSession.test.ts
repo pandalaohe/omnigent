@@ -911,42 +911,64 @@ describe("TerminalSession", () => {
     }
   });
 
-  it("keeps physical Cmd+V native and forwards the paste event once without Enter", () => {
-    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-    const clipboard = vi.fn();
-    const { session, socket, container } = makeSession(
-      undefined,
-      undefined,
-      true,
-      undefined,
-      true,
-      false,
-      clipboard,
-    );
-    socket.open();
-    socket.sent.length = 0;
-    const input = container.querySelector("textarea")!;
-    const key = new KeyboardEvent("keydown", {
-      key: "v",
-      code: "KeyV",
-      keyCode: 86,
-      metaKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    expect(input.dispatchEvent(key)).toBe(true);
-    expect(clipboard).not.toHaveBeenCalled();
+  it.each([undefined, "never", "always"] as const)(
+    "routes Mac Cmd+V with paste box preference %s and still accepts a native paste event",
+    (mode) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+      const clipboard = vi.fn();
+      const { session, socket, container } = makeSession(
+        undefined,
+        undefined,
+        true,
+        undefined,
+        true,
+        false,
+        clipboard,
+      );
+      try {
+        socket.open();
+        socket.sent.length = 0;
+        if (mode) {
+          expect(writeTerminalKeyboardPreferences({ v: 1, pasteBoxMode: { macos: mode } })).toBe(
+            "saved",
+          );
+        }
+        const input = container.querySelector("textarea")!;
+        const key = new KeyboardEvent("keydown", {
+          key: "v",
+          code: "KeyV",
+          keyCode: 86,
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        expect(input.dispatchEvent(key)).toBe(mode !== "always");
+        if (mode === "always") {
+          expect(clipboard).toHaveBeenCalledExactlyOnceWith("paste", { enter: false });
+        } else {
+          expect(clipboard).not.toHaveBeenCalled();
+        }
+        clipboard.mockClear();
 
-    const getData = vi.fn(() => "native\r\ntext");
-    const paste = new Event("paste", { bubbles: true, cancelable: true });
-    Object.defineProperty(paste, "clipboardData", { value: { getData } });
-    input.dispatchEvent(paste);
+        const getData = vi.fn(() => "native\r\ntext");
+        const paste = new Event("paste", { bubbles: true, cancelable: true });
+        Object.defineProperty(paste, "clipboardData", { value: { getData } });
+        input.dispatchEvent(paste);
 
-    expect(getData).toHaveBeenCalledExactlyOnceWith("text/plain");
-    expect(clipboard).toHaveBeenCalledExactlyOnceWith("paste", { enter: false }, "native\r\ntext");
-    expect(socket.sent).toEqual([]);
-    session.dispose();
-  });
+        expect(getData).toHaveBeenCalledExactlyOnceWith("text/plain");
+        expect(clipboard).toHaveBeenCalledExactlyOnceWith(
+          "paste",
+          { enter: false },
+          "native\r\ntext",
+        );
+        expect(socket.sent).toEqual([]);
+      } finally {
+        session.dispose();
+        container.remove();
+        localStorage.removeItem(MOBILE_ASSISTANT_STORAGE_KEY);
+      }
+    },
+  );
 
   it("uses xterm bracketed paste without appending Enter to the lines", async () => {
     const { session, socket } = makeSession();
