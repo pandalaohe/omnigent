@@ -49,11 +49,14 @@ class PeerMessageStore(ABC):
         peer_id: str,
         reason: str | None,
         expected_states: tuple[str, ...],
+        *,
+        exclude_reason: str | None = None,
     ) -> bool:
         """Claim the oldest actionable message in its sender/receiver pair.
 
         An older pending, queued, or delivering record blocks the claim.
         The successful claim moves the target to delivering and stores reason.
+        A target whose stored reason equals ``exclude_reason`` is not claimed.
         """
         ...
 
@@ -123,6 +126,7 @@ class PeerMessageStore(ABC):
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
+        exclude_reason: str | None = None,
     ) -> bool:
         """
         Compare-and-set a record's state.
@@ -147,6 +151,8 @@ class PeerMessageStore(ABC):
         :param notice: When ``True``, the same write records that the
             terminal state owes its sender a back-notice. Atomic with the
             compare-and-set so a lost race leaves no mark.
+        :param exclude_reason: When supplied, a stored reason equal to it
+            makes this return ``False``; a NULL reason does not.
         :returns: ``True`` when exactly one row changed, else ``False``.
         """
         ...

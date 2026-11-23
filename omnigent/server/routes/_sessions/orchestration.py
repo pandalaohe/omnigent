@@ -11773,6 +11773,7 @@ async def _dispatch_session_event_to_runner_impl(
             else None
         )
         forwarded = False
+        native_receipt_pending = False
         try:
             if taken_notes is not None and (
                 pending_id is None
@@ -11819,6 +11820,9 @@ async def _dispatch_session_event_to_runner_impl(
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
                 if claude_native and supports_claim:
                     pending_inputs.enable_runner_lease(session_id, pending_id)
+                    # The runner answers before it claims or pastes, and a failure
+                    # or mirror may remove the entry before the caller reads it.
+                    native_receipt_pending = bool(body.data.get("peer_message_id"))
             log_input_event(
                 _logger,
                 "native_input_forward_finished",
@@ -11850,6 +11854,8 @@ async def _dispatch_session_event_to_runner_impl(
             )
             if lost_confirmation:
                 raise _NativeDeliveryUncertain("The runner's delivery reply was lost.") from exc
+            if claimed and claude_native and isinstance(exc, _NativeForwardReplyLost):
+                native_receipt_pending = bool(body.data.get("peer_message_id"))
             if not (claimed and isinstance(exc, _NativeForwardReplyLost)):
                 raise
         finally:
@@ -11899,7 +11905,9 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_native_decision_harness,
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, native_receipt_pending=native_receipt_pending
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None, forwarded=False)
     item_id = await _forward_event_to_runner(

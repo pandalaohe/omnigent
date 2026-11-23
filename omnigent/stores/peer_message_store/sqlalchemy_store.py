@@ -167,6 +167,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         peer_id: str,
         reason: str | None,
         expected_states: tuple[str, ...],
+        *,
+        exclude_reason: str | None = None,
     ) -> bool:
         """Move one unblocked pair record to delivering in one transaction."""
         if not expected_states:
@@ -185,6 +187,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             self._lock_receiver(session, receiver_id)
             target = session.get(SqlSessionPeerMessage, (current_workspace_id(), peer_id))
             if target is None or target.state not in expected_states:
+                return False
+            if exclude_reason is not None and target.reason == exclude_reason:
                 return False
             self._fill_legacy_pair_sequence(
                 session, target.sender_session_id, target.receiver_session_id
@@ -215,6 +219,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                         SqlSessionPeerMessage.workspace_id == current_workspace_id(),
                         SqlSessionPeerMessage.id == peer_id,
                         SqlSessionPeerMessage.state.in_(sorted(expected_states)),
+                        *self._reason_not(exclude_reason),
                     )
                     .values(**values)
                 ),
@@ -222,6 +227,15 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             return bool(result.rowcount)
 
         return run_write_transaction(self._session_immediate, "claim_oldest_peer_message", write)
+
+    @staticmethod
+    def _reason_not(excluded: str | None) -> tuple[Any, ...]:
+        """Condition that the stored reason is not *excluded* (NULL passes)."""
+        if excluded is None:
+            return ()
+        return (
+            or_(SqlSessionPeerMessage.reason.is_(None), SqlSessionPeerMessage.reason != excluded),
+        )
 
     def get(self, peer_id: str) -> SessionPeerMessage | None:
         """Return a peer message by id, or ``None`` if not found."""
@@ -294,6 +308,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
+        exclude_reason: str | None = None,
     ) -> bool:
         """Compare-and-set a record's state; ``False`` on a lost race."""
         now = now_epoch()
@@ -316,6 +331,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 stmt = stmt.where(SqlSessionPeerMessage.state.in_(sorted(expected_states)))
             if expected_reason is not None:
                 stmt = stmt.where(SqlSessionPeerMessage.reason == expected_reason)
+            stmt = stmt.where(*self._reason_not(exclude_reason))
             result = cast(
                 "CursorResult[Any]",
                 session.execute(stmt.values(**values)),

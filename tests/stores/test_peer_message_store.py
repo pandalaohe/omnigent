@@ -471,3 +471,26 @@ def test_row_lock_backend_requires_receiver(store: SqlAlchemyPeerMessageStore) -
     real_store = SqlAlchemyPeerMessageStore(store.storage_location)
     with pytest.raises(RuntimeError, match="receiver conversation missing"):
         real_store.create(_record("missing-receiver-lock"))
+
+
+def test_excluded_reason_blocks_transition_and_claim(store: SqlAlchemyPeerMessageStore) -> None:
+    """``exclude_reason`` refuses only that stored reason; NULL and others pass."""
+    unset = store.create(_record("exclude-null", state="delivering"))
+    other = store.create(_record("exclude-other", state="delivering", reason="released"))
+    marked = store.create(_record("exclude-marked", state="delivering", reason="native_claimed"))
+    for record in (unset, other):
+        assert store.transition(
+            record.id, "pending", None, ("delivering",), exclude_reason="native_claimed"
+        )
+    assert not store.transition(
+        marked.id, "pending", None, ("delivering",), exclude_reason="native_claimed"
+    )
+    current = store.get(marked.id)
+    assert current is not None
+    assert (current.state, current.reason) == ("delivering", "native_claimed")
+
+    assert store.claim_oldest(unset.id, None, ("pending",), exclude_reason="native_claimed")
+    assert store.transition(marked.id, "pending", None, ("delivering",))
+    assert not store.claim_oldest(marked.id, None, ("pending",), exclude_reason="native_claimed")
+    assert store.get(marked.id).state == "pending"  # type: ignore[union-attr]
+    assert store.claim_oldest(marked.id, None, ("pending",))

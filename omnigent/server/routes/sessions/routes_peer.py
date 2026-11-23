@@ -127,6 +127,8 @@ _PEER_INBOUND_REFUSE = "refuse"
 # re-hold it while the receiver's inbound policy is still ``hold``.
 _PEER_RELEASED_REASON = "released"
 _NATIVE_ATTEMPT_REASON_PREFIX = "native_attempt:"
+# A Claude runner claimed (may have pasted) this copy; it is never resent.
+_NATIVE_CLAIMED_REASON = "native_claimed"
 
 
 def _native_attempt_id(reason: str | None) -> str | None:
@@ -925,7 +927,7 @@ def _public_peer_reason(record: SessionPeerMessage) -> str | None:
             if record.state == "delivering"
             else None
         )
-    if _native_attempt_id(record.reason) is not None:
+    if _native_attempt_id(record.reason) is not None or record.reason == _NATIVE_CLAIMED_REASON:
         return "awaiting_native_receipt" if record.state == "delivering" else None
     return record.reason
 
@@ -1274,9 +1276,13 @@ def register_peer_routes(
             return "failed", "not_ready"
         if sdk_delivery:
             return "uncertain", "awaiting_sdk_receipt"
-        if native_receiver and _needs_native_peer_receipt(receiver):
-            # The events POST only confirms that the runner has the message.
-            # The native terminal accepts it later; the durable record settles
+        if native_receiver and (
+            _needs_native_peer_receipt(receiver)
+            or (isinstance(delivery, dict) and delivery.get("native_receipt_pending") is True)
+        ):
+            # The events POST only confirms that the runner has the message
+            # (a claim-capable Claude runner answers before it pastes). The
+            # native terminal accepts it later; the durable record settles
             # from the terminal-originated transcript mirror.
             return "uncertain", "awaiting_native_receipt"
         return "delivered", None
@@ -1831,16 +1837,27 @@ def register_peer_routes(
                 require_init_success=require_init_success,
             )
             if result_state == "uncertain":
-                # The runner may have accepted the input despite a lost or
-                # unconfirmable response. Leave the record in ``delivering``
-                # (no transition) so the sweeper settles it by the msg=
-                # marker after its grace, exactly as for a swept send; an
-                # identical immediate retry still drops as a duplicate
-                # because ``release`` keeps an uncertain send's reservation.
                 uncertain = True
-                response = await _queued_response_for_record(record, runner_online)
-                response["reason"] = "uncertain"
-                return response
+                try:
+                    settled = await asyncio.to_thread(peer_message_store.get, record.id)
+                except Exception:
+                    # Only a confirmed settlement upgrades the result; keep it trackable.
+                    _logger.warning("Peer record re-read failed for %s", record.id, exc_info=True)
+                    settled = None
+                if settled is not None and settled.state == "delivered":
+                    # The receiver's mirror settled this record before the reply was read.
+                    uncertain = False
+                    result_state, reason = "delivered", None
+                else:
+                    # The runner may have accepted the input despite a lost or
+                    # unconfirmable response. Leave the record in ``delivering``
+                    # (no transition) so the sweeper settles it by the msg=
+                    # marker after its grace, exactly as for a swept send; an
+                    # identical immediate retry still drops as a duplicate
+                    # because ``release`` keeps an uncertain send's reservation.
+                    response = await _queued_response_for_record(record, runner_online)
+                    response["reason"] = "uncertain"
+                    return response
             if (
                 sdk_identity is not None
                 and result_state in ("failed", "rejected")

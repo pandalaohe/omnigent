@@ -10324,11 +10324,15 @@ class _SessionEventDispatchResult:
         events (already persisted, so no separate pending entry).
     :param forwarded: ``False`` when native-terminal startup failed before
         the message reached a runner, even though a failure item was persisted.
+    :param native_receipt_pending: ``True`` when a claim-capable Claude runner
+        accepted a peer copy before claiming or pasting it; only its mirrored
+        envelope proves delivery, whether or not the pending entry still exists.
     """
 
     item_id: str | None
     pending_id: str | None
     forwarded: bool = True
+    native_receipt_pending: bool = False
 
     @property
     def accepted(self) -> bool:
