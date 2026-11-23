@@ -1289,8 +1289,17 @@ def _filter_link(
     pool = pool_of(link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
-    if request.required_model is not None and link.model != request.required_model:
-        return Skipped(link, "model_mismatch")
+    required_model = request.required_model
+    if required_model is not None and link.model != required_model:
+        resolved = resolve_saved_model(
+            required_model,
+            request.models.get(link.agent_id),
+            request.provider_groups,
+            allow_substitution=False,
+        )
+        required_route = codex_route_pool(required_model, product)
+        if resolved.model != link.model or required_route != codex_route_pool(link.model, product):
+            return Skipped(link, "model_mismatch")
     if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
         return Skipped(link, "model_unavailable")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)

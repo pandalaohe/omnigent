@@ -55,7 +55,7 @@ from omnigent.server.session_choice_external import (
     route_states,
 )
 from omnigent.server.user_preferences_store import SessionChoiceSnapshot
-from omnigent.util.reasoning_effort import efforts_for_harness, unsupported_effort_message
+from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
 
 CHOICE_PROTOCOL_HEADER = "x-omnigent-session-choice"
 _logger = logging.getLogger(__name__)
@@ -1321,6 +1321,31 @@ def _named_chain_link(settings: SessionChoice, host: str, work_type: str, agent:
     )
 
 
+def _with_named_pool_cap(
+    settings: SessionChoice,
+    link: Link,
+    pool: str | None,
+    product: str | None,
+    request: ChoiceRequest,
+) -> Link:
+    if link.meter or link.max_running is not None:
+        return link
+    cap = pool_limits(settings, link, product, request.provider_groups).max_running
+    if pool and not cap:
+        cap = next(
+            (
+                configured.max_running
+                for configured in ordered_links(settings)
+                if pool_of(
+                    configured, request.products.get(configured.agent_id), request.provider_groups
+                )
+                == pool
+            ),
+            None,
+        )
+    return link if cap is None else link.model_copy(update={"max_running": cap})
+
+
 def _explicit_named_link(
     app: Any, body: Any, settings: SessionChoice, request: ChoiceRequest
 ) -> tuple[Link, str | None, ChoiceRequest]:
@@ -1341,18 +1366,19 @@ def _explicit_named_link(
             probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
         )
     )
+    if settings.schema_version == 2:
+        request = replace(request, products={**request.products, link.agent_id: product})
+    link = resolved_link(link, request)
     pool = pool_of_session(
-        probe,
+        replace(probe, model_override=link.model),
         settings,
         product=product,
         model=link.model,
         products=request.products,
         groups=request.provider_groups,
     )
-    if settings.schema_version == 2:
-        request = replace(request, products={**request.products, link.agent_id: product})
-        if pool is None:
-            pool = pool_of(link, product, request.provider_groups)
+    if settings.schema_version == 2 and pool is None:
+        pool = pool_of(link, product, request.provider_groups)
     meter = next(
         (
             configured.meter
@@ -1364,22 +1390,7 @@ def _explicit_named_link(
     )
     if meter is not None:
         link = link.model_copy(update={"meter": meter})
-    cap = pool_limits(settings, link, product, request.provider_groups).max_running
-    if pool and not cap:
-        cap = next(
-            (
-                configured.max_running
-                for configured in ordered_links(settings)
-                if pool_of(
-                    configured, request.products.get(configured.agent_id), request.provider_groups
-                )
-                == pool
-            ),
-            None,
-        )
-    if not link.meter and cap:
-        link = link.model_copy(update={"max_running": cap})
-    return resolved_link(link, request), pool, request
+    return _with_named_pool_cap(settings, link, pool, product, request), pool, request
 
 
 @asynccontextmanager
@@ -1497,20 +1508,12 @@ async def admit_create(
                 link = resolved_link(
                     _named_chain_link(settings, host, work.id, body.agent_id), request
                 )
-                pool = pool_of(link, request.products.get(link.agent_id), request.provider_groups)
+                product = request.products.get(link.agent_id)
+                pool = pool_of(link, product, request.provider_groups)
+                if settings.schema_version == 1:
+                    link = _with_named_pool_cap(settings, link, pool, product, request)
             else:
                 link, pool, request = _explicit_named_link(app, body, settings, request)
-                if link.model != body.model_override:
-                    raise HTTPException(
-                        409,
-                        {
-                            "code": "session_choice_ask",
-                            "reason": (
-                                f"Requested model {body.model_override!r} resolves to "
-                                f"{link.model!r} on this host. Pass the resolved model explicitly."
-                            ),
-                        },
-                    )
             failure = check_candidate_limits(
                 settings,
                 work,
@@ -1587,15 +1590,17 @@ async def admit_create(
                 agent_cache=app.state.agent_cache,
             )
             supported = efforts_for_harness(harness)
-            if supported is not None and effort not in supported:
-                reason = (
-                    unsupported_effort_message(
-                        effort, harness or "the selected harness", supported
-                    )
-                    if supported
-                    else f"Harness {harness!r} does not support a reasoning_effort override"
+            if supported == frozenset():
+                raise HTTPException(
+                    400, f"Harness {harness!r} does not support a reasoning_effort override"
                 )
-                raise HTTPException(400, reason)
+            if supported:
+                try:
+                    effort = validate_effort(effort, harness or "the selected harness", supported)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if effort is None:
+                    raise HTTPException(400, "reasoning_effort must be non-empty")
             link = link.model_copy(update={"effort": effort})
         product = request.products.get(link.agent_id)
         if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:

@@ -1519,6 +1519,70 @@ async def test_automatic_create_refuses_effort_unsupported_by_selected_harness(c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "named,old_provider,new_provider,accepted",
+    [
+        (False, "old", "new", True),
+        (True, "old", "new", True),
+        (False, "official", "ccs-krill", False),
+    ],
+)
+async def test_explicit_create_resolves_a_registered_model_alias(
+    choice_env, db_uri, monkeypatch, named, old_provider, new_provider, accepted
+):
+    from omnigent.models.model_reference import ALIASES_NAMESPACE
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+
+    env = choice_env
+    env.prefs.patch_namespace(
+        RESERVED_USER_LOCAL, ALIASES_NAMESPACE, {"pairs": [[old_provider, new_provider]]}
+    )
+    requested_model = f"{old_provider}/example"
+    launch_model = f"{new_provider}/example"
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, "codex-native", [{"id": launch_model}], int(time.time()))
+    env.app.state.host_model_catalog_cache_store = catalogs
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    env.settings["hosts"][HOST]["work"][0][0]["links"][0]["model"] = launch_model
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    args = {"agent_id": env.agents[0]["id"], "choice_reason": "Specific task"} if named else {}
+    response = await create(env, **args, model_override=requested_model, reasoning_effort="high")
+    if not accepted:
+        assert response.status_code == 409, response.text
+        assert requested_model in response.json()["detail"]["reason"]
+        return
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["model_override"] == result["session_choice"]["model"] == launch_model
+    assert result["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [False, True])
+async def test_explicit_create_persists_effort_alias_for_selected_harness(
+    choice_env, monkeypatch, named
+):
+    env = choice_env
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "openai-agents",
+    )
+    args = {"agent_id": env.agents[0]["id"], "choice_reason": "Specific task"} if named else {}
+    response = await create(env, **args, model_override="test-model", reasoning_effort="ultra")
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["reasoning_effort"] == result["session_choice"]["effort"] == "xhigh"
+    assert env.store.get_conversation(result["id"]).reasoning_effort == "xhigh"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["missing", "foreign"])
 async def test_create_skips_an_unbindable_agent_before_choosing_next(choice_env, invalid):
     env = choice_env
@@ -1579,6 +1643,46 @@ async def test_named_reason_checks_cap_but_user_can_override(
         assert detail["effectiveLimits"]["maxRunning"]["runningCount"] == 1
     allowed = await create(env, **{**named, "user_named": True})
     assert allowed.status_code == 201, allowed.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_cap", [None, 2])
+async def test_named_chain_keeps_own_cap_or_inherits_legacy_same_pool_cap(
+    choice_env, monkeypatch, link_cap
+):
+    env = choice_env
+    agent = env.agents[0]["id"]
+    model = "gpt-example"
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model", lambda *a, **kw: model
+    )
+    env.settings["presets"][0]["links"] = [{"agent": agent, "model": model, "maxRunning": 1}]
+    link = {"agent": agent, "model": model}
+    if link_cap is not None:
+        link["maxRunning"] = link_cap
+    env.settings["hosts"][HOST]["work"][0] = [{"links": [link]}]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    first = await create(env)
+    assert first.status_code == 201, first.text
+    named = {"agent_id": agent, "choice_reason": "Specific task"}
+    response = await create(env, **named)
+    if link_cap is not None:
+        assert response.status_code == 201, response.text
+        assert response.json()["session_choice"]["maxRunning"] == link_cap
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "agent_busy"
+        assert response.json()["detail"]["running"] == [first.json()["id"]]
+        user_named = await create(env, **named, user_named=True)
+        assert user_named.status_code == 201, user_named.text
 
 
 @pytest.mark.asyncio
@@ -1817,6 +1921,41 @@ async def test_all_full_holds_then_releases_only_bound_pool(choice_env, monkeypa
     queue._start.assert_awaited_once()
     assert start_allowed(env.store.get_conversation(row.id))
     assert holds_slot(env.store.get_conversation(row.id), time.time())
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_hold_releases_only_the_requested_model(choice_env, monkeypatch):
+    env = choice_env
+    env.settings["hosts"][HOST]["work"][1][0]["links"][0]["model"] = "other-model"
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    first = await create(env)
+    assert first.status_code == 201, first.text
+    response = await create(env, model_override="test-model", reasoning_effort="high")
+    assert response.status_code == 201, response.text
+    held = response.json()
+    identity = {"model": "test-model", "effort": "high", "pool": "pool-0"}
+    assert held["session_choice"]["outcome"] == "hold"
+    assert {key: held["session_choice"][key] for key in identity} == identity
+    assert held["session_choice"]["skipped"][1]["why"] == "model_mismatch"
+
+    queue = HostLoadQueue(env.store)
+    start = AsyncMock()
+    monkeypatch.setattr(queue, "_start", start)
+    monkeypatch.setattr(env.app.state.host_load_inputs, "deliver_session", AsyncMock())
+    assert not await queue.release(env.app, held["id"], HOST)
+    start.assert_not_awaited()
+    env.store.set_session_live_status(first.json()["id"], "idle")
+    assert await queue.release(env.app, held["id"], HOST)
+    start.assert_awaited_once()
+    released = env.store.get_conversation(held["id"])
+    receipt = choice_record(released)
+    assert receipt and receipt["outcome"] == "pick"
+    assert {key: receipt[key] for key in identity} == identity
+    assert (released.model_override, released.reasoning_effort) == ("test-model", "high")
 
 
 @pytest.mark.asyncio
