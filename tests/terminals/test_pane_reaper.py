@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -23,6 +23,7 @@ from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry, TerminalCloseOutcome
+from omnigent.terminals import pane_reaper
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
@@ -685,6 +686,7 @@ async def test_background_shell_protects_pane_from_automatic_reap(
     monkeypatch.setattr(
         resources, "terminal_resource_role", lambda *_args: f"{terminal_name}-native"
     )
+    owner = None
     if terminal_name == "codex":
         task = asyncio.current_task()
         assert task is not None
@@ -692,9 +694,10 @@ async def test_background_shell_protects_pane_from_automatic_reap(
         owner = native_runtime._track_codex_forwarder(conv, None, None, instance)
         owner.note_background_terminals(True)
         replacement = make_test_terminal_instance(terminal_name, "main", tmp_path)
-        assert not native_runtime.codex_pane_has_background_terminals(conv, replacement)
+        assert native_runtime.codex_pane_background_terminal_status(conv, replacement) is None
 
         def finish_background_shell() -> None:
+            assert owner is not None
             owner.note_background_terminals(False)
 
     else:
@@ -720,13 +723,23 @@ async def test_background_shell_protects_pane_from_automatic_reap(
     reap = AsyncMock()
     monkeypatch.setattr(reaper, "_reap", reap)
     now = time.monotonic()
+    hold_started_at = now
     monkeypatch.setattr(time, "monotonic", lambda: now)
     [pane] = reaper._list_native_panes()
     reaper._last_busy_at[conv] = now - 120
     await reaper._scan_once()
     reap.assert_not_awaited()
 
-    now += BACKGROUND_SHELL_PANE_HOLD_S - 1
+    if owner is not None:
+        # An unsuccessful or missing listing never renews the last observation.
+        now += native_runtime._CODEX_BACKGROUND_TERMINAL_FRESHNESS_S
+        assert not await reaper._is_busy(pane)
+        owner.note_background_terminals(True)
+        assert await reaper._is_busy(pane)
+
+    now = hold_started_at + BACKGROUND_SHELL_PANE_HOLD_S - 1
+    if owner is not None:
+        owner.note_background_terminals(True)
     assert await reaper._is_busy(pane)
     now += 1
     assert not await reaper._is_busy(pane)
@@ -735,6 +748,8 @@ async def test_background_shell_protects_pane_from_automatic_reap(
     instance.note_client_interaction()
     assert await reaper._is_busy(pane)
     now += PANE_OUTPUT_BUSY_WINDOW_S + 1
+    if owner is not None:
+        owner.note_background_terminals(True)
     assert await reaper._is_busy(pane)
 
     finish_background_shell()
@@ -744,6 +759,115 @@ async def test_background_shell_protects_pane_from_automatic_reap(
     now += 30
     await reaper._scan_once()
     reap.assert_awaited_once_with(pane)
+
+
+async def test_replayed_claude_shell_count_shares_the_hold_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A positive reconnect tally preserves the original shell-only deadline."""
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    conv = "conv_shell_reconnect"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminals._by_conversation[conv] = {("claude", "main"): instance}
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    monkeypatch.setattr(resources, "terminal_resource_role", lambda *_args: "claude-native")
+    app = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    reap = AsyncMock()
+    monkeypatch.setattr(reaper, "_reap", reap)
+    now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    shell_status = resources._session_background_publisher
+    assert shell_status is not None
+    shell_status(conv, True)
+    path = f"/v1/sessions/{conv}/cli-retention"
+    policy = {"host_id": "host-a", "policy_revision": 1, "idle_threshold_seconds": 60}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        assert (await client.get(path, params=policy)).json()["busy"] is True
+        now += BACKGROUND_SHELL_PANE_HOLD_S - 60
+        resources.note_external_session_status(conv, "idle", background_task_count=1)
+        shell_status(conv, False)
+        resources.resync_session_statuses()
+        assert (await client.get(path, params=policy)).json()["busy"] is True
+
+        now += 60
+        resources.resync_session_statuses()
+        expired = (await client.get(path, params=policy)).json()
+        assert expired["eligible"] is True
+        released = await client.post(
+            f"{path}/release",
+            json={
+                **policy,
+                "reason": "idle_pool_overflow",
+                "expected_activity_token": expired["activity_token"],
+                "runtime_generation": expired["runtime_generation"],
+            },
+        )
+        assert released.json()["status"] == "released"
+        reap.assert_awaited_once()
+
+
+async def test_hung_antigravity_capture_reaps_its_tmux_client_and_scan_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(pane_reaper, "AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S", 0.01)
+    terminals = TerminalRegistry()
+    for name in ("antigravity", "claude"):
+        instance = TerminalInstance(
+            name=name,
+            session_key="main",
+            socket_path=tmp_path / f"{name}.sock",
+            private_dir=tmp_path,
+            running=True,
+        )
+        terminals._by_conversation[f"conv_{name}"] = {(name, "main"): instance}
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    monkeypatch.setattr(
+        resources, "terminal_resource_role", lambda conv, _terminal_id: f"{conv[5:]}-native"
+    )
+    reaper = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        native_pane_idle_timeout_s=60,
+    ).state.native_pane_reaper
+    reap = AsyncMock()
+    monkeypatch.setattr(reaper, "_reap", reap)
+    for pane in reaper._list_native_panes():
+        reaper._last_busy_at[pane.conversation_id] = time.monotonic() - 120
+
+    async def communicate() -> None:
+        await asyncio.Future()
+
+    children = []
+
+    async def spawn(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        child = SimpleNamespace(
+            returncode=None, communicate=communicate, kill=Mock(), wait=AsyncMock(return_value=-9)
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    await asyncio.wait_for(reaper._scan_once(), timeout=1)
+    assert children
+    for child in children:
+        child.kill.assert_called_once()
+        child.wait.assert_awaited_once()
+    assert [call.args[0].conversation_id for call in reap.await_args_list] == [
+        "conv_antigravity",
+        "conv_claude",
+    ]
 
 
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(

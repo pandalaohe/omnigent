@@ -3121,7 +3121,9 @@ def create_runner_app(
                 if item.get("type") == "message":
                     mark_purged_message_attachments(item, session_id, purged)
 
-    def _session_has_cli_retention_protection(session_id: str) -> bool:
+    def _session_has_cli_retention_protection(
+        session_id: str, *, include_background_tasks: bool = True
+    ) -> bool:
         if session_id in _active_turns:
             return True
         if process_manager is not None and process_manager.has_active_turn(session_id):
@@ -3134,7 +3136,7 @@ def create_runner_app(
             return True
         if any(not task.done() for task in _session_timers.get(session_id, {}).values()):
             return True
-        if _session_background_task_counts.get(session_id, 0) > 0:
+        if include_background_tasks and _session_background_task_counts.get(session_id, 0) > 0:
             return True
         return any(
             entry.status in {"launching", "launch_unconfirmed", "running", "waiting"}
@@ -3445,6 +3447,7 @@ def create_runner_app(
         *,
         failure_detail: str | None = None,
         inferred: bool = False,
+        replayed_background_tasks: bool = False,
     ) -> None:
         hold_until = _keep_warm_status_hold.get(session_id)
         if hold_until is not None:
@@ -3460,7 +3463,7 @@ def create_runner_app(
             else:
                 _keep_warm_status_hold.pop(session_id, None)
         pane_reaper = getattr(app.state, "native_pane_reaper", None)
-        if pane_reaper is not None:
+        if pane_reaper is not None and not replayed_background_tasks:
             pane_reaper.note_activity(session_id)
         background_agents: list[dict[str, object]] = []
         wire_status = status
@@ -15116,6 +15119,7 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S,
             BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
@@ -15203,17 +15207,28 @@ def create_runner_app(
                 background_shell_hold_since.pop(instance_id, None)
                 return True
             if pane.terminal_name == "claude":
-                running = pane.conversation_id in _sessions_with_background_shell
+                running = (
+                    pane.conversation_id in _sessions_with_background_shell
+                    or resource_registry.session_has_reported_background_shells(
+                        pane.conversation_id
+                    )
+                )
             elif pane.terminal_name == "codex":
-                running = _native_runtime.codex_pane_has_background_terminals(
+                running = _native_runtime.codex_pane_background_terminal_status(
                     pane.conversation_id, instance
                 )
             else:
-                capture = await instance.read()
+                try:
+                    async with asyncio.timeout(AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S):
+                        capture = await instance.read()
+                except TimeoutError:
+                    return False
                 screen = capture.get("screen")
                 if not isinstance(screen, str):
                     return False
                 running = agy_pane_has_running_background_tasks(screen)
+            if running is None:
+                return False
             if not running:
                 background_shell_hold_since.pop(instance_id, None)
                 return False
@@ -15223,7 +15238,9 @@ def create_runner_app(
 
         async def _native_pane_busy_without_background_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            if _session_has_cli_retention_protection(conv_id):
+            if _session_has_cli_retention_protection(
+                conv_id, include_background_tasks=pane.terminal_name != "claude"
+            ):
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the
@@ -15542,7 +15559,9 @@ def create_runner_app(
             )
         reaper = app.state.native_pane_reaper
         snapshot = None
-        protected = _session_has_cli_retention_protection(session_id)
+        protected = _session_has_cli_retention_protection(
+            session_id, include_background_tasks=False
+        )
         if protected:
             if reaper is not None:
                 reaper.note_activity(session_id)
@@ -15566,6 +15585,9 @@ def create_runner_app(
             else:
                 reaper.unmanage(session_id)
         if snapshot is None and process_manager is not None:
+            if not protected and _session_background_task_counts.get(session_id, 0) > 0:
+                protected = True
+                process_manager.note_activity(session_id)
             process_manager.manage_for_retention(session_id)
             snapshot = await process_manager.retention_snapshot(
                 session_id,
@@ -15690,7 +15712,10 @@ def create_runner_app(
                     status_code=409,
                     content={"session_id": session_id, "status": "stale_policy"},
                 )
-            if _session_has_cli_retention_protection(session_id):
+            pane_release = token.startswith("pane:") and reaper is not None
+            if _session_has_cli_retention_protection(
+                session_id, include_background_tasks=not pane_release
+            ):
                 if reaper is not None:
                     reaper.note_activity(session_id)
                 if process_manager is not None:

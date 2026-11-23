@@ -1173,6 +1173,7 @@ class _CodexForwarderState:
     background_tasks_unsupported: bool = False
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
+    background_terminal_thread_closed: bool = False
     on_background_terminals: Callable[[bool], None] | None = None
     goal_unknown: bool = False
 
@@ -1470,6 +1471,7 @@ class _CodexForwarderState:
         self.goal_status = None
         self.goal_updates += 1
         self.goal_unknown = False
+        self.background_terminal_thread_closed = False
         self.note_background_terminals(None)
         self.posted_background_work_running = None
         self.posted_background_tasks = None
@@ -4745,6 +4747,19 @@ async def _handle_event(
         return
     if forwarder_state is not None and bridge_dir != Path():
         forwarder_state.child_usage_baseline_dir = bridge_dir
+    if method == "thread/closed":
+        if (
+            forwarder_state is not None
+            and expected_thread_id is not None
+            and _thread_id_from_params(params) == expected_thread_id
+        ):
+            forwarder_state.background_terminal_thread_closed = True
+            forwarder_state.cancel_background_terminal_poll()
+            forwarder_state.note_background_terminals([])
+            await _sync_background_work_running(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+        return
     terminal_event = method in {"turn/completed", "turn/failed"} or (
         method == "error" and params.get("willRetry") is not True
     )
@@ -5931,6 +5946,8 @@ async def _refresh_background_terminals(
     :returns: ``True`` when a terminal is still running, or was before a
         failed listing, so the caller should list again.
     """
+    if forwarder_state.background_terminal_thread_closed:
+        return False
     keep_listing = False
     if forwarder_state.background_terminals_supported:
         try:
@@ -5954,12 +5971,14 @@ async def _refresh_background_terminals(
             _logger.warning("Codex background terminal listing failed", exc_info=True)
             keep_listing = forwarder_state.has_background_terminals
         else:
+            if forwarder_state.background_terminal_thread_closed:
+                return False
             forwarder_state.note_background_terminals(_background_terminal_tasks(terminals))
             keep_listing = forwarder_state.has_background_terminals
     await _sync_background_work_running(
         ap_client, session_id=session_id, forwarder_state=forwarder_state
     )
-    return keep_listing
+    return keep_listing and not forwarder_state.background_terminal_thread_closed
 
 
 async def _poll_background_terminals(

@@ -191,6 +191,8 @@ class SessionStatusPublisher(Protocol):
 
     ``inferred`` marks a reason read from the pane rather than reported by the
     harness, so the server lets it annotate a running turn but never reopen one.
+    ``replayed_background_tasks`` repopulates the server's tally on reconnect
+    without recording new pane activity.
     """
 
     def __call__(
@@ -203,6 +205,7 @@ class SessionStatusPublisher(Protocol):
         /,
         *,
         inferred: bool = False,
+        replayed_background_tasks: bool = False,
     ) -> None: ...
 
 
@@ -1025,7 +1028,7 @@ class SessionResourceRegistry:
         publisher = self._session_status_publisher
         if publisher is not None:
             for session_id, status, count, tasks in background_replays:
-                publisher(session_id, status, None, count, tasks)
+                publisher(session_id, status, None, count, tasks, replayed_background_tasks=True)
         for poller in pollers:
             poller.resync()
         if sessions or pollers:
@@ -1058,6 +1061,11 @@ class SessionResourceRegistry:
         with self._lock:
             poller = self._status_pollers.get(session_id)
         return poller is not None and poller.holding_background_agents
+
+    def session_has_reported_background_shells(self, session_id: str) -> bool:
+        """Whether the current native status reports a positive shell count."""
+        with self._lock:
+            return session_id in self._background_task_replay
 
     def session_background_agents(self, session_id: str) -> list[dict[str, object]]:
         """Display fields of the background agents a settled Claude turn left running.

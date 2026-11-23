@@ -2846,11 +2846,20 @@ async def test_reconnect_resync_replays_exact_background_shell_state(tmp_path: P
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     published: list[tuple[str, str, str | None, int | None, list[dict[str, object]] | None]] = []
-    registry.set_session_status_publisher(
-        lambda session_id, status, blocked_on=None, count=None, tasks=None: published.append(
-            (session_id, status, blocked_on, count, tasks)
-        )
-    )
+
+    def publish(
+        session_id,
+        status,
+        blocked_on=None,
+        count=None,
+        tasks=None,
+        *,
+        replayed_background_tasks=False,
+    ):
+        assert replayed_background_tasks
+        published.append((session_id, status, blocked_on, count, tasks))
+
+    registry.set_session_status_publisher(publish)
     tasks: list[dict[str, object]] = [
         {
             "id": "shell-1",

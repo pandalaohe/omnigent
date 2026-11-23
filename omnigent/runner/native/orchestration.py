@@ -507,6 +507,9 @@ _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 # stop record there once the server is gone.
 _AUTO_CODEX_BRIDGE_DIRS: dict[str, Path] = {}
 
+# A failed listing does not renew the last successful observation.
+_CODEX_BACKGROUND_TERMINAL_FRESHNESS_S = 120.0
+
 
 @dataclasses.dataclass
 class _CodexForwarderOwner:
@@ -514,10 +517,12 @@ class _CodexForwarderOwner:
     subagent_router: SubagentRouter | None
     turn_router: TurnRouter | None
     terminal_instance: TerminalInstance | None
-    background_terminals_running: bool = False
+    background_terminals_running: bool | None = None
+    background_terminals_observed_at: float = 0.0
 
     def note_background_terminals(self, running: bool) -> None:
         self.background_terminals_running = running
+        self.background_terminals_observed_at = time.monotonic()
 
 
 _CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexForwarderOwner] = (
@@ -537,18 +542,23 @@ def _track_codex_forwarder(
     return owner
 
 
-def codex_pane_has_background_terminals(session_id: str, instance: TerminalInstance) -> bool:
+def codex_pane_background_terminal_status(
+    session_id: str, instance: TerminalInstance
+) -> bool | None:
     """Use the live forwarder's last app-server listing for this pane incarnation."""
     task = _AUTO_FORWARDER_TASKS.get(session_id)
     if task is None or task.done() or task.cancelling():
-        return False
+        return None
     owner = _CODEX_FORWARDER_OWNERS.get(task)
-    return (
-        owner is not None
-        and owner.session_id == session_id
-        and owner.terminal_instance is instance
-        and owner.background_terminals_running
-    )
+    if owner is None or owner.session_id != session_id or owner.terminal_instance is not instance:
+        return None
+    if (
+        owner.background_terminals_running
+        and time.monotonic() - owner.background_terminals_observed_at
+        >= _CODEX_BACKGROUND_TERMINAL_FRESHNESS_S
+    ):
+        return None
+    return owner.background_terminals_running
 
 
 def _prepare_codex_forwarder_transfer(

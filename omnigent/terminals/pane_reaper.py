@@ -58,6 +58,7 @@ PANE_OUTPUT_BUSY_WINDOW_S = 120.0
 
 # A background shell alone can spare a pane for a day after its other work.
 BACKGROUND_SHELL_PANE_HOLD_S = 24 * 60 * 60.0
+AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S = 1.0
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the

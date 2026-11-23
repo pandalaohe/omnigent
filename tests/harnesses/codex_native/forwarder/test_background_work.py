@@ -951,6 +951,59 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
 
 
 @pytest.mark.asyncio
+async def test_background_terminal_poll_stops_only_when_its_thread_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiting = _park_poll(monkeypatch)
+    app_server = _AppServerStub(listings=[_terminal_listing("npm run dev")])
+    client = _RecordingClient()
+    signals: list[bool] = []
+    state = fwd._CodexForwarderState(on_background_terminals=signals.append)
+    await fwd._track_background_terminals(
+        client,
+        app_server,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        forwarder_state=state,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        await _deliver_to_parent(
+            client, tmp_path, state, {"method": "thread/closed", "params": {"threadId": "other"}}
+        )
+        assert state.background_terminal_poll is poll
+        assert signals == [True]
+
+        await _deliver_to_parent(
+            client,
+            tmp_path,
+            state,
+            {"method": "thread/closed", "params": {"threadId": "thread_123"}},
+        )
+        assert state.background_terminal_poll is None
+        assert signals == [True, False]
+        assert client.posts[-1] == _background_work_post(False, [])
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+        await fwd._track_background_terminals(
+            client,
+            app_server,
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            forwarder_state=state,
+        )
+        assert len(app_server.requests) == 1
+        assert state.background_terminal_poll is None
+    finally:
+        poll.cancel()
+        await asyncio.gather(poll, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_server_without_the_list_still_gets_flag_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1321,10 +1374,12 @@ async def test_failed_terminal_listing_keeps_the_last_known_state(
         list_error=ConnectionError("app-server socket closed"), list_error_count=1
     )
     client = _RecordingClient()
+    signals: list[bool] = []
     state = fwd._CodexForwarderState(
         background_terminals=_terminal_tasks("npm run dev"),
         posted_background_work_running=True,
         posted_background_tasks=_terminal_tasks("npm run dev"),
+        on_background_terminals=signals.append,
     )
 
     await _deliver_to_parent(
@@ -1335,12 +1390,14 @@ async def test_failed_terminal_listing_keeps_the_last_known_state(
         codex_client=app_server,
     )
     assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+    assert signals == []
 
     # The next listing succeeds and finds no terminal, which clears the flag.
     poll = state.background_terminal_poll
     assert poll is not None
     await poll
     assert client.posts[-1] == _background_work_post(False, [])
+    assert signals == [False]
 
 
 @pytest.mark.asyncio
