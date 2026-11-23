@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from omnigent.runner.resource_registry import SessionResourceRegistry, TerminalC
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
+    BACKGROUND_SHELL_PANE_HOLD_S,
     NATIVE_PANE_TERMINAL_NAMES,
     PANE_OUTPUT_BUSY_WINDOW_S,
     PENDING_RETIRE_MAX_AGE_S,
@@ -611,24 +613,26 @@ def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
     assert pane_names >= NATIVE_PANE_TERMINAL_NAMES
 
 
-@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent"])
+@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent", "background_shell"])
 async def test_runner_busy_check_spares_a_pane_with_live_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     live_work: str,
 ) -> None:
     """
-    The runner's busy check treats an approval wait or a background agent as busy.
+    The runner's busy check treats an approval wait or background work as busy.
 
     A pane parked on a permission prompt, or whose settled turn left a background
-    agent working, has no active turn, no ``running`` status, no attached client
-    and no output, so every other signal reads idle and the reaper would kill it.
+    agent or shell working, has no active turn, no ``running`` status, no attached
+    client and no output, so every other signal reads idle.
     """
     # Bound by name when the app is built, so stub before building: no tmux here.
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    registry._by_conversation["conv_parked"] = {("claude", "main"): instance}
     resources = SessionResourceRegistry(terminal_registry=registry)
     agent_sessions: set[str] = set()
     monkeypatch.setattr(resources, "session_has_background_agents", agent_sessions.__contains__)
@@ -640,7 +644,11 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
     reaper = app.state.native_pane_reaper
     assert reaper is not None
     pane = PaneRef(
-        "conv_parked", terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+        "conv_parked",
+        terminal_resource_id("claude", "main"),
+        "claude",
+        instance.socket_path,
+        instance,
     )
 
     assert not await reaper._is_busy(pane)
@@ -649,12 +657,73 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
         marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
         marker.parent.mkdir(parents=True)
         claude_native_bridge.touch_approval_wait_marker(marker)
-    else:
+    elif live_work == "background_agent":
         agent_sessions.add("conv_parked")
+    else:
+        assert resources._session_background_publisher is not None
+        resources._session_background_publisher("conv_parked", True)
     assert await reaper._is_busy(pane)
     # Another session's live work does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
+
+
+async def test_antigravity_background_shell_protects_pane_from_automatic_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiet job holds an otherwise idle pane until it exits or the hold expires."""
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("antigravity", "main", tmp_path)
+    conv = "conv_awaiting_build"
+    registry._by_conversation[conv] = {("antigravity", "main"): instance}
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    monkeypatch.setattr(resources, "terminal_resource_role", lambda *_args: "antigravity-native")
+    rule = "─" * 80
+    row = "  ● [12:45:28] sleep 600 && echo done... running"
+    footer = "? for shortcuts · 1 task(s) · /tasks"
+    # After the job ends its past task row may still be visible in the transcript.
+    idle_screen = f"{rule}\n{row}\n{rule}\n{footer}\n{rule}\n>\n{rule}\n? for shortcuts"
+    running_screen = f"{rule}\n>\n{rule}\n{row}\n{rule}\n{footer}"
+    capture = AsyncMock(return_value={"screen": running_screen})
+    monkeypatch.setattr(instance, "read", capture)
+
+    reaper = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        native_pane_idle_timeout_s=60,
+    ).state.native_pane_reaper
+    assert reaper is not None
+    reap = AsyncMock()
+    monkeypatch.setattr(reaper, "_reap", reap)
+    now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    [pane] = reaper._list_native_panes()
+    reaper._last_busy_at[conv] = now - 120
+    await reaper._scan_once()
+    reap.assert_not_awaited()
+
+    now += BACKGROUND_SHELL_PANE_HOLD_S - 1
+    assert await reaper._is_busy(pane)
+    now += 1
+    assert not await reaper._is_busy(pane)
+
+    # Another busy signal re-arms the limit for fresh work.
+    instance.note_client_interaction()
+    assert await reaper._is_busy(pane)
+    now += PANE_OUTPUT_BUSY_WINDOW_S + 1
+    assert await reaper._is_busy(pane)
+
+    capture.return_value = {"screen": idle_screen}
+    reaper._last_busy_at[conv] = now - 30
+    await reaper._scan_once()
+    reap.assert_not_awaited()
+    now += 30
+    await reaper._scan_once()
+    reap.assert_awaited_once_with(pane)
 
 
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(

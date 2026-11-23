@@ -15106,6 +15106,9 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from omnigent.harnesses.antigravity_native.bridge import (
+            agy_pane_has_running_background_tasks,
+        )
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
@@ -15113,14 +15116,18 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             NativePaneStillAlive,
             PaneRef,
         )
 
+        background_shell_hold_since: dict[str, float] = {}
+
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
+            live_instance_ids: set[str] = set()
             for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
                 terminal_id = terminal_resource_id(name, "main")
                 if is_native_harness(
@@ -15128,6 +15135,7 @@ def create_runner_app(
                 ):
                     instance = _pane_reaper_registry.get(conv_id, name, "main")
                     if instance is not None:
+                        live_instance_ids.add(instance.diagnostic_id)
                         panes.append(
                             PaneRef(
                                 conv_id,
@@ -15138,6 +15146,8 @@ def create_runner_app(
                                 sub_agent=_is_sub_agent_session(conv_id),
                             )
                         )
+            for gone in background_shell_hold_since.keys() - live_instance_ids:
+                del background_shell_hold_since[gone]
             return panes
 
         async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
@@ -15182,6 +15192,32 @@ def create_runner_app(
             return False
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            busy = await _native_pane_busy_without_background_shell(pane)
+            if pane.terminal_name not in ("claude", "antigravity"):
+                return busy
+            instance = _pane_reaper_registry.get(pane.conversation_id, pane.terminal_name, "main")
+            if instance is None or (pane.instance is not None and pane.instance is not instance):
+                return busy
+            instance_id = instance.diagnostic_id
+            if busy:
+                background_shell_hold_since.pop(instance_id, None)
+                return True
+            if pane.terminal_name == "claude":
+                running = pane.conversation_id in _sessions_with_background_shell
+            else:
+                capture = await instance.read()
+                screen = capture.get("screen")
+                if not isinstance(screen, str):
+                    return False
+                running = agy_pane_has_running_background_tasks(screen)
+            if not running:
+                background_shell_hold_since.pop(instance_id, None)
+                return False
+            now = time.monotonic()
+            held_since = background_shell_hold_since.setdefault(instance_id, now)
+            return now - held_since < BACKGROUND_SHELL_PANE_HOLD_S
+
+        async def _native_pane_busy_without_background_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
             if _session_has_cli_retention_protection(conv_id):
                 return True

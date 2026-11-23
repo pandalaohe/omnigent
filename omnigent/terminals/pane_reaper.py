@@ -9,7 +9,7 @@ without bound as idle conversations accumulate, independent of how many are
 actually active (#1349).
 
 This reaps a single native pane only when it is genuinely unused. "Busy" is the
-disjunction of three signals (any one spares the pane):
+disjunction of live-work signals (any one spares the pane):
 
   * an in-flight runner turn (``has_active_turn``), OR
   * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
@@ -18,9 +18,10 @@ disjunction of three signals (any one spares the pane):
     signal for a long autonomous turn), OR
   * a human recently drove an attached viewer — a keypress on a tmux client, or
     any event on the web attach bridge. An idle attached viewer alone does not
-    count, else a tab left open overnight pins the pane (and its MCP fleet).
+    count, else a tab left open overnight pins the pane (and its MCP fleet), OR
+  * the harness reports a background shell within the bounded hold window.
 
-A pane idle on all three for longer than the window is reaped, with a **second
+A pane idle on all signals for longer than the window is reaped, with a **second
 busy re-check immediately before teardown** to close the select→reap race. The
 tmux client probe is a blocking ``subprocess`` call, so it runs off the event
 loop via ``asyncio.to_thread``.
@@ -54,6 +55,9 @@ _logger = logging.getLogger(__name__)
 # terminal reaped. Two reaper scan intervals, so activity between scans re-arms
 # the idle clock.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
+
+# A background shell alone can spare a pane for a day after its other work.
+BACKGROUND_SHELL_PANE_HOLD_S = 24 * 60 * 60.0
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
@@ -186,9 +190,7 @@ class NativePaneReaper:
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
-    :param is_busy: ``async`` predicate — ``True`` if the pane has an in-flight
-        turn, is reporting ``running``, or has an attached tmux client. Async so
-        the (blocking) tmux probe runs off the event loop.
+    :param is_busy: ``async`` predicate for the current pane live-work signals.
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
