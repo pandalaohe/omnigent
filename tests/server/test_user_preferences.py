@@ -564,6 +564,118 @@ def test_terminal_bar_size_fixtures_match_the_server_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_keyboard_patches_merge_stale_platform_edits_and_accept_older_clients(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    transport = httpx.ASGITransport(app=_preferences_app(db_uri, tmp_path))
+    defaults = {"version": 2, "enabled": True, "buttons": [], "chatActionsRevision": 1}
+    common = [{"code": "F9", "modifiers": []}]
+    mac_binding = [{"code": "F10", "modifiers": []}]
+    windows_binding = [{"code": "F11", "modifiers": []}]
+    mac_map = {"ctrl": "ctrl", "alt": "cmd", "meta": "alt"}
+    windows_map = {"ctrl": "ctrl", "alt": "alt", "meta": "cmd"}
+    route = "/v1/me/preferences/mobile_assistant"
+    headers = {"x-test-user": "alice@example.com"}
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers) as mac,
+        httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers) as windows,
+    ):
+        # Old client sends a complete keyboard object.
+        original = {
+            "version": 2,
+            "enabled": False,
+            "buttons": [],
+            "terminalKeyboard": {"v": 1, "bindings": {"newline": {"common": common}}},
+        }
+        initial = await mac.patch(route, json={"value": original})
+        assert initial.status_code == 200
+        mac_snapshot = (await mac.get("/v1/me")).json()["preferences"]
+        assert (await windows.get("/v1/me")).json()["preferences"] == mac_snapshot
+
+        for client, platform, mode, modifier_map, binding in (
+            (windows, "windows", "always", windows_map, windows_binding),
+            (mac, "macos", "never", mac_map, mac_binding),
+        ):
+            response = await client.patch(
+                route,
+                json={
+                    "value": {},
+                    "terminal_keyboard": {
+                        "defaults": defaults,
+                        "changes": [
+                            {"platform": platform, "field": field, "value": value}
+                            for field, value in (
+                                ("pasteBoxMode", mode),
+                                ("modifierMap", modifier_map),
+                                ("newline", binding),
+                            )
+                        ],
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+
+        synced = (await windows.get("/v1/me")).json()["preferences"]["settings"][
+            "mobile_assistant"
+        ]
+        assert synced == {
+            **original,
+            "terminalKeyboard": {
+                "v": 1,
+                "pasteBoxMode": {"windows": "always", "macos": "never"},
+                "modifierMap": {"windows": windows_map, "macos": mac_map},
+                "bindings": {
+                    "newline": {
+                        "common": common,
+                        "platformOverrides": {"windows": windows_binding, "macos": mac_binding},
+                    },
+                },
+            },
+        }
+        invalid = await mac.patch(
+            route,
+            json={
+                "value": {},
+                "terminal_keyboard": {
+                    "defaults": defaults,
+                    "changes": [
+                        {"platform": "macos", "field": "pasteBoxMode", "value": "always"},
+                        {"platform": "macos", "field": "newline", "value": [{"code": "F8"}]},
+                    ],
+                },
+            },
+        )
+        assert invalid.status_code == 422
+        after_invalid = (await mac.get("/v1/me")).json()["preferences"]["settings"]
+        assert after_invalid["mobile_assistant"] == synced
+
+        restored = await mac.patch(
+            route,
+            json={
+                "value": {},
+                "terminal_keyboard": {
+                    "defaults": defaults,
+                    "changes": [{"platform": "macos", "field": "newline", "value": None}],
+                },
+            },
+        )
+        assert restored.status_code == 200
+        expected = synced["terminalKeyboard"]
+        expected["bindings"]["newline"]["platformOverrides"].pop("macos")
+        assert restored.json()["settings"]["mobile_assistant"]["terminalKeyboard"] == expected
+
+        replacement = {"v": 1, "pasteBoxMode": {"linux": "never"}}
+        legacy = await windows.patch(route, json={"value": {"terminalKeyboard": replacement}})
+        assert legacy.status_code == 200
+        assert legacy.json()["settings"]["mobile_assistant"] == {
+            **original,
+            "terminalKeyboard": replacement,
+        }
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_initializes_merges_and_returns_from_me(
     db_uri: str,
     runtime_init: None,

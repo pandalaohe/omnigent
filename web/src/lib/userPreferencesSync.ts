@@ -1,4 +1,8 @@
 import { canonicalTerminalFields } from "@/lib/terminalKeyBar";
+import {
+  applyTerminalKeyboardChanges,
+  type TerminalKeyboardChange,
+} from "@/lib/terminalKeyboardChanges";
 
 export type UserPreferenceNamespace =
   | "keyboard_shortcuts"
@@ -145,6 +149,7 @@ let activeOwnerId: string | null = null;
 let activeServerId = "__default__";
 let activeConnectionId = "__default__";
 let syncGeneration = 0;
+let terminalKeyboardSaveVersion = 0;
 let preferenceConnectionIsCurrent = () => true;
 
 function isCurrentPreferenceGeneration(generation: number): boolean {
@@ -312,6 +317,93 @@ function mobileSyncValue(value: unknown): unknown | null {
   });
 }
 
+interface TerminalKeyboardPatch {
+  defaults: Record<string, unknown>;
+  changes: TerminalKeyboardChange[];
+}
+
+function splitMobilePatch(value: unknown) {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const { terminal_keyboard, ...fields } = raw;
+  return { fields, keyboard: terminal_keyboard as TerminalKeyboardPatch | undefined };
+}
+
+function sameKeyboardField(first: TerminalKeyboardChange, second: TerminalKeyboardChange) {
+  return first.platform === second.platform && first.field === second.field;
+}
+
+function mergeMobilePatch(previous: unknown, value: unknown): unknown {
+  if (value === null) return null;
+  const { fields, keyboard } = splitMobilePatch(value);
+  const prior = splitMobilePatch(previous);
+  if (keyboard) {
+    const otherChanges =
+      prior.keyboard?.changes.filter(
+        (change) => !keyboard.changes.some((next) => sameKeyboardField(change, next)),
+      ) ?? [];
+    return {
+      ...prior.fields,
+      ...fields,
+      terminal_keyboard: { ...keyboard, changes: [...otherChanges, ...keyboard.changes] },
+    };
+  }
+  const normalized = mobileSyncValue({
+    ...fields,
+    terminalKeyboard:
+      fields.terminalKeyboard === undefined
+        ? prior.fields.terminalKeyboard
+        : fields.terminalKeyboard,
+  });
+  return prior.keyboard && normalized && fields.terminalKeyboard === undefined
+    ? { ...(normalized as object), terminal_keyboard: prior.keyboard }
+    : normalized;
+}
+
+function applyMobilePatch(serverValue: unknown, patch: unknown) {
+  if (patch === null) return null;
+  const { fields, keyboard } = splitMobilePatch(patch);
+  let merged = { ...(serverValue as object | null), ...fields };
+  if (keyboard) {
+    if (
+      merged.version !== 2 ||
+      typeof merged.enabled !== "boolean" ||
+      !Array.isArray(merged.buttons)
+    )
+      merged = { ...merged, ...keyboard.defaults };
+    merged.terminalKeyboard = applyTerminalKeyboardChanges(
+      merged.terminalKeyboard,
+      keyboard.changes,
+    );
+  }
+  return merged;
+}
+
+function pendingMobilePatch(current: unknown, acknowledged: unknown): unknown {
+  const latest = splitMobilePatch(current);
+  const sent = splitMobilePatch(acknowledged);
+  const changes = latest.keyboard?.changes.filter(
+    (change) =>
+      !sent.keyboard?.changes.some((saved) => JSON.stringify(saved) === JSON.stringify(change)),
+  );
+  const { terminalKeyboard, ...latestFields } = latest.fields;
+  const { terminalKeyboard: sentKeyboard, ...sentFields } = sent.fields;
+  // A full keyboard snapshot carried forward with a toolbar edit is already saved.
+  // An explicit full replacement removes the queued scoped changes.
+  const replaceKeyboard =
+    terminalKeyboard !== undefined &&
+    (JSON.stringify(terminalKeyboard) !== JSON.stringify(sentKeyboard) ||
+      (sent.keyboard && !latest.keyboard));
+  const fields = replaceKeyboard
+    ? latest.fields
+    : JSON.stringify(latestFields) === JSON.stringify(sentFields)
+      ? {}
+      : latestFields;
+  if (changes?.length) {
+    return { ...fields, terminal_keyboard: { ...latest.keyboard, changes } };
+  }
+  return Object.keys(fields).length ? fields : null;
+}
+
 function sessionCollabSyncValue(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const raw = value as Record<string, unknown>;
@@ -397,6 +489,8 @@ function serializedNamespaceValue(
   namespace: UserPreferenceNamespace,
   value: unknown | null,
 ): string {
+  if (namespace === "mobile_assistant" && splitMobilePatch(value).keyboard)
+    return JSON.stringify(value);
   return JSON.stringify(normalizedSyncValue(namespace, value));
 }
 
@@ -405,17 +499,25 @@ function latestNamespaceValue(namespace: UserPreferenceNamespace): unknown | nul
   return dirty.found ? dirty.value : localNamespaceValue(namespace);
 }
 
-function hydrateServerEnvelope(envelope: UserPreferencesEnvelope): void {
+function hydrateServerEnvelope(envelope: UserPreferencesEnvelope, skipMobile = false): void {
   const dirty = readDirtyNamespaces();
   const pendingDirty: UserPreferenceNamespace[] = [];
   applyingServerPreferences = true;
   try {
     for (const namespace of Object.keys(CATEGORY_CONFIG) as UserPreferenceNamespace[]) {
+      if (skipMobile && namespace === "mobile_assistant") continue;
       const serverNamespace = normalizedSyncValue(namespace, envelope.settings[namespace] ?? null);
       lastServerValues.set(namespace, serverNamespace);
       if (dirty.has(namespace)) {
         const retained = readDirtyValue(namespace);
-        if (retained.found) applyNamespace(namespace, retained.value);
+        if (retained.found) {
+          applyNamespace(
+            namespace,
+            namespace === "mobile_assistant"
+              ? applyMobilePatch(serverNamespace, retained.value)
+              : retained.value,
+          );
+        }
         pendingDirty.push(namespace);
       } else {
         applyNamespace(namespace, serverNamespace);
@@ -438,6 +540,7 @@ export async function refreshUserPreferencesFromServer(): Promise<void> {
   const fetcher = preferenceFetcher;
   const generation = syncGeneration;
   if (!serverSupportsPreferences || fetcher === null || !preferenceConnectionIsCurrent()) return;
+  const keyboardSaveVersion = terminalKeyboardSaveVersion;
   try {
     const response = await fetcher("/v1/me", { cache: "no-store" });
     if (!isCurrentPreferenceGeneration(generation)) return;
@@ -450,7 +553,10 @@ export async function refreshUserPreferencesFromServer(): Promise<void> {
       !isEnvelope(data.preferences)
     )
       return;
-    hydrateServerEnvelope(data.preferences);
+    // The GET may have taken its snapshot before a keyboard PATCH committed.
+    const skipMobile = keyboardSaveVersion !== terminalKeyboardSaveVersion;
+    hydrateServerEnvelope(data.preferences, skipMobile);
+    if (skipMobile) void refreshUserPreferencesFromServer();
   } catch {
     // The durable dirty map retains offline edits for the next focus/reload.
   }
@@ -662,12 +768,18 @@ function schedulePatch(
       }
       if (fetcher === null) return;
       inFlightPatches.set(namespace, generation);
+      const serverBeforePatch = lastServerValues.get(namespace);
       void (async () => {
         try {
+          const mobile = namespace === "mobile_assistant" ? splitMobilePatch(syncValue) : undefined;
           const response = await fetcher(`/v1/me/preferences/${namespace}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ value: syncValue }),
+            body: JSON.stringify(
+              mobile?.keyboard
+                ? { value: mobile.fields, terminal_keyboard: mobile.keyboard }
+                : { value: syncValue },
+            ),
           });
           if (!isCurrentPreferenceGeneration(generation)) return;
           if (response?.status === 422) {
@@ -704,17 +816,67 @@ function schedulePatch(
             return;
           }
           if (!response?.ok) throw new Error("preference patch failed");
-          lastAcknowledged.set(namespace, serialized);
-          lastServerValues.set(namespace, syncValue);
-          settlePatchWaiters(namespace, serialized);
-          window.dispatchEvent(
-            new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
-              detail: { namespace },
-            }),
-          );
+          const body = mobile ? ((await response.json().catch(() => null)) as unknown) : null;
+          if (!isCurrentPreferenceGeneration(generation)) return;
           const current = latestNamespaceValue(namespace);
           const currentSerialized = serializedNamespaceValue(namespace, current);
-          if (currentSerialized === serialized) {
+          const mergeKeyboard =
+            mobile &&
+            (mobile.keyboard ||
+              mobile.fields.terminalKeyboard !== undefined ||
+              splitMobilePatch(current).keyboard);
+          const refreshOverlapped =
+            mergeKeyboard && serverBeforePatch !== lastServerValues.get(namespace);
+          const serverValue = mobile
+            ? isEnvelope(body)
+              ? (body.settings.mobile_assistant ?? null)
+              : applyMobilePatch(lastServerValues.get(namespace), syncValue)
+            : syncValue;
+          lastAcknowledged.set(namespace, serialized);
+          if (!refreshOverlapped) lastServerValues.set(namespace, serverValue);
+          if (mergeKeyboard) {
+            terminalKeyboardSaveVersion += 1;
+            const remaining =
+              currentSerialized === serialized ? null : pendingMobilePatch(current, syncValue);
+            const deletePending = current === null && currentSerialized !== serialized;
+            if (remaining === null && !deletePending) {
+              clearDirty(namespace);
+              patchesAfterFlight.delete(namespace);
+              const queuedTimer = pendingTimers.get(namespace);
+              if (queuedTimer !== undefined) window.clearTimeout(queuedTimer);
+              pendingTimers.delete(namespace);
+              lastAcknowledged.set(
+                namespace,
+                serializedNamespaceValue(namespace, lastServerValues.get(namespace)),
+              );
+            } else {
+              markDirty(namespace, remaining);
+              patchesAfterFlight.set(namespace, {
+                syncValue: remaining,
+                serialized: serializedNamespaceValue(namespace, remaining),
+                delayMs: 0,
+                attempt: 0,
+              });
+            }
+            if (refreshOverlapped) {
+              // Keep the hydrated local view until a fresh read can order the two responses.
+              void refreshUserPreferencesFromServer();
+            } else {
+              applyingServerPreferences = true;
+              try {
+                applyNamespace(
+                  namespace,
+                  remaining !== null
+                    ? applyMobilePatch(serverValue, remaining)
+                    : deletePending
+                      ? null
+                      : serverValue,
+                );
+              } finally {
+                applyingServerPreferences = false;
+              }
+            }
+          } else if (currentSerialized === serialized) {
             clearDirty(namespace);
           } else {
             markDirty(namespace, current);
@@ -725,6 +887,12 @@ function schedulePatch(
               attempt: 0,
             });
           }
+          settlePatchWaiters(namespace, serialized);
+          window.dispatchEvent(
+            new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+              detail: { namespace },
+            }),
+          );
         } catch {
           if (isCurrentPreferenceGeneration(generation)) {
             const current = latestNamespaceValue(namespace);
@@ -780,8 +948,11 @@ export function queueUserPreferencePatch(
   ) {
     return;
   }
-  const syncValue = normalizedSyncValue(namespace, value);
-  const serialized = JSON.stringify(syncValue);
+  const syncValue =
+    namespace === "mobile_assistant"
+      ? mergeMobilePatch(readDirtyValue(namespace).value, value)
+      : normalizedSyncValue(namespace, value);
+  const serialized = serializedNamespaceValue(namespace, syncValue);
   for (const waiter of patchWaiters) {
     if (waiter.namespace === namespace && waiter.serialized !== serialized) {
       waiter.finish(new Error("A newer edit replaced this save. Please retry."));
@@ -863,6 +1034,7 @@ export function resetUserPreferencesSyncForTests(): void {
   activeServerId = "__default__";
   activeConnectionId = "__default__";
   syncGeneration = 0;
+  terminalKeyboardSaveVersion = 0;
   preferenceConnectionIsCurrent = () => true;
   lastFocusRefreshAt = 0;
   if (refreshListenersInstalled) {

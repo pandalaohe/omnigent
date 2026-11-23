@@ -4707,7 +4707,7 @@ def create_app(
         "type": "object",
         "additionalProperties": False,
         "required": ["value"],
-        "properties": {"value": {}},
+        "properties": {"value": {}, "terminal_keyboard": {"type": "object"}},
     }
     _preferences_error_responses: dict[int | str, dict[str, Any]] = {
         400: {"description": "Invalid Content-Length header"},
@@ -4817,6 +4817,7 @@ def create_app(
                 owner,
                 namespace,
                 body.value,
+                terminal_keyboard=body.terminal_keyboard,
                 create_if_missing=create_if_missing,
             )
         except UserPreferencesUserNotFoundError as exc:

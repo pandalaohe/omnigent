@@ -23,11 +23,11 @@ import {
   terminalPasteBoxModeFor,
   TERMINAL_BINDING_IDS,
   TERMINAL_BINDINGS,
-  writeTerminalKeyboardPreferences,
+  writeTerminalKeyboardChange,
   type TerminalBindingId,
-  type TerminalKeyboardPreferences,
   type TerminalPasteBoxMode,
 } from "@/lib/terminalKeyboardPreferences";
+import type { TerminalKeyboardChange } from "@/lib/terminalKeyboardChanges";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   SHORTCUT_ACTION_IDS,
@@ -136,7 +136,7 @@ function remappedTerminalBindingLabels(
     });
 }
 
-function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardPreferences>) {
+function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardChange>) {
   if (result === "saved") return null;
   if (result === "too-large")
     return "Too large to sync. Your preferences would exceed the 64 KiB limit.";
@@ -292,15 +292,12 @@ export function KeyboardShortcutEditor() {
       ].some((value) => normalizeSearch(value).includes(query))
     );
   });
-  const saveTerminalPreferences = (next: TerminalKeyboardPreferences) => {
-    setError(terminalSaveError(writeTerminalKeyboardPreferences(next)));
+  const saveTerminalChange = (change: TerminalKeyboardChange) => {
+    setError(terminalSaveError(writeTerminalKeyboardChange(change)));
   };
   const saveTerminalMap = (map: typeof terminalMap) => {
     stopRecording();
-    saveTerminalPreferences({
-      ...terminalPreferences,
-      modifierMap: { ...terminalPreferences.modifierMap, [terminalPlatform]: map },
-    });
+    saveTerminalChange({ platform: terminalPlatform, field: "modifierMap", value: map });
   };
   const isChanged = (actionId: ShortcutActionId) => {
     const preference = preferences.actions[actionId];
@@ -368,16 +365,10 @@ export function KeyboardShortcutEditor() {
           setError(`That shortcut is already used by ${TERMINAL_BINDINGS[conflict].label}.`);
           return;
         }
-        const binding = current.bindings?.[terminalId];
-        const result = writeTerminalKeyboardPreferences({
-          ...current,
-          bindings: {
-            ...current.bindings,
-            [terminalId]: {
-              ...binding,
-              platformOverrides: { ...binding?.platformOverrides, [target]: [chord] },
-            },
-          },
+        const result = writeTerminalKeyboardChange({
+          platform: target,
+          field: terminalId,
+          value: [chord],
         });
         setError(terminalSaveError(result));
         if (result === "saved") {
@@ -836,12 +827,10 @@ export function KeyboardShortcutEditor() {
                   value={pasteBoxMode}
                   onChange={(event) => {
                     stopRecording();
-                    saveTerminalPreferences({
-                      ...terminalPreferences,
-                      pasteBoxMode: {
-                        ...terminalPreferences.pasteBoxMode,
-                        [terminalPlatform]: event.target.value as TerminalPasteBoxMode,
-                      },
+                    saveTerminalChange({
+                      platform: terminalPlatform,
+                      field: "pasteBoxMode",
+                      value: event.target.value as TerminalPasteBoxMode,
                     });
                   }}
                 >
@@ -903,15 +892,7 @@ export function KeyboardShortcutEditor() {
                       aria-label={`Restore ${platformLabel(terminalPlatform)} shortcut for ${label}`}
                       onClick={() => {
                         stopRecording();
-                        const { [terminalPlatform]: _removed, ...overrides } =
-                          binding?.platformOverrides ?? {};
-                        saveTerminalPreferences({
-                          ...terminalPreferences,
-                          bindings: {
-                            ...terminalPreferences.bindings,
-                            [id]: { ...binding, platformOverrides: overrides },
-                          },
-                        });
+                        saveTerminalChange({ platform: terminalPlatform, field: id, value: null });
                       }}
                     >
                       <RotateCcwIcon />

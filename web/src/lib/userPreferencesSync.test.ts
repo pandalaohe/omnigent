@@ -26,6 +26,7 @@ import { defaultTerminalBar, legacyFingerprint, projectLegacy } from "./terminal
 import { resolveTerminalKeys, writeTerminalKeyPreferences } from "./terminalKeys";
 import {
   readTerminalKeyboardPreferences,
+  writeTerminalKeyboardChange,
   writeTerminalKeyboardPreferences,
   type TerminalKeyboardPreferences,
 } from "./terminalKeyboardPreferences";
@@ -65,6 +66,231 @@ describe("terminal bar preference synchronization", () => {
       terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
     };
   }
+
+  it("sends and retries only the edited terminal keyboard fields", async () => {
+    vi.useFakeTimers();
+    const originalKeyboard = {
+      v: 1,
+      pasteBoxMode: { windows: "whenBlocked" },
+      bindings: {
+        newline: { platformOverrides: { macos: [{ code: "F8", modifiers: [] }] } },
+      },
+    };
+    const mobile = { ...mobileValue(), terminalKeyboard: originalKeyboard };
+    const envelope = { version: 1, settings: { mobile_assistant: mobile } };
+    let acknowledge!: (response: Response) => void;
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          acknowledge = resolve;
+        }),
+    );
+    await initializeUserPreferencesSync(envelope, fetcher, "alice");
+
+    const pasteEdit = { platform: "macos", field: "pasteBoxMode", value: "never" } as const;
+    const bindingReset = { platform: "macos", field: "newline", value: null } as const;
+    const mapEdit = {
+      platform: "linux",
+      field: "modifierMap",
+      value: { ctrl: "ctrl", alt: "cmd", meta: "alt" },
+    } as const;
+    expect(writeTerminalKeyboardChange(pasteEdit)).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const first = JSON.parse(fetcher.mock.calls[0][1].body);
+    expect(first.value).toEqual({});
+    expect(first.terminal_keyboard.changes).toEqual([pasteEdit]);
+
+    expect(writeTerminalKeyboardChange(bindingReset)).toBe("saved");
+    expect(writeTerminalKeyboardChange(mapEdit)).toBe("saved");
+    // A canonical response can include a newer choice from the other device.
+    acknowledge(
+      Response.json({
+        ...envelope,
+        settings: {
+          mobile_assistant: {
+            ...mobile,
+            terminalKeyboard: {
+              ...originalKeyboard,
+              pasteBoxMode: { windows: "always", macos: "never" },
+            },
+          },
+        },
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(300);
+    const second = JSON.parse(fetcher.mock.calls[1][1].body);
+    expect(second.value).toEqual({});
+    expect(second.terminal_keyboard.changes).toEqual([bindingReset, mapEdit]);
+    expect(readTerminalKeyboardPreferences().pasteBoxMode).toEqual({
+      windows: "always",
+      macos: "never",
+    });
+    expect(
+      readTerminalKeyboardPreferences().bindings?.newline?.platformOverrides?.macos,
+    ).toBeUndefined();
+
+    const keys = resolveTerminalKeys({ ...readMobileAssistantPreferences() }).keys;
+    expect(writeTerminalKeyPreferences({ terminalKeys: keys })).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const unrelated = JSON.parse(fetcher.mock.calls[2][1].body);
+    expect(unrelated.value).toHaveProperty("terminalKeys");
+    expect(unrelated.value).not.toHaveProperty("terminalKeyboard");
+    expect(unrelated).not.toHaveProperty("terminal_keyboard");
+  });
+
+  it.each(["legacy", "scoped"])(
+    "retains a %s offline keyboard edit across reload and a toolbar save",
+    async (kind) => {
+      vi.useFakeTimers();
+      const envelope = { version: 1, settings: { mobile_assistant: mobileValue() } };
+      const offline = vi.fn().mockRejectedValue(new Error("offline"));
+      await initializeUserPreferencesSync(envelope, offline, "alice");
+      const keyboard = { v: 1, pasteBoxMode: { macos: "never" } } as const;
+      const change = { platform: "macos", field: "pasteBoxMode", value: "never" } as const;
+      const saved =
+        kind === "legacy"
+          ? writeTerminalKeyboardPreferences(keyboard)
+          : writeTerminalKeyboardChange(change);
+      expect(saved).toBe("saved");
+      await vi.advanceTimersByTimeAsync(251);
+      expect(offline).toHaveBeenCalledOnce();
+
+      resetUserPreferencesSyncForTests();
+      const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+      await initializeUserPreferencesSync(envelope, fetcher, "alice");
+      expect(readTerminalKeyboardPreferences().pasteBoxMode).toEqual(keyboard.pasteBoxMode);
+      const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+      expect(
+        writeTerminalKeyPreferences({
+          terminalKeys: { ...keys, shell: { ...keys.shell, enabled: false } },
+        }),
+      ).toBe("saved");
+      await vi.advanceTimersByTimeAsync(251);
+      const [request] = fetcher.mock.calls;
+      const payload = JSON.parse(request[1].body);
+      expect(payload.value.terminalKeysEnabled).toBe(false);
+      if (kind === "legacy") expect(payload.value.terminalKeyboard).toEqual(keyboard);
+      else {
+        expect(payload.value).not.toHaveProperty("terminalKeyboard");
+        expect(payload.terminal_keyboard.changes).toEqual([change]);
+      }
+    },
+  );
+
+  it.each([
+    ["refresh", "scoped"],
+    ["patch", "scoped"],
+    ["patch", "legacy"],
+  ])("keeps the latest keyboard when %s responds first to a %s save", async (first, kind) => {
+    vi.useFakeTimers();
+    const withKeyboard = (windows: "always" | "never", macos?: "never") => ({
+      version: 1,
+      settings: {
+        mobile_assistant: {
+          ...mobileValue(),
+          terminalKeyboard: { v: 1, pasteBoxMode: { windows, macos } },
+        },
+      },
+    });
+    const me = (preferences: ReturnType<typeof withKeyboard>) =>
+      Response.json({ user_id: "alice", preferences });
+    let finishPatch!: (response: Response) => void;
+    let finishRefresh!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            finishPatch = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            finishRefresh = resolve;
+          }),
+      )
+      .mockImplementationOnce(() => Promise.resolve(me(withKeyboard("never", "never"))));
+    await initializeUserPreferencesSync(withKeyboard("always"), fetcher, "alice");
+    const result =
+      kind === "legacy"
+        ? writeTerminalKeyboardPreferences({
+            v: 1,
+            pasteBoxMode: { windows: "never", macos: "never" },
+          })
+        : writeTerminalKeyboardChange({
+            platform: "macos",
+            field: "pasteBoxMode",
+            value: "never",
+          });
+    expect(result).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const refresh = refreshUserPreferencesFromServer();
+    if (first === "refresh") {
+      finishRefresh(me(withKeyboard("never", "never")));
+      await refresh;
+      finishPatch(Response.json(withKeyboard("always", "never")));
+    } else {
+      finishPatch(Response.json(withKeyboard("never", "never")));
+      await vi.advanceTimersByTimeAsync(0);
+      finishRefresh(me(withKeyboard("always")));
+      await refresh;
+    }
+    await vi.advanceTimersByTimeAsync(300);
+    expect(readTerminalKeyboardPreferences().pasteBoxMode).toEqual({
+      windows: "never",
+      macos: "never",
+    });
+    expect(fetcher.mock.calls.map((call) => call[0])).toEqual([
+      "/v1/me/preferences/mobile_assistant",
+      "/v1/me",
+      "/v1/me",
+    ]);
+  });
+
+  it("does not replay a committed legacy keyboard snapshot with a newer toolbar edit", async () => {
+    vi.useFakeTimers();
+    const mobile = mobileValue();
+    const envelope = { version: 1, settings: { mobile_assistant: mobile } };
+    let acknowledge!: (response: Response) => void;
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          acknowledge = resolve;
+        }),
+    );
+    await initializeUserPreferencesSync(envelope, fetcher, "alice");
+    const keyboard = { v: 1, pasteBoxMode: { macos: "always" } } as const;
+    expect(writeTerminalKeyboardPreferences(keyboard)).toBe("saved");
+    const change = { platform: "macos", field: "pasteBoxMode", value: "never" } as const;
+    expect(writeTerminalKeyboardChange(change)).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const combined = JSON.parse(fetcher.mock.calls[0][1].body);
+    expect(combined.value.terminalKeyboard).toEqual(keyboard);
+    expect(combined.terminal_keyboard.changes).toEqual([change]);
+
+    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    expect(
+      writeTerminalKeyPreferences({
+        terminalKeys: { ...keys, shell: { ...keys.shell, enabled: false } },
+      }),
+    ).toBe("saved");
+    const savedKeyboard = { v: 1, pasteBoxMode: { macos: "never" } };
+    acknowledge(
+      Response.json({
+        ...envelope,
+        settings: { mobile_assistant: { ...combined.value, terminalKeyboard: savedKeyboard } },
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(251);
+    const toolbar = JSON.parse(fetcher.mock.calls[1][1].body);
+    expect(toolbar.value.terminalKeysEnabled).toBe(false);
+    expect(toolbar.value).not.toHaveProperty("terminalKeyboard");
+    expect(toolbar).not.toHaveProperty("terminal_keyboard");
+    expect(readTerminalKeyboardPreferences()).toEqual(savedKeyboard);
+  });
 
   it("preserves terminal maps and bindings when an older editor deletes the app shortcut namespace", async () => {
     vi.useFakeTimers();
