@@ -137,7 +137,7 @@ async def test_claude_program_status_real_launch_and_fallback(
     statuses: list[tuple[str, str | None]] = []
     counts: list[int | None] = []
     registry.set_session_status_publisher(
-        lambda _, state, reason, count=None, _tasks=None: (
+        lambda _, state, reason, count=None, _tasks=None, *, replayed=False: (
             statuses.append((state, reason)),
             counts.append(count),
         )
@@ -1468,6 +1468,7 @@ async def _observe_native_with_real_poller(
         _tasks=None,
         *,
         inferred: bool = False,
+        replayed: bool = False,
     ) -> None:
         statuses.append(status)
         counts.append(count)
@@ -2854,9 +2855,9 @@ async def test_reconnect_resync_replays_exact_background_shell_state(tmp_path: P
         count=None,
         tasks=None,
         *,
-        replayed_background_tasks=False,
+        replayed=False,
     ):
-        assert replayed_background_tasks
+        assert replayed
         published.append((session_id, status, blocked_on, count, tasks))
 
     registry.set_session_status_publisher(publish)

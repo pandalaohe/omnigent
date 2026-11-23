@@ -39,7 +39,7 @@ import contextlib
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Container
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -127,6 +127,10 @@ class NativePaneStillAlive(RuntimeError):
         self.probe = probe
 
 
+class NativePaneActivityUnavailable(RuntimeError):
+    """The final probe could not establish that a pane was safe to reap."""
+
+
 @dataclass
 class _RetireRecord:
     instance: Any
@@ -191,7 +195,8 @@ class NativePaneReaper:
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
-    :param is_busy: ``async`` predicate for the current pane live-work signals.
+    :param is_busy: ``async`` predicate for pane live-work signals. ``None``
+        defers reclamation without changing the idle clock.
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
@@ -204,7 +209,7 @@ class NativePaneReaper:
         self,
         *,
         list_native_panes: Callable[[], list[PaneRef]],
-        is_busy: Callable[[PaneRef], Awaitable[bool]],
+        is_busy: Callable[[PaneRef], Awaitable[bool | None]],
         reap: Callable[[PaneRef], Awaitable[None]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
@@ -310,12 +315,14 @@ class NativePaneReaper:
         busy = await self._is_busy(pane)
         if busy:
             self._last_busy_at[conversation_id] = now
-        last_busy = self._last_busy_at.setdefault(conversation_id, now)
+        elif busy is False:
+            self._last_busy_at.setdefault(conversation_id, now)
+        last_busy = self._last_busy_at.get(conversation_id, now)
         idle_seconds = 0.0 if busy else max(0.0, now - last_busy)
         return {
             "family": pane.terminal_name,
-            "busy": busy,
-            "eligible": not busy and idle_seconds >= idle_threshold_s,
+            "busy": busy is True,
+            "eligible": busy is False and idle_seconds >= idle_threshold_s,
             "idle_seconds": idle_seconds,
             "activity_token": f"{last_busy:.9f}",
         }
@@ -339,7 +346,10 @@ class NativePaneReaper:
             self._last_busy_at.pop(conversation_id, None)
             return "absent"
         now = time.monotonic()
-        if await self._is_busy(pane):
+        busy = await self._is_busy(pane)
+        if busy is None:
+            return "not_eligible"
+        if busy:
             self._last_busy_at[conversation_id] = now
             return "busy"
         last_busy = self._last_busy_at.setdefault(conversation_id, now)
@@ -349,7 +359,10 @@ class NativePaneReaper:
             return "not_eligible"
         # Close the selection→reap race using the same final busy probe as the
         # legacy scanner. A new turn/output/client re-arms the clock.
-        if await self._is_busy(pane):
+        busy = await self._is_busy(pane)
+        if busy is None:
+            return "not_eligible"
+        if busy:
             self._last_busy_at[conversation_id] = time.monotonic()
             return "busy"
         saved_expiry = (
@@ -367,11 +380,13 @@ class NativePaneReaper:
                     saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
                 )
             return "failed"
-        except Exception:
+        except Exception as exc:
             if saved_expiry is not None:
                 self._managed_conversations[conversation_id] = max(
                     saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
                 )
+            if isinstance(exc, NativePaneActivityUnavailable):
+                return "not_eligible"
             _logger.exception(
                 "native pane retention release failed for conversation %s",
                 conversation_id,
@@ -444,14 +459,18 @@ class NativePaneReaper:
             self._task = None
         self._started = False
 
-    def _classify(self, now: float, panes: list[PaneRef], busy_convs: set[str]) -> list[PaneRef]:
+    def _classify(
+        self,
+        now: float,
+        panes: list[PaneRef],
+        busy_convs: set[str],
+        unavailable_convs: Container[str] = (),
+    ) -> list[PaneRef]:
         """Pure idle-clock decision: which panes are reapable right now.
 
-        Given the set of conversation ids observed busy this scan, maintain the
-        per-conversation idle clock and return the panes idle for at least their
-        idle window. A busy pane re-arms its clock; a newly-observed idle
-        pane gets one full window of grace before it is eligible. No I/O, so it is
-        unit-testable with an injected ``now`` and ``busy_convs``.
+        A busy pane re-arms its clock; a newly-observed idle pane gets one full
+        window of grace. Panes with unavailable evidence keep their clock and
+        are skipped this scan.
         """
         live: set[str] = set()
         reapable: list[PaneRef] = []
@@ -460,6 +479,8 @@ class NativePaneReaper:
             live.add(conv)
             if conv in busy_convs:
                 self._last_busy_at[conv] = now
+                continue
+            if conv in unavailable_convs:
                 continue
             last = self._last_busy_at.get(conv)
             if last is None:
@@ -493,15 +514,24 @@ class NativePaneReaper:
     async def _scan_once(self) -> None:
         panes = self._list_native_panes()
         now = time.monotonic()
-        busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
-        for pane in self._classify(now, panes, busy_convs):
+        busy_convs: set[str] = set()
+        unavailable_convs: set[str] = set()
+        for pane in panes:
+            busy = await self._is_busy(pane)
+            if busy is None:
+                unavailable_convs.add(pane.conversation_id)
+            elif busy:
+                busy_convs.add(pane.conversation_id)
+        for pane in self._classify(now, panes, busy_convs, unavailable_convs):
             if self._is_managed(pane.conversation_id, time.monotonic()):
                 continue
             # Re-check immediately before teardown: selection happened above with
             # possibly-stale signals, and a turn / client / autonomous run may
             # have started since (the select→reap race). Re-arm and skip if so.
-            if await self._is_busy(pane):
-                self._last_busy_at[pane.conversation_id] = time.monotonic()
+            busy = await self._is_busy(pane)
+            if busy is not False:
+                if busy:
+                    self._last_busy_at[pane.conversation_id] = time.monotonic()
                 continue
             if self._is_managed(pane.conversation_id, time.monotonic()):
                 continue
@@ -513,9 +543,12 @@ class NativePaneReaper:
             )
             # Drop the clock entry up front: a reap failure then re-arms the grace
             # window next scan instead of permanently skipping the conversation.
-            self._last_busy_at.pop(pane.conversation_id, None)
+            last_busy = self._last_busy_at.pop(pane.conversation_id, None)
             try:
                 await self._reap(pane)
+            except NativePaneActivityUnavailable:
+                if last_busy is not None:
+                    self._last_busy_at.setdefault(pane.conversation_id, last_busy)
             except NativePaneStillAlive as exc:
                 self._record_pending(pane, exc.instance)
             except Exception:

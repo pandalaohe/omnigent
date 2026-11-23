@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -20,6 +21,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
+from omnigent.runner import resource_registry as resource_registry_mod
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry, TerminalCloseOutcome
@@ -815,8 +817,9 @@ async def test_replayed_claude_shell_count_shares_the_hold_deadline(
         reap.assert_awaited_once()
 
 
-async def test_hung_antigravity_capture_reaps_its_tmux_client_and_scan_continues(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("successful_captures", [0, 1, 2], ids=["scan", "recheck", "under-lock"])
+async def test_hung_antigravity_capture_defers_its_pane_and_scan_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, successful_captures: int
 ) -> None:
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
@@ -835,39 +838,116 @@ async def test_hung_antigravity_capture_reaps_its_tmux_client_and_scan_continues
     monkeypatch.setattr(
         resources, "terminal_resource_role", lambda conv, _terminal_id: f"{conv[5:]}-native"
     )
+    close = AsyncMock(return_value="closed")
+    monkeypatch.setattr(resources, "close_terminal_detailed", close)
     reaper = create_runner_app(
         terminal_registry=terminals,
         resource_registry=resources,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         native_pane_idle_timeout_s=60,
     ).state.native_pane_reaper
-    reap = AsyncMock()
-    monkeypatch.setattr(reaper, "_reap", reap)
+    last_busy = time.monotonic() - 120
     for pane in reaper._list_native_panes():
-        reaper._last_busy_at[pane.conversation_id] = time.monotonic() - 120
+        reaper._last_busy_at[pane.conversation_id] = last_busy
 
     async def communicate() -> None:
         await asyncio.Future()
 
-    children = []
+    captures = 0
+    hung_children = []
 
     async def spawn(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal captures
+        captures += 1
+        if captures <= successful_captures:
+            return SimpleNamespace(
+                returncode=0, communicate=AsyncMock(return_value=(b"? for shortcuts", b""))
+            )
         child = SimpleNamespace(
             returncode=None, communicate=communicate, kill=Mock(), wait=AsyncMock(return_value=-9)
         )
-        children.append(child)
+        hung_children.append(child)
         return child
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     await asyncio.wait_for(reaper._scan_once(), timeout=1)
-    assert children
-    for child in children:
-        child.kill.assert_called_once()
-        child.wait.assert_awaited_once()
-    assert [call.args[0].conversation_id for call in reap.await_args_list] == [
-        "conv_antigravity",
-        "conv_claude",
-    ]
+    close.assert_awaited_once()
+    assert close.await_args.args[0] == "conv_claude"
+    [child] = hung_children
+    child.kill.assert_called_once()
+    child.wait.assert_awaited_once()
+    assert reaper._last_busy_at["conv_antigravity"] == last_busy
+
+
+async def test_unavailable_probe_defers_managed_pane_release() -> None:
+    fakes = _Fakes()
+    pane = _pane("conv_agy", "antigravity")
+    fakes.panes = [pane]
+    reaper = _make(fakes)
+    last_busy = time.monotonic() - 120
+    reaper._last_busy_at[pane.conversation_id] = last_busy
+    reaper._is_busy = AsyncMock(side_effect=[None, False, None])
+
+    snapshot = await reaper.retention_snapshot(pane.conversation_id, idle_threshold_s=60)
+    assert snapshot is not None and not snapshot["eligible"]
+    assert (
+        await reaper.release_if_idle(
+            pane.conversation_id,
+            idle_threshold_s=60,
+            expected_activity_token=str(snapshot["activity_token"]),
+        )
+        == "not_eligible"
+    )
+    assert fakes.reaped == []
+    assert reaper._last_busy_at[pane.conversation_id] == last_busy
+
+
+async def test_claude_watcher_reconnect_idle_replay_preserves_idle_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live watcher replays idle to the server without crediting pane activity."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(resource_registry_mod, "_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS", 0.01)
+    status_path = tmp_path / "sessions" / "123.json"
+    status_path.parent.mkdir()
+    status_path.write_text(json.dumps({"pid": 123, "kind": "interactive", "status": "shell"}))
+
+    conv = "conv_claude_watch_replay"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminals._by_conversation[conv] = {("claude", "main"): instance}
+    monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
+    monkeypatch.setattr(instance, "_pane_probe_can_wait", lambda *_args: False)
+    monkeypatch.setattr(instance, "_capture_pane_for_idle_or_none", lambda: "ready")
+    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    app = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    events = app.state.session_event_queues.setdefault(conv, asyncio.Queue())
+
+    async def next_status() -> str:
+        while True:
+            event = await events.get()
+            if event["type"] == "session.status":
+                return event["status"]
+
+    try:
+        await resources.observe_required_terminal(
+            conv, "claude", "main", instance, resource_role="claude-native"
+        )
+        assert instance._idle_thread is not None and instance._idle_thread.is_alive()
+        assert await asyncio.wait_for(next_status(), timeout=2) == "idle"
+        last_busy = reaper._last_busy_at[conv]
+        resources.resync_session_statuses()
+        assert await asyncio.wait_for(next_status(), timeout=2) == "idle"
+        assert reaper._last_busy_at[conv] == last_busy
+    finally:
+        instance._stop_idle_watcher_thread()
 
 
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(

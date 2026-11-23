@@ -3447,7 +3447,7 @@ def create_runner_app(
         *,
         failure_detail: str | None = None,
         inferred: bool = False,
-        replayed_background_tasks: bool = False,
+        replayed: bool = False,
     ) -> None:
         hold_until = _keep_warm_status_hold.get(session_id)
         if hold_until is not None:
@@ -3463,7 +3463,7 @@ def create_runner_app(
             else:
                 _keep_warm_status_hold.pop(session_id, None)
         pane_reaper = getattr(app.state, "native_pane_reaper", None)
-        if pane_reaper is not None and not replayed_background_tasks:
+        if pane_reaper is not None and not replayed:
             pane_reaper.note_activity(session_id)
         background_agents: list[dict[str, object]] = []
         wire_status = status
@@ -15122,6 +15122,7 @@ def create_runner_app(
             AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S,
             BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
+            NativePaneActivityUnavailable,
             NativePaneReaper,
             NativePaneStillAlive,
             PaneRef,
@@ -15195,7 +15196,7 @@ def create_runner_app(
             resource_registry.note_external_session_status(conv_id, status)
             return False
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(pane: PaneRef) -> bool | None:
             busy = await _native_pane_busy_without_background_shell(pane)
             if pane.terminal_name not in ("claude", "antigravity", "codex"):
                 return busy
@@ -15222,7 +15223,7 @@ def create_runner_app(
                     async with asyncio.timeout(AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S):
                         capture = await instance.read()
                 except TimeoutError:
-                    return False
+                    return None
                 screen = capture.get("screen")
                 if not isinstance(screen, str):
                     return False
@@ -15312,16 +15313,20 @@ def create_runner_app(
                             "native pane changed or became busy before retention release"
                         )
                     # A message can reuse the pane while the reap waits for the lock.
-                    if not pane.allow_busy_release and await _native_pane_is_busy(pane):
-                        _logger.info(
-                            "native pane reaper: pane for conversation %s became busy while "
-                            "the reap waited; leaving it",
-                            conv_id,
-                            extra={"session_id": conv_id},
-                        )
-                        raise RuntimeError(
-                            "native pane changed or became busy before retention release"
-                        )
+                    if not pane.allow_busy_release:
+                        busy = await _native_pane_is_busy(pane)
+                        if busy is None:
+                            raise NativePaneActivityUnavailable
+                        if busy:
+                            _logger.info(
+                                "native pane reaper: pane for conversation %s became busy while "
+                                "the reap waited; leaving it",
+                                conv_id,
+                                extra={"session_id": conv_id},
+                            )
+                            raise RuntimeError(
+                                "native pane changed or became busy before retention release"
+                            )
                     _capture_codex_release(conv_id, snapshot)
                     outcome = await resource_registry.close_terminal_detailed(
                         pane.conversation_id,

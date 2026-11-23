@@ -191,8 +191,7 @@ class SessionStatusPublisher(Protocol):
 
     ``inferred`` marks a reason read from the pane rather than reported by the
     harness, so the server lets it annotate a running turn but never reopen one.
-    ``replayed_background_tasks`` repopulates the server's tally on reconnect
-    without recording new pane activity.
+    ``replayed`` marks a reconnect report that does not record new pane activity.
     """
 
     def __call__(
@@ -205,7 +204,7 @@ class SessionStatusPublisher(Protocol):
         /,
         *,
         inferred: bool = False,
-        replayed_background_tasks: bool = False,
+        replayed: bool = False,
     ) -> None: ...
 
 
@@ -1028,7 +1027,7 @@ class SessionResourceRegistry:
         publisher = self._session_status_publisher
         if publisher is not None:
             for session_id, status, count, tasks in background_replays:
-                publisher(session_id, status, None, count, tasks, replayed_background_tasks=True)
+                publisher(session_id, status, None, count, tasks, replayed=True)
         for poller in pollers:
             poller.resync()
         if sessions or pollers:
@@ -1975,13 +1974,20 @@ class SessionResourceRegistry:
             blocked_on: str | None,
             background_task_count: int | None = None,
             failure_detail: str | None = None,
+            *,
+            replayed_idle: bool = False,
         ) -> None:
             if not _owns_terminal():
                 return
             if status == "failed" and failure_detail is not None and failure_publisher is not None:
                 failure_publisher(session_id, failure_detail)
             elif status_publisher is not None:
-                status_publisher(session_id, status, blocked_on, background_task_count, None)
+                if replayed_idle:
+                    status_publisher(
+                        session_id, status, blocked_on, background_task_count, None, replayed=True
+                    )
+                else:
+                    status_publisher(session_id, status, blocked_on, background_task_count, None)
 
         def _publish_status(
             status: str,
@@ -2047,7 +2053,11 @@ class SessionResourceRegistry:
                 )
             if status == "failed" or replay_activity_epoch is not None:
                 _publish_status_if_current(
-                    status, blocked_on, background_task_count, failure_detail
+                    status,
+                    blocked_on,
+                    background_task_count,
+                    failure_detail,
+                    replayed_idle=status == "idle" and replay_activity_epoch is not None,
                 )
             else:
                 loop.call_soon_threadsafe(
