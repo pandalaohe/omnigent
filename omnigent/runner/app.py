@@ -15218,24 +15218,25 @@ def create_runner_app(
                 running = _native_runtime.codex_pane_background_terminal_status(
                     pane.conversation_id, instance
                 )
+                if running is None:
+                    return False
             else:
                 try:
                     async with asyncio.timeout(AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S):
                         capture = await instance.read()
                 except TimeoutError:
-                    return None
-                screen = capture.get("screen")
-                if not isinstance(screen, str):
-                    return False
-                running = agy_pane_has_running_background_tasks(screen)
-            if running is None:
-                return False
-            if not running:
+                    running = None
+                else:
+                    screen = capture.get("screen")
+                    if not isinstance(screen, str):
+                        return False
+                    running = agy_pane_has_running_background_tasks(screen)
+            if running is False:
                 background_shell_hold_since.pop(instance_id, None)
                 return False
             now = time.monotonic()
             held_since = background_shell_hold_since.setdefault(instance_id, now)
-            return now - held_since < BACKGROUND_SHELL_PANE_HOLD_S
+            return running if now - held_since < BACKGROUND_SHELL_PANE_HOLD_S else False
 
         async def _native_pane_busy_without_background_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id

@@ -879,6 +879,54 @@ async def test_hung_antigravity_capture_defers_its_pane_and_scan_continues(
     assert reaper._last_busy_at["conv_antigravity"] == last_busy
 
 
+@pytest.mark.parametrize("managed", [False, True], ids=["scan", "managed"])
+async def test_persistent_antigravity_capture_timeouts_stop_deferring_at_the_hold_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, managed: bool
+) -> None:
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    conv = "conv_agy_capture_timeout"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("antigravity", "main", tmp_path)
+    terminals._by_conversation[conv] = {("antigravity", "main"): instance}
+    monkeypatch.setattr(instance, "read", AsyncMock(side_effect=TimeoutError))
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    monkeypatch.setattr(resources, "terminal_resource_role", lambda *_args: "antigravity-native")
+    close = AsyncMock(return_value="closed")
+    monkeypatch.setattr(resources, "close_terminal_detailed", close)
+    reaper = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        native_pane_idle_timeout_s=60,
+    ).state.native_pane_reaper
+    started_at = now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    last_busy = started_at - 120
+    reaper._last_busy_at[conv] = last_busy
+
+    for elapsed in (0, BACKGROUND_SHELL_PANE_HOLD_S - 1, BACKGROUND_SHELL_PANE_HOLD_S + 1):
+        now = started_at + elapsed
+        expired = elapsed > BACKGROUND_SHELL_PANE_HOLD_S
+        if managed:
+            reaper.manage(conv)
+            snapshot = await reaper.retention_snapshot(conv, idle_threshold_s=60)
+            assert snapshot["eligible"] is expired
+            result = await reaper.release_if_idle(
+                conv, idle_threshold_s=60, expected_activity_token=snapshot["activity_token"]
+            )
+            assert result == ("released" if expired else "not_eligible")
+        else:
+            await reaper._scan_once()
+        if expired:
+            close.assert_awaited_once_with(
+                conv, terminal_resource_id("antigravity", "main"), expected_instance=instance
+            )
+        else:
+            close.assert_not_awaited()
+            assert reaper._last_busy_at[conv] == last_busy
+
+
 async def test_unavailable_probe_defers_managed_pane_release() -> None:
     fakes = _Fakes()
     pane = _pane("conv_agy", "antigravity")
