@@ -321,13 +321,11 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     el.addEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
+      if (!(target instanceof HTMLElement) || !el.contains(target)) return;
       if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
       if ((event.shiftKey && event.key !== " ") || !ownsScroll(target)) return;
-      if (
-        target instanceof HTMLElement &&
-        (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
-      )
-        return;
+      if (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (event.key === " " && target.closest("button")) return;
       if (
         ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
         (event.key === " " && event.shiftKey) ||
@@ -340,7 +338,8 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     el.addEventListener("input", onCardEdit);
     el.addEventListener("scroll", onScroll, { passive: true });
     el.addEventListener("wheel", onWheel, { passive: true });
-    el.addEventListener("keydown", onKeyDown);
+    // Let React controls consume their shortcuts before treating the key as scroll intent.
+    document.addEventListener("keydown", onKeyDown);
     el.addEventListener("touchstart", onTouchStart, { passive: true });
     el.addEventListener("touchmove", onTouchMove, { passive: true });
     el.addEventListener("touchend", onTouchEnd, { passive: true });
@@ -360,7 +359,7 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       el.removeEventListener("scroll", onScroll);
       el.removeEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
       el.removeEventListener("wheel", onWheel);
-      el.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown);
       el.removeEventListener("touchstart", onTouchStart);
       el.removeEventListener("touchmove", onTouchMove);
       el.removeEventListener("touchend", onTouchEnd);

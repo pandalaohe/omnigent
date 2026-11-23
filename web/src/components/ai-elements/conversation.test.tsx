@@ -46,8 +46,14 @@ it("holds a question card through stream growth and resumes the original bottom 
     const ref = useRef<HTMLDivElement>(null);
     useQuestionCardScroll(ref, held, null);
     return (
-      <div ref={ref} data-testid="question">
-        Question
+      <div
+        ref={ref}
+        data-testid="question"
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown") event.preventDefault();
+        }}
+      >
+        <button type="button">Question option</button>
       </div>
     );
   }
@@ -81,6 +87,9 @@ it("holds a question card through stream growth and resumes the original bottom 
   expect(scroller.scrollTop).toBe(599);
 
   view.rerender(transcript(true));
+  fireEvent.keyDown(card, { key: "ArrowDown" });
+  fireEvent.keyDown(view.getByRole("button", { name: "Question option" }), { key: " " });
+  expect(scroller).toHaveAttribute("data-question-card-scroll-held");
   const initialTop = card.getBoundingClientRect().top;
   // When content above the card shrinks at the bottom, the browser has
   // already clamped scrollTop by nearly the whole layout change.

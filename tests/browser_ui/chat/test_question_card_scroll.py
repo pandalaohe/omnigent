@@ -254,6 +254,11 @@ def test_draft_yields_to_history_navigation_and_prepend(
     expect(field).to_have_value("Keep this draft")
     page.keyboard.insert_text(".")
     expect(scroller).to_have_attribute("data-question-card-scroll-held", "")
+    card_form = page.get_by_test_id("ask-user-question-form")
+    card_form.press("ArrowDown")  # The card uses this to move to the next option.
+    expect(scroller).to_have_attribute("data-question-card-scroll-held", "")
+    card_form.press("PageUp")
+    expect(scroller).not_to_have_attribute("data-question-card-scroll-held", "")
 
 
 def _expect_following(page: Page) -> None:
