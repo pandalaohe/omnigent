@@ -331,6 +331,7 @@ import { ArchivedCommentsBanner } from "@/components/ArchivedCommentsBanner";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
+import { isQuestionCardScrollHeld } from "@/components/ai-elements/conversation";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -2086,7 +2087,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     // An escaped reader keeps their position. Check the physical position, not
     // the lock: rows measuring shorter than estimated clamp scrollTop down, which
     // StickToBottom can misread as an escape while still at the bottom.
-    if (!pinnedToBottomRef.current) return;
+    if (!pinnedToBottomRef.current || isQuestionCardScrollHeld(scrollEl)) return;
     // Park at the same position stick-to-bottom settles on (one pixel short
     // of the maximum); writing the exact bottom would leave the settle one
     // pixel lower than the library's park and trail a 1px snap-back.

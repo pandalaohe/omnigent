@@ -1,5 +1,7 @@
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { ScrollToBottomOnSend } from "@/components/chat/chatBubbleParts";
+import { useQuestionCardScroll } from "@/hooks/useQuestionCardScroll";
+import { useRef } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Conversation, ConversationContent, ConversationScrollButton } from "./conversation";
 
@@ -37,6 +39,61 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+it("holds a question card through stream growth and resumes the original bottom follow", async () => {
+  function Card({ held }: { held: boolean }) {
+    const ref = useRef<HTMLDivElement>(null);
+    useQuestionCardScroll(ref, held, null);
+    return (
+      <div ref={ref} data-testid="question">
+        Question
+      </div>
+    );
+  }
+  const transcript = (held: boolean) => (
+    <div className="session-chat-transcript">
+      <Conversation>
+        <ConversationContent>
+          <Card held={held} />
+        </ConversationContent>
+      </Conversation>
+    </div>
+  );
+  const view = render(transcript(false));
+  const scroller = view.getByRole("log").firstElementChild as HTMLElement;
+  const card = view.getByTestId("question");
+  let height = 1000;
+  let cardOffset = 680;
+  Object.defineProperties(scroller, {
+    clientHeight: { get: () => 400 },
+    scrollHeight: { get: () => height },
+  });
+  vi.spyOn(card, "getBoundingClientRect").mockImplementation(
+    () => new DOMRect(0, cardOffset - scroller.scrollTop, 200, 100),
+  );
+  const settle = () =>
+    act(async () => {
+      resizeContent.forEach((resize) => resize(height));
+      await vi.advanceTimersByTimeAsync(100);
+    });
+  await settle();
+  expect(scroller.scrollTop).toBe(599);
+
+  view.rerender(transcript(true));
+  const initialTop = card.getBoundingClientRect().top;
+  cardOffset += 200;
+  height += 300; // 200px of output above, 100px of content below.
+  await settle();
+  expect(card.getBoundingClientRect().top).toBe(initialTop);
+  expect(scroller.scrollTop).toBe(799);
+
+  view.rerender(transcript(false));
+  await settle();
+  expect(scroller.scrollTop).toBe(899);
+  height += 100;
+  await settle();
+  expect(scroller.scrollTop).toBe(999);
 });
 
 it.each(["touch", "wheel", "keyboard"])(

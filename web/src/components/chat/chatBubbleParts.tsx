@@ -104,7 +104,10 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { CONVERSATION_RESUME_SCROLL_EVENT } from "@/components/ai-elements/conversation";
+import {
+  CONVERSATION_RESUME_SCROLL_EVENT,
+  isQuestionCardScrollHeld,
+} from "@/components/ai-elements/conversation";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -1809,7 +1812,8 @@ export function KeepBottomOnResize({
     // Growth is answered only while the lock is live and no selection is being
     // dragged: a history page landing above the reader releases the lock first,
     // and the library holds its own correction under a selection.
-    const lockLive = () => state.isAtBottom && !state.escapedFromLock && !isSelecting();
+    const lockLive = () =>
+      state.isAtBottom && !state.escapedFromLock && !isQuestionCardScrollHeld(el) && !isSelecting();
     // Target the library's park position (one pixel short) so the settle is
     // identical whether our write or the library's lands last.
     const pin = () => {

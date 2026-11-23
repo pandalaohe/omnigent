@@ -426,6 +426,7 @@ function TranscriptImpl({
         )}
       >
         <Conversation
+          data-transcript-session={selectedConversationId ?? undefined}
           className={cn(
             !isMobileViewport &&
               (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
