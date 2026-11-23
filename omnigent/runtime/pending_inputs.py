@@ -119,7 +119,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -138,7 +138,10 @@ from omnigent.native.input_diagnostics import input_attributes, log_input_event
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
-_CLAIMED_INPUT_TIMEOUT_S = 720.0
+# After granting the paste, the server cannot infer a read or loss from the
+# turn ending, a missing receipt, or a reconnect. Keep the matchable identity
+# for a fixed two hours from the claim so a late transcript can settle it.
+_CLAIMED_INPUT_TIMEOUT_S = 2 * 60 * 60.0
 
 # Hard cap on unheld queued entries per conversation, enforced by
 # :func:`record`: the oldest unheld entries are evicted when a new one would
@@ -274,7 +277,6 @@ class DrainedInput:
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
-    runner_claim_owner: str | None = None
 
 
 @dataclass
@@ -361,8 +363,6 @@ class _Entry:
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
-    # Runner id that claimed this input; only its heartbeats renew a confirmed paste.
-    runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
 
@@ -380,23 +380,6 @@ _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] 
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
 )
 _lock = threading.Lock()
-
-# Optional check the server wires to its cached session status; called under
-# :data:`_lock`, so it must be cheap and non-blocking.
-_session_busy_check: Callable[[str], bool] | None = None
-
-
-def set_session_busy_check(check: Callable[[str], bool] | None) -> None:
-    """
-    Register (or clear) the check that reports a session mid-turn.
-
-    :param check: Callback invoked as ``check(conversation_id)``; ``True``
-        means the session still has a turn in flight, so a pasted message the
-        runner confirmed may still be absorbed at the turn's next step. Pass
-        ``None`` to clear.
-    """
-    global _session_busy_check
-    _session_busy_check = check
 
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
@@ -541,7 +524,6 @@ def claim_runner_input(
     claim_id: str,
     *,
     expected_attempt_id: str | None = None,
-    runner_id: str | None = None,
 ) -> bool:
     """Grant one runner attempt the right to paste while its lease is live."""
     with _lock:
@@ -561,7 +543,6 @@ def claim_runner_input(
         if now - last_renewal >= _TTL_S:
             return False
         entry.runner_claim_id = claim_id
-        entry.runner_claim_owner = runner_id
         entry.last_runner_renewal = now
         entry.sending_since_ms = entry.input_enqueued_at_ms
         return True
@@ -598,7 +579,7 @@ def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
 
 
 def renew_runner_inputs(
-    conversation_id: str, held_ids: set[str], active_ids: set[str], runner_id: str | None = None
+    conversation_id: str, held_ids: set[str], active_ids: set[str]
 ) -> dict[str, int | None]:
     """Renew the runner's live inputs and return their current sending timestamps."""
     now = _now()
@@ -624,23 +605,6 @@ def renew_runner_inputs(
                 entry.input_enqueued_at_ms if pending_id in active_ids else None
             )
             sending[pending_id] = entry.sending_since_ms
-        busy_check = _session_busy_check
-        if busy_check is not None and busy_check(conversation_id):
-            # A running turn absorbs a confirmed paste at its next step, which
-            # can outlast the claim lease; its mirror settles it. A replacement
-            # runner never had the paste, so only the claiming runner renews it.
-            for entry in entries.values():
-                if (
-                    entry.runner_claim_id is not None
-                    and runner_id is not None
-                    and entry.runner_claim_owner == runner_id
-                    and entry.last_delivery_stage == "native_turn_completed"
-                    and not entry.held
-                    and not entry.interrupted
-                    and entry.last_runner_renewal is not None
-                    and now - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
-                ):
-                    entry.last_runner_renewal = now
     return sending
 
 
@@ -1143,7 +1107,6 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
-        runner_claim_owner=drained.runner_claim_owner,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1423,7 +1386,7 @@ def resolve_matching_text(
         )
 
 
-def has_pending(conversation_id: str) -> bool:
+def has_pending(conversation_id: str, *, include_claimed: bool = True) -> bool:
     """
     Report whether a session still holds an un-consumed message.
 
@@ -1431,12 +1394,17 @@ def has_pending(conversation_id: str) -> bool:
     to boot, the session is working even though no turn has started yet.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param include_claimed: Include inputs whose paste was already claimed.
+        A retained claim waiting for its mirror does not mean the session is starting.
     :returns: ``True`` iff at least one non-stale pending entry exists that the
         person has not cancelled by interrupting (see :func:`mark_interrupted`).
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
-        return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
+        return any(
+            not entry.interrupted and (include_claimed or entry.runner_claim_id is None)
+            for entry in _pending.get(conversation_id, {}).values()
+        )
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -1520,7 +1488,6 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
-        runner_claim_owner=entry.runner_claim_owner,
     )
 
 

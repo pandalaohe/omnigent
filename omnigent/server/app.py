@@ -73,7 +73,6 @@ from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
-    pending_inputs,
     set_harness_process_manager,
     set_runner_direct_attach_resolver,
     set_runner_router,
@@ -151,10 +150,8 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
-    _MID_TURN_STATUSES,
     CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
-    _session_status_cache,
     announce_hosts_changed,
     create_sessions_router,
     set_relay_host_offline_probe,
@@ -3405,11 +3402,6 @@ def create_app(
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
-    # A Claude turn absorbs a pasted message only at its next step; keep that
-    # confirmed paste's lease while the turn runs.
-    pending_inputs.set_session_busy_check(
-        lambda session_id: _session_status_cache.get(session_id) in _MID_TURN_STATUSES
-    )
 
     @app.middleware("http")
     async def _record_server_metrics(

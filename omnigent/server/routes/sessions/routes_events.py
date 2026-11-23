@@ -6630,7 +6630,6 @@ def register_events_routes(
                 pending_id,
                 claim_id,
                 expected_attempt_id=attempt_id,
-                runner_id=conv.runner_id,
             )
         }
 
