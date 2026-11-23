@@ -92,14 +92,15 @@ async def _persist_mirrors(
 
 @pytest.mark.asyncio
 async def test_text_matched_mirror_names_its_web_send(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    users, receipts = await _persist_mirrors(
-        db_uri,
-        monkeypatch,
-        [("deploy the fix", _OTHER_WEB_ID), ("ship it", _WEB_ID)],
-        [_mirror("ship it")],
-    )
+    with caplog.at_level("INFO"):
+        users, receipts = await _persist_mirrors(
+            db_uri,
+            monkeypatch,
+            [("deploy the fix", _OTHER_WEB_ID), ("ship it", _WEB_ID)],
+            [_mirror("ship it"), _mirror("typed in the terminal", source_id="terminal-record")],
+        )
 
     item, data = users["ship it"]
     assert item.id != _WEB_ID
@@ -107,6 +108,17 @@ async def test_text_matched_mirror_names_its_web_send(
     assert item.to_api_dict()["web_stable_id"] == _WEB_ID
     [receipt] = [receipt for receipt in receipts if receipt["item_id"] == item.id]
     assert receipt["data"]["web_stable_id"] == _WEB_ID
+    assert receipt["cleared_pending_id"] is not None
+    terminal_item, _ = users["typed in the terminal"]
+    observed = {
+        record.attributes["item_id"]: record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_consumed_published"
+    }
+    assert observed[item.id]["matched_pending_id"] == receipt["cleared_pending_id"]
+    assert observed[item.id]["input_stable_id"] == _WEB_ID
+    assert observed[terminal_item.id]["matched_pending_id"] is None
+    assert "input_stable_id" not in observed[terminal_item.id]
 
 
 @pytest.mark.asyncio
