@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 from unittest.mock import Mock
 
 import httpx
@@ -23855,4 +23855,5 @@ async def test_relay_returns_created_handle_after_inner_startup_budget(monkeypat
         {},
     )
     assert not result.get("isError")
-    assert json.loads(result["content"][0]["text"])["conversation_id"] == "existing_child"
+    content = cast(list[dict[str, str]], result["content"])
+    assert json.loads(content[0]["text"])["conversation_id"] == "existing_child"

@@ -66,7 +66,9 @@ def test_editing_card_holds_position_and_reveals_the_caret(
     posted: list[dict] = []
 
     def resolve(request: Request) -> dict[str, bool]:
-        posted.append(request.post_data_json)
+        payload = request.post_data_json
+        assert payload is not None
+        posted.append(payload)
         return {"queued": True}
 
     chat.contract.json(

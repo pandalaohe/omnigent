@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import httpx
@@ -111,9 +111,10 @@ async def test_text_matched_mirror_names_its_web_send(
     assert receipt["cleared_pending_id"] is not None
     terminal_item, _ = users["typed in the terminal"]
     observed = {
-        record.attributes["item_id"]: record.attributes
+        attrs["item_id"]: attrs
         for record in caplog.records
         if getattr(record, "event_name", None) == "native_input_consumed_published"
+        for attrs in [cast(dict[str, Any], getattr(record, "attributes", {}))]
     }
     assert observed[item.id]["matched_pending_id"] == receipt["cleared_pending_id"]
     assert observed[item.id]["input_stable_id"] == _WEB_ID

@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -130,7 +131,9 @@ def sample_host_load(notices, monkeypatch):
             machine=replace(frame.machine, load_per_core=load),
         )
         report = decode_host_frame(
-            host_connect.HostProcess._sample_resource_snapshot(host, {}, None, 60)
+            host_connect.HostProcess._sample_resource_snapshot(
+                cast(host_connect.HostProcess, host), {}, None, 60
+            )
         )
         h.hub.ingest(host_id=HOST_A, workspace_id=0, now=at, frame=report)
 

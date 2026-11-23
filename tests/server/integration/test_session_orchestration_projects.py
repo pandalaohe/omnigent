@@ -397,4 +397,5 @@ async def test_settings_update_checks_source_sharing_for_an_owned_child(
     )
     assert "HTTP 403" in refused["error"]
     assert "shared with edit access cannot" in refused["error"]
-    assert store.get_conversation(child.id).model_override == "gpt-6-sol"
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.model_override == "gpt-6-sol"
