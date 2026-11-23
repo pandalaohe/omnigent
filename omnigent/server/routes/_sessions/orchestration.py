@@ -5585,7 +5585,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
-                and match_method != "attachment_attempt"
+                and match_method not in ("attachment_attempt", "unattributed_claim")
                 and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
@@ -6367,7 +6367,9 @@ async def _watch_runner_input_lease(
             )
             if pending_inputs.runner_lease_remaining(session_id, pending_id) is None:
                 return
-        await asyncio.sleep(remaining if remaining > 0 else 15)
+        # A mirror normally settles long before the deadline. Release its
+        # watcher promptly instead of retaining a sleeping task for two hours.
+        await asyncio.sleep(min(remaining, 60) if remaining > 0 else 15)
 
 
 async def _reconcile_runner_input_leases(
@@ -6375,7 +6377,6 @@ async def _reconcile_runner_input_leases(
     session_id: str,
     event: Mapping[str, Any],
     previous_ids: set[str],
-    runner_id: str | None = None,
 ) -> None:
     active, queued = event.get("active_pending_ids"), event.get("queued_pending_ids")
     if not isinstance(active, list) or not isinstance(queued, list):
@@ -6384,7 +6385,7 @@ async def _reconcile_runner_input_leases(
         return
     active_ids = set(active)
     held_ids = active_ids.union(queued)
-    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids, runner_id)
+    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids)
     for pending_id, since in sending.items():
         session_stream.publish(
             session_id,
@@ -11188,7 +11189,7 @@ def _session_is_starting(conversation_id: str) -> bool:
         parked in :mod:`omnigent.runtime.pending_inputs`.
     """
     return _dispatch_in_flight.get(conversation_id, 0) > 0 or pending_inputs.has_pending(
-        conversation_id
+        conversation_id, include_claimed=False
     )
 
 
@@ -12788,7 +12789,6 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 event,
                                 previous_pending_ids,
-                                runner_id=runner_id,
                             )
                         continue
 

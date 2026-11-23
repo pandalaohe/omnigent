@@ -9419,9 +9419,15 @@ function pendingMatchesConsumedEvent(
   event: SessionInputConsumedEvent,
   pending: PendingUserMessage,
 ): boolean {
-  // The runner already named this queued input. A mirror for an unknown or
-  // different send cannot prove that Claude has taken it out of the queue.
   if (pending.received) return false;
+  // An unnamed terminal echo cannot acknowledge a native send already known
+  // to the server through its POST id or a runner sending timestamp.
+  if (
+    event.clearedPendingId == null &&
+    (pending.pendingId || pending.sendingSinceMs !== undefined)
+  ) {
+    return false;
+  }
   const hasFiles = pending.content.some(
     (block) => block.type === "input_image" || block.type === "input_file",
   );

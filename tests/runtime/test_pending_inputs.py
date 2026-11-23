@@ -296,6 +296,22 @@ def _text_block(text: str) -> dict[str, object]:
     return {"type": "input_text", "text": text}
 
 
+def test_claimed_input_cap_refuses_before_paste_and_releases_a_settled_slot() -> None:
+    ids = [
+        pending_inputs.record("conv", [_text_block(f"Message {index}")], runner_managed=True)
+        for index in range(65)
+    ]
+    for pending_id in ids[:-1]:
+        assert pending_inputs.claim_runner_input("conv", pending_id, pending_id)
+
+    assert not pending_inputs.claim_runner_input("conv", ids[-1], "extra")
+    assert pending_inputs.claim_runner_input("conv", ids[0], ids[0])
+    assert pending_inputs.pending_ids("conv") == ids
+
+    assert pending_inputs.resolve("conv", ids[0]) is not None
+    assert pending_inputs.claim_runner_input("conv", ids[-1], "extra")
+
+
 def test_record_then_snapshot_preserves_order_and_content() -> None:
     """
     Snapshot replays recorded messages FIFO with content verbatim.
@@ -1184,6 +1200,58 @@ def test_resolve_matching_text_prefers_a_live_resend_over_an_interrupted_twin() 
     assert [entry.pending_id for entry in drained.uncertain] == [cancelled]
     assert drained.skipped == []
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_late_claim_does_not_shadow_same_text_resend_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late old claim waits for its attempt evidence while a resend settles."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    original = pending_inputs.record("conv_a", [_text_block("continue")], runner_managed=True)
+    assert pending_inputs.claim_runner_input("conv_a", original, "claim-a")
+    pending_inputs.mark_interrupted("conv_a", [original])
+
+    clock["t"] += pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S + 1.0
+    resend = pending_inputs.record("conv_a", [_text_block("continue")], runner_managed=True)
+    assert pending_inputs.claim_runner_input("conv_a", resend, "claim-b")
+
+    matched = pending_inputs.resolve_matching_text("conv_a", "continue")
+
+    assert matched.matched is not None and matched.matched.pending_id == resend
+    assert matched.skipped == [] and matched.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == [original]
+
+
+def test_late_claim_is_excluded_from_request_dedup_and_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained old claim cannot stand in for a different native request."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    pending_id = pending_inputs.record(
+        "conv_a",
+        [_text_block("old request")],
+        admission_id="admission-old",
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input("conv_a", pending_id, "claim-old")
+    clock["t"] += pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S + 1.0
+
+    # The snapshot still carries the old bubble for late attempt-linked proof.
+    assert pending_inputs.snapshot_for("conv_a")
+    assert not pending_inputs.has_request_phase_pending("conv_a")
+    assert pending_inputs.oldest_admission_id("conv_a") is None
+
+
+def test_held_entry_still_counts_as_request_phase_pending() -> None:
+    pending_id = pending_inputs.record("conv_a", [_text_block("held request")])
+    held = pending_inputs.resolve_matching_text("conv_a", "held request", hold=True)
+
+    assert held.matched is not None and held.matched.pending_id == pending_id
+    assert pending_inputs.has_request_phase_pending("conv_a")
 
 
 @pytest.mark.parametrize("with_attachment", [False, True])

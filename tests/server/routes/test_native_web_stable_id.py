@@ -109,6 +109,62 @@ async def test_text_matched_mirror_names_its_web_send(
     assert receipt["data"]["web_stable_id"] == _WEB_ID
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newer_web_text", [None, "Another message.", "Check the status."])
+async def test_later_same_text_terminal_input_cannot_settle_old_claim(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, newer_web_text: str | None
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE})
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    pending_id = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "Check the status."}],
+        stable_id=_WEB_ID,
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input(conv.id, pending_id, "claim_web")
+    newer_id = None
+    try:
+        now = 30 * 60.0
+        if newer_web_text is not None:
+            newer_id = pending_inputs.record(
+                conv.id, [{"type": "input_text", "text": newer_web_text}], stable_id=_OTHER_WEB_ID
+            )
+        item_id, _ = await _persist_external_conversation_item(
+            conv.id, conv, _mirror("Check the status.", source_id="terminal-record"), store
+        )
+        [terminal] = store.list_items(conv.id).data
+        assert terminal.id == item_id
+        assert isinstance(terminal.data, MessageData)
+        assert terminal.data.web_stable_id is None
+        assert pending_inputs.pending_ids(conv.id) == (
+            [pending_id, newer_id] if newer_id is not None else [pending_id]
+        )
+        [echo] = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1]["type"] == "session.input.consumed"
+        ]
+        assert echo["item_id"] == item_id
+        assert echo.get("cleared_pending_id") is None
+
+        now = 7201.0
+        assert await _settle_lost_runner_input(
+            store, conv.id, pending_id, "native_input_lease_expired", expired=True
+        )
+        assert pending_id not in pending_inputs.pending_ids(conv.id)
+        [error] = store.list_items(conv.id, type="error").data
+        assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+    finally:
+        pending_inputs.resolve(conv.id, pending_id)
+        if newer_id is not None:
+            pending_inputs.resolve(conv.id, newer_id)
+
+
 @pytest.mark.parametrize("attachment_kind", ["image", "file", "partial-failure"])
 @pytest.mark.asyncio
 async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_position(

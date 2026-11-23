@@ -12426,6 +12426,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
+    it.each([
+      { tempId: "tmp_web", pendingId: "pending_web" },
+      { tempId: "pending_web", sendingSinceMs: 1000 },
+    ])("keeps an unread native send after same-text terminal input: %j", (identity) => {
+      const content = [{ type: "input_text" as const, text: "Check the status." }];
+      const pending: PendingUserMessage = { ...identity, content };
+      const terminalEcho: SessionInputConsumedEvent = {
+        type: "session_input_consumed",
+        itemId: "terminal_item",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [pending] });
+
+      handleSessionEvent(terminalEcho);
+      handleSessionEvent(terminalEcho);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "terminal_item",
+      ]);
+
+      handleSessionEvent({ ...terminalEcho, itemId: "web_item", clearedPendingId: "pending_web" });
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "terminal_item",
+        "web_item",
+      ]);
+    });
+
     it.each([false, true])(
       "keeps a received input waiting when a mirror cannot name its send (already mirrored=%s)",
       (alreadyMirrored) => {
