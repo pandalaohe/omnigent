@@ -1,5 +1,8 @@
 import { useContext, useLayoutEffect, type RefObject } from "react";
-import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import {
+  ConversationScrollLockContext,
+  isQuestionCardScrollHeld,
+} from "@/components/ai-elements/conversation";
 import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
 export function useQuestionCardScroll(
@@ -15,8 +18,9 @@ export function useQuestionCardScroll(
   }, [held, hold, rootRef]);
 
   useLayoutEffect(() => {
-    const scroller = field?.closest<HTMLElement>("[data-question-card-scroll-held]");
-    if (!held || !field || !scroller) return;
+    const log = field?.closest<HTMLElement>("[role='log']");
+    const scroller = log?.firstElementChild;
+    if (!held || !field || !(scroller instanceof HTMLElement) || !log) return;
     const composer = scroller
       .closest("[data-chat-surface]")
       ?.querySelector<HTMLElement>(".chat-composer-form");
@@ -29,13 +33,16 @@ export function useQuestionCardScroll(
     host.setAttribute("aria-hidden", "true");
     host.style.cssText =
       "position:fixed;inset:0 auto auto 0;width:0;height:0;overflow:hidden;contain:strict";
+    // Let CSS resolve the safe-area calculation used by the transcript mask.
+    host.style.paddingTop = "var(--chat-header-fade-end, 0px)";
+    scroller.append(host);
     const prefix = document.createTextNode("");
     const tail = document.createElement("span");
     let mirror: HTMLDivElement | undefined;
 
     const reveal = () => {
       frame = 0;
-      if (document.activeElement !== field) return;
+      if (document.activeElement !== field || !isQuestionCardScrollHeld(scroller)) return;
       const scrollRect = scroller.getBoundingClientRect();
       const composerTop = composer?.getBoundingClientRect().top ?? scrollRect.bottom;
       const layoutBottom = Math.min(scrollRect.bottom, composerTop);
@@ -46,7 +53,7 @@ export function useQuestionCardScroll(
         keyboardRoom = room;
         scroller.style.setProperty("--question-card-keyboard-room", `${room}px`);
       }
-      const top = Math.max(scrollRect.top, viewportTop) + 8;
+      const top = Math.max(scrollRect.top + host.getBoundingClientRect().height, viewportTop) + 8;
       // Desktop fades the last 32px of the transcript. On a phone the fade
       // starts 8px above the composer, whose stack overlays the scroller.
       const fade = composerTop < scrollRect.bottom ? 8 : 32;
@@ -62,7 +69,6 @@ export function useQuestionCardScroll(
         nextMirror.append(prefix, tail);
         host.replaceChildren(nextMirror);
         mirror = nextMirror;
-        if (!host.isConnected) document.body.append(host);
       }
       if (!mirror) return;
       const offset =

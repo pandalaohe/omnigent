@@ -26,10 +26,16 @@ export const ConversationScrollLockContext = createContext<
   (ConversationScrollLock & { holdQuestionCard?: (card: HTMLElement) => () => void }) | null
 >(null);
 export const CONVERSATION_RESUME_SCROLL_EVENT = "conversation-resume-scroll";
+export const QUESTION_CARD_SCROLL_CHANGE_EVENT = "question-card-scroll-change";
+const PAUSE_QUESTION_CARD_SCROLL_EVENT = "conversation-pause-question-card-scroll";
+
+export function pauseQuestionCardScroll(scroller: HTMLElement): void {
+  scroller.dispatchEvent(new Event(PAUSE_QUESTION_CARD_SCROLL_EVENT));
+}
 
 // Module handle so non-React scroll helpers (deep links, activity rail,
 // Cmd+Alt nav) can release the bottom-lock without Conversation context.
-let activeScrollLock: ConversationScrollLock | null = null;
+let activeScrollLock: (ConversationScrollLock & { pauseQuestionCard: () => void }) | null = null;
 
 /**
  * Release StickToBottom's bottom-lock so a programmatic scroll is not
@@ -38,6 +44,7 @@ let activeScrollLock: ConversationScrollLock | null = null;
  */
 export function releaseConversationScrollLock(): void {
   if (!activeScrollLock) return;
+  activeScrollLock.pauseQuestionCard();
   activeScrollLock.stopScroll();
   activeScrollLock.state.isAtBottom = false;
   activeScrollLock.state.escapedFromLock = true;
@@ -57,25 +64,56 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     ConversationScrollLock;
   const { scrollRef, contentRef, stopScroll, scrollToBottom, state } = ctx;
   const cards = useRef(new Set<HTMLElement>());
-  const anchor = useRef<{ card: HTMLElement; offset: number } | null>(null);
+  const anchor = useRef<{ card: HTMLElement; offset: number; scrollTop: number } | null>(null);
   const resumeFollow = useRef(false);
   const resumeFrame = useRef(0);
   const keepCardInPlace = useCallback(() => {
     const el = scrollRef.current;
-    if (!el || cards.current.size === 0) return false;
+    if (!el || !isQuestionCardScrollHeld(el) || cards.current.size === 0) return false;
     stopScroll();
     const held = [...cards.current];
     const card = held.find((node) => node.contains(document.activeElement)) ?? held.at(-1)!;
     const offset = card.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
     const previous = anchor.current;
-    anchor.current = { card, offset };
-    // Compensate for layout above the card. A deliberate reader scroll changes
-    // scrollTop and the rect by opposite amounts and contributes zero here.
-    if (previous?.card === card && Math.abs(offset - previous.offset) >= 1) {
-      state.scrollTop += offset - previous.offset;
+    if (previous?.card === card) {
+      // At the bottom, shrinking content can move scrollTop before the resize
+      // callback. Only compensate the layout movement the clamp didn't absorb.
+      const clamp = Math.min(previous.scrollTop, el.scrollHeight - el.clientHeight);
+      const absorbed = Math.abs(el.scrollTop - clamp) <= 1 ? clamp - previous.scrollTop : 0;
+      const delta = offset - previous.offset - absorbed;
+      if (Math.abs(delta) >= 1) state.scrollTop += delta;
     }
+    anchor.current = { card, offset, scrollTop: el.scrollTop };
     return true;
   }, [scrollRef, state, stopScroll]);
+  const startQuestionCardAnchor = useCallback((el: HTMLElement, content: HTMLElement) => {
+    // Keep the starting spacer height available while stream output fills it.
+    const spacer = content.querySelector("[data-latest-turn-spacer]");
+    if (spacer) {
+      el.style.setProperty(
+        "--question-card-spacer-floor",
+        `${spacer.getBoundingClientRect().height}px`,
+      );
+    }
+    el.setAttribute(QUESTION_CARD_HOLD, "");
+    el.dispatchEvent(new Event(QUESTION_CARD_SCROLL_CHANGE_EVENT));
+  }, []);
+  const clearQuestionCardAnchor = useCallback((el: HTMLElement) => {
+    anchor.current = null;
+    if (!isQuestionCardScrollHeld(el)) return;
+    el.removeAttribute(QUESTION_CARD_HOLD);
+    el.style.removeProperty("--question-card-spacer-floor");
+    el.dispatchEvent(new Event(QUESTION_CARD_SCROLL_CHANGE_EVENT));
+  }, []);
+  const pauseQuestionCard = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || (!isQuestionCardScrollHeld(el) && !resumeFrame.current)) return false;
+    cancelAnimationFrame(resumeFrame.current);
+    resumeFrame.current = 0;
+    resumeFollow.current = false;
+    clearQuestionCardAnchor(el);
+    return true;
+  }, [clearQuestionCardAnchor, scrollRef]);
   const holdQuestionCard = useCallback(
     (card: HTMLElement) => {
       // A restored draft can mount before the ancestor's refs are attached.
@@ -91,20 +129,10 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
           el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
         cancelAnimationFrame(resumeFrame.current);
         resumeFrame.current = 0;
-        // The latest-turn spacer normally shrinks as output fills it. Keep
-        // its starting height available so that shrink cannot clamp the
-        // scrollTop needed to offset growth above the card.
-        const spacer = content.querySelector("[data-latest-turn-spacer]");
-        if (spacer) {
-          el.style.setProperty(
-            "--question-card-spacer-floor",
-            `${spacer.getBoundingClientRect().height}px`,
-          );
-        }
-        el.setAttribute(QUESTION_CARD_HOLD, "");
+        startQuestionCardAnchor(el, content);
       }
       cards.current.add(card);
-      if (!keepCardInPlace()) stopScroll();
+      if (!keepCardInPlace() && isQuestionCardScrollHeld(el)) stopScroll();
       // The virtual list can grow while its trailing spacer shrinks by the
       // same amount, so content height alone cannot signal a shifted card.
       const observer = new ResizeObserver(keepCardInPlace);
@@ -114,9 +142,7 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
         observer.disconnect();
         cards.current.delete(card);
         if (cards.current.size > 0) return;
-        anchor.current = null;
-        el.removeAttribute(QUESTION_CARD_HOLD);
-        el.style.removeProperty("--question-card-spacer-floor");
+        clearQuestionCardAnchor(el);
         if (!resumeFollow.current) return;
         // Let a submitted card's replacement render before restoring follow.
         resumeFrame.current = requestAnimationFrame(() => {
@@ -127,7 +153,16 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
         });
       };
     },
-    [contentRef, keepCardInPlace, scrollRef, scrollToBottom, state, stopScroll],
+    [
+      clearQuestionCardAnchor,
+      contentRef,
+      keepCardInPlace,
+      scrollRef,
+      scrollToBottom,
+      startQuestionCardAnchor,
+      state,
+      stopScroll,
+    ],
   );
   const value = useMemo(
     () => ({ stopScroll, state, holdQuestionCard }),
@@ -136,11 +171,19 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
   // Layout so the module handle is live before sibling/parent useEffects
   // (message deep links) try to scroll away from the bottom.
   useLayoutEffect(() => {
-    activeScrollLock = value;
-    return () => {
-      if (activeScrollLock === value) activeScrollLock = null;
+    const lock = {
+      stopScroll,
+      state,
+      pauseQuestionCard: () => {
+        const el = scrollRef.current;
+        if (el) pauseQuestionCardScroll(el);
+      },
     };
-  }, [value]);
+    activeScrollLock = lock;
+    return () => {
+      if (activeScrollLock === lock) activeScrollLock = null;
+    };
+  }, [scrollRef, state, stopScroll]);
   useLayoutEffect(() => {
     const el = ctx.scrollRef.current;
     const content = ctx.contentRef.current;
@@ -152,8 +195,22 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     let released = false;
     const release = () => {
       released = true;
-      if (isQuestionCardScrollHeld(el)) resumeFollow.current = false;
+      pauseQuestionCard();
       ctx.stopScroll();
+    };
+    const onPauseCardScroll = () => {
+      if (!pauseQuestionCard()) return;
+      released = true;
+      ctx.stopScroll();
+    };
+    const onCardEdit = (event: Event) => {
+      const held = isQuestionCardScrollHeld(el);
+      if (held && event.type === "input") return;
+      if (!(event.target instanceof HTMLElement)) return;
+      const target = event.target;
+      if (![...cards.current].some((card) => card.contains(target))) return;
+      if (!held) startQuestionCardAnchor(el, content);
+      keepCardInPlace();
     };
     // A nested scrollable control owns its gesture (code, terminals, editors).
     const ownsScroll = (target: EventTarget | null) => {
@@ -178,7 +235,8 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       const point = event.touches.length === 1 ? event.touches[0] : undefined;
       if (!touch || !point) return;
       const dy = point.clientY - touch.y;
-      if (dy > 6 && dy > Math.abs(point.clientX - touch.x)) {
+      const distance = isQuestionCardScrollHeld(el) ? Math.abs(dy) : dy;
+      if (distance > 6 && distance > Math.abs(point.clientX - touch.x)) {
         pressed = null;
         release();
       }
@@ -229,6 +287,14 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     // The library resumes within 70px of the bottom. A reader's escape lasts
     // until they actually reach it, including after a resize swallowed a scroll.
     const onScroll = () => {
+      const previous = anchor.current;
+      if (previous && el.scrollTop !== previous.scrollTop) {
+        const cap = el.scrollHeight - el.clientHeight;
+        const clamped = previous.scrollTop > cap && Math.abs(el.scrollTop - cap) <= 1;
+        // Caret reveal can move the viewport on its own. A clamp is handled
+        // by the resize observer using the previous scrollTop.
+        if (!clamped) previous.scrollTop = el.scrollTop;
+      }
       clearTimeout(scrollTimer);
       scrollTimer = setTimeout(() => {
         if (isQuestionCardScrollHeld(el) || pressed) ctx.stopScroll();
@@ -242,7 +308,11 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       }, 1);
     };
     const onWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0 && ownsScroll(event.target)) release();
+      if (
+        (event.deltaY < 0 || (event.deltaY > 0 && isQuestionCardScrollHeld(el))) &&
+        ownsScroll(event.target)
+      )
+        release();
     };
     const onResume = () => {
       released = false;
@@ -260,10 +330,14 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
         return;
       if (
         ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
-        (event.key === " " && event.shiftKey)
+        (event.key === " " && event.shiftKey) ||
+        (isQuestionCardScrollHeld(el) && ["ArrowDown", "PageDown", "End", " "].includes(event.key))
       )
         release();
     };
+    el.addEventListener(PAUSE_QUESTION_CARD_SCROLL_EVENT, onPauseCardScroll);
+    el.addEventListener("focusin", onCardEdit);
+    el.addEventListener("input", onCardEdit);
     el.addEventListener("scroll", onScroll, { passive: true });
     el.addEventListener("wheel", onWheel, { passive: true });
     el.addEventListener("keydown", onKeyDown);
@@ -280,6 +354,9 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       resumeFrame.current = 0;
       cancelAnimationFrame(releaseFrame);
       clearTimeout(scrollTimer);
+      el.removeEventListener(PAUSE_QUESTION_CARD_SCROLL_EVENT, onPauseCardScroll);
+      el.removeEventListener("focusin", onCardEdit);
+      el.removeEventListener("input", onCardEdit);
       el.removeEventListener("scroll", onScroll);
       el.removeEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
       el.removeEventListener("wheel", onWheel);
@@ -299,6 +376,8 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     ctx.scrollToBottom,
     ctx.state,
     keepCardInPlace,
+    pauseQuestionCard,
+    startQuestionCardAnchor,
   ]);
   return (
     <ConversationScrollLockContext.Provider value={value}>
@@ -371,7 +450,11 @@ export const ConversationScrollButton = ({
   const { isAtBottom, scrollToBottom, scrollRef } = useStickToBottomContext();
 
   const handleScrollToBottom = useCallback(() => {
-    scrollRef.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    const el = scrollRef.current;
+    if (el) {
+      pauseQuestionCardScroll(el);
+      el.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    }
     scrollToBottom("instant");
   }, [scrollRef, scrollToBottom]);
 

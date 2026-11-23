@@ -82,18 +82,28 @@ it("holds a question card through stream growth and resumes the original bottom 
 
   view.rerender(transcript(true));
   const initialTop = card.getBoundingClientRect().top;
+  // When content above the card shrinks at the bottom, the browser has
+  // already clamped scrollTop by nearly the whole layout change.
+  cardOffset -= 80;
+  height -= 80;
+  scroller.scrollTop = height - scroller.clientHeight;
+  fireEvent.scroll(scroller);
+  await settle();
+  expect(Math.abs(card.getBoundingClientRect().top - initialTop)).toBeLessThanOrEqual(1);
+  const clampedTop = scroller.scrollTop;
+
   cardOffset += 200;
   height += 300; // 200px of output above, 100px of content below.
   await settle();
-  expect(card.getBoundingClientRect().top).toBe(initialTop);
-  expect(scroller.scrollTop).toBe(799);
+  expect(Math.abs(card.getBoundingClientRect().top - initialTop)).toBeLessThanOrEqual(1);
+  expect(scroller.scrollTop).toBe(clampedTop + 200);
 
   view.rerender(transcript(false));
   await settle();
-  expect(scroller.scrollTop).toBe(899);
+  expect(scroller.scrollTop).toBe(819);
   height += 100;
   await settle();
-  expect(scroller.scrollTop).toBe(999);
+  expect(scroller.scrollTop).toBe(919);
 });
 
 it.each(["touch", "wheel", "keyboard"])(

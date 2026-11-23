@@ -107,6 +107,7 @@ import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   CONVERSATION_RESUME_SCROLL_EVENT,
   isQuestionCardScrollHeld,
+  pauseQuestionCardScroll,
 } from "@/components/ai-elements/conversation";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
@@ -1727,7 +1728,11 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
 
   useLayoutEffect(() => {
     if (nonce === 0) return;
-    scrollRef?.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    const el = scrollRef?.current;
+    if (el) {
+      pauseQuestionCardScroll(el);
+      el.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
+    }
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollRef, scrollToBottom]);
@@ -2611,6 +2616,7 @@ export function JumpToTopButton({
     try {
       // Release StickToBottom's bottom-lock so prepend-driven scrolls bail
       // instead of yanking the view back to the bottom.
+      pauseQuestionCardScroll(el);
       stopScroll();
       state.isAtBottom = false;
       state.escapedFromLock = true;

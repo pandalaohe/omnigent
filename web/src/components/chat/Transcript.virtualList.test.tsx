@@ -4,7 +4,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 import type { Bubble } from "@/lib/renderItems";
-import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
+import {
+  Conversation,
+  ConversationContent,
+  QUESTION_CARD_SCROLL_CHANGE_EVENT,
+} from "@/components/ai-elements/conversation";
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
 import type { AnyBlock, BlockContext, ElicitationBlock } from "@/lib/blocks";
 import { MemoryRouter } from "react-router-dom";
@@ -236,6 +240,25 @@ it("pins after an observer re-measure of a row, never after a mount measure", ()
   // Without a registered pin the measurement still goes through.
   expect(measureRowAndPin({ current: null })(node, entry, instance)).toBe(64);
   expect(measureRowAndPin(undefined)(node, entry, instance)).toBe(64);
+});
+
+it("restores default row compensation when a card releases between renders", () => {
+  const scrollEl = document.createElement("div");
+  scrollEl.setAttribute("data-question-card-scroll-held", "");
+  render(list(false, scrollEl));
+  const virtualizer = vi.mocked(useVirtualizer).mock.results.at(-1)!.value;
+  expect(virtualizer.shouldAdjustScrollPositionOnItemSizeChange).toBeTypeOf("function");
+
+  // A row may be measured as soon as the form's layout cleanup removes the
+  // hold, before the list has rendered again. Undefined selects TanStack's
+  // own compensation for that measurement.
+  scrollEl.removeAttribute("data-question-card-scroll-held");
+  scrollEl.dispatchEvent(new Event(QUESTION_CARD_SCROLL_CHANGE_EVENT));
+  expect(virtualizer.shouldAdjustScrollPositionOnItemSizeChange).toBeUndefined();
+
+  scrollEl.setAttribute("data-question-card-scroll-held", "");
+  scrollEl.dispatchEvent(new Event(QUESTION_CARD_SCROLL_CHANGE_EVENT));
+  expect(virtualizer.shouldAdjustScrollPositionOnItemSizeChange).toBeTypeOf("function");
 });
 
 it("publishes navigation that distinguishes loaded and missing turns", async () => {
