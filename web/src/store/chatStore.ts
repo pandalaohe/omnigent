@@ -1918,7 +1918,7 @@ const interruptRequestsInFlight = new Set<string>();
  * lost and an earlier refused attempt's item already sits in the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
-const inFlightSendSessions = new Map<string, { sessionId: string; claudePost: boolean }>();
+const inFlightSendSessions = new Map<string, string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -3213,8 +3213,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      const sendSession = { sessionId, claudePost: false };
-      inFlightSendSessions.set(stableId, sendSession);
+      inFlightSendSessions.set(stableId, sessionId);
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
@@ -3337,7 +3336,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
 
       const postingState = setterForState(sessionId);
-      sendSession.claudePost = postingState?.sessionHarness === "claude-native";
       const sentWhileRunning =
         postingState?.isNativeTerminalSession === true && postingState.sessionStatus === "running";
       if (hasAttachments) {
@@ -7083,7 +7081,7 @@ async function rehydrateWindowOnReconnect(
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
-  pendingAtReconnectStart: ReadonlyMap<string, boolean>,
+  pendingAtReconnectStart: Set<string>,
   statusPatchFor: (s: ChatState) => Partial<ChatState>,
 ): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
@@ -7254,14 +7252,7 @@ async function reconcileOnReconnect(
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks, id);
   const todosAtReconnectStart = get().todos;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
-  // A queued or open POST can settle after the history read starts and before it merges.
-  const isClaudeNative = stateBeforeFetch.sessionHarness === "claude-native";
-  const pendingAtReconnectStart = new Map(
-    stateBeforeFetch.pendingUserMessages.map((p) => [
-      p.tempId,
-      (isClaudeNative && p.beforePost === true) || isAwaitingClaudePost(p, id),
-    ]),
-  );
+  const pendingAtReconnectStart = new Set(get().pendingUserMessages.map((p) => p.tempId));
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -8903,8 +8894,7 @@ function confirmedWebSendIds(items: readonly ConversationItem[]): string[] {
 }
 
 function recordInFlightNativeDelivery(conversationId: string | null, stableId: string): void {
-  if (inFlightSendSessions.get(stableId)?.sessionId === conversationId)
-    inFlightSends.set(stableId, true);
+  if (inFlightSendSessions.get(stableId) === conversationId) inFlightSends.set(stableId, true);
 }
 
 /** Keep the first card's position and prefer the durable error when it arrives. */
@@ -9426,27 +9416,17 @@ function committedContentFor(
   return pendingHasFiles ? pendingContent : serverContent;
 }
 
-// A cold rebind can receive echoes before the replacement entry learns its harness.
-function isAwaitingClaudePost(pending: PendingUserMessage, conversationId: string | null): boolean {
-  if (pending.posted || pending.stableId === undefined) return false;
-  const sendSession = inFlightSendSessions.get(pending.stableId);
-  return sendSession?.sessionId === conversationId && sendSession.claudePost;
-}
-
-/** Whether a consumed event can safely claim the FIFO pending head. */
+/** Whether an id-less consumed event can safely claim the FIFO pending head. */
 function pendingMatchesConsumedEvent(
   event: SessionInputConsumedEvent,
   pending: PendingUserMessage,
-  conversationId: string | null,
 ): boolean {
   if (pending.received) return false;
-  // Claude's terminal can emit an unattributed echo before the web POST
-  // returns its pending id. Keep it pending until an attributed receipt.
+  // An unnamed terminal echo cannot acknowledge a native send already known
+  // to the server through its POST id or a runner sending timestamp.
   if (
     event.clearedPendingId == null &&
-    (pending.pendingId ||
-      pending.sendingSinceMs !== undefined ||
-      isAwaitingClaudePost(pending, conversationId))
+    (pending.pendingId || pending.sendingSinceMs !== undefined)
   ) {
     return false;
   }
@@ -9751,10 +9731,10 @@ function* recoveredInputReceipts(
 }
 
 function recoveredPendingInputPatch(
-  s: PendingInputState & Pick<ChatState, "conversationId">,
+  s: PendingInputState,
   recovered: AnyBlock[],
   history: ConversationItem[],
-  pendingAtReconnectStart: ReadonlyMap<string, boolean>,
+  pendingAtReconnectStart: Set<string>,
   serverInputs: PendingInput[] | undefined,
 ): PendingInputState {
   const pendingById = pendingInputsById(serverInputs);
@@ -9817,8 +9797,6 @@ function recoveredPendingInputPatch(
         if (
           head &&
           eligible(head) &&
-          !pendingAtReconnectStart.get(head.tempId) &&
-          !isAwaitingClaudePost(head, s.conversationId) &&
           (!namedReceiptSuccessors.has(head.tempId) ||
             head.pendingId !== undefined ||
             head.received) &&
@@ -10822,7 +10800,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             return {};
           }
           if (!pendingHead || pendingHead.initialDraft || pendingHead.beforePost) return {};
-          if (!pendingMatchesConsumedEvent(event, pendingHead, sourceConversationId)) return {};
+          if (!pendingMatchesConsumedEvent(event, pendingHead)) return {};
           return { pendingUserMessages: s.pendingUserMessages.filter((p) => p !== pendingHead) };
         }
 
@@ -10878,8 +10856,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           pendingHead?.beforePost
             ? undefined
             : pendingHead;
-        const matchedHead =
-          head && pendingMatchesConsumedEvent(event, head, sourceConversationId) ? head : undefined;
+        const matchedHead = head && pendingMatchesConsumedEvent(event, head) ? head : undefined;
         if (matchedHead) {
           const content = committedContentFor(event, matchedHead.content);
           if (content === null) return {};

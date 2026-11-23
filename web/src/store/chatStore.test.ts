@@ -9945,57 +9945,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
   });
 
-  it("keeps a Claude web send pending through a same-text terminal echo during its POST", async () => {
-    useChatStore.setState({
-      abortController: new AbortController(),
-      sessionHarness: "claude-native",
-      isNativeTerminalSession: true,
-    });
-    let resolvePost!: (response: Response) => void;
-    fetchMock.mockImplementation((input, init) => {
-      if (String(input).endsWith("/v1/sessions/conv_abc/events") && init?.method === "POST") {
-        return new Promise<Response>((resolve) => {
-          resolvePost = resolve;
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
-
-    const send = useChatStore.getState().send("steer", "agent_xyz");
-    await tick();
-    expect(resolvePost).toBeTypeOf("function");
-    const [pending] = useChatStore.getState().pendingUserMessages;
-    expect(pending?.beforePost).toBeUndefined();
-    expect(pending?.pendingId).toBeUndefined();
-    const terminalEcho: SessionInputConsumedEvent = {
-      type: "session_input_consumed",
-      itemId: "msg_terminal",
-      itemType: "message",
-      data: { role: "user", content: [{ type: "input_text", text: "steer" }] },
-    };
-    handleSessionEvent(terminalEcho);
-    handleSessionEvent(terminalEcho);
-    const duringPost = useChatStore.getState();
-
-    resolvePost(mockResponse({ queued: true, pending_id: "pending_web" }));
-    await send;
-    expect(duringPost.pendingUserMessages).toEqual([pending]);
-    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
-      { tempId: pending!.tempId, pendingId: "pending_web" },
-    ]);
-
-    handleSessionEvent({
-      ...terminalEcho,
-      itemId: "msg_web",
-      clearedPendingId: "pending_web",
-    });
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    expect(useChatStore.getState().blocks).toMatchObject([
-      { ctx: { itemId: "msg_terminal" }, stableKey: undefined },
-      { ctx: { itemId: "msg_web" }, stableKey: pending!.tempId },
-    ]);
-  });
-
   it("shows a mid-turn paste as received, then commits it once from its mirror", () => {
     const since = 1_710_000_000_000;
     const content = [{ type: "input_text" as const, text: "steer" }];
@@ -20803,99 +20752,68 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
-  it.each([
-    { postAtReconnect: "open", postAnswersFirst: false },
-    { postAtReconnect: "open", postAnswersFirst: true },
-    { postAtReconnect: "queued", postAnswersFirst: true },
-  ])(
-    "keeps a Claude send when reconnect recovers same-text terminal input ($postAtReconnect POST, answers before merge: $postAnswersFirst)",
-    async ({ postAtReconnect, postAnswersFirst }) => {
-      const id = "conv_posting_terminal_echo";
-      const before = userMessage("posting_pre", "before the gap");
-      seedSession(id, [before]);
-      const sinks = routeStreamOpens();
-      const route = fetchMock.getMockImplementation()!;
-      let releasePriorPost: (() => void) | undefined;
-      let resolvePost!: (response: Response) => void;
-      let holdItems = false;
-      let releaseItems!: () => void;
-      const historyHeld = new Promise<void>((resolve) => {
-        releaseItems = resolve;
-      });
-      fetchMock.mockImplementation(async (input, init) => {
-        const url = String(input);
-        if (url.endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
-          return new Promise<Response>((resolve) => {
-            if (postAtReconnect === "queued" && releasePriorPost === undefined) {
-              releasePriorPost = () => resolve(mockResponse({ queued: false, denied: true }));
-            } else {
-              resolvePost = resolve;
-            }
-          });
-        }
-        if (holdItems && url.split("?")[0] === `/v1/sessions/${id}/items`) await historyHeld;
-        return route(input, init);
-      });
-      const controller = new AbortController();
-      useChatStore.setState({
-        conversationId: id,
-        abortController: controller,
-        sessionHarness: "claude-native",
-        isNativeTerminalSession: true,
-        blocks: itemsToBlocks([before]),
-      });
-      const loop = startStreamPump(id, controller, setState, getState);
-      await drainAsync();
-      const prior = postAtReconnect === "queued" ? getState().send("earlier", "agent_xyz") : null;
-      const sending = getState().send("ship it", "agent_xyz");
-      await drainAsync();
-      const pending = getState().pendingUserMessages.at(-1);
-      expect(pending).toBeDefined();
-      if (prior) {
-        expect(releasePriorPost).toBeTypeOf("function");
-        expect(resolvePost).toBeUndefined();
-        expect(pending?.beforePost).toBe(true);
-      } else {
-        expect(resolvePost).toBeTypeOf("function");
+  it("settles a Claude resend when reconnect misses its named receipt", async () => {
+    const id = "conv_retry_during_disconnect";
+    const before = { ...userMessage("failed_send", "ship it"), delivery_confirmed: false };
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    let releasePost!: () => void;
+    let holdHistory = false;
+    let releaseHistory!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input).split("?")[0];
+      if (url === `/v1/sessions/${id}/events` && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          releasePost = () => resolve(mockResponse({ queued: true, pending_id: "retry_pending" }));
+        });
       }
-
-      const terminal = userMessage("terminal_echo", "ship it");
-      seedSessionItems(id, [before, terminal]);
-      holdItems = postAnswersFirst;
-      sinks[0]!.error();
-      await drainAsync();
-      if (postAnswersFirst) {
-        expect(getState().blocks.map((b) => b.ctx.itemId)).toEqual([before.id]);
-        if (prior) {
-          releasePriorPost!();
-          await prior;
-          await drainAsync();
-        }
-        resolvePost(mockResponse({ queued: true, pending_id: "pending_web" }));
-        await sending;
-        releaseItems();
-        await drainAsync();
+      if (holdHistory && url === `/v1/sessions/${id}/items`) {
+        return new Promise<Response>((resolve) => {
+          releaseHistory = () => resolve(route(input, init));
+        });
       }
-      const afterReconnect = getState();
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      sessionHarness: "claude-native",
+      isNativeTerminalSession: true,
+      blocks: itemsToBlocks([before]),
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    const sending = getState().send("ship it", "agent_xyz");
+    await drainAsync();
+    expect(releasePost).toBeTypeOf("function");
 
-      if (!postAnswersFirst) {
-        resolvePost(mockResponse({ queued: true, pending_id: "pending_web" }));
-        await sending;
-      }
-      const afterPost = getState();
-      const last = sinks[1]!;
-      last.push("data: [DONE]\n\n");
-      last.close();
-      await drainAsync(2);
-      await loop;
+    holdHistory = true;
+    sinks[0]!.error();
+    // The named live receipt was lost with the stream. The durable mirror
+    // of a same-text resend can have its own item id and no web stable id.
+    const mirror = userMessage("retry_mirror", "ship it");
+    seedSessionItems(id, [before, mirror]);
+    await drainAsync();
+    expect(releaseHistory).toBeTypeOf("function");
 
-      expect(afterReconnect.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, terminal.id]);
-      expect(afterReconnect.pendingUserMessages.map((p) => p.tempId)).toEqual([pending!.tempId]);
-      expect(afterPost.pendingUserMessages).toMatchObject([
-        { tempId: pending!.tempId, pendingId: "pending_web" },
-      ]);
-    },
-  );
+    releasePost();
+    await sending;
+    expect(getState().pendingUserMessages).toMatchObject([{ pendingId: "retry_pending" }]);
+    holdHistory = false;
+    releaseHistory();
+    await drainAsync();
+
+    const state = getState();
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual([before.id, mirror.id]);
+    expect(state.pendingUserMessages).toEqual([]);
+  });
 
   it("keeps a server-refused restored draft when the snapshot holds its persisted item", async () => {
     const stableId = "d".repeat(32);
