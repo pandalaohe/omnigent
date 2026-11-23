@@ -35,6 +35,15 @@ def payload(name, args):
     return {"toolCall": {"name": name, "args": args}}
 
 
+def assert_pre_tool_reply(result):
+    # The CLI decodes the hook's JSON into a protobuf and rejects unknown fields.
+    assert isinstance(result, dict)
+    assert result.keys() <= {"decision", "reason"}
+    assert result["decision"] in {"allow", "ask", "force_ask", "deny"}
+    if "reason" in result:
+        assert isinstance(result["reason"], str)
+
+
 @pytest.mark.parametrize(
     "tier,name,args,expected",
     [
@@ -68,6 +77,7 @@ def payload(name, args):
 def test_native_decision_mapping(state, tier, name, args, expected):
     context = local_host_context(state, control_paths=(str(Path(state.workspace) / "bridge"),))
     result = guard.decide(payload(name, args), tier, load_rules(), context)
+    assert_pre_tool_reply(result)
     assert result["decision"] == expected
     if name == "run_command" and "mkfs" in args.get("CommandLine", ""):
         assert "[disk-destroy]" in result["reason"]
@@ -167,6 +177,7 @@ def test_cli_cache_failure_is_explicit_denial(tmp_path, state, case):
     assert result.returncode == 0
     assert result.stderr == ""
     response = json.loads(result.stdout)
+    assert_pre_tool_reply(response)
     assert response["decision"] == "deny"
     assert response["reason"].startswith("Permission check unavailable:")
 
@@ -384,7 +395,13 @@ def native_transport(tmp_path, state, monkeypatch, capsys):
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(native)))
         args = ["--tier-file", str(tier)] + (["--finish"] if finish else [])
         assert guard.main(args) == 0
-        return json.loads(capsys.readouterr().out), calls
+        output = capsys.readouterr()
+        result = json.loads(output.out)
+        if finish:
+            assert result == {}
+        else:
+            assert_pre_tool_reply(result)
+        return result, calls, output.err
 
     return matching, run
 
@@ -403,7 +420,9 @@ def test_state_transient_recovery_still_checks_policy(native_transport, failure,
         "503": http_error(503),
         "504": http_error(504),
     }
-    result, calls = run([failures[failure], matching, {"result": policy, "reason": "policy deny"}])
+    result, calls, _ = run(
+        [failures[failure], matching, {"result": policy, "reason": "policy deny"}]
+    )
     assert result["decision"] == ("allow" if policy == "POLICY_ACTION_ALLOW" else "deny")
     if policy == "POLICY_ACTION_DENY":
         assert result["reason"] == "policy deny"
@@ -421,22 +440,31 @@ def test_state_transient_recovery_still_checks_policy(native_transport, failure,
 )
 def test_recovered_state_mismatch_denies_without_retry(native_transport, field, value):
     matching, run = native_transport
-    result, calls = run([TimeoutError(), {**matching, field: value}])
+    result, calls, _ = run([TimeoutError(), {**matching, field: value}])
     assert result["decision"] == "deny"
     assert [path for path, _ in calls] == ["/permission-tiers/state"] * 2
 
 
 def test_persistent_state_timeout_is_recoverable_at_shared_deadline(native_transport, monkeypatch):
-    _, run = native_transport
+    matching, run = native_transport
     clock = [0.0]
     monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
     monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, clock[0] + 20))
-    result, calls = run([TimeoutError(), TimeoutError(), TimeoutError()])
+    result, calls, _ = run([TimeoutError(), TimeoutError(), TimeoutError()])
     assert result["decision"] == "deny"
-    assert result["status"] == "unavailable"
-    assert "unavailable" in result["reason"]
+    assert "retry" in result["reason"]
     assert [path for path, _ in calls] == ["/permission-tiers/state"] * 3
     assert all(timeout > 5 for _, timeout in calls)
+
+    result, calls, _ = run([matching, {"result": "POLICY_ACTION_ALLOW"}])
+    assert result == {"decision": "allow"}
+    assert [path for path, _ in calls] == ["/permission-tiers/state", "/policies/evaluate"]
+
+
+def test_nonstring_policy_denial_reason_keeps_valid_hook_reply(native_transport):
+    matching, run = native_transport
+    result, _, _ = run([matching, {"result": "POLICY_ACTION_DENY", "reason": ["invalid"]}])
+    assert result == {"decision": "deny", "reason": "Omnigent policy denied"}
 
 
 @pytest.mark.parametrize("policy", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"])
@@ -445,7 +473,7 @@ def test_state_recovers_after_old_total_budget(native_transport, monkeypatch, po
     clock = [0.0]
     monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
     monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, 35.0))
-    result, calls = run([http_error(503), matching, {"result": policy}])
+    result, calls, _ = run([http_error(503), matching, {"result": policy}])
     assert result["decision"] == ("allow" if policy == "POLICY_ACTION_ALLOW" else "deny")
     assert calls[1] == ("/permission-tiers/state", 25.0)
 
@@ -458,7 +486,7 @@ def test_state_nontransient_failure_is_not_retried(native_transport, failure):
         "malformed": b"not-json",
         "url-other": urllib.error.URLError(OSError("offline")),
     }
-    result, calls = run([failures[failure]])
+    result, calls, _ = run([failures[failure]])
     assert result["decision"] == "deny"
     assert [path for path, _ in calls] == ["/permission-tiers/state"]
 
@@ -466,11 +494,14 @@ def test_state_nontransient_failure_is_not_retried(native_transport, failure):
 @pytest.mark.parametrize("finish", [False, True])
 def test_policy_and_control_timeouts_are_not_retried(native_transport, finish):
     matching, run = native_transport
-    result, calls = run([TimeoutError()] if finish else [matching, TimeoutError()], finish=finish)
-    assert result["decision"] == "deny"
-    assert "TimeoutError" in result["reason"]
+    result, calls, stderr = run(
+        [TimeoutError()] if finish else [matching, TimeoutError()], finish=finish
+    )
     if finish:
+        assert "TimeoutError" in stderr
         assert calls == [("/permission-tiers/control", 5)]
     else:
+        assert result["decision"] == "deny"
+        assert "TimeoutError" in result["reason"]
         assert [path for path, _ in calls] == ["/permission-tiers/state", "/policies/evaluate"]
         assert calls[1][1] == 86400

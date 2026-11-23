@@ -46,7 +46,6 @@ def _error(exc: Exception) -> dict[str, str]:
     if isinstance(exc, PermissionStateUnavailable):
         return {
             "decision": "deny",
-            "status": "unavailable",
             "reason": (
                 "Permission state unavailable; retry the permission check "
                 "before running this tool."
@@ -201,7 +200,11 @@ def _lease_native_call(
     )
     action = verdict.get("result")
     if action == "POLICY_ACTION_DENY":
-        return {"decision": "deny", "reason": verdict.get("reason") or "Omnigent policy denied"}
+        reason = verdict.get("reason")
+        return {
+            "decision": "deny",
+            "reason": reason if isinstance(reason, str) and reason else "Omnigent policy denied",
+        }
     if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
         raise ValueError("Native policy did not confirm permission")
     # The service has completed both independent policy and mandatory tier approval.
@@ -261,11 +264,13 @@ def relay_schema_read(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    finish = False
     try:
         parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
         parser.add_argument("--tier-file")
         parser.add_argument("--finish", action="store_true")
         args, unknown = parser.parse_known_args(argv)
+        finish = args.finish
         if unknown or not args.tier_file:
             raise ValueError("Expected --tier-file")
         tier_file = Path(args.tier_file)
@@ -275,7 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if tier_file.read_text(encoding="utf-8").strip() != state.tier:
             raise ValueError("Permission cache mismatch")
         payload = _object(json.load(sys.stdin))
-        if args.finish:
+        if finish:
             if state.tier == "full":
                 print("{}")
                 return 0
@@ -355,6 +360,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if read_host_permission_state(tier_file.parent / HOST_PERMISSION_STATE_FILE) != state:
             raise ValueError("Permission state changed during native policy check")
     except Exception as exc:
+        if finish:
+            # PostToolUse only accepts an empty reply. Report settlement errors out of band.
+            print(f"Native completion check failed: {type(exc).__name__}", file=sys.stderr)
+            print("{}")
+            return 0
         result = _error(exc)
     print(json.dumps(result))
     return 0

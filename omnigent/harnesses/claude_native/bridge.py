@@ -11577,6 +11577,14 @@ def _tool_relay_handler_factory(
             future = asyncio.run_coroutine_threadsafe(
                 policy_client.get(
                     f"/v1/sessions/{quote(session_id, safe='')}",
+                    # Permission state comes from the stored session. The live-status
+                    # probe can call back into the runner waiting for this response.
+                    params={
+                        "include_items": "false",
+                        "include_liveness": "false",
+                        "include_live_status": "false",
+                        "include_usage": "false",
+                    },
                     headers={"X-Omnigent-Permission-Tiers": "1"},
                 ),
                 loop,
