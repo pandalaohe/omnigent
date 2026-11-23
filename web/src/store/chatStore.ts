@@ -9752,9 +9752,14 @@ function recoveredPendingInputPatch(
   };
   const eligible = (p: PendingUserMessage) =>
     !p.initialDraft && !p.beforePost && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
+  const namedReceiptSuccessors = new Set<string>();
   for (const block of recoveredInputReceipts(history, recovered)) {
     if (typeof block === "string") {
-      state.pendingUserMessages = state.pendingUserMessages.filter((p) => p.stableId !== block);
+      state.pendingUserMessages = state.pendingUserMessages.filter((pending, index, queue) => {
+        if (pending.stableId === block) return false;
+        if (queue[index - 1]?.stableId === block) namedReceiptSuccessors.add(pending.tempId);
+        return true;
+      });
       continue;
     }
     if (isTerminalCommandInput(block) && block.ctx.itemId) {
@@ -9780,10 +9785,17 @@ function recoveredPendingInputPatch(
           (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
         )
       ) {
-        // Old mirrors have independent IDs. Match content to the queued head
-        // only, so an unrelated native input cannot consume a different send.
+        // A named receipt can expose a later send the server has yet to see.
+        // Require arrival evidence before matching that new head by content.
         const head = state.pendingUserMessages[0];
-        if (head && eligible(head) && contentKeyOf(head.content) === contentKeyOf(block.content))
+        if (
+          head &&
+          eligible(head) &&
+          (!namedReceiptSuccessors.has(head.tempId) ||
+            head.pendingId !== undefined ||
+            head.received) &&
+          contentKeyOf(head.content) === contentKeyOf(block.content)
+        )
           at = 0;
       }
     }
