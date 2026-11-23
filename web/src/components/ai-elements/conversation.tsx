@@ -191,26 +191,48 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     let touch: { x: number; y: number } | null = null;
     let pressed: { el: HTMLElement; top: number } | null = null;
     let releaseFrame = 0;
+    let caretFrame = 0;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     let released = false;
+    const cancelCaretAnchor = () => {
+      cancelAnimationFrame(caretFrame);
+      caretFrame = 0;
+    };
     const release = () => {
+      cancelCaretAnchor();
       released = true;
       pauseQuestionCard();
       ctx.stopScroll();
     };
     const onPauseCardScroll = () => {
+      cancelCaretAnchor();
       if (!pauseQuestionCard()) return;
       released = true;
       ctx.stopScroll();
     };
     const onCardEdit = (event: Event) => {
       const held = isQuestionCardScrollHeld(el);
-      if (held && event.type === "input") return;
+      if (held && event.type !== "focusin") return;
       if (!(event.target instanceof HTMLElement)) return;
       const target = event.target;
       if (![...cards.current].some((card) => card.contains(target))) return;
       if (!held) startQuestionCardAnchor(el, content);
       keepCardInPlace();
+    };
+    const onCardCaretIntent = (event: Event) => {
+      const target = event.target;
+      if (
+        isQuestionCardScrollHeld(el) ||
+        !(target instanceof HTMLTextAreaElement) ||
+        target !== document.activeElement
+      )
+        return;
+      cancelCaretAnchor();
+      // React controls and window shortcuts can consume the event after this listener.
+      caretFrame = requestAnimationFrame(() => {
+        caretFrame = 0;
+        if (!event.defaultPrevented && target === document.activeElement) onCardEdit(event);
+      });
     };
     // A nested scrollable control owns its gesture (code, terminals, editors).
     const ownsScroll = (target: EventTarget | null) => {
@@ -309,7 +331,8 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     };
     const onWheel = (event: WheelEvent) => {
       if (
-        (event.deltaY < 0 || (event.deltaY > 0 && isQuestionCardScrollHeld(el))) &&
+        (event.deltaY < 0 ||
+          (event.deltaY > 0 && (isQuestionCardScrollHeld(el) || caretFrame !== 0))) &&
         ownsScroll(event.target)
       )
         release();
@@ -322,9 +345,18 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
       if (!(target instanceof HTMLElement) || !el.contains(target)) return;
-      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.defaultPrevented) return;
+      if (target instanceof HTMLTextAreaElement) {
+        if (
+          !event.isComposing &&
+          ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)
+        )
+          onCardCaretIntent(event);
+        return;
+      }
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
       if ((event.shiftKey && event.key !== " ") || !ownsScroll(target)) return;
-      if (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (target.isContentEditable || /^(INPUT|SELECT)$/.test(target.tagName)) return;
       if (event.key === " " && target.closest("button")) return;
       if (
         ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
@@ -336,6 +368,7 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
     el.addEventListener(PAUSE_QUESTION_CARD_SCROLL_EVENT, onPauseCardScroll);
     el.addEventListener("focusin", onCardEdit);
     el.addEventListener("input", onCardEdit);
+    el.addEventListener("click", onCardCaretIntent);
     el.addEventListener("scroll", onScroll, { passive: true });
     el.addEventListener("wheel", onWheel, { passive: true });
     // Let React controls consume their shortcuts before treating the key as scroll intent.
@@ -352,10 +385,12 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       cancelAnimationFrame(resumeFrame.current);
       resumeFrame.current = 0;
       cancelAnimationFrame(releaseFrame);
+      cancelCaretAnchor();
       clearTimeout(scrollTimer);
       el.removeEventListener(PAUSE_QUESTION_CARD_SCROLL_EVENT, onPauseCardScroll);
       el.removeEventListener("focusin", onCardEdit);
       el.removeEventListener("input", onCardEdit);
+      el.removeEventListener("click", onCardCaretIntent);
       el.removeEventListener("scroll", onScroll);
       el.removeEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
       el.removeEventListener("wheel", onWheel);

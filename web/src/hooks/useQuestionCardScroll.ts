@@ -2,6 +2,7 @@ import { useContext, useLayoutEffect, type RefObject } from "react";
 import {
   ConversationScrollLockContext,
   isQuestionCardScrollHeld,
+  QUESTION_CARD_SCROLL_CHANGE_EVENT,
 } from "@/components/ai-elements/conversation";
 import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
@@ -94,6 +95,7 @@ export function useQuestionCardScroll(
     const schedule = () => {
       if (!frame) frame = requestAnimationFrame(reveal);
     };
+    scroller.addEventListener(QUESTION_CARD_SCROLL_CHANGE_EVENT, schedule);
     field.addEventListener("input", schedule);
     field.addEventListener("keyup", schedule);
     field.addEventListener("select", schedule);
@@ -108,6 +110,7 @@ export function useQuestionCardScroll(
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
+      scroller.removeEventListener(QUESTION_CARD_SCROLL_CHANGE_EVENT, schedule);
       field.removeEventListener("input", schedule);
       field.removeEventListener("keyup", schedule);
       field.removeEventListener("select", schedule);
