@@ -20752,6 +20752,69 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
+  it("settles a Claude resend when reconnect misses its named receipt", async () => {
+    const id = "conv_retry_during_disconnect";
+    const before = { ...userMessage("failed_send", "ship it"), delivery_confirmed: false };
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    let releasePost!: () => void;
+    let holdHistory = false;
+    let releaseHistory!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input).split("?")[0];
+      if (url === `/v1/sessions/${id}/events` && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          releasePost = () => resolve(mockResponse({ queued: true, pending_id: "retry_pending" }));
+        });
+      }
+      if (holdHistory && url === `/v1/sessions/${id}/items`) {
+        return new Promise<Response>((resolve) => {
+          releaseHistory = () => resolve(route(input, init));
+        });
+      }
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      sessionHarness: "claude-native",
+      isNativeTerminalSession: true,
+      blocks: itemsToBlocks([before]),
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    const sending = getState().send("ship it", "agent_xyz");
+    await drainAsync();
+    expect(releasePost).toBeTypeOf("function");
+
+    holdHistory = true;
+    sinks[0]!.error();
+    // The named live receipt was lost with the stream. The durable mirror
+    // of a same-text resend can have its own item id and no web stable id.
+    const mirror = userMessage("retry_mirror", "ship it");
+    seedSessionItems(id, [before, mirror]);
+    await drainAsync();
+    expect(releaseHistory).toBeTypeOf("function");
+
+    releasePost();
+    await sending;
+    expect(getState().pendingUserMessages).toMatchObject([{ pendingId: "retry_pending" }]);
+    holdHistory = false;
+    releaseHistory();
+    await drainAsync();
+
+    const state = getState();
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual([before.id, mirror.id]);
+    expect(state.pendingUserMessages).toEqual([]);
+  });
+
   it("keeps a server-refused restored draft when the snapshot holds its persisted item", async () => {
     const stableId = "d".repeat(32);
     const before = userMessage("refused_pre", "before the gap");
