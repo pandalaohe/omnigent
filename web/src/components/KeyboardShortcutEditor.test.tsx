@@ -98,6 +98,39 @@ describe("KeyboardShortcutEditor", () => {
     expect(terminal.getByText(fallbackHint)).toBeVisible();
   });
 
+  it("finds the paste box setting and saves each client platform separately", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    const { unmount } = render(<KeyboardShortcutEditor />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Search shortcuts" }), {
+      target: { value: "paste box" },
+    });
+
+    const platform = screen.getByRole("combobox", { name: "Client platform" });
+    const pasteBox = screen.getByRole("combobox", { name: "Paste box" });
+    expect(pasteBox).toBeVisible();
+    expect(platform).toHaveValue("windows");
+    expect(pasteBox).toHaveValue("whenBlocked");
+    fireEvent.change(pasteBox, { target: { value: "always" } });
+    fireEvent.change(platform, { target: { value: "macos" } });
+    expect(pasteBox).toHaveValue("whenBlocked");
+    fireEvent.change(pasteBox, { target: { value: "never" } });
+    fireEvent.change(platform, { target: { value: "linux" } });
+    expect(pasteBox).toHaveValue("whenBlocked");
+    unmount();
+
+    renderExpandedEditor();
+    const reopened = screen.getByRole("combobox", { name: "Paste box" });
+    expect(reopened).toHaveValue("always");
+    fireEvent.change(screen.getByRole("combobox", { name: "Client platform" }), {
+      target: { value: "macos" },
+    });
+    expect(reopened).toHaveValue("never");
+    expect(readTerminalKeyboardPreferences().pasteBoxMode).toEqual({
+      windows: "always",
+      macos: "never",
+    });
+  });
+
   it("sets a custom modifier map and records and restores a Windows-only terminal binding", () => {
     vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
     render(<KeyboardShortcutEditor />);

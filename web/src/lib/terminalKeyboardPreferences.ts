@@ -49,11 +49,15 @@ export type TerminalBindingId = keyof typeof TERMINAL_BINDINGS;
 export const TERMINAL_BINDING_IDS = Object.keys(TERMINAL_BINDINGS) as TerminalBindingId[];
 const PLATFORMS = ["macos", "windows", "linux"] as const;
 
+export type TerminalPasteBoxMode = "always" | "whenBlocked" | "never";
+export const DEFAULT_TERMINAL_PASTE_BOX_MODE: TerminalPasteBoxMode = "whenBlocked";
+
 type PlatformShortcutValues = Pick<ShortcutActionPreference, "common" | "platformOverrides">;
 
 export interface TerminalKeyboardPreferences {
   v: 1;
   modifierMap?: Partial<Record<ShortcutPlatform, ModifierMap>>;
+  pasteBoxMode?: Partial<Record<ShortcutPlatform, TerminalPasteBoxMode>>;
   bindings?: Partial<Record<TerminalBindingId, PlatformShortcutValues>>;
 }
 
@@ -79,6 +83,16 @@ function normalizeTerminalKeyboardPreferences(value: unknown): TerminalKeyboardP
     }
     if (Object.keys(modifierMap).length) preferences.modifierMap = modifierMap;
   }
+  if ("pasteBoxMode" in value && value.pasteBoxMode && typeof value.pasteBoxMode === "object") {
+    const pasteBoxMode: NonNullable<TerminalKeyboardPreferences["pasteBoxMode"]> = {};
+    for (const platform of PLATFORMS) {
+      const mode = (value.pasteBoxMode as Record<string, unknown>)[platform];
+      if (mode === "always" || mode === "whenBlocked" || mode === "never") {
+        pasteBoxMode[platform] = mode;
+      }
+    }
+    if (Object.keys(pasteBoxMode).length) preferences.pasteBoxMode = pasteBoxMode;
+  }
   if ("bindings" in value && value.bindings && typeof value.bindings === "object") {
     const bindings: NonNullable<TerminalKeyboardPreferences["bindings"]> = {};
     for (const id of TERMINAL_BINDING_IDS) {
@@ -100,6 +114,13 @@ export function readTerminalKeyboardPreferences(): TerminalKeyboardPreferences {
 
 export function writeTerminalKeyboardPreferences(preferences: TerminalKeyboardPreferences) {
   return writeTerminalKeyPreferences({ terminalKeyboard: preferences });
+}
+
+export function terminalPasteBoxModeFor(
+  preferences: TerminalKeyboardPreferences,
+  platform = currentShortcutPlatform(),
+): TerminalPasteBoxMode {
+  return preferences.pasteBoxMode?.[platform] ?? DEFAULT_TERMINAL_PASTE_BOX_MODE;
 }
 
 export function terminalBindingsFor(
@@ -159,16 +180,17 @@ export function terminalHardwareKeyAction(
   const bindingBytes = terminalBindingBytes(input, preferences, platform);
   if (bindingBytes !== undefined) return { bytes: bindingBytes };
 
-  if (
-    logical.remapped &&
-    logical.cmd &&
-    !logical.ctrl &&
-    !logical.alt &&
-    !logical.shift &&
-    clipboard
-  ) {
-    if (logical.key.toLowerCase() === "v") return { clipboard: "paste" };
-    if (logical.key.toLowerCase() === "c" && clipboard.hasSelection()) {
+  if (logical.cmd && !logical.ctrl && !logical.alt && !logical.shift && clipboard) {
+    const key = logical.key.toLowerCase();
+    // Preserve browser-native Cmd+V on Mac unless the user opted into the editor.
+    if (
+      key === "v" &&
+      (logical.remapped ||
+        (platform === "macos" && terminalPasteBoxModeFor(preferences, platform) === "always"))
+    ) {
+      return { clipboard: "paste" };
+    }
+    if (logical.remapped && key === "c" && clipboard.hasSelection()) {
       return { clipboard: "copy" };
     }
   }
