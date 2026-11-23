@@ -172,20 +172,20 @@ def _terminal_binding_chords(
 
 
 def _check_terminal_binding_conflicts(
-    previous: Any, keyboard: dict[str, Any], edited: dict[str, set[str]]
+    previous: Any, keyboard: dict[str, Any], edited: dict[str, dict[str, int]]
 ) -> None:
     for platform, actions in edited.items():
         chords = {
             action: _terminal_binding_chords(keyboard, action, platform)
             for action in _TERMINAL_KEYBOARD_BINDINGS
         }
-        for action in sorted(actions):
+        for action in sorted(actions, key=actions.__getitem__, reverse=True):
             added = chords[action] - _terminal_binding_chords(previous, action, platform)
             for other, other_chords in chords.items():
                 if other != action and added & other_chords:
                     label = _TERMINAL_KEYBOARD_BINDINGS[other][0]
-                    raise UserPreferencesValidationError(
-                        f"That shortcut is already used by {label}."
+                    raise TerminalKeyboardConflictError(
+                        actions[action], f"That shortcut is already used by {label}."
                     )
 
 
@@ -219,8 +219,8 @@ def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, 
     keyboard: dict[str, Any] = (
         deepcopy(stored) if isinstance(stored, dict) and stored.get("v") == 1 else {"v": 1}
     )
-    edited_bindings: dict[str, set[str]] = {}
-    for change in changes:
+    edited_bindings: dict[str, dict[str, int]] = {}
+    for index, change in enumerate(changes):
         if not isinstance(change, dict) or "value" not in change:
             raise UserPreferencesValidationError("Invalid terminal keyboard change")
         platform, field, value = change.get("platform"), change.get("field"), change["value"]
@@ -257,7 +257,7 @@ def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, 
                 overrides.pop(platform, None)
             else:
                 overrides[platform] = value
-            edited_bindings.setdefault(platform, set()).add(field)
+            edited_bindings.setdefault(platform, {})[field] = index
         else:
             raise UserPreferencesValidationError("Invalid terminal keyboard field")
     _check_terminal_binding_conflicts(stored, keyboard, edited_bindings)
@@ -327,6 +327,12 @@ def read_worktree_archive_mode(
 
 class UserPreferencesValidationError(ValueError):
     """A preferences payload violates the persisted envelope contract."""
+
+
+class TerminalKeyboardConflictError(UserPreferencesValidationError):
+    def __init__(self, change_index: int, message: str) -> None:
+        super().__init__(message)
+        self.change_index = change_index
 
 
 class UserPreferencesUserNotFoundError(LookupError):

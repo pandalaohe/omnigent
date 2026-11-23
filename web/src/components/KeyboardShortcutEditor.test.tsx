@@ -189,7 +189,14 @@ describe("KeyboardShortcutEditor", () => {
     const winner = { platformOverrides: { macos: [{ code: "F8", modifiers: [] }] } };
     const fetcher = vi
       .fn()
-      .mockResolvedValueOnce(Response.json({ detail: reason }, { status: 422 }))
+      .mockResolvedValueOnce(
+        Response.json(
+          {
+            detail: { code: "terminal_keyboard_conflict", change_index: 0, message: reason },
+          },
+          { status: 422 },
+        ),
+      )
       .mockResolvedValueOnce(
         Response.json({
           user_id: "alice",

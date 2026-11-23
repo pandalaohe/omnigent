@@ -720,10 +720,24 @@ async def test_terminal_keyboard_rejects_stale_conflicting_binding(
         saved = await a.patch(route, json=patch(first, ["primary"]))
         assert saved.status_code == 200
         # Primary and Meta match the same chord on macOS.
-        rejected = await b.patch(route, json=patch(second, ["meta"]))
+        batch = patch(second, ["meta"])
+        paste = {"platform": "linux", "field": "pasteBoxMode", "value": "always"}
+        batch["terminal_keyboard"]["changes"].insert(0, paste)
+        rejected = await b.patch(route, json=batch)
         assert rejected.status_code == 422
-        assert rejected.json()["detail"] == f"That shortcut is already used by {used_by}."
+        detail = rejected.json()["detail"]
+        assert detail == {
+            "code": "terminal_keyboard_conflict",
+            "change_index": 1,
+            "message": f"That shortcut is already used by {used_by}.",
+        }
         assert (await b.get("/v1/me")).json()["preferences"] == saved.json()
+
+        batch["terminal_keyboard"]["changes"].pop(detail["change_index"])
+        retried = await b.patch(route, json=batch)
+        assert retried.status_code == 200
+        keyboard = retried.json()["settings"]["mobile_assistant"]["terminalKeyboard"]
+        assert keyboard["pasteBoxMode"] == {"linux": "always"}
 
         separate_platform = await b.patch(route, json=patch(second, ["primary"], "windows"))
         assert separate_platform.status_code == 200
@@ -734,6 +748,21 @@ async def test_terminal_keyboard_rejects_stale_conflicting_binding(
             first: {"platformOverrides": {"macos": [{"code": "F8", "modifiers": ["primary"]}]}},
             second: {"platformOverrides": {"windows": [{"code": "F8", "modifiers": ["primary"]}]}},
         }
+
+
+@pytest.mark.asyncio
+async def test_terminal_keyboard_patch_model_error_uses_current_server_detail(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    transport = httpx.ASGITransport(app=_preferences_app(db_uri, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        rejected = await client.patch(
+            "/v1/me/preferences/mobile_assistant",
+            headers={"x-test-user": "alice@example.com"},
+            json={"value": {}, "terminal_keyboard": []},
+        )
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": "Invalid preference update"}
 
 
 @pytest.mark.asyncio

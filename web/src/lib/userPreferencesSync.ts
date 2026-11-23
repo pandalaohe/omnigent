@@ -451,6 +451,16 @@ function pendingMobilePatch(current: unknown, acknowledged: unknown): unknown {
   return Object.keys(fields).length ? fields : null;
 }
 
+function withoutTerminalKeyboardChange(current: unknown, rejected: TerminalKeyboardChange) {
+  const { fields, keyboard } = splitMobilePatch(current);
+  // An edit to the same field made during the request may have a different value.
+  const changes = keyboard?.changes.filter(
+    (change) => JSON.stringify(change) !== JSON.stringify(rejected),
+  );
+  if (changes?.length) return { ...fields, terminal_keyboard: { ...keyboard, changes } };
+  return Object.keys(fields).length ? fields : null;
+}
+
 function sessionCollabSyncValue(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const raw = value as Record<string, unknown>;
@@ -775,22 +785,21 @@ function announceRejectedNamespace(
   );
 }
 
-/**
- * A 422 is permanent for a namespace: cancel any queued work, drop the dirty
- * mark, restore the last Server value (absent → remove the local key) exactly
- * as hydration does, and announce the rejection. No retry is scheduled.
- */
-function discardRejectedNamespace(
-  namespace: UserPreferenceNamespace,
-  detail?: unknown,
-  terminalKeyboard = false,
-): void {
+function cancelQueuedPatch(namespace: UserPreferenceNamespace): void {
   const queuedTimer = pendingTimers.get(namespace);
   if (queuedTimer !== undefined) {
     window.clearTimeout(queuedTimer);
     pendingTimers.delete(namespace);
   }
   patchesAfterFlight.delete(namespace);
+}
+
+function discardRejectedNamespace(
+  namespace: UserPreferenceNamespace,
+  detail?: unknown,
+  terminalKeyboard = false,
+): void {
+  cancelQueuedPatch(namespace);
   const serverValue = lastServerValues.get(namespace) ?? null;
   clearDirty(namespace);
   lastAcknowledged.set(namespace, serializedNamespaceValue(namespace, serverValue));
@@ -845,36 +854,64 @@ function schedulePatch(
           if (response?.status === 422) {
             const body = await response.json().catch(() => null);
             if (!isCurrentPreferenceGeneration(generation)) return;
+            const detail = body?.detail;
+            const terminalKeyboard = mobile?.keyboard !== undefined;
+            if (terminalKeyboard && detail === "Invalid preferences payload") {
+              // A rolled-back server rejects the extra request field. Leave the
+              // dirty records for the next refresh or connection to replay.
+              cancelQueuedPatch(namespace);
+              return;
+            }
+            const rejected =
+              detail?.code === "terminal_keyboard_conflict" &&
+              Number.isInteger(detail.change_index) &&
+              typeof detail.message === "string"
+                ? mobile?.keyboard?.changes[detail.change_index]
+                : undefined;
+            const reason = rejected ? detail.message : detail;
             settlePatchWaiters(
               namespace,
               serialized,
               Object.assign(
                 new Error(
-                  typeof body?.detail === "string"
-                    ? body.detail
-                    : "The server rejected these settings (422).",
+                  typeof reason === "string" ? reason : "The server rejected these settings (422).",
                 ),
                 { status: 422 },
               ),
             );
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
-            const terminalKeyboard = mobile?.keyboard !== undefined;
-            if (currentSerialized !== serialized) {
-              // A newer local edit arrived while this patch was in flight: send
-              // the newest value next (a stale queued patch could cancel its timer).
-              markDirty(namespace, current);
+            const retained = rejected ? readDirtyValue(namespace) : undefined;
+            const retry = rejected
+              ? withoutTerminalKeyboardChange(retained?.value, rejected)
+              : current;
+            const retryPending = retained
+              ? retry !== null || (retained.found && retained.value === null)
+              : currentSerialized !== serialized;
+            if (retryPending) {
+              markDirty(namespace, retry);
               patchesAfterFlight.set(namespace, {
-                syncValue: current,
-                serialized: currentSerialized,
+                syncValue: retry,
+                serialized: serializedNamespaceValue(namespace, retry),
                 delayMs: 0,
                 attempt: 0,
               });
-              announceRejectedNamespace(namespace, body?.detail, terminalKeyboard);
+              if (rejected) {
+                applyingServerPreferences = true;
+                try {
+                  applyNamespace(
+                    namespace,
+                    applyMobilePatch(lastServerValues.get(namespace), retry),
+                  );
+                } finally {
+                  applyingServerPreferences = false;
+                }
+              }
+              announceRejectedNamespace(namespace, reason, terminalKeyboard);
             } else {
-              discardRejectedNamespace(namespace, body?.detail, terminalKeyboard);
+              discardRejectedNamespace(namespace, reason, terminalKeyboard);
+              if (terminalKeyboard) void refreshUserPreferencesFromServer();
             }
-            if (terminalKeyboard) void refreshUserPreferencesFromServer();
             return;
           }
           if (!response?.ok) throw new Error("preference patch failed");
@@ -903,10 +940,7 @@ function schedulePatch(
             const deletePending = current === null && currentSerialized !== serialized;
             if (remaining === null && !deletePending) {
               clearDirty(namespace);
-              patchesAfterFlight.delete(namespace);
-              const queuedTimer = pendingTimers.get(namespace);
-              if (queuedTimer !== undefined) window.clearTimeout(queuedTimer);
-              pendingTimers.delete(namespace);
+              cancelQueuedPatch(namespace);
               lastAcknowledged.set(
                 namespace,
                 serializedNamespaceValue(namespace, lastServerValues.get(namespace)),
