@@ -457,9 +457,9 @@ def _codex_mcp_server_config_section(
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
-        # Codex defaults to 60s; the relay can dispatch for 300s and needs
-        # time to return its result or its own timeout diagnosis.
-        f"tool_timeout_sec = 330\n"
+        # Codex sets this per MCP server. Allow the longest relay budget
+        # (sys_session_update) to finish and return its result.
+        f"tool_timeout_sec = 1110\n"
         f"args = [{args_toml}]\n"
         f"env = {{ {DATA_DIR_ENV_VAR} = {json.dumps(str(relay_data_dir))} }}\n\n"
         f"{approvals}"

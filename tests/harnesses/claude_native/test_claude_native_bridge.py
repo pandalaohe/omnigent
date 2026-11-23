@@ -10403,6 +10403,66 @@ async def test_session_create_relay_waits_for_created_handle(
 
 
 @pytest.mark.asyncio
+async def test_session_update_relay_waits_for_single_slow_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.session_projects import execute_session_update
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(
+        claude_native_bridge, "_SESSION_UPDATE_TOOL_CALL_TIMEOUT_S", 3.0, raising=False
+    )
+    source_id, target_id = "a" * 32, "b" * 32
+    requests: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_settings_source_checks": True})
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4})
+        await asyncio.sleep(0.25)
+        return httpx.Response(200, json={"model_override": "host-model"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def execute(name: str, arguments: dict[str, object]) -> object:
+            assert name == "sys_session_update"
+            return json.loads(await execute_session_update(arguments, client, source_id))
+
+        bridge_dir = tmp_path / "bridge"
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[{"name": "sys_session_update", "parameters": {}}],
+            tool_executor=execute,
+            loop=asyncio.get_running_loop(),
+        )
+        try:
+            result = await asyncio.to_thread(
+                claude_native_bridge._call_relay_tool,
+                bridge_dir,
+                "sys_session_update",
+                {"session_id": target_id, "model": "host-model"},
+            )
+        finally:
+            relay.close()
+
+    assert not result.get("isError"), result
+    assert json.loads(result["content"][0]["text"]) == {
+        "session_id": target_id,
+        "status": "updated",
+        "model": "host-model",
+    }
+    assert requests == [
+        ("GET", "/v1/info"),
+        ("GET", f"/v1/sessions/{target_id}"),
+        ("PATCH", f"/v1/sessions/{target_id}"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_relay_names_empty_dispatch_exception() -> None:
     async def execute(name: str, arguments: dict[str, Any]) -> object:
         raise TimeoutError()
