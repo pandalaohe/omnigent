@@ -2160,6 +2160,27 @@ describe("chatStore — switchTo", () => {
     expect(bubble).not.toHaveProperty("sendingSinceMs");
   });
 
+  it("lets an exact history receipt supersede a stale native pending snapshot", async () => {
+    const id = "conv_native_snapshot_receipt";
+    const committed = {
+      ...userMessage("persisted_native_turn", "same prompt"),
+      web_stable_id: "a".repeat(32),
+    };
+    const content = [{ type: "input_text" as const, text: "same prompt" }];
+    const unreadId = "b".repeat(32);
+    seedSession(id, [committed]);
+    seedPendingInputs(id, [
+      { pending_id: "pending_settled", stable_id: committed.web_stable_id, content },
+      { pending_id: "pending_unread", stable_id: unreadId, content },
+    ]);
+
+    await useChatStore.getState().switchTo(id);
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      { tempId: "pending_unread", stableId: unreadId, content },
+    ]);
+  });
+
   it("replays the server send time for a native message waiting for delivery", async () => {
     seedSession("conv_native", []);
     const waiting = {
@@ -20052,6 +20073,71 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    { alreadyShown: false, unreadOnServer: false },
+    { alreadyShown: true, unreadOnServer: true },
+  ])(
+    "uses a persisted native send id to settle only its bubble on reconnect ($alreadyShown, $unreadOnServer)",
+    async ({ alreadyShown, unreadOnServer }) => {
+      const id = "conv_native_plain_text_receipt";
+      const before = userMessage("before_receipt_gap", "before the gap");
+      const settled = {
+        tempId: "settled-bubble",
+        pendingId: "pending-settled",
+        stableId: "a".repeat(32),
+        content: [{ type: "input_text" as const, text: "same prompt" }],
+        posted: true,
+        sentMidTurn: true,
+      };
+      const unread = {
+        ...settled,
+        tempId: "unread-bubble",
+        pendingId: "pending-unread",
+        stableId: "b".repeat(32),
+      };
+      const committed = {
+        ...userMessage("native_plain_text_turn", "same prompt"),
+        web_stable_id: settled.stableId,
+      };
+      const reply = assistantMessage("native_plain_text_turn", "the reply");
+      seedSession(id, alreadyShown ? [before, committed, reply] : [before]);
+      seedPendingInputs(
+        id,
+        unreadOnServer
+          ? [{ pending_id: unread.pendingId, stable_id: unread.stableId, content: unread.content }]
+          : [],
+      );
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: itemsToBlocks(alreadyShown ? [before, committed, reply] : [before]),
+        pendingUserMessages: [unread, settled],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+      seedSessionItems(id, [before, committed, reply]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        before.id,
+        committed.id,
+        reply.id,
+      ]);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([unread]);
+    },
+  );
 
   it.each(
     (["shell", "command", "skill", "queued"] as const).flatMap((kind) =>

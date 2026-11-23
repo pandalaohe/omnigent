@@ -6007,6 +6007,7 @@ async function bindStream(
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     const reloadedSend = hydratePending ? restoredSendAfterReload(id, items) : null;
+    const persistedSendIds = new Set(confirmedWebSendIds(items));
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(
@@ -6063,9 +6064,7 @@ async function bindStream(
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
-      // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
+      // Rebind preserves live pending sends unless history names their send id.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -6132,7 +6131,7 @@ async function bindStream(
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
         blocks: reconcileDeliveryCards(syntheticError ? [...allBlocks, syntheticError] : allBlocks),
-        pendingUserMessages: snapshotPending,
+        pendingUserMessages: withoutPersistedPendingSends(snapshotPending, persistedSendIds),
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
           : {}),
@@ -7127,6 +7126,7 @@ async function rehydrateWindowOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = committedSendIdsOf(fresh.items);
   const deliveryProof = confirmedWebSendIds(settlementItems);
+  const persistedSendIds = new Set(deliveryProof);
   for (const stableId of deliveryProof) {
     freshItemIds.add(stableId);
     recordInFlightNativeDelivery(id, stableId);
@@ -7160,6 +7160,7 @@ async function rehydrateWindowOnReconnect(
     const pendingPatch = recoveredPendingInputPatch(
       s,
       settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+      persistedSendIds,
       pendingAtReconnectStart,
       session.pendingInputs,
     );
@@ -7339,6 +7340,7 @@ async function reconcileOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = committedSendIdsOf(items);
   const deliveryProof = confirmedWebSendIds(items);
+  const persistedSendIds = new Set(deliveryProof);
   for (const stableId of deliveryProof) recordInFlightNativeDelivery(id, stableId);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
@@ -7362,6 +7364,7 @@ async function reconcileOnReconnect(
       recoveredPendingInputPatch(
         s,
         settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+        persistedSendIds,
         pendingAtReconnectStart,
         session.pendingInputs,
       ),
@@ -9694,10 +9697,19 @@ function syncPendingSendTimes(
   });
 }
 
-// Lost stream receipts have durable equivalents in the recovered input blocks.
+function withoutPersistedPendingSends(
+  messages: PendingUserMessage[],
+  persistedSendIds: ReadonlySet<string>,
+): PendingUserMessage[] {
+  if (persistedSendIds.size === 0) return messages;
+  return messages.filter((pending) => !pending.stableId || !persistedSendIds.has(pending.stableId));
+}
+
+// Named receipts can be recovered even if the user item is already on screen.
 function recoveredPendingInputPatch(
   s: PendingInputState,
   recovered: AnyBlock[],
+  persistedSendIds: ReadonlySet<string>,
   pendingAtReconnectStart: Set<string>,
   serverInputs: PendingInput[] | undefined,
 ): PendingInputState {
@@ -9706,7 +9718,7 @@ function recoveredPendingInputPatch(
     p !== undefined && pendingById.has(p.pendingId ?? p.tempId);
   let state: PendingInputState = {
     pendingUserMessages: syncPendingSendTimes(
-      s.pendingUserMessages.filter(
+      withoutPersistedPendingSends(s.pendingUserMessages, persistedSendIds).filter(
         (p) =>
           serverInputs === undefined ||
           !pendingAtReconnectStart.has(p.tempId) ||
@@ -9730,7 +9742,11 @@ function recoveredPendingInputPatch(
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && messageContentText(p.content) === text,
       );
-    } else if (block.type === "user_message" && !isSystemUserContent(block.content)) {
+    } else if (
+      block.type === "user_message" &&
+      !block.ctx.webStableId &&
+      !isSystemUserContent(block.content)
+    ) {
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && block.ctx.itemId && (p.stableId ?? p.tempId) === block.ctx.itemId,
       );

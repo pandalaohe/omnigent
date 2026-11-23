@@ -5864,6 +5864,17 @@ async def _persist_external_conversation_item_unlocked(
     _publish_persisted_external_item(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
+    if drains_pending_inputs and isinstance(persisted.data, MessageData):
+        log_input_event(
+            _logger,
+            "native_input_consumed_published",
+            session_id=session_id,
+            attributes={"item_id": persisted.id},
+            response_id=persisted.response_id,
+            matched_pending_id=cleared_pending_id,
+            input_stable_id=persisted.data.web_stable_id,
+            match_method=match_method,
+        )
     await _drive_terminal_resolved_elicitation_from_store(
         session_id, persisted, conversation_store
     )
