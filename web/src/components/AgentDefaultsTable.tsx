@@ -65,7 +65,7 @@ const LEGACY_EFFORT_FAMILIES: Readonly<Record<string, string>> = {
   "codex-native": "codex-native",
   "pi-native": "pi",
   pi: "pi",
-  "antigravity-native": "gemini",
+  "antigravity-native": "antigravity",
   "devin-native": "anthropic",
 };
 

@@ -4524,6 +4524,58 @@ def test_agy_slash_command_requires_fresh_confirmation(
         == "⎿  Model set to Claude Sonnet 5.5 (Medium)"
     )
     assert commands == ["/model claude-sonnet-5-5-medium"]
+    assert (
+        _mod.parse_agy_footer_model(agy_controls_captures["model-effort"]) == "Claude Sonnet 5.5"
+    )
+
+
+def test_agy_slash_command_validates_same_capture_within_timeout_budget(
+    tmp_path, monkeypatch, _fast_tmux_timeouts
+):
+    """P1/P2: validation reuses captures inside timeout_s and blocks Hydrogen -> Opus."""
+    clock = [0.0]
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="main")
+    panes = [
+        "> \n? for shortcuts    Gemini 4 Hydrogen · high\n",
+        "> \n? for shortcuts    Claude Opus 5.5 · high\n",
+    ]
+    capture_index = [0]
+    calls: list[tuple[list[str], float]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        calls.append((cmd, float(timeout)))
+        if "capture-pane" in cmd:
+            pane = panes[min(capture_index[0], len(panes) - 1)]
+            capture_index[0] += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    def require_hydrogen(pane: str) -> None:
+        if _mod.parse_agy_footer_model(pane) != "Gemini 4 Hydrogen":
+            raise ValueError("unsupported model")
+
+    with pytest.raises(ValueError, match="unsupported model"):
+        _mod.run_agy_slash_command(
+            tmp_path,
+            "/effort xhigh",
+            expect="Effort set to xhigh",
+            timeout_s=3.0,
+            validate_baseline=require_hydrogen,
+        )
+
+    assert calls
+    assert all(timeout <= 3.0 for _, timeout in calls)
+    assert not any(
+        "load-buffer" in cmd or "paste-buffer" in cmd or cmd[-1] == "Enter" for cmd, _ in calls
+    )
 
 
 def test_agy_agent_mode_cycles_captured_footers(tmp_path, monkeypatch, agy_controls_captures):

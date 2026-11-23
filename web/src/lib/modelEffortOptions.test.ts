@@ -109,10 +109,58 @@ describe("reconcileStartEffortOnModelChange", () => {
 
 it("filters Antigravity efforts per model and clears an unsupported pick", () => {
   const models = [
-    { id: "claude-sonnet-5-5", efforts: ["low", "medium", "high", "max"] },
-    { id: "gpt-oss", efforts: ["medium"] },
+    {
+      id: "gemini-4-hydrogen",
+      displayName: "Gemini 4 Hydrogen",
+      efforts: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      efforts: ["low", "medium", "high", "max"],
+    },
+    {
+      id: "claude-opus-5-5",
+      displayName: "Claude Opus 5.5",
+      efforts: ["low", "medium", "high"],
+    },
+    { id: "gpt-oss", displayName: "GPT-OSS", efforts: ["medium"] },
   ];
+  expect(effortLevelsFor("antigravity-native", models, "gemini-4-hydrogen")).toEqual([
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "Gemini 4 Hydrogen (High)")).toEqual([
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "Gemini 4 Hydrogen (XHigh)")).toEqual([
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "gemini-4-hydrogen-high")).toEqual([
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
   expect(effortLevelsFor("antigravity-native", models, "claude-sonnet-5-5")).toEqual([
+    "low",
+    "medium",
+    "high",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "claude-opus-5-5")).toEqual([
+    "low",
+    "medium",
+    "high",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "Claude Opus 5.5 (High)")).toEqual([
     "low",
     "medium",
     "high",
@@ -121,4 +169,16 @@ it("filters Antigravity efforts per model and clears an unsupported pick", () =>
   expect(effortLevelsFor("antigravity-native", rows, "model-b")).toEqual(["medium"]);
   expect(effortLevelsFor("antigravity-native", models, "unknown")).toEqual([]);
   expect(reconcileEffortOnModelChange("antigravity-native", models, "gpt-oss", "high")).toBeNull();
+  expect(
+    reconcileEffortOnModelChange("antigravity-native", models, "claude-opus-5-5", "xhigh"),
+  ).toBeNull();
+  expect(
+    reconcileEffortOnModelChange("antigravity-native", models, "Claude Opus 5.5 (High)", "xhigh"),
+  ).toBeNull();
+  expect(
+    reconcileEffortOnModelChange("antigravity-native", models, "gemini-4-hydrogen", "xhigh"),
+  ).toBe("xhigh");
+  expect(
+    reconcileEffortOnModelChange("antigravity-native", models, "Gemini 4 Hydrogen (High)", "xhigh"),
+  ).toBe("xhigh");
 });

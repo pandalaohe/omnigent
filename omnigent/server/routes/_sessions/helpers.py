@@ -3855,6 +3855,10 @@ class _LiveSettingsChange:
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
+        # Silent mirror writes must remain possible while a live request waits
+        # on the runner, but their DB write + sequence note cannot interleave
+        # with a conditional reconciliation commit and its stream event.
+        self.write_lock = asyncio.Lock()
         self._position = 0
         # Setting → (position, value) of the latest write by another request.
         self._writes: dict[str, tuple[int, str | None]] = {}
@@ -3928,23 +3932,27 @@ async def _persist_external_reasoning_effort_change(
     :returns: None.
     """
     effort = _validate_external_reasoning_effort(body)
-    if conv.reasoning_effort == effort:
-        # The terminal still reports what it runs when the saved value matches.
-        _note_settings_write(session_id, {"reasoning_effort": effort})
-        return
-    await asyncio.to_thread(
-        conversation_store.update_conversation,
-        session_id,
-        reasoning_effort=effort,
-        _unset_reasoning_effort=effort is None,
-    )
-    _note_settings_write(session_id, {"reasoning_effort": effort})
-    event = SessionReasoningEffortEvent(
-        type="session.reasoning_effort",
-        conversation_id=session_id,
-        reasoning_effort=effort,
-    )
-    session_stream.publish(session_id, event.model_dump())
+    change = _live_settings_change(session_id)
+    async with change.write_lock:
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        current_effort = current.reasoning_effort if current is not None else conv.reasoning_effort
+        if current_effort == effort:
+            # The terminal still reports what it runs when the saved value matches.
+            change.note_write("reasoning_effort", effort)
+            return
+        await asyncio.to_thread(
+            conversation_store.update_conversation,
+            session_id,
+            reasoning_effort=effort,
+            _unset_reasoning_effort=effort is None,
+        )
+        change.note_write("reasoning_effort", effort)
+        event = SessionReasoningEffortEvent(
+            type="session.reasoning_effort",
+            conversation_id=session_id,
+            reasoning_effort=effort,
+        )
+        session_stream.publish(session_id, event.model_dump())
 
 
 async def _persist_external_codex_collaboration_mode_change(

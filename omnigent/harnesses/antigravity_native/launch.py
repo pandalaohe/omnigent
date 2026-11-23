@@ -38,12 +38,14 @@ from __future__ import annotations
 import logging
 import secrets
 import shutil
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
+from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -59,6 +61,28 @@ _AGY_INSTALL_HINT = (
     "Install agy via the Antigravity installer script:\n"
     "  curl -fsSL https://antigravity.google/cli/install.sh | bash\n"
     "Then restart your shell so ~/.local/bin is on PATH."
+)
+# Value-taking options reported by ``agy --help`` plus the two hidden options
+# Omnigent owns. Their following token stays opaque even when it resembles one
+# of the model/effort flags extracted below.
+_AGY_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--conversation",
+        "--csrf_token",
+        "--effort",
+        "--gemini_dir",
+        "--input-format",
+        "--json-schema",
+        "--log-file",
+        "--mode",
+        "--model",
+        "--output-format",
+        "--print-timeout",
+        "--project",
+        "--settings",
+    }
 )
 
 
@@ -160,6 +184,86 @@ def should_skip_permissions(
     return headless
 
 
+def _is_xhigh_effort(effort: str | None) -> bool:
+    """Return whether *effort* is ``xhigh`` or one of its higher aliases."""
+    return effort is not None and EFFORT_ALIASES.get(effort, effort) == "xhigh"
+
+
+def _extract_model_and_effort_from_extra_args(
+    extra_args: tuple[str, ...],
+) -> tuple[str | None, str | None, tuple[str, ...], bool, bool]:
+    """Strip ``--model`` and ``--effort`` (split or ``=`` forms) from *extra_args*.
+
+    Stops parsing flags at ``--`` so positional arguments are preserved verbatim.
+    When repeated, the last occurrence wins, matching CLI flag semantics.
+    """
+    extracted_model: str | None = None
+    extracted_effort: str | None = None
+    remaining: list[str] = []
+    skip_permissions_seen = False
+    csrf_token_seen = False
+    xhigh_seen = False
+    idx = 0
+    while idx < len(extra_args):
+        arg = extra_args[idx]
+        if arg == "--":
+            remaining.extend(extra_args[idx:])
+            break
+        if arg == "--model":
+            if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
+                val = extra_args[idx + 1]
+                extracted_model = val if val else None
+                if val and _is_xhigh_effort(split_agy_effort_suffix(val)[1]):
+                    xhigh_seen = True
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("--model="):
+            val = arg.partition("=")[2]
+            extracted_model = val if val else None
+            if val and _is_xhigh_effort(split_agy_effort_suffix(val)[1]):
+                xhigh_seen = True
+            idx += 1
+            continue
+        if arg == "--effort":
+            if idx + 1 < len(extra_args) and extra_args[idx + 1] != "--":
+                val = extra_args[idx + 1]
+                extracted_effort = val if val else None
+                if _is_xhigh_effort(val):
+                    xhigh_seen = True
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("--effort="):
+            val = arg.partition("=")[2]
+            extracted_effort = val if val else None
+            if _is_xhigh_effort(val):
+                xhigh_seen = True
+            idx += 1
+            continue
+        if arg == _SKIP_PERMISSIONS_FLAG:
+            if not skip_permissions_seen:
+                remaining.append(arg)
+                skip_permissions_seen = True
+            idx += 1
+            continue
+        if arg == "--csrf_token" or arg.startswith("--csrf_token="):
+            csrf_token_seen = True
+        remaining.append(arg)
+        if (
+            arg in _AGY_OPTIONS_WITH_VALUE
+            and idx + 1 < len(extra_args)
+            and extra_args[idx + 1] != "--"
+        ):
+            remaining.append(extra_args[idx + 1])
+            idx += 2
+            continue
+        idx += 1
+    return extracted_model, extracted_effort, tuple(remaining), csrf_token_seen, xhigh_seen
+
+
 def build_agy_launch(
     *,
     conversation_id: str | None,
@@ -168,6 +272,7 @@ def build_agy_launch(
     effort: str | None = None,
     extra_args: tuple[str, ...] = (),
     log_dir: Path | None = None,
+    catalog_models: Iterable[Mapping[str, object]] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Build the argv and environment overrides for an agy launch.
 
@@ -204,6 +309,8 @@ def build_agy_launch(
     :param extra_args: Additional raw CLI args appended after all generated
         flags, e.g. ``("--print-timeout", "30")``.
     :param log_dir: Private directory for this launch's RPC discovery log.
+    :param catalog_models: Optional agy model-catalog snapshot used to require
+        explicit per-model ``xhigh`` support when a row is present.
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
@@ -213,10 +320,34 @@ def build_agy_launch(
     :raises OmnigentError: When saved credentials need repair through setup.
     :raises RuntimeError: When the agy executable cannot be found.
     """
-    launch = resolve_native_antigravity_launch(model=model)
-    model = launch.model
+    (
+        extra_model,
+        extra_effort,
+        remaining_extra_args,
+        csrf_token_seen,
+        extra_has_xhigh,
+    ) = _extract_model_and_effort_from_extra_args(extra_args)
+    model_suffix = split_agy_effort_suffix(model)[1] if model is not None else None
+    rewrite_model_and_effort = (
+        _is_xhigh_effort(effort) or _is_xhigh_effort(model_suffix) or extra_has_xhigh
+    )
+    launch = resolve_native_antigravity_launch(
+        model=extra_model if rewrite_model_and_effort and extra_model is not None else model
+    )
+    if (
+        not rewrite_model_and_effort
+        and launch.model is not None
+        and _is_xhigh_effort(split_agy_effort_suffix(launch.model)[1])
+    ):
+        rewrite_model_and_effort = True
+        if extra_model is not None:
+            launch = NativeAntigravityLaunch(
+                auth_mode=launch.auth_mode,
+                model=extra_model,
+                extra_env=launch.extra_env,
+            )
     argv: list[str] = [agy_binary_path()]
-    if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
+    if not csrf_token_seen:
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if log_dir is not None:
         argv.append(f"--log-file={log_dir / f'agy-{secrets.token_hex(16)}.log'}")
@@ -224,12 +355,54 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
-    if model is not None:
-        argv.extend(["--model", split_agy_effort_suffix(model)[0] if effort else model])
-    if effort is not None:
-        argv.extend(["--effort", effort])
-    for arg in extra_args:
-        if arg != _SKIP_PERMISSIONS_FLAG or arg not in argv:
+    if not rewrite_model_and_effort:
+        if launch.model is not None:
+            argv.extend(
+                [
+                    "--model",
+                    split_agy_effort_suffix(launch.model)[0] if effort else launch.model,
+                ]
+            )
+        if effort is not None:
+            argv.extend(["--effort", effort])
+        skip_permissions_seen = False
+        for idx, arg in enumerate(extra_args):
+            if arg == "--":
+                argv.extend(extra_args[idx:])
+                break
+            if arg == _SKIP_PERMISSIONS_FLAG:
+                if skip_permissions_seen:
+                    continue
+                skip_permissions_seen = True
             argv.append(arg)
+        return argv, launch.extra_env
+    final_model = launch.model
+    final_effort = extra_effort if extra_effort is not None else effort
+    if final_model is not None:
+        base_model, suffix_effort = split_agy_effort_suffix(final_model)
+        if final_effort:
+            final_effort = clamp_antigravity_effort(
+                final_effort, base_model, catalog_models=catalog_models
+            )
+            argv.extend(["--model", base_model])
+        elif suffix_effort is not None:
+            clamped_suffix = clamp_antigravity_effort(
+                suffix_effort, base_model, catalog_models=catalog_models
+            )
+            argv.extend(
+                [
+                    "--model",
+                    f"{base_model}-{clamped_suffix}"
+                    if clamped_suffix != suffix_effort
+                    else final_model,
+                ]
+            )
+        else:
+            argv.extend(["--model", final_model])
+    elif final_effort:
+        final_effort = clamp_antigravity_effort(final_effort, None, catalog_models=catalog_models)
+    if final_effort is not None:
+        argv.extend(["--effort", final_effort])
+    argv.extend(remaining_extra_args)
 
     return argv, launch.extra_env

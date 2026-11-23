@@ -16,12 +16,15 @@ import pytest
 
 from omnigent.util.reasoning_effort import (
     ANTHROPIC_EFFORTS,
+    ANTIGRAVITY_EFFORTS,
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
     DEFAULT_MODEL_EFFORT_CAPS,
     EFFORT_VALUES,
+    GEMINI_EFFORTS,
     PI_EFFORTS,
     ModelEffortCaps,
+    clamp_antigravity_effort,
     clamp_effort_for_model,
     effort_for_model_switch,
     model_effort_caps,
@@ -236,11 +239,14 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     returns ``None`` (callers cannot classify it, so a filter must pass the
     value through rather than drop what a plugin harness might accept).
     """
-    from omnigent.util.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
+    from omnigent.util.reasoning_effort import efforts_for_harness
 
     assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
     assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
-    assert efforts_for_harness("antigravity-native") == GEMINI_EFFORTS
+    assert efforts_for_harness("antigravity-native") == ANTIGRAVITY_EFFORTS
+    assert set(ANTIGRAVITY_EFFORTS) == {"low", "medium", "high", "xhigh"}
+    # Gemini-family harnesses other than Antigravity keep the 3-level ladder.
+    assert set(GEMINI_EFFORTS) == {"low", "medium", "high"}
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS
@@ -261,3 +267,110 @@ def test_efforts_for_harness_resolves_aliases() -> None:
 
     canonical = canonicalize_harness("claude-code") or "claude-code"
     assert efforts_for_harness("claude-code") == efforts_for_harness(canonical)
+
+
+@pytest.mark.parametrize("model", ["gemini-4-neon", "gemini-4-hydrogen"])
+@pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
+def test_antigravity_caps_keep_xhigh_for_gemini_4_models_that_offer_it(
+    model: str, effort: str
+) -> None:
+    """Gemini 4 Neon and Hydrogen support xhigh and its aliases."""
+    assert clamp_antigravity_effort(effort, model) == "xhigh"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5-5",
+        "claude-opus-5.5",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5.5",
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+    ],
+)
+@pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
+def test_antigravity_caps_clamp_above_high_for_high_only_models(model: str, effort: str) -> None:
+    """Antigravity models capped at high never receive xhigh/max/ultra."""
+    assert clamp_antigravity_effort(effort, model) == "high"
+
+
+def test_antigravity_caps_clamp_gpt_oss_to_medium_and_leave_default_caps_unchanged() -> None:
+    """GPT-OSS xhigh falls back to medium; default caps leave Claude 5.5 alone."""
+    assert clamp_antigravity_effort("xhigh", "gpt-oss-120b") == "medium"
+    # Anthropic/Claude harnesses use the default table and must not lose xhigh/max on 5.5.
+    assert clamp_effort_for_model("xhigh", "claude-opus-5-5") == "xhigh"
+    assert clamp_effort_for_model("xhigh", "claude-sonnet-5-5") == "xhigh"
+    # A gateway routing.effort_caps override does not weaken Antigravity's per-model cap.
+    from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
+
+    settings = RoutingSettings(
+        **parse_routing_tables(
+            {"effort_caps": {"gpt-5.6-sol": {"fallback": "medium", "unsupported": ["xhigh"]}}}
+        )
+    )
+    with patch("omnigent.runtime._globals._caps", new=SimpleNamespace(routing_settings=settings)):
+        assert clamp_antigravity_effort("xhigh", "claude-opus-5-5") == "high"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_antigravity_clamp_preserves_ordinary_efforts(effort: str) -> None:
+    assert clamp_antigravity_effort(effort, "gpt-oss-120b") == effort
+    assert (
+        clamp_antigravity_effort(
+            effort,
+            "claude-opus-5-5",
+            catalog_models=[{"id": "claude-opus-5-5", "efforts": ["high"]}],
+        )
+        == effort
+    )
+
+
+def test_antigravity_clamp_fails_closed_for_unknown_and_omitted_model_and_honors_catalog() -> None:
+    """Omitted or unseen AG models fail closed to high; catalog advertising xhigh allows it."""
+    assert clamp_antigravity_effort("xhigh", None) == "high"
+    assert clamp_antigravity_effort("high", None) == "high"
+    assert clamp_antigravity_effort("xhigh", "gemini-5-unseen") == "high"
+    assert clamp_antigravity_effort("xhigh", "unconfirmed") == "high"
+    assert clamp_antigravity_effort("xhigh", "Gemini 4 Hydrogen (High)") == "xhigh"
+    assert clamp_antigravity_effort("xhigh", "Claude Opus 5.5 (High)") == "high"
+    catalog = [
+        {
+            "id": "gemini-5-unseen",
+            "displayName": "Gemini 5 Unseen",
+            "efforts": ["low", "medium", "high", "xhigh"],
+        },
+        {
+            "id": "gemini-4-hydrogen",
+            "displayName": "Gemini 4 Hydrogen",
+            "efforts": ["low", "medium", "high"],
+        },
+        {
+            "id": "gemini-4-neon",
+            "displayName": "Gemini 4 Neon",
+            "efforts": ["max"],
+        },
+    ]
+    assert clamp_antigravity_effort("xhigh", "gemini-5-unseen", catalog_models=catalog) == "xhigh"
+    assert (
+        clamp_antigravity_effort("xhigh", "Gemini 5 Unseen (High)", catalog_models=catalog)
+        == "xhigh"
+    )
+    # When the live catalog explicitly omits xhigh for a model, the catalog wins.
+    assert clamp_antigravity_effort("xhigh", "gemini-4-hydrogen", catalog_models=catalog) == "high"
+    assert clamp_antigravity_effort("xhigh", "gemini-4-neon", catalog_models=catalog) == "high"
+    assert (
+        clamp_antigravity_effort(
+            "xhigh",
+            "gemini-4-hydrogen",
+            catalog_models=[
+                {
+                    "id": "gemini-4-hydrogen",
+                    "displayName": "Gemini 4 Hydrogen",
+                    "efforts": [],
+                }
+            ],
+        )
+        == "high"
+    )

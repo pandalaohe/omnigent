@@ -8156,7 +8156,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         attempted: Conversation,
         restore_effort: bool = True,
         restore_model: bool = False,
-    ) -> None:
+    ) -> bool:
         """Roll back refused settings under the row lock, retaining newer field values."""
         settings: dict[str, tuple[str | None, str | None]] = {}
         if restore_effort:
@@ -8164,9 +8164,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         if restore_model:
             settings["model_override"] = (attempted.model_override, previous.model_override)
         if not settings:
-            return
+            return False
 
-        def restore(session: Session) -> None:
+        def restore(session: Session) -> bool:
             query = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == conversation_id,
@@ -8175,7 +8175,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 query = query.with_for_update()
             row = session.scalar(query)
             if row is None:
-                return
+                return False
             overrides = _decode_session_overrides(row.session_overrides)
             changed = False
             for key, (expected, original) in settings.items():
@@ -8185,8 +8185,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if changed:
                 row.session_overrides = _encode_session_overrides(overrides)
                 row.updated_at = now_epoch()
+            return changed
 
-        run_write_transaction(
+        return run_write_transaction(
             self._conv_session_immediate, "restore_session_settings_if_matches", restore
         )
 
