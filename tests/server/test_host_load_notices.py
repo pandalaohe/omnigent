@@ -1,6 +1,7 @@
 """Host-load notices use inherited placement, a fake clock and real stores/hub."""
 
 import asyncio
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -8,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import LoadLevelReport
+from omnigent.host import connect as host_connect
+from omnigent.host.frames import LoadLevelReport, decode_host_frame
+from omnigent.host.load_level import FACTORY_LINES, LevelState
 from omnigent.server.host_load_notices import HostLoadNotices
 from omnigent.server.system_status import SystemStatusHub
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -91,11 +94,129 @@ async def test_busy_hold_clear_hold_composes_current_level_once(notices):
     await _tick(h)
     assert len(h.posts) == 1
     assert h.posts[0][0] == parent.id
-    assert "heavy-work line (4.25 per core ≥ 4)" in h.posts[0][1]
+    assert "heavy-work hold (load line 4 per core)" in h.posts[0][1]
+    assert "4.25 per core" not in h.posts[0][1]
     assert "Do not dispatch new heavy work" in h.posts[0][1]
     assert h.posts[0][2] == "owner"
     await _tick(h)
     assert len(h.posts) == 1
+
+
+@pytest.fixture
+def sample_host_load(notices, monkeypatch):
+    h = notices
+    _connect(h.hub, host_id=HOST_A, now=60000, workspace_id=0)
+    monkeypatch.setattr(
+        host_connect,
+        "time",
+        SimpleNamespace(time=lambda: h.clock.now, thread_time=time.thread_time),
+    )
+    sampler = SimpleNamespace()
+    host = SimpleNamespace(
+        _resource_sampler=sampler,
+        _load_state=LevelState(),
+        _load_lines=FACTORY_LINES,
+        _load_report=None,
+        _load_lines_synced_at=None,
+    )
+
+    def sample(at, load):
+        h.clock.now = at
+        frame = _frame(mem_used=50, mem_total=100)
+        sampler.sample_load_per_core = load
+        sampler.sample = lambda **_: replace(
+            frame,
+            sampled_at=datetime.fromtimestamp(at, UTC).isoformat(),
+            machine=replace(frame.machine, load_per_core=load),
+        )
+        report = decode_host_frame(
+            host_connect.HostProcess._sample_resource_snapshot(host, {}, None, 60)
+        )
+        h.hub.ingest(host_id=HOST_A, workspace_id=0, now=at, frame=report)
+
+    return sample
+
+
+async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
+    notices, sample_host_load
+):
+    h = notices
+    _parent(h)
+    for at, load in ((60000, 4.5), (60060, 4.5), (60120, 5.8), (60150, 3.2), (60180, 2.01)):
+        sample_host_load(at, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    hold = h.posts[0][1]
+
+    for at, load in ((60240, 2.8), (60300, 3.2), (60360, 4.56)):
+        sample_host_load(at, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    sample_host_load(60420, 4.56)
+    sample_host_load(60480, 4.56)
+    await _tick(h)
+    assert len(h.posts) == 2
+    clear = h.posts[1][1]
+
+    assert "is on heavy-work hold" in hold
+    assert "deciding minute averaged 4.50 per core and 50.0% memory" in hold
+    assert "2.01 per core" not in hold
+    assert "is clear" in clear
+    assert "deciding minute averaged 3.20 per core and 50.0% memory" in clear
+    assert "4.56 per core" not in clear
+
+
+async def test_delayed_clear_keeps_deciding_minute_after_spare_to_normal(
+    notices, sample_host_load
+):
+    h = notices
+    _parent(h)
+    for minute, load in enumerate((4.5, 4.5, 4.5, 0.4)):
+        sample_host_load(60000 + 60 * minute, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    assert "is on heavy-work hold" in h.posts[0][1]
+
+    h.clock.state = "busy"
+    for minute, load in enumerate((0.4, 0.4, 1.4), start=4):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "spare"
+    await _tick(h)
+    assert len(h.posts) == 1
+
+    for minute, load in enumerate((1.4, 4.56, 0.5), start=7):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "normal"
+    h.clock.state = "idle"
+    await _tick(h)
+    assert len(h.posts) == 2
+    assert "is clear" in h.posts[1][1]
+    assert "deciding minute averaged 0.40 per core and 50.0% memory" in h.posts[1][1]
+
+
+async def test_step_down_to_heavy_hold_omits_new_session_clear_reading(notices, sample_host_load):
+    h = notices
+    _parent(h)
+    for minute, load in enumerate((5.5, 5.5, 5.5, 4.5)):
+        sample_host_load(60000 + 60 * minute, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    assert "is on new-session hold" in h.posts[0][1]
+    assert "deciding minute averaged 5.50 per core and 50.0% memory" in h.posts[0][1]
+
+    for minute, load in enumerate((4.5, 2.0, 4.5), start=4):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "heavy_hold"
+    await _tick(h)
+    assert len(h.posts) == 1
+
+    sample_host_load(60420, 4.5)
+    sample_host_load(60480, 4.5)
+    await _tick(h)
+    assert len(h.posts) == 2
+    assert "is on heavy-work hold (load line 4 per core)" in h.posts[1][1]
+    assert "Do not dispatch new heavy work" in h.posts[1][1]
+    assert "deciding minute" not in h.posts[1][1]
 
 
 async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
@@ -103,7 +224,8 @@ async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
     _parent(h)
     _report(h, "heavy_hold", reason="memory")
     await _tick(h)
-    assert "memory 92.0% ≥ 90%" in h.posts[0][1]
+    assert "heavy-work hold (memory line 90%)" in h.posts[0][1]
+    assert "92.0%" not in h.posts[0][1]
     h.clock.now += 299
     _report(h, "spare", reason=None)
     await _tick(h)
@@ -183,7 +305,7 @@ async def test_readiness_probe_does_not_deliver_an_old_level(notices):
     h.notifier._true_state = state
     await _tick(h)
     assert len(h.posts) == 1
-    assert "memory 92.0%" in h.posts[0][1]
+    assert "heavy-work hold (memory line 90%)" in h.posts[0][1]
 
 
 async def test_owner_read_failure_keeps_pending_until_retry(notices):

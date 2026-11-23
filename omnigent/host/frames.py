@@ -772,6 +772,9 @@ class LoadLevelReport:
     heavy: float
     new_session: float
     lines_synced_at: str | None
+    # Averages from the completed minute behind the scheduling transition, when attributable.
+    decision_load_per_core: float | None = None
+    decision_mem_pct: float | None = None
 
 
 @dataclass
@@ -5149,6 +5152,8 @@ def _decode_load_level(msg: _JsonObject) -> LoadLevelReport | None:
         heavy=_required_float(raw, "heavy"),
         new_session=_required_float(raw, "new_session"),
         lines_synced_at=_optional_nullable_str(raw, "lines_synced_at"),
+        decision_load_per_core=_optional_nullable_float(raw, "decision_load_per_core"),
+        decision_mem_pct=_optional_nullable_float(raw, "decision_mem_pct"),
     )
 
 
