@@ -144,9 +144,13 @@ async def test_later_same_text_terminal_input_cannot_settle_old_claim(
         assert pending_inputs.pending_ids(conv.id) == (
             [pending_id, newer_id] if newer_id is not None else [pending_id]
         )
-        assert not any(
-            call.args[1]["type"] == "session.input.consumed" for call in publish.call_args_list
-        )
+        [echo] = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1]["type"] == "session.input.consumed"
+        ]
+        assert echo["item_id"] == item_id
+        assert echo.get("cleared_pending_id") is None
 
         now = 7201.0
         assert await _settle_lost_runner_input(
