@@ -6055,12 +6055,13 @@ async def test_events_codex_side_chat_preserves_indentation(
 
 
 @pytest.mark.parametrize(
-    "lookup", ["unavailable", "missing-label", "explicit-label", "wrong-label", "no-map"]
+    "lookup",
+    ["unavailable", "missing-label", "explicit-label", "wrong-label", "label-only", "no-map"],
 )
 async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lookup: str
 ) -> None:
-    """Queue side questions in the forwarder's directory without starting a turn."""
+    """Queue side questions at the recorded launch or its fallback without starting a turn."""
     import httpx
 
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -6069,21 +6070,24 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
     from omnigent.runner.native import orchestration as native_runtime
 
     conv_id = "acbeddbbce38421b921a7abbe82f7176"
-    rotated_id = "rotated-" + conv_id
-    wrong_id = "wrong-" + conv_id
+    rotated_id = f"{conv_id}-cleared"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     default_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     rotated_dir = codex_native_bridge.bridge_dir_for_bridge_id(rotated_id)
-    wrong_dir = codex_native_bridge.bridge_dir_for_bridge_id(wrong_id)
     mapped_dirs = {conv_id: rotated_dir}
     expected_dir = rotated_dir
     live_labels = {}
     if lookup == "explicit-label":
         live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = rotated_id
         mapped_dirs[conv_id] = default_dir
+        expected_dir = default_dir
     elif lookup == "wrong-label":
-        live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = wrong_id
-        expected_dir = wrong_dir
+        # A stale label can still name the bridge transferred to the successor.
+        live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = conv_id
+        mapped_dirs["conv_successor"] = default_dir
+    elif lookup == "label-only":
+        mapped_dirs.clear()
+        live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = rotated_id
     elif lookup == "no-map":
         mapped_dirs.clear()
         expected_dir = default_dir
@@ -6132,7 +6136,7 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
     assert [request.question for request in side_chat.peek_side_chat_requests(expected_dir)] == [
         question
     ]
-    for unused_dir in {default_dir, rotated_dir, wrong_dir} - {expected_dir}:
+    for unused_dir in {default_dir, rotated_dir} - {expected_dir}:
         assert side_chat.peek_side_chat_requests(unused_dir) == []
 
 
