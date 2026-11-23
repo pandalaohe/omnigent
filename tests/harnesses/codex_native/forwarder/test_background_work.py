@@ -116,6 +116,19 @@ def _goal_state_post(state: str | None) -> tuple[str, dict[str, Any]]:
     return (_EVENTS_URL, {"type": "external_goal_state", "data": {"state": state}})
 
 
+def _completed_turn_status_post(
+    turn_id: str, *, generation: int = 1
+) -> tuple[str, dict[str, Any]]:
+    return _status_post(
+        {
+            "status": "idle",
+            "response_id": f"codex_{turn_id}",
+            "turn_completed": True,
+            "native_turn_generation": generation,
+        }
+    )
+
+
 class _AppServerStub:
     """
     App-server stub for the goal and background-terminal reads.
@@ -1036,7 +1049,7 @@ async def test_server_without_the_list_still_gets_flag_changes(
     await poll
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(True, _terminal_tasks("npm run dev")),
         _background_work_post(None, _terminal_tasks("npm run dev", "make watch")),
         _background_work_post(False),
@@ -1315,7 +1328,7 @@ async def test_goal_and_terminal_share_one_flag(
     assert client.posts == [
         _background_work_post(True),
         _goal_state_post("active"),
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(None, _terminal_tasks("npm run dev")),
         _background_work_post(None, []),
         _background_work_post(False),
@@ -1357,9 +1370,9 @@ async def test_codex_without_terminal_listing_is_not_asked_again(
         "thread/backgroundTerminals/list"
     ]
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(False),
-        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+        _completed_turn_status_post("turn_2", generation=3),
     ]
 
 
@@ -1389,7 +1402,7 @@ async def test_failed_terminal_listing_keeps_the_last_known_state(
         _turn_completed("turn_1", "completed"),
         codex_client=app_server,
     )
-    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+    assert client.posts == [_completed_turn_status_post("turn_1")]
     assert signals == []
 
     # The next listing succeeds and finds no terminal, which clears the flag.
@@ -1442,7 +1455,7 @@ async def test_hung_terminal_listing_does_not_hold_the_turn_end(
     )
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(False),
     ]
     assert state.background_terminal_poll is None
