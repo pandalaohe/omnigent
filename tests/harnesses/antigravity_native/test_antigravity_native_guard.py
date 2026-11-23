@@ -9,6 +9,7 @@ import subprocess
 import sys
 import urllib.error
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -387,6 +388,8 @@ def native_transport(tmp_path, state, monkeypatch, capsys):
             response = next(remaining)
             if isinstance(response, Exception):
                 raise response
+            if isinstance(response, io.BytesIO):
+                return response
             if isinstance(response, bytes):
                 return io.BytesIO(response)
             return io.BytesIO(json.dumps(response).encode())
@@ -449,12 +452,11 @@ def test_persistent_state_timeout_is_recoverable_at_shared_deadline(native_trans
     matching, run = native_transport
     clock = [0.0]
     monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, clock[0] + 20))
-    result, calls, _ = run([TimeoutError(), TimeoutError(), TimeoutError()])
+    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, clock[0] + 250))
+    result, calls, _ = run([TimeoutError(), TimeoutError(), TimeoutError(), matching])
     assert result["decision"] == "deny"
     assert "retry" in result["reason"]
-    assert [path for path, _ in calls] == ["/permission-tiers/state"] * 3
-    assert all(timeout > 5 for _, timeout in calls)
+    assert calls == [("/permission-tiers/state", timeout) for timeout in (120, 120, 100)]
 
     result, calls, _ = run([matching, {"result": "POLICY_ACTION_ALLOW"}])
     assert result == {"decision": "allow"}
@@ -472,10 +474,53 @@ def test_state_recovers_after_old_total_budget(native_transport, monkeypatch, po
     matching, run = native_transport
     clock = [0.0]
     monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, 35.0))
+    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, 505.0))
     result, calls, _ = run([http_error(503), matching, {"result": policy}])
     assert result["decision"] == ("allow" if policy == "POLICY_ACTION_ALLOW" else "deny")
-    assert calls[1] == ("/permission-tiers/state", 25.0)
+    assert calls[1] == ("/permission-tiers/state", 95.0)
+
+
+def test_state_does_not_retry_without_time_for_the_relay(native_transport, monkeypatch):
+    matching, run = native_transport
+    clock = [0.0]
+    monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, 515.0))
+    result, calls, _ = run([http_error(503), matching])
+    assert result["decision"] == "deny"
+    assert "retry" in result["reason"]
+    assert calls == [("/permission-tiers/state", 120)]
+
+
+def test_state_read_in_progress_cannot_extend_the_budget(native_transport, monkeypatch):
+    matching, run = native_transport
+    entered = Event()
+    release = Event()
+    finished = Event()
+
+    class SlowResponse(io.BytesIO):
+        def read(self, *args):
+            entered.set()
+            try:
+                if not release.wait(3):
+                    raise RuntimeError("test response was not released")
+                return super().read(*args)
+            finally:
+                finished.set()
+
+    monkeypatch.setattr(guard, "_PERMISSION_STATE_BUDGET_S", 0.5)
+    monkeypatch.setattr(guard, "_PERMISSION_STATE_REQUEST_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(guard, "PERMISSION_STATE_RELAY_TIMEOUT_S", 0.1)
+    try:
+        result, calls, _ = run([SlowResponse(json.dumps(matching).encode())])
+        assert entered.is_set()
+        assert not finished.is_set()
+        assert result["decision"] == "deny"
+        assert "retry" in result["reason"]
+        assert calls == [("/permission-tiers/state", 0.25)]
+    finally:
+        release.set()
+        if entered.is_set():
+            assert finished.wait(3)
 
 
 @pytest.mark.parametrize("failure", ["401", "malformed", "url-other"])

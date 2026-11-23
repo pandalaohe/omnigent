@@ -95,7 +95,7 @@ async def test_busy_hold_clear_hold_composes_current_level_once(notices):
     await _tick(h)
     assert len(h.posts) == 1
     assert h.posts[0][0] == parent.id
-    assert "heavy-work hold (load line 4 per core)" in h.posts[0][1]
+    assert "heavy-work hold (current load line 4 per core)" in h.posts[0][1]
     assert "4.25 per core" not in h.posts[0][1]
     assert "Do not dispatch new heavy work" in h.posts[0][1]
     assert h.posts[0][2] == "owner"
@@ -169,6 +169,25 @@ async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
     assert "4.56 per core" not in clear
 
 
+async def test_pending_notice_labels_the_current_line_after_settings_change(
+    notices, sample_host_load
+):
+    h = notices
+    _parent(h)
+    h.clock.state = "busy"
+    for minute in range(4):
+        sample_host_load(60000 + 60 * minute, 4.5)
+    await _tick(h)
+    assert not h.posts
+
+    h.hub.put_settings({"load_lines": {"default": {"heavy": 5, "new_session": 6}}})
+    h.clock.state = "idle"
+    await _tick(h)
+    assert len(h.posts) == 1
+    assert "heavy-work hold (current load line 5 per core)" in h.posts[0][1]
+    assert "deciding minute averaged 4.50 per core and 50.0% memory" in h.posts[0][1]
+
+
 async def test_delayed_clear_keeps_deciding_minute_after_spare_to_normal(
     notices, sample_host_load
 ):
@@ -217,7 +236,7 @@ async def test_step_down_to_heavy_hold_omits_new_session_clear_reading(notices, 
     sample_host_load(60480, 4.5)
     await _tick(h)
     assert len(h.posts) == 2
-    assert "is on heavy-work hold (load line 4 per core)" in h.posts[1][1]
+    assert "is on heavy-work hold (current load line 4 per core)" in h.posts[1][1]
     assert "Do not dispatch new heavy work" in h.posts[1][1]
     assert "deciding minute" not in h.posts[1][1]
 
@@ -227,7 +246,7 @@ async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
     _parent(h)
     _report(h, "heavy_hold", reason="memory")
     await _tick(h)
-    assert "heavy-work hold (memory line 90%)" in h.posts[0][1]
+    assert "heavy-work hold (current memory line 90%)" in h.posts[0][1]
     assert "92.0%" not in h.posts[0][1]
     h.clock.now += 299
     _report(h, "spare", reason=None)
@@ -308,7 +327,7 @@ async def test_readiness_probe_does_not_deliver_an_old_level(notices):
     h.notifier._true_state = state
     await _tick(h)
     assert len(h.posts) == 1
-    assert "heavy-work hold (memory line 90%)" in h.posts[0][1]
+    assert "heavy-work hold (current memory line 90%)" in h.posts[0][1]
 
 
 async def test_owner_read_failure_keeps_pending_until_retry(notices):
