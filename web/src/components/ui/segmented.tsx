@@ -17,7 +17,10 @@ export interface SegmentedProps<T extends string> {
   stretch?: boolean;
   /** For a control that qualifies a value beside it, not the value itself. */
   quiet?: boolean;
-  /** Fit a fixed-height header without the regular touch target minimum. */
+  /**
+   * Fit a fixed-height header without the regular touch target minimum: a
+   * 24px track (the header Share button's h-6) with an even 4px inset.
+   */
   fitHeight?: boolean;
   className?: string;
 }
@@ -44,7 +47,7 @@ export function Segmented<T extends string>({
         "inline-flex max-w-full rounded-lg bg-muted p-1",
         quiet && "p-0.5",
         stretch && "flex w-full",
-        fitHeight && "h-full max-h-10",
+        fitHeight && "h-6 p-1",
         className,
       )}
     >

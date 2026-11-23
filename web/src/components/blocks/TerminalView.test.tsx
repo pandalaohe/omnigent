@@ -2307,7 +2307,7 @@ describe("TerminalView phone key rows", () => {
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
-    // Portrait room floor: height 180 < 119 + 108 (227) -> hidden
+    // Portrait room floor: height 180 < 103 + 108 (211) -> hidden
     rectSpy.mockRestore();
     const tightSpy = stubRootRect(390, 180);
     rerender(
@@ -2319,7 +2319,7 @@ describe("TerminalView phone key rows", () => {
     });
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
-    // Landscape 1-row bar with the page strip: width 667 >= 560, height 190 >= 73 + 108 (181) -> visible
+    // Landscape 1-row bar with the page strip: width 667 >= 560, height 190 >= 65 + 108 (173) -> visible
     tightSpy.mockRestore();
     stubPhoneViewport(667, 375);
     stubRootRect(667, 190);
@@ -2343,7 +2343,7 @@ describe("TerminalView phone key rows", () => {
       window.dispatchEvent(new Event("resize"));
     });
 
-    // 590.8 - 47 - 47 = 496.8px: two rows need 119 + 108px, not 73 + 108px.
+    // 590.8 - 47 - 47 = 496.8px: two rows need 103 + 108px, not 65 + 108px.
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
   });
 

@@ -130,6 +130,8 @@ from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     attachment_delivery_identity,
+    needs_attachment_attempt,
+    strip_attachment_attempt_marker,
 )
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -363,6 +365,7 @@ class _Entry:
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
+    runtime_notice: bool = False
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
 
@@ -434,6 +437,7 @@ def record(
     auto_retry: AutoRetryMetadata | None = None,
     runner_managed: bool = False,
     peer_message_id: str | None = None,
+    runtime_notice: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -489,6 +493,7 @@ def record(
             auto_retry=auto_retry,
             last_runner_renewal=_now() if runner_managed else None,
             peer_message_id=peer_message_id,
+            runtime_notice=runtime_notice,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -890,6 +895,22 @@ def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> Dra
         return _drained_input(entry)
 
 
+def discard_refused_notice(conversation_id: str, pending_id: str, attempt_id: str) -> None:
+    """Retire the named server notice before its lease can create a send error."""
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        entry = entries.get(pending_id)
+        if (
+            entry is not None
+            and entry.runtime_notice
+            and entry.delivery_attempt_id == attempt_id
+            and not entry.held
+            and entry.runner_claim_id is None
+            and not entry.agent_received
+        ):
+            _settle_locked(conversation_id, entries, pending_id)
+
+
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
@@ -1241,7 +1262,7 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        if attachment_delivery is not None and attachment_delivery[1] is not None:
+        if attachment_delivery is not None:
             attempt_id, count = attachment_delivery
             for pending_id, entry in entries.items():
                 if (
@@ -1249,8 +1270,14 @@ def resolve_matching_text(
                     and entry.runner_claim_id is not None
                     and not entry.held
                     and entry.auto_retry is None
-                    and _attachment_count(entry.content) == count
-                    and not _content_text(entry.content).strip()
+                    and _attachment_count(entry.content) > 0
+                    and (
+                        _matches_forwarded_blocks(
+                            entry.content, exact_needle, attempt_id=attempt_id
+                        )
+                        if _content_text(entry.content).strip()
+                        else _attachment_count(entry.content) == count
+                    )
                 ):
                     if hold:
                         entry.held = True
@@ -1263,12 +1290,20 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
+        # Claude is the sender that claims pending prompts before pasting.
+        # Its tagged uploads require evidence even for a shell or slash echo.
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()
             if not entry.held
             and entry.auto_retry is None
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
+            and not (
+                entry.runner_claim_id is not None
+                and entry.delivery_attempt_id is not None
+                and _attachment_count(entry.content)
+                and needs_attachment_attempt(entry.content, entry.delivery_attempt_id)
+            )
         ]
         texts = [
             _shell_command_text(entry.content)
@@ -1276,12 +1311,8 @@ def resolve_matching_text(
             else _collapse_whitespace(_content_text(entry.content))
             for _pid, entry in ordered
         ]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
-        # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then, for entries carrying attachments:
-        # the executor pastes one generated marker line per file block ahead
-        # of the text, so drop exactly that many from the mirror and compare
-        # with the entry's own text — typed marker-like text still counts.
+        # Try exact text before interpreting anything as a generated marker.
+        # Older executors put untagged attachment markers first.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
@@ -1506,19 +1537,31 @@ def _content_text(content: list[dict[str, Any]]) -> str:
 
 
 def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:
-    """Match recorded text and attachment markers in their forwarded block order."""
+    """Match a framework prefix followed by the recorded composer content."""
     if not entry.injected_prefix:
         return False
     prefix = _collapse_whitespace(entry.injected_prefix)
     if not mirror.startswith(prefix + " "):
         return False
-    remaining = mirror[len(prefix) :].lstrip()
-    for block in entry.content:
+    return _matches_forwarded_blocks(entry.content, mirror[len(prefix) :].lstrip())
+
+
+def _matches_forwarded_blocks(
+    content: list[dict[str, Any]], remaining: str, *, attempt_id: str | None = None
+) -> bool:
+    """Match every text span and one generated marker per file in composer order."""
+    ordinal = 0
+    for block in content:
         if block.get("type") in _ATTACHMENT_BLOCK_TYPES:
-            stripped = _strip_generated_markers(remaining, 1)
-            if stripped == remaining:
+            stripped = (
+                strip_attachment_attempt_marker(remaining, attempt_id, ordinal)
+                if attempt_id is not None
+                else _strip_generated_markers(remaining, 1)
+            )
+            if stripped is None or stripped == remaining:
                 return False
             remaining = stripped
+            ordinal += 1
         elif block.get("type") in {"input_text", "text", "output_text"}:
             expected = _collapse_whitespace(block.get("text", ""))
             if not expected:

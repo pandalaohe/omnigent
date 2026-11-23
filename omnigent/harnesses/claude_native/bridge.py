@@ -935,6 +935,10 @@ class ClaudeDeliveryUnconfirmed(RuntimeError):
     """A pasted message has no conclusive native acknowledgement and must not be replayed."""
 
 
+class _ClaudeUnrecognizedDraftUnconfirmed(ClaudeDeliveryUnconfirmed):
+    """The final usable frame still shows this paste in an unrecognized composer."""
+
+
 class ClaudeDeliveryClaimRefused(RuntimeError):
     """The server did not grant this attempt the right to paste."""
 
@@ -5686,10 +5690,33 @@ def _inject_user_message(
             if isinstance(exc, ClaudePromptTimeout):
                 owner.check_owner()
             raise
-        if owner.read_receipt() is True:
+        receipt = owner.read_receipt()
+        if receipt is True:
             _record_accepted_input(bridge_dir, owner.check_owner)
             delivery_diagnostics.record_details(verification="native_recorded")
             return True
+        if isinstance(exc, _ClaudeUnrecognizedDraftUnconfirmed) and receipt is None:
+            try:
+                final_receipt = _set_protected_draft(
+                    bridge_dir,
+                    owner.socket_path,
+                    owner.tmux_target,
+                    protect=True,
+                    unrecognized=True,
+                    check_owner=owner.check_owner,
+                    receipt_check=owner.read_receipt,
+                )
+            except OSError:
+                delivery_diagnostics.record_details(unrecognized_draft_marker_write_failed=True)
+                _logger.warning(
+                    "Could not persist the unrecognized Claude draft marker",
+                    exc_info=True,
+                )
+            else:
+                if final_receipt is True:
+                    _record_accepted_input(bridge_dir, owner.check_owner)
+                    delivery_diagnostics.record_details(verification="native_recorded")
+                    return True
         if isinstance(exc, ClaudeDeliveryUnconfirmed):
             raise
         detail = (
@@ -5908,6 +5935,15 @@ def _paste_and_submit(
     if owner is not None and not owner.wrote_paste and not _claim_passed():
         # The box can hide again after the readiness gate; nothing is claimed or typed yet.
         pane = _capture_pane(socket_path, tmux_target)
+        guessed = _passthrough_slash_command_name(text)
+        if (
+            has_unrecognized_protected_draft(bridge_dir)
+            and guessed is not None
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", guessed)
+        ):
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
+            if has_running_turn(bridge_dir):
+                raise _busy_pane_refusal(pane)
         if (
             pane.strip()
             and not _claude_prompt_rendered(pane)
@@ -5978,6 +6014,7 @@ def _paste_and_submit(
             read_receipt=read_receipt,
             owns_paste=owns_paste,
             bridge_dir=bridge_dir,
+            initial_pane=pane,
         )
         if observed is None:
             _record_accepted_input(bridge_dir, check_paste_owner)
@@ -6016,6 +6053,7 @@ def _paste_and_submit(
             read_receipt=read_receipt,
             owns_paste=owns_paste,
             bridge_dir=bridge_dir,
+            initial_pane=current if current.strip() else pane,
         )
         if observed is None:
             _record_accepted_input(bridge_dir, check_paste_owner)
@@ -6182,6 +6220,7 @@ def _wait_for_unobserved_paste(
     read_receipt: Callable[[], bool | None],
     owns_paste: Callable[[], bool],
     bridge_dir: Path,
+    initial_pane: str = "",
 ) -> str | None:
     """Wait without typing until the pasted draft or a fresh native receipt appears.
 
@@ -6198,6 +6237,7 @@ def _wait_for_unobserved_paste(
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
     another_prompt_observed = False
+    pane = initial_pane if initial_pane.strip() else ""
     while time.monotonic() < deadline:
         _check_injection_cancelled()
         if not owns_paste():
@@ -6211,21 +6251,23 @@ def _wait_for_unobserved_paste(
             raise ClaudeUserPromptPending(
                 "Claude is waiting for an explicit answer; message not sent."
             )
-        pane = _capture_pane(socket_path, tmux_target)
-        composer = _composer_box(pane)
+        captured = _capture_pane(socket_path, tmux_target)
+        if captured.strip():
+            pane = captured
+        composer = _composer_box(captured)
         if (
             not another_prompt_observed
             and (
                 (
                     composer is not None
                     and composer.framed
-                    and _draft_in_input_box(pane, needle, tail_needle=tail_needle)
+                    and _draft_in_input_box(captured, needle, tail_needle=tail_needle)
                 )
-                or _clipped_draft_matches(pane, tail_needle)
+                or _clipped_draft_matches(captured, tail_needle)
             )
             and owns_paste()
         ):
-            return pane
+            return captured
         if time.monotonic() >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.exited:
@@ -6235,10 +6277,41 @@ def _wait_for_unobserved_paste(
                 )
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    unrecognized_draft = (
+        not another_prompt_observed
+        and _unrecognized_paste_left_in_composer(pane, tail_needle)
+        and owns_paste()
+    )
     delivery_diagnostics.record_details(verification="unconfirmed_paste")
-    raise ClaudeDeliveryUnconfirmed(
+    error_type = (
+        _ClaudeUnrecognizedDraftUnconfirmed if unrecognized_draft else ClaudeDeliveryUnconfirmed
+    )
+    raise error_type(
         "Claude did not confirm this pasted message. It may already be queued or running. "
         "Inspect the terminal before retrying."
+    )
+
+
+def _unrecognized_paste_left_in_composer(pane: str, tail_needle: str) -> bool:
+    """Match a paste before a lone closing rule, for protecting the draft only."""
+    target = _comparable_draft_text(tail_needle)
+    lines = pane.splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    if not target or len(rules) != 1 or _box_rule_start(lines[rules[0]]) != 0:
+        return False
+    closing = rules[0]
+    rows = [line for line in lines[:closing] if line.strip()]
+    footer = [line.strip() for line in lines[closing + 1 :] if line.strip()]
+    return (
+        bool(rows)
+        and all(row.startswith("  ") for row in rows)
+        and _comparable_draft_text("".join(rows)).endswith(target)
+        and not _occupied_tall_draft(pane)
+        and not _claude_prompt_rendered(pane)
+        and not any(_DIALOG_FOOTER_RE.search(line) for line in footer)
+        and not _history_search_footer_shown(pane)
+        and not _btw_overlay_present(pane)
+        and _terminal_dialog_headline(pane) is None
     )
 
 
@@ -6333,9 +6406,11 @@ def _paste_and_await_draft(
     deadline = wait_started + min(_PASTE_COMMIT_TIMEOUT_S, message_readiness_remaining())
     while time.monotonic() < deadline:
         _check_injection_cancelled()
-        pane = _capture_pane(socket_path, tmux_target)
+        captured = _capture_pane(socket_path, tmux_target)
         polls += 1
-        empty_captures += not pane.strip()
+        empty_captures += not captured.strip()
+        if captured.strip():
+            pane = captured
         if _draft_in_input_box(pane, needle, tail_needle=tail_needle):
             draft_seen = True
             break
@@ -8850,12 +8925,12 @@ def _restore_occupied_input(
             ),
             nothing_typed=True,
         )
+        if bridge_dir is not None:
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
         if _occupied_tall_draft(pane):
             if bridge_dir is not None:
                 _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             return _SCROLLED_DRAFT_SURFACE
-        if bridge_dir is not None:
-            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
         btw_visible = _btw_overlay_present(pane)
         if btw_visible and _keep_warm_btw_overlay_present(pane):
             if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
@@ -9169,30 +9244,62 @@ def _chat_composer_empty(pane: str) -> bool:
 
 
 def _set_protected_draft(
-    bridge_dir: Path, socket_path: str, tmux_target: str, *, protect: bool
-) -> None:
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    protect: bool,
+    unrecognized: bool = False,
+    check_owner: Callable[[], None] | None = None,
+    receipt_check: Callable[[], bool | None] | None = None,
+) -> bool | None:
+    """Return the final receipt state; persist a fence only while it remains unknown."""
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
     with _bridge_metadata_write_lock(bridge_dir):
+        if check_owner is not None:
+            check_owner()
+        if receipt_check is not None:
+            receipt = receipt_check()
+            if receipt is not None:
+                return receipt
         if _tmux_input_identity(bridge_dir) != identity:
-            return
+            return None
         state = _read_json_file(bridge_dir / _STATE_FILE)
         if protect:
-            state["protected_draft_tmux"] = identity
+            key = "unrecognized_draft_tmux" if unrecognized else "protected_draft_tmux"
+            state[key] = identity
         else:
             state.pop("protected_draft_tmux", None)
+            state.pop("unrecognized_draft_tmux", None)
         _write_json_file(bridge_dir / _STATE_FILE, state)
+    return None
+
+
+def has_unrecognized_protected_draft(bridge_dir: Path) -> bool:
+    """Return whether the currently advertised pane owns an unrecognized draft marker."""
+    identity = _tmux_input_identity(bridge_dir)
+    return _read_json_file(bridge_dir / _STATE_FILE).get("unrecognized_draft_tmux") == identity
 
 
 def _require_protected_draft_clear(
     bridge_dir: Path, socket_path: str, tmux_target: str, *, pane: str | None = None
 ) -> bool:
-    """Fence a previously clipped draft until the same pane shows an empty chat composer."""
+    """Protect a leftover draft until the same pane shows an empty chat composer."""
     identity = {"socket_path": socket_path, "tmux_target": tmux_target}
-    if _read_json_file(bridge_dir / _STATE_FILE).get("protected_draft_tmux") != identity:
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    clipped = state.get("protected_draft_tmux") == identity
+    unrecognized = state.get("unrecognized_draft_tmux") == identity
+    if not clipped and not unrecognized:
         return False
     if pane is None:
         pane = _capture_pane(socket_path, tmux_target)
     if not _chat_composer_empty(pane):
+        if unrecognized:
+            # Unlike an ordinary clipped draft, this refusal must bypass the executor's hold.
+            raise ClaudeMessageNotAccepted(
+                "Claude Code may still have a draft from the previous send. The message was "
+                "not delivered. Open the terminal and review the draft before resending."
+            )
         raise ClaudeInputBoxOccupied(
             "Claude Code's input box still holds a draft. Clear it in the terminal to continue.",
             surface=_SCROLLED_DRAFT_SURFACE,
@@ -9883,6 +9990,8 @@ def _wait_for_claude_prompt_ready(
             message="Claude is waiting for an explicit answer; message not sent.",
             nothing_typed=True,
         )
+        if bridge_dir is not None and has_unrecognized_protected_draft(bridge_dir):
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
         polls += 1
         if pane.strip():
             last_nonempty = pane

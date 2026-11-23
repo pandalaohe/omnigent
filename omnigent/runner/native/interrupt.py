@@ -397,7 +397,7 @@ class NativeInterruptRunner:
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
         runtime_lock_for_session: Callable[[str], SessionRuntimeLock],
-        cancel_session_turn: Callable[[str], Awaitable[None]],
+        cancel_session_turn: Callable[[str], Awaitable[object]],
         subagent_work_id_for_session: SubagentWorkIdForSession | None = None,
     ) -> None:
         self._server_client = server_client

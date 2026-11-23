@@ -5,6 +5,8 @@ import contextlib
 import json
 import threading
 import time
+from typing import cast
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
@@ -13,10 +15,40 @@ import uvicorn
 
 from omnigent.entities.subagent_retry import InputExecutionClaim, InputExecutionReceipt, RetryInput
 from omnigent.runner import create_runner_app
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server.schemas import InputExecutionClaimEvent
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 from tests.runner.test_runner_dispatch import _runner_test_client, _sse_text_turn
+
+
+class _ScriptedAdmissionServer(NullServerClient):
+    class _AdmissionResponse(NullServerClient._Response):
+        def __init__(self, accepted: bool):
+            self.result = (
+                InputExecutionReceipt(state="accepted", reason="accepted")
+                if accepted
+                else InputExecutionReceipt(reason="input_closed")
+            )
+
+        def json(self):
+            return self.result.model_dump()
+
+    def __init__(self, *accepted_ids: str):
+        self.accepted_ids = set(accepted_ids)
+        self.claims: list[InputExecutionClaim] = []
+        self.resolutions: list[tuple[InputExecutionClaim, str]] = []
+
+    async def post(self, url: str, **kwargs) -> NullServerClient._Response:
+        if url.endswith("/input-admission"):
+            claim = InputExecutionClaim.model_validate(kwargs["json"])
+            self.claims.append(claim)
+            return self._AdmissionResponse(claim.input_id in self.accepted_ids)
+        if url.endswith("/input-admission/resolve"):
+            claim = InputExecutionClaim.model_validate(kwargs["json"])
+            self.resolutions.append((claim, kwargs["params"]["close"]))
+            return self._AdmissionResponse(claim.input_id in self.accepted_ids)
+        return await super().post(url, **kwargs)
 
 
 @contextlib.asynccontextmanager
@@ -231,6 +263,45 @@ async def test_native_definite_refusal_finalizes_once_without_attempt(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_resolve", [False, True], ids=["post", "resolve"])
+async def test_retry_input_consumed_requires_final_admission(db_uri, via_resolve):
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.stores.test_subagent_retry_execution import _prepared
+    from tests.stores.test_subagent_retry_store import _journal
+
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+    journal.conversations.update_conversation(journal.child, harness_override="claude-sdk")
+    _, claim = _prepared(journal)
+    with patch("omnigent.runtime.session_stream.publish") as publish:
+        async with _receiver(journal, True) as (receive, resolve):
+            wrong = claim.model_copy(update={"input_id": uuid4().hex})
+            assert (await receive(wrong)).state == "refused"
+            if via_resolve:
+                # Simulate losing the POST after the journal commit and before history append.
+                assert journal.store.admit_execution(
+                    journal.child,
+                    claim,
+                    runner_id=journal.conversations.get_conversation(journal.child).runner_id,
+                ).accepted
+            assert journal.conversations.list_items(journal.child).data == []
+            assert not any(
+                call.args[1]["type"] == "session.input.consumed" for call in publish.call_args_list
+            )
+            if via_resolve:
+                assert (await resolve(claim, close=False)).accepted
+                assert journal.conversations.get_item(journal.child, claim.input_id) is not None
+            assert (await receive(claim)).state == "accepted"
+            assert (await resolve(claim, close=True)).accepted
+        consumed = [
+            event["data"]["item_id"]
+            for (_, event), _ in publish.call_args_list
+            if event["type"] == "session.input.consumed"
+        ]
+        assert consumed == [claim.input_id]
+    assert len(journal.conversations.list_items(journal.child).data) == 1
 
 
 @pytest.mark.asyncio
@@ -479,14 +550,15 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
-@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize("opening", ["accepted", "notice", "sender"])
 # A steered input's refusal in the same response must not change the opener's outcome.
 @pytest.mark.parametrize("steered", [False, True])
 async def test_refused_turn_input_ends_turn_without_failure_or_result(
-    monkeypatch, native, accepted, steered
+    monkeypatch, native, opening, steered
 ):
     from omnigent.runner import app as runner_app
     from omnigent.runner.subagent_work import _SubagentDeliveryAck
+    from omnigent.runtime.harnesses._scaffold import _format_sse_event
 
     terminals, started = [], []
 
@@ -497,46 +569,46 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
     monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
     monkeypatch.setattr(runner_app, "mark_subagent_work_terminal", record_terminal)
     monkeypatch.setattr(runner_app, "mark_subagent_work_started", started.append)
-    deadline = time.time() + 30
+    deadline = int(time.time()) + 30.1234567
     input_id, session_id = "f" * 32, "child"
-    claim = InputExecutionClaim(
-        input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
-    )
+    status = "failed" if opening == "sender" else "completed"
+    terminal = {
+        "type": f"response.{status}",
+        "response": {"id": "resp_multiturn", "status": status},
+    }
+    if opening == "sender":
+        terminal["response"]["error"] = {
+            "code": "RuntimeError",
+            "message": "Input execution admission refused",
+        }
 
-    class Server(NullServerClient):
-        async def post(self, url, **kwargs):
-            if url.endswith("/input-admission"):
-                receipt = (
-                    InputExecutionReceipt(state="accepted", reason="accepted")
-                    if accepted
-                    else InputExecutionReceipt(reason="input_closed")
+    class Harness(_ScriptedHarnessClient):
+        def stream(self, method, url, *, json, timeout):
+            if json.get("input_admission_required") is True:
+                claim = InputExecutionClaim(
+                    input_id=json["input_id"],
+                    turn_id="resp_multiturn",
+                    admission_deadline=json["input_admission_deadline"],
                 )
-                return httpx.Response(
-                    200,
-                    json=receipt.model_dump(),
-                    request=httpx.Request("POST", "http://server" + url),
-                )
-            return await super().post(url, **kwargs)
+                opener = InputExecutionClaimEvent(claim_id="opener", claim=claim)
+                self._sse_frames = [_sse_text_turn("")[0], _format_sse_event(opener).decode()]
+                if steered:
+                    # An unregistered steered input is refused without a server call.
+                    steer = InputExecutionClaimEvent(
+                        claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
+                    )
+                    self._sse_frames.append(_format_sse_event(steer).decode())
+                self._sse_frames.append(terminal_frame)
+            return super().stream(method, url, json=json, timeout=timeout)
 
-    event = InputExecutionClaimEvent(claim_id="claim", claim=claim)
-    # An unregistered steered input is refused at the receiver without a server call.
-    steer = InputExecutionClaimEvent(
-        claim_id="steer", claim=claim.model_copy(update={"input_id": "b" * 32})
+    terminal_frame = f"event: response.{status}\ndata: {json.dumps(terminal)}\n\n"
+    harness = Harness([])
+    server = _ScriptedAdmissionServer(*([input_id] if opening == "accepted" else []))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
+        server_client=cast(httpx.AsyncClient, server),
     )
-    frames = [
-        'event: response.created\ndata: {"type":"response.created",'
-        '"response":{"id":"resp_multiturn"}}\n\n',
-        "event: input.execution.claim\ndata: " + json.dumps(event.model_dump()) + "\n\n",
-        *(
-            ["event: input.execution.claim\ndata: " + json.dumps(steer.model_dump()) + "\n\n"]
-            if steered
-            else []
-        ),
-        'event: response.completed\ndata: {"type":"response.completed",'
-        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
-    ]
-    harness = _ScriptedHarnessClient(frames)
-    app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
+    monkeypatch.setitem(app.state.session_event_queues, session_id, asyncio.Queue())
     async with _runner_test_client(app) as client:
         response = await client.post(
             f"/v1/sessions/{session_id}/events?stream=true",
@@ -548,28 +620,393 @@ async def test_refused_turn_input_ends_turn_without_failure_or_result(
                 "input_id": input_id,
                 "input_admission_required": True,
                 "input_admission_deadline": deadline,
+                **({"stable_id": input_id} if opening == "sender" else {}),
             },
         )
+        assert [(claim.input_id, claim.admission_deadline) for claim in server.claims] == [
+            (input_id, deadline)
+        ]
+        replies = [
+            (event["claim_id"], event["result"]["state"])
+            for event in harness.patched_events
+            if event.get("type") == "input_execution_result"
+        ]
+        assert replies == [
+            ("opener", "accepted" if opening == "accepted" else "refused"),
+            *([("steer", "refused")] if steered else []),
+        ]
+        if opening != "accepted":
+            harness._sse_frames = _sse_text_turn("accepted")
+            await client.post(
+                f"/v1/sessions/{session_id}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "test",
+                    "content": [{"type": "input_text", "text": "legal follow-up"}],
+                },
+            )
+            assert "[System: host load] notice" not in json.dumps(harness.posted_bodies[-1])
     assert response.status_code == 200
     queue = app.state.session_event_queues.get(session_id)
-    statuses = []
+    statuses, skips = [], []
     while queue is not None and not queue.empty():
         published = queue.get_nowait()
         if published.get("type") == "session.status":
             statuses.append(published.get("status"))
+        if published.get("input_execution_skipped"):
+            skips.append(published["input_execution_skipped"])
     assert "failed" not in statuses
     if not native:
         assert statuses[-1:] == ["idle"]
-    if accepted:
-        assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
-    else:
-        assert (started, terminals) == ([], [])
+    assert (started, terminals) == (([session_id], []) if native else ([], [session_id]))
+    assert skips == ([] if opening == "accepted" else ["refused"])
     assert app.state.refused_turn_inputs == set()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True], ids=["refused-opener", "running-turn"])
+async def test_stop_background_turn_respects_opening_admission(monkeypatch, accepted):
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.subagent_work import _SubagentDeliveryAck
+
+    session_id, response_id = "stop-admission-child", "resp_multiturn"
+    input_id, deadline = uuid4().hex, float(int(time.time()) + 30)
+    waiting = asyncio.Event()
+    terminals = []
+
+    def record_terminal(child, *, status, **_kwargs):
+        terminals.append((child, status))
+        return _SubagentDeliveryAck(
+            entry=None, delivered=False, delivered_now=False, reason="test"
+        )
+
+    monkeypatch.setattr(runner_app, "mark_subagent_work_terminal", record_terminal)
+    monkeypatch.setitem(runner_app._session_histories_ref, session_id, [])
+
+    def claim_frame(claim_id, claimed_input):
+        event = InputExecutionClaimEvent(
+            claim_id=claim_id,
+            claim=InputExecutionClaim(
+                input_id=claimed_input, turn_id=response_id, admission_deadline=deadline
+            ),
+        )
+        return "event: input.execution.claim\ndata: " + event.model_dump_json() + "\n\n"
+
+    created, delta, _ = _sse_text_turn("execution began")
+    frames = [created, claim_frame("opener", input_id)]
+    if accepted:
+        # Stop after execution starts, while an unrelated steered input is refused.
+        frames.extend([delta, claim_frame("steer", uuid4().hex)])
+
+    class Harness(_ScriptedHarnessClient):
+        async def post(self, url, *, json, timeout=None):
+            if json.get("claim_id") == ("steer" if accepted else "opener"):
+                assert json["result"]["state"] == "refused"
+                waiting.set()
+                await asyncio.Future()
+            return await super().post(url, json=json, timeout=timeout)
+
+    harness = Harness(frames)
+    manager = _FakeProcessManager(harness)
+    server = _ScriptedAdmissionServer(*([input_id] if accepted else []))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, manager),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    url = f"/v1/sessions/{session_id}/events"
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test",
+        "content": [{"type": "input_text", "text": "input being stopped"}],
+    }
+    async with _runner_test_client(app) as client:
+        posted = await client.post(
+            url,
+            json={
+                **body,
+                "input_id": input_id,
+                "input_admission_required": True,
+                "input_admission_deadline": deadline,
+            },
+        )
+        assert posted.status_code == 202, posted.text
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        assert [claim.input_id for claim in server.claims] == [input_id]
+        assert "input being stopped" in json.dumps(runner_app._session_histories_ref[session_id])
+        stopped = await client.post(url, json={"type": "stop_session"})
+        assert stopped.status_code == 204
+        assert terminals == ([(session_id, "cancelled")] if accepted else [])
+        assert session_id not in app.state.active_turns
+        assert session_id in manager.cleared_in_flight
+        assert app.state.refused_turn_inputs == set()
+
+        if not accepted:
+            harness._sse_frames = _sse_text_turn("done")
+            followup = await client.post(
+                url + "?stream=true",
+                json={**body, "content": [{"type": "input_text", "text": "legal follow-up"}]},
+            )
+            assert followup.status_code == 200, followup.text
+            assert server.resolutions == [(server.claims[0], "true")]
+            assert "input being stopped" not in json.dumps(
+                runner_app._session_histories_ref[session_id]
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_post", [False, True], ids=["buffered-pair", "post-during-drain"])
+async def test_buffered_openers_admit_in_order_and_refusal_keeps_accepted_history(
+    monkeypatch, later_post
+):
+    from omnigent.runner import app as runner_app
+    from tests._helpers.polling import poll_until_async
+
+    session_id = "buffered-admissions"
+    accepted_id, refused_id, later_id = (uuid4().hex for _ in range(3))
+    deadline = float(int(time.time()) + 30)
+    started, release = asyncio.Event(), asyncio.Event()
+    started_b, release_b = asyncio.Event(), asyncio.Event()
+    resolving_d, release_d = asyncio.Event(), asyncio.Event()
+
+    resolve_content = runner_app._resolve_forwarded_message_content
+
+    async def resolve_after_b(content, **kwargs):
+        if content == [{"type": "input_text", "text": "later D"}]:
+            resolving_d.set()
+            await release_d.wait()
+        return await resolve_content(content, **kwargs)
+
+    monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", resolve_after_b)
+
+    class Harness(_ScriptedHarnessClient):
+        @contextlib.asynccontextmanager
+        async def stream(self, method, url, *, json, timeout):
+            input_id = json.get("input_id")
+            response_id = f"resp_{input_id or len(self.posted_bodies)}"
+            created, delta, completed = [
+                frame.replace("resp_multiturn", response_id) for frame in _sse_text_turn("done")
+            ]
+            if input_id is not None:
+                claim = InputExecutionClaimEvent(
+                    claim_id=input_id,
+                    claim=InputExecutionClaim(
+                        input_id=input_id,
+                        turn_id=response_id,
+                        admission_deadline=json["input_admission_deadline"],
+                    ),
+                )
+                self._sse_frames = [
+                    created,
+                    "event: input.execution.claim\ndata: " + claim.model_dump_json() + "\n\n",
+                    *([delta] if input_id != refused_id else []),
+                    completed,
+                ]
+            else:
+                self._sse_frames = [created, delta, completed]
+            async with super().stream(method, url, json=json, timeout=timeout) as response:
+                first = len(self.posted_bodies) == 1
+                if first or (later_post and input_id == accepted_id):
+                    frames = response.aiter_text
+                    entered, unblock = (started, release) if first else (started_b, release_b)
+
+                    async def hold_turn():
+                        async for frame in frames():
+                            yield frame
+                            if frame == created:
+                                entered.set()
+                                await unblock.wait()
+
+                    response.aiter_text = hold_turn
+                yield response
+
+    def body(text):
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test",
+            "content": [{"type": "input_text", "text": text}],
+        }
+
+    harness = Harness([])
+    server = _ScriptedAdmissionServer(accepted_id, later_id)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    url = f"/v1/sessions/{session_id}/events"
+    async with _runner_test_client(app) as client:
+
+        async def post_admitted(input_id, text):
+            return await client.post(
+                url,
+                json={
+                    **body(text),
+                    "input_id": input_id,
+                    "input_admission_required": True,
+                    "input_admission_deadline": deadline,
+                },
+            )
+
+        assert (await client.post(url, json=body("opening input"))).status_code == 202
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            for input_id, text in [(accepted_id, "buffered B"), (refused_id, "buffered C")]:
+                buffered = await post_admitted(input_id, text)
+                assert buffered.json()["status"] == "buffered"
+        finally:
+            release.set()
+        if later_post:
+            post_d = None
+            try:
+                await asyncio.wait_for(started_b.wait(), timeout=5)
+                turn_b = app.state.active_turns[session_id]
+                post_d = asyncio.create_task(post_admitted(later_id, "later D"))
+                await asyncio.wait_for(resolving_d.wait(), timeout=5)
+                release_b.set()
+                await asyncio.wait_for(asyncio.shield(turn_b), timeout=5)
+                # D owns the ingest slot. B has freed the turn slot, and C is waiting.
+                assert session_id not in app.state.active_turns
+                assert [
+                    item["input_id"] for item in app.state.session_message_buffers[session_id]
+                ] == [refused_id]
+            finally:
+                release_b.set()
+                release_d.set()
+                if post_d is not None:
+                    response_d = await asyncio.wait_for(post_d, timeout=5)
+            assert response_d.status_code == 202
+            assert response_d.json()["status"] == "buffered"
+        await poll_until_async(
+            lambda: (
+                not app.state.session_message_buffers.get(session_id)
+                and session_id not in app.state.active_turns
+            ),
+            timeout_s=5,
+        )
+        expected_ids = [accepted_id, refused_id, *([later_id] if later_post else [])]
+        assert [(claim.input_id, claim.turn_id) for claim in server.claims] == [
+            (input_id, f"resp_{input_id}") for input_id in expected_ids
+        ]
+        followup = await client.post(url, json=body("legal follow-up"))
+        assert followup.status_code == 202, followup.text
+        await poll_until_async(lambda: session_id not in app.state.active_turns, timeout_s=5)
+        warm_history = json.dumps(harness.posted_bodies[-1])
+        assert "legal follow-up" in warm_history
+        assert "buffered B" in warm_history
+        assert "buffered C" not in warm_history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "same_attempt", "outcome"),
+    [
+        ("input_closed", True, "refused"),
+        ("input_expired", True, "unknown"),
+        ("input_identity_conflict", True, "unknown"),
+        ("input_closed", False, "unknown"),
+    ],
+)
+async def test_pi_peer_admission_reports_only_its_own_proven_refusal(
+    reason, same_attempt, outcome
+):
+    deadline = time.time() + 30
+    peer_id, attempt_id = uuid4().hex, uuid4().hex
+    input_id = attempt_id if same_attempt else uuid4().hex
+    session_id = f"child-{attempt_id}"
+    claim = InputExecutionClaimEvent(
+        claim_id="claim",
+        claim=InputExecutionClaim(
+            input_id=input_id, turn_id="resp_peer", admission_deadline=deadline
+        ),
+    )
+    receipt = asyncio.Future()
+    exits = []
+    closed = (
+        RetryInput(
+            input_id=input_id,
+            chain_id=None,
+            target_id=session_id,
+            kind="human",
+            attempt=0,
+            state="closed",
+            payload={},
+            version=0,
+            turn_id="resp_peer",
+            input_generation=None,
+            reason={"code": "acceptance_unknown"},
+        )
+        if reason == "input_closed"
+        else None
+    )
+
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/input-admission"):
+                return httpx.Response(
+                    200,
+                    json=InputExecutionReceipt(reason=reason, receipt=closed).model_dump(),
+                    request=httpx.Request("POST", "http://server" + url),
+                )
+            body = kwargs.get("json", {})
+            if body.get("type") == "sdk_peer_delivery_receipt" and not receipt.done():
+                receipt.set_result(body["data"])
+            if body.get("type") == "external_session_status":
+                exits.append(body)
+            return await super().post(url, **kwargs)
+
+    frames = [
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_peer"}}\n\n',
+        f"event: input.execution.claim\ndata: {claim.model_dump_json()}\n\n",
+        'event: response.failed\ndata: {"type":"response.failed",'
+        '"response":{"id":"resp_peer","status":"failed",'
+        '"error":{"code":"RuntimeError","message":"Input execution admission refused"}}}\n\n',
+    ]
+    harness = _ScriptedHarnessClient(_sse_text_turn("ready"))
+    app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=Server())
+    async with _runner_test_client(app) as client:
+        ready = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "harness_override": "pi",
+                "content": [{"type": "input_text", "text": "start Pi"}],
+            },
+        )
+        assert ready.status_code == 200, ready.text
+        harness._sse_frames = frames
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test",
+                "harness_override": "pi",
+                "content": [{"type": "input_text", "text": "peer input"}],
+                "input_id": input_id,
+                "input_admission_required": True,
+                "input_admission_deadline": deadline,
+                "peer_delivery": {"peer_id": peer_id, "attempt_id": attempt_id},
+                "peer_delivery_start": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        result = await asyncio.wait_for(receipt, timeout=2)
+    assert (result["peer_id"], result["attempt_id"], result["outcome"]) == (
+        peer_id,
+        attempt_id,
+        outcome,
+    )
+    assert exits == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["terminal", "no_terminal"])
-async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end):
+async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(monkeypatch, end):
     deadline = time.time() + 30
     input_id, session_id = "f" * 32, "child"
     newer = (session_id, "resp_newer", "b" * 32)
@@ -605,10 +1042,11 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
     app = create_runner_app(
         process_manager=_FakeProcessManager(Harness(frames)), server_client=Server()
     )
+    monkeypatch.setitem(app.state.session_event_queues, session_id, asyncio.Queue())
     # A newer turn's marker, recorded before this older stream ends.
     app.state.refused_turn_inputs.add(newer)
     async with _runner_test_client(app) as client:
-        await client.post(
+        response = await client.post(
             f"/v1/sessions/{session_id}/events?stream=true",
             json={
                 "type": "message",
@@ -621,6 +1059,8 @@ async def test_refusal_marker_is_owned_by_its_turn_and_cleared_on_every_end(end)
             },
         )
     assert app.state.refused_turn_inputs == {newer}
+    assert '"input_execution_skipped": "refused"' in response.text
+    assert "response.failed" not in response.text
 
 
 @pytest.mark.asyncio
@@ -867,7 +1307,7 @@ async def test_runner_posts_same_control_receipt_before_reply_and_recovers_lost_
                 "input_control": {"session_id": "child", "input_id": control_id},
             },
         )
-        assert interrupted.status_code == 204
+        assert interrupted.is_success, interrupted.text
         assert writes == [{"outcome": "accepted", "expected_version": 0}]
         response = await client.post(
             "/v1/sessions/child/events?stream=true",
@@ -966,11 +1406,10 @@ async def test_cancelled_admission_is_closed_before_next_human_can_start(db_uri)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert (
-                await client.post(
-                    f"/v1/sessions/{journal.child}/events", json={"type": "interrupt"}
-                )
-            ).status_code == 204
+            interrupted = await client.post(
+                f"/v1/sessions/{journal.child}/events", json={"type": "interrupt"}
+            )
+            assert interrupted.is_success, interrupted.text
             harness._sse_frames = frames(new_id, "new-human-turn")
             accepted = await client.post(
                 f"/v1/sessions/{journal.child}/events?stream=true", json=body(new_id)

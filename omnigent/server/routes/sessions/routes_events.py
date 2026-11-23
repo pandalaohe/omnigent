@@ -462,7 +462,7 @@ _RetryFlight = tuple[str, str | None]
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
     WorkspaceScopedCache()
 )
-_interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
+_interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[bool]] = WorkspaceScopedCache()
 
 # Leading text of the runner's sub-agent wake notice
 # (``omnigent.runner.app._format_subagent_wake_notice``).
@@ -475,8 +475,12 @@ async def _deliver_interrupt_once(
     runner_router: RunnerRouter | None,
     *,
     startup_cancelled_before_dispatch: bool = False,
-) -> None:
-    """Forward one interrupt and publish only after the runner accepts it."""
+) -> bool:
+    """Forward one interrupt and publish only after the runner accepts it.
+
+    :returns: ``True`` when the runner accepted the interrupt request,
+        ``False`` when the runner reports a no-op or startup ended before dispatch.
+    """
     # Read before the forward so a message sent after Stop stays live; marked
     # only if the interrupt lands, else the turn may still run them.
     queued_pending_ids = pending_inputs.pending_ids(session_id)
@@ -490,7 +494,7 @@ async def _deliver_interrupt_once(
         # so the turn's remaining output isn't dropped and a retry can forward.
         _interrupt_fenced_sessions.discard(session_id)
         if runner_result is None and startup_cancelled_before_dispatch:
-            return
+            return False
         if runner_result is None:
             message = (
                 "Interrupt was not delivered because no live runner was available. "
@@ -512,26 +516,25 @@ async def _deliver_interrupt_once(
         except (TypeError, ValueError):
             interrupt_result = None
         if isinstance(interrupt_result, dict) and interrupt_result.get("interrupted") is False:
-            # Runner authoritatively observed that the terminal had already
-            # settled before this delayed control arrived. Nothing was cancelled,
-            # so do not fence output or publish a false cancelled decoration.
+            # The runner reported no interrupt. Release the fence without
+            # marking pending inputs or publishing cancellation.
             _interrupt_fenced_sessions.discard(session_id)
-            return
-    # The runner accepted and cancelled the turn: flag the web inputs queued at
+            return False
+    # The runner accepted the interrupt request: flag the web inputs queued at
     # the snapshot as interrupted so they don't look live in a later turn.
     pending_inputs.mark_interrupted(session_id, queued_pending_ids)
     if session_id not in _interrupt_fenced_sessions:
         # A terminal or next-running edge won the race while Runner handled the
         # control. That edge is authoritative; publishing interrupted now would
         # retroactively cancel the settled/new turn in connected clients.
-        return
-    # Only tell clients that the turn was interrupted after the runner confirms
-    # that the native bridge/app-server accepted the control and the original
-    # turn fence still identifies the same unsettled boundary.
+        return True
+    # Publish the accepted interrupt only while the original turn fence still
+    # identifies the same unsettled boundary.
     _publish_interrupted(session_id)
+    return True
 
 
-def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> None:
+def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[bool]) -> None:
     """Drop a completed delivery task without cancelling shared delivery."""
     if _interrupt_delivery_tasks.get(session_id) is task:
         _interrupt_delivery_tasks.pop(session_id, None)
@@ -2233,6 +2236,7 @@ def register_events_routes(
                 "input_generation",
                 "_input_admission_required",
                 "_final_wake",
+                "_runtime_notice",
                 "input_admission_deadline",
             ):
                 body.data.pop(key, None)
@@ -2253,6 +2257,10 @@ def register_events_routes(
                 request.app.state, "subagent_retry_admission", None
             ) is not None:
                 body.data["_input_admission_required"] = True
+                if isinstance(request, Request) and getattr(
+                    request.state, "runtime_notice", False
+                ):
+                    body.data["_runtime_notice"] = True
         opens_codex_side_chat = body.type == "message" and await _opens_codex_side_chat(conv, body)
         if (
             body.type == "message"
@@ -6529,6 +6537,35 @@ def register_events_routes(
             reason=reason,
         )
 
+    async def _persist_admitted_input(
+        session_id: str,
+        conv: Conversation,
+        body: InputExecutionClaim,
+        result: InputExecutionReceipt,
+    ) -> None:
+        receipt = result.receipt
+        if not result.accepted or receipt is None or receipt.kind not in {"retry", "wake"}:
+            return
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if harness in {"claude-native", "codex-native", "pi-native"}:
+            return
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=body.turn_id or "",
+                    stable_id=receipt.input_id,
+                    data=parse_item_data("message", receipt.payload["data"]),
+                )
+            ],
+        )
+        if not persisted[0].deduplicated:
+            _publish_input_consumed(session_id, persisted[0])
+
     @event_router.post("/sessions/{session_id}/input-admission", include_in_schema=False)
     async def input_execution_admission(
         request: Request, session_id: str, body: InputExecutionClaim
@@ -6562,28 +6599,7 @@ def register_events_routes(
             from omnigent.server.turn_recovery import reconcile_turn_recovery
 
             await reconcile_turn_recovery(conversation_store, conv)
-        if (
-            result.accepted
-            and result.receipt is not None
-            and (body.retry is not None or result.receipt.kind == "wake")
-        ):
-            harness = await asyncio.to_thread(
-                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
-            )
-            if harness not in {"claude-native", "codex-native", "pi-native"}:
-                payload = result.receipt.payload["data"]
-                await asyncio.to_thread(
-                    conversation_store.append,
-                    session_id,
-                    [
-                        NewConversationItem(
-                            type="message",
-                            response_id=body.turn_id or "",
-                            stable_id=body.input_id,
-                            data=parse_item_data("message", payload),
-                        )
-                    ],
-                )
+        await _persist_admitted_input(session_id, conv, body, result)
         return result
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
@@ -6601,13 +6617,15 @@ def register_events_routes(
             # Reconcile the exact outcome or reservation through the admission
             # fences; a read-only lookup cannot revalidate its owner.
             return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.journal.resolve_execution,
             session_id,
             body,
             runner_id=conv.runner_id,
             close=close,
         )
+        await _persist_admitted_input(session_id, conv, body, result)
+        return result
 
     async def _control_receiver(request: Request, session_id: str):
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

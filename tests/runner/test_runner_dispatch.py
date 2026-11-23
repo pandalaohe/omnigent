@@ -13595,6 +13595,23 @@ async def test_sdk_terminal_retains_owner_response_before_marker_cleanup(outcome
         subagent_work._session_inboxes_ref.pop(parent, None)
 
 
+@pytest.mark.asyncio
+async def test_interrupt_on_idle_inprocess_session_returns_noop() -> None:
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_idle_interrupt/events", json={"type": "interrupt"}
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"interrupted": False, "reason": "idle"}
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
@@ -18028,7 +18045,7 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
-async def test_unknown_admission_does_not_fail_independent_native_execution(monkeypatch, native):
+async def test_unknown_admission_does_not_fail_the_session(monkeypatch, native):
     from omnigent.runner import app as runner_app
 
     monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
@@ -18048,9 +18065,9 @@ async def test_unknown_admission_does_not_fail_independent_native_execution(monk
     events = []
     while not queue.empty():
         events.append(queue.get_nowait())
-    assert any(
-        e.get("type") == "session.status" and e.get("status") == "failed" for e in events
-    ) is (not native)
+    assert [e.get("status") for e in events if e.get("type") == "session.status"] == (
+        [] if native else ["idle"]
+    )
     app.state.session_event_queues.pop("child", None)
 
 

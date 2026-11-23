@@ -3385,7 +3385,8 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
             json={"type": "interrupt"},
         )
 
-    assert int_resp.status_code == 204, int_resp.text
+    assert int_resp.status_code == 200, int_resp.text
+    assert int_resp.json() == {"interrupted": False, "reason": "idle"}
 
 
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):
@@ -6279,6 +6280,450 @@ async def test_antigravity_control_dispatch_sends_one_command(
         response = await client.post("/v1/sessions/conv_agy_control/events", json=event)
     assert response.status_code == 200, response.text
     assert calls == [expected]
+
+
+@pytest.mark.parametrize(
+    (
+        "snapshot_payload",
+        "footer",
+        "event",
+        "expected_status",
+        "expected_calls",
+        "expected_body",
+    ),
+    [
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "xhigh"},
+            "",
+            {"type": "model_change", "model": "claude-opus-5-5"},
+            200,
+            ["/model claude-opus-5-5-high"],
+            {"model": "claude-opus-5-5-high", "effort": "high"},
+        ),
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            "",
+            {"type": "model_change", "model": "claude-opus-5-5", "effort": "xhigh"},
+            200,
+            ["/model claude-opus-5-5-high"],
+            {"model": "claude-opus-5-5-high", "effort": "high"},
+        ),
+        (
+            {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"},
+            "",
+            {"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
+            200,
+            ["/model gemini-4-hydrogen-xhigh"],
+            {"model": "gemini-4-hydrogen-xhigh", "effort": "xhigh"},
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "reasoning_effort": "high",
+            },
+            "Claude Opus 5.5 · high",
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "claude-opus-5-5",
+                "reasoning_effort": "high",
+            },
+            "Gemini 4 Hydrogen · high",
+            {"type": "effort_change", "effort": "xhigh"},
+            200,
+            ["/effort xhigh"],
+            {"effort": "xhigh"},
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "reasoning_effort": "high",
+            },
+            "model unavailable",
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_override": "gemini-4-hydrogen",
+                "reasoning_effort": "high",
+            },
+            "",
+            {"type": "effort_change", "effort": "xhigh"},
+            503,
+            [],
+            None,
+        ),
+        # P2-3: catalog-advertised xhigh model is allowed; catalog without xhigh fails closed.
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "model_options": [
+                    {
+                        "id": "gemini-5-next",
+                        "displayName": "Gemini 5 Next",
+                        "efforts": ["low", "medium", "high", "xhigh"],
+                    }
+                ],
+                "reasoning_effort": "high",
+            },
+            "Gemini 5 Next · high",
+            {"type": "effort_change", "effort": "xhigh"},
+            200,
+            ["/effort xhigh"],
+            {"effort": "xhigh"},
+        ),
+        (
+            {
+                "labels": {},
+                "terminal_launch_args": [],
+                "reasoning_effort": "high",
+            },
+            "Gemini 5 Next · high",
+            {"type": "effort_change", "effort": "xhigh"},
+            400,
+            [],
+            None,
+        ),
+    ],
+)
+async def test_antigravity_control_dispatch_guards_xhigh_per_model(
+    monkeypatch,
+    tmp_path,
+    isolate_antigravity_controls_launch,
+    snapshot_payload,
+    footer,
+    event,
+    expected_status,
+    expected_calls,
+    expected_body,
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    calls = []
+    pane_footer = (
+        footer or "Gemini 4 Hydrogen · high" if event["type"] == "model_change" else footer
+    )
+
+    def control_pane(_):
+        if not calls:
+            return f"? for shortcuts    {pane_footer}"
+        return "Effort set to xhigh" if calls[-1].startswith("/effort") else "Model set to ok"
+
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", lambda *a, **kw: calls.append(kw["content"]))
+
+    async def snapshot(*args, **kwargs):
+        return snapshot_payload
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_xhigh", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post("/v1/sessions/conv_agy_xhigh/events", json=event)
+    assert response.status_code == expected_status, response.text
+    assert calls == expected_calls
+    if expected_body is not None:
+        assert response.json() == expected_body
+
+
+async def test_antigravity_effort_uses_last_successful_model_switch_before_new_turn(
+    monkeypatch,
+    tmp_path,
+    isolate_antigravity_controls_launch,
+):
+    """A stale Hydrogen readback cannot allow xhigh after switching to Opus."""
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    current_readback = "Gemini 4 Hydrogen (High)"
+    current_footer = "Claude Opus 5.5 · high"
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": current_readback,
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    calls = []
+    pending_confirm: list[str | None] = [None]
+
+    def control_pane(_):
+        if pending_confirm[0] is not None:
+            reply = pending_confirm[0]
+            pending_confirm[0] = None
+            return reply
+        return f"? for shortcuts    {current_footer}"
+
+    def paste_and_submit(*args, **kwargs):
+        text = kwargs["content"]
+        calls.append(text)
+        pending_confirm[0] = (
+            "Effort set to xhigh"
+            if text.startswith("/effort")
+            else "Model set to Claude Opus 5.5 (High)"
+        )
+
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", paste_and_submit)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_no_turn", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        switched = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "model_change", "model": "claude-opus-5-5", "effort": "high"},
+        )
+        raised = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+        switched_back = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "model_change", "model": "gemini-4-hydrogen", "effort": "xhigh"},
+        )
+        current_footer = "Gemini 4 Hydrogen · xhigh"
+        allowed = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+        current_footer = "Claude Opus 5.5 · high"
+        refused_manual_switch = await client.post(
+            "/v1/sessions/conv_agy_no_turn/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+    assert switched.status_code == 200, switched.text
+    assert raised.status_code == 400, raised.text
+    assert switched_back.status_code == 200, switched_back.text
+    assert allowed.status_code == 200, allowed.text
+    assert refused_manual_switch.status_code == 400, refused_manual_switch.text
+    assert calls == [
+        "/model claude-opus-5-5-high",
+        "/model gemini-4-hydrogen-xhigh",
+        "/effort xhigh",
+    ]
+
+
+async def test_antigravity_effort_uses_footer_after_first_manual_model_switch(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    footer = "accept-edits · Claude Opus 5.5 · high"
+    calls = []
+    pending_confirm: list[str | None] = [None]
+
+    def control_pane(_):
+        if pending_confirm[0] is not None:
+            reply = pending_confirm[0]
+            pending_confirm[0] = None
+            return reply
+        return f"⎿  Model set to Gemini 4 Hydrogen (High)\n? for shortcuts    {footer}\n"
+
+    def paste_and_submit(*args, **kwargs):
+        calls.append(kwargs["content"])
+        pending_confirm[0] = "Effort set to xhigh"
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(agy, "_agy_control_pane", control_pane)
+    monkeypatch.setattr(agy, "_paste_and_submit", paste_and_submit)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_manual", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        url = "/v1/sessions/conv_agy_manual/events"
+        refused = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        footer = "model unavailable"
+        unconfirmed = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        footer = "plan · Gemini 4 Hydrogen · high"
+        allowed = await client.post(url, json={"type": "effort_change", "effort": "max"})
+
+    assert refused.status_code == 400, refused.text
+    assert "Claude Opus 5.5" in refused.json()["detail"]
+    assert unconfirmed.status_code == 400, unconfirmed.text
+    assert allowed.status_code == 200, allowed.text
+    assert calls == ["/effort xhigh"]
+
+
+async def test_antigravity_xhigh_refuses_hydrogen_to_opus_switch_within_3s_budget(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    """P1/P2: Hydrogen -> Opus reads never send /effort xhigh and stay in the 3 s budget."""
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy,
+        "read_tmux_info",
+        lambda _: {"socket_path": "/tmp/example/tmux.sock", "tmux_target": "main"},
+    )
+
+    panes = [
+        "> \n? for shortcuts    Gemini 4 Hydrogen · high\n",
+        "> \n? for shortcuts    Claude Opus 5.5 · high\n",
+    ]
+    capture_index = [0]
+    tmux_calls: list[tuple[list[str], float]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        tmux_calls.append((cmd, float(timeout)))
+        if "capture-pane" in cmd:
+            pane = panes[min(capture_index[0], len(panes) - 1)]
+            capture_index[0] += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(agy.subprocess, "run", fake_run)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_race", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        url = "/v1/sessions/conv_agy_race/events"
+        raced = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+        single_read_start = len(tmux_calls)
+        already_opus = await client.post(url, json={"type": "effort_change", "effort": "xhigh"})
+
+    assert raced.status_code == 400, raced.text
+    assert "Claude Opus 5.5" in raced.json()["detail"]
+    assert already_opus.status_code == 400, already_opus.text
+    assert tmux_calls
+    assert all(timeout <= 3.0 for _, timeout in tmux_calls)
+    assert not any(
+        "load-buffer" in cmd or "paste-buffer" in cmd or cmd[-1] == "Enter"
+        for cmd, _ in tmux_calls
+    )
+    # When the first capture already shows Opus, no extra capture or key send occurs.
+    assert len(tmux_calls) - single_read_start == 1
+    assert "capture-pane" in tmux_calls[single_read_start][0]
+
+
+async def test_antigravity_xhigh_returns_503_when_pane_turns_busy_before_paste(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    async def snapshot(*args, **kwargs):
+        return {
+            "labels": {},
+            "terminal_launch_args": [],
+            "llm_model": "Gemini 4 Hydrogen (High)",
+            "reasoning_effort": "high",
+        }
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        agy,
+        "read_tmux_info",
+        lambda _: {"socket_path": "/tmp/example/tmux.sock", "tmux_target": "main"},
+    )
+
+    panes = [
+        "> \n? for shortcuts    Gemini 4 Hydrogen · high\n",
+        "> \nesc to cancel\n",
+    ]
+    capture_index = [0]
+    tmux_calls: list[tuple[list[str], float]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        tmux_calls.append((cmd, float(timeout)))
+        if "capture-pane" in cmd:
+            pane = panes[min(capture_index[0], len(panes) - 1)]
+            capture_index[0] += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(agy.subprocess, "run", fake_run)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_busy_race", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            "/v1/sessions/conv_agy_busy_race/events",
+            json={"type": "effort_change", "effort": "xhigh"},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "antigravity_native_effort_failed"
+    assert tmux_calls
+    assert all(timeout <= 3.0 for _, timeout in tmux_calls)
+    assert not any(
+        "load-buffer" in cmd or "paste-buffer" in cmd or cmd[-1] == "Enter"
+        for cmd, _ in tmux_calls
+    )
 
 
 @pytest.mark.parametrize(

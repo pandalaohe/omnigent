@@ -77,6 +77,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     framework_notices,
     is_tagged_filesystem_attachment,
+    needs_attachment_attempt,
 )
 from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
@@ -1269,21 +1270,14 @@ def _content_to_text(
         contain ``input_image`` blocks with an ``image_url`` data URI
         or ``input_file`` blocks with a ``file_data`` data URI.
     :param bridge_dir: Session bridge path identifying the attachment cache.
-    :param attempt_id: Tag attachment paths only when authored text is absent.
+    :param attempt_id: Correlate attachment-only and inline attachment echoes.
     :returns: Plain text content with file-path references kept at their
         authored positions.
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        if attempt_id is not None and any(
-            isinstance(block, dict)
-            and block.get("type") == "input_text"
-            and isinstance(text := block.get("text"), str)
-            and text.strip()
-            and not is_tagged_filesystem_attachment(text, attempt_id)
-            for block in content
-        ):
+        if attempt_id is not None and not needs_attachment_attempt(content, attempt_id):
             attempt_id = None
         parts: list[str] = []
         attachment_index = 0

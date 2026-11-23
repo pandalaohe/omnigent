@@ -1158,6 +1158,8 @@ async def _launch_and_record(
         write_host_permission_state, bridge_dir / HOST_PERMISSION_STATE_FILE, state
     )
     effort = snapshot.get("reasoning_effort")
+    raw_model_options = snapshot.get("model_options")
+    catalog_models = raw_model_options if isinstance(raw_model_options, list) else None
     argv, launch_env = await asyncio.to_thread(
         build_agy_launch,
         conversation_id=conversation_id if resume else None,
@@ -1166,6 +1168,7 @@ async def _launch_and_record(
         extra_args=passthrough_args + tuple(agy_tier_launch_args(tier)),
         effort=effort if isinstance(effort, str) and effort else None,
         log_dir=bridge_dir,
+        catalog_models=catalog_models,
     )
     env_overrides.update(launch_env)
     await asyncio.to_thread(

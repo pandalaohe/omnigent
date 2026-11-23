@@ -134,6 +134,10 @@ class EffortFamily(str, Enum):
     DYNAMIC = "dynamic"  # the session advertisement, not a static vocabulary, decides support
     OPENAI = "openai"
     GEMINI = "gemini"
+    # agy offers xhigh on Gemini 4 Neon / Hydrogen while capping models that
+    # top out at high (e.g. Opus/Sonnet 5.5) per model; other Gemini-family
+    # harnesses stay on GEMINI (low/medium/high).
+    ANTIGRAVITY = "antigravity"
     COPILOT = "copilot"
     PI = "pi"
     # The real codex process is the per-model authority on reasoning levels

@@ -29,6 +29,7 @@ from omnigent.codex_approval_modes import (
 )
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
     CERTIFICATE_REMEDIATION,
@@ -3875,14 +3876,36 @@ async def _create_thread_replacement_session(
     external_resp.raise_for_status()
 
     terminal_id = terminal_resource_id("codex", "main")
-    transfer_resp = await client.post(
-        (
-            f"/v1/sessions/{url_component(old_session_id)}"
-            f"/resources/terminals/{url_component(terminal_id)}/transfer"
-        ),
-        json={"target_session_id": new_session_id},
+    source_terminal_path = (
+        f"/v1/sessions/{url_component(old_session_id)}"
+        f"/resources/terminals/{url_component(terminal_id)}"
     )
-    transfer_resp.raise_for_status()
+    instance_id = await _read_terminal_instance_id(client, source_terminal_path)
+    transfer_path = f"{source_terminal_path}/transfer"
+    transfer_body = {"target_session_id": new_session_id}
+    if instance_id is not None:
+        transfer_body["expected_instance_id"] = instance_id
+    try:
+        transfer_resp = await client.post(transfer_path, json=transfer_body)
+        if _is_pre_move_owner_write_failure(transfer_resp):
+            await asyncio.sleep(0.1)
+            transfer_resp = await client.post(transfer_path, json=transfer_body)
+        transfer_resp.raise_for_status()
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        if isinstance(exc, httpx.HTTPStatusError) and (
+            not exc.response.is_server_error or _is_pre_move_owner_write_failure(exc.response)
+        ):
+            raise
+        target_terminal_path = (
+            f"/v1/sessions/{url_component(new_session_id)}"
+            f"/resources/terminals/{url_component(terminal_id)}"
+        )
+        # A persisted resource owner predates the move. Only the original
+        # instance under the successor proves this transfer happened.
+        if instance_id is None or instance_id != await _read_terminal_instance_id(
+            client, target_terminal_path
+        ):
+            raise
 
     write_bridge_state(
         bridge_dir,
@@ -3902,20 +3925,57 @@ async def _create_thread_replacement_session(
         ),
     )
 
-    clear_resp = await client.patch(
-        f"/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
-    )
-    if clear_resp.status_code >= 400:
+    try:
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={"runner_id": ""},
+        )
+    except httpx.RequestError as exc:
         _logger.warning(
             "Failed to clear old codex-native runner binding after thread switch; "
-            "old_session=%s new_session=%s status=%s body=%s",
+            "old_session=%s new_session=%s error=%s",
             old_session_id,
             new_session_id,
-            clear_resp.status_code,
-            clear_resp.text,
+            type(exc).__name__,
         )
+    else:
+        if clear_resp.status_code >= 400:
+            _logger.warning(
+                "Failed to clear old codex-native runner binding after thread switch; "
+                "old_session=%s new_session=%s status=%s body=%s",
+                old_session_id,
+                new_session_id,
+                clear_resp.status_code,
+                clear_resp.text,
+            )
     return new_session_id
+
+
+async def _read_terminal_instance_id(client: httpx.AsyncClient, path: str) -> str | None:
+    """Read the live pane's instance identity; an unavailable read proves nothing."""
+    try:
+        response = await client.get(path)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError, RecursionError):
+        return None
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    instance_id = metadata.get("instance_id") if isinstance(metadata, dict) else None
+    return instance_id if isinstance(instance_id, str) and instance_id else None
+
+
+def _is_pre_move_owner_write_failure(response: httpx.Response) -> bool:
+    if response.status_code != httpx.codes.INTERNAL_SERVER_ERROR:
+        return False
+    try:
+        payload = response.json()
+    except (ValueError, RecursionError):
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED
+    )
 
 
 async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) -> _JsonObject:

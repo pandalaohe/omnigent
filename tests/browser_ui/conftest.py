@@ -280,6 +280,12 @@ def browser_contract(
             },
         ),
         (
+            re.compile(
+                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/host-terminals(?:\?.*)?$"
+            ),
+            {"terminals": [], "complete": True},
+        ),
+        (
             "/v1/artifact-sharing",
             {"external": False, "share_code_set": False, "allow_comments": True},
         ),

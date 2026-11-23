@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
@@ -30,7 +32,9 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
-ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
+# agy supports xhigh on Gemini 4 Neon / Hydrogen; clamp_antigravity_effort
+# checks model support when xhigh is requested.
+ANTIGRAVITY_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 # The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
 # exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
 # support is gated by the Copilot backend (``list_models()``).
@@ -140,6 +144,7 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
         EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
         EffortFamily.OPENAI: OPENAI_EFFORTS,
         EffortFamily.GEMINI: GEMINI_EFFORTS,
+        EffortFamily.ANTIGRAVITY: ANTIGRAVITY_EFFORTS,
         EffortFamily.COPILOT: COPILOT_EFFORTS,
         EffortFamily.PI: PI_EFFORTS,
         EffortFamily.CODEX_NATIVE: CODEX_NATIVE_EFFORTS,
@@ -201,6 +206,112 @@ class ModelEffortCaps:
 
 #: The caps every deployment gets unless its ``routing:`` block overrides them.
 DEFAULT_MODEL_EFFORT_CAPS = ModelEffortCaps()
+
+# agy serves several models that top out below ``xhigh`` (``agy models`` offers
+# ``xhigh`` only for Gemini 4 Neon / Hydrogen). Kept separate from
+# ``DEFAULT_MODEL_EFFORT_CAPS`` because Opus/Sonnet 5.5 support ``xhigh``/``max``
+# on Anthropic harnesses and because ``routing.effort_caps`` overrides the
+# gateway table independently of agy's CLI catalog.
+_ANTIGRAVITY_XHIGH_FALLBACK_ORDER = ("xhigh", "high", "medium", "low")
+_ANTIGRAVITY_DISPLAY_EFFORT_RE = re.compile(
+    r"\s*\((?:low|medium|high|xhigh|max)\)$", re.IGNORECASE
+)
+_ANTIGRAVITY_SLUG_EFFORT_RE = re.compile(r"-(?:low|medium|high|xhigh|max)$", re.IGNORECASE)
+
+
+def _strip_antigravity_effort_suffix(model: str) -> str:
+    """Strip a trailing agy display-name or slug effort suffix."""
+    without_display = _ANTIGRAVITY_DISPLAY_EFFORT_RE.sub("", model.strip())
+    return _ANTIGRAVITY_SLUG_EFFORT_RE.sub("", without_display).strip()
+
+
+def _antigravity_model_identity(model: str) -> str:
+    """Fold an agy model id or display name into a comparison key."""
+    base = _strip_antigravity_effort_suffix(model)
+    return re.sub(r"[^a-z0-9]", "", _bare_model(base))
+
+
+def _antigravity_row_efforts(row: Mapping[str, object]) -> frozenset[str] | None:
+    """Extract advertised effort values from one agy catalog row."""
+    raw = row.get("efforts")
+    if isinstance(raw, (list, tuple)):
+        levels = frozenset(v for v in raw if isinstance(v, str) and v)
+        if levels:
+            return levels
+    supported = row.get("supportedReasoningEfforts")
+    if isinstance(supported, (list, tuple)):
+        levels = frozenset(
+            item["reasoningEffort"]
+            for item in supported
+            if isinstance(item, Mapping)
+            and isinstance(item.get("reasoningEffort"), str)
+            and item["reasoningEffort"]
+        )
+        if levels:
+            return levels
+    return None
+
+
+@lru_cache(maxsize=1)
+def _antigravity_static_xhigh_efforts() -> dict[str, str]:
+    """Return verified xhigh or fallback efforts by normalized agy model identity.
+
+    Imported lazily because :mod:`omnigent.models.model_fallbacks` pulls in
+    ``provider_config`` → ``spec.parser`` → ``spec.validator`` → this module.
+    """
+    from omnigent.models.model_fallbacks import (
+        ANTIGRAVITY_MEDIUM_CAP_MODELS,
+        ANTIGRAVITY_XHIGH_MODELS,
+    )
+
+    return {
+        **dict.fromkeys(
+            map(_antigravity_model_identity, ANTIGRAVITY_XHIGH_MODELS.model_ids), "xhigh"
+        ),
+        **dict.fromkeys(
+            map(_antigravity_model_identity, ANTIGRAVITY_MEDIUM_CAP_MODELS.model_ids), "medium"
+        ),
+    }
+
+
+def clamp_antigravity_effort(
+    effort: str | None,
+    model: str | None,
+    *,
+    catalog_models: Iterable[Mapping[str, object]] | None = None,
+) -> str | None:
+    """Clamp an Antigravity xhigh request (including aliases) by model.
+
+    ``xhigh`` (and higher aliases ``max``/``ultra``) is allowed only when the
+    resolved model is known to offer ``xhigh`` — either because its row in
+    *catalog_models* advertises ``xhigh``, or (when no catalog row matches) its
+    normalized identity is in :data:`ANTIGRAVITY_XHIGH_MODELS`. Any other or
+    unknown model, including ``model=None``, fails closed to ``"high"`` (or the
+    highest/nearest rung the model supports, such as ``"medium"`` for
+    medium-only models).
+    """
+    if effort is None or EFFORT_ALIASES.get(effort, effort) != "xhigh":
+        return effort
+    identity = (
+        _antigravity_model_identity(model) if isinstance(model, str) and model.strip() else ""
+    )
+    if identity and catalog_models is not None:
+        for row in catalog_models:
+            if not isinstance(row, Mapping):
+                continue
+            row_id = row.get("id")
+            row_display = row.get("displayName")
+            if (isinstance(row_id, str) and _antigravity_model_identity(row_id) == identity) or (
+                isinstance(row_display, str)
+                and _antigravity_model_identity(row_display) == identity
+            ):
+                offered = _antigravity_row_efforts(row)
+                if offered:
+                    for level in _ANTIGRAVITY_XHIGH_FALLBACK_ORDER:
+                        if level in offered:
+                            return level
+                return "high"
+    return _antigravity_static_xhigh_efforts().get(identity, "high")
 
 
 def model_effort_caps(caps: ModelEffortCaps | None = None) -> ModelEffortCaps:
