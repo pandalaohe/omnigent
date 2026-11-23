@@ -221,10 +221,11 @@ async def _update_request(
     client: httpx.AsyncClient, method: str, path: str, *, wait_s: float, **kwargs: Any
 ) -> httpx.Response:
     """Apply a hard deadline as well as HTTPX's per-operation timeouts."""
+    io_timeout_s = 60.0 if method == "PATCH" else 30.0
     try:
         async with asyncio.timeout(wait_s):
             return await client.request(
-                method, path, timeout=httpx.Timeout(30.0, read=wait_s), **kwargs
+                method, path, timeout=httpx.Timeout(io_timeout_s, read=wait_s), **kwargs
             )
     except TimeoutError as exc:
         raise httpx.ReadTimeout(f"no complete response within {wait_s:g}s") from exc

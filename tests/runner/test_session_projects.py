@@ -289,6 +289,9 @@ async def test_update_settings_waits_for_slow_probe_snapshot_and_patch():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append((request.method, request.url.path))
+        timeout = request.extensions["timeout"]
+        io_timeout = 60.0 if request.method == "PATCH" else 30.0
+        assert all(timeout[phase] == io_timeout for phase in ("connect", "pool", "write"))
         if request.url.path == "/v1/info":
             delay, reply = 80, CHECKED_INFO
         elif request.method == "GET":
@@ -300,7 +303,7 @@ async def test_update_settings_waits_for_slow_probe_snapshot_and_patch():
             assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
             delay, reply = 630, {"model_override": "host-model", "reasoning_effort": "high"}
         # Simulate reply latencies against the bound HTTPX passes to the transport.
-        if request.extensions["timeout"]["read"] < delay:
+        if timeout["read"] < delay:
             raise httpx.ReadTimeout("")
         return httpx.Response(200, json=reply)
 
