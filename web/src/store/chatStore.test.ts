@@ -12427,6 +12427,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
   describe("session.input.consumed", () => {
     it.each([false, true])(
+      "keeps a received input waiting when a mirror cannot name its send (already mirrored=%s)",
+      (alreadyMirrored) => {
+        const content = [{ type: "input_text" as const, text: "Use metric units." }];
+        const pending = { tempId: "tmp_web", pendingId: "pending_web", content, received: true };
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "terminal_item",
+          itemType: "message",
+          data: { role: "user", content },
+        };
+        useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+        if (alreadyMirrored) handleSessionEvent(event);
+        useChatStore.setState({ pendingUserMessages: [pending] });
+
+        handleSessionEvent(event);
+
+        expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+        expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["terminal_item"]);
+      },
+    );
+
+    it.each([false, true])(
       "does not consume an unsent model-switch draft (already mirrored=%s)",
       (alreadyMirrored) => {
         const event: SessionInputConsumedEvent = {
@@ -24246,6 +24268,67 @@ describe("chatStore — live delta streaming (claude-native)", () => {
           b.type === "text_done" && b.ctx.itemId?.startsWith("live:") === true,
       );
   }
+
+  it("promotes a read steer between earlier buffered output and the next reply", async () => {
+    const id = "conv_read_steer";
+    const content = [{ type: "input_text" as const, text: "Use metric units." }];
+    const read = { tempId: "tmp_read", pendingId: "pending_read", content, received: true };
+    const unread = { ...read, tempId: "tmp_unread", pendingId: "pending_unread" };
+    useChatStore.setState({
+      conversationId: id,
+      blocks: [],
+      isNativeTerminalSession: true,
+      sessionHarness: "claude-native",
+      pendingUserMessages: [read, unread],
+    });
+    const { sink, controller, manual } = startPump(id);
+    sink.push(nativeDelta("prior", 0, "Working on it.", true));
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["live:prior"]);
+    sink.push(messageDone("prior_1", "resp_prior", "Working on it.", "prior"));
+    await tick();
+    sink.push(messageDone("prior_2", "resp_prior", "This also happened before the steer."));
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["prior_1"]);
+
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "read_item",
+          cleared_pending_id: read.pendingId,
+          type: "message",
+          data: { role: "user", content },
+        },
+      }),
+    );
+    sink.push(nativeDelta("reply", 0, "The distance is 5 km.", false));
+    await tick();
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
+      "prior_1",
+      "prior_2",
+      "read_item",
+      "live:reply",
+    ]);
+    expect(buildBubbles(state.blocks, null).map((b) => b.kind)).toEqual([
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(buildPendingBubbles(state.pendingUserMessages, null)).toMatchObject([
+      { itemId: unread.tempId, awaitingAgent: true },
+    ]);
+    sink.push(messageDone("next_item", "resp_next", "The distance is 5 km.", "reply"));
+    await tick();
+    manual.fire();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      "prior_1",
+      "prior_2",
+      "read_item",
+      "next_item",
+    ]);
+    controller.abort();
+  });
 
   it("streams into a provisional block in `blocks`, not a separate lane", async () => {
     useChatStore.setState({

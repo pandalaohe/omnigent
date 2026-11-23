@@ -8477,8 +8477,7 @@ export async function pumpStreamEvents(
         };
       },
       () => {
-        // Commit what the stream emitted before a turn edge applies, so the
-        // edge's adoption and cleanup (e.g. of a "Compacting…" spinner) see it.
+        // Commit preceding stream blocks before a turn edge or a user item.
         flush();
       },
     ),
@@ -9420,6 +9419,9 @@ function pendingMatchesConsumedEvent(
   event: SessionInputConsumedEvent,
   pending: PendingUserMessage,
 ): boolean {
+  // The runner already named this queued input. A mirror for an unknown or
+  // different send cannot prove that Claude has taken it out of the queue.
+  if (pending.received) return false;
   const hasFiles = pending.content.some(
     (block) => block.type === "input_image" || block.type === "input_file",
   );
@@ -11319,7 +11321,7 @@ async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
   onElicitationResolved?: (event: Extract<StreamEvent, { type: "elicitation_resolved" }>) => void,
-  beforeTurnEdge?: () => void,
+  flushBeforeEvent?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     const turnEdge = event.type === "session_status" || event.type === "session_interrupted";
@@ -11332,7 +11334,16 @@ async function* tapSessionEvents(
         );
       }
     }
-    if (turnEdge) beforeTurnEdge?.();
+    // A consumed user item enters history at this point in the stream. Apply
+    // any older output still waiting for its animation-frame flush first.
+    if (
+      turnEdge ||
+      (event.type === "session_input_consumed" &&
+        event.itemType === "message" &&
+        event.data.role === "user")
+    ) {
+      flushBeforeEvent?.();
+    }
     if (event.type === "elicitation_resolved") {
       bumpElicitationVerdictRevision(conversationId, event.elicitationId);
     }

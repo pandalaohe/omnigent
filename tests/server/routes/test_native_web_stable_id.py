@@ -1,5 +1,6 @@
 """A native mirror names the web send it delivered only when the pending-input link is exact."""
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -9,7 +10,11 @@ import pytest
 
 from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import ConversationItem, MessageData
-from omnigent.harnesses.claude_native.bridge import _claim_message_delivery
+from omnigent.harnesses.claude_native.bridge import (
+    _claim_message_delivery,
+    read_transcript_items_from_offset,
+)
+from omnigent.harnesses.claude_native.forwarder import _post_external_conversation_item
 from omnigent.inner import claude_native_executor
 from omnigent.inner.executor import ExecutorConfig, TurnComplete
 from omnigent.native.input_diagnostics import input_delivery_scope
@@ -102,6 +107,217 @@ async def test_text_matched_mirror_names_its_web_send(
     assert item.to_api_dict()["web_stable_id"] == _WEB_ID
     [receipt] = [receipt for receipt in receipts if receipt["item_id"] == item.id]
     assert receipt["data"]["web_stable_id"] == _WEB_ID
+
+
+@pytest.mark.parametrize("attachment_kind", ["image", "file", "partial-failure"])
+@pytest.mark.asyncio
+async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_position(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, attachment_kind: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        title="Native", labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE}
+    )
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    before = {"type": "input_text", "text": "See this screenshot."}
+    after = {"type": "input_text", "text": "Check the red dot."}
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.attachments_root", lambda: tmp_path / "attachments"
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.attachment_cache_dir",
+        lambda _bridge_dir: tmp_path / "attachments" / ("c" * 32),
+    )
+    filename, mime = (
+        ("status.png", "image/png")
+        if attachment_kind != "file"
+        else ("status.zip", "application/zip")
+    )
+    upload = {
+        "type": "input_file" if attachment_kind == "file" else "input_image",
+        "file_id": "file_upload",
+        "filename": filename,
+    }
+    other_uploads = (
+        [{"type": "input_image", "file_id": "file_missing", "filename": "missing.png"}]
+        if attachment_kind == "partial-failure"
+        else []
+    )
+    content = [before, upload, *other_uploads, after]
+    older = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Unclaimed"}])
+    # Same authored text and attachment position, but a different attempt and upload.
+    unread = pending_inputs.record(
+        conv.id,
+        [before, {**upload, "file_id": "file_unread"}, *other_uploads, after],
+        runner_managed=True,
+    )
+    read = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
+    assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
+    assert pending_inputs.claim_runner_input(conv.id, read, "claim_read")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if "file_missing" in request.url.path:
+            return httpx.Response(404)
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"\0", headers={"Content-Type": mime})
+        return httpx.Response(
+            200, json={"name": filename, "content_type": mime, "metadata": {"bytes": 1}}
+        )
+
+    attempt = str(pending_inputs.delivery_attributes_for(conv.id, read)["delivery_attempt_id"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="https://test"
+    ) as client:
+        resolved = await _resolve_forwarded_message_content(
+            content, session_id=conv.id, server_client=client, delivery_attempt_id=attempt
+        )
+    prompt = claude_native_executor._content_to_text(
+        _normalize_message_content(resolved), tmp_path, attempt_id=attempt
+    )
+    assert f"omnigent-upload-{attempt}-0" in prompt
+    if other_uploads:
+        assert (
+            f"[Attachment missing.png could not be loaded] [omnigent-upload-{attempt}-1]" in prompt
+        )
+
+    queued = f'<pasted_content id="paste">\n{prompt}\n</pasted_content id="paste">'
+    queue_record = {"type": "queue-operation", "sessionId": "claude-session", "content": queued}
+
+    def assistant(uuid: str, text: str) -> dict[str, Any]:
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        }
+
+    async def persist(request: httpx.Request) -> httpx.Response:
+        item_id, replayed = await _persist_external_conversation_item(
+            conv.id, conv, SessionEventInput.model_validate_json(request.content), store
+        )
+        return httpx.Response(202, json={"item_id": item_id, "replayed": replayed})
+
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        assistant("previous", "Prior output"),
+        {**queue_record, "operation": "enqueue"},
+    ]
+    transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(persist), base_url="https://test"
+    ) as client:
+        first = read_transcript_items_from_offset(
+            transcript, 0, start_line=0, agent_name="claude-native-ui"
+        )
+        for item in first.items:
+            await _post_external_conversation_item(client, session_id=conv.id, item=item)
+        assert pending_inputs.pending_ids(conv.id) == [older, unread, read]
+
+        records = [
+            {
+                **queue_record,
+                "operation": "remove",
+                "reason": "absorbed_mid_turn",
+                "commandUuid": "command",
+                "deliveryId": "delivery",
+            },
+            {
+                "type": "attachment",
+                "uuid": "drained",
+                "isSidechain": False,
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": queued,
+                    "commandMode": "prompt",
+                    "source_uuid": "command",
+                    "delivery_id": "delivery",
+                    "origin": {"kind": "human"},
+                },
+            },
+            assistant("next", "New output"),
+        ]
+        with transcript.open("a") as file:
+            file.writelines(json.dumps(record) + "\n" for record in records)
+        second = read_transcript_items_from_offset(
+            transcript,
+            first.byte_offset,
+            start_line=first.line_cursor,
+            agent_name="claude-native-ui",
+            current_response_id=first.current_response_id,
+        )
+        for item in second.items:
+            await _post_external_conversation_item(client, session_id=conv.id, item=item)
+
+    assert pending_inputs.pending_ids(conv.id) == [older, unread]
+    persisted = store.list_items(conv.id, order="asc").data
+    assert len(persisted) == 3
+    receipts = [call.args[1] for call in publish.call_args_list]
+    assert [event["type"] for event in receipts] == [
+        "response.output_item.done",
+        "session.input.consumed",
+        "response.output_item.done",
+    ]
+    assert receipts[1]["data"]["item_id"] == persisted[1].id
+    assert [receipts[i]["item"]["id"] for i in (0, 2)] == [persisted[0].id, persisted[2].id]
+    assert receipts[1]["data"]["cleared_pending_id"] == read
+    assert receipts[1]["data"]["data"]["content"] == content
+    assert receipts[1]["data"]["data"]["web_stable_id"] == _WEB_ID
+
+
+@pytest.mark.parametrize(
+    "echo",
+    ["inline", "foreign-attempt", "text-only", "leading-attachment", "wrong-failure-ordinal"],
+)
+@pytest.mark.asyncio
+async def test_claude_inline_attachment_echo_cannot_consume_unread_claim(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, echo: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    before = "See this screenshot."
+    after = "Check the red dot."
+    content = [
+        {"type": "input_text", "text": before},
+        {"type": "input_image", "file_id": "file_unread", "filename": "same-name.png"},
+        {"type": "input_text", "text": after},
+    ]
+    unread = pending_inputs.record(conv.id, content, stable_id=_WEB_ID, runner_managed=True)
+    assert pending_inputs.claim_runner_input(conv.id, unread, "claim_unread")
+    attempt = pending_inputs.delivery_attributes_for(conv.id, unread)["delivery_attempt_id"]
+    path = f"/opt/work/attachments/{'c' * 32}/"
+    marker = f"[Attached: {path}same-name.png]"
+    prompt = {
+        "inline": f"{before}\n\n{marker}\n\n{after}",
+        "foreign-attempt": (
+            f"{before}\n\n[Attached: {path}omnigent-upload-{'d' * 32}-0-same-name.png]\n\n{after}"
+        ),
+        "text-only": f"{before}\n\n{after}",
+        "leading-attachment": f"{marker}\n\n{before}\n\n{after}",
+        "wrong-failure-ordinal": (
+            f"{before}\n\n[Attachment same-name.png could not be loaded] "
+            f"[omnigent-upload-{attempt}-1]\n\n{after}"
+        ),
+    }[echo]
+
+    item_id, replay = await _persist_external_conversation_item(
+        conv.id, conv, _mirror(prompt), store
+    )
+
+    assert item_id and not replay
+    item = store.get_item(conv.id, item_id)
+    assert item is not None and isinstance(item.data, MessageData)
+    assert item.data.content == [{"type": "input_text", "text": prompt}]
+    assert "web_stable_id" not in item.to_api_dict()
+    assert pending_inputs.pending_ids(conv.id) == [unread]
+    [receipt] = [
+        call.args[1]["data"]
+        for call in publish.call_args_list
+        if call.args[1]["type"] == "session.input.consumed"
+    ]
+    assert receipt["item_id"] == item_id
+    assert receipt.get("cleared_pending_id") is None
 
 
 @pytest.mark.parametrize("files", [("image",), ("zip",), ("zip", "image"), ("image", "zip")])

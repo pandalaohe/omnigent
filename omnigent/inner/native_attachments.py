@@ -27,7 +27,7 @@ import shutil
 import stat
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import ModuleType
@@ -396,12 +396,14 @@ def mark_purged_attachments(text: str, session_id: str, purged: Mapping[str, str
 _DELIVERY_FILENAME_PREFIX = "omnigent-upload-"
 _DELIVERY_ATTEMPT = r"[0-9a-f]{32}"
 _DELIVERY_ORDINAL = r"[0-9]+"
+_UNRESOLVED_ATTACHMENT_MARKER = r"\[Attachment [^\]\r\n]+ could not be loaded\]"
 _DELIVERY_ATTACHMENT_MARKER = re.compile(
     r"\[Attached: (?:/|[A-Za-z]:[\\/]|\\\\)(?:[^\]\r\n]*[\\/])?attachments[\\/][0-9a-f]{32}[\\/]"
     rf"{_DELIVERY_FILENAME_PREFIX}(?P<cache_attempt>{_DELIVERY_ATTEMPT})-"
     rf"(?P<cache_ordinal>{_DELIVERY_ORDINAL})-[^\]\\/\r\n]+\]"
-    rf"|(?:{_ATTACHED_PATH_RE.pattern}) \[{_DELIVERY_FILENAME_PREFIX}"
-    rf"(?P<path_attempt>{_DELIVERY_ATTEMPT})-(?P<path_ordinal>{_DELIVERY_ORDINAL})\]"
+    rf"|(?:(?P<by_path>{_ATTACHED_PATH_RE.pattern})|{_UNRESOLVED_ATTACHMENT_MARKER})"
+    rf" \[{_DELIVERY_FILENAME_PREFIX}"
+    rf"(?P<tag_attempt>{_DELIVERY_ATTEMPT})-(?P<tag_ordinal>{_DELIVERY_ORDINAL})\]"
 )
 
 
@@ -410,13 +412,13 @@ def attachment_delivery_identity(text: str) -> tuple[str, int | None] | None:
     found = _DELIVERY_ATTACHMENT_MARKER.search(text) if _DELIVERY_FILENAME_PREFIX in text else None
     if found is None:
         return None
-    attempt_id = found["cache_attempt"] or found["path_attempt"]
+    attempt_id = found["cache_attempt"] or found["tag_attempt"]
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     for index, line in enumerate(lines):
         match = _DELIVERY_ATTACHMENT_MARKER.fullmatch(line)
         if match is None or (
-            match["cache_attempt"] or match["path_attempt"],
-            match["cache_ordinal"] or match["path_ordinal"],
+            match["cache_attempt"] or match["tag_attempt"],
+            match["cache_ordinal"] or match["tag_ordinal"],
         ) != (
             attempt_id,
             str(index),
@@ -428,7 +430,39 @@ def attachment_delivery_identity(text: str) -> tuple[str, int | None] | None:
 def is_tagged_filesystem_attachment(text: str, attempt_id: str) -> bool:
     """Distinguish the current attempt's runner-generated path line from authored text."""
     match = _DELIVERY_ATTACHMENT_MARKER.fullmatch(text)
-    return match is not None and match["path_attempt"] == attempt_id
+    return (
+        match is not None and match["by_path"] is not None and match["tag_attempt"] == attempt_id
+    )
+
+
+def needs_attachment_attempt(content: Sequence[object], attempt_id: str) -> bool:
+    """Tag attachment-only prompts and uploads that follow authored text."""
+    has_text = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        text = block.get("text") if kind == "input_text" else None
+        if kind in ("input_image", "input_file") or (
+            isinstance(text, str) and is_tagged_filesystem_attachment(text, attempt_id)
+        ):
+            if has_text:
+                return True
+        elif isinstance(text, str) and text.strip():
+            has_text = True
+    return not has_text
+
+
+def strip_attachment_attempt_marker(text: str, attempt_id: str, ordinal: int) -> str | None:
+    """Strip a reference or load failure that proves this attempt and ordinal."""
+    match = _DELIVERY_ATTACHMENT_MARKER.match(text)
+    if match is None or (
+        match["cache_attempt"] or match["tag_attempt"],
+        match["cache_ordinal"] or match["tag_ordinal"],
+    ) != (attempt_id, str(ordinal)):
+        return None
+    rest = text[match.end() :]
+    return rest.lstrip() if not rest or rest[0].isspace() else None
 
 
 def materialize_attachment(
@@ -449,8 +483,7 @@ def materialize_attachment(
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
-    :param delivery: Validated attempt ID and zero-based ordinal for a claimed
-        attachment-only prompt, whose transcript will have no text to match.
+    :param delivery: Validated attempt ID and zero-based attachment ordinal.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
@@ -1139,7 +1172,10 @@ def _read_fd(fd: int, size: int) -> bytes:
 # Regex source matching the exact line unresolved_attachment_marker() emits.
 # Consumers (title synthesis, TUI forwarders) compose their marker-matching
 # patterns from this so the shapes cannot drift apart.
-UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded\]"
+UNRESOLVED_ATTACHMENT_MARKER_PATTERN = (
+    rf"{_UNRESOLVED_ATTACHMENT_MARKER}"
+    rf"(?: \[{_DELIVERY_FILENAME_PREFIX}{_DELIVERY_ATTEMPT}-{_DELIVERY_ORDINAL}\])?"
+)
 
 # TUI forwarders strip local file paths from mirrored chat bubbles.
 # Codex's binary file inputs also use the "[Attached file: ...]" shape.
@@ -1191,7 +1227,11 @@ def attachment_reference_line(
     path = materialize_attachment(block, bridge_dir, delivery=delivery)
     if path is not None:
         return f"[Attached: {path}]"
-    return unresolved_attachment_marker(block)
+    marker = unresolved_attachment_marker(block)
+    if delivery is not None:
+        attempt_id, ordinal = delivery
+        marker += f" [{_DELIVERY_FILENAME_PREFIX}{attempt_id}-{ordinal}]"
+    return marker
 
 
 def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
@@ -1547,7 +1587,7 @@ async def resolve_file_reference(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
-    :param delivery: Tag the resolved filesystem reference for an attachment-only Claude claim.
+    :param delivery: Tag the resolved filesystem reference for a Claude claim.
     :returns: The replacement blocks, or ``None`` when resolution failed, in
         which case the caller keeps the original block and a visible marker
         can surface downstream.
