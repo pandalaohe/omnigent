@@ -87,16 +87,11 @@ Limitations (identical to :mod:`pending_elicitations`):
   subscribers live on one process), so this rides the same affinity.
 * Ordinary native entries do not survive a server restart. Durable startup
   entries are restored from conversation items when a transcript arrives.
-* At most :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries per
-  conversation; :func:`record` evicts the oldest unheld entries beyond that
-  and never the entry it just recorded. Entries a persist in progress has
-  drained with ``hold=True`` keep their slot until :func:`release` (it
-  landed) or :func:`restore` (it did not) settles them, so a queue that
-  refills during the persist can never discard the entries a failed append
-  has to put back; they are a transient overlay of at most one drain, so
-  the queue never exceeds twice the cap. A drain reports at most a cap's
-  worth of skipped entries, so the persist site's append stays bounded
-  even right after a rolled-back drain left the queue over the cap.
+* :func:`record` caps unheld entries without a runner lease per conversation.
+  A persist in progress keeps its held entries so it can restore them if the
+  append fails. :func:`claim_runner_input` separately caps outstanding paste
+  claims, including interrupted claims still awaiting settlement. A drain
+  reports at most a cap's worth of skipped entries to bound each append.
 * An image-only message has no text to match, so it drains by position;
   behind a stale head
   entry its image can land on the wrong message. This is the positional
@@ -144,13 +139,12 @@ _TTL_S: float = 600.0
 # turn ending, a missing receipt, or a reconnect. Keep the matchable identity
 # for a fixed two hours from the claim so a late transcript can settle it.
 _CLAIMED_INPUT_TIMEOUT_S = 2 * 60 * 60.0
+# Legacy echoes carry text without a delivery identity. Restrict this
+# fallback to the original claim timeout; extra time is for linked evidence.
+_CLAIMED_TEXT_MATCH_TIMEOUT_S = 12 * 60.0
 
-# Hard cap on unheld queued entries per conversation, enforced by
-# :func:`record`: the oldest unheld entries are evicted when a new one would
-# exceed it (never the new one itself). Bounds the snapshot replay and the
-# persist site's append (each skipped entry becomes two rows). Far above any
-# real queue: nobody sends this many messages within the TTL with none echoed
-# back.
+# Per-conversation cap for unheld entries without a runner lease, and a
+# separate cap of the same size for claims awaiting settlement.
 _MAX_ENTRIES_PER_CONVERSATION = 64
 
 # One attachment reference line a native executor prepends to a pasted message
@@ -465,10 +459,9 @@ def record(
         its input id must equal ``stable_id``.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
-    Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
-    unheld one is evicted (never this new one), so the queue (and everything
-    sized by it) stays bounded without touching entries a persist in progress
-    must be able to put back.
+    Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries without a
+    runner lease, evict the oldest of those entries. Held entries and entries
+    with a runner lease settle through their respective owners.
     """
     if auto_retry is not None and auto_retry.input_id != stable_id:
         raise ValueError("Automatic input metadata requires its stable input id")
@@ -532,7 +525,8 @@ def claim_runner_input(
 ) -> bool:
     """Grant one runner attempt the right to paste while its lease is live."""
     with _lock:
-        entry = _pending.get(conversation_id, {}).get(pending_id)
+        entries = _pending.get(conversation_id, {})
+        entry = entries.get(pending_id)
         if entry is None or entry.held or entry.interrupted:
             return False
         if expected_attempt_id is not None and entry.delivery_attempt_id != expected_attempt_id:
@@ -546,6 +540,11 @@ def claim_runner_input(
                 entry.runner_claim_id == claim_id and now - last_renewal < _CLAIMED_INPUT_TIMEOUT_S
             )
         if now - last_renewal >= _TTL_S:
+            return False
+        # Refuse before pasting rather than evict a claim that may still have
+        # a delayed transcript receipt. Duplicate claims use their existing slot.
+        outstanding_claims = sum(other.runner_claim_id is not None for other in entries.values())
+        if outstanding_claims >= _MAX_ENTRIES_PER_CONVERSATION:
             return False
         entry.runner_claim_id = claim_id
         entry.last_runner_renewal = now
@@ -1258,7 +1257,8 @@ def resolve_matching_text(
         attachment_delivery_identity(text) if claude_commands and not shell_command else None
     )
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
@@ -1357,6 +1357,16 @@ def resolve_matching_text(
                 or _matches_injected_prefix(entry, exact_needle)
             )
         ]
+        # A matching text could belong to a retained claim whose original
+        # text-match window has closed. Leave every candidate queued in that
+        # case: even a newer same-text entry could be the wrong owner.
+        for index in (match_index, *shared_matches):
+            candidate = ordered[index][1]
+            claimed_at = candidate.last_runner_renewal
+            if candidate.runner_claim_id is not None and (
+                claimed_at is None or now - claimed_at >= _CLAIMED_TEXT_MATCH_TIMEOUT_S
+            ):
+                return MatchedDrain(matched=None, skipped=[], match_method="unattributed_claim")
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an

@@ -296,6 +296,22 @@ def _text_block(text: str) -> dict[str, object]:
     return {"type": "input_text", "text": text}
 
 
+def test_claimed_input_cap_refuses_before_paste_and_releases_a_settled_slot() -> None:
+    ids = [
+        pending_inputs.record("conv", [_text_block(f"Message {index}")], runner_managed=True)
+        for index in range(65)
+    ]
+    for pending_id in ids[:-1]:
+        assert pending_inputs.claim_runner_input("conv", pending_id, pending_id)
+
+    assert not pending_inputs.claim_runner_input("conv", ids[-1], "extra")
+    assert pending_inputs.claim_runner_input("conv", ids[0], ids[0])
+    assert pending_inputs.pending_ids("conv") == ids
+
+    assert pending_inputs.resolve("conv", ids[0]) is not None
+    assert pending_inputs.claim_runner_input("conv", ids[-1], "extra")
+
+
 def test_record_then_snapshot_preserves_order_and_content() -> None:
     """
     Snapshot replays recorded messages FIFO with content verbatim.

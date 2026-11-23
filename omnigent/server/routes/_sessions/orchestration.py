@@ -5585,7 +5585,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
-                and match_method != "attachment_attempt"
+                and match_method not in ("attachment_attempt", "unattributed_claim")
                 and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)

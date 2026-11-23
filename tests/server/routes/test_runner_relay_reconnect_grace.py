@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
@@ -144,12 +145,15 @@ async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri,
 @pytest.mark.parametrize("receipt", ["prompt", "late", "blind", "missing"])
 async def test_claimed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkeypatch, receipt):
     store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation().id
+    session_id = store.create_conversation(
+        labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE}
+    ).id
     now = 0.0
     monkeypatch.setattr(pending_inputs, "_now", lambda: now)
-    pending_id = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "steer"}], runner_managed=True
-    )
+    pending_id, mirror_text = _record_tagged_paste(session_id)
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
     assert pending_inputs.claim_runner_input(session_id, pending_id, "paste")
     collector = await start_session_stream_collector(session_id)
     try:
@@ -162,9 +166,7 @@ async def test_claimed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkeypa
                     "type": "response.completed",
                     "response": {"id": "resp_blind"},
                     "pending_id": pending_id,
-                    "delivery_attempt_id": pending_inputs.delivery_attributes_for(
-                        session_id, pending_id
-                    )["delivery_attempt_id"],
+                    "delivery_attempt_id": attempt_id,
                 },
             )
         # A lost lease heartbeat or a restart could leave the claim without
@@ -205,7 +207,7 @@ async def test_claimed_mid_turn_paste_waits_for_its_late_mirror(db_uri, monkeypa
                         "item_type": "message",
                         "item_data": {
                             "role": "user",
-                            "content": [{"type": "input_text", "text": "steer"}],
+                            "content": [{"type": "input_text", "text": mirror_text}],
                         },
                         "response_id": "resp_turn",
                     },
@@ -274,6 +276,23 @@ async def test_a_completion_after_the_claim_ends_marks_nothing_received(
     pending_inputs.resolve(session_id, pending_id)
 
 
+def _record_tagged_paste(session_id: str, *, stable_id: str | None = None) -> tuple[str, str]:
+    pending_id = pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": "steer"},
+            {"type": "input_file", "file_id": "file_status", "filename": "status.txt"},
+        ],
+        stable_id=stable_id,
+        runner_managed=True,
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    path = f"/opt/work/attachments/{'b' * 32}/omnigent-upload-{attempt_id}-0-status.txt"
+    return pending_id, f"steer\n[Attached: {path}]"
+
+
 def _confirm_paste(session_id: str, pending_id: str) -> None:
     attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
         "delivery_attempt_id"
@@ -293,7 +312,7 @@ def _confirm_paste(session_id: str, pending_id: str) -> None:
 @pytest.mark.asyncio
 async def test_stop_hides_claimed_input_and_keeps_its_proof_deadline(db_uri, monkeypatch):
     store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(title="Native")
+    conv = store.create_conversation(labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE})
     session_id = conv.id
     stable_id = "d" * 32
     now = 0.0
@@ -302,9 +321,7 @@ async def test_stop_hides_claimed_input_and_keeps_its_proof_deadline(db_uri, mon
     monkeypatch.setattr(
         session_stream, "publish", lambda _conversation_id, event: published.append(event)
     )
-    waiting = pending_inputs.record(
-        session_id, [{"type": "input_text", "text": "steer"}], stable_id=stable_id
-    )
+    waiting, mirror_text = _record_tagged_paste(session_id, stable_id=stable_id)
     pending_inputs.mark_delivery_stage(session_id, waiting, "forward_accepted")
     pending_inputs.enable_runner_lease(session_id, waiting)
     stopped: str | None = None
@@ -333,7 +350,7 @@ async def test_stop_hides_claimed_input_and_keeps_its_proof_deadline(db_uri, mon
                         "item_type": "message",
                         "item_data": {
                             "role": "user",
-                            "content": [{"type": "input_text", "text": "steer"}],
+                            "content": [{"type": "input_text", "text": mirror_text}],
                         },
                         "response_id": "resp_mirror",
                     },
