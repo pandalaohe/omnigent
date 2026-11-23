@@ -84,6 +84,7 @@ describe("effortLevelsForFamily", () => {
       "xhigh",
     ]);
     expect(effortLevelsForFamily("gemini")).toEqual(["low", "medium", "high"]);
+    expect(effortLevelsForFamily("antigravity")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(effortLevelsForFamily("copilot")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(effortLevelsForFamily("pi")).toEqual([
       "none",

@@ -5934,16 +5934,28 @@ def register_core_routes(
         """
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
+        settings_change_requested = bool(
+            {"reasoning_effort", "model_override"} & body.model_fields_set
+        )
         if (
             "speed_tier" in body.model_fields_set
             or "permission_mode" in body.model_fields_set
-            or (not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set)
+            or (not body.silent and settings_change_requested)
         ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
                 return await _update_session(
                     request, session_id, body, include_usage, live_change, background_tasks
                 )
+        if settings_change_requested:
+            return await _update_session(
+                request,
+                session_id,
+                body,
+                include_usage,
+                _live_settings_change(session_id),
+                background_tasks,
+            )
         return await _update_session(
             request, session_id, body, include_usage, background_tasks=background_tasks
         )
@@ -7282,47 +7294,59 @@ def register_core_routes(
                 raise _session_not_found()
             set_project = False
 
-        update_result = await apply_session_archive_transition(
-            request,
-            conv,
-            body,
-            conversation_store,
-            permission_store,
-            runner_router,
-            title=body.title,
-            reasoning_effort=None if clear_effort else effort,
-            _unset_reasoning_effort=clear_effort,
-            model_override=None if clear_model else model_override,
-            _unset_model_override=clear_model,
-            cost_control_mode_override=None if clear_cost_control else cost_control_mode_override,
-            _unset_cost_control_mode_override=clear_cost_control,
-            subagent_routing_override=(
-                None if clear_subagent_routing else subagent_routing_override
-            ),
-            _unset_subagent_routing_override=clear_subagent_routing,
-            # Owner opt-in for workspace-file browsing. Presence is the signal:
-            # an omitted field leaves it unchanged; True/False set or clear it.
-            share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
-            terminal_launch_args=terminal_launch_args,
-            label_updates=(
-                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
-                if defer_side_settings and (clear_effort or effort is not None)
-                else None
-            ),
+        settings_write = bool({"reasoning_effort", "model_override"} & body.model_fields_set)
+        write_guard = (
+            live_change.write_lock
+            if live_change is not None and settings_write
+            else contextlib.nullcontext()
         )
-        updated = update_result.conversation
-        effort_changed = update_result.reasoning_effort_changed
-        saved = live_change.position() if live_change is not None else 0
-        if body.silent:
-            # An active live change orders this write against its own when refused.
-            _note_settings_write(
-                session_id,
-                {
-                    key: getattr(updated, key)
-                    for key in ("reasoning_effort", "model_override")
-                    if key in body.model_fields_set
-                },
+        async with write_guard:
+            update_result = await apply_session_archive_transition(
+                request,
+                conv,
+                body,
+                conversation_store,
+                permission_store,
+                runner_router,
+                title=body.title,
+                reasoning_effort=None if clear_effort else effort,
+                _unset_reasoning_effort=clear_effort,
+                model_override=None if clear_model else model_override,
+                _unset_model_override=clear_model,
+                cost_control_mode_override=None
+                if clear_cost_control
+                else cost_control_mode_override,
+                _unset_cost_control_mode_override=clear_cost_control,
+                subagent_routing_override=(
+                    None if clear_subagent_routing else subagent_routing_override
+                ),
+                _unset_subagent_routing_override=clear_subagent_routing,
+                # Owner opt-in for workspace-file browsing. Presence is the signal:
+                # an omitted field leaves it unchanged; True/False set or clear it.
+                share_workspace_files=(
+                    body.share_workspace_files if set_share_workspace else None
+                ),
+                terminal_launch_args=terminal_launch_args,
+                label_updates=(
+                    {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
+                    if defer_side_settings and (clear_effort or effort is not None)
+                    else None
+                ),
             )
+            updated = update_result.conversation
+            effort_changed = update_result.reasoning_effort_changed
+            saved = live_change.position() if live_change is not None else 0
+            if body.silent:
+                # Record the DB write under the same short lock a live
+                # reconciliation uses for its compare, commit and event.
+                _note_settings_write(
+                    session_id,
+                    {
+                        key: getattr(updated, key)
+                        for key in ("reasoning_effort", "model_override")
+                        if key in body.model_fields_set
+                    },
+                )
         # The runner applies native settings live and caches SDK settings for the
         # next turn. Silent startup metadata writes skip both recovery and
         # forwarding to avoid recursive launches.
@@ -7504,6 +7528,54 @@ def register_core_routes(
                     "The terminal did not confirm the settings change. The previous selection has been restored.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
+            if agy_native and _model_forward is not None:
+                confirmed_effort = _runner_reply_field(_model_forward.body, "effort")
+                if (
+                    isinstance(confirmed_effort, str)
+                    and confirmed_effort in EFFORT_VALUES
+                    and confirmed_effort != updated.reasoning_effort
+                ):
+                    reconcile_guard = (
+                        live_change.write_lock
+                        if live_change is not None
+                        else contextlib.nullcontext()
+                    )
+                    async with reconcile_guard:
+                        write_back_allowed = True
+                        if live_change is not None:
+                            write_back_allowed, _ = live_change.restore_target(
+                                "reasoning_effort",
+                                updated.reasoning_effort,
+                                began=saved,
+                                saved=saved,
+                            )
+                        committed = False
+                        if write_back_allowed:
+                            committed = await asyncio.to_thread(
+                                conversation_store.restore_session_settings_if_matches,
+                                session_id,
+                                previous=dataclasses.replace(
+                                    updated, reasoning_effort=confirmed_effort
+                                ),
+                                attempted=updated,
+                            )
+                        latest = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if latest is not None:
+                            updated = latest
+                        if committed:
+                            from omnigent.runtime import session_stream
+                            from omnigent.server.schemas import SessionReasoningEffortEvent
+
+                            session_stream.publish(
+                                session_id,
+                                SessionReasoningEffortEvent(
+                                    type="session.reasoning_effort",
+                                    conversation_id=session_id,
+                                    reasoning_effort=confirmed_effort,
+                                ).model_dump(),
+                            )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
             # omnigent.ui, which chat-first SDK terminal-view sessions like

@@ -295,6 +295,7 @@ async def test_malformed_reasoning_effort_is_rejected_before_server_side_effects
         pytest.param("codex-native", "ultra", "ultra", id="codex-native-ultra"),
         pytest.param("pi-native", "ultra", "ultra", id="pi-native-ultra"),
         pytest.param("openai-agents", "xhigh", "xhigh", id="openai-xhigh"),
+        pytest.param("antigravity-native", "xhigh", "xhigh", id="antigravity-xhigh"),
     ],
 )
 async def test_reasoning_effort_is_validated_and_carried_to_child_create(
@@ -324,7 +325,7 @@ async def test_reasoning_effort_is_validated_and_carried_to_child_create(
     ("harness", "effort"),
     [
         pytest.param("claude-native", "minimal", id="anthropic-rejects-minimal"),
-        pytest.param("antigravity-native", "xhigh", id="gemini-rejects-xhigh"),
+        pytest.param("antigravity-native", "minimal", id="antigravity-rejects-minimal"),
         pytest.param("cursor-native", "low", id="cursor-has-no-effort-plumbing"),
     ],
 )

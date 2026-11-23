@@ -2273,7 +2273,10 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
 
     resp = await client.post(
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
-        json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"},
+        json={
+            "target_session_id": "5d29bee4350489d66feafecfebd94a97",
+            "expected_instance_id": "original_pane",
+        },
     )
 
     assert resp.status_code == 200
@@ -2287,7 +2290,10 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     assert fake_runner.post_json_calls == [
         (
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
-            {"target_session_id": "5d29bee4350489d66feafecfebd94a97"},
+            {
+                "target_session_id": "5d29bee4350489d66feafecfebd94a97",
+                "expected_instance_id": "original_pane",
+            },
         ),
     ]
     assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
@@ -2350,6 +2356,18 @@ async def test_transfer_terminal_copies_worktree_onto_a_hostless_row(
             503,
             ErrorCode.RUNNER_UNAVAILABLE,
             "tunnel closed before request completed",
+        ),
+        (
+            500,
+            {
+                "error": {
+                    "code": ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED,
+                    "message": "Unable to persist the transferred Codex bridge owner",
+                }
+            },
+            500,
+            ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED,
+            "Unable to persist the transferred Codex bridge owner",
         ),
         # Runner returns an error with no body — fall back to INTERNAL_ERROR
         # (→500) and the route's default transfer-failure message.

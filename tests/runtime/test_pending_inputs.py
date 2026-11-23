@@ -920,6 +920,25 @@ def test_resolve_matching_text_drops_only_generated_leading_markers() -> None:
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("shell_command", [False, True])
+def test_claimed_claude_inline_attachment_rejects_command_text_echo(shell_command: bool) -> None:
+    command = "echo" if shell_command else "/review"
+    prefix = f"!{command}" if shell_command else command
+    pending_id = pending_inputs.record(
+        "conv_a",
+        [_text_block(prefix), {"type": "input_image", "file_id": "file_image"}, _text_block("ok")],
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input("conv_a", pending_id, "claim")
+
+    matched = pending_inputs.resolve_matching_text(
+        "conv_a", f"{command} ok", shell_command=shell_command
+    )
+
+    assert matched.matched is None
+    assert pending_inputs.pending_ids("conv_a") == [pending_id]
+
+
 @pytest.mark.parametrize("path_prefix", ["/opt/work/attachments/", "C:\\work\\attachments\\"])
 def test_claude_attachment_echo_requires_current_claim_and_complete_ordered_paths(
     path_prefix: str,

@@ -2118,6 +2118,7 @@ def build_native_controls(
             split_agy_effort_suffix,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+        from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
         if not model or not model.strip():
             return JSONResponse(
@@ -2134,11 +2135,24 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(
             labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         )
+        raw_options = snapshot.get("model_options")
+        catalog_models = raw_options if isinstance(raw_options, list) else None
         if not effort_set:
             raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
             effort = raw_effort if isinstance(raw_effort, str) else None
+        base_model, suffix_effort = split_agy_effort_suffix(model.strip())
+        requested_effort = effort or suffix_effort
+        applied_effort = clamp_antigravity_effort(
+            requested_effort, base_model, catalog_models=catalog_models
+        )
+        xhigh_requested = (
+            requested_effort is not None
+            and EFFORT_ALIASES.get(requested_effort, requested_effort) == "xhigh"
+        )
         selected = (
-            split_agy_effort_suffix(model.strip())[0] + "-" + effort if effort else model.strip()
+            f"{base_model}-{applied_effort}"
+            if effort or applied_effort != requested_effort
+            else model.strip()
         )
         try:
             await asyncio.to_thread(
@@ -2158,12 +2172,20 @@ def build_native_controls(
                     ),
                 },
             )
-        if effort_set:
+        if xhigh_requested and applied_effort:
+            _session_reasoning_effort[conv_id] = applied_effort
+        elif effort_set:
             if effort:
                 _session_reasoning_effort[conv_id] = effort
             else:
                 _session_reasoning_effort.pop(conv_id, None)
-        return JSONResponse(status_code=200, content={"model": selected})
+        reply: dict[str, object] = {"model": selected}
+        if xhigh_requested:
+            reply["effort"] = applied_effort
+        return JSONResponse(status_code=200, content=reply)
+
+    class _AntigravityEffortUnsupportedError(Exception):
+        """Raised inside slash-command validation when the pane model rejects xhigh."""
 
     async def _handle_antigravity_native_effort_change(
         conv_id: str, effort: str | None
@@ -2171,9 +2193,11 @@ def build_native_controls(
         from omnigent.harnesses.antigravity_native.bridge import (
             ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
+            parse_agy_footer_model,
             run_agy_slash_command,
         )
         from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+        from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
         if not effort:
             return JSONResponse(
@@ -2190,13 +2214,51 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(
             labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         )
+        effort = EFFORT_ALIASES.get(effort, effort)
+        validate_baseline: Callable[[str], None] | None = None
+        if effort == "xhigh":
+            raw_options = snapshot.get("model_options")
+            catalog_models = raw_options if isinstance(raw_options, list) else None
+
+            def _require_xhigh_model(pane: str) -> None:
+                confirmed_model = parse_agy_footer_model(pane)
+                if (
+                    clamp_antigravity_effort(
+                        effort, confirmed_model, catalog_models=catalog_models
+                    )
+                    != effort
+                ):
+                    target = confirmed_model or "unconfirmed Antigravity model"
+                    raise _AntigravityEffortUnsupportedError(
+                        f"Effort {effort!r} is not supported by {target}"
+                    )
+
+            validate_baseline = _require_xhigh_model
         try:
-            await asyncio.to_thread(
-                run_agy_slash_command,
-                bridge_dir,
-                f"/effort {effort}",
-                expect=f"Effort set to {effort}",
-                timeout_s=3.0,
+            if validate_baseline is not None:
+                await asyncio.to_thread(
+                    run_agy_slash_command,
+                    bridge_dir,
+                    f"/effort {effort}",
+                    expect=f"Effort set to {effort}",
+                    timeout_s=3.0,
+                    validate_baseline=validate_baseline,
+                )
+            else:
+                await asyncio.to_thread(
+                    run_agy_slash_command,
+                    bridge_dir,
+                    f"/effort {effort}",
+                    expect=f"Effort set to {effort}",
+                    timeout_s=3.0,
+                )
+        except _AntigravityEffortUnsupportedError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "antigravity_native_effort_unsupported",
+                    "detail": str(exc),
+                },
             )
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(

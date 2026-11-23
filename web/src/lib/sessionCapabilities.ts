@@ -96,6 +96,7 @@ const EFFORT_FAMILY_LEVELS: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["low", "medium", "high", "xhigh", "max"],
   openai: ["none", "minimal", "low", "medium", "high", "xhigh"],
   gemini: ["low", "medium", "high"],
+  antigravity: ["low", "medium", "high", "xhigh"],
   copilot: ["low", "medium", "high", "xhigh"],
   pi: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
 };

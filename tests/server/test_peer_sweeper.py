@@ -427,6 +427,7 @@ class _PostEventScript:
                 "session_id": session_id,
                 "text": body.data["content"][0]["text"],
                 "acting_user_id": acting_user_id,
+                "runtime_notice": getattr(request.state, "runtime_notice", False),
             }
         )
         return {"queued": True}
@@ -1265,6 +1266,7 @@ async def test_notices_to_busy_sender_park_and_flush_as_one_message() -> None:
     h.true_state.states["sender"] = "idle"
     await h.sweeper._tick()  # no new due records; the outstanding-parked pass flushes
     assert len(h.post_event.calls) == 1
+    assert h.post_event.calls[0]["runtime_notice"] is True
     text = h.post_event.calls[0]["text"]
     assert text.count("[System: peer message") == 2
     assert h.sweeper._parked.get("sender") == []

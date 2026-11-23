@@ -616,7 +616,7 @@ class PeerSweeper:
                 if not remaining:
                     return
                 joined = "\n".join(line for _peer_id, line in remaining)
-                request = self._synthetic_request(sender.id, app)
+                request = self._synthetic_request(sender.id, app, runtime_notice=True)
                 sender_owner = effective_owner_id(
                     sender, self._conversation_store, self._permission_store
                 )
@@ -675,7 +675,7 @@ class PeerSweeper:
                 )
 
     @staticmethod
-    def _synthetic_request(session_id: str, app: Any) -> Request:
+    def _synthetic_request(session_id: str, app: Any, *, runtime_notice: bool = False) -> Request:
         """Build the one synthetic ``Request`` the events path needs.
 
         No inbound HTTP request drives a sweeper tick or a route-triggered
@@ -694,6 +694,7 @@ class PeerSweeper:
                 "root_path": "",
                 "client": None,
                 "server": None,
+                "state": {"runtime_notice": runtime_notice},
             }
         )
 

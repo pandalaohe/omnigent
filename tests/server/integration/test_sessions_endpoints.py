@@ -14643,6 +14643,56 @@ async def test_interrupt_noop_after_terminal_idle_does_not_publish_cancellation(
         _interrupt_fenced_sessions.discard(session_id)
 
 
+@pytest.mark.asyncio
+async def test_interrupt_noop_returns_false_without_marking_pending_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle runner result leaves the queued input live and reports no interruption."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = "conv_interrupt_noop"
+    pending_inputs.reset_for_tests()
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "keep queued"}],
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input(
+        session_id,
+        pending_id,
+        "claim-1",
+        runner_id="runner_a",
+    )
+
+    async def _already_idle(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+        return _RunnerForwardResult(
+            status_code=200,
+            body='{"interrupted":false,"reason":"idle"}',
+        )
+
+    monkeypatch.setattr(
+        routes_events,
+        "_forward_session_change_to_runner",
+        _already_idle,
+    )
+    routes_events._interrupt_fenced_sessions.add(session_id)
+    try:
+        assert await routes_events._deliver_interrupt_once(session_id, None) is False
+        assert pending_inputs.pending_ids(session_id) == [pending_id]
+        assert pending_inputs.claim_runner_input(
+            session_id,
+            pending_id,
+            "claim-1",
+            runner_id="runner_a",
+        )
+        assert session_id not in routes_events._interrupt_fenced_sessions
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+        pending_inputs.reset_for_tests()
+
+
 async def test_terminal_edge_during_interrupt_delivery_wins_over_late_publish(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -18105,7 +18155,67 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale route snapshot must not hide a real effort change in storage."""
+    """A slow runner forward does not hold the settings DB write lock."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation(session_id, reasoning_effort="medium")
+    captured: list[dict[str, Any]] = []
+    entered_forward = asyncio.Event()
+    resume_forward = asyncio.Event()
+
+    async def paused_forward(
+        forwarded_session_id: str,
+        runner_router: Any,
+        event: dict[str, Any],
+        timeout_s: float = 5.0,
+    ) -> _RunnerForwardResult:
+        del runner_router, timeout_s
+        assert forwarded_session_id == session_id
+        captured.append(event)
+        entered_forward.set()
+        await resume_forward.wait()
+        return _RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", paused_forward)
+    pending = asyncio.create_task(
+        client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
+    )
+    try:
+        await asyncio.wait_for(entered_forward.wait(), timeout=5)
+        mirrored = await asyncio.wait_for(
+            client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"reasoning_effort": "high", "silent": True},
+            ),
+            timeout=5,
+        )
+    finally:
+        resume_forward.set()
+        response = await asyncio.wait_for(pending, timeout=5)
+
+    assert mirrored.status_code == 200, mirrored.text
+    assert mirrored.json()["reasoning_effort"] == "high"
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "high"
+    assert captured == [{"type": "effort_change", "effort": "high"}]
+    saved = store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "high"
+
+
+async def test_patch_session_effort_forwards_after_silent_write_invalidates_route_snapshot(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent DB change after the route snapshot still triggers the live forward."""
+    from omnigent.server.routes._sessions.helpers import _live_settings_change
+
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
@@ -18124,27 +18234,24 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
             return httpx.Response(204)
         return httpx.Response(202, json={"queued": True})
 
-    entered_update = threading.Event()
-    resume_update = threading.Event()
-    original_update = SqlAlchemyConversationStore.update_conversation_with_changes
+    route_snapshot_read = asyncio.Event()
+    resume_live_write = asyncio.Event()
 
-    def paused_update(
-        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
-    ) -> Any:
-        if conversation_id == session_id and kwargs.get("reasoning_effort") == "high":
-            entered_update.set()
-            assert resume_update.wait(timeout=5), "Timed out waiting for concurrent write"
-        return original_update(self, conversation_id, **kwargs)
+    class PauseFirstWriteLock(asyncio.Lock):
+        async def __aenter__(self) -> None:
+            if not route_snapshot_read.is_set():
+                route_snapshot_read.set()
+                await resume_live_write.wait()
+            await super().__aenter__()
 
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore, "update_conversation_with_changes", paused_update
-    )
+    live_change = _live_settings_change(session_id)
+    monkeypatch.setattr(live_change, "write_lock", PauseFirstWriteLock())
     async with _runtime_runner(handler):
         pending = asyncio.create_task(
             client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
         )
         try:
-            assert await asyncio.to_thread(entered_update.wait, 5)
+            await asyncio.wait_for(route_snapshot_read.wait(), timeout=5)
             mirrored = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"reasoning_effort": "medium", "silent": True},
@@ -18152,11 +18259,10 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
             assert mirrored.status_code == 200, mirrored.text
             assert mirrored.json()["reasoning_effort"] == "medium"
             assert captured == []
-            # A silent write mirrors an effort the native pane already applied.
             runtime_effort = "medium"
         finally:
-            resume_update.set()
-            response = await pending
+            resume_live_write.set()
+            response = await asyncio.wait_for(pending, timeout=5)
 
     assert response.status_code == 200, response.text
     assert response.json()["reasoning_effort"] == "high"

@@ -2061,6 +2061,7 @@ def _paste_and_submit(
     *,
     content: str,
     before_submit: Callable[[], None] | None = None,
+    validate_baseline: Callable[[str], None] | None = None,
 ) -> None:
     """
     Clear the composer, paste *content* through a tmux buffer, and submit it.
@@ -2079,6 +2080,8 @@ def _paste_and_submit(
         pasted draft never renders, or the submit never starts a turn.
     """
     baseline_pane = _prepare_composer(socket_path, tmux_target)
+    if validate_baseline is not None:
+        validate_baseline(baseline_pane)
     baseline_region = _agy_input_region(baseline_pane)
     # ``delete=False`` + name captured BEFORE the write, so a write failure still
     # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
@@ -2608,14 +2611,17 @@ def _agy_control_pane(bridge_dir: Path) -> str:
     return _capture_pane(info["socket_path"], info["tmux_target"])
 
 
-def _require_agy_idle(bridge_dir: Path) -> str:
-    pane = _agy_control_pane(bridge_dir)
+def _require_idle_pane(pane: str) -> str:
     mode = parse_agy_agent_mode(pane)
     if mode is None and _AGY_ACTIVE_MARKER in pane:
         raise RuntimeError("Antigravity is busy; wait for the active turn to finish")
     if mode is None:
         raise RuntimeError(f"Antigravity input is not idle; pane: {_format_pane_debug_tail(pane)}")
     return pane
+
+
+def _require_agy_idle(bridge_dir: Path) -> str:
+    return _require_idle_pane(_agy_control_pane(bridge_dir))
 
 
 def parse_agy_config_row(pane: str, row: str) -> str | None:
@@ -2654,15 +2660,46 @@ def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
     return slug[: match.start()], match.group(1)
 
 
+def parse_agy_footer_model(pane: str) -> str | None:
+    """Parse the current model name from an idle agy pane footer."""
+    line = next((line for line in reversed(pane.splitlines()) if line.strip()), "")
+    if _AGY_IDLE_MARKER not in line:
+        return None
+    footer = line.split(_AGY_IDLE_MARKER, 1)[1].strip()
+    footer = footer.removeprefix("accept-edits · ").removeprefix("plan · ")
+    model, sep, effort = footer.rpartition(" · ")
+    if sep and effort in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        return model.strip() or None
+    return None
+
+
 @_bounded_control(60.0)
-def run_agy_slash_command(bridge_dir: Path, command: str, *, expect: str, timeout_s: float) -> str:
+def run_agy_slash_command(
+    bridge_dir: Path,
+    command: str,
+    *,
+    expect: str,
+    timeout_s: float,
+    validate_baseline: Callable[[str], None] | None = None,
+) -> str:
     """Submit one idle slash command and verify its new pane confirmation."""
     if not command.startswith("/") or "\n" in command or "\r" in command:
         raise ValueError("Expected one slash command")
     baseline = _require_agy_idle(bridge_dir)
+    if validate_baseline is not None:
+        validate_baseline(baseline)
     info = read_tmux_info(bridge_dir)
     assert info is not None
-    _paste_and_submit(bridge_dir, info["socket_path"], info["tmux_target"], content=command)
+    if validate_baseline is not None:
+        _paste_and_submit(
+            bridge_dir,
+            info["socket_path"],
+            info["tmux_target"],
+            content=command,
+            validate_baseline=lambda pane: validate_baseline(_require_idle_pane(pane)),
+        )
+    else:
+        _paste_and_submit(bridge_dir, info["socket_path"], info["tmux_target"], content=command)
     deadline = _deadline_after(timeout_s)
     while True:
         pane = _agy_control_pane(bridge_dir)

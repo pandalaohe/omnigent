@@ -475,6 +475,32 @@ async def test_launch_validates_subscription_model_with_same_binary(monkeypatch,
     reap.assert_awaited_once_with(process, terminate_timeout=0.5, kill_timeout=0.5)
 
 
+@pytest.mark.parametrize(
+    ("model", "extra_args", "expected_model", "expected_effort"),
+    [
+        (
+            "gemini-4-neon",
+            ("--model=gemini-4-hydrogen", "--effort=low"),
+            "gemini-4-hydrogen",
+            "low",
+        ),
+        ("gemini-4-neon", ("--model=claude-opus-5-5", "--effort=max"), "claude-opus-5-5", "high"),
+        ("claude-opus-5-5-xhigh", (), "claude-opus-5-5-high", None),
+    ],
+)
+async def test_launch_probes_effective_subscription_model_and_effort(
+    monkeypatch, fake_agy, model, extra_args, expected_model, expected_effort
+):
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(_mod, "_probe_agy_subscription_model", probe)
+    launch = build_agy_launch(
+        conversation_id=None, model=model, resume=False, extra_args=extra_args
+    )
+
+    assert await launch.check_subscription_model() is None
+    probe.assert_awaited_once_with(fake_agy, expected_model, expected_effort)
+
+
 async def test_launches_share_only_identical_inflight_model_probes(monkeypatch, fake_agy):
     monkeypatch.setattr(_mod, "gemini_auth_has_credential", lambda: True)
     finish = asyncio.Event()
@@ -491,7 +517,7 @@ async def test_launches_share_only_identical_inflight_model_probes(monkeypatch, 
 
     def launch(effort):
         return build_agy_launch(
-            conversation_id=None, model="example-model", resume=False, effort=effort
+            conversation_id=None, model="gemini-4-neon", resume=False, effort=effort
         )
 
     first = asyncio.create_task(launch("xhigh").check_subscription_model())
@@ -508,3 +534,262 @@ async def test_launches_share_only_identical_inflight_model_probes(monkeypatch, 
     assert await second is None
     assert await launch("xhigh").check_subscription_model() is None
     assert run.await_count == 3
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_model", "expected_effort"),
+    [
+        ("gemini-4-hydrogen", "xhigh", "gemini-4-hydrogen", "xhigh"),
+        ("gemini-4-neon", "xhigh", "gemini-4-neon", "xhigh"),
+        ("gemini-4-hydrogen-high", "xhigh", "gemini-4-hydrogen", "xhigh"),
+        ("claude-opus-5-5", "xhigh", "claude-opus-5-5", "high"),
+        ("claude-opus-5-5-high", "xhigh", "claude-opus-5-5", "high"),
+        ("claude-sonnet-5-5", "xhigh", "claude-sonnet-5-5", "high"),
+        ("gemini-4-carbon", "xhigh", "gemini-4-carbon", "high"),
+        ("gemini-3.8-flash", "xhigh", "gemini-3.8-flash", "high"),
+        ("gpt-oss-120b", "xhigh", "gpt-oss-120b", "medium"),
+    ],
+)
+def test_launch_xhigh_allowed_for_gemini_4_and_clamped_for_capped_models(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    effort: str,
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(conversation_id=None, resume=False, model=model, effort=effort).argv
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert argv[argv.index("--effort") + 1] == expected_effort
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_model"),
+    [
+        ("claude-opus-5-5-xhigh", "claude-opus-5-5-high"),
+        ("claude-sonnet-5-5-xhigh", "claude-sonnet-5-5-high"),
+        ("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-xhigh"),
+    ],
+)
+def test_launch_suffixed_capped_model_never_passes_xhigh(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_model: str,
+) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(conversation_id=None, resume=False, model=model, effort=None).argv
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert "--effort" not in argv
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "extra_args", "expected_model", "expected_effort"),
+    [
+        (
+            "claude-opus-5-5",
+            "high",
+            ("--effort=xhigh",),
+            "claude-opus-5-5",
+            "high",
+        ),
+        (
+            "claude-opus-5-5",
+            None,
+            ("--effort", "xhigh"),
+            "claude-opus-5-5",
+            "high",
+        ),
+        (
+            "gemini-4-hydrogen",
+            "xhigh",
+            ("--model=claude-opus-5-5",),
+            "claude-opus-5-5",
+            "high",
+        ),
+        (
+            None,
+            None,
+            ("--model", "claude-opus-5-5", "--effort=xhigh"),
+            "claude-opus-5-5",
+            "high",
+        ),
+        (
+            None,
+            None,
+            ("--model=gemini-4-hydrogen", "--effort", "xhigh"),
+            "gemini-4-hydrogen",
+            "xhigh",
+        ),
+    ],
+)
+def test_launch_parses_and_clamps_model_and_effort_from_extra_args(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    effort: str | None,
+    extra_args: tuple[str, ...],
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    """extra_args --model/--effort (split or =) are parsed once and never duplicated."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model=model,
+        effort=effort,
+        extra_args=extra_args,
+    ).argv
+    assert sum(arg == "--model" or arg.startswith("--model=") for arg in argv) == 1
+    assert sum(arg == "--effort" or arg.startswith("--effort=") for arg in argv) == 1
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert argv[argv.index("--effort") + 1] == expected_effort
+
+
+def test_launch_extra_args_stops_parsing_flags_after_double_dash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen",
+        effort="high",
+        extra_args=("--effort=low", "--effort", "xhigh", "--", "--effort=max"),
+    ).argv
+    sep = argv.index("--")
+    assert argv[:sep].count("--effort") == 1
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+    assert argv[sep:] == ["--", "--effort=max"]
+
+
+def test_launch_extra_args_preserves_values_that_look_like_owned_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supported option's value is never reinterpreted as model or effort."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="claude-opus-5-5",
+        effort="high",
+        extra_args=("--log-file", "--effort=xhigh"),
+    ).argv
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[-2:] == ["--log-file", "--effort=xhigh"]
+
+
+def test_launch_extra_args_preserves_double_dash_after_missing_owned_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing effort value cannot consume ``--`` or parse its tail."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen",
+        effort="high",
+        extra_args=(
+            "--effort",
+            "--",
+            "--model=claude-opus-5-5",
+            _SKIP_FLAG,
+            _SKIP_FLAG,
+        ),
+    ).argv
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[argv.index("--") :] == [
+        "--",
+        "--model=claude-opus-5-5",
+        _SKIP_FLAG,
+        _SKIP_FLAG,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_effort"),
+    [
+        (None, "high"),
+        ("gemini-5-unseen", "high"),
+    ],
+)
+def test_launch_fails_closed_for_omitted_or_unknown_model_at_xhigh(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    expected_effort: str,
+) -> None:
+    """Omitted (agy default) or unseen AG models clamp xhigh down to high."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(conversation_id=None, resume=False, model=model, effort="xhigh").argv
+    assert argv[argv.index("--effort") + 1] == expected_effort
+    if model is None:
+        assert "--model" not in argv
+    else:
+        assert argv[argv.index("--model") + 1] == model
+
+
+def test_launch_catalog_row_must_explicitly_offer_xhigh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matched live catalog row overrides the static Hydrogen fallback."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen",
+        effort="xhigh",
+        catalog_models=[
+            {
+                "id": "gemini-4-hydrogen",
+                "displayName": "Gemini 4 Hydrogen",
+                "efforts": ["low", "medium", "high"],
+            }
+        ],
+    ).argv
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_launch_ordinary_effort_passthrough_preserves_base_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary efforts keep base argv bytes and positions on the passthrough path."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model="gemini-4-hydrogen-high",
+        effort=None,
+        extra_args=("--effort=low",),
+    ).argv
+    assert argv[0] == "agy"
+    assert argv[1].startswith("--csrf_token=")
+    assert argv[2:] == ["--model", "gemini-4-hydrogen-high", "--effort=low"]
+
+
+@pytest.mark.parametrize(
+    ("model", "extra_args", "expected_model", "expected_effort"),
+    [
+        ("claude-opus-5-5-high", ("--effort=max",), "claude-opus-5-5", "high"),
+        ("claude-opus-5-5-high", ("--effort=ultra",), "claude-opus-5-5", "high"),
+        ("gemini-4-hydrogen-high", ("--effort=max",), "gemini-4-hydrogen", "xhigh"),
+    ],
+)
+def test_launch_rewrites_xhigh_aliases_in_extra_args(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    extra_args: tuple[str, ...],
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    """xhigh aliases in extra_args still trigger model/effort rewrite and clamping."""
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv = build_agy_launch(
+        conversation_id=None,
+        resume=False,
+        model=model,
+        effort=None,
+        extra_args=extra_args,
+    ).argv
+    assert sum(arg == "--model" or arg.startswith("--model=") for arg in argv) == 1
+    assert sum(arg == "--effort" or arg.startswith("--effort=") for arg in argv) == 1
+    assert argv[argv.index("--model") + 1] == expected_model
+    assert argv[argv.index("--effort") + 1] == expected_effort

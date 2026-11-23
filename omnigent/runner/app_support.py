@@ -15,6 +15,7 @@ from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
     has_unresolved_file_id,
+    needs_attachment_attempt,
     resolve_file_reference,
 )
 from omnigent.process_logging import process_log_reference
@@ -197,12 +198,8 @@ async def _resolve_forwarded_message_content(
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
 
-    if delivery_attempt_id is not None and any(
-        isinstance(block, dict)
-        and block.get("type") == "input_text"
-        and isinstance(text := block.get("text"), str)
-        and text.strip()
-        for block in content
+    if delivery_attempt_id is not None and not needs_attachment_attempt(
+        content, delivery_attempt_id
     ):
         delivery_attempt_id = None
     resolved: list[_JsonObject] = []

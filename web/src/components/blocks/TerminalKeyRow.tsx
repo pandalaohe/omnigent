@@ -20,6 +20,7 @@ import {
   type TerminalStickyModifiers,
   type TerminalStickyState,
 } from "@/lib/mobileAssistantPreferences";
+import { TERMINAL_KEY_HEIGHT_PX } from "@/lib/terminalKeyBar";
 import {
   isArmedModifier,
   availableAction,
@@ -573,9 +574,9 @@ export function TerminalKeyRow({
         data-sticky-state={modifier ? modifierState : undefined}
         title={unavailableReason ?? (modifier ? `${key.label}: ${modifierState}` : undefined)}
         onClick={(event) => handleButtonClick(key, event)}
-        style={{ gridColumn: `span ${key.width}` }}
+        style={{ gridColumn: `span ${key.width}`, height: TERMINAL_KEY_HEIGHT_PX }}
         className={cn(
-          "flex h-[44px] min-w-0 items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-none",
+          "flex min-w-0 items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-none",
           "active:bg-muted disabled:pointer-events-none disabled:opacity-45",
           isKeyboardAction && isActive && "border-primary/50 bg-primary/15 text-primary",
           modifierState !== "off" &&
@@ -636,7 +637,7 @@ export function TerminalKeyRow({
                   key={`${rowName}-gap-${page}-${index}`}
                   data-testid="terminal-key-gap"
                   aria-hidden="true"
-                  className="h-[44px]"
+                  style={{ height: TERMINAL_KEY_HEIGHT_PX }}
                 />
               ))}
             </div>
@@ -650,7 +651,7 @@ export function TerminalKeyRow({
                   key={`${rowName}-empty-${index}`}
                   data-testid="terminal-key-gap"
                   aria-hidden="true"
-                  className="h-[44px]"
+                  style={{ height: TERMINAL_KEY_HEIGHT_PX }}
                 />
               ),
             )

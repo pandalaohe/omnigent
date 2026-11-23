@@ -103,10 +103,10 @@ def try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
         lock.release()
 
 
-def read_bridge_session_id(bridge_dir: Path) -> str | None:
+def read_bridge_session_id(bridge_dir: Path, *, filename: str = "state.json") -> str | None:
     """Read the owner independently of runtime fields; invalid existing state raises."""
     try:
-        raw = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+        raw = json.loads((bridge_dir / filename).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     session_id = raw.get("session_id") if isinstance(raw, dict) else None

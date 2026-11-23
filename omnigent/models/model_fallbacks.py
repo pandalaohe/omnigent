@@ -283,3 +283,26 @@ BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["claude"].mo
 
 #: The codex-family arm background session titles pin.
 BACKGROUND_TITLE_CODEX_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["codex"].model_ids[0]
+
+
+# agy models verified to offer xhigh in `agy models` (used as fallback when the
+# live catalog omits them or is unavailable). Antigravity fails closed: every
+# other or unknown model (including omitted/default) caps above-high at high.
+ANTIGRAVITY_XHIGH_MODELS = StaticModelFallback(
+    model_ids=(
+        "gemini-4-neon",
+        "gemini-4-hydrogen",
+    ),
+    owner="Antigravity reasoning effort (omnigent.util.reasoning_effort)",
+    provenance="Probed `agy models` catalog: Gemini 4 Neon and Hydrogen advertise xhigh",
+    discovery_gap=(
+        "the host launch catalog may omit Neon/Hydrogen or be unavailable at launch/control time"
+    ),
+)
+
+ANTIGRAVITY_MEDIUM_CAP_MODELS = StaticModelFallback(
+    model_ids=("gpt-oss-120b",),
+    owner="Antigravity reasoning effort (omnigent.util.reasoning_effort)",
+    provenance="Probed `agy models` catalog: model advertises medium effort only",
+    discovery_gap="launch and live-control effort clamping runs without querying `agy models`",
+)

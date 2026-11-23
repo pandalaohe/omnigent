@@ -468,7 +468,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
         _RS.WARM_REATTACH,
-        _EF.GEMINI,
+        _EF.ANTIGRAVITY,
         _MF.GEMINI,
         _AU.OWN_AUTH,
         subagents=True,

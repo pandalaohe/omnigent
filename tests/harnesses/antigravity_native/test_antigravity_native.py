@@ -717,6 +717,27 @@ async def test_launch_and_record_passes_cli_args_to_agy_argv(
     assert "--add-dir=/opt/work/extra" in launch_calls[0]["extra_args"]
 
 
+async def test_launch_and_record_passes_catalog_snapshot_to_agy_builder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The CLI launch builder receives the same model catalog snapshot as the session."""
+    model_options = [
+        {
+            "id": "gemini-4-hydrogen",
+            "displayName": "Gemini 4 Hydrogen",
+            "efforts": ["low", "medium", "high"],
+        }
+    ]
+    launch_calls = await _record_launch_and_record_args(
+        monkeypatch,
+        tmp_path,
+        snapshot=_confirmed_permission_snapshot("ask", model_options=model_options),
+        antigravity_args=(),
+    )
+    assert len(launch_calls) == 1
+    assert launch_calls[0]["catalog_models"] == model_options
+
+
 async def test_restricted_launch_refuses_project_pre_tool_hook(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
