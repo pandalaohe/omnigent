@@ -63,7 +63,12 @@ logger = logging.getLogger(__name__)
 USER_PREFERENCE_VERSION = 1
 USER_PREFERENCES_MAX_BYTES = 64 * 1024
 _TERMINAL_KEYBOARD_PLATFORMS = ("macos", "windows", "linux")
-_TERMINAL_KEYBOARD_BINDINGS = ("lineStart", "lineEnd", "killLine", "newline")
+_TERMINAL_KEYBOARD_BINDINGS = {
+    "lineStart": ("Move to start of line", "meta", ("ArrowLeft",)),
+    "lineEnd": ("Move to end of line", "meta", ("ArrowRight",)),
+    "killLine": ("Delete to start of line", "meta", ("Backspace",)),
+    "newline": ("Send Shift+Enter", "shift", ("Enter", "NumpadEnter")),
+}
 _SHORTCUT_MODIFIERS = ("primary", "control", "meta", "alt", "shift")
 USER_PREFERENCE_NAMESPACES = frozenset(
     {
@@ -125,6 +130,65 @@ def _valid_terminal_binding(value: Any) -> bool:
     return True
 
 
+def _terminal_binding_chords(
+    keyboard: Any, field: str, platform: str
+) -> set[tuple[str, frozenset[str]]]:
+    bindings = (
+        keyboard.get("bindings") if isinstance(keyboard, dict) and keyboard.get("v") == 1 else None
+    )
+    binding = bindings.get(field) if isinstance(bindings, dict) else None
+    if isinstance(binding, dict):
+        overrides = binding.get("platformOverrides", {})
+        common = binding.get("common")
+        if (
+            isinstance(overrides, dict)
+            and ("enabled" not in binding or isinstance(binding["enabled"], bool))
+            and ("common" not in binding or _valid_terminal_binding(common))
+            and all(
+                key not in overrides or _valid_terminal_binding(overrides[key])
+                for key in _TERMINAL_KEYBOARD_PLATFORMS
+            )
+        ):
+            chords = overrides.get(platform, common)
+            if chords is not None:
+                primary = "meta" if platform == "macos" else "control"
+                return {
+                    (
+                        code,
+                        frozenset(
+                            primary if modifier == "primary" else modifier
+                            for modifier in chord["modifiers"]
+                        ),
+                    )
+                    for chord in chords
+                    for code in (
+                        (f"Digit{digit}" for digit in range(10))
+                        if chord["code"] == "Digit*"
+                        else (chord["code"],)
+                    )
+                }
+    _, modifier, codes = _TERMINAL_KEYBOARD_BINDINGS[field]
+    return {(code, frozenset((modifier,))) for code in codes}
+
+
+def _check_terminal_binding_conflicts(
+    previous: Any, keyboard: dict[str, Any], edited: dict[str, set[str]]
+) -> None:
+    for platform, actions in edited.items():
+        chords = {
+            action: _terminal_binding_chords(keyboard, action, platform)
+            for action in _TERMINAL_KEYBOARD_BINDINGS
+        }
+        for action in sorted(actions):
+            added = chords[action] - _terminal_binding_chords(previous, action, platform)
+            for other, other_chords in chords.items():
+                if other != action and added & other_chords:
+                    label = _TERMINAL_KEYBOARD_BINDINGS[other][0]
+                    raise UserPreferencesValidationError(
+                        f"That shortcut is already used by {label}."
+                    )
+
+
 def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, Any]:
     defaults = patch.get("defaults")
     changes = patch.get("changes")
@@ -155,6 +219,7 @@ def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, 
     keyboard: dict[str, Any] = (
         deepcopy(stored) if isinstance(stored, dict) and stored.get("v") == 1 else {"v": 1}
     )
+    edited_bindings: dict[str, set[str]] = {}
     for change in changes:
         if not isinstance(change, dict) or "value" not in change:
             raise UserPreferencesValidationError("Invalid terminal keyboard change")
@@ -176,7 +241,7 @@ def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, 
                 **(platform_map if isinstance(platform_map, dict) else {}),
                 platform: value,
             }
-        elif field in _TERMINAL_KEYBOARD_BINDINGS:
+        elif isinstance(field, str) and field in _TERMINAL_KEYBOARD_BINDINGS:
             if value is not None and not _valid_terminal_binding(value):
                 raise UserPreferencesValidationError("Invalid terminal shortcut binding")
             bindings = keyboard.get("bindings")
@@ -192,8 +257,10 @@ def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, 
                 overrides.pop(platform, None)
             else:
                 overrides[platform] = value
+            edited_bindings.setdefault(platform, set()).add(field)
         else:
             raise UserPreferencesValidationError("Invalid terminal keyboard field")
+    _check_terminal_binding_conflicts(stored, keyboard, edited_bindings)
     mobile["terminalKeyboard"] = keyboard
     return mobile
 

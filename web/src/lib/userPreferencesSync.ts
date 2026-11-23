@@ -39,7 +39,7 @@ export const USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT =
 
 /**
  * Window event fired when the Server permanently rejects a namespace patch
- * (HTTP 422). Detail: `{ namespace, status: 422 }`.
+ * (HTTP 422). Detail includes the namespace, status, and optional server reason.
  */
 export const USER_PREFERENCES_PATCH_REJECTED_EVENT = "omnigent:user-preference-rejected";
 
@@ -140,6 +140,8 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
 const USER_PREFERENCES_SCOPE_KEY = "omnigent:user-preferences-owner";
 export const USER_PREFERENCES_DIRTY_KEY = "omnigent:user-preferences-dirty";
 const USER_PREFERENCES_DIRTY_VALUES_KEY = "omnigent:user-preferences-dirty-values";
+// Older clients interpret an incomplete mobile_assistant snapshot as a deletion.
+const TERMINAL_KEYBOARD_DIRTY_KEY = "omnigent:terminal-keyboard-dirty";
 const MOBILE_ASSISTANT_DEVICE_STORAGE_KEY = "omnigent:mobile-assistant-device-state";
 
 let preferenceFetcher: PreferenceFetcher | null = null;
@@ -186,7 +188,7 @@ function dirtyOwnerKey(): string {
   return `${activeServerId}:${activeOwnerId ?? "__local__"}`;
 }
 
-function readDirtyNamespaces(
+function readLegacyDirtyNamespaces(
   raw: string | null = window.localStorage.getItem(USER_PREFERENCES_DIRTY_KEY),
 ): Set<UserPreferenceNamespace> {
   const parsed = safeParse(raw);
@@ -196,6 +198,14 @@ function readDirtyNamespaces(
   return new Set(
     values.filter((value): value is UserPreferenceNamespace => value in CATEGORY_CONFIG),
   );
+}
+
+function readDirtyNamespaces(raw?: string | null): Set<UserPreferenceNamespace> {
+  const dirty = readLegacyDirtyNamespaces(raw);
+  if (readQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, "mobile_assistant").found) {
+    dirty.add("mobile_assistant");
+  }
+  return dirty;
 }
 
 export function isUserPreferenceNamespaceDirty(
@@ -218,8 +228,11 @@ function writeDirtyNamespaces(values: Set<UserPreferenceNamespace>): void {
   else window.localStorage.setItem(USER_PREFERENCES_DIRTY_KEY, JSON.stringify(all));
 }
 
-function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; value: unknown } {
-  const parsed = safeParse(window.localStorage.getItem(USER_PREFERENCES_DIRTY_VALUES_KEY));
+function readQueueValue(
+  key: string,
+  namespace: UserPreferenceNamespace,
+): { found: boolean; value: unknown } {
+  const parsed = safeParse(window.localStorage.getItem(key));
   if (!parsed || typeof parsed !== "object") return { found: false, value: null };
   const ownerValues = (parsed as Record<string, unknown>)[dirtyOwnerKey()];
   if (!ownerValues || typeof ownerValues !== "object" || Array.isArray(ownerValues)) {
@@ -231,8 +244,24 @@ function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; v
   return { found: true, value: (ownerValues as Record<string, unknown>)[namespace] };
 }
 
-function writeDirtyValue(namespace: UserPreferenceNamespace, value: unknown, remove = false): void {
-  const parsed = safeParse(window.localStorage.getItem(USER_PREFERENCES_DIRTY_VALUES_KEY));
+function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; value: unknown } {
+  const legacy = readQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace);
+  if (namespace !== "mobile_assistant") return legacy;
+  const keyboard = readQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace);
+  if (!keyboard.found) return legacy;
+  return {
+    found: true,
+    value: { ...(legacy.value as object | null), terminal_keyboard: keyboard.value },
+  };
+}
+
+function writeQueueValue(
+  key: string,
+  namespace: UserPreferenceNamespace,
+  value: unknown,
+  remove = false,
+): void {
+  const parsed = safeParse(window.localStorage.getItem(key));
   const all =
     parsed && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
   const current = all[dirtyOwnerKey()];
@@ -244,23 +273,41 @@ function writeDirtyValue(namespace: UserPreferenceNamespace, value: unknown, rem
   else ownerValues[namespace] = value;
   if (Object.keys(ownerValues).length === 0) Reflect.deleteProperty(all, dirtyOwnerKey());
   else all[dirtyOwnerKey()] = ownerValues;
-  if (Object.keys(all).length === 0)
-    window.localStorage.removeItem(USER_PREFERENCES_DIRTY_VALUES_KEY);
-  else window.localStorage.setItem(USER_PREFERENCES_DIRTY_VALUES_KEY, JSON.stringify(all));
+  if (Object.keys(all).length === 0) window.localStorage.removeItem(key);
+  else window.localStorage.setItem(key, JSON.stringify(all));
 }
 
 function markDirty(namespace: UserPreferenceNamespace, value: unknown): void {
-  const dirty = readDirtyNamespaces();
+  let legacyValue = value;
+  if (namespace === "mobile_assistant") {
+    const { fields, keyboard } = splitMobilePatch(value);
+    writeQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace, keyboard, !keyboard);
+    if (keyboard) {
+      legacyValue = mobileSyncValue(fields);
+      if (legacyValue === null) {
+        clearLegacyDirty(namespace);
+        return;
+      }
+    }
+  }
+  const dirty = readLegacyDirtyNamespaces();
   dirty.add(namespace);
   writeDirtyNamespaces(dirty);
-  writeDirtyValue(namespace, value);
+  writeQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace, legacyValue);
+}
+
+function clearLegacyDirty(namespace: UserPreferenceNamespace): void {
+  const dirty = readLegacyDirtyNamespaces();
+  dirty.delete(namespace);
+  writeDirtyNamespaces(dirty);
+  writeQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace, null, true);
 }
 
 function clearDirty(namespace: UserPreferenceNamespace): void {
-  const dirty = readDirtyNamespaces();
-  dirty.delete(namespace);
-  writeDirtyNamespaces(dirty);
-  writeDirtyValue(namespace, null, true);
+  if (namespace === "mobile_assistant") {
+    writeQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace, null, true);
+  }
+  clearLegacyDirty(namespace);
 }
 
 function safeParse(raw: string | null): unknown | null {
@@ -711,10 +758,19 @@ export async function initializeUserPreferencesSync(
   hydrateServerEnvelope(serverValue);
 }
 
-function announceRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
+function announceRejectedNamespace(
+  namespace: UserPreferenceNamespace,
+  detail?: unknown,
+  terminalKeyboard = false,
+): void {
   window.dispatchEvent(
     new CustomEvent(USER_PREFERENCES_PATCH_REJECTED_EVENT, {
-      detail: { namespace, status: 422, ...(typeof detail === "string" ? { detail } : {}) },
+      detail: {
+        namespace,
+        status: 422,
+        ...(terminalKeyboard ? { terminalKeyboard: true } : {}),
+        ...(typeof detail === "string" ? { detail } : {}),
+      },
     }),
   );
 }
@@ -724,7 +780,11 @@ function announceRejectedNamespace(namespace: UserPreferenceNamespace, detail?: 
  * mark, restore the last Server value (absent → remove the local key) exactly
  * as hydration does, and announce the rejection. No retry is scheduled.
  */
-function discardRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
+function discardRejectedNamespace(
+  namespace: UserPreferenceNamespace,
+  detail?: unknown,
+  terminalKeyboard = false,
+): void {
   const queuedTimer = pendingTimers.get(namespace);
   if (queuedTimer !== undefined) {
     window.clearTimeout(queuedTimer);
@@ -740,7 +800,7 @@ function discardRejectedNamespace(namespace: UserPreferenceNamespace, detail?: u
   } finally {
     applyingServerPreferences = false;
   }
-  announceRejectedNamespace(namespace, detail);
+  announceRejectedNamespace(namespace, detail, terminalKeyboard);
 }
 
 function schedulePatch(
@@ -799,6 +859,7 @@ function schedulePatch(
             );
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
+            const terminalKeyboard = mobile?.keyboard !== undefined;
             if (currentSerialized !== serialized) {
               // A newer local edit arrived while this patch was in flight: send
               // the newest value next (a stale queued patch could cancel its timer).
@@ -809,10 +870,11 @@ function schedulePatch(
                 delayMs: 0,
                 attempt: 0,
               });
-              announceRejectedNamespace(namespace, body?.detail);
+              announceRejectedNamespace(namespace, body?.detail, terminalKeyboard);
             } else {
-              discardRejectedNamespace(namespace, body?.detail);
+              discardRejectedNamespace(namespace, body?.detail, terminalKeyboard);
             }
+            if (terminalKeyboard) void refreshUserPreferencesFromServer();
             return;
           }
           if (!response?.ok) throw new Error("preference patch failed");

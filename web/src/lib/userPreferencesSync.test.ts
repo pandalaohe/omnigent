@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -10,6 +11,7 @@ import {
   resetUserPreferencesSyncForTests,
   USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
   USER_PREFERENCES_PATCH_REJECTED_EVENT,
+  USER_PREFERENCES_DIRTY_KEY,
 } from "./userPreferencesSync";
 import {
   readApprovalTimeoutPreferences,
@@ -22,7 +24,12 @@ import {
   writeKeepWarmPreferences,
 } from "./keepWarmPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefaultPreferences";
-import { defaultTerminalBar, legacyFingerprint, projectLegacy } from "./terminalKeyBar";
+import {
+  canonicalTerminalFields,
+  defaultTerminalBar,
+  legacyFingerprint,
+  projectLegacy,
+} from "./terminalKeyBar";
 import { resolveTerminalKeys, writeTerminalKeyPreferences } from "./terminalKeys";
 import {
   readTerminalKeyboardPreferences,
@@ -66,6 +73,70 @@ describe("terminal bar preference synchronization", () => {
       terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
     };
   }
+
+  it("leaves an unacknowledged scoped edit out of the rollback client's queue", async () => {
+    vi.useFakeTimers();
+    const mobile = {
+      ...mobileValue(),
+      terminalKeyboard: { v: 1, pasteBoxMode: { windows: "always" } },
+    };
+    const envelope = { version: 1, settings: { mobile_assistant: mobile } };
+    const offline = vi.fn().mockRejectedValue(new Error("offline"));
+    await initializeUserPreferencesSync(envelope, offline, "alice");
+    const change = { platform: "macos", field: "pasteBoxMode", value: "never" } as const;
+    expect(writeTerminalKeyboardChange(change)).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(offline).toHaveBeenCalledOnce();
+    resetUserPreferencesSyncForTests();
+
+    // Full-history rollback checks exercise the previously installed module.
+    // Shallow checkouts still verify the queue format and new-client replay.
+    if (process.env.OMNIGENT_TEST_LEGACY_PREFERENCE_SYNC === "1") {
+      const { default: ts } = await import("typescript");
+      const source = execFileSync(
+        "git",
+        ["show", "ac87ae93a8fc96a1fde0f89d15ba74de982f3c5a:web/src/lib/userPreferencesSync.ts"],
+        { encoding: "utf8" },
+      );
+      const { outputText } = ts.transpileModule(source, {
+        compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+      });
+      const legacy = {} as {
+        initializeUserPreferencesSync: typeof initializeUserPreferencesSync;
+        resetUserPreferencesSyncForTests: typeof resetUserPreferencesSyncForTests;
+      };
+      new Function("exports", "require", outputText)(legacy, (path: string) => {
+        expect(path).toBe("@/lib/terminalKeyBar");
+        return { canonicalTerminalFields };
+      });
+      const rollback = vi.fn().mockResolvedValue(Response.json(envelope));
+      try {
+        await legacy.initializeUserPreferencesSync(envelope, rollback, "alice");
+        await vi.advanceTimersByTimeAsync(251);
+        expect(rollback).not.toHaveBeenCalled();
+        expect(readMobileAssistantPreferences().terminalBar).toEqual(mobile.terminalBar);
+        expect(readTerminalKeyboardPreferences()).toEqual(mobile.terminalKeyboard);
+      } finally {
+        legacy.resetUserPreferencesSyncForTests();
+      }
+    }
+
+    expect(localStorage.getItem(USER_PREFERENCES_DIRTY_KEY)).toBeNull();
+    expect(localStorage.getItem("omnigent:user-preferences-dirty-values")).toBeNull();
+    const updated = {
+      ...mobile,
+      terminalKeyboard: { v: 1, pasteBoxMode: { windows: "always", macos: "never" } },
+    };
+    const reinstalled = vi
+      .fn()
+      .mockResolvedValue(Response.json({ version: 1, settings: { mobile_assistant: updated } }));
+    await initializeUserPreferencesSync(envelope, reinstalled, "alice");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(JSON.parse(reinstalled.mock.calls[0][1].body).terminal_keyboard.changes).toEqual([
+      change,
+    ]);
+    expect(readTerminalKeyboardPreferences()).toEqual(updated.terminalKeyboard);
+  });
 
   it("sends and retries only the edited terminal keyboard fields", async () => {
     vi.useFakeTimers();

@@ -61,6 +61,7 @@ import {
 } from "@/lib/keyboardShortcutPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 
 const GROUPS: { id: ShortcutGroupId; label: string; note?: string }[] = [
   { id: "general", label: "General" },
@@ -218,6 +219,17 @@ export function KeyboardShortcutEditor() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [changedOnly, setChangedOnly] = useState(false);
+  useEffect(() => {
+    const onRejected = (event: Event) => {
+      const rejection = (event as CustomEvent<{ terminalKeyboard?: boolean; detail?: string }>)
+        .detail;
+      if (rejection?.terminalKeyboard) {
+        setError(rejection.detail ?? "Could not save terminal keyboard settings.");
+      }
+    };
+    window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
+    return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
+  }, []);
   const preferences = readKeyboardShortcutPreferences();
   const defaultContext = useMemo(
     () => ({

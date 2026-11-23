@@ -676,6 +676,67 @@ async def test_terminal_keyboard_patches_merge_stale_platform_edits_and_accept_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second", "used_by"),
+    [
+        ("lineStart", "killLine", "Move to start of line"),
+        ("killLine", "lineStart", "Delete to start of line"),
+    ],
+)
+async def test_terminal_keyboard_rejects_stale_conflicting_binding(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    first: str,
+    second: str,
+    used_by: str,
+) -> None:
+    transport = httpx.ASGITransport(app=_preferences_app(db_uri, tmp_path))
+    mobile = {"version": 2, "enabled": True, "buttons": []}
+    route = "/v1/me/preferences/mobile_assistant"
+    headers = {"x-test-user": "alice@example.com"}
+
+    def patch(field: str, modifiers: list[str], platform: str = "macos") -> dict[str, Any]:
+        return {
+            "value": {},
+            "terminal_keyboard": {
+                "defaults": mobile,
+                "changes": [
+                    {
+                        "platform": platform,
+                        "field": field,
+                        "value": [{"code": "F8", "modifiers": modifiers}],
+                    }
+                ],
+            },
+        }
+
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers) as a,
+        httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers) as b,
+    ):
+        assert (await a.patch(route, json={"value": mobile})).status_code == 200
+        assert (await a.get("/v1/me")).json() == (await b.get("/v1/me")).json()
+        saved = await a.patch(route, json=patch(first, ["primary"]))
+        assert saved.status_code == 200
+        # Primary and Meta match the same chord on macOS.
+        rejected = await b.patch(route, json=patch(second, ["meta"]))
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == f"That shortcut is already used by {used_by}."
+        assert (await b.get("/v1/me")).json()["preferences"] == saved.json()
+
+        separate_platform = await b.patch(route, json=patch(second, ["primary"], "windows"))
+        assert separate_platform.status_code == 200
+        bindings = separate_platform.json()["settings"]["mobile_assistant"]["terminalKeyboard"][
+            "bindings"
+        ]
+        assert bindings == {
+            first: {"platformOverrides": {"macos": [{"code": "F8", "modifiers": ["primary"]}]}},
+            second: {"platformOverrides": {"windows": [{"code": "F8", "modifiers": ["primary"]}]}},
+        }
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_initializes_merges_and_returns_from_me(
     db_uri: str,
     runtime_init: None,
