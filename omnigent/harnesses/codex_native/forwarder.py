@@ -1173,6 +1173,7 @@ class _CodexForwarderState:
     background_tasks_unsupported: bool = False
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
+    on_background_terminals: Callable[[bool], None] | None = None
     goal_unknown: bool = False
 
     def __post_init__(self) -> None:
@@ -1469,7 +1470,7 @@ class _CodexForwarderState:
         self.goal_status = None
         self.goal_updates += 1
         self.goal_unknown = False
-        self.background_terminals = None
+        self.note_background_terminals(None)
         self.posted_background_work_running = None
         self.posted_background_tasks = None
         self.goal_failure_awaits_turn = False
@@ -1480,6 +1481,12 @@ class _CodexForwarderState:
     def has_background_terminals(self) -> bool:
         """Whether the last listing found a background terminal still running."""
         return bool(self.background_terminals)
+
+    def note_background_terminals(self, terminals: list[_JsonObject] | None) -> None:
+        """Record the list and update the runner's local liveness signal."""
+        self.background_terminals = terminals
+        if self.on_background_terminals is not None:
+            self.on_background_terminals(self.has_background_terminals)
 
     async def forget_posted_terminals(self) -> None:
         """
@@ -3136,6 +3143,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    on_background_terminals: Callable[[bool], None] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -3158,6 +3166,7 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param on_background_terminals: Runner-local observer for running background terminals.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -3216,6 +3225,7 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
+            on_background_terminals=on_background_terminals,
         )
         bridge_state = read_bridge_state(bridge_dir)
         if bridge_state is not None and bridge_state.permission_profile:
@@ -5931,7 +5941,7 @@ async def _refresh_background_terminals(
         except CodexAppServerResponseError as exc:
             if codex_rejects_request_method(exc, _CODEX_BACKGROUND_TERMINALS_LIST_METHOD):
                 forwarder_state.background_terminals_supported = False
-                forwarder_state.background_terminals = None
+                forwarder_state.note_background_terminals(None)
                 log_info_once(
                     _logger,
                     "Codex app-server cannot list background terminals; "
@@ -5944,7 +5954,7 @@ async def _refresh_background_terminals(
             _logger.warning("Codex background terminal listing failed", exc_info=True)
             keep_listing = forwarder_state.has_background_terminals
         else:
-            forwarder_state.background_terminals = _background_terminal_tasks(terminals)
+            forwarder_state.note_background_terminals(_background_terminal_tasks(terminals))
             keep_listing = forwarder_state.has_background_terminals
     await _sync_background_work_running(
         ap_client, session_id=session_id, forwarder_state=forwarder_state

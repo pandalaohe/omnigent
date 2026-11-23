@@ -916,7 +916,8 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
         ]
     )
     client = _RecordingClient()
-    state = fwd._CodexForwarderState()
+    background_terminal_signals: list[bool] = []
+    state = fwd._CodexForwarderState(on_background_terminals=background_terminal_signals.append)
 
     await _deliver_to_parent(
         client,
@@ -930,7 +931,14 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
     await poll
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _status_post(
+            {
+                "status": "idle",
+                "response_id": "codex_turn_1",
+                "turn_completed": True,
+                "native_turn_generation": 1,
+            }
+        ),
         _background_work_post(True, _terminal_tasks("npm run dev")),
         _background_work_post(None, _terminal_tasks("make watch")),
         _background_work_post(False, []),
@@ -939,6 +947,7 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
     assert [method for method, _params in app_server.requests] == [
         "thread/backgroundTerminals/list"
     ] * 4
+    assert background_terminal_signals == [True, True, True, False]
 
 
 @pytest.mark.asyncio

@@ -668,27 +668,47 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
     assert not await reaper._is_busy(other)
 
 
-async def test_antigravity_background_shell_protects_pane_from_automatic_reap(
+@pytest.mark.parametrize("terminal_name", ["antigravity", "codex"])
+async def test_background_shell_protects_pane_from_automatic_reap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    terminal_name: str,
 ) -> None:
     """A quiet job holds an otherwise idle pane until it exits or the hold expires."""
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
     registry = TerminalRegistry()
-    instance = make_test_terminal_instance("antigravity", "main", tmp_path)
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
     conv = "conv_awaiting_build"
-    registry._by_conversation[conv] = {("antigravity", "main"): instance}
+    registry._by_conversation[conv] = {(terminal_name, "main"): instance}
     resources = SessionResourceRegistry(terminal_registry=registry)
-    monkeypatch.setattr(resources, "terminal_resource_role", lambda *_args: "antigravity-native")
-    rule = "─" * 80
-    row = "  ● [12:45:28] sleep 600 && echo done... running"
-    footer = "? for shortcuts · 1 task(s) · /tasks"
-    # After the job ends its past task row may still be visible in the transcript.
-    idle_screen = f"{rule}\n{row}\n{rule}\n{footer}\n{rule}\n>\n{rule}\n? for shortcuts"
-    running_screen = f"{rule}\n>\n{rule}\n{row}\n{rule}\n{footer}"
-    capture = AsyncMock(return_value={"screen": running_screen})
-    monkeypatch.setattr(instance, "read", capture)
+    monkeypatch.setattr(
+        resources, "terminal_resource_role", lambda *_args: f"{terminal_name}-native"
+    )
+    if terminal_name == "codex":
+        task = asyncio.current_task()
+        assert task is not None
+        monkeypatch.setitem(native_runtime._AUTO_FORWARDER_TASKS, conv, task)
+        owner = native_runtime._track_codex_forwarder(conv, None, None, instance)
+        owner.note_background_terminals(True)
+        replacement = make_test_terminal_instance(terminal_name, "main", tmp_path)
+        assert not native_runtime.codex_pane_has_background_terminals(conv, replacement)
+
+        def finish_background_shell() -> None:
+            owner.note_background_terminals(False)
+
+    else:
+        rule = "─" * 80
+        row = "  ● [12:45:28] sleep 600 && echo done... running"
+        footer = "? for shortcuts · 1 task(s) · /tasks"
+        running_screen = f"{rule}\n>\n{rule}\n{row}\n{rule}\n{footer}"
+        capture = AsyncMock(return_value={"screen": running_screen})
+        monkeypatch.setattr(instance, "read", capture)
+
+        def finish_background_shell() -> None:
+            # A past task row may still be visible in the transcript.
+            idle_screen = f"{rule}\n{row}\n{rule}\n{footer}\n{rule}\n>\n{rule}\n? for shortcuts"
+            capture.return_value = {"screen": idle_screen}
 
     reaper = create_runner_app(
         terminal_registry=registry,
@@ -717,7 +737,7 @@ async def test_antigravity_background_shell_protects_pane_from_automatic_reap(
     now += PANE_OUTPUT_BUSY_WINDOW_S + 1
     assert await reaper._is_busy(pane)
 
-    capture.return_value = {"screen": idle_screen}
+    finish_background_shell()
     reaper._last_busy_at[conv] = now - 30
     await reaper._scan_once()
     reap.assert_not_awaited()

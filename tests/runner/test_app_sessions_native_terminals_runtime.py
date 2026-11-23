@@ -1097,6 +1097,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             ),
             # The forwarder tears down only the app-server this launch started.
             "app_server": app_server,
+            "terminal_instance": None,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)

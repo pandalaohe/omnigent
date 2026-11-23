@@ -15193,7 +15193,7 @@ def create_runner_app(
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             busy = await _native_pane_busy_without_background_shell(pane)
-            if pane.terminal_name not in ("claude", "antigravity"):
+            if pane.terminal_name not in ("claude", "antigravity", "codex"):
                 return busy
             instance = _pane_reaper_registry.get(pane.conversation_id, pane.terminal_name, "main")
             if instance is None or (pane.instance is not None and pane.instance is not instance):
@@ -15204,6 +15204,10 @@ def create_runner_app(
                 return True
             if pane.terminal_name == "claude":
                 running = pane.conversation_id in _sessions_with_background_shell
+            elif pane.terminal_name == "codex":
+                running = _native_runtime.codex_pane_has_background_terminals(
+                    pane.conversation_id, instance
+                )
             else:
                 capture = await instance.read()
                 screen = capture.get("screen")

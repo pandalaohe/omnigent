@@ -513,6 +513,11 @@ class _CodexForwarderOwner:
     session_id: str
     subagent_router: SubagentRouter | None
     turn_router: TurnRouter | None
+    terminal_instance: TerminalInstance | None
+    background_terminals_running: bool = False
+
+    def note_background_terminals(self, running: bool) -> None:
+        self.background_terminals_running = running
 
 
 _CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexForwarderOwner] = (
@@ -521,12 +526,29 @@ _CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexF
 
 
 def _track_codex_forwarder(
-    session_id: str, subagent_router: SubagentRouter | None, turn_router: TurnRouter | None
+    session_id: str,
+    subagent_router: SubagentRouter | None,
+    turn_router: TurnRouter | None,
+    terminal_instance: TerminalInstance | None,
 ) -> _CodexForwarderOwner:
-    owner = _CodexForwarderOwner(session_id, subagent_router, turn_router)
+    owner = _CodexForwarderOwner(session_id, subagent_router, turn_router, terminal_instance)
     if (task := asyncio.current_task()) is not None:
         _CODEX_FORWARDER_OWNERS[task] = owner
     return owner
+
+
+def codex_pane_has_background_terminals(session_id: str, instance: TerminalInstance) -> bool:
+    """Use the live forwarder's last app-server listing for this pane incarnation."""
+    task = _AUTO_FORWARDER_TASKS.get(session_id)
+    if task is None or task.done() or task.cancelling():
+        return False
+    owner = _CODEX_FORWARDER_OWNERS.get(task)
+    return (
+        owner is not None
+        and owner.session_id == session_id
+        and owner.terminal_instance is instance
+        and owner.background_terminals_running
+    )
 
 
 def _prepare_codex_forwarder_transfer(
@@ -7305,6 +7327,7 @@ async def _auto_create_codex_terminal(
                 client=retained_resume_client,
                 inventory_incarnation_id=inventory_incarnation_id,
                 app_server=app_server,
+                terminal_instance=terminal_instance,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -7654,7 +7677,7 @@ async def _codex_discover_thread_and_forward(
         _RunnerDatabricksAuth,
     )
 
-    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router, terminal_instance)
     if login_required:
         # The launch router already knows this TUI can only render the
         # sign-in screen: no provider routes the codex harness and Codex
@@ -7971,6 +7994,7 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_background_terminals=owner.note_background_terminals,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -8031,6 +8055,7 @@ async def _codex_forward_known_thread(
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
     inventory_incarnation_id: str | None = None,
+    terminal_instance: TerminalInstance | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -8054,6 +8079,7 @@ async def _codex_forward_known_thread(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param terminal_instance: Pane owned by this forwarder for liveness checks.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -8064,7 +8090,7 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
-    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router, terminal_instance)
     cancelled = False
     try:
         _bind_codex_inventory_client(
@@ -8083,6 +8109,7 @@ async def _codex_forward_known_thread(
             thread_id=thread_id,
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_background_terminals=owner.note_background_terminals,
         )
     except asyncio.CancelledError:
         cancelled = True
