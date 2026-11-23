@@ -33,6 +33,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 _WEB_ID = "a" * 32
 _OTHER_WEB_ID = "b" * 32
 _FORGED_ID = "c" * 32
+_LITERAL_ATTACHMENT_MARKER = "[Attached: /opt/work/status.txt]"
 
 
 def _mirror(
@@ -110,9 +111,20 @@ async def test_text_matched_mirror_names_its_web_send(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("newer_web_text", [None, "Another message.", "Check the status."])
+@pytest.mark.parametrize(
+    ("echo_text", "newer_web_text"),
+    [
+        pytest.param("Check the status.", None, id="None"),
+        pytest.param("Check the status.", "Another message.", id="Another message."),
+        pytest.param("Check the status.", "Check the status.", id="Check the status."),
+        pytest.param(_LITERAL_ATTACHMENT_MARKER, "Another message.", id="literal-marker-fifo"),
+        pytest.param(
+            _LITERAL_ATTACHMENT_MARKER, _LITERAL_ATTACHMENT_MARKER, id="literal-marker-text"
+        ),
+    ],
+)
 async def test_later_same_text_terminal_input_cannot_settle_old_claim(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, newer_web_text: str | None
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, echo_text: str, newer_web_text: str | None
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE})
@@ -122,7 +134,7 @@ async def test_later_same_text_terminal_input_cannot_settle_old_claim(
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
     pending_id = pending_inputs.record(
         conv.id,
-        [{"type": "input_text", "text": "Check the status."}],
+        [{"type": "input_text", "text": echo_text}],
         stable_id=_WEB_ID,
         runner_managed=True,
     )
@@ -135,7 +147,7 @@ async def test_later_same_text_terminal_input_cannot_settle_old_claim(
                 conv.id, [{"type": "input_text", "text": newer_web_text}], stable_id=_OTHER_WEB_ID
             )
         item_id, _ = await _persist_external_conversation_item(
-            conv.id, conv, _mirror("Check the status.", source_id="terminal-record"), store
+            conv.id, conv, _mirror(echo_text, source_id="terminal-record"), store
         )
         [terminal] = store.list_items(conv.id).data
         assert terminal.id == item_id
@@ -881,20 +893,29 @@ def _command_mirror(item_type: str, item_data: dict[str, Any]) -> SessionEventIn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("old_text", "new_text"),
+    [
+        pytest.param("/review", "/review", id="same-short-name"),
+        pytest.param("/example:review", "/review", id="late-qualified-name"),
+        pytest.param("/review", "/example:review", id="late-short-name"),
+    ],
+)
 async def test_late_slash_command_mirror_leaves_unclaimed_resend_queued(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, old_text: str, new_text: str
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE})
     now = 0.0
     monkeypatch.setattr(pending_inputs, "_now", lambda: now)
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
-    content = [{"type": "input_text", "text": "/review"}]
-    original = pending_inputs.record(conv.id, content, runner_managed=True)
+    original = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": old_text}], runner_managed=True
+    )
     assert pending_inputs.claim_runner_input(conv.id, original, "original")
 
     now = pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S
-    resend = pending_inputs.record(conv.id, content)
+    resend = pending_inputs.record(conv.id, [{"type": "input_text", "text": new_text}])
     try:
         item_id, replay = await _persist_external_conversation_item(
             conv.id,
