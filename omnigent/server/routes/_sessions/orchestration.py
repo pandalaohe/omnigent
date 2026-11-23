@@ -5710,9 +5710,13 @@ async def _persist_external_conversation_item_unlocked(
         # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
         # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
         spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
-        for spelling in spellings:
-            command_line = f"/{spelling} {item.data.arguments}".strip()
-            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        command_lines = tuple(
+            f"/{spelling} {item.data.arguments}".strip() for spelling in spellings
+        )
+        for command_line in command_lines:
+            matched = pending_inputs.resolve_matching_text(
+                session_id, command_line, hold=True, echo_spellings=command_lines
+            )
             if matched.matched is not None:
                 break
         drained = matched.matched

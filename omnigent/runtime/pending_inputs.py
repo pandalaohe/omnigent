@@ -48,13 +48,13 @@ generated marker lines — one per file block — are dropped from the mirror
 first) and reports the older entries it skipped, which the caller
 persists as undelivered. Two queued messages with identical text drain in
 queue order while their claims are inside the text-match window. A claim
-retained past that window is omitted from text-only matching and request-phase
+retained past that window is omitted from text-only settlement and request-phase
 lookups, but remains available for its own attempt-linked evidence until the
-two-hour proof bound. When no entry matches — the transcript may still reformat
-text in ways not normalized here — the oldest entry is drained, as before, and
-every entry still queued is marked uncertain (:func:`mark_uncertain`): the
-drained receipt may really have belonged to one of them, so a later match that
-jumps over them drains them quietly instead of recording them as undelivered.
+two-hour proof bound. A late claim that explains the text without a current
+claimed match leaves the queue alone. Other text misses can drain the oldest
+entry and mark the rest uncertain (:func:`mark_uncertain`): the drained receipt
+may really have belonged to one of them, so a later match that jumps over them
+drains them quietly instead of recording them as undelivered.
 
 A message the person cancelled with Stop before the agent recorded it would
 otherwise be recorded as undelivered at the next match. The interrupt route
@@ -1240,6 +1240,7 @@ def resolve_matching_text(
     hold: bool = False,
     shell_command: bool = False,
     claude_commands: bool = False,
+    echo_spellings: tuple[str, ...] = (),
 ) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
@@ -1264,6 +1265,8 @@ def resolve_matching_text(
     :param claude_commands: The session runs Claude Code, so its own commands
         (``!`` shell commands and bare exit words) are not known lost either
         when a later match jumps over them; see :func:`_is_command_entry`.
+    :param echo_spellings: Equivalent command lines to check for late-claim
+        ambiguity before settling a match for ``text``.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -1316,6 +1319,29 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
+        bare_needle = exact_needle if shell_command else _bare_text(text)
+        late_claim_needles = [(exact_needle, bare_needle)]
+        late_claim_needles.extend(
+            (_collapse_whitespace(spelling), _bare_text(spelling))
+            for spelling in echo_spellings
+            if spelling != text
+        )
+        # A late claim can explain the echo. Only a current claim can settle
+        # from that text because it has already been admitted to paste.
+        late_claim_echo = (
+            not shell_command
+            and attachment_delivery is None
+            and any(
+                not entry.held
+                and entry.auto_retry is None
+                and _is_late_claimed_entry(entry, now)
+                and any(
+                    _matches_late_claim_text(entry, exact, bare)
+                    for exact, bare in late_claim_needles
+                )
+                for entry in entries.values()
+            )
+        )
         # Claude is the sender that claims pending prompts before pasting.
         # Its tagged uploads require evidence even for a shell or slash echo.
         ordered = [
@@ -1324,6 +1350,7 @@ def resolve_matching_text(
             if not entry.held
             and entry.auto_retry is None
             and not _is_late_claimed_entry(entry, now)
+            and (not late_claim_echo or entry.runner_claim_id is not None)
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
             and not (
                 entry.runner_claim_id is not None
@@ -1369,10 +1396,13 @@ def resolve_matching_text(
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
-            return MatchedDrain(matched=None, skipped=[])
+            return MatchedDrain(
+                matched=None,
+                skipped=[],
+                match_method="unattributed_claim" if late_claim_echo else None,
+            )
         # Look across match tiers. A literal attachment marker or a command's
         # injected prefix can also explain an otherwise exact mirror.
-        bare_needle = _bare_text(text) if not shell_command else exact_needle
         shared_matches = [
             index
             for index, (_pid, entry) in enumerate(ordered)
@@ -1561,6 +1591,17 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _matches_late_claim_text(entry: _Entry, exact_needle: str, bare_needle: str) -> bool:
+    """Check the raw text when an echo consists entirely of attachment markers."""
+    queued_text = _content_text(entry.content)
+    matches_text = (
+        _bare_text(queued_text) == bare_needle
+        if bare_needle
+        else _collapse_whitespace(queued_text) == exact_needle
+    )
+    return matches_text or _matches_injected_prefix(entry, exact_needle)
 
 
 def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:
