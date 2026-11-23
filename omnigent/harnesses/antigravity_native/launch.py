@@ -51,7 +51,14 @@ from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 _logger = logging.getLogger(__name__)
 AGY_MODEL_PROBE_TIMEOUT_S = 90.0
 # Allow native setup, cold-start and notice delivery around the probe.
-AGY_MODEL_LAUNCH_TIMEOUT_S = AGY_MODEL_PROBE_TIMEOUT_S + 60.0
+AGY_MODEL_LAUNCH_TIMEOUT_S = AGY_MODEL_PROBE_TIMEOUT_S + 90.0
+# The binding PATCH waits for the runner's session initialization, which can
+# include the same model probe and cold start before it returns.
+AGY_RUNNER_INIT_TIMEOUT_S = AGY_MODEL_LAUNCH_TIMEOUT_S + 60.0
+# The CLI's post-bind ensure request must also outlive the runner-side launch.
+AGY_TERMINAL_ENSURE_TIMEOUT_S = AGY_MODEL_LAUNCH_TIMEOUT_S + 10.0
+# Keep the CLI's binding wait outside the server-side initialization budget.
+AGY_CLI_BIND_TIMEOUT_S = AGY_RUNNER_INIT_TIMEOUT_S + 60.0
 _agy_model_probes: dict[
     tuple[asyncio.AbstractEventLoop, str, str, str | None], asyncio.Task[bool | None]
 ] = {}

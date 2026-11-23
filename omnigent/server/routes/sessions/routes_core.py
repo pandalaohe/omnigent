@@ -67,6 +67,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     AGY_SWITCH_STEP_TIMEOUT_S,
     resolve_agy_permission_tier,
 )
+from omnigent.harnesses.antigravity_native.launch import AGY_RUNNER_INIT_TIMEOUT_S
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -7023,11 +7024,26 @@ def register_core_routes(
                         request,
                         suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
                     )
+                    runner_init_timeout = _RUNNER_SESSION_INIT_TIMEOUT_S
+                    if (
+                        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                        in (
+                            ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+                            ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+                        )
+                        or _resolve_harness(
+                            conv,
+                            agent_store=agent_store,
+                            agent_cache=agent_cache,
+                        )
+                        == "antigravity-native"
+                    ):
+                        runner_init_timeout = AGY_RUNNER_INIT_TIMEOUT_S
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
                             json=init_body,
-                            timeout=10.0,
+                            timeout=runner_init_timeout,
                         )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST

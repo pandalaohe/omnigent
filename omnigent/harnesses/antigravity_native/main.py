@@ -115,7 +115,9 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_tmux_target,
 )
 from omnigent.harnesses.antigravity_native.launch import (
-    AGY_MODEL_LAUNCH_TIMEOUT_S,
+    AGY_CLI_BIND_TIMEOUT_S,
+    AGY_MODEL_LAUNCH_TIMEOUT_S,  # noqa: F401 — preserve the module-level export
+    AGY_TERMINAL_ENSURE_TIMEOUT_S,
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
@@ -640,7 +642,7 @@ async def _prepare_antigravity_terminal(
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
-    timeout = httpx.Timeout(30.0, read=120.0)
+    timeout = httpx.Timeout(30.0, read=AGY_CLI_BIND_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
@@ -781,7 +783,7 @@ async def _attachable_runner_antigravity_terminal(
             "session_key": _TERMINAL_SESSION_KEY,
             "ensure_native_terminal": True,
         },
-        timeout=httpx.Timeout(30.0, read=AGY_MODEL_LAUNCH_TIMEOUT_S + 10.0),
+        timeout=httpx.Timeout(30.0, read=AGY_TERMINAL_ENSURE_TIMEOUT_S),
     )
     if response.status_code >= 400:
         raise click.ClickException(f"Antigravity terminal launch failed: {error_text(response)}")
@@ -861,7 +863,7 @@ async def _prepare_antigravity_terminal_via_daemon(
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
-    timeout = httpx.Timeout(30.0, read=120.0)
+    timeout = httpx.Timeout(30.0, read=AGY_CLI_BIND_TIMEOUT_S)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str

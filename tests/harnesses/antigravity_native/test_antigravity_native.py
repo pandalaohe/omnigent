@@ -26,8 +26,35 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_bridge_state,
     read_tmux_info,
 )
-from omnigent.harnesses.antigravity_native.launch import AgyLaunchCommand
+from omnigent.harnesses.antigravity_native.launch import (
+    AGY_CLI_BIND_TIMEOUT_S,
+    AGY_MODEL_LAUNCH_TIMEOUT_S,
+    AGY_MODEL_PROBE_TIMEOUT_S,
+    AGY_RUNNER_INIT_TIMEOUT_S,
+    AGY_TERMINAL_ENSURE_TIMEOUT_S,
+    AgyLaunchCommand,
+)
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
+
+
+def test_agy_startup_wait_budgets_are_nested() -> None:
+    """The outer binding wait must cover every runner-side startup phase."""
+    from omnigent.harnesses.antigravity_native.rpc import _RPC_CALL_TIMEOUT_S
+    from omnigent.runner.native.orchestration import (
+        _AGY_COLD_START_MODEL_STABILIZATION_S,
+        _AGY_COLD_START_PORT_TIMEOUT_S,
+    )
+
+    runner_startup = (
+        AGY_MODEL_PROBE_TIMEOUT_S
+        + _AGY_COLD_START_PORT_TIMEOUT_S
+        + _AGY_COLD_START_MODEL_STABILIZATION_S
+        + _RPC_CALL_TIMEOUT_S
+    )
+    assert runner_startup < AGY_MODEL_LAUNCH_TIMEOUT_S
+    assert AGY_MODEL_LAUNCH_TIMEOUT_S < AGY_TERMINAL_ENSURE_TIMEOUT_S
+    assert AGY_TERMINAL_ENSURE_TIMEOUT_S < AGY_RUNNER_INIT_TIMEOUT_S
+    assert AGY_RUNNER_INIT_TIMEOUT_S < AGY_CLI_BIND_TIMEOUT_S
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
