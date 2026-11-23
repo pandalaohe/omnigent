@@ -1415,7 +1415,7 @@ def register_resources_routes(
         body: dict[str, Any],
         conversation: Conversation,
         *,
-        timeout: float = 10.0,
+        timeout: float | httpx.Timeout = 10.0,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a POST request to the runner and return status + JSON.
 
@@ -1977,11 +1977,23 @@ def register_resources_routes(
         router = runner_router or get_server_runner_router()
         if router is not None:
             await asyncio.to_thread(router.require_mcp_registry_support, conv)
+        timeout: float | httpx.Timeout = 10.0
+        if (
+            is_native_bootstrap
+            and body.get("ensure_native_terminal") is True
+            and body.get("terminal") == "antigravity"
+            and not body.get("spec")
+            and conv.model_override
+        ):
+            from omnigent.harnesses.antigravity_native.launch import AGY_MODEL_LAUNCH_TIMEOUT_S
+
+            timeout = httpx.Timeout(10.0, read=AGY_MODEL_LAUNCH_TIMEOUT_S)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,
             body,
             conv,
+            timeout=timeout,
         )
         timings.mark("runner_launch")
         _logger.info(

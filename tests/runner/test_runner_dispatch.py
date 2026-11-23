@@ -5387,19 +5387,22 @@ async def test_sys_session_send_family_guard_runs_before_normalization(
 def _host_catalog_server(
     requests: list[httpx.Request],
     fail: str | None = None,
+    *,
+    harness: str = "codex-native",
 ) -> Callable[[httpx.Request], httpx.Response]:
     """
     Serve the host list, agent-to-harness resolution and cached catalogs.
 
-    ``ag_known`` runs on ``codex-native``, ``ag_uncached`` on a harness with
+    ``ag_known`` runs on the selected harness, ``ag_uncached`` on a harness with
     no cached row, and any other agent resolves to no harness.
 
     :param requests: Receives every request the handler sees.
     :param fail: ``"hosts-502"``, ``"hosts-html"`` or ``"catalogs-500"`` to
         break that read, or ``None``.
+    :param harness: Harness for the selected agent and its catalog row.
     :returns: An ``httpx.MockTransport`` handler.
     """
-    harnesses = {"ag_known": "codex-native", "ag_uncached": "pi-native"}
+    harnesses = {"ag_known": harness, "ag_uncached": "pi-native"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -5437,7 +5440,7 @@ def _host_catalog_server(
                 },
                 {
                     "host_id": "host-a",
-                    "harness": "codex-native",
+                    "harness": harness,
                     "models": [
                         {"id": "relay/model-x", "displayName": "Model X", "isDefault": True},
                         {"id": "row-2", "model": "relay/model-y", "hidden": True},
@@ -5526,7 +5529,8 @@ async def test_sys_list_models_requires_agent_spec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
+@pytest.mark.parametrize("harness", ["codex-native", "antigravity-native"])
+async def test_sys_list_models_lists_host_catalog_for_agent(harness: str) -> None:
     """
     ``host`` + ``agent_id`` return that host's cached rows for the agent's harness.
 
@@ -5538,7 +5542,7 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
 
     requests: list[httpx.Request] = []
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_host_catalog_server(requests)),
+        transport=httpx.MockTransport(_host_catalog_server(requests, harness=harness)),
         base_url="http://server",
     ) as server_client:
         output = await execute_tool(
@@ -5553,7 +5557,7 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
         "host": "alpha",
         "host_id": "host-a",
         "agent_id": "ag_known",
-        "harness": "codex-native",
+        "harness": harness,
         "source": "host_catalog",
         "fetched_at": 1700000000,
         "stale": True,
@@ -5585,9 +5589,9 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
     }
     resolve = next(r for r in requests if r.url.path == "/v1/calling-defaults/resolve")
     assert dict(resolve.url.params) == {"host_id": "host-a", "agent_id": "ag_known"}
-    # The catalog read is the filtered, cache-only one.
+    # Keep a refresh scoped to this host and harness.
     catalogs = next(r for r in requests if r.url.path == "/v1/calling-defaults/catalogs")
-    assert dict(catalogs.url.params) == {"host_id": "host-a", "harness": "codex-native"}
+    assert dict(catalogs.url.params) == {"host_id": "host-a", "harness": harness}
 
 
 @pytest.mark.asyncio

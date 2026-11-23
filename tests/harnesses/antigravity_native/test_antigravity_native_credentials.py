@@ -52,9 +52,11 @@ def test_saved_gateway_drives_launch_and_isolated_settings(tmp_path: Path, resum
     secrets.store_secret("gateway", "gateway-fake-key")
     save_provider(tmp_path)
     assert antigravity_credentials_ready()
-    argv, env = build_agy_launch(
+    launch = build_agy_launch(
         conversation_id="existing" if resume else None, model=None, resume=resume
     )
+    argv, env = launch.argv, launch.env
+    assert launch.subscription_model is None
     assert env == {
         "GEMINI_API_KEY": "gateway-fake-key",
         "GOOGLE_GEMINI_BASE_URL": "https://gateway.example/gemini",
@@ -72,7 +74,9 @@ def test_saved_gateway_drives_launch_and_isolated_settings(tmp_path: Path, resum
 def test_explicit_model_wins(tmp_path: Path) -> None:
     secrets.store_secret("gateway", "fake-key")
     save_provider(tmp_path)
-    argv, _ = build_agy_launch(conversation_id=None, model="Gemini 3.8 Flash (Low)", resume=False)
+    argv = build_agy_launch(
+        conversation_id=None, model="Gemini 3.8 Flash (Low)", resume=False
+    ).argv
     assert argv[argv.index("--model") + 1] == "Gemini 3.8 Flash (Low)"
 
 
@@ -165,7 +169,7 @@ def test_oauth_fallback_removes_bridge_owned_gemini_provider(
     assert antigravity_credentials_ready()
     assert resolve_antigravity_credentials() is None
     ensure_agy_feedback_survey_disabled(tmp_path, launch_env={"GEMINI_API_KEY": "fake"})
-    _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+    env = build_agy_launch(conversation_id=None, model=None, resume=False).env
     assert env == {}
     ensure_agy_feedback_survey_disabled(tmp_path, launch_env=env)
     settings = json.loads((tmp_path / ".gemini/antigravity-cli/settings.json").read_text())
@@ -296,7 +300,7 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
         if legacy_key
         else {}
     )
-    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == expected_env
+    assert build_agy_launch(conversation_id=None, model=None, resume=False).env == expected_env
     assert path.read_bytes() == before
 
     # Selecting Gemini explicitly activates the gateway without disturbing Codex.
@@ -304,7 +308,7 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
     path.write_text(yaml.safe_dump(config))
     before = path.read_bytes()
     if compatible:
-        _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+        env = build_agy_launch(conversation_id=None, model=None, resume=False).env
         assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
     else:
         with pytest.raises(OmnigentError, match="OpenAI Responses"):
@@ -313,7 +317,7 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
     # Remove only Gemini's default to recover OAuth without changing Codex routing.
     config["providers"]["existing"]["default"] = ["openai"]
     path.write_text(yaml.safe_dump(config))
-    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == expected_env
+    assert build_agy_launch(conversation_id=None, model=None, resume=False).env == expected_env
     assert default_provider_for_harness(config, "native-codex").name == "existing"
 
 

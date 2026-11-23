@@ -3329,11 +3329,11 @@ async def _get_server_object(
 
 async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient | None) -> str:
     """
-    List one host's cached launch catalog for an agent's harness.
+    List one host's launch catalog for an agent's harness.
 
     The server maps the agent to its harness as a session create would
-    (``/v1/calling-defaults/resolve``); the rows are the cached catalog the
-    new-session picker reads (``/v1/calling-defaults/catalogs``).
+    (``/v1/calling-defaults/resolve``); the rows come from the same catalog
+    the new-session picker reads (``/v1/calling-defaults/catalogs``).
 
     :param args: Tool arguments carrying ``host`` (id or exact name) and
         ``agent_id``.
@@ -3381,7 +3381,8 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
                 ),
             }
         )
-    # The filtered read is cache-only, so other hosts' probes never delay it.
+    # The filters keep any refresh scoped to this host and harness. The server
+    # bounds an AG read below this client's HTTP timeout and can return stale rows.
     catalogs, error = await _get_server_object(
         server_client,
         "/v1/calling-defaults/catalogs",
