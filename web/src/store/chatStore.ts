@@ -7254,9 +7254,13 @@ async function reconcileOnReconnect(
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks, id);
   const todosAtReconnectStart = get().todos;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
-  // The history read may predate a POST reply that arrives before its merge.
+  // A queued or open POST can settle after the history read starts and before it merges.
+  const isClaudeNative = stateBeforeFetch.sessionHarness === "claude-native";
   const pendingAtReconnectStart = new Map(
-    stateBeforeFetch.pendingUserMessages.map((p) => [p.tempId, isAwaitingClaudePost(p, id)]),
+    stateBeforeFetch.pendingUserMessages.map((p) => [
+      p.tempId,
+      (isClaudeNative && p.beforePost === true) || isAwaitingClaudePost(p, id),
+    ]),
   );
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;

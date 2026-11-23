@@ -20803,14 +20803,19 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
-  it.each([false, true])(
-    "keeps a Claude send when reconnect recovers same-text terminal input (POST answers before merge: %s)",
-    async (postAnswersFirst) => {
+  it.each([
+    { postAtReconnect: "open", postAnswersFirst: false },
+    { postAtReconnect: "open", postAnswersFirst: true },
+    { postAtReconnect: "queued", postAnswersFirst: true },
+  ])(
+    "keeps a Claude send when reconnect recovers same-text terminal input ($postAtReconnect POST, answers before merge: $postAnswersFirst)",
+    async ({ postAtReconnect, postAnswersFirst }) => {
       const id = "conv_posting_terminal_echo";
       const before = userMessage("posting_pre", "before the gap");
       seedSession(id, [before]);
       const sinks = routeStreamOpens();
       const route = fetchMock.getMockImplementation()!;
+      let releasePriorPost: (() => void) | undefined;
       let resolvePost!: (response: Response) => void;
       let holdItems = false;
       let releaseItems!: () => void;
@@ -20821,7 +20826,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         const url = String(input);
         if (url.endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
           return new Promise<Response>((resolve) => {
-            resolvePost = resolve;
+            if (postAtReconnect === "queued" && releasePriorPost === undefined) {
+              releasePriorPost = () => resolve(mockResponse({ queued: false, denied: true }));
+            } else {
+              resolvePost = resolve;
+            }
           });
         }
         if (holdItems && url.split("?")[0] === `/v1/sessions/${id}/items`) await historyHeld;
@@ -20837,10 +20846,18 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       });
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
+      const prior = postAtReconnect === "queued" ? getState().send("earlier", "agent_xyz") : null;
       const sending = getState().send("ship it", "agent_xyz");
       await drainAsync();
-      expect(resolvePost).toBeTypeOf("function");
-      const [pending] = getState().pendingUserMessages;
+      const pending = getState().pendingUserMessages.at(-1);
+      expect(pending).toBeDefined();
+      if (prior) {
+        expect(releasePriorPost).toBeTypeOf("function");
+        expect(resolvePost).toBeUndefined();
+        expect(pending?.beforePost).toBe(true);
+      } else {
+        expect(resolvePost).toBeTypeOf("function");
+      }
 
       const terminal = userMessage("terminal_echo", "ship it");
       seedSessionItems(id, [before, terminal]);
@@ -20849,6 +20866,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       if (postAnswersFirst) {
         expect(getState().blocks.map((b) => b.ctx.itemId)).toEqual([before.id]);
+        if (prior) {
+          releasePriorPost!();
+          await prior;
+          await drainAsync();
+        }
         resolvePost(mockResponse({ queued: true, pending_id: "pending_web" }));
         await sending;
         releaseItems();

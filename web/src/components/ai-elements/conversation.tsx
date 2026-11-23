@@ -224,7 +224,8 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       if (
         isQuestionCardScrollHeld(el) ||
         !(target instanceof HTMLTextAreaElement) ||
-        target !== document.activeElement
+        target !== document.activeElement ||
+        ![...cards.current].some((card) => card.contains(target))
       )
         return;
       cancelCaretAnchor();
