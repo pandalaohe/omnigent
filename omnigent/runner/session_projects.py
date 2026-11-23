@@ -16,8 +16,17 @@ from omnigent.tools.builtins.session_projects import (
 )
 
 _DEFAULT_LISTED_SESSIONS = 50
-_SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
+_SNAPSHOT_PARAMS = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+    "include_usage": "false",
+}
 _CONCURRENT_NAME_READS = 8
+_UPDATE_PREFLIGHT_TIMEOUT_S = 120.0
+# A combined update can perform two 310s native Codex forwards with older runners.
+# Leave room for the session lock and response work after those forwards.
+_SETTINGS_PATCH_TIMEOUT_S = 720.0
 
 
 async def resolve_project_id(
@@ -208,30 +217,49 @@ def _refusal(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}: {detail}"
 
 
-async def _movable_snapshot(
+async def _update_request(
+    client: httpx.AsyncClient, method: str, path: str, *, wait_s: float, **kwargs: Any
+) -> httpx.Response:
+    """Apply a hard deadline as well as HTTPX's per-operation timeouts."""
+    try:
+        async with asyncio.timeout(wait_s):
+            return await client.request(
+                method, path, timeout=httpx.Timeout(30.0, read=wait_s), **kwargs
+            )
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(f"no complete response within {wait_s:g}s") from exc
+
+
+async def _update_snapshot(
     client: httpx.AsyncClient, session_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return ``(snapshot, None)`` for a session this tool may refile, else ``(None, error)``."""
+    """Read the target fields needed for update validation."""
     try:
-        snapshot = await client.get(
-            f"/v1/sessions/{session_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
+        snapshot = await _update_request(
+            client,
+            "GET",
+            f"/v1/sessions/{session_id}",
+            params=_SNAPSHOT_PARAMS,
+            wait_s=_UPDATE_PREFLIGHT_TIMEOUT_S,
         )
         if snapshot.is_error:
             return None, _refusal(snapshot)
         current = snapshot.json()
+        if not isinstance(current, dict):
+            raise ValueError("expected a session object")
     except (httpx.HTTPError, ValueError) as exc:
-        return None, f"session could not be read: {exc}"
-    level = current.get("permission_level")
-    # Filing is owner-gated; refuse here so a readable foreign session is never "unchanged".
-    if isinstance(level, int) and level < LEVEL_OWNER:
-        return None, "only the session's owner can change its project"
+        return None, f"session could not be read: {str(exc) or type(exc).__name__}"
+    return current, None
+
+
+def _move_refusal(current: dict[str, Any]) -> str | None:
     parent = current.get("parent_session_id")
     if parent:
-        return None, f"sub-agent sessions follow their parent's project; update {parent} instead"
+        return f"sub-agent sessions follow their parent's project; update {parent} instead"
     representative = (current.get("family") or {}).get("representative_id")
     if representative and representative != current.get("id"):
-        return None, f"this session shares its family's project; update {representative} instead"
-    return current, None
+        return f"this session shares its family's project; update {representative} instead"
+    return None
 
 
 async def _set_project(
@@ -258,21 +286,32 @@ async def _set_project(
     return "updated", None
 
 
-async def _server_checks_move_source(client: httpx.AsyncClient, *, settings: bool = False) -> bool:
-    """Whether the server checks the calling session for this mutation."""
+async def _source_check_refusal(client: httpx.AsyncClient, *, settings: bool) -> str | None:
+    """Require a positive server capability before any update or project creation."""
+    probe = "sys_session_update: GET /v1/info"
     try:
-        info = await client.get("/v1/info", timeout=30.0)
-        body = info.json() if info.status_code == 200 else None
-    except (httpx.HTTPError, ValueError):
-        return False
+        info = await _update_request(client, "GET", "/v1/info", wait_s=_UPDATE_PREFLIGHT_TIMEOUT_S)
+    except httpx.HTTPError as exc:
+        return f"{probe} failed: {str(exc) or type(exc).__name__}"
+    if info.status_code != 200:
+        return f"{probe} returned HTTP {info.status_code} while checking source sharing support"
+    try:
+        body = info.json()
+    except ValueError:
+        body = None
     if not isinstance(body, dict):
-        return False
-    if settings:
-        return (
-            body.get("session_settings_source_checks") is True
-            or body.get("session_organize_source_checks") is True
-        )
-    return body.get("session_move_source_checks") is True
+        return f"{probe} returned an invalid capability response"
+    flags = (
+        ("session_settings_source_checks", "session_organize_source_checks")
+        if settings
+        else ("session_move_source_checks",)
+    )
+    if any(body.get(flag) is True for flag in flags):
+        return None
+    return (
+        "sys_session_update: this Omnigent server cannot check the calling "
+        "session's sharing before this update; upgrade the server or use the Web controls"
+    )
 
 
 async def execute_session_update(
@@ -332,58 +371,63 @@ async def execute_session_update(
         return json.dumps({"session_id": session_id, "error": "invalid session ID"})
     if client is None or source_id is None:
         return json.dumps({"error": "sys_session_update requires an authenticated runner"})
-    if not await _server_checks_move_source(client, settings=bool(settings)):
+    if (error := await _source_check_refusal(client, settings=bool(settings))) is not None:
+        return json.dumps({"error": error})
+    current, error = await _update_snapshot(client, canonical)
+    if current is None:
+        return json.dumps({"session_id": session_id, "error": error})
+    level = current.get("permission_level")
+    if isinstance(level, int) and level < LEVEL_OWNER:
+        field = "settings" if settings else "project"
         return json.dumps(
-            {
-                "error": "sys_session_update: this Omnigent server cannot check the calling "
-                "session's sharing before this update; upgrade the server or use the Web controls"
-            }
+            {"session_id": session_id, "error": f"only the session's owner can change its {field}"}
         )
-    if settings:
+    if "project" in args and (error := _move_refusal(current)) is not None:
+        return json.dumps({"session_id": session_id, "error": error})
+    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
+    name = project.strip()
+    project_id, created = "", False
+    if name:
         try:
-            snapshot = await client.get(
-                f"/v1/sessions/{canonical}", params=_SNAPSHOT_PARAMS, timeout=30.0
+            project_id, created = await resolve_project_id(client, name, headers=headers)
+        except (httpx.HTTPError, ValueError) as exc:
+            return json.dumps(
+                {
+                    "session_id": session_id,
+                    "error": f"project could not be resolved: {str(exc) or type(exc).__name__}",
+                }
             )
-            if snapshot.is_error:
-                return json.dumps({"session_id": session_id, "error": _refusal(snapshot)})
-            level = snapshot.json().get("permission_level")
-            if isinstance(level, int) and level < LEVEL_OWNER:
-                return json.dumps(
-                    {
-                        "session_id": session_id,
-                        "error": "only the session's owner can change its settings",
-                    }
-                )
-            payload = {
-                "model_override" if key == "model" else key: value
-                for key, value in settings.items()
-            }
-            project_result = {}
-            if "project" in args:
-                current, error = await _movable_snapshot(client, canonical)
-                if current is None:
-                    return json.dumps({"session_id": session_id, "error": error})
-                name = project.strip()
-                headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
-                project_id, created = (
-                    await resolve_project_id(client, name, headers=headers)
-                    if name
-                    else ("", False)
-                )
-                payload.update({"project_id": project_id, "labels": {PROJECT_LABEL_KEY: ""}})
-                project_result = {"project": name or None, "project_created": created}
-            updated = await client.patch(
-                f"/v1/sessions/{canonical}",
+    if settings:
+        payload = {
+            "model_override" if key == "model" else key: value for key, value in settings.items()
+        }
+        project_result = {}
+        if "project" in args:
+            payload.update({"project_id": project_id, "labels": {PROJECT_LABEL_KEY: ""}})
+            project_result = {"project": name or None, "project_created": created}
+        path = f"/v1/sessions/{canonical}"
+        try:
+            updated = await _update_request(
+                client,
+                "PATCH",
+                path,
                 json=payload,
-                headers={ORCHESTRATION_SOURCE_HEADER: source_id},
-                timeout=60.0,
+                headers=headers,
+                params={"include_usage": "false"},
+                wait_s=_SETTINGS_PATCH_TIMEOUT_S,
             )
             if updated.is_error:
                 return json.dumps({"session_id": session_id, "error": _refusal(updated)})
             applied = updated.json()
+            if not isinstance(applied, dict):
+                raise ValueError("expected a session object")
         except (httpx.HTTPError, ValueError) as exc:
+            detail = str(exc) or type(exc).__name__
             return json.dumps(
-                {"session_id": session_id, "error": f"update could not be confirmed: {exc}"}
+                {
+                    "session_id": session_id,
+                    "error": f"update could not be confirmed: PATCH {path}: {detail}",
+                }
             )
         return json.dumps(
             {
@@ -396,17 +440,6 @@ async def execute_session_update(
                 },
             }
         )
-    current, error = await _movable_snapshot(client, canonical)
-    if current is None:
-        return json.dumps({"session_id": session_id, "error": error})
-    name = project.strip()
-    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
-    project_id, created = "", False
-    if name:
-        try:
-            project_id, created = await resolve_project_id(client, name, headers=headers)
-        except (httpx.HTTPError, ValueError) as exc:
-            return json.dumps({"session_id": session_id, "error": f"sys_session_update: {exc}"})
     status, error = await _set_project(
         client, current, canonical, project_id=project_id, headers=headers
     )

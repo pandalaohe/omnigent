@@ -373,3 +373,28 @@ async def test_project_update_refuses_a_source_shared_with_edit_access(auth_clie
         json={"project_id": ""},
     )
     assert direct.status_code == 403 and "bound runner" in direct.text
+
+
+@_ONE_ENVIRONMENT
+async def test_settings_update_checks_source_sharing_for_an_owned_child(
+    auth_client, peers, db_uri
+):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+    )
+    updated = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=child.id, model="gpt-6-sol"
+    )
+    assert updated == {"session_id": child.id, "status": "updated", "model": "gpt-6-sol"}
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
+    refused = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=child.id, model="gpt-5.4"
+    )
+    assert "HTTP 403" in refused["error"]
+    assert "shared with edit access cannot" in refused["error"]
+    assert store.get_conversation(child.id).model_override == "gpt-6-sol"
