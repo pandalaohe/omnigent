@@ -12,6 +12,7 @@ from typing import Any, Literal
 Level = Literal["spare", "normal", "heavy_hold", "new_session_hold", "unknown"]
 LEVELS = {"spare", "normal", "heavy_hold", "new_session_hold", "unknown"}
 MAX_READING_AGE_S = 180
+_HOLD_LEVELS = {"heavy_hold", "new_session_hold"}
 
 
 @dataclass(frozen=True)
@@ -125,9 +126,16 @@ class LevelState:
             )
             spare.update(load < 1 and memory < lines.mem_pct, "load")
             next_status = self._status()
-            if next_status != status:
+            old_level, new_level = status[0], next_status[0]
+            if old_level == "new_session_hold" and new_level == "heavy_hold":
+                # This minute cleared the new-session hold. The heavy flag can predate it.
+                self.decision_reading = None
+            elif old_level != new_level and (
+                old_level in _HOLD_LEVELS or new_level in _HOLD_LEVELS
+            ):
+                # Spare/normal changes do not trigger scheduling notices.
                 self.decision_reading = (load, memory)
-                status = next_status
+            status = next_status
             self._next_bucket = bucket + 1
         if self._next_bucket is not None and self._next_bucket < current:
             for flag in self._flags:

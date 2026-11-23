@@ -772,7 +772,7 @@ class LoadLevelReport:
     heavy: float
     new_session: float
     lines_synced_at: str | None
-    # Averages from the completed minute that changed the reported status.
+    # Averages from the completed minute behind the scheduling transition, when attributable.
     decision_load_per_core: float | None = None
     decision_mem_pct: float | None = None
 

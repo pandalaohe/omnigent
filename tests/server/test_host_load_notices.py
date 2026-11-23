@@ -102,11 +102,9 @@ async def test_busy_hold_clear_hold_composes_current_level_once(notices):
     assert len(h.posts) == 1
 
 
-async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
-    notices, monkeypatch
-):
+@pytest.fixture
+def sample_host_load(notices, monkeypatch):
     h = notices
-    _parent(h)
     _connect(h.hub, host_id=HOST_A, now=60000, workspace_id=0)
     monkeypatch.setattr(
         host_connect,
@@ -136,18 +134,26 @@ async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
         )
         h.hub.ingest(host_id=HOST_A, workspace_id=0, now=at, frame=report)
 
+    return sample
+
+
+async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
+    notices, sample_host_load
+):
+    h = notices
+    _parent(h)
     for at, load in ((60000, 4.5), (60060, 4.5), (60120, 5.8), (60150, 3.2), (60180, 2.01)):
-        sample(at, load)
+        sample_host_load(at, load)
     await _tick(h)
     assert len(h.posts) == 1
     hold = h.posts[0][1]
 
     for at, load in ((60240, 2.8), (60300, 3.2), (60360, 4.56)):
-        sample(at, load)
+        sample_host_load(at, load)
     await _tick(h)
     assert len(h.posts) == 1
-    sample(60420, 4.56)
-    sample(60480, 4.56)
+    sample_host_load(60420, 4.56)
+    sample_host_load(60480, 4.56)
     await _tick(h)
     assert len(h.posts) == 2
     clear = h.posts[1][1]
@@ -158,6 +164,59 @@ async def test_notice_uses_deciding_minute_even_when_latest_sample_crosses_line(
     assert "is clear" in clear
     assert "deciding minute averaged 3.20 per core and 50.0% memory" in clear
     assert "4.56 per core" not in clear
+
+
+async def test_delayed_clear_keeps_deciding_minute_after_spare_to_normal(
+    notices, sample_host_load
+):
+    h = notices
+    _parent(h)
+    for minute, load in enumerate((4.5, 4.5, 4.5, 0.4)):
+        sample_host_load(60000 + 60 * minute, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    assert "is on heavy-work hold" in h.posts[0][1]
+
+    h.clock.state = "busy"
+    for minute, load in enumerate((0.4, 0.4, 1.4), start=4):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "spare"
+    await _tick(h)
+    assert len(h.posts) == 1
+
+    for minute, load in enumerate((1.4, 4.56, 0.5), start=7):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "normal"
+    h.clock.state = "idle"
+    await _tick(h)
+    assert len(h.posts) == 2
+    assert "is clear" in h.posts[1][1]
+    assert "deciding minute averaged 0.40 per core and 50.0% memory" in h.posts[1][1]
+
+
+async def test_step_down_to_heavy_hold_omits_new_session_clear_reading(notices, sample_host_load):
+    h = notices
+    _parent(h)
+    for minute, load in enumerate((5.5, 5.5, 5.5, 4.5)):
+        sample_host_load(60000 + 60 * minute, load)
+    await _tick(h)
+    assert len(h.posts) == 1
+    assert "is on new-session hold" in h.posts[0][1]
+    assert "deciding minute averaged 5.50 per core and 50.0% memory" in h.posts[0][1]
+
+    for minute, load in enumerate((4.5, 2.0, 4.5), start=4):
+        sample_host_load(60000 + 60 * minute, load)
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "heavy_hold"
+    await _tick(h)
+    assert len(h.posts) == 1
+
+    sample_host_load(60420, 4.5)
+    sample_host_load(60480, 4.5)
+    await _tick(h)
+    assert len(h.posts) == 2
+    assert "is on heavy-work hold (load line 4 per core)" in h.posts[1][1]
+    assert "Do not dispatch new heavy work" in h.posts[1][1]
+    assert "deciding minute" not in h.posts[1][1]
 
 
 async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
