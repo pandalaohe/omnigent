@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import omnigent.harnesses.antigravity_native.launch as _mod
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.launch import (
     NativeAntigravityLaunch,
     agy_binary_path,
@@ -407,3 +408,49 @@ def test_launch_model_effort_pair(monkeypatch, model, effort, expected_model):
         assert argv[argv.index("--effort") + 1] == "medium"
     else:
         assert "--effort" not in argv
+
+
+@pytest.mark.parametrize(
+    "returncode,stderr,rejected",
+    [(0, b"", False), (1, b"error: invalid model selection", True), (1, b"offline", False)],
+)
+def test_launch_validates_subscription_model_with_same_binary(
+    monkeypatch, returncode, stderr, rejected
+):
+    import subprocess
+
+    monkeypatch.setattr(_mod, "gemini_auth_has_credential", lambda: True)
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, returncode, b"", stderr)
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    kwargs = {
+        "conversation_id": None,
+        "resume": False,
+        "model": "gemini-4-neon-high",
+        "effort": "xhigh",
+        "command": "agy-custom",
+    }
+    if rejected:
+        with pytest.raises(OmnigentError, match="does not offer model 'gemini-4-neon'") as error:
+            build_agy_launch(**kwargs)
+        assert error.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    else:
+        argv, _ = build_agy_launch(**kwargs)
+        assert argv[0] == "agy-custom"
+        assert argv[-4:] == ["--model", "gemini-4-neon", "--effort", "xhigh"]
+    assert calls == [
+        [
+            "agy-custom",
+            f"--gemini_dir={Path.home() / '.gemini'}",
+            "--model",
+            "gemini-4-neon",
+            "--effort",
+            "xhigh",
+            "-p",
+            "/model",
+        ]
+    ]

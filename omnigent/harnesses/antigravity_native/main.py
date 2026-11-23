@@ -1166,6 +1166,7 @@ async def _launch_and_record(
         extra_args=passthrough_args + tuple(agy_tier_launch_args(tier)),
         effort=effort if isinstance(effort, str) and effort else None,
         log_dir=bridge_dir,
+        command=command,
     )
     env_overrides.update(launch_env)
     await asyncio.to_thread(

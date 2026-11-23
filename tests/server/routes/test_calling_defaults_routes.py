@@ -24,6 +24,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
+from omnigent.db.utils import now_epoch
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -335,6 +336,61 @@ async def test_catalogs_filter_reads_one_cached_row_without_probing(
     assert full.status_code == 200, full.text
     proxy.assert_awaited_once()
     assert proxy.await_args.kwargs["host_conn"].host_id == HOST_B
+
+
+@pytest.mark.parametrize("seed", ["missing", "expired"])
+@pytest.mark.parametrize("path", ["picker", "host-tool"])
+async def test_agy_catalog_refreshes_without_manual_sync(
+    client, app, stores, monkeypatch, seed, path
+):
+    harness = "antigravity-native"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    _register_host(app, HOST_A)
+    if seed == "expired":
+        stores.cache.upsert(HOST_A, harness, [{"id": "retired"}], now_epoch() - 301)
+    models = [{"id": model} for model in ("gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon")]
+    proxy = AsyncMock(return_value={"status": "ok", "models": models})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    params = {"host_id": HOST_A, "harness": harness} if path == "host-tool" else None
+
+    started_at = now_epoch()
+    response = await client.get("/v1/calling-defaults/catalogs", params=params)
+    assert response.status_code == 200, response.text
+    row = response.json()["rows"][0]
+    assert row["models"] == models
+    assert row["fetched_at"] >= started_at
+    assert row["stale"] is False
+    repeated = await client.get("/v1/calling-defaults/catalogs", params=params)
+    assert repeated.json()["rows"] == [row]
+    proxy.assert_awaited_once()
+
+
+@pytest.mark.parametrize("online", [True, False])
+async def test_agy_catalog_preserves_old_rows_when_refresh_unavailable(
+    client, app, stores, monkeypatch, online
+):
+    harness = "antigravity-native"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    if online:
+        _register_host(app, HOST_A)
+    fetched_at = now_epoch() - 301
+    models = [{"id": "last-known"}]
+    stores.cache.upsert(HOST_A, harness, models, fetched_at)
+    proxy = AsyncMock(return_value={"status": "failed", "error": "probe unavailable"})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+
+    response = await client.get(
+        "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+    )
+    assert response.status_code == 200, response.text
+    row = response.json()["rows"][0]
+    assert row["models"] == models
+    assert row["fetched_at"] == fetched_at
+    assert row["stale"] is True
+    assert row["error"] == ("probe unavailable" if online else None)
+    assert proxy.await_count == int(online)
 
 
 async def test_resolve_exposes_unavailable_defaults(client, stores, monkeypatch):

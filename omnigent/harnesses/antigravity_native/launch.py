@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import secrets
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -160,6 +161,34 @@ def should_skip_permissions(
     return headless
 
 
+def _validate_agy_subscription_model(command: str, model: str, effort: str | None) -> None:
+    """Ask agy's print-mode resolver before the TUI can silently fall back."""
+    args = [command, f"--gemini_dir={Path.home() / '.gemini'}", "--model", model]
+    if effort is not None:
+        args.extend(["--effort", effort])
+    try:
+        result = subprocess.run(
+            [*args, "-p", "/model"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _logger.warning("Could not check the requested Antigravity model with agy")
+        return
+    if result.returncode == 0:
+        return
+    if b"invalid model selection" in result.stderr.lower():
+        raise OmnigentError(
+            f"Antigravity does not offer model {model!r} for this login. "
+            "Choose a model from the host's `agy models` list.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+    # An older CLI, sign-in, or transport failure is not a verdict about the ID.
+    _logger.warning("Could not check the requested Antigravity model with agy")
+
+
 def build_agy_launch(
     *,
     conversation_id: str | None,
@@ -168,6 +197,7 @@ def build_agy_launch(
     effort: str | None = None,
     extra_args: tuple[str, ...] = (),
     log_dir: Path | None = None,
+    command: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Build the argv and environment overrides for an agy launch.
 
@@ -204,18 +234,19 @@ def build_agy_launch(
     :param extra_args: Additional raw CLI args appended after all generated
         flags, e.g. ``("--print-timeout", "30")``.
     :param log_dir: Private directory for this launch's RPC discovery log.
+    :param command: Override the resolved agy executable for both probe and launch.
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
         environment.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
-    :raises OmnigentError: When saved credentials need repair through setup.
+    :raises OmnigentError: When credentials need repair or agy rejects the model.
     :raises RuntimeError: When the agy executable cannot be found.
     """
     launch = resolve_native_antigravity_launch(model=model)
-    model = launch.model
-    argv: list[str] = [agy_binary_path()]
+    binary = command if command is not None else agy_binary_path()
+    argv: list[str] = [binary]
     if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if log_dir is not None:
@@ -224,8 +255,11 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
-    if model is not None:
-        argv.extend(["--model", split_agy_effort_suffix(model)[0] if effort else model])
+    if launch.model is not None:
+        model_arg = split_agy_effort_suffix(launch.model)[0] if effort else launch.model
+        if launch.auth_mode == "subscription":
+            _validate_agy_subscription_model(binary, model_arg, effort)
+        argv.extend(["--model", model_arg])
     if effort is not None:
         argv.extend(["--effort", effort])
     for arg in extra_args:

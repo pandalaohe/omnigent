@@ -441,8 +441,8 @@ class CallingDefaultsCatalogRow(BaseModel):
     :param models: The host's model-option rows as reported.
     :param fetched_at: Unix epoch seconds of the last successful sync,
         or ``None`` when only a failed one is recorded.
-    :param stale: Whether the row should be treated as untrustworthy —
-        its last sync failed, or the host is offline on this replica.
+    :param stale: Whether the last sync failed, the host is offline on this
+        replica, or the native Antigravity catalog has expired.
     :param error: The last sync's failure text, or ``None``.
     """
 

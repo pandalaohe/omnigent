@@ -4,7 +4,8 @@ Three surfaces, all scoped to the caller's own hosts:
 
 * ``POST /sync`` — ask each online owned host for the model catalogs of
   the harnesses it reports as configured, and cache the answers.
-* ``GET /catalogs`` — read cached catalogs, fetching missing ACP delivery metadata.
+* ``GET /catalogs`` — read cached catalogs, refreshing expired agy rows and
+  fetching missing ACP delivery metadata.
 * ``GET /resolve`` — resolve the agent / harness / model / effort one
   create would use, and report any default-sourced value the cached
   catalog does not offer. Pure read: it never syncs.
@@ -50,6 +51,8 @@ from omnigent.stores.project_store import ProjectStore
 
 #: Per-sync limit on concurrent host round-trips.
 _SYNC_CONCURRENCY = 4
+_AGY_HARNESS = "antigravity-native"
+_AGY_CATALOG_TTL_S = 300
 
 
 def _owner(user_id: str | None) -> str:
@@ -122,11 +125,16 @@ async def _sync_pair(
         )
 
 
+def _agy_catalog_expired(record: dict[str, Any] | None) -> bool:
+    fetched_at = record["fetched_at"] if record is not None else None
+    return fetched_at is None or now_epoch() - fetched_at >= _AGY_CATALOG_TTL_S
+
+
 def _catalog_row(
     record: dict[str, Any],
     host_registry: HostRegistry,
 ) -> CallingDefaultsCatalogRow:
-    """Add the registry-based offline half of the staleness flag."""
+    """Expose offline, probe-failure and age-based staleness."""
     offline = host_registry.get(record["host_id"]) is None
     return CallingDefaultsCatalogRow(
         host_id=record["host_id"],
@@ -135,7 +143,9 @@ def _catalog_row(
         permission_options=record.get("permission_options", []),
         injects_prompt=record.get("injects_prompt"),
         fetched_at=record["fetched_at"],
-        stale=bool(record["error"]) or offline,
+        stale=bool(record["error"])
+        or offline
+        or (record["harness"] == _AGY_HARNESS and _agy_catalog_expired(record)),
         error=record["error"],
     )
 
@@ -167,6 +177,30 @@ def create_calling_defaults_router(
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
+    agy_refreshes: dict[str, asyncio.Task[None]] = {}
+    agy_sync_limit = asyncio.Semaphore(_SYNC_CONCURRENCY)
+
+    async def refresh_agy_catalog(host_id: str, conn: HostConnection) -> None:
+        # The picker and host-catalog tool can reach the same expired row at once.
+        # Keep one CLI probe in flight even if one reader disconnects.
+        async def refresh() -> None:
+            try:
+                await _sync_pair(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    catalog_store=catalog_store,
+                    semaphore=agy_sync_limit,
+                    host_id=host_id,
+                    harness=_AGY_HARNESS,
+                )
+            finally:
+                agy_refreshes.pop(host_id, None)
+
+        task = agy_refreshes.get(host_id)
+        if task is None:
+            task = asyncio.create_task(refresh(), name=f"agy-catalog-{host_id}")
+            agy_refreshes[host_id] = task
+        await asyncio.shield(task)
 
     @router.post("/calling-defaults/sync")
     async def sync_calling_defaults(
@@ -219,6 +253,9 @@ def create_calling_defaults_router(
                     continue
                 if not _harness_configured(host, harness):
                     continue
+                if harness == _AGY_HARNESS:
+                    syncs.append(refresh_agy_catalog(host.host_id, conn))
+                    continue
                 syncs.append(
                     _sync_pair(
                         host_registry=host_registry,
@@ -245,8 +282,8 @@ def create_calling_defaults_router(
     ) -> CallingDefaultsCatalogsResponse:
         """Return the caller's own cached catalogs, stale rows included.
 
-        A ``host_id`` or ``harness`` filter reads the cache only: it skips the
-        first-use ACP metadata sync, so it never waits on a host probe.
+        Filters limit agy refreshes to the requested hosts and harness.
+        First-use ACP metadata sync remains exclusive to unfiltered reads.
 
         :param request: The incoming request, used to identify the caller.
         :param host_id: Optional filter narrowing the rows to one owned host.
@@ -257,31 +294,46 @@ def create_calling_defaults_router(
         """
         user_id = require_user(request, auth_provider)
         owner = _owner(user_id)
+        if host_id is not None:
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+            if host is None or host.user_id != owner:
+                raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
+            hosts = [host]
+        else:
+            hosts = await asyncio.to_thread(host_store.list_hosts, owner)
+        wanted = (
+            harness
+            if harness is None or harness.startswith("acp:")
+            else canonicalize_harness(harness) or harness
+        )
+        host_ids = [host.host_id for host in hosts]
+        records = await asyncio.to_thread(catalog_store.list, host_ids)
+        if wanted is None or wanted == _AGY_HARNESS:
+            agy_records = {
+                row["host_id"]: row for row in records if row["harness"] == _AGY_HARNESS
+            }
+            refreshes = [
+                (host.host_id, conn)
+                for host in hosts
+                if (conn := host_registry.get(host.host_id)) is not None
+                and _harness_configured(host, _AGY_HARNESS)
+                and (
+                    host.host_id in agy_records
+                    or (host.configured_harnesses or {}).get(_AGY_HARNESS) is True
+                )
+                and _agy_catalog_expired(agy_records.get(host.host_id))
+            ]
+            if refreshes:
+                await asyncio.gather(*(refresh_agy_catalog(*pair) for pair in refreshes))
+                records = await asyncio.to_thread(catalog_store.list, host_ids)
         if host_id is not None or harness is not None:
-            if host_id is not None:
-                host = await asyncio.to_thread(host_store.get_host, host_id)
-                if host is None or host.user_id != owner:
-                    raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
-                host_ids = [host.host_id]
-            else:
-                host_ids = [
-                    host.host_id for host in await asyncio.to_thread(host_store.list_hosts, owner)
-                ]
-            wanted = (
-                harness
-                if harness is None or harness.startswith("acp:")
-                else canonicalize_harness(harness) or harness
-            )
-            records = await asyncio.to_thread(catalog_store.list, host_ids)
             return CallingDefaultsCatalogsResponse(
                 rows=[
                     _catalog_row(record, host_registry)
                     for record in records
                     if wanted is None or record["harness"] == wanted
-                ]
+                ],
             )
-        hosts = await asyncio.to_thread(host_store.list_hosts, owner)
-        records = await asyncio.to_thread(catalog_store.list, [host.host_id for host in hosts])
         # Configuration metadata must be visible on first use, independently
         # of a model probe succeeding or an explicit Sync models action.
         known = {
@@ -308,7 +360,7 @@ def create_calling_defaults_router(
                 and (host.host_id, harness) not in known
             )
         )
-        records = await asyncio.to_thread(catalog_store.list, [host.host_id for host in hosts])
+        records = await asyncio.to_thread(catalog_store.list, host_ids)
         return CallingDefaultsCatalogsResponse(
             rows=[_catalog_row(record, host_registry) for record in records]
         )
