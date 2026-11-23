@@ -120,8 +120,8 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
     )
     publish = Mock()
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
-    before = {"type": "input_text", "text": "See this screenshot."}
-    after = {"type": "input_text", "text": "Check the red dot."}
+    before: dict[str, object] = {"type": "input_text", "text": "See this screenshot."}
+    after: dict[str, object] = {"type": "input_text", "text": "Check the red dot."}
     monkeypatch.setattr(
         "omnigent.inner.native_attachments.attachments_root", lambda: tmp_path / "attachments"
     )
@@ -134,12 +134,12 @@ async def test_claude_midturn_attachment_echo_consumes_at_its_transcript_positio
         if attachment_kind != "file"
         else ("status.zip", "application/zip")
     )
-    upload = {
+    upload: dict[str, object] = {
         "type": "input_file" if attachment_kind == "file" else "input_image",
         "file_id": "file_upload",
         "filename": filename,
     }
-    other_uploads = (
+    other_uploads: list[dict[str, object]] = (
         [{"type": "input_image", "file_id": "file_missing", "filename": "missing.png"}]
         if attachment_kind == "partial-failure"
         else []
