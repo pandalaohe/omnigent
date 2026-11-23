@@ -9,8 +9,10 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
+from threading import Thread
 from time import monotonic, sleep
 
 from omnigent import permission_tiers
@@ -30,6 +32,10 @@ from omnigent.permission_tiers.host import (
     local_host_context,
     read_host_permission_state,
 )
+
+PERMISSION_STATE_RELAY_TIMEOUT_S = 90.0
+_PERMISSION_STATE_REQUEST_TIMEOUT_S = 120.0
+_PERMISSION_STATE_BUDGET_S = 600.0
 
 
 def _object(value: object) -> dict[str, object]:
@@ -82,21 +88,20 @@ def decide(
         return _error(exc)
 
 
-def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, object]:
-    """Check server readiness as well as the local fence before any native tool."""
-    if state.status != "ready":
-        raise ValueError("Permission state is blocked or switching")
-    relay = _relay_config(bridge_dir, state)
-    deadline = monotonic() + 60.0
+def _read_permission_state(relay: Mapping[str, object], deadline: float) -> dict[str, object]:
+    retry_delay = 0.2
     while True:
+        remaining = deadline - monotonic()
+        # Leave time for the relay to cancel a stalled snapshot before our client leaves.
+        if remaining <= PERMISSION_STATE_RELAY_TIMEOUT_S:
+            raise PermissionStateUnavailable("State observation deadline expired")
         try:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise PermissionStateUnavailable("State observation deadline expired")
-            confirmed = _relay_post(
-                relay, "/permission-tiers/state", {}, timeout_s=min(55.0, remaining)
+            return _relay_post(
+                relay,
+                "/permission-tiers/state",
+                {},
+                timeout_s=min(_PERMISSION_STATE_REQUEST_TIMEOUT_S, remaining),
             )
-            break
         except urllib.error.HTTPError as exc:
             if exc.code not in (503, 504):
                 raise
@@ -106,9 +111,33 @@ def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, 
                 raise
         except TimeoutError:
             pass
-        if monotonic() >= deadline:
-            raise PermissionStateUnavailable("State observation deadline expired")
-        sleep(min(0.2, max(0.0, deadline - monotonic())))
+        sleep(min(retry_delay, max(0.0, deadline - monotonic())))
+        retry_delay = min(5.0, retry_delay * 2)
+
+
+def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, object]:
+    """Check server readiness as well as the local fence before any native tool."""
+    if state.status != "ready":
+        raise ValueError("Permission state is blocked or switching")
+    relay = _relay_config(bridge_dir, state)
+    deadline = monotonic() + _PERMISSION_STATE_BUDGET_S
+    observation: Future[dict[str, object]] = Future()
+
+    def observe() -> None:
+        try:
+            observation.set_result(_read_permission_state(relay, deadline))
+        except Exception as exc:
+            observation.set_exception(exc)
+
+    # Socket timeouts bound individual reads. The hook process can still exit at
+    # its deadline if an in-flight state request stalls while reading the reply.
+    Thread(target=observe, daemon=True).start()
+    try:
+        confirmed = observation.result(timeout=max(0.0, deadline - monotonic()))
+    except TimeoutError as exc:
+        raise PermissionStateUnavailable("State observation deadline expired") from exc
+    if monotonic() >= deadline:
+        raise PermissionStateUnavailable("State observation deadline expired")
     if (
         confirmed.get("permission_tiers_capability") is not True
         or confirmed.get("permission_tier") != state.tier
@@ -150,7 +179,7 @@ def _relay_post(
     if path == "/policies/evaluate":
         timeout = 86400
     elif path == "/permission-tiers/state":
-        timeout = 55
+        timeout = _PERMISSION_STATE_REQUEST_TIMEOUT_S
     else:
         timeout = 5
     with urllib.request.urlopen(

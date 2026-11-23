@@ -67,9 +67,9 @@ def _notice(hub: SystemStatusHub, workspace: int, host: str, load: dict[str, Any
     if level == "heavy_hold":
         if load["reason"] == "memory":
             threshold = hub.effective_load_lines(workspace, host).mem_pct
-            detail = f"memory line {threshold:g}%"
+            detail = f"current memory line {threshold:g}%"
         else:
-            detail = f"load line {load['lines']['heavy']:g} per core"
+            detail = f"current load line {load['lines']['heavy']:g} per core"
         return (
             prefix + f"is on heavy-work hold ({detail}).{decision} New heavy test runs on "
             "this host wait. Do not dispatch new heavy work to it until a later notice says it "
@@ -84,12 +84,13 @@ def _notice(hub: SystemStatusHub, workspace: int, host: str, load: dict[str, Any
             "or heavy test runs to this host until it is clear."
         )
         return (
-            prefix + f"is on new-session hold (line {load['lines']['new_session']:g} per core)."
+            prefix
+            + f"is on new-session hold (current line {load['lines']['new_session']:g} per core)."
             f"{decision} {action}"
         )
     if level in {"normal", "spare"}:
         return (
-            prefix + f"is clear (heavy-work line {load['lines']['heavy']:g} per core)."
+            prefix + f"is clear (current heavy-work line {load['lines']['heavy']:g} per core)."
             f"{decision} Heavy work may resume."
         )
     return (

@@ -18911,12 +18911,15 @@ def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return clock
 
 
-def _hook_relay(tmp_path, monkeypatch, client, *, permission_tier_control=None):
+def _hook_relay(tmp_path, monkeypatch, client, *, permission_tier_control=None, bridge_dir=None):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
-    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
-    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
+    if bridge_dir is None:
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native"
+        )
+        bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
 
     async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
         """Accept any relayed tool call."""
@@ -18953,8 +18956,33 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
 
 
 @pytest.mark.asyncio
-async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("antigravity", [False, True])
+async def test_permission_state_relay_is_session_scoped_and_minimal(
+    tmp_path, monkeypatch, antigravity
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+
     requests = []
+    waits = []
+    bridge_dir = None
+    if antigravity:
+        monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+        bridge_dir = agy_bridge.prepare_bridge_dir("conv_hook_eval")
+
+    def submit(coro, loop):
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        result = future.result
+
+        def observe_wait(*, timeout):
+            waits.append(timeout)
+            return result(timeout=timeout)
+
+        monkeypatch.setattr(future, "result", observe_wait)
+        return future
+
+    relay_asyncio = Mock(wraps=asyncio)
+    relay_asyncio.run_coroutine_threadsafe.side_effect = submit
+    monkeypatch.setattr(claude_native_bridge, "asyncio", relay_asyncio)
     snapshot_options = {
         "include_items": "false",
         "include_liveness": "false",
@@ -18980,7 +19008,7 @@ async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, mo
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), base_url="http://server"
     ) as upstream:
-        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream)
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream, bridge_dir=bridge_dir)
         try:
             body = await asyncio.to_thread(
                 _relay_request_raw, bridge_dir, "/permission-tiers/state", {}
@@ -18993,6 +19021,7 @@ async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, mo
             }
             assert requests[0].url.path == "/v1/sessions/conv_hook_eval"
             assert requests[0].headers["X-Omnigent-Permission-Tiers"] == "1"
+            assert waits == [90.0 if antigravity else 5.0]
         finally:
             relay.close()
 

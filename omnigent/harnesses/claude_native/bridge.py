@@ -10891,6 +10891,16 @@ def _tool_relay_handler_factory(
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
+    from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
+
+    permission_state_timeout_s = 5.0
+    if bridge_dir is not None and _absolute_syntactic_path(bridge_dir).is_relative_to(
+        _absolute_syntactic_path(antigravity_bridge_root())
+    ):
+        from omnigent.harnesses.antigravity_native.guard import PERMISSION_STATE_RELAY_TIMEOUT_S
+
+        permission_state_timeout_s = PERMISSION_STATE_RELAY_TIMEOUT_S
+
     pending: dict[str, Future[object]] = {}
     pending_lock = threading.Lock()
     # Remember a cancellation that races ahead of its /tool request.
@@ -11590,7 +11600,7 @@ def _tool_relay_handler_factory(
                 loop,
             )
             try:
-                response = future.result(timeout=5.0)
+                response = future.result(timeout=permission_state_timeout_s)
                 response.raise_for_status()
                 state = response.json()
                 if not isinstance(state, dict):
