@@ -18440,9 +18440,17 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
 @pytest.mark.asyncio
 async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, monkeypatch):
     requests = []
+    snapshot_options = {
+        "include_items": "false",
+        "include_liveness": "false",
+        "include_live_status": "false",
+        "include_usage": "false",
+    }
 
     def handle(request):
         requests.append(request)
+        if dict(request.url.params) != snapshot_options:
+            return httpx.Response(503)
         return httpx.Response(
             200,
             json={
