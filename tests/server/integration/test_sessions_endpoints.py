@@ -18158,6 +18158,71 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
     assert saved.reasoning_effort == "high"
 
 
+async def test_patch_session_effort_forwards_after_silent_write_invalidates_route_snapshot(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent DB change after the route snapshot still triggers the live forward."""
+    from omnigent.server.routes._sessions.helpers import _live_settings_change
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation(session_id, reasoning_effort="high")
+    captured: list[dict[str, Any]] = []
+    runtime_effort = "high"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal runtime_effort
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            body = json.loads(request.content)
+            if body.get("type") == "effort_change":
+                captured.append(body)
+                runtime_effort = body["effort"]
+            return httpx.Response(204)
+        return httpx.Response(202, json={"queued": True})
+
+    route_snapshot_read = asyncio.Event()
+    resume_live_write = asyncio.Event()
+
+    class PauseFirstWriteLock(asyncio.Lock):
+        async def __aenter__(self) -> None:
+            if not route_snapshot_read.is_set():
+                route_snapshot_read.set()
+                await resume_live_write.wait()
+            await super().__aenter__()
+
+    live_change = _live_settings_change(session_id)
+    monkeypatch.setattr(live_change, "write_lock", PauseFirstWriteLock())
+    async with _runtime_runner(handler):
+        pending = asyncio.create_task(
+            client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
+        )
+        try:
+            await asyncio.wait_for(route_snapshot_read.wait(), timeout=5)
+            mirrored = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"reasoning_effort": "medium", "silent": True},
+            )
+            assert mirrored.status_code == 200, mirrored.text
+            assert mirrored.json()["reasoning_effort"] == "medium"
+            assert captured == []
+            runtime_effort = "medium"
+        finally:
+            resume_live_write.set()
+            response = await asyncio.wait_for(pending, timeout=5)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "high"
+    assert captured == [{"type": "effort_change", "effort": "high"}]
+    assert runtime_effort == "high"
+    saved = store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == runtime_effort
+
+
 @pytest.mark.parametrize(
     "native_session,patch_effort,expected_persisted,expected_event_effort",
     [
