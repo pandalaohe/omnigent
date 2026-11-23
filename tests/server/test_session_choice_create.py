@@ -1412,6 +1412,113 @@ async def test_named_precedence_and_old_runner(choice_env, mode):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides,model,effort",
+    [
+        ({}, "configured-default", "medium"),
+        ({"work_type": "work"}, "first-named-link", "low"),
+        ({"work_type": "work", "reasoning_effort": "high"}, "first-named-link", "high"),
+        (
+            {"model_override": "explicit-model", "reasoning_effort": "high"},
+            "explicit-model",
+            "high",
+        ),
+    ],
+)
+async def test_named_create_uses_first_link_for_requested_or_default_work_type(
+    choice_env, overrides, model, effort
+):
+    env = choice_env
+    agent = env.agents[1]["id"]
+    env.settings["hosts"][HOST]["work"][0][0]["links"].append(
+        {"agent": agent, "model": "first-named-link", "effort": "low", "meter": "pool-first"}
+    )
+    env.settings["workTypes"].append({"id": "default", "label": "Configured default"})
+    env.settings["defaultWorkType"] = "default"
+    env.settings["hosts"][HOST]["default"] = [
+        [{"links": [{"agent": agent, "model": "configured-default", "effort": "medium"}]}]
+    ]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    response = await env.client.post(
+        "/v1/sessions",
+        headers=HEADERS,
+        json={
+            "parent_session_id": env.parent.id,
+            "agent_id": agent,
+            "choice_reason": "The task needs this agent",
+            **overrides,
+        },
+    )
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["agent_id"] == agent
+    assert result["model_override"] == result["session_choice"]["model"] == model
+    assert result["reasoning_effort"] == result["session_choice"]["effort"] == effort
+    if model == "first-named-link":
+        assert result["session_choice"]["pool"] == "pool-first"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_model_less_link", [False, True])
+async def test_named_create_requires_model_in_host_work_chain(choice_env, has_model_less_link):
+    env = choice_env
+    agent = env.agents[1]["id"]
+    env.settings["hosts"][HOST]["work"].pop()
+    if has_model_less_link:
+        env.settings["hosts"][HOST]["work"][0][0]["links"].append({"agent": agent})
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    response = await create(env, agent_id=agent, user_named=True)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == {
+        "code": "session_choice_ask",
+        "agent": agent,
+        "host": HOST,
+        "work_type": "work",
+        "reason": "No model on the named agent's first matching link. Pass model explicitly.",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "second-model", "absent-model"])
+async def test_automatic_create_honors_explicit_options_or_refuses_model(choice_env, model):
+    env = choice_env
+    env.settings["hosts"][HOST]["work"][0][0]["links"][0]["effort"] = "low"
+    env.settings["hosts"][HOST]["work"][1][0]["links"][0]["model"] = "second-model"
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    response = await create(env, model_override=model, reasoning_effort="high")
+    if model == "absent-model":
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "session_choice_ask"
+        assert "absent-model" in detail["reason"]
+        return
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["agent_id"] == env.agents[int(model is not None)]["id"]
+    assert result["model_override"] == result["session_choice"]["model"] == (model or "test-model")
+    assert result["reasoning_effort"] == result["session_choice"]["effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_automatic_create_refuses_effort_unsupported_by_selected_harness(choice_env):
+    response = await create(choice_env, reasoning_effort="none")
+    assert response.status_code == 400, response.text
+    assert "Effort 'none' is not supported by claude-sdk" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["missing", "foreign"])
 async def test_create_skips_an_unbindable_agent_before_choosing_next(choice_env, invalid):
     env = choice_env
@@ -1762,6 +1869,7 @@ async def test_refusal_and_reserved_labels_leave_no_child(choice_env):
         env,
         agent_id=env.agents[0]["id"],
         user_named=True,
+        model_override="test-model",
         labels={CHOICE_LABEL: json.dumps({"pool": "forged"})},
     )
     assert response.status_code == 400, response.text

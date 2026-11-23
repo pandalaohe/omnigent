@@ -835,6 +835,7 @@ class ChoiceRequest:
     # Model identities include route prefixes; None selects all models of an agent.
     quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
     link_exclusions: Mapping[str, float] | None = None
+    required_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1288,6 +1289,8 @@ def _filter_link(
     pool = pool_of(link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
+    if request.required_model is not None and link.model != request.required_model:
+        return Skipped(link, "model_mismatch")
     if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
         return Skipped(link, "model_unavailable")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
@@ -1581,6 +1584,11 @@ def plan_choice(
             ),
             drops=tuple(drops),
         )
+    reason = "No eligible link"
+    if request.required_model is not None:
+        reason = f"No eligible link for requested model {request.required_model!r}"
+    elif any(item.why == "model_unavailable" for item in skipped):
+        reason = "Choose a model for this Codex route"
     return ChoicePlan(
         Choice(
             "ask",
@@ -1588,12 +1596,7 @@ def plan_choice(
             None,
             None,
             None,
-            (
-                "Choose a model for this Codex route"
-                if any(item.why == "model_unavailable" for item in skipped)
-                else "No eligible link"
-            )
-            + drop_note,
+            reason + drop_note,
             tuple(skipped),
             flags,
             warnings,
