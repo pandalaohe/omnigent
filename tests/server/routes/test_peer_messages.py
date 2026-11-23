@@ -1849,6 +1849,45 @@ async def test_busy_recheck_after_record_creation_queues_same_record(
     assert records[0].state == "queued"
 
 
+async def test_busy_recheck_keeps_a_copy_claimed_meanwhile_delivering(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """A delayed busy re-check does not queue a record another copy's runner claimed."""
+    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    peer_store: Any = peer_env["peer_store"]
+    real_claim = peer_store.claim_oldest
+    mark = "native_claimed:" + "d" * 32
+
+    def _claim_then_stall(peer_id: str, *args: Any, **kwargs: Any) -> bool:
+        claimed = real_claim(peer_id, *args, **kwargs)
+        # While the re-check stalls, the sweeper re-sent the copy and its runner claimed it.
+        assert mark_peer_copy_claimed(peer_store, receiver.id, peer_id, "d" * 32)
+        sessions_module._session_status_cache[receiver.id] = "running"
+        return claimed
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(peer_store, "claim_oldest", _claim_then_stall)
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"bc-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+    finally:
+        monkeypatch.undo()
+        sessions_module._session_status_cache.pop(receiver.id, None)
+    assert resp.status_code == 200, resp.text
+    assert fake.calls == []
+    stored = peer_store.get(resp.json()["peer_id"])
+    assert stored is not None
+    # The winner can still retry its claim and the mirror can still settle it.
+    assert (stored.state, stored.reason) == ("delivering", mark)
+
+
 async def test_busy_recheck_child_is_queued_not_steered(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],

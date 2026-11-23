@@ -1818,12 +1818,14 @@ def register_peer_routes(
             # steered to its next tool boundary.
             recheck_state, _recheck_runner_online = await _true_state(receiver, receiver=True)
             if recheck_state == "busy":
+                # A copy a runner claimed meanwhile keeps delivering for its retry and mirror.
                 await asyncio.to_thread(
                     peer_message_store.transition,
                     record.id,
                     "queued",
                     None,
                     ("delivering",),
+                    exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
                 )
                 return await _queued_response_for_record(record, runner_online)
             sdk_identity = sdk_attempt(record.reason)
