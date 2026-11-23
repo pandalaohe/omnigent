@@ -1357,6 +1357,7 @@ _AGY_COLLAPSED_LINES_RE = re.compile(r"↑ \d+ more lines?")
 # (``● [12:45:28] sleep 600… running``; footer ``… · 1 task(s) · /tasks``).
 # A task row, or the "↓ N more" row agy adds when more tasks than fit are running.
 _AGY_TASK_ROW_RE = re.compile(r"(?:[^\s>] \[\d{1,2}:\d{2}:\d{2}\] .+|↓ \d+ more)")
+_AGY_TASK_FOOTER_RE = re.compile(r"· [1-9]\d* task\(s\) · /tasks\s*$")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1723,6 +1724,18 @@ def _agy_task_panel(lines: list[str]) -> bool:
     """Return whether *lines* hold only agy background-task rows (never a composer)."""
     rows = [line.strip() for line in lines if line.strip()]
     return bool(rows) and all(_AGY_TASK_ROW_RE.fullmatch(row) for row in rows)
+
+
+def agy_pane_has_running_background_tasks(pane: str) -> bool:
+    """Read agy's live task panel below the composer, excluding the transcript."""
+    lines = pane.splitlines()
+    rules = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    if len(rules) < 3 or not any(
+        _AGY_TASK_FOOTER_RE.search(line) for line in lines[rules[-1] + 1 :]
+    ):
+        return False
+    rows = lines[rules[-2] + 1 : rules[-1]]
+    return _agy_task_panel(rows) and any(row.rstrip().endswith(" running") for row in rows)
 
 
 def _agy_turn_running(pane: str) -> bool:
