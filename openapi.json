@@ -26010,6 +26010,9 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
+                  "terminal_keyboard": {
+                    "type": "object"
+                  },
                   "value": {}
                 },
                 "required": [

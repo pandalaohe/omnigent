@@ -62,6 +62,14 @@ logger = logging.getLogger(__name__)
 
 USER_PREFERENCE_VERSION = 1
 USER_PREFERENCES_MAX_BYTES = 64 * 1024
+_TERMINAL_KEYBOARD_PLATFORMS = ("macos", "windows", "linux")
+_TERMINAL_KEYBOARD_BINDINGS = {
+    "lineStart": ("Move to start of line", "meta", ("ArrowLeft",)),
+    "lineEnd": ("Move to end of line", "meta", ("ArrowRight",)),
+    "killLine": ("Delete to start of line", "meta", ("Backspace",)),
+    "newline": ("Send Shift+Enter", "shift", ("Enter", "NumpadEnter")),
+}
+_SHORTCUT_MODIFIERS = ("primary", "control", "meta", "alt", "shift")
 USER_PREFERENCE_NAMESPACES = frozenset(
     {
         "keyboard_shortcuts",
@@ -103,6 +111,159 @@ _DRAIN_LOCKS_KEY = "session_choice.drain_locks"
 _DRAIN_LOCKS_MAX_BYTES = 2 * 1024 * 1024
 
 PreferencesEnvelope: TypeAlias = dict[str, Any]
+
+
+def _valid_terminal_binding(value: Any) -> bool:
+    if not isinstance(value, list) or not 1 <= len(value) <= 4:
+        return False
+    for chord in value:
+        if not isinstance(chord, dict):
+            return False
+        code, modifiers = chord.get("code"), chord.get("modifiers")
+        if (
+            not isinstance(code, str)
+            or not 1 <= len(code.encode("utf-16-le", errors="surrogatepass")) // 2 <= 64
+            or not isinstance(modifiers, list)
+            or any(modifier not in _SHORTCUT_MODIFIERS for modifier in modifiers)
+        ):
+            return False
+    return True
+
+
+def _terminal_binding_chords(
+    keyboard: Any, field: str, platform: str
+) -> set[tuple[str, frozenset[str]]]:
+    bindings = (
+        keyboard.get("bindings") if isinstance(keyboard, dict) and keyboard.get("v") == 1 else None
+    )
+    binding = bindings.get(field) if isinstance(bindings, dict) else None
+    if isinstance(binding, dict):
+        overrides = binding.get("platformOverrides", {})
+        common = binding.get("common")
+        if (
+            isinstance(overrides, dict)
+            and ("enabled" not in binding or isinstance(binding["enabled"], bool))
+            and ("common" not in binding or _valid_terminal_binding(common))
+            and all(
+                key not in overrides or _valid_terminal_binding(overrides[key])
+                for key in _TERMINAL_KEYBOARD_PLATFORMS
+            )
+        ):
+            chords = overrides.get(platform, common)
+            if chords is not None:
+                primary = "meta" if platform == "macos" else "control"
+                return {
+                    (
+                        code,
+                        frozenset(
+                            primary if modifier == "primary" else modifier
+                            for modifier in chord["modifiers"]
+                        ),
+                    )
+                    for chord in chords
+                    for code in (
+                        (f"Digit{digit}" for digit in range(10))
+                        if chord["code"] == "Digit*"
+                        else (chord["code"],)
+                    )
+                }
+    _, modifier, codes = _TERMINAL_KEYBOARD_BINDINGS[field]
+    return {(code, frozenset((modifier,))) for code in codes}
+
+
+def _check_terminal_binding_conflicts(
+    previous: Any, keyboard: dict[str, Any], edited: dict[str, dict[str, int]]
+) -> None:
+    for platform, actions in edited.items():
+        chords = {
+            action: _terminal_binding_chords(keyboard, action, platform)
+            for action in _TERMINAL_KEYBOARD_BINDINGS
+        }
+        for action in sorted(actions, key=actions.__getitem__, reverse=True):
+            added = chords[action] - _terminal_binding_chords(previous, action, platform)
+            for other, other_chords in chords.items():
+                if other != action and added & other_chords:
+                    label = _TERMINAL_KEYBOARD_BINDINGS[other][0]
+                    raise TerminalKeyboardConflictError(
+                        actions[action], f"That shortcut is already used by {label}."
+                    )
+
+
+def _terminal_keyboard_patch(existing: Any, patch: dict[str, Any]) -> dict[str, Any]:
+    defaults = patch.get("defaults")
+    changes = patch.get("changes")
+    if (
+        not isinstance(defaults, dict)
+        or defaults.get("version") != 2
+        or not isinstance(defaults.get("enabled"), bool)
+        or not isinstance(defaults.get("buttons"), list)
+        or not isinstance(changes, list)
+        or not changes
+    ):
+        raise UserPreferencesValidationError("Invalid terminal keyboard update")
+    mobile = dict(existing) if isinstance(existing, dict) else {}
+    if (
+        mobile.get("version") != 2
+        or not isinstance(mobile.get("enabled"), bool)
+        or not isinstance(mobile.get("buttons"), list)
+    ):
+        mobile = {
+            **mobile,
+            **{
+                key: defaults[key]
+                for key in ("version", "enabled", "buttons", "chatActionsRevision")
+                if key in defaults
+            },
+        }
+    stored = mobile.get("terminalKeyboard")
+    keyboard: dict[str, Any] = (
+        deepcopy(stored) if isinstance(stored, dict) and stored.get("v") == 1 else {"v": 1}
+    )
+    edited_bindings: dict[str, dict[str, int]] = {}
+    for index, change in enumerate(changes):
+        if not isinstance(change, dict) or "value" not in change:
+            raise UserPreferencesValidationError("Invalid terminal keyboard change")
+        platform, field, value = change.get("platform"), change.get("field"), change["value"]
+        if platform not in _TERMINAL_KEYBOARD_PLATFORMS:
+            raise UserPreferencesValidationError("Invalid terminal keyboard platform")
+        if field in ("modifierMap", "pasteBoxMode"):
+            if field == "modifierMap" and (
+                not isinstance(value, dict)
+                or any(
+                    value.get(key) not in ("ctrl", "alt", "cmd") for key in ("ctrl", "alt", "meta")
+                )
+            ):
+                raise UserPreferencesValidationError("Invalid terminal keyboard modifier map")
+            if field == "pasteBoxMode" and value not in ("always", "whenBlocked", "never"):
+                raise UserPreferencesValidationError("Invalid terminal paste box mode")
+            platform_map = keyboard.get(field)
+            keyboard[field] = {
+                **(platform_map if isinstance(platform_map, dict) else {}),
+                platform: value,
+            }
+        elif isinstance(field, str) and field in _TERMINAL_KEYBOARD_BINDINGS:
+            if value is not None and not _valid_terminal_binding(value):
+                raise UserPreferencesValidationError("Invalid terminal shortcut binding")
+            bindings = keyboard.get("bindings")
+            if not isinstance(bindings, dict):
+                bindings = keyboard["bindings"] = {}
+            binding = bindings.get(field)
+            if not isinstance(binding, dict):
+                binding = bindings[field] = {}
+            overrides = binding.get("platformOverrides")
+            if not isinstance(overrides, dict):
+                overrides = binding["platformOverrides"] = {}
+            if value is None:
+                overrides.pop(platform, None)
+            else:
+                overrides[platform] = value
+            edited_bindings.setdefault(platform, {})[field] = index
+        else:
+            raise UserPreferencesValidationError("Invalid terminal keyboard field")
+    _check_terminal_binding_conflicts(stored, keyboard, edited_bindings)
+    mobile["terminalKeyboard"] = keyboard
+    return mobile
+
 
 WORKTREE_ARCHIVE_NAMESPACE = "worktree_archive"
 
@@ -166,6 +327,12 @@ def read_worktree_archive_mode(
 
 class UserPreferencesValidationError(ValueError):
     """A preferences payload violates the persisted envelope contract."""
+
+
+class TerminalKeyboardConflictError(UserPreferencesValidationError):
+    def __init__(self, change_index: int, message: str) -> None:
+        super().__init__(message)
+        self.change_index = change_index
 
 
 class UserPreferencesUserNotFoundError(LookupError):
@@ -2299,11 +2466,18 @@ class SqlAlchemyUserPreferencesStore:
         namespace: str,
         value: Any | None,
         *,
+        terminal_keyboard: dict[str, Any] | None = None,
         create_if_missing: bool = True,
     ) -> PreferencesEnvelope:
-        """Atomically shallow-merge one namespace, or delete it with NULL."""
+        """Atomically update one namespace, or delete it with NULL."""
         if namespace not in USER_PREFERENCE_NAMESPACES:
             raise UserPreferencesValidationError(f"unsupported preferences namespace: {namespace}")
+        if terminal_keyboard is not None:
+            if namespace != "mobile_assistant" or not isinstance(value, dict):
+                raise UserPreferencesValidationError(
+                    "Terminal keyboard updates require mobile_assistant"
+                )
+            _validate_json(terminal_keyboard)
         if namespace == SESSION_COLLAB_NAMESPACE:
             value = _approval_preference(value)
             if isinstance(value, dict):
@@ -2382,6 +2556,10 @@ class SqlAlchemyUserPreferencesStore:
                         and "sessionChoice" in existing
                     ):
                         settings[namespace] = {"sessionChoice": existing["sessionChoice"]}
+            if terminal_keyboard is not None:
+                settings[namespace] = _terminal_keyboard_patch(
+                    settings.get(namespace), terminal_keyboard
+                )
             if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
                 stored = settings.get(namespace)
                 if isinstance(stored, dict):

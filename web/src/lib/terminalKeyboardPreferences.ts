@@ -15,6 +15,7 @@ import {
 } from "./keyboardShortcutPreferences";
 import { keyEventToSequence } from "./keySequence";
 import { readMobileAssistantPreferences, terminalDataForChord } from "./mobileAssistantPreferences";
+import type { TerminalKeyboardChange } from "./terminalKeyboardChanges";
 import { writeTerminalKeyPreferences } from "./terminalKeys";
 
 export const TERMINAL_BINDINGS = {
@@ -114,6 +115,10 @@ export function readTerminalKeyboardPreferences(): TerminalKeyboardPreferences {
 
 export function writeTerminalKeyboardPreferences(preferences: TerminalKeyboardPreferences) {
   return writeTerminalKeyPreferences({ terminalKeyboard: preferences });
+}
+
+export function writeTerminalKeyboardChange(change: TerminalKeyboardChange) {
+  return writeTerminalKeyPreferences({}, change);
 }
 
 export function terminalPasteBoxModeFor(

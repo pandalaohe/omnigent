@@ -189,6 +189,7 @@ class UserPreferenceNamespacePatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     value: JsonValue | None
+    terminal_keyboard: dict[str, JsonValue] | None = None
 
 
 class CurrentUserResponse(BaseModel):

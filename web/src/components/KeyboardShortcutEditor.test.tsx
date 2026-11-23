@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -12,6 +12,10 @@ import {
 } from "@/lib/keyboardShortcutPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { readTerminalKeyboardPreferences } from "@/lib/terminalKeyboardPreferences";
+import {
+  initializeUserPreferencesSync,
+  resetUserPreferencesSyncForTests,
+} from "@/lib/userPreferencesSync";
 
 function actionRow(label: string): HTMLElement {
   const row = screen.getByText(label).closest('[data-testid^="shortcut-editor-row-"]');
@@ -32,7 +36,9 @@ describe("KeyboardShortcutEditor", () => {
 
   afterEach(() => {
     cleanup();
+    resetUserPreferencesSyncForTests();
     localStorage.clear();
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -173,6 +179,53 @@ describe("KeyboardShortcutEditor", () => {
       screen.getByRole("button", { name: "Restore Windows shortcut for Move to start of line" }),
     );
     expect(readTerminalKeyboardPreferences().bindings?.lineStart?.platformOverrides).toEqual({});
+  });
+
+  it("shows the server conflict and loads the winning binding from another device", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const mobile = { version: 2, enabled: true, buttons: [] };
+    const reason = "That shortcut is already used by Delete to start of line.";
+    const winner = { platformOverrides: { macos: [{ code: "F8", modifiers: [] }] } };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json(
+          {
+            detail: { code: "terminal_keyboard_conflict", change_index: 0, message: reason },
+          },
+          { status: 422 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          user_id: "alice",
+          preferences: {
+            version: 1,
+            settings: {
+              mobile_assistant: {
+                ...mobile,
+                terminalKeyboard: { v: 1, bindings: { killLine: winner } },
+              },
+            },
+          },
+        }),
+      );
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: mobile } },
+      fetcher,
+      "alice",
+    );
+    render(<KeyboardShortcutEditor />);
+    fireEvent.click(screen.getByText("Terminal", { selector: "summary" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Record .* shortcut for Move to start of line/ }),
+    );
+    fireEvent.keyDown(window, { key: "F8", code: "F8" });
+    expect(readTerminalKeyboardPreferences().bindings?.lineStart).toBeDefined();
+    await act(async () => vi.advanceTimersByTimeAsync(251));
+    expect(screen.getByRole("alert")).toHaveTextContent(reason);
+    expect(readTerminalKeyboardPreferences().bindings).toEqual({ killLine: winner });
   });
 
   it("explains restore defaults when the shortcut is already unchanged", async () => {

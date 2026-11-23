@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -198,6 +198,7 @@ from omnigent.server.user_preferences_store import (
     USER_PREFERENCES_MAX_BYTES,
     KeepWarmIdentity,
     SqlAlchemyUserPreferencesStore,
+    TerminalKeyboardConflictError,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
     read_keep_warm_settings,
@@ -4660,7 +4661,12 @@ def create_app(
 
     _preferences_http_max_bytes = USER_PREFERENCES_MAX_BYTES + 4096
 
-    async def _read_preferences_body(request: Request, model: type[BaseModel]) -> BaseModel:
+    async def _read_preferences_body(
+        request: Request,
+        model: type[BaseModel],
+        *,
+        invalid_detail: str = "Invalid preferences payload",
+    ) -> BaseModel:
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
@@ -4684,7 +4690,7 @@ def create_app(
         except ValidationError as exc:
             raise StarletteHTTPException(
                 status_code=422,
-                detail="Invalid preferences payload",
+                detail=invalid_detail,
             ) from exc
 
     _preference_write_hits: dict[str, list[float]] = {}
@@ -4707,7 +4713,7 @@ def create_app(
         "type": "object",
         "additionalProperties": False,
         "required": ["value"],
-        "properties": {"value": {}},
+        "properties": {"value": {}, "terminal_keyboard": {"type": "object"}},
     }
     _preferences_error_responses: dict[int | str, dict[str, Any]] = {
         400: {"description": "Invalid Content-Length header"},
@@ -4809,7 +4815,12 @@ def create_app(
         store = _preferences_store()
         owner, create_if_missing = _preferences_owner(request)
         _check_preference_write_rate(owner)
-        body = await _read_preferences_body(request, UserPreferenceNamespacePatchRequest)
+        # Older servers use the default detail when they reject the new patch format.
+        body = await _read_preferences_body(
+            request,
+            UserPreferenceNamespacePatchRequest,
+            invalid_detail="Invalid preference update",
+        )
         assert isinstance(body, UserPreferenceNamespacePatchRequest)
         try:
             persisted = await asyncio.to_thread(
@@ -4817,12 +4828,22 @@ def create_app(
                 owner,
                 namespace,
                 body.value,
+                terminal_keyboard=body.terminal_keyboard,
                 create_if_missing=create_if_missing,
             )
         except UserPreferencesUserNotFoundError as exc:
             raise StarletteHTTPException(
                 status_code=401,
                 detail="Account no longer exists",
+            ) from exc
+        except TerminalKeyboardConflictError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "terminal_keyboard_conflict",
+                    "change_index": exc.change_index,
+                    "message": str(exc),
+                },
             ) from exc
         except UserPreferencesValidationError as exc:
             raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
