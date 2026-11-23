@@ -47,15 +47,14 @@ persist site drains the oldest entry whose text equals the mirror
 generated marker lines — one per file block — are dropped from the mirror
 first) and reports the older entries it skipped, which the caller
 persists as undelivered. Two queued messages with identical text drain in
-queue order: text alone cannot tell them apart, so if the older one was
-lost the receipt names it and the later one is surfaced as undelivered
-at the next match — the only ambiguity this scheme accepts. When
-no entry matches — the transcript may still reformat text in ways not
-normalized here — the oldest entry is drained, as before, and every entry
-still queued is marked uncertain (:func:`mark_uncertain`): the drained
-receipt may really have belonged to one of them, so a later match that
-jumps over them drains them quietly instead of recording them as
-undelivered.
+queue order while their claims are inside the text-match window. A claim
+retained past that window is omitted from text-only matching and request-phase
+lookups, but remains available for its own attempt-linked evidence until the
+two-hour proof bound. When no entry matches — the transcript may still reformat
+text in ways not normalized here — the oldest entry is drained, as before, and
+every entry still queued is marked uncertain (:func:`mark_uncertain`): the
+drained receipt may really have belonged to one of them, so a later match that
+jumps over them drains them quietly instead of recording them as undelivered.
 
 A message the person cancelled with Stop before the agent recorded it would
 otherwise be recorded as undelivered at the next match. The interrupt route
@@ -379,6 +378,14 @@ _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] 
 _lock = threading.Lock()
 
 
+def _is_late_claimed_entry(entry: _Entry, now: float) -> bool:
+    """Whether a claimed entry is retained only for attempt-linked proof."""
+    return entry.runner_claim_id is not None and (
+        entry.last_runner_renewal is None
+        or now - entry.last_runner_renewal >= _CLAIMED_TEXT_MATCH_TIMEOUT_S
+    )
+
+
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
     """
     Drop entries older than :data:`_TTL_S` for one conversation.
@@ -685,16 +692,35 @@ def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None
 
 
 def oldest_admission_id(conversation_id: str) -> str | None:
-    """The admission carried by the oldest outstanding native web input."""
+    """The admission carried by the oldest current native web input."""
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         return next(
             (
                 entry.admission_id
                 for entry in _pending.get(conversation_id, {}).values()
-                if not entry.interrupted and not entry.held
+                if not entry.interrupted
+                and not entry.held
+                and not _is_late_claimed_entry(entry, now)
             ),
             None,
+        )
+
+
+def has_request_phase_pending(conversation_id: str) -> bool:
+    """Whether a current web input should deduplicate a native request hook.
+
+    A claimed entry beyond the text-only matching window remains in the index
+    for its original attempt evidence, but it no longer represents the native
+    request currently being evaluated.
+    """
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        return any(
+            not entry.interrupted and not entry.held and not _is_late_claimed_entry(entry, now)
+            for entry in _pending.get(conversation_id, {}).values()
         )
 
 
@@ -1297,6 +1323,7 @@ def resolve_matching_text(
             for pid, entry in entries.items()
             if not entry.held
             and entry.auto_retry is None
+            and not _is_late_claimed_entry(entry, now)
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
             and not (
                 entry.runner_claim_id is not None
@@ -1357,16 +1384,6 @@ def resolve_matching_text(
                 or _matches_injected_prefix(entry, exact_needle)
             )
         ]
-        # A matching text could belong to a retained claim whose original
-        # text-match window has closed. Leave every candidate queued in that
-        # case: even a newer same-text entry could be the wrong owner.
-        for index in (match_index, *shared_matches):
-            candidate = ordered[index][1]
-            claimed_at = candidate.last_runner_renewal
-            if candidate.runner_claim_id is not None and (
-                claimed_at is None or now - claimed_at >= _CLAIMED_TEXT_MATCH_TIMEOUT_S
-            ):
-                return MatchedDrain(matched=None, skipped=[], match_method="unattributed_claim")
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an

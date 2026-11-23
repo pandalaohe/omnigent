@@ -1202,6 +1202,50 @@ def test_resolve_matching_text_prefers_a_live_resend_over_an_interrupted_twin() 
     assert pending_inputs.pending_ids("conv_a") == []
 
 
+def test_late_claim_does_not_shadow_same_text_resend_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late old claim waits for its attempt evidence while a resend settles."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    original = pending_inputs.record("conv_a", [_text_block("continue")], runner_managed=True)
+    assert pending_inputs.claim_runner_input("conv_a", original, "claim-a")
+    pending_inputs.mark_interrupted("conv_a", [original])
+
+    clock["t"] += pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S + 1.0
+    resend = pending_inputs.record("conv_a", [_text_block("continue")], runner_managed=True)
+    assert pending_inputs.claim_runner_input("conv_a", resend, "claim-b")
+
+    matched = pending_inputs.resolve_matching_text("conv_a", "continue")
+
+    assert matched.matched is not None and matched.matched.pending_id == resend
+    assert matched.skipped == [] and matched.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == [original]
+
+
+def test_late_claim_is_excluded_from_request_dedup_and_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained old claim cannot stand in for a different native request."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    pending_id = pending_inputs.record(
+        "conv_a",
+        [_text_block("old request")],
+        admission_id="admission-old",
+        runner_managed=True,
+    )
+    assert pending_inputs.claim_runner_input("conv_a", pending_id, "claim-old")
+    clock["t"] += pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S + 1.0
+
+    # The snapshot still carries the old bubble for late attempt-linked proof.
+    assert pending_inputs.snapshot_for("conv_a")
+    assert not pending_inputs.has_request_phase_pending("conv_a")
+    assert pending_inputs.oldest_admission_id("conv_a") is None
+
+
 @pytest.mark.parametrize("with_attachment", [False, True])
 def test_delayed_interrupted_echo_does_not_skip_a_live_message_before_a_resend(
     with_attachment: bool,
