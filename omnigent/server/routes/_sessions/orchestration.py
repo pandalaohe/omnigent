@@ -9102,6 +9102,11 @@ async def _ensure_native_terminal_ready(
     """
     display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
     terminal_name = _native_terminal_name_for_harness(harness)
+    timeout: float | httpx.Timeout = 10.0
+    if harness == "antigravity-native" and conv.model_override:
+        from omnigent.harnesses.antigravity_native.launch import AGY_MODEL_LAUNCH_TIMEOUT_S
+
+        timeout = httpx.Timeout(10.0, read=AGY_MODEL_LAUNCH_TIMEOUT_S)
 
     async def _post_ensure() -> httpx.Response:
         if runner_router is not None:
@@ -9114,7 +9119,7 @@ async def _ensure_native_terminal_ready(
                 "ensure_native_terminal": True,
                 "persist_resource_event": persist_resource_event,
             },
-            timeout=10.0,
+            timeout=timeout,
         )
 
     def _is_tunnel_loss(exc: httpx.HTTPError | ConnectionError) -> bool:

@@ -6,7 +6,10 @@ gemini_auth_has_credential, agy_binary_path) are monkeypatched.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -167,9 +170,9 @@ class TestBuildAgyLaunch:
     def test_launch_logs_are_unique(self, fake_agy: str, tmp_path: Path) -> None:
         paths = []
         for _ in range(2):
-            argv, _ = build_agy_launch(
+            argv = build_agy_launch(
                 conversation_id=None, model=None, resume=False, log_dir=tmp_path
-            )
+            ).argv
             path = Path(
                 next(arg.partition("=")[2] for arg in argv if arg.startswith("--log-file="))
             )
@@ -182,9 +185,9 @@ class TestBuildAgyLaunch:
 
         tokens = []
         for resume in (False, True):
-            argv, _ = build_agy_launch(
+            argv = build_agy_launch(
                 conversation_id="existing-conversation", model=None, resume=resume
-            )
+            ).argv
             flag = next(arg for arg in argv if arg.startswith("--csrf_token="))
             token = flag.partition("=")[2]
             assert len(token) >= 32
@@ -196,16 +199,18 @@ class TestBuildAgyLaunch:
     def test_explicit_csrf_token_is_not_duplicated(
         self, fake_agy: str, args: tuple[str, ...]
     ) -> None:
-        argv, _ = build_agy_launch(conversation_id=None, model=None, resume=False, extra_args=args)
+        argv = build_agy_launch(
+            conversation_id=None, model=None, resume=False, extra_args=args
+        ).argv
         assert sum(arg.startswith("--csrf_token") for arg in argv) == 1
 
     def test_argv_starts_with_binary(self, fake_agy: str) -> None:
         """argv[0] is the agy binary path."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).argv
         assert argv[0] == fake_agy
 
     # ------------------------------------------------------------------
@@ -214,29 +219,29 @@ class TestBuildAgyLaunch:
 
     def test_fresh_env_is_empty(self, fake_agy: str) -> None:
         """Fresh session emits no env overrides (agy ignores all knobs)."""
-        _, env = build_agy_launch(
+        env = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).env
         assert env == {}
 
     def test_fresh_env_has_no_conversation_id(self, fake_agy: str) -> None:
         """Fresh session does NOT set ANTIGRAVITY_CONVERSATION_ID (agy ignores it)."""
-        _, env = build_agy_launch(
+        env = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).env
         assert "ANTIGRAVITY_CONVERSATION_ID" not in env
 
     def test_fresh_argv_no_conversation_flag(self, fake_agy: str) -> None:
         """Fresh session does NOT include --conversation in argv."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).argv
         assert "--conversation" not in argv
 
     # ------------------------------------------------------------------
@@ -245,22 +250,22 @@ class TestBuildAgyLaunch:
 
     def test_resume_argv_has_conversation_flag(self, fake_agy: str) -> None:
         """Resume session includes --conversation <id> in argv."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id="68caaeac-real-uuid",
             model=None,
             resume=True,
-        )
+        ).argv
         assert "--conversation" in argv
         idx = argv.index("--conversation")
         assert argv[idx + 1] == "68caaeac-real-uuid"
 
     def test_resume_env_no_conversation_id(self, fake_agy: str) -> None:
         """Resume session does NOT set ANTIGRAVITY_CONVERSATION_ID in env."""
-        _, env = build_agy_launch(
+        env = build_agy_launch(
             conversation_id="68caaeac-real-uuid",
             model=None,
             resume=True,
-        )
+        ).env
         assert "ANTIGRAVITY_CONVERSATION_ID" not in env
 
     def test_resume_without_conversation_id_raises(self, fake_agy: str) -> None:
@@ -274,22 +279,22 @@ class TestBuildAgyLaunch:
 
     def test_model_flag_present_when_given(self, fake_agy: str) -> None:
         """--model <label> is appended when model is provided."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model="gemini-2.5-pro",
             resume=False,
-        )
+        ).argv
         assert "--model" in argv
         idx = argv.index("--model")
         assert argv[idx + 1] == "gemini-2.5-pro"
 
     def test_model_flag_absent_when_none(self, fake_agy: str) -> None:
         """--model is NOT appended when model is None."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).argv
         assert "--model" not in argv
 
     # ------------------------------------------------------------------
@@ -299,20 +304,20 @@ class TestBuildAgyLaunch:
     def test_no_sidecar_port_env(self, fake_agy: str) -> None:
         """ANTIGRAVITY_SIDECAR_WEB_PORT is never emitted (agy ignores it)."""
         for resume in (False, True):
-            _, env = build_agy_launch(
+            env = build_agy_launch(
                 conversation_id="68caaeac-real-uuid" if resume else None,
                 model=None,
                 resume=resume,
-            )
+            ).env
             assert "ANTIGRAVITY_SIDECAR_WEB_PORT" not in env
 
     def test_no_data_dir_env(self, fake_agy: str) -> None:
         """ANTIGRAVITY_EXECUTABLE_DATA_DIR is never emitted (agy ignores it)."""
-        _, env = build_agy_launch(
+        env = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).env
         assert "ANTIGRAVITY_EXECUTABLE_DATA_DIR" not in env
 
     # ------------------------------------------------------------------
@@ -321,31 +326,31 @@ class TestBuildAgyLaunch:
 
     def test_extra_args_appended(self, fake_agy: str) -> None:
         """Extra args are appended after generated flags."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
             extra_args=("--print-timeout", "30"),
-        )
+        ).argv
         assert argv[-2:] == ["--print-timeout", "30"]
 
     def test_skip_flag_defaults_absent(self, fake_agy: str) -> None:
         """Defaults (no permission_mode, not headless) omit the skip flag."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
-        )
+        ).argv
         assert _SKIP_FLAG not in argv
 
     def test_skip_flag_not_duplicated_from_extra_args(self, fake_agy: str) -> None:
         """A user-passed skip flag in extra_args is not duplicated when headless."""
-        argv, _ = build_agy_launch(
+        argv = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
             extra_args=(_SKIP_FLAG,),
-        )
+        ).argv
         assert argv.count(_SKIP_FLAG) == 1
 
 
@@ -380,13 +385,13 @@ class TestShouldSkipPermissions:
 
 def test_effort_and_repeated_skip_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
-    argv, _ = build_agy_launch(
+    argv = build_agy_launch(
         conversation_id=None,
         model="gemini-3.8-flash",
         effort="high",
         resume=False,
         extra_args=(_SKIP_FLAG, _SKIP_FLAG, "--print-timeout", "30"),
-    )
+    ).argv
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv.count(_SKIP_FLAG) == 1
     assert argv[-2:] == ["--print-timeout", "30"]
@@ -402,7 +407,7 @@ def test_effort_and_repeated_skip_flags(monkeypatch: pytest.MonkeyPatch) -> None
 )
 def test_launch_model_effort_pair(monkeypatch, model, effort, expected_model):
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
-    argv, _ = build_agy_launch(conversation_id=None, resume=False, model=model, effort=effort)
+    argv = build_agy_launch(conversation_id=None, resume=False, model=model, effort=effort).argv
     assert argv[argv.index("--model") + 1] == expected_model
     if effort:
         assert argv[argv.index("--effort") + 1] == "medium"
@@ -411,22 +416,28 @@ def test_launch_model_effort_pair(monkeypatch, model, effort, expected_model):
 
 
 @pytest.mark.parametrize(
-    "returncode,stderr,rejected",
-    [(0, b"", False), (1, b"error: invalid model selection", True), (1, b"offline", False)],
+    "result",
+    ["accepted", "rejected", "offline", "timeout"],
 )
-def test_launch_validates_subscription_model_with_same_binary(
-    monkeypatch, returncode, stderr, rejected
-):
-    import subprocess
-
+async def test_launch_validates_subscription_model_with_same_binary(monkeypatch, result):
     monkeypatch.setattr(_mod, "gemini_auth_has_credential", lambda: True)
-    calls = []
+    stderr = b"error: invalid model selection" if result == "rejected" else b""
+    if result == "timeout":
+        monkeypatch.setattr(_mod, "AGY_MODEL_PROBE_TIMEOUT_S", 0.01)
 
-    def run(args, **_kwargs):
-        calls.append(args)
-        return subprocess.CompletedProcess(args, returncode, b"", stderr)
+    async def communicate():
+        if result == "timeout":
+            await asyncio.Event().wait()
+        return None, stderr
 
-    monkeypatch.setattr(_mod.subprocess, "run", run)
+    process = SimpleNamespace(
+        returncode=int(result != "accepted"),
+        communicate=communicate,
+    )
+    spawn = AsyncMock(return_value=process)
+    reap = AsyncMock()
+    monkeypatch.setattr(_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(_mod, "terminate_direct_subprocess", reap)
     kwargs = {
         "conversation_id": None,
         "resume": False,
@@ -434,23 +445,66 @@ def test_launch_validates_subscription_model_with_same_binary(
         "effort": "xhigh",
         "command": "agy-custom",
     }
-    if rejected:
+    launch = build_agy_launch(**kwargs)
+    assert launch.argv[0] == "agy-custom"
+    assert launch.argv[-4:] == ["--model", "gemini-4-neon", "--effort", "xhigh"]
+    if result == "rejected":
         with pytest.raises(OmnigentError, match="does not offer model 'gemini-4-neon'") as error:
-            build_agy_launch(**kwargs)
+            await launch.check_subscription_model()
         assert error.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
     else:
-        argv, _ = build_agy_launch(**kwargs)
-        assert argv[0] == "agy-custom"
-        assert argv[-4:] == ["--model", "gemini-4-neon", "--effort", "xhigh"]
-    assert calls == [
-        [
-            "agy-custom",
-            f"--gemini_dir={Path.home() / '.gemini'}",
-            "--model",
-            "gemini-4-neon",
-            "--effort",
-            "xhigh",
-            "-p",
-            "/model",
-        ]
-    ]
+        async with asyncio.timeout(2):
+            warning = await launch.check_subscription_model()
+        if result == "accepted":
+            assert warning is None
+        else:
+            assert warning is not None
+            assert "Could not verify Antigravity model 'gemini-4-neon'" in warning
+            assert "may use its default model" in warning
+    [call] = spawn.await_args_list
+    assert call.args == (
+        "agy-custom",
+        f"--gemini_dir={Path.home() / '.gemini'}",
+        "--model",
+        "gemini-4-neon",
+        "--effort",
+        "xhigh",
+        "-p",
+        "/model",
+    )
+    reap.assert_awaited_once_with(process, terminate_timeout=0.5, kill_timeout=0.5)
+
+
+async def test_launches_share_only_identical_inflight_model_probes(monkeypatch, fake_agy):
+    monkeypatch.setattr(_mod, "gemini_auth_has_credential", lambda: True)
+    finish = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def probe(command, model, effort):
+        if effort == "xhigh":
+            entered.set()
+            await finish.wait()
+        return True
+
+    run = AsyncMock(side_effect=probe)
+    monkeypatch.setattr(_mod, "_probe_agy_subscription_model", run)
+
+    def launch(effort):
+        return build_agy_launch(
+            conversation_id=None, model="example-model", resume=False, effort=effort
+        )
+
+    first = asyncio.create_task(launch("xhigh").check_subscription_model())
+    await entered.wait()
+    second = asyncio.create_task(launch("xhigh").check_subscription_model())
+    try:
+        assert await launch("low").check_subscription_model() is None
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert run.await_count == 2
+    finally:
+        finish.set()
+    assert await second is None
+    assert await launch("xhigh").check_subscription_model() is None
+    assert run.await_count == 3

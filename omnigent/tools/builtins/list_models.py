@@ -83,7 +83,8 @@ class SysListModelsTool(Tool):
             "provider, displayName, isDefault, hidden}]}: filter the rows "
             "by provider and name, then pass a row's 'id' verbatim as the "
             "model for a session of that agent on that host. A native "
-            "Antigravity catalog refreshes on read after expiry. 'stale' "
+            "Antigravity catalog starts a background refresh after expiry. "
+            "A slow refresh returns the last known rows. 'stale' "
             "indicates a failed sync, an offline host, or an expired native "
             "Antigravity catalog. 'fetched_at' is in Unix seconds."
         )

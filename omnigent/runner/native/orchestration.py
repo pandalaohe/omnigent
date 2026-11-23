@@ -4060,17 +4060,15 @@ async def _post_native_launch_notice(
     server_client: httpx.AsyncClient | None,
     code: str,
     notice: str,
+    level: Literal["info", "warning"] = "info",
 ) -> None:
-    """Surface an informational launch notice (e.g. an ignored effort setting).
-
-    Posts an ``error`` item with ``level: "info"`` so the web UI renders a
-    neutral notice pill rather than a destructive banner. The session still
-    works; the notice only explains how the launch adapted the user's choice.
+    """Surface a non-blocking native launch notice in the session transcript.
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
     :param code: Stable notice code, e.g. ``"pi_native_effort_ignored"``.
     :param notice: The user-facing notice text to surface.
+    :param level: Presentation level for the notice.
     """
     if server_client is None:
         return
@@ -4085,7 +4083,7 @@ async def _post_native_launch_notice(
                         "source": "execution",
                         "code": code,
                         "message": notice,
-                        "level": "info",
+                        "level": level,
                     },
                 },
             },
@@ -8281,7 +8279,7 @@ async def _auto_create_antigravity_terminal(
         arg for arg in terminal_launch_args if arg != "--dangerously-skip-permissions"
     )
     effort = snapshot.get("reasoning_effort")
-    argv, launch_env = await asyncio.to_thread(
+    launch = await asyncio.to_thread(
         build_agy_launch,
         conversation_id=external_session_id if resume else None,
         model=model,
@@ -8290,8 +8288,9 @@ async def _auto_create_antigravity_terminal(
         effort=effort if isinstance(effort, str) and effort else None,
         log_dir=bridge_dir,
     )
-    env_overrides.update(launch_env)
-    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    model_warning = await launch.check_subscription_model()
+    env_overrides.update(launch.env)
+    argv = [launch.argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
     argv = wrap_agy_gateway_launch(argv, env_overrides)
@@ -8487,6 +8486,15 @@ async def _auto_create_antigravity_terminal(
                 session_id,
                 exc_info=True,
             )
+
+    if model_warning is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="antigravity_native_model_unverified",
+            notice=model_warning,
+            level="warning",
+        )
 
     # Announce the terminal to clients ONLY after the reader is started and
     # registered. ``session_resource_view_to_dict`` serialization + the publish

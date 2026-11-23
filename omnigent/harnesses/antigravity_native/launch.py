@@ -35,6 +35,7 @@ Key design points:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import shutil
@@ -44,9 +45,16 @@ from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
+from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
+AGY_MODEL_PROBE_TIMEOUT_S = 90.0
+# Allow native setup, cold-start and notice delivery around the probe.
+AGY_MODEL_LAUNCH_TIMEOUT_S = AGY_MODEL_PROBE_TIMEOUT_S + 60.0
+_agy_model_probes: dict[
+    tuple[asyncio.AbstractEventLoop, str, str, str | None], asyncio.Task[bool | None]
+] = {}
 
 # Tier settings and the PreToolUse guard are installed by the bridge.
 # This flag bypasses agy's native permission prompts for the full tier.
@@ -161,32 +169,81 @@ def should_skip_permissions(
     return headless
 
 
-def _validate_agy_subscription_model(command: str, model: str, effort: str | None) -> None:
-    """Ask agy's print-mode resolver before the TUI can silently fall back."""
+async def _probe_agy_subscription_model(
+    command: str, model: str, effort: str | None
+) -> bool | None:
+    """Return acceptance, explicit rejection, or an inconclusive probe."""
     args = [command, f"--gemini_dir={Path.home() / '.gemini'}", "--model", model]
     if effort is not None:
         args.extend(["--effort", effort])
     try:
-        result = subprocess.run(
-            [*args, "-p", "/model"],
-            capture_output=True,
-            timeout=10,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            "-p",
+            "/model",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        _logger.warning("Could not check the requested Antigravity model with agy")
-        return
-    if result.returncode == 0:
-        return
-    if b"invalid model selection" in result.stderr.lower():
-        raise OmnigentError(
-            f"Antigravity does not offer model {model!r} for this login. "
-            "Choose a model from the host's `agy models` list.",
-            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+    except (OSError, NotImplementedError):
+        return None
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=AGY_MODEL_PROBE_TIMEOUT_S
         )
+    except (OSError, TimeoutError):
+        return None
+    finally:
+        await terminate_direct_subprocess(process, terminate_timeout=0.5, kill_timeout=0.5)
+    if process.returncode == 0:
+        return True
+    if b"invalid model selection" in stderr.lower():
+        return False
     # An older CLI, sign-in, or transport failure is not a verdict about the ID.
-    _logger.warning("Could not check the requested Antigravity model with agy")
+    return None
+
+
+@dataclass(frozen=True)
+class AgyLaunchCommand:
+    """Command and environment for the native agy terminal."""
+
+    argv: list[str] = field(repr=False)
+    env: dict[str, str] = field(repr=False)
+    subscription_model: str | None = None
+    effort: str | None = None
+
+    async def check_subscription_model(self) -> str | None:
+        """Reject an unavailable model or return a caller-visible warning."""
+        model = self.subscription_model
+        if model is None:
+            return None
+        command = self.argv[0]
+        key = (asyncio.get_running_loop(), command, model, self.effort)
+
+        async def probe() -> bool | None:
+            try:
+                return await _probe_agy_subscription_model(command, model, self.effort)
+            finally:
+                _agy_model_probes.pop(key, None)
+
+        task = _agy_model_probes.get(key)
+        if task is None:
+            task = asyncio.create_task(probe())
+            _agy_model_probes[key] = task
+        accepted = await asyncio.shield(task)
+        if accepted is False:
+            raise OmnigentError(
+                f"Antigravity does not offer model {model!r} for this login. "
+                "Choose a model from the host's `agy models` list.",
+                code=ErrorCode.HARNESS_NOT_CONFIGURED,
+            )
+        if accepted is None:
+            return (
+                f"Could not verify Antigravity model {model!r} before launch. "
+                "Antigravity may use its default model."
+            )
+        return None
 
 
 def build_agy_launch(
@@ -198,7 +255,7 @@ def build_agy_launch(
     extra_args: tuple[str, ...] = (),
     log_dir: Path | None = None,
     command: str | None = None,
-) -> tuple[list[str], dict[str, str]]:
+) -> AgyLaunchCommand:
     """Build the argv and environment overrides for an agy launch.
 
     Each launch receives a fresh CSRF token for its local RPC server unless
@@ -235,13 +292,11 @@ def build_agy_launch(
         flags, e.g. ``("--print-timeout", "30")``.
     :param log_dir: Private directory for this launch's RPC discovery log.
     :param command: Override the resolved agy executable for both probe and launch.
-    :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
-        command list starting with the agy binary path and *env_overrides*
-        is a dict of env variables to layer on top of the process
-        environment.
+    :returns: The launch command. Call ``check_subscription_model`` before
+        starting the terminal.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
-    :raises OmnigentError: When credentials need repair or agy rejects the model.
+    :raises OmnigentError: When credentials need repair.
     :raises RuntimeError: When the agy executable cannot be found.
     """
     launch = resolve_native_antigravity_launch(model=model)
@@ -255,10 +310,11 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
+    subscription_model = None
     if launch.model is not None:
         model_arg = split_agy_effort_suffix(launch.model)[0] if effort else launch.model
         if launch.auth_mode == "subscription":
-            _validate_agy_subscription_model(binary, model_arg, effort)
+            subscription_model = model_arg
         argv.extend(["--model", model_arg])
     if effort is not None:
         argv.extend(["--effort", effort])
@@ -266,4 +322,4 @@ def build_agy_launch(
         if arg != _SKIP_PERMISSIONS_FLAG or arg not in argv:
             argv.append(arg)
 
-    return argv, launch.extra_env
+    return AgyLaunchCommand(argv, launch.extra_env, subscription_model, effort)

@@ -12,7 +12,9 @@ import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import AsyncMock
 
+import click
 import httpx
 import pytest
 
@@ -24,6 +26,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_bridge_state,
     read_tmux_info,
 )
+from omnigent.harnesses.antigravity_native.launch import AgyLaunchCommand
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
 
 
@@ -598,14 +601,15 @@ async def _record_launch_and_record_args(
     *,
     snapshot: dict[str, object],
     antigravity_args: tuple[str, ...],
+    subscription_model: str | None = None,
 ) -> list[dict[str, object]]:
     """Run ``_launch_and_record`` with a stubbed launcher; return its kwargs."""
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     launch_calls: list[dict[str, object]] = []
 
-    def fake_build_agy_launch(**kwargs: object) -> tuple[list[str], dict[str, str]]:
+    def fake_build_agy_launch(**kwargs: object) -> AgyLaunchCommand:
         launch_calls.append(kwargs)
-        return (["agy"], {})
+        return AgyLaunchCommand(["agy"], {}, subscription_model=subscription_model)
 
     monkeypatch.setattr(_mod, "build_agy_launch", fake_build_agy_launch)
     async with _mock_client(_snapshot_launch_handler(launch_calls, snapshot)) as client:
@@ -621,6 +625,50 @@ async def _record_launch_and_record_args(
             startup_progress=None,
         )
     return launch_calls
+
+
+async def test_cli_fallback_warns_when_agy_cannot_verify_model(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.launch._probe_agy_subscription_model",
+        AsyncMock(return_value=None),
+    )
+    await _record_launch_and_record_args(
+        monkeypatch,
+        tmp_path,
+        snapshot=_confirmed_permission_snapshot("auto"),
+        antigravity_args=(),
+        subscription_model="example-model",
+    )
+    assert "Warning: Could not verify Antigravity model 'example-model'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_cli_joins_runner_launch_for_a_saved_model(accepted):
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/sessions/conv_123/resources/terminals"
+        assert request.extensions["timeout"]["read"] > _mod.AGY_MODEL_LAUNCH_TIMEOUT_S
+        assert json.loads(request.content) == {
+            "terminal": "antigravity",
+            "session_key": "main",
+            "ensure_native_terminal": True,
+        }
+        if not accepted:
+            return httpx.Response(412, json={"error": {"message": "model is unavailable"}})
+        return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
+
+    async with _mock_client(handle) as client:
+        if accepted:
+            terminal = await _mod._attachable_runner_antigravity_terminal(
+                client, "conv_123", "example-model"
+            )
+            assert terminal is not None
+            assert terminal.terminal_id == "terminal_antigravity_main"
+        else:
+            with pytest.raises(click.ClickException, match="model is unavailable"):
+                await _mod._attachable_runner_antigravity_terminal(
+                    client, "conv_123", "example-model"
+                )
 
 
 async def test_launch_and_record_passes_cli_args_to_agy_argv(

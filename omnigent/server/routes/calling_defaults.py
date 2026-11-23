@@ -4,8 +4,8 @@ Three surfaces, all scoped to the caller's own hosts:
 
 * ``POST /sync`` — ask each online owned host for the model catalogs of
   the harnesses it reports as configured, and cache the answers.
-* ``GET /catalogs`` — read cached catalogs, refreshing expired agy rows and
-  fetching missing ACP delivery metadata.
+* ``GET /catalogs`` — read cached catalogs, refreshing expired agy rows in
+  the background and fetching missing ACP delivery metadata.
 * ``GET /resolve`` — resolve the agent / harness / model / effort one
   create would use, and report any default-sourced value the cached
   catalog does not offer. Pure read: it never syncs.
@@ -18,8 +18,11 @@ than collapsed into a transport error.
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable
 from typing import Any
 
+from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from omnigent.calling_defaults import (
@@ -28,7 +31,7 @@ from omnigent.calling_defaults import (
     model_option_harnesses,
     resolve_calling,
 )
-from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -53,6 +56,10 @@ from omnigent.stores.project_store import ProjectStore
 _SYNC_CONCURRENCY = 4
 _AGY_HARNESS = "antigravity-native"
 _AGY_CATALOG_TTL_S = 300
+_AGY_REFRESH_BACKOFF_S = 60
+# Leave time for cache reads and HTTP overhead within sys_list_models' 30s GET.
+_AGY_FILTERED_READ_WAIT_S = 20
+_logger = logging.getLogger(__name__)
 
 
 def _owner(user_id: str | None) -> str:
@@ -177,13 +184,25 @@ def create_calling_defaults_router(
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
-    agy_refreshes: dict[str, asyncio.Task[None]] = {}
+    agy_refreshes: dict[tuple[int, str], asyncio.Task[None]] = {}
+    agy_attempts: TTLCache[tuple[int, str], int] = TTLCache(
+        maxsize=4096, ttl=_AGY_REFRESH_BACKOFF_S
+    )
     agy_sync_limit = asyncio.Semaphore(_SYNC_CONCURRENCY)
 
-    async def refresh_agy_catalog(host_id: str, conn: HostConnection) -> None:
+    def start_agy_refresh(
+        host_id: str, conn: HostConnection, *, manual: bool = False
+    ) -> asyncio.Task[None] | None:
         # The picker and host-catalog tool can reach the same expired row at once.
         # Keep one CLI probe in flight even if one reader disconnects.
+        key = (current_workspace_id(), host_id)
+        if task := agy_refreshes.get(key):
+            return task
+        if not manual and key in agy_attempts:
+            return None
+
         async def refresh() -> None:
+            attempted_at = now_epoch()
             try:
                 await _sync_pair(
                     host_registry=host_registry,
@@ -193,14 +212,17 @@ def create_calling_defaults_router(
                     host_id=host_id,
                     harness=_AGY_HARNESS,
                 )
+            except Exception:
+                _logger.exception("Could not refresh the Antigravity catalog for host %s", host_id)
             finally:
-                agy_refreshes.pop(host_id, None)
+                # Cool down after completion, even when a slow probe fails.
+                # Keep fetched_at reserved for the last successful payload.
+                agy_attempts[key] = attempted_at
+                agy_refreshes.pop(key, None)
 
-        task = agy_refreshes.get(host_id)
-        if task is None:
-            task = asyncio.create_task(refresh(), name=f"agy-catalog-{host_id}")
-            agy_refreshes[host_id] = task
-        await asyncio.shield(task)
+        task = asyncio.create_task(refresh(), name=f"agy-catalog-{host_id}")
+        agy_refreshes[key] = task
+        return task
 
     @router.post("/calling-defaults/sync")
     async def sync_calling_defaults(
@@ -234,7 +256,7 @@ def create_calling_defaults_router(
             else None
         )
         semaphore = asyncio.Semaphore(_SYNC_CONCURRENCY)
-        syncs = []
+        syncs: list[Awaitable[None]] = []
         for host in hosts:
             conn = host_registry.get(host.host_id)
             if conn is None:
@@ -254,7 +276,8 @@ def create_calling_defaults_router(
                 if not _harness_configured(host, harness):
                     continue
                 if harness == _AGY_HARNESS:
-                    syncs.append(refresh_agy_catalog(host.host_id, conn))
+                    if task := start_agy_refresh(host.host_id, conn, manual=True):
+                        syncs.append(asyncio.shield(task))
                     continue
                 syncs.append(
                     _sync_pair(
@@ -282,7 +305,8 @@ def create_calling_defaults_router(
     ) -> CallingDefaultsCatalogsResponse:
         """Return the caller's own cached catalogs, stale rows included.
 
-        Filters limit agy refreshes to the requested hosts and harness.
+        Only an explicit AG harness filter waits briefly for an AG refresh.
+        Other reads use cached AG rows while the refresh runs in the background.
         First-use ACP metadata sync remains exclusive to unfiltered reads.
 
         :param request: The incoming request, used to identify the caller.
@@ -313,7 +337,7 @@ def create_calling_defaults_router(
                 row["host_id"]: row for row in records if row["harness"] == _AGY_HARNESS
             }
             refreshes = [
-                (host.host_id, conn)
+                task
                 for host in hosts
                 if (conn := host_registry.get(host.host_id)) is not None
                 and _harness_configured(host, _AGY_HARNESS)
@@ -322,10 +346,13 @@ def create_calling_defaults_router(
                     or (host.configured_harnesses or {}).get(_AGY_HARNESS) is True
                 )
                 and _agy_catalog_expired(agy_records.get(host.host_id))
+                and (task := start_agy_refresh(host.host_id, conn)) is not None
             ]
-            if refreshes:
-                await asyncio.gather(*(refresh_agy_catalog(*pair) for pair in refreshes))
-                records = await asyncio.to_thread(catalog_store.list, host_ids)
+            if wanted == _AGY_HARNESS and refreshes:
+                # A timed-out reader leaves the shared probes running.
+                done, _ = await asyncio.wait(refreshes, timeout=_AGY_FILTERED_READ_WAIT_S)
+                if done:
+                    records = await asyncio.to_thread(catalog_store.list, host_ids)
         if host_id is not None or harness is not None:
             return CallingDefaultsCatalogsResponse(
                 rows=[

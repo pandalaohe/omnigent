@@ -3381,7 +3381,8 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
                 ),
             }
         )
-    # The filters keep any refresh scoped to this host and harness.
+    # The filters keep any refresh scoped to this host and harness. The server
+    # bounds an AG read below this client's HTTP timeout and can return stale rows.
     catalogs, error = await _get_server_object(
         server_client,
         "/v1/calling-defaults/catalogs",

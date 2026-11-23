@@ -2214,7 +2214,7 @@
             "type": "array"
           },
           "stale": {
-            "description": "Whether the row should be treated as untrustworthy \u2014 its last sync failed, or the host is offline on this replica.",
+            "description": "Whether the last sync failed, the host is offline on this replica, or the native Antigravity catalog has expired.",
             "title": "Stale",
             "type": "boolean"
           }
@@ -21990,7 +21990,7 @@
     },
     "/v1/calling-defaults/catalogs": {
       "get": {
-        "description": "Return the caller's own cached catalogs, stale rows included.\n\nA `host_id` or `harness` filter reads the cache only: it skips the\nfirst-use ACP metadata sync, so it never waits on a host probe.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
+        "description": "Return the caller's own cached catalogs, stale rows included.\n\nOnly an explicit AG harness filter waits briefly for an AG refresh.\nOther reads use cached AG rows while the refresh runs in the background.\nFirst-use ACP metadata sync remains exclusive to unfiltered reads.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
         "operationId": "list_calling_default_catalogs_v1_calling_defaults_catalogs_get",
         "parameters": [
           {

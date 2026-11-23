@@ -8,6 +8,7 @@ statuses the route must record (ok / failed / offline) without a tunnel.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
@@ -24,6 +25,8 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
+import omnigent.server.routes.calling_defaults as calling_defaults_routes
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.utils import now_epoch
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime.agent_cache import AgentCache
@@ -339,10 +342,7 @@ async def test_catalogs_filter_reads_one_cached_row_without_probing(
 
 
 @pytest.mark.parametrize("seed", ["missing", "expired"])
-@pytest.mark.parametrize("path", ["picker", "host-tool"])
-async def test_agy_catalog_refreshes_without_manual_sync(
-    client, app, stores, monkeypatch, seed, path
-):
+async def test_agy_catalog_refreshes_without_manual_sync(client, app, stores, monkeypatch, seed):
     harness = "antigravity-native"
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
     stores.host_store.update_harness_readiness(HOST_A, {harness: True})
@@ -352,7 +352,7 @@ async def test_agy_catalog_refreshes_without_manual_sync(
     models = [{"id": model} for model in ("gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon")]
     proxy = AsyncMock(return_value={"status": "ok", "models": models})
     monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
-    params = {"host_id": HOST_A, "harness": harness} if path == "host-tool" else None
+    params = {"host_id": HOST_A, "harness": harness}
 
     started_at = now_epoch()
     response = await client.get("/v1/calling-defaults/catalogs", params=params)
@@ -391,6 +391,100 @@ async def test_agy_catalog_preserves_old_rows_when_refresh_unavailable(
     assert row["stale"] is True
     assert row["error"] == ("probe unavailable" if online else None)
     assert proxy.await_count == int(online)
+    assert (
+        await client.get(
+            "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+        )
+    ).json()["rows"] == [row]
+    assert proxy.await_count == int(online)
+    if online:
+        recovered = [{"id": "available-again"}]
+        proxy.return_value = {"status": "ok", "models": recovered}
+        synced = await client.post(
+            "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
+        )
+        assert synced.json()["rows"][0]["models"] == recovered
+        assert proxy.await_count == 2
+
+
+async def test_slow_agy_refresh_does_not_hold_catalog_readers(client, app, stores, monkeypatch):
+    harness = "antigravity-native"
+    acp = "acp:example"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True, acp: True})
+    _register_host(app, HOST_A)
+    fetched_at = now_epoch() - 301
+    stores.cache.upsert(HOST_A, harness, [{"id": "last-known"}], fetched_at)
+    stores.cache.upsert(HOST_A, "codex", [{"id": "codex-cached"}], now_epoch())
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def proxy(*, harness, **_kwargs):
+        if harness == acp:
+            return {"status": "ok", "models": [], "injects_prompt": True}
+        assert harness == "antigravity-native"
+        started.set()
+        await finish.wait()
+        return {"status": "ok", "models": [{"id": "current-model"}]}
+
+    lookup = AsyncMock(side_effect=proxy)
+    monkeypatch.setattr(calling_defaults_routes, "_proxy_model_options", lookup)
+    monkeypatch.setattr(calling_defaults_routes, "_AGY_FILTERED_READ_WAIT_S", 0.01)
+    params = {"host_id": HOST_A, "harness": harness}
+
+    try:
+        async with asyncio.timeout(2):
+            full = await client.get("/v1/calling-defaults/catalogs")
+            await started.wait()
+            rows = {row["harness"]: row for row in full.json()["rows"]}
+            assert rows["codex"]["models"] == [{"id": "codex-cached"}]
+            assert rows[acp]["injects_prompt"] is True
+            assert rows[harness]["stale"] is True
+
+            filtered = await client.get("/v1/calling-defaults/catalogs", params=params)
+            assert filtered.json()["rows"] == [rows[harness]]
+            assert rows[harness]["models"] == [{"id": "last-known"}]
+            assert rows[harness]["fetched_at"] == fetched_at
+    finally:
+        finish.set()
+    monkeypatch.setattr(calling_defaults_routes, "_AGY_FILTERED_READ_WAIT_S", 2)
+    synced = await client.get("/v1/calling-defaults/catalogs", params=params)
+    row = synced.json()["rows"][0]
+    assert row["models"] == [{"id": "current-model"}]
+    assert row["stale"] is False
+    assert [call.kwargs["harness"] for call in lookup.await_args_list].count(harness) == 1
+
+
+async def test_same_agy_host_id_refreshes_each_workspace(client, app, stores, monkeypatch):
+    harness = "antigravity-native"
+    for workspace in (1, 2):
+        with workspace_scope(workspace):
+            stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+            stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+            _register_host(app, HOST_A)
+    active = set()
+    both_started = asyncio.Event()
+
+    async def proxy(**_kwargs):
+        workspace = current_workspace_id()
+        active.add(workspace)
+        if active == {1, 2}:
+            both_started.set()
+        await both_started.wait()
+        return {"status": "ok", "models": [{"id": f"model-{workspace}"}]}
+
+    monkeypatch.setattr(calling_defaults_routes, "_proxy_model_options", proxy)
+
+    async def read(workspace):
+        with workspace_scope(workspace):
+            return await client.get(
+                "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+            )
+
+    async with asyncio.timeout(2):
+        first, second = await asyncio.gather(read(1), read(2))
+    assert first.json()["rows"][0]["models"] == [{"id": "model-1"}]
+    assert second.json()["rows"][0]["models"] == [{"id": "model-2"}]
 
 
 async def test_resolve_exposes_unavailable_defaults(client, stores, monkeypatch):
