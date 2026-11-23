@@ -880,6 +880,43 @@ def _command_mirror(item_type: str, item_data: dict[str, Any]) -> SessionEventIn
     )
 
 
+@pytest.mark.asyncio
+async def test_late_slash_command_mirror_leaves_unclaimed_resend_queued(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE})
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    content = [{"type": "input_text", "text": "/review"}]
+    original = pending_inputs.record(conv.id, content, runner_managed=True)
+    assert pending_inputs.claim_runner_input(conv.id, original, "original")
+
+    now = pending_inputs._CLAIMED_TEXT_MATCH_TIMEOUT_S
+    resend = pending_inputs.record(conv.id, content)
+    try:
+        item_id, replay = await _persist_external_conversation_item(
+            conv.id,
+            conv,
+            _command_mirror(
+                "slash_command",
+                {
+                    "agent": "claude-native-ui",
+                    "kind": "skill",
+                    "name": "example:review",
+                    "arguments": "",
+                },
+            ),
+            store,
+        )
+        assert item_id and not replay
+        assert pending_inputs.pending_ids(conv.id) == [original, resend]
+    finally:
+        pending_inputs.resolve(conv.id, original)
+        pending_inputs.resolve(conv.id, resend)
+
+
 @_COMMAND_MIRRORS
 @pytest.mark.asyncio
 async def test_command_resend_after_stop_leaves_its_echo_ambiguous(
