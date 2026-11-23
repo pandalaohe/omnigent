@@ -719,7 +719,7 @@ def has_request_phase_pending(conversation_id: str) -> bool:
         now = _now()
         _evict_stale_locked(conversation_id, now)
         return any(
-            not entry.interrupted and not entry.held and not _is_late_claimed_entry(entry, now)
+            not entry.interrupted and not _is_late_claimed_entry(entry, now)
             for entry in _pending.get(conversation_id, {}).values()
         )
 

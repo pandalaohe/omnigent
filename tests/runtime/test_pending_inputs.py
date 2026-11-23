@@ -1246,6 +1246,14 @@ def test_late_claim_is_excluded_from_request_dedup_and_admission(
     assert pending_inputs.oldest_admission_id("conv_a") is None
 
 
+def test_held_entry_still_counts_as_request_phase_pending() -> None:
+    pending_id = pending_inputs.record("conv_a", [_text_block("held request")])
+    held = pending_inputs.resolve_matching_text("conv_a", "held request", hold=True)
+
+    assert held.matched is not None and held.matched.pending_id == pending_id
+    assert pending_inputs.has_request_phase_pending("conv_a")
+
+
 @pytest.mark.parametrize("with_attachment", [False, True])
 def test_delayed_interrupted_echo_does_not_skip_a_live_message_before_a_resend(
     with_attachment: bool,
