@@ -186,8 +186,11 @@ async def test_buffered_messages_retry_unavailable_bridge_labels(
     monkeypatch: pytest.MonkeyPatch,
     pending_prompt: dict[str, bool],
     fail_drain: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Label failure during a background prompt check preserves the accepted FIFO."""
+    # Expected 503 tracebacks can consume the queue's test deadline in the console renderer.
+    caplog.set_level(logging.ERROR, logger=runner_app.__name__)
     app, harness = _build_app()
     sid = uuid.uuid4().hex
     state = {"unavailable": True, "fail_next": False, "drain_failed": False, "failures": 0}
