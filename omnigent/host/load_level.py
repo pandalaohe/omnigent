@@ -79,6 +79,7 @@ class LevelState:
 
     def __init__(self) -> None:
         self.reading_at: float | None = None
+        self.decision_reading: tuple[float, float] | None = None
         self._buckets: dict[int, tuple[float, float, int]] = {}
         self._next_bucket: int | None = None
         self._flags = [_Flag(), _Flag(), _Flag()]
@@ -95,6 +96,7 @@ class LevelState:
         bucket = int(at // 60)
         if self.reading_at is not None and at - self.reading_at > MAX_READING_AGE_S:
             self._flags = [_Flag(), _Flag(), _Flag()]
+            self.decision_reading = None
             self._buckets.clear()
             self._next_bucket = bucket
         if self._next_bucket is not None and bucket < self._next_bucket:
@@ -107,6 +109,7 @@ class LevelState:
 
     def step(self, now: float, lines: LoadLines) -> tuple[Level, str | None]:
         current = int(now // 60)
+        status = self._status()
         for bucket in sorted(key for key in self._buckets if key < current):
             if bucket != self._next_bucket:
                 for flag in self._flags:
@@ -121,6 +124,10 @@ class LevelState:
                 "load" if load >= lines.heavy else "memory",
             )
             spare.update(load < 1 and memory < lines.mem_pct, "load")
+            next_status = self._status()
+            if next_status != status:
+                self.decision_reading = (load, memory)
+                status = next_status
             self._next_bucket = bucket + 1
         if self._next_bucket is not None and self._next_bucket < current:
             for flag in self._flags:
@@ -128,9 +135,13 @@ class LevelState:
             self._next_bucket = current
         if self.reading_at is None or now - self.reading_at > MAX_READING_AGE_S:
             self._flags = [_Flag(), _Flag(), _Flag()]
+            self.decision_reading = None
             self._buckets.clear()
             self._next_bucket = current
             return "unknown", None
+        return status
+
+    def _status(self) -> tuple[Level, str | None]:
         levels: tuple[Level, ...] = ("new_session_hold", "heavy_hold", "spare")
         for level, flag in zip(levels, self._flags, strict=True):
             if flag.active:

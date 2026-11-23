@@ -7010,6 +7010,7 @@ class HostProcess:
             self._load_state.add_sample(now, sampler.sample_load_per_core, mem_pct)
         lines = self._load_lines
         level, reason = self._load_state.step(now, lines)
+        decision_load, decision_memory = self._load_state.decision_reading or (None, None)
         previous = self._load_report
         report = LoadLevelReport(
             level=level,
@@ -7020,6 +7021,8 @@ class HostProcess:
             heavy=lines.heavy,
             new_session=lines.new_session,
             lines_synced_at=self._load_lines_synced_at,
+            decision_load_per_core=decision_load,
+            decision_mem_pct=decision_memory,
         )
         self._load_report = report
         frame.load_level = report
