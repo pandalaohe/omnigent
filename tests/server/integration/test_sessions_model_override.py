@@ -1091,7 +1091,8 @@ async def test_patch_antigravity_clamped_model_switch_persists_applied_effort(
     )
     assert switched.status_code == 200, switched.text
     assert switched.json()["reasoning_effort"] == "high"
-    assert store.get_conversation(sid).reasoning_effort == "high"
+    saved = store.get_conversation(sid)
+    assert saved is not None and saved.reasoning_effort == "high"
     assert forwarded[0]["type"] == "model_change"
 
     # Re-submitting xhigh is NOT skipped as unchanged because high was persisted.
@@ -1166,7 +1167,8 @@ async def test_patch_antigravity_clamped_effort_keeps_newer_silent_write(
 
     assert switched.status_code == 200, switched.text
     assert switched.json()["reasoning_effort"] == "medium"
-    assert store.get_conversation(sid).reasoning_effort == "medium"
+    saved = store.get_conversation(sid)
+    assert saved is not None and saved.reasoning_effort == "medium"
     assert not any(
         event.get("type") == "session.reasoning_effort" and event.get("reasoning_effort") == "high"
         for event in published
@@ -1255,7 +1257,8 @@ async def test_patch_antigravity_clamped_effort_keeps_newer_silent_write(
     assert newer_response is not None
     assert newer_response.status_code == 200, newer_response.text
     assert newer_response.json()["reasoning_effort"] == "xhigh"
-    assert store.get_conversation(sid2).reasoning_effort == "xhigh"
+    saved2 = store.get_conversation(sid2)
+    assert saved2 is not None and saved2.reasoning_effort == "xhigh"
     assert [
         event.get("reasoning_effort")
         for event in published
@@ -1342,5 +1345,6 @@ async def test_terminal_effort_report_claims_write_lock_before_antigravity_patch
 
     assert reported.status_code == 202, reported.text
     assert switched is not None and switched.status_code == 200
-    assert store.get_conversation(sid).reasoning_effort == "high"
+    saved = store.get_conversation(sid)
+    assert saved is not None and saved.reasoning_effort == "high"
     assert published == ["medium", "high"]

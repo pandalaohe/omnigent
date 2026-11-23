@@ -6248,7 +6248,7 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
     codex_native_bridge.update_active_child_turn(bridge_dir, "thread_child", turn_id="turn_child")
     state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert state is not None
-    server = NullServerClient()
+    server = cast(httpx.AsyncClient, NullServerClient())
     get = server.get
 
     async def get_with_bridge_label(url: str, **kwargs: Any) -> Any:
@@ -6304,7 +6304,7 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
             bridge_dir=bridge_dir,
             codex_ws_url=state.socket_path,
             thread_id=state.thread_id,
-            app_server=backend,
+            app_server=cast(codex_app_server.CodexNativeAppServer, backend),
             subagent_router=subagent,
             turn_router=turn,
         )
@@ -6534,7 +6534,9 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                             lambda *_: None,
                             server_client=server,
                         )
-                assert patch.await_args.kwargs["json"]["labels"] == {
+                patch_args = patch.await_args
+                assert patch_args is not None
+                assert patch_args.kwargs["json"]["labels"] == {
                     codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: f"{old_id}-cleared"
                 }
             assert not task.done()
