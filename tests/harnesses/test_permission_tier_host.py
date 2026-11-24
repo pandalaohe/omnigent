@@ -115,17 +115,50 @@ def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) 
         assert decide_tier("auto", intent, load_rules()).rule_id == "protected-path"
 
 
+@pytest.fixture
+def fresh_windows_shell_selection():
+    from omnigent._platform import windows_os_env_shell_path
+
+    windows_os_env_shell_path.cache_clear()
+    yield
+    windows_os_env_shell_path.cache_clear()
+
+
+@pytest.mark.usefixtures("fresh_windows_shell_selection")
 @pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", None])
-def test_windows_os_shell_checks_the_selected_executor(monkeypatch, shell):
+def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypatch, shell):
+    from omnigent import _platform
+    from omnigent.inner import os_env
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    comspec = r"C:\Windows\System32\cmd.exe"
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(os_env, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        _platform, "_shell_on_path", lambda name: shell if name == "bash" else None
+    )
+    monkeypatch.setattr(_platform, "_git_for_windows_bash", lambda: None)
     monkeypatch.setattr(host.sys, "platform", "win32")
     monkeypatch.setattr(host.Path, "home", lambda: Path("C:/work/sample"))
-    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("COMSPEC", comspec)
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
-    monkeypatch.setattr(host, "posix_shell_path", lambda: shell)
     monkeypatch.setattr(
         host,
         "resolve_local_path",
         lambda value: ResolvedPath(value, "directory" if value == r"C:\work" else "new-file"),
+    )
+    executor = os_env.create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert executor is not None
+    try:
+        assert executor.shell_path == (shell or comspec)
+    finally:
+        executor.close()
+    monkeypatch.setattr(
+        _platform,
+        "_shell_on_path",
+        lambda name: r"C:\work\Git\bin\bash.exe" if shell is None and name == "bash" else None,
     )
     state = host.HostPermissionState("s", "h", r"C:\work", "auto", 1, "ready")
     command = 'printf "%s" "$label"'

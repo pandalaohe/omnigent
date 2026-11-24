@@ -23,6 +23,7 @@ import shutil
 import sys
 from collections.abc import Callable
 from contextlib import suppress
+from functools import cache
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
@@ -289,6 +290,12 @@ def posix_shell_path() -> str | None:
         if git_bash is not None:
             return git_bash
     return _shell_on_path("sh")
+
+
+@cache
+def windows_os_env_shell_path() -> str:
+    """Pin the Windows OS environment shell shared by execution and permission checks."""
+    return posix_shell_path() or os.environ.get("COMSPEC", "cmd.exe")
 
 
 def default_shell_argv(command: str) -> list[str]:

@@ -1566,9 +1566,11 @@ def test_windows_live_data_and_environment(shell, command):
     "command",
     [
         'start=$(date +%s); sleep 615; echo "OMNIGENT_LONG_TOOL_OK $(( $(date +%s) - start ))s"',
-        "printf '%b' 'echo ok\\n' | bash",
-        r"printf '\x65cho ok\n' | bash",
+        "printf '%b' 'ok\\n'",
+        r"printf '\x6fk\n'",
         'echo "$label" "/rooted text"',
+        "printf '%s' ok | cat",
+        "printf '%s' ok | bash -c 'cat'",
     ],
 )
 def test_windows_git_bash_expansion_and_data_follow_posix_tiers(command):
@@ -1619,6 +1621,45 @@ def test_windows_git_bash_reassigned_host_variable_cannot_bind_a_path():
     result = decision("auto", "sys_os_shell", arguments, host)
     assert result.action == Verdict.DENY
     assert "TARGET" in result.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf '%b' 'echo ok\\n' | bash",
+        "printf '%s' 'echo ok' | sh",
+        "printf '%s' 'echo ok' | (echo ready; sh)",
+        "bash < input.sh",
+        "bash -s",
+        "bash <<< 'echo ok'",
+        "bash <<'END'\necho ok\nEND\n",
+    ],
+)
+def test_windows_git_bash_stdin_script_requires_approval(command):
+    host = windows_host(shell="bash")
+    arguments = {"command": command}
+    assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize("shell", ["cmd", "pwsh"])
+@pytest.mark.parametrize("tier", ["auto", "accept-edits"])
+def test_windows_native_shell_keeps_conservative_nested_bash_paths(shell, tier):
+    arguments = {"command": 'bash -c "printf %b ok"'}
+    assert (
+        decision(tier, "sys_os_shell", arguments, windows_host(shell=shell)).action == Verdict.DENY
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["/c/Windows/x", "/c/Users/example/x", "/tmp/x", "~/x", "$HOME/x"]
+)
+def test_windows_git_bash_does_not_guess_msys_write_paths(path):
+    host = windows_host(
+        shell="bash", environment={"SystemRoot": r"C:\Windows", "HOME": r"C:\work\sample"}
+    )
+    arguments = {"command": f"printf ok > {path}"}
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
 
 
 @pytest.mark.parametrize(

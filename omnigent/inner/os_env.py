@@ -31,6 +31,7 @@ from omnigent._platform import (
     IS_WINDOWS,
     WINDOWS_ENV_PASSTHROUGH,
     posix_shell_path,
+    windows_os_env_shell_path,
 )
 from omnigent.git_commands import run_git
 from omnigent.runner.identity import (
@@ -1195,11 +1196,7 @@ def create_os_environment(
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = posix_shell_path()
-    if shell_path is None:
-        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
-        # keep the historical /bin/sh default.
-        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
+    shell_path = windows_os_env_shell_path() if IS_WINDOWS else posix_shell_path() or "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
