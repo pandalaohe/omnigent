@@ -5908,6 +5908,7 @@ def _build_session_create_body(
     reasoning_effort: object = None,
     placement: _CreatePlacement | None = None,
     speed: object = None,
+    permission_tier: str | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -5952,6 +5953,8 @@ def _build_session_create_body(
         body["agent_id"] = agent_id
     if speed is not None:
         body["labels"] = {"omnigent.speed_tier": speed}
+    if permission_tier is not None:
+        body["permission_tier"] = permission_tier
     if placement is not None:
         if placement.host_id is not None:
             body["host_id"] = placement.host_id
@@ -6577,6 +6580,18 @@ async def _execute_session_create_impl(
     placement_mode = args.get("placement", "child")
     if placement_mode not in ("child", "same_host", "managed"):
         return json.dumps({"error": "placement must be child, same_host or managed"})
+    permission_tier = args.get("permission_tier")
+    if permission_tier is not None:
+        from omnigent.permission_tiers import NON_FULL_TIERS
+
+        if not isinstance(permission_tier, str) or permission_tier not in NON_FULL_TIERS:
+            return json.dumps(
+                {"error": "permission_tier must be ask, plan, accept-edits, or auto"}
+            )
+        if placement_mode != "child" or has_config_path:
+            return json.dumps(
+                {"error": "permission_tier requires a registered or default child agent"}
+            )
     if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
@@ -6659,8 +6674,15 @@ async def _execute_session_create_impl(
         reasoning_effort=args.get("reasoning_effort"),
         placement=placement,
         speed=args.get("speed"),
+        permission_tier=cast(str | None, permission_tier),
     )
     headers: dict[str, str] = dict(_AGENT_CREATE_HEADERS)
+    from omnigent.server.permission_tiers import (
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+    )
+
+    headers[PERMISSION_PROTOCOL_HEADER] = PERMISSION_PROTOCOL_VERSION
     headers["x-omnigent-session-choice"] = "1"
     for key in ("work_type", "user_named", "choice_reason", "exclude", "differ_from"):
         if key in args:

@@ -277,6 +277,7 @@ class AcpAgentConfig:
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
+    host_permission_tier: bool = False
     inject_system_prompt: bool = True
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
@@ -570,6 +571,8 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        self._permission_calls: dict[str, _AcpJsonObject] = {}
+        self._answered_permission_calls: set[str] = set()
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -1324,6 +1327,33 @@ class AcpExecutor(Executor):
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
         return [o for o in (params.get("options") or []) if isinstance(o, dict)]
 
+    def _bound_permission_call(self, params: _AcpJsonObject) -> _AcpJsonObject | None:
+        """Bind a permission request to the pending tool event, never its display title."""
+        call = params.get("toolCall")
+        if not isinstance(call, dict) or not isinstance(call.get("toolCallId"), str):
+            return None
+        call_id = call["toolCallId"]
+        observed = self._permission_calls.pop(call_id, None)
+        if observed is None or call_id in self._answered_permission_calls:
+            return None
+        self._answered_permission_calls.add(call_id)
+        for key in ("kind", "title", "rawInput"):
+            if key in call and call[key] != observed.get(key):
+                return None
+        arguments = observed.get("rawInput")
+        if not isinstance(arguments, dict):
+            return None
+        kind = observed.get("kind")
+        name = "unknown"
+        if kind == "execute" and isinstance(arguments.get("CommandLine"), str):
+            name = "run_command"
+        elif kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
+            name = "view_file"
+        elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
+            # The shared classifier binds all of these to the same write target.
+            name = "write_to_file"
+        return {"call_id": call_id, "name": name, "arguments": arguments}
+
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
         """Label the agent's options for a choice card, or ``None`` if unusable.
 
@@ -1357,6 +1387,21 @@ class AcpExecutor(Executor):
         then honors itself, so the same command class stops re-prompting. Falls
         back to the yes/no bridge, whose grant stays once-scoped.
         """
+        if self._config.host_permission_tier:
+            allow_once = self._allow_once_id(params)
+            if allow_once is None:
+                return False, None
+            params = {
+                **params,
+                "options": [
+                    option
+                    for option in self._permission_options(params)
+                    if option.get("optionId") == allow_once or option.get("kind") == "reject_once"
+                ],
+            }
+            command_line = tool_input.get("CommandLine")
+            if isinstance(command_line, str):
+                tool_input = {**tool_input, "command": command_line}
         choice_handler = self._elicitation_choice_handler
         labeled = self._scoped_options(params) if choice_handler is not None else None
         if choice_handler is not None and labeled is not None:
@@ -1389,7 +1434,10 @@ class AcpExecutor(Executor):
         )
         if handler is None:
             return False, None
-        return bool(await handler(tool_name, tool_input)), None
+        allowed = bool(await handler(tool_name, tool_input))
+        return allowed, self._allow_once_id(
+            params
+        ) if allowed and self._config.host_permission_tier else None
 
     async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
         """Decide a permission request — policy then elicitation.
@@ -1414,19 +1462,27 @@ class AcpExecutor(Executor):
             :meth:`_permission_outcome` choose the narrowest grant.
         """
         tool_name, tool_input = self._extract_tool_call(params)
+        bound_call = None
+        if self._config.host_permission_tier:
+            bound_call = self._bound_permission_call(params)
+            if bound_call is None:
+                return False, None
         policy_eval = getattr(self, "_policy_evaluator", None)
+        action: str | None = None
+        verdict_data: object = None
         # Either bridge can carry the question to the user.
         can_ask = (
             self._elicitation_handler is not None or self._elicitation_choice_handler is not None
         )
 
         if policy_eval is not None:
-            action: str | None
             try:
-                verdict = await policy_eval(
-                    "PHASE_TOOL_CALL", {"name": tool_name, "arguments": tool_input}
-                )
+                data = {"name": tool_name, "arguments": tool_input}
+                if bound_call is not None:
+                    data["_omnigent_acp_call"] = bound_call
+                verdict = await policy_eval("PHASE_TOOL_CALL", data)
                 action = getattr(verdict, "action", None)
+                verdict_data = getattr(verdict, "data", None)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("acp TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
                 action = None
@@ -1443,6 +1499,21 @@ class AcpExecutor(Executor):
                 return await self._ask_user(tool_name, tool_input, params, policy_ask=True)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
+        if bound_call is not None:
+            tier = (
+                verdict_data.get("_omnigent_acp_tier") if isinstance(verdict_data, dict) else None
+            )
+            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") or tier not in (
+                "allow",
+                "ask",
+            ):
+                return False, None
+            if tier == "allow" and (option_id := self._allow_once_id(params)):
+                return True, option_id
+            return (
+                await self._ask_user(tool_name, tool_input, params) if can_ask else (False, None)
+            )
+
         if can_ask and not self._bypass_permissions:
             return await self._ask_user(tool_name, tool_input, params)
         if can_ask:
@@ -1455,6 +1526,19 @@ class AcpExecutor(Executor):
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
         return True, None
+
+    def _allow_once_id(self, params: _AcpJsonObject) -> str | None:
+        options = self._permission_options(params)
+        for option in options:
+            option_id = option.get("optionId")
+            if (
+                option.get("kind") == "allow_once"
+                and isinstance(option_id, str)
+                and option_id
+                and sum(row.get("optionId") == option_id for row in options) == 1
+            ):
+                return option_id
+        return None
 
     @staticmethod
     def _permission_outcome(
@@ -1725,6 +1809,8 @@ class AcpExecutor(Executor):
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
+        self._permission_calls.clear()
+        self._answered_permission_calls.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -1785,6 +1871,8 @@ class AcpExecutor(Executor):
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
+                if self._config.host_permission_tier and update.get("status") in (None, "pending"):
+                    self._permission_calls[call_id] = copy.deepcopy(update)
                 metadata: _AcpJsonObject = {"call_id": call_id}
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
@@ -1801,6 +1889,7 @@ class AcpExecutor(Executor):
             ):
                 name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
+                self._permission_calls.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -2408,8 +2497,25 @@ class AcpExecutor(Executor):
         requested_model = config.model if config is not None else None
         requested_mode = config.extra.get("session_mode") if config else None
         mode_selection = config.extra.get("session_mode_selection") if config else None
+        self._permission_calls.clear()
+        self._answered_permission_calls.clear()
         await self._drain_stale_queue()
+        managed_agy = (
+            self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
+        )
+        if managed_agy:
+            # In agy Auto, tools can run without a client permission request.
+            # Keep the CLI in its request-producing mode for a host-tier session.
+            requested_mode = "default"
         mode_notice = await self._apply_session_mode(session_id, requested_mode)
+        if managed_agy and self._active_mode != "default":
+            yield ExecutorError(
+                message=(
+                    "Antigravity did not enter its approval-requesting mode for the host tier."
+                ),
+                preserve_session=True,
+            )
+            return
         reported_mode = self._active_mode
         if requested_mode and reported_mode:
             yield SessionModeChanged(

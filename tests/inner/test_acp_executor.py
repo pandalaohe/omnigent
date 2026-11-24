@@ -1028,6 +1028,52 @@ async def test_decide_permission_allows_with_no_gates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_host_tier_allows_only_the_bound_call_once() -> None:
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_ALLOW",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+    observed = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "shell-1",
+        "kind": "execute",
+        "title": "Run command",
+        "rawInput": {"CommandLine": "git status"},
+    }
+    ex._handle_session_update(observed)
+    options = [
+        {"kind": "allow_always", "optionId": "persistent"},
+        {"kind": "allow_once", "optionId": "once"},
+    ]
+    request = {"toolCall": {"toolCallId": "shell-1"}, "options": options}
+    assert await ex._decide_permission(request) == (True, "once")
+    assert await ex._decide_permission(request) == (False, None)
+    ex._handle_session_update({**observed, "toolCallId": "shell-2"})
+    assert await ex._decide_permission(
+        {**request, "toolCall": {"toolCallId": "shell-2", "rawInput": {"CommandLine": "git diff"}}}
+    ) == (False, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._handle_session_update({**observed, "toolCallId": "shell-3"})
+    assert await ex._decide_permission(
+        {"toolCall": {"toolCallId": "shell-3"}, "options": options[:1]}
+    ) == (False, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._handle_session_update({**observed, "toolCallId": "shell-4"})
+    ex._policy_evaluator.return_value = PolicyVerdictPayload(action="POLICY_ACTION_ASK")
+    assert await ex._decide_permission({**request, "toolCall": {"toolCallId": "shell-4"}}) == (
+        True,
+        "once",
+    )
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_denies_on_policy_deny() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 

@@ -26,16 +26,30 @@ PERMISSION_PROTOCOL_VERSION = "1"
 # Sent only on a server-to-runner inspection after catalog and selection checks.
 REGISTRY_TOOL_INSPECTION_HEADER = "X-Omnigent-Registry-Tool-Inspection"
 TIER_HARNESSES = frozenset({"pi", "pi-native", "antigravity-native"})
+ACP_PERMISSION_TIER_LABEL_KEY = "omnigent.acp.permission_tier"
 PERMISSION_LABEL_KEYS = frozenset(
     {
         PI_PERMISSION_TIER_LABEL_KEY,
         AGY_PERMISSION_TIER_LABEL_KEY,
+        ACP_PERMISSION_TIER_LABEL_KEY,
         PERMISSION_STATE_LABEL_KEY,
         PERMISSION_MIGRATION_LABEL_KEY,
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_RUNTIME_ID_LABEL_KEY,
     }
 )
+
+
+def is_acp_permission_harness(harness: str | None) -> bool:
+    return harness is not None and (harness == "acp" or harness.startswith("acp:"))
+
+
+def permission_tier_active(harness: str | None, labels: Mapping[str, str]) -> bool:
+    """ACP opts into managed tiers; existing managed harnesses always require them."""
+    return harness in TIER_HARNESSES or (
+        is_acp_permission_harness(harness)
+        and (ACP_PERMISSION_TIER_LABEL_KEY in labels or PERMISSION_STATE_LABEL_KEY in labels)
+    )
 
 
 def is_permission_label_key(key: str) -> bool:
@@ -66,6 +80,8 @@ def tier_label_key(harness: str) -> str:
         return AGY_PERMISSION_TIER_LABEL_KEY
     if harness in {"pi", "pi-native"}:
         return PI_PERMISSION_TIER_LABEL_KEY
+    if is_acp_permission_harness(harness):
+        return ACP_PERMISSION_TIER_LABEL_KEY
     raise ValueError(f"Harness does not support permission tiers: {harness}")
 
 

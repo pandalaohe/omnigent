@@ -1204,6 +1204,14 @@ class SysSessionCreateTool(Tool):
                                 "when nested agents are enabled."
                             ),
                         },
+                        "permission_tier": {
+                            "type": "string",
+                            "enum": ["ask", "plan", "accept-edits", "auto"],
+                            "description": (
+                                "Host tier for a registered or default child agent. "
+                                "Use a tier the user authorized for the target harness."
+                            ),
+                        },
                         "sandbox_provider": {
                             "type": "string",
                             "description": "Optional provider for placement='managed'.",

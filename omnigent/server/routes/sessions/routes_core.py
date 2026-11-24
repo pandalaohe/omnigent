@@ -6117,7 +6117,11 @@ def register_core_routes(
                     getattr(request.app.state, "user_preferences_store", None),
                     action="unarchive",
                 )
-        from omnigent.server.permission_tiers import require_permission_protocol
+        from omnigent.server.permission_tiers import (
+            is_acp_permission_harness,
+            permission_tier_active,
+            require_permission_protocol,
+        )
 
         conv_for_protocol = await asyncio.to_thread(
             conversation_store.get_conversation, session_id
@@ -6129,15 +6133,14 @@ def register_core_routes(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
             )
+            managed_tier = permission_tier_active(effective_harness, conv_for_protocol.labels)
             require_permission_protocol(
                 request,
                 harness=effective_harness,
+                required=managed_tier,
             )
-            if body.permission_mode is not None and effective_harness in {
-                "pi",
-                "pi-native",
-                "antigravity-native",
-            }:
+            if managed_tier and body.permission_mode is not None:
+                assert effective_harness is not None
                 from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
                 from omnigent.server.permission_tiers import (
                     PERMISSION_CAPABILITY_VALUE,
@@ -6159,6 +6162,7 @@ def register_core_routes(
                 allowed_tiers = (
                     NON_FULL_TIERS
                     if effective_harness == "antigravity-native"
+                    or is_acp_permission_harness(effective_harness)
                     else PERMISSION_TIERS
                 )
                 if target not in allowed_tiers or (

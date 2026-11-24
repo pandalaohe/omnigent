@@ -9450,7 +9450,13 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
             output = await execute_tool(
                 tool_name="sys_session_create",
                 arguments=json.dumps(
-                    {"agent_id": "ag_x", "title": "auth", "message": "start", "speed": "fast"}
+                    {
+                        "agent_id": "ag_x",
+                        "title": "auth",
+                        "message": "start",
+                        "speed": "fast",
+                        "permission_tier": "auto",
+                    }
                 ),
                 server_client=server_client,
                 conversation_id="conv_caller",
@@ -9465,6 +9471,7 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
+    assert captured["permission_tier"] == "auto"
     attempt = captured["labels"].pop("omnigent.create_attempt")
     assert len(attempt) == 32 and int(attempt, 16) > 0
     assert captured["labels"] == {"omnigent.speed_tier": "fast"}

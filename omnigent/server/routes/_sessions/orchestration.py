@@ -3128,12 +3128,12 @@ def _build_session_response(
     from omnigent.server.permission_tiers import (
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_CAPABILITY_VALUE,
-        TIER_HARNESSES,
         legacy_permission_tier,
+        permission_tier_active,
         read_permission_state,
     )
 
-    if harness in TIER_HARNESSES:
+    if permission_tier_active(harness, conv.labels):
         assert harness is not None
         try:
             confirmed = read_permission_state(conv.labels, harness=harness)
@@ -16241,10 +16241,19 @@ async def _create_session_from_existing_agent_impl(
         or (_spec_harness(selection_spec) if selection_spec is not None else None)
         or await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
     )
-    from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+    from omnigent.server.permission_tiers import (
+        TIER_HARNESSES,
+        is_acp_permission_harness,
+        permission_tier_active,
+        require_permission_protocol,
+    )
 
     require_permission_protocol(request, harness=selected_harness)
-    if body.permission_tier is not None and selected_harness not in TIER_HARNESSES:
+    if (
+        body.permission_tier is not None
+        and selected_harness not in TIER_HARNESSES
+        and not is_acp_permission_harness(selected_harness)
+    ):
         raise OmnigentError(
             "permission_tier is only supported by Pi and Antigravity sessions",
             code=ErrorCode.INVALID_INPUT,
@@ -16746,13 +16755,29 @@ async def _create_session_from_existing_agent_impl(
         initial_labels.update(sdk_permission_labels)
 
     create_harness = selected_harness
-    require_permission_protocol(request, harness=create_harness)
-    if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
-        raise OmnigentError(
-            "permission_tier is only supported by Pi and Antigravity sessions",
-            code=ErrorCode.INVALID_INPUT,
+    acp_default_tier = None
+    acp_tier_enabled = False
+    if is_acp_permission_harness(create_harness):
+        from omnigent.permission_tiers import NON_FULL_TIERS
+
+        acp_harness = await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
         )
-    if create_harness in TIER_HARNESSES:
+        host_registry = getattr(request.app.state, "host_registry", None)
+        connection = (
+            host_registry.get(permission_host_id) if host_registry and permission_host_id else None
+        )
+        if acp_harness and connection is not None:
+            acp_default_tier = (getattr(connection.hello, "acp_permission_tiers", None) or {}).get(
+                acp_harness
+            )
+        if acp_default_tier not in NON_FULL_TIERS:
+            acp_default_tier = None
+        if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
+            raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
+        acp_tier_enabled = body.permission_tier is not None or acp_default_tier is not None
+    require_permission_protocol(request, harness=create_harness, required=acp_tier_enabled)
+    if create_harness in TIER_HARNESSES or acp_tier_enabled:
         assert create_harness is not None
         from omnigent.server.permission_tiers import (
             ConfirmedPermissionState,
@@ -16765,7 +16790,7 @@ async def _create_session_from_existing_agent_impl(
             parent_harness = await asyncio.to_thread(
                 _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
             )
-            if parent_harness in TIER_HARNESSES:
+            if permission_tier_active(parent_harness, parent_conv.labels or {}):
                 assert parent_harness is not None
                 try:
                     inherited_tier = legacy_permission_tier(
@@ -16787,7 +16812,13 @@ async def _create_session_from_existing_agent_impl(
                 if explicit_permission_application is not None
                 else None
             ),
-            default=project_resolution.permission if body.sub_agent_name is None else None,
+            default=(
+                acp_default_tier
+                if acp_tier_enabled
+                else project_resolution.permission
+                if body.sub_agent_name is None
+                else None
+            ),
             inherited=inherited_tier,
         )
         initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))

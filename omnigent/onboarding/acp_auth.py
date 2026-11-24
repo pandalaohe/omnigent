@@ -82,6 +82,7 @@ class AcpAgentEntry:
     env_passthrough: tuple[str, ...] = ()
     init_timeout_s: float = 30.0
     permission_concepts: Mapping[str, str] = field(default_factory=dict)
+    permission_tier: str | None = None
 
 
 def parse_permission_concepts(raw: object) -> dict[str, str]:
@@ -214,6 +215,13 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         inject_system_prompt = raw.get("inject_system_prompt", True)
         if not isinstance(inject_system_prompt, bool):
             raise ValueError("acp agent inject_system_prompt must be a boolean")
+        from omnigent.permission_tiers import NON_FULL_TIERS
+
+        permission_tier = raw.get("permission_tier")
+        if permission_tier is not None and (
+            not isinstance(permission_tier, str) or permission_tier not in NON_FULL_TIERS
+        ):
+            raise ValueError("acp agent permission_tier must be ask, plan, accept-edits, or auto")
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -227,6 +235,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
                 init_timeout_s=parse_init_timeout_s(raw.get("init_timeout_s", 30.0)),
                 permission_concepts=parse_permission_concepts(raw.get("permission_concepts")),
+                permission_tier=permission_tier,
             )
         )
     return entries
@@ -295,6 +304,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["init_timeout_s"] = e.init_timeout_s
         if e.permission_concepts:
             item["permission_concepts"] = dict(e.permission_concepts)
+        if e.permission_tier is not None:
+            item["permission_tier"] = e.permission_tier
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

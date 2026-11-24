@@ -3356,7 +3356,10 @@ function ComposerImpl(
   const acpHarnessId =
     composerSession?.harnessNamespace ??
     (sessionHarness?.startsWith("acp:") ? sessionHarness : undefined);
-  const acpPermissionControl = sessionHarness === "acp" || sessionHarness?.startsWith("acp:");
+  const tierPermissionControl = composerSession?.permissionTierState != null;
+  const hostPermissionControl = showClaudePermissionMode || tierPermissionControl;
+  const acpSession = sessionHarness === "acp" || sessionHarness?.startsWith("acp:");
+  const acpPermissionControl = acpSession && !tierPermissionControl;
   const acpHostId = composerSession?.effectiveHostId ?? composerSession?.hostId;
   const [acpCatalog, setAcpCatalog] = useState<CallingDefaultsCatalogRow | null>(null);
   useEffect(() => {
@@ -3383,7 +3386,6 @@ function ComposerImpl(
     acpCatalog !== null && acpCatalog.host_id === acpHostId && acpCatalog.harness === acpHarnessId
       ? (acpCatalog.permission_options ?? [])
       : [];
-  const tierPermissionControl = composerSession?.permissionTierState != null;
   const claudePermissionMode = tierPermissionControl
     ? (composerSession?.permissionTier ?? "")
     : storedPermissionMode;
@@ -3491,16 +3493,16 @@ function ComposerImpl(
         }))
       : null) ??
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
-    (showClaudePermissionMode
+    (hostPermissionControl
       ? tierPermissionControl
-        ? AGY_NATIVE_PERMISSION_TIERS
+        ? AGY_NATIVE_PERMISSION_TIERS.filter((option) => !acpSession || option.value !== "full")
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
       : CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS);
   const permissionLabel = acpPermissionControl
     ? (acpOptions.find((option) => option.value === acpMode)?.label ?? acpMode)
-    : showClaudePermissionMode
+    : hostPermissionControl
       ? tierPermissionControl
         ? composerSession?.permissionTierState === "blocked"
           ? PERMISSION_TIER_BLOCKED
@@ -3514,11 +3516,9 @@ function ComposerImpl(
         ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
           codexApprovalMode)
         : (nativePermissionReadback?.value ?? codexApprovalModeLabel(codexApprovalMode));
-  const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
-    : codexApprovalMode;
+  const selectedPermissionMode = hostPermissionControl ? claudePermissionMode : codexApprovalMode;
   const permissionControlInteractive =
-    (showClaudePermissionMode ||
+    (hostPermissionControl ||
       showCodexApprovalMode ||
       (acpPermissionControl && acpOptions.length > 0)) &&
     !isReadOnly &&
@@ -3543,6 +3543,12 @@ function ComposerImpl(
   );
   const currentPermissionMode = (): string => {
     const state = useChatStore.getState();
+    if (tierPermissionControl) {
+      return (
+        chatQueryClient()?.getQueryData<Session>(["session", state.conversationId])
+          ?.permissionTier ?? claudePermissionMode
+      );
+    }
     return acpPermissionControl
       ? acpMode
       : showClaudePermissionMode
@@ -5615,7 +5621,7 @@ function ComposerImpl(
                   <BackgroundTaskIndicator className="h-11 rounded-full bg-transparent [--icon-container-default:20px] [&_svg]:p-0" />
                 </MobileHeaderControlPortal>
               )}
-              {(showClaudePermissionMode ||
+              {(hostPermissionControl ||
                 showCodexApprovalMode ||
                 (acpPermissionControl && acpOptions.length > 0) ||
                 false) &&
@@ -5636,7 +5642,7 @@ function ComposerImpl(
                         ? acpMode
                         : nativePermissionControl
                           ? nativePermissionReadback?.selectedValue
-                          : showClaudePermissionMode
+                          : hostPermissionControl
                             ? claudePermissionMode
                             : codexApprovalMode
                     }

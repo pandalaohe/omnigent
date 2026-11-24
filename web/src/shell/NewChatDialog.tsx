@@ -4167,11 +4167,22 @@ function NewChatLandingContent({
   const declaredPermissionOptions = useMemo(
     () =>
       acpHarness
-        ? acpPermissionOptions.map((option) => ({
-            ...option,
-            description:
-              option.description ?? "Sets the agent's own mode. What it covers is up to the agent.",
-          }))
+        ? [
+            { value: "", label: "Default" },
+            ...acpPermissionOptions.map((option) => ({
+              ...option,
+              description:
+                option.description ??
+                "Sets the agent's own mode. What it covers is up to the agent.",
+            })),
+            ...AGY_NATIVE_PERMISSION_TIERS.filter(
+              (option) => option.value !== AGY_NATIVE_FULL_PERMISSION_TIER,
+            ).map((option) => ({
+              ...option,
+              value: `host-tier:${option.value}`,
+              label: `Host tier · ${option.label}`,
+            })),
+          ]
         : selectionHarness
           ? sessionDefaultModeOptions(
               selectionHarness,
@@ -4187,7 +4198,7 @@ function NewChatLandingContent({
   const hasDeclaredPermissionMode =
     selectionHarness !== null &&
     (acpHarness !== null
-      ? acpPermissionOptions.length > 0
+      ? declaredPermissionOptions.length > 0
       : harnessCapabilities[selectionHarness]?.session_modes?.permission != null);
   const hasGenericPermissionMode =
     hasDeclaredPermissionMode &&
@@ -7583,9 +7594,13 @@ function NewChatLandingContent({
           reasoning_effort:
             normalizedReasoningEffort ??
             (createProjectId !== null && effortTouchedRef.current ? null : undefined),
-          ...(sdkHarness === "claude-sdk" || hasGenericPermissionMode
-            ? { permission_mode: permissionMode || undefined }
-            : {}),
+          ...(hasGenericPermissionMode &&
+          acpHarness !== null &&
+          permissionMode.startsWith("host-tier:")
+            ? { permission_tier: permissionMode.slice("host-tier:".length) }
+            : sdkHarness === "claude-sdk" || hasGenericPermissionMode
+              ? { permission_mode: permissionMode || undefined }
+              : {}),
           ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
           ...(agentSupportsAgyPermissionTier && !smartRoutingHarnessSelected
             ? { permission_tier: agySkipMode }

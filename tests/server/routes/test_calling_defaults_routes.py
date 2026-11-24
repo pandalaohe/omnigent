@@ -643,6 +643,36 @@ async def test_acp_session_patch_preserves_literal_values_and_null_reset(
         assert response.json()["reasoning_effort"] == effort
 
 
+async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    legacy = await client.post("/v1/sessions", json=request)
+    assert legacy.status_code == 201, legacy.text
+    assert legacy.json()["permission_tier"] is None
+
+    connection = app.state.host_registry.get(HOST_A)
+    connection.hello.acp_permission_tiers = {"acp:neutral": "auto"}
+    defaulted = await client.post("/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS)
+    assert defaulted.status_code == 201, defaulted.text
+    assert defaulted.json()["permission_tier"] == "auto"
+
+    explicit = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "accept-edits"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert explicit.status_code == 201, explicit.text
+    assert explicit.json()["permission_tier"] == "accept-edits"
+    assert explicit.json()["permission_tier_state"] == "blocked"
+
+
 async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
 
