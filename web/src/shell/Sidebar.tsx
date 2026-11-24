@@ -2133,9 +2133,13 @@ function ProjectFolder({
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
   const { showGoalSessionMarkers } = useSessionNavigationPreferences();
+  // A collapsed folder keeps showing the open session until you navigate away; that
+  // row owns its badge, so the header summarizes only the rows it hides.
+  const heldIndex = expanded ? -1 : conversations.findIndex((c) => c.id === activeConversationId);
+  const isHidden = (_row: unknown, index: number) => index !== heldIndex;
   const marker = projectMarkerState(
-    conversations,
-    errors,
+    conversations.filter(isHidden),
+    errors.filter(isHidden),
     startingConversationId,
     showGoalSessionMarkers,
   );
@@ -2269,6 +2273,9 @@ function ProjectFolder({
         marker={marker.state}
         backgroundActivityCount={marker.backgroundActivityCount}
         conversations={display.rows}
+        heldConversations={
+          expanded ? undefined : conversations.filter((_row, index) => index === heldIndex)
+        }
         listRef={listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
@@ -4215,28 +4222,12 @@ function ConversationList({
     onExitSelectionMode,
   ]);
 
-  // The project the currently-selected session is filed under, if any. Derived
-  // as a primitive so the auto-expand effect below only fires when the
-  // selection (or its project) changes — not on every background list refetch,
-  // which would re-open a folder the user just collapsed.
-  const activeProjectName = useMemo(() => {
-    if (!resolvedActiveId) return null;
-    const active = allConversations.find((c) => c.id === resolvedActiveId);
-    // Live views list an archived session outside its folder.
-    if (!active || (active.archived === true && activeTab !== "archived")) return null;
-    return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
-  }, [resolvedActiveId, allConversations, activeTab, projects, viewerId]);
-  // Auto-expand the project folder holding the selected session, so navigating
-  // to a filed session reveals it instead of leaving it hidden in a collapsed
-  // folder. Skipped for pinned sessions: they're already reachable from the
-  // Pinned section, so forcing their project open would undo a manual collapse
-  // every time the user clicks the pinned row.
-  useEffect(() => {
-    if (!resolvedActiveId || !activeProjectName) return;
-    if (pinnedSet.has(resolvedActiveId) || suppressedScrollIdRef.current === resolvedActiveId)
-      return;
-    expandProject(activeProjectName);
-  }, [resolvedActiveId, activeProjectName, pinnedSet, expandProject]);
+  // A collapsed folder only lists the active session, matching the folder body.
+  const listedFolderRows = useCallback(
+    (key: string, rows: readonly Conversation[]) =>
+      expandedProjects.includes(key) ? rows : rows.filter((row) => row.id === displayedActiveId),
+    [expandedProjects, displayedActiveId],
+  );
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Sections render in layout order.
@@ -4250,14 +4241,12 @@ function ConversationList({
         ids.push(conversation.id);
       }
     };
-    // A project's chats are navigable only when the section that contains the
-    // folder is expanded AND that individual folder is expanded (folders are
-    // collapsed unless explicitly opened — inverse of the fixed sections).
+    // A collapsed section hides its folders. A collapsed folder holds its active row.
     for (const { section, collapsed, groups, flatSessions, favoriteOrder } of projection) {
       if (collapsed) continue;
       if (section.kind === "projects" || section.kind === "other_projects") {
         for (const { group, rows } of groups) {
-          if (expandedProjects.includes(group.name)) push(rows);
+          push(listedFolderRows(group.name, rows));
         }
       } else if (section.kind === "favorites" && favoriteOrder !== undefined) {
         const groupById = new Map(groups.map((entry) => [entry.group.id, entry] as const));
@@ -4272,11 +4261,8 @@ function ConversationList({
               push([conversation]);
           } else {
             const entry = groupById.get(ref.id);
-            if (
-              entry !== undefined &&
-              expandedProjects.includes(`fav:${section.id}:${entry.group.name}`)
-            ) {
-              push(entry.rows);
+            if (entry !== undefined) {
+              push(listedFolderRows(`fav:${section.id}:${entry.group.name}`, entry.rows));
             }
           }
         }
@@ -4297,7 +4283,7 @@ function ConversationList({
   }, [
     projection,
     collapsedFamilies,
-    expandedProjects,
+    listedFolderRows,
     sections.shared,
     sections.sessions,
     sessionGroups,
@@ -4416,8 +4402,10 @@ function ConversationList({
       for (const { collapsed, groups } of projection) {
         if (collapsed) continue;
         for (const { group, rows } of groups) {
-          if (!expandedProjects.includes(group.name)) continue;
-          for (const conversation of orderSessionFamilies(rows, collapsedFamilies)) {
+          for (const conversation of orderSessionFamilies(
+            listedFolderRows(group.name, rows),
+            collapsedFamilies,
+          )) {
             if (seen.has(conversation.id)) continue;
             seen.add(conversation.id);
             ids.push(conversation.id);
@@ -4433,9 +4421,9 @@ function ConversationList({
           collapsed
             ? []
             : groups.flatMap(({ group, rows }) =>
-                expandedProjects.includes(group.name)
-                  ? orderSessionFamilies(rows, collapsedFamilies).map((c) => c.id)
-                  : [],
+                orderSessionFamilies(listedFolderRows(group.name, rows), collapsedFamilies).map(
+                  (c) => c.id,
+                ),
               ),
         )
       : [];
@@ -6536,6 +6524,7 @@ function ConversationSection({
   backgroundActivityCount,
   active,
   conversations,
+  heldConversations,
   activeConversationId,
   pinnedConversationIds,
   collapsed,
@@ -6578,6 +6567,8 @@ function ConversationSection({
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
+  /** Rows still listed while collapsed (a project folder's open session). */
+  heldConversations?: Conversation[];
   /** The active conversation's resolved top-level root id, or null — each row
       derives its own `isActive` by comparing against this. Resolved once by the
       list owner so a row never runs the (multi-step) active-root query itself. */
@@ -6636,14 +6627,17 @@ function ConversationSection({
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
   const { showGoalSessionMarkers } = useSessionNavigationPreferences();
-  const families = sessionFamilyGroups(conversations);
+  // An untitled section is always open — there's no header to collapse it.
+  const isCollapsed = title != null && collapsed;
+  const rows = isCollapsed ? (heldConversations ?? []) : conversations;
+  const families = sessionFamilyGroups(rows);
   const familyRepresentative = (row: Conversation) =>
     row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)?.[0] : undefined;
   const isNestedFamilyRow = (row: Conversation) => {
     const representative = familyRepresentative(row);
     return representative !== undefined && representative.id !== row.id;
   };
-  const visibleFamilyRows = orderSessionFamilies(conversations, collapsedFamilies);
+  const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
@@ -6652,8 +6646,6 @@ function ConversationSection({
   // A provisional row has no server id yet, so it can't be a Move up/down target.
   const reorderNeighbour = (row: Conversation | undefined) =>
     reorderGroup && row && !row.provisional ? row.id : undefined;
-  // An untitled section is always open — there's no header to collapse it.
-  const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
@@ -6731,14 +6723,14 @@ function ConversationSection({
         </div>
       )}
       {afterHeader}
-      {!isCollapsed && (
+      {(!isCollapsed || rows.length > 0) && (
         <div
           ref={bodyRef}
           data-testid="sidebar-section-body"
           className={cn("pt-1", bodyMaxHeight != null && "overflow-y-auto")}
           style={bodyMaxHeight != null ? { maxHeight: bodyMaxHeight } : undefined}
         >
-          {(hasRows ?? conversations.length > 0) === false && emptyMessage ? (
+          {(hasRows ?? rows.length > 0) === false && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
             indentRows ? (
@@ -6818,7 +6810,7 @@ function ConversationSection({
               })}
             </ul>
           )}
-          {footer}
+          {!isCollapsed && footer}
         </div>
       )}
     </section>

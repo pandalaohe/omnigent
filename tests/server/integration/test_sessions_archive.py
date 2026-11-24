@@ -27,6 +27,7 @@ from fastapi import FastAPI
 
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.errors import OmnigentError
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.cli_release_store import CliReleaseIntentStore
@@ -1822,9 +1823,11 @@ async def test_agent_contents_404_for_nonexistent_session(
 # ── stop_when_idle deferral ──────────────────────────────
 
 
+@pytest.mark.parametrize("self_archive", [False, True], ids=["requested", "self-archive"])
 async def test_stop_when_idle_defers_teardown_until_the_tree_settles(
     client: httpx.AsyncClient,
     db_uri: str,
+    self_archive: bool,
 ) -> None:
     """
     A ``stop_when_idle`` archive parks the teardown while the tree runs.
@@ -1867,7 +1870,8 @@ async def test_stop_when_idle_defers_teardown_until_the_tree_settles(
         ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
-                json={"archived": True, "stop_when_idle": True},
+                json={"archived": True, **({} if self_archive else {"stop_when_idle": True})},
+                headers={ORCHESTRATION_SOURCE_HEADER: session_id} if self_archive else {},
             )
             assert resp.status_code == 200
             row = conv_store.get_conversation(session_id)

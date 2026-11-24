@@ -8055,6 +8055,7 @@ async def _launch_runner_on_host_impl(
     caller: str = "recovery",
     request_id: str | None = None,
     on_frame_enqueued: Callable[[], None] | None = None,
+    replace_move_claim: bool = False,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -8080,6 +8081,8 @@ async def _launch_runner_on_host_impl(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param replace_move_claim: Whether this launch may replace a move's claim
+        on the runner; only the move's own sandbox launch may.
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -8106,6 +8109,14 @@ async def _launch_runner_on_host_impl(
             )
         if caller == "card_answer" and not _can_wake_for_card_answer(fresh):
             return _HostLaunchAttempt(runner_id=fresh.runner_id or "", not_enqueued=True)
+        from omnigent.server.managed_hosts import is_move_claim
+
+        if is_move_claim(fresh.runner_id) and not replace_move_claim:
+            # A move holds the session, perhaps claimed since the caller's read:
+            # there's no runner to ride, and its sandbox's launch starts one.
+            # Not recorded as a launch, so the move's own launch, which may be
+            # waiting on this lock, doesn't take it for its result.
+            return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
         # A waiter may already have read the active flight's replacement binding.
         if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
@@ -8160,6 +8171,7 @@ async def _launch_runner_on_host_impl(
             caller=caller,
             request_id=request_id,
             on_frame_enqueued=on_frame_enqueued,
+            replace_move_claim=replace_move_claim,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -8168,6 +8180,20 @@ async def _launch_runner_on_host_impl(
         while len(_relaunch_last_attempt) > _RELAUNCH_MEMO_MAX:
             del _relaunch_last_attempt[next(iter(_relaunch_last_attempt))]
         return attempt
+
+
+def _move_in_progress_attempt(claim: str) -> _HostLaunchAttempt:
+    """
+    The refusal for a launch that finds a move's claim on the session.
+
+    :param claim: The move's claim, e.g. ``"runner_token_move_…"``; callers
+        recognize the refusal by it (:func:`~omnigent.server.managed_hosts.is_move_claim`).
+    """
+    return _HostLaunchAttempt(
+        runner_id=claim,
+        error_code="session_binding_changed",
+        error="the session is moving to a new sandbox",
+    )
 
 
 async def _launch_runner_on_host_locked(
@@ -8180,12 +8206,17 @@ async def _launch_runner_on_host_locked(
     caller: str = "recovery",
     request_id: str | None = None,
     on_frame_enqueued: Callable[[], None] | None = None,
+    replace_move_claim: bool = False,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.scheduled_context import current_scheduled_run
+    from omnigent.server.managed_hosts import is_move_claim
 
+    if is_move_claim(conv.runner_id) and not replace_move_claim:
+        # The session is moving onto a new sandbox; that launch starts its runner.
+        return _move_in_progress_attempt(conv.runner_id or "")
     retained = await asyncio.to_thread(
         retained_runner_ids, conversation_store, host_conn.host_id, conv.id
     )
@@ -8202,24 +8233,31 @@ async def _launch_runner_on_host_locked(
     def replace_binding() -> Conversation:
         return conversation_store.replace_runner_id(conv.id, new_runner_id, expected_binding=conv)
 
-    # Preparation above can yield while the old generation connects. Fence
-    # the write itself against connection admission, after every slow await.
-    if superseded_runner_id and runner_router is not None:
-        bound_conv = await asyncio.to_thread(
-            runner_router.run_if_runner_offline, superseded_runner_id, replace_binding
-        )
-        if bound_conv is None:
-            _log_runner_allocation(
-                conv.id,
-                caller=caller,
-                request_id=request_id,
-                old_runner_id=superseded_runner_id,
-                new_runner_id=superseded_runner_id,
-                action="reuse",
+    try:
+        # Preparation above can yield while the old generation connects. Fence
+        # the write itself against connection admission, after every slow await.
+        if superseded_runner_id and runner_router is not None:
+            bound_conv = await asyncio.to_thread(
+                runner_router.run_if_runner_offline, superseded_runner_id, replace_binding
             )
-            return _HostLaunchAttempt(runner_id=superseded_runner_id, acknowledged=True)
-    else:
-        bound_conv = await asyncio.to_thread(replace_binding)
+            if bound_conv is None:
+                _log_runner_allocation(
+                    conv.id,
+                    caller=caller,
+                    request_id=request_id,
+                    old_runner_id=superseded_runner_id,
+                    new_runner_id=superseded_runner_id,
+                    action="reuse",
+                )
+                return _HostLaunchAttempt(runner_id=superseded_runner_id, acknowledged=True)
+        else:
+            bound_conv = await asyncio.to_thread(replace_binding)
+    except ValueError:
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="session_binding_changed",
+            error="the session's host or runner changed before the runner could start",
+        )
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -8434,6 +8472,7 @@ def _start_managed_launch_task(
     conversation_store: ConversationStore,
     tracker: ManagedLaunchTracker,
     startup: ManagedStartupInputs | None,
+    held_runner_id: str | None = None,
 ) -> asyncio.Task[None]:
     """
     Run a managed launch in the background, failing saved inputs it can't deliver.
@@ -8449,8 +8488,108 @@ def _start_managed_launch_task(
     :param tracker: The app's launch tracker; a settled failure is read here.
     :param startup: The server's saved-input service, or ``None`` when the
         server has none.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while this launch provisions, released if shutdown abandons it.
     :returns: The launch task.
     """
+    # Read before the launch settles, which forgets a superseded entry.
+    entry = tracker.get(session_id)
+    superseded_note = (
+        "The message wasn't sent: the session's move to a new sandbox was cancelled "
+        "before the sandbox was ready. Send it again."
+    )
+
+    async def hold_to_settle(*, unbound_only: bool = False) -> str:
+        """
+        Hold the session under the move's claim while this launch settles it.
+
+        Only the move releases its claim, so until it does nothing else can bind
+        the session: a host that takes it afterwards isn't settled with this
+        launch's outcome. A claim handed over to the sandbox's replica, or one
+        its runner replaced, is taken back first, from the binding just read.
+
+        :param unbound_only: Leave a session bound to this launch's sandbox to
+            that sandbox's replica, which finishes the launch.
+        :returns: ``"held"``; ``"bound"`` when left to the sandbox's replica; or
+            ``"taken"`` when another host has the session.
+        """
+        if held_runner_id is None:
+            return "held"
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id == held_runner_id:
+                return "held"
+            on_sandbox = (
+                current.host_id is not None
+                and entry is not None
+                and entry.host_id == current.host_id
+            )
+            if not on_sandbox and (current.host_id is not None or current.runner_id is not None):
+                return "taken"
+            if on_sandbox and unbound_only:
+                return "bound"
+            try:
+                await asyncio.to_thread(
+                    conversation_store.replace_runner_id,
+                    session_id,
+                    held_runner_id,
+                    expected_binding=current,
+                )
+            except ConversationNotFoundError:
+                return "held"
+            except ValueError:
+                continue  # Changed since the read; classify it again.
+            return "held"
+        # Still contended after repeated reads: don't settle the session.
+        return "taken"
+
+    async def release_claim() -> None:
+        """Drop the move's claim, keeping any host its sandbox bound."""
+        if held_runner_id is None:
+            return
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != held_runner_id:
+                return
+            # Compare-and-clear on the exact binding read, so the host stays.
+            try:
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=current
+                )
+            except ConversationNotFoundError:
+                return
+            except ValueError:
+                continue
+            return
+
+    async def settle_superseded() -> None:
+        # Another host runs the session: nothing failed there, but what was
+        # held for this sandbox will never reach it.
+        tracker.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+        if startup is not None:
+            await startup.release_held_inputs(
+                session_id, superseded_note, move_claim=held_runner_id
+            )
+
+    async def settle(held: str, record: Callable[[], Awaitable[object]] | None) -> None:
+        """Record the launch's outcome while the session is held, then release the claim."""
+        if held == "taken":
+            await settle_superseded()
+            return
+        try:
+            if held == "held" and record is not None:
+                await record()
+        finally:
+            await release_claim()
+
+    # Only a move's failure carries its claim; a create's launch has none.
+    move_kwargs = {"move_claim": held_runner_id} if held_runner_id is not None else {}
+
+    def record_failure(reason: str) -> Callable[[], Awaitable[object]] | None:
+        if startup is None:
+            return None
+        return lambda: startup.record_launch_failure(session_id, reason, **move_kwargs)
 
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
@@ -8460,29 +8599,41 @@ def _start_managed_launch_task(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is not None and conv.host_id is None:
             await startup.record_launch_failure(
-                session_id, "the server shut down before the sandbox finished launching"
+                session_id,
+                "the server shut down before the sandbox finished launching",
+                **move_kwargs,
             )
+
+    async def settle_cancelled() -> None:
+        await settle(
+            await hold_to_settle(unbound_only=True),
+            record_unbound_launch_failure if startup is not None else None,
+        )
 
     async def launch_and_record_failure() -> None:
         try:
             await launch
         except asyncio.CancelledError:
-            if startup is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(
-                        record_unbound_launch_failure(),
-                        timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
-                    )
-            raise
-        except Exception as exc:
-            if startup is not None:
-                await startup.record_launch_failure(
-                    session_id, f"managed sandbox failed to launch: {exc}"
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    settle_cancelled(), timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S
                 )
             raise
+        except Exception as exc:
+            await settle(
+                await hold_to_settle(),
+                record_failure(f"managed sandbox failed to launch: {exc}"),
+            )
+            raise
+        if entry is not None and entry.superseded:
+            if startup is not None:
+                await startup.release_held_inputs(
+                    session_id, superseded_note, move_claim=held_runner_id
+                )
+            return
         failed = tracker.get(session_id)
-        if startup is not None and failed is not None and failed.error is not None:
-            await startup.record_launch_failure(session_id, failed.error)
+        if failed is not None and failed.error is not None:
+            await settle(await hold_to_settle(), record_failure(failed.error))
 
     launch_task = asyncio.create_task(launch_and_record_failure())
     _managed_launch_tasks.add(launch_task)
