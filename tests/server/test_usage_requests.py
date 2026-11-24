@@ -314,6 +314,7 @@ async def test_requests_all_only_forwards_bound_accounts(service, monkeypatch) -
         ("expired", "expired", None, "expired"),
         ("partial", "ok", None, "partial"),
         ("unavailable", "ok", None, "partial"),
+        ("over-cap", "ok", None, "partial"),
         ("ok", "ok", "partial", "partial"),
         ("ok", "ok", None, "ok"),
     ],
@@ -457,6 +458,39 @@ def test_usage_request_source_rejects_invalid_owner_bindings(invalid) -> None:
     config = {"base_url": "https://board.example.test", "owners": [OWNER], **invalid}
     with pytest.raises(ValueError, match=r"usage\.request_source\.(owners|account_ids)"):
         usage_request_source({"usage": {"request_source": config}})
+
+
+def test_usage_request_source_rejects_shared_account_id() -> None:
+    config = {
+        "base_url": "https://board.example.test",
+        "owners": ["first-owner", "second-owner"],
+        "account_ids": {"first-owner": ["acct-alpha"], "second-owner": ["acct-alpha"]},
+        "credential_env": "TEST_USAGE_REQUEST_CREDENTIAL",
+    }
+    with pytest.raises(ValueError, match=r"account_ids.*acct-alpha.*multiple owners") as exc:
+        usage_request_source({"usage": {"request_source": config}})
+    assert config["credential_env"] not in str(exc.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bindings", [{}, {"account_ids": {OWNER: []}}])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/me/usage/analysis?group=account&range=d7",
+        "/v1/me/usage/analysis/hours?group=account&range=d7&day=2026-11-05",
+    ],
+)
+async def test_requests_entry_hidden_without_binding(service, monkeypatch, bindings, path) -> None:
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
+    config = {"base_url": "https://board.example.test", "owners": [OWNER], **bindings}
+    app = _make_app(service, usage_request_source({"usage": {"request_source": config}}))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(path)
+        assert response.status_code == 200
+        assert response.json()["requests_configured"] is False
 
 
 @pytest.mark.asyncio
@@ -672,12 +706,12 @@ async def test_requests_credential_refs_and_fail_closed(
             monkeypatch.delenv(env_name)
             missing = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
             assert missing.status_code == 503
-            assert "credential_env is unset or invalid" in caplog.text
+            assert "credential is unset or invalid" in caplog.text
             assert env_name not in caplog.text
 
         # File credential ref.
         cred_file = tmp_path / "request-cred"
-        cred_file.write_text("fake-file-bearer-value\n", encoding="utf-8")
+        cred_file.write_text("fake-file-bearer-value", encoding="utf-8")
         app_file = _make_app(
             service,
             request_source=_bound_source(gateway.base_url, credential_file=str(cred_file)),
@@ -697,3 +731,47 @@ def test_usage_requests_error_holds_status_and_detail() -> None:
     err = UsageRequestsError(504, "request_source_timeout")
     assert err.status_code == 504
     assert err.detail == "request_source_timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "value"),
+    [
+        ("env", "fake-malformed token"),
+        ("env", " fake-malformed"),
+        ("env", "fake-malformed\x01token"),
+        ("file", "fake-malformed\ttoken"),
+        ("file", "fake-malformed\n"),
+        ("file", "fake-malformed\x81token"),
+    ],
+)
+async def test_requests_refuses_malformed_credential(
+    service, monkeypatch, tmp_path, caplog, reference, value
+) -> None:
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
+    service.report_account(
+        OWNER, "acct-alpha", UsageReportV2(schema_version=2, observed_at=NOW), now=NOW
+    )
+    env_name = "TEST_USAGE_REQUEST_BAD_CREDENTIAL"
+    gateway = _FakeGateway([])
+    try:
+        if reference == "env":
+            monkeypatch.setenv(env_name, value)
+            source = _bound_source(gateway.base_url, credential_env=env_name)
+        else:
+            cred_file = tmp_path / "request-cred"
+            cred_file.write_text(value, encoding="utf-8")
+            source = _bound_source(gateway.base_url, credential_file=str(cred_file))
+        app = _make_app(service, source)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Usage request credential is unavailable"
+        assert not gateway.requests
+        assert "fake-malformed" not in caplog.text
+        assert env_name not in caplog.text
+    finally:
+        gateway.close()

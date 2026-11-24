@@ -666,7 +666,9 @@ def create_agent_quota_router(
                     for name in ("filter", "span", "complete", "incomplete_reason", "approx")
                 } | {"hours": payload["hours"]}
             payload["requests_configured"] = (
-                request_source is not None and owner in request_source.owners
+                request_source is not None
+                and owner in request_source.owners
+                and bool(request_source.account_ids.get(owner))
             )
             return JSONResponse(
                 jsonable_encoder(display_values(payload)),

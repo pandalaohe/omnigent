@@ -255,7 +255,10 @@ class UsageRequestSource:
 
 
 def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None:
-    """Validate the server-owned per-request upstream configuration."""
+    """Validate the server-owned per-request upstream configuration.
+
+    Entries are keyed by username. Remove the entries when deleting the account.
+    """
     from urllib.parse import urlsplit
 
     usage = config.get("usage")
@@ -329,6 +332,7 @@ def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None
     if not isinstance(raw_account_ids, Mapping):
         raise ValueError("usage.request_source.account_ids must be a mapping by owner ID")
     account_ids: dict[str, frozenset[str]] = {}
+    assigned_ids: set[str] = set()
     for owner, ids in raw_account_ids.items():
         if owner not in owners:
             raise ValueError("usage.request_source.account_ids must name listed owners")
@@ -338,6 +342,12 @@ def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None
             for account_id in ids
         ):
             raise ValueError("usage.request_source.account_ids must list report account IDs")
+        overlap = assigned_ids.intersection(ids)
+        if overlap:
+            raise ValueError(
+                f"usage.request_source.account_ids lists {min(overlap)!r} under multiple owners"
+            )
+        assigned_ids.update(ids)
         account_ids[owner] = frozenset(ids)
     return UsageRequestSource(
         base_url=base_url.rstrip("/"),

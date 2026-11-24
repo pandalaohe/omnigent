@@ -210,22 +210,20 @@ def resolve_owner_accounts(
 
 
 def _resolve_auth_header(source: UsageRequestSource) -> dict[str, str]:
-    token: str | None = None
     if source.credential_env is not None:
-        token = os.environ.get(source.credential_env, "").strip()
-        if not token or "\r" in token or "\n" in token:
-            _logger.warning("usage.request_source credential_env is unset or invalid")
-            raise UsageRequestsError(503, "Usage request credential is unavailable")
+        token = os.environ.get(source.credential_env, "")
     elif source.credential_file is not None:
         try:
-            token = Path(source.credential_file).read_text(encoding="utf-8").strip()
+            token = Path(source.credential_file).read_text(encoding="utf-8")
         except OSError:
             _logger.warning("usage.request_source credential_file could not be read")
             raise UsageRequestsError(503, "Usage request credential is unavailable") from None
-        if not token or "\r" in token or "\n" in token:
-            _logger.warning("usage.request_source credential_file is empty or invalid")
-            raise UsageRequestsError(503, "Usage request credential is unavailable")
-    return {"Authorization": f"Bearer {token}"} if token is not None else {}
+    else:
+        return {}
+    if not token or re.search(r"[\s\x00-\x1f\x7f-\x9f]", token):
+        _logger.warning("usage.request_source credential is unset or invalid")
+        raise UsageRequestsError(503, "Usage request credential is unavailable")
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _nonneg_int(value: Any) -> int | None:
@@ -348,8 +346,9 @@ def _project_page(payload: Any, filters: UsageRequestsFilter) -> UsageRequestsVi
     state: Literal["ok", "expired", "partial"] = "ok"
     if payload.get("state") == "expired" or section_states == {"expired"}:
         state = "expired"
-    elif payload.get("state") in ("partial", "unavailable") or section_states & {
+    elif payload.get("state") in ("partial", "unavailable", "over-cap") or section_states & {
         "expired",
+        "over-cap",
         "partial",
         "unavailable",
     }:
