@@ -514,6 +514,26 @@ runs the session.
 
 </details>
 
+<details>
+<summary>Choose how Codex handles a model missing from the host catalog</summary>
+
+By default (`fallback`), a native Codex session with an explicit model pick
+missing from the host's current catalog starts on the agent's listed model
+or the default. Set `as_requested` to keep the pick and pass it to Codex.
+The provider can still reject the model when the turn runs.
+
+```bash
+omnigent config set --global codex_native_unlisted_model=as_requested
+omnigent config unset --global codex_native_unlisted_model
+```
+
+The setting lives in the host user's `~/.omnigent/config.yaml`. Set
+`fallback` or remove the entry to restore the default. The next applicable
+launch reads the setting without a host restart. Databricks profile launches
+and sessions with an inference binding use their existing selection rules.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash

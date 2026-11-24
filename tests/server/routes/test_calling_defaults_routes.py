@@ -503,7 +503,7 @@ async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
     assert body["problems"] == []
     assert body["notes"][0]["outcome"] == "missing"
     assert body["notes"][0]["saved"] == "gpt-6-sol"
-    assert any("trying it as unknown" in warning for warning in body["warnings"])
+    assert any("passing it to the host unchanged" in warning for warning in body["warnings"])
 
     # Once the pair is stale, the offered check is skipped entirely.
     stores.cache.mark_error(HOST_A, "codex", "unsupported")
