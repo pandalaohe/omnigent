@@ -24,6 +24,33 @@ import {
 
 const fetcher = vi.hoisted(() => vi.fn());
 
+it("shows Today decisions by source visibility regardless of language or prefix", () => {
+  const task: BoardTask = {
+    uid: "task",
+    title: "Release plan",
+    "omnigent.ai:source": "example",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      quotes: [
+        {
+          id: "shown",
+          task: { source: "example", uid: "task" },
+          text: "按表格更新这条来自外部来源的决定",
+        },
+        {
+          id: "hidden",
+          task: { source: "example", uid: "task" },
+          text: "Internal draft wording",
+          showInSummary: false,
+        },
+      ],
+    },
+  };
+  render(<TaskBoardToday tasks={[task]} sessions={[]} caches={{}} now={0} onSelect={vi.fn()} />);
+  expect(screen.getByText(/按表格更新/)).toBeTruthy();
+  expect(screen.queryByText(/Internal draft wording/)).toBeNull();
+});
+
 it("shows the frozen Taipei 225 repository commits beside 172 linked without assigning links to repositories", () => {
   const { cache, now } = dailyRepositoryFixture(Intl.DateTimeFormat().resolvedOptions().timeZone);
   const { container } = render(

@@ -154,10 +154,18 @@ class Badge(Closed):
     tone: Literal["neutral", "info", "success", "warning", "danger"] | None = None
 
 
+class FileDisplay(Closed):
+    name: Sentence | None = None
+    archived: bool | None = None
+    versionLabel: Label | None = None
+
+
 class DetailRow(Closed):
     id: Id
     label: Key
     value: Note
+    file: FileDisplay | None = None
+    monospace: bool | None = None
 
 
 class TaskIdentity(Closed):
@@ -271,6 +279,7 @@ class Quote(Closed):
     sourceLabel: Label | None = None
     sourceLink: Link | None = None
     rank: Rank | None = None
+    showInSummary: bool | None = None
 
 
 class Commit(Closed):

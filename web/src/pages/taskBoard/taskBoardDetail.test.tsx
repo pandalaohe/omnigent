@@ -83,7 +83,13 @@ const task: BoardTask = {
       },
     ],
     quotes: [
-      { id: "quote", text: "Literal <script>example</script> text", date: "2026-11-12", task: ref },
+      {
+        id: "quote",
+        text: "Literal <script>example</script> text",
+        date: "2026-11-12",
+        task: ref,
+        showInSummary: false,
+      },
     ],
     commits: Array.from({ length: 5 }, (_, index) => ({
       id: String(index),
@@ -397,7 +403,8 @@ it("uses the native tool tuple and live clock instead of the older source tool",
 
 it("shows file short names, deduplicates paths, folds old versions and reports clipboard success or failure", async () => {
   const { TaskSourceDetails } = await import("./TaskSourceDetails");
-  const path = "/opt/work/261024_T260101-EX-AGENT-1_task-placement-trust-separation_design.html";
+  const path = "/opt/work/task-placement.html";
+  const previous = "/opt/work/versions/task-placement.md";
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   render(
@@ -405,24 +412,26 @@ it("shows file short names, deduplicates paths, folds old versions and reports c
       display={{
         version: 1,
         rows: [
-          { id: "path-0", label: "Design", value: path },
+          { id: "path-0", label: "Design", value: path, file: { name: "task placement" } },
           { id: "path-1", label: "Design", value: path },
           {
-            id: "path-2",
+            id: "artifact-previous",
             label: "Design",
-            value:
-              "/opt/work/generation-history/v1/261024_T260101-EX-AGENT-1_task-placement-trust-separation_design.md",
+            value: previous,
+            file: { name: "task placement", archived: true, versionLabel: "v1" },
           },
+          { id: "reference", label: "Reference", value: "ENG-42", monospace: true },
           { id: "event_age", label: "Snapshot event age", value: "12345" },
         ],
       }}
     />,
   );
   const file = screen.getByTitle(path);
-  expect(file.textContent).toContain("task placement trust separation");
+  expect(file.textContent).toContain("task placement");
   expect(screen.getAllByTitle(path)).toHaveLength(1);
+  expect(screen.getByText("ENG-42").closest("dd")?.className).toBe("tb-source-monospace");
   expect(screen.queryByText("Snapshot event age")).toBeNull();
-  expect(screen.queryByTitle(/generation-history/)).toBeNull();
+  expect(screen.queryByTitle(previous)).toBeNull();
   fireEvent.click(file);
   await screen.findByText("Copied");
   expect(writeText).toHaveBeenCalledWith(path);
@@ -430,7 +439,7 @@ it("shows file short names, deduplicates paths, folds old versions and reports c
   fireEvent.click(file);
   await screen.findByText("Copy failed — try again");
   fireEvent.click(screen.getByRole("button", { name: "Older versions (1)" }));
-  expect(screen.getByTitle(/generation-history/)).toBeTruthy();
+  expect(within(screen.getByTitle(previous)).getByText("v1")).toBeTruthy();
 });
 
 it("activates artifact copy by keyboard and hides placeholder path actions", async () => {

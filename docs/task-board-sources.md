@@ -326,8 +326,17 @@ Deletion is scoped to the authenticated owner and removes the source row, its ta
 The canonical [report schema](schemas/task-board-report.schema.json) defines `TaskDisplayV1`,
 `SourceDisplayV1`, and their nested records and bounds. Unknown display fields and unsupported
 versions reject the report; ordinary legacy JSCalendar properties continue to round-trip.
-Task display badges, rows and HTTP links appear in **Source details** when populated. Strings
-render literally. A missing/empty display adds no section. Rich projections are stored for their
+Task display badges, rows and HTTP links appear in **Source details** when populated. A row
+with `file` uses its `value` as the copyable path and `label` as the file type label. Set
+`file.name` to supply a display name, or omit it to show the basename. Set
+`file.archived: true` to place the file under **Older versions**, with an optional
+`file.versionLabel`. Legacy rows with IDs starting with `path-`, `path_`, `path.`, or exactly
+`path` still display as files. Other rows may opt into fixed-width text with `monospace: true`.
+
+A quote with `showInSummary: false` stays in task details and is skipped in the Today and
+Sessions quote summaries. All eligible quotes appear in summaries by default.
+
+Strings render literally. A missing/empty display adds no section. Rich projections are stored for their
 native consumers; supplying a projection does not itself add its chart or view to the page.
 Money is kept at full precision internally and displayed with two fractional digits.
 

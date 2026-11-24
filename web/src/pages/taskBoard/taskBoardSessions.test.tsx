@@ -410,7 +410,8 @@ it("selects seven non-commit events and three eligible quotes by their supplied 
   display.quotes = Array.from({ length: 6 }, (_, index) => ({
     id: `quote-${index}`,
     task: { source: "source", uid: "task" },
-    text: index === 5 ? "推荐 a decision to ignore" : `A decision long enough ${index}`,
+    text: index === 4 ? "推荐保留这条来自外部来源的决定" : `A decision long enough ${index}`,
+    showInSummary: index === 5 ? false : undefined,
     date: `2026-11-0${index + 1}`,
   }));
   display.quotes.push({

@@ -201,7 +201,7 @@ export function recentSessionFacts(tasks: BoardTask[]) {
   );
   const quotes = tasks.flatMap((task) =>
     (task["omnigent.ai:sourceDisplay"]?.quotes ?? [])
-      .filter((quote) => quote.text.length > 8 && !/^(推荐|按表格)/.test(quote.text))
+      .filter((quote) => quote.text.length > 8 && quote.showInSummary !== false)
       .flatMap((quote) => {
         const linked = byId.get(JSON.stringify([quote.task.source, quote.task.uid]));
         return linked ? [{ task: linked, quote }] : [];
