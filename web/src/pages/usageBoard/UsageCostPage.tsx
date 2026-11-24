@@ -16,7 +16,6 @@ import {
   AnalysisV2Shares,
   exactCost,
   paymentRestricted,
-  paymentRestriction,
   v2Failure,
   v2Requests,
   v2Tokens,
@@ -42,6 +41,7 @@ import {
   type PageFilter,
 } from "./usageAnalysisFilters";
 import { formatRingPercent, formatUsageValue } from "./usageBoardFormat";
+import { interfaceText } from "@/lib/interfaceText";
 import "./usageAnalysis.css";
 
 export function UsageCostPage() {
@@ -143,7 +143,7 @@ export function UsageCostPage() {
       />
       {outdated ? (
         <p className="ua-v2-status" role="alert">
-          服务器版本不支持这个筛选
+          {interfaceText("analysisFilterUnsupported")}
         </p>
       ) : null}
       {reading.error && !outdated ? (
@@ -185,7 +185,7 @@ export function UsageCostPage() {
             ) : null}
             {!updating && data.complete && filter.day && filter.slot && !data.totals.last_at ? (
               <p className="ua-v2-status" role="status">
-                这一天没有这个时段的用量
+                {interfaceText("noUsageForTimeSlot")}
               </p>
             ) : null}
             <AnalysisTotals data={data} filter={filter} />
@@ -250,8 +250,8 @@ export function UsageCostPage() {
 function PaymentUnknown() {
   return (
     <div className="ua-unknown">
-      <strong>未知</strong>
-      <small>{paymentRestriction}</small>
+      <strong>{interfaceText("paymentUnknown")}</strong>
+      <small>{interfaceText("paymentRestriction")}</small>
     </div>
   );
 }

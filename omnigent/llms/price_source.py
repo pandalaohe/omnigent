@@ -141,7 +141,7 @@ def selected_source() -> dict:
     _, version, fetched_at = _selected
     return {
         "layer": "import",
-        "name": "导入价",
+        "name": "Imported price",
         "version": version,
         "fetched_at": int(fetched_at) if fetched_at is not None else None,
     }

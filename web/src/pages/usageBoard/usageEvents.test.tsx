@@ -7,10 +7,17 @@ import { sampleTotals } from "./usageActivityFixtures";
 import type { UsageActivity } from "./usageActivityData";
 import { usageJson } from "./usagePriceSourceData";
 
+const locale = vi.hoisted(() => ({ value: "en" }));
+vi.mock("@/lib/uiLanguage", () => ({
+  get uiLanguage() {
+    return locale.value;
+  },
+}));
 vi.mock("./usagePriceSourceData", () => ({ usageJson: vi.fn() }));
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  locale.value = "en";
 });
 
 function setup() {
@@ -46,18 +53,21 @@ it("keeps the cost receipt time after ten refreshes and marks an expired source"
   );
   const { view, client } = setup();
   const rendered = render(view(1000));
-  const label = await screen.findByText(/^费用获取/);
+  expect(screen.getByRole("region", { name: "Event history" })).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Event type" })).toBeTruthy();
+  const label = await screen.findByText(/^Cost fetched/);
   const receipt = label.textContent;
   await waitFor(() => expect(label.className).toContain("text-amber-600"));
   for (let i = 1; i <= 10; i++) {
     rendered.rerender(view(1000 + i));
-    expect(screen.getByText(/^费用获取/).textContent).toBe(receipt);
+    expect(screen.getByText(/^Cost fetched/).textContent).toBe(receipt);
   }
-  expect(screen.queryByText(/下次/)).toBeNull();
+  expect(label).not.toHaveTextContent(/next/i);
   client.clear();
 });
 
 it("renders a paired fault with raw details and filters before paging", async () => {
+  locale.value = "zh-CN";
   vi.mocked(usageJson).mockImplementation(async (path) =>
     path.startsWith("sources")
       ? { sources: [] }
@@ -79,6 +89,8 @@ it("renders a paired fault with raw details and filters before paging", async ()
   );
   const { view, client } = setup();
   render(view(1000));
+  expect(screen.getByRole("region", { name: "事件记录" })).toBeTruthy();
+  expect(screen.getByRole("group", { name: "事件类型" })).toBeTruthy();
   expect(await screen.findByText(/已恢复 · 2分0秒/)).toBeTruthy();
   fireEvent.click(screen.getByText("原文"));
   expect(screen.getByText(/"host": "Workstation"/)).toBeTruthy();

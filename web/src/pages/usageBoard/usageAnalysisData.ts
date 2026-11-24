@@ -170,7 +170,7 @@ export const ANALYSIS_POLL_MS = 300_000;
 
 export class AnalysisFilterMismatch extends Error {
   constructor() {
-    super("服务器版本不支持这个筛选");
+    super("The server did not return the requested usage filter");
   }
 }
 
