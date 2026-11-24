@@ -1090,6 +1090,74 @@ async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("policy_name", "command", "action"),
+    [
+        ("ask_on_os_tools", "git status", "ASK"),
+        ("blast_radius", "git push origin work", "ASK"),
+        ("blast_radius", "git push --force origin work", "DENY"),
+        ("github_policy", "gh pr view 1 --repo example/private", "DENY"),
+        ("working_dir", "cd ../other", "DENY"),
+    ],
+)
+async def test_host_tier_respects_builtin_shell_policies(
+    policy_name: str, command: str, action: str
+) -> None:
+    from omnigent.policies.builtins.github import github_policy
+    from omnigent.policies.builtins.orchestration import blast_radius
+    from omnigent.policies.builtins.safety import ask_on_os_tools
+    from omnigent.policies.builtins.working_dir import block_working_dir_changes
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    ex._note_permission_update(
+        "s1",
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "shell-1",
+            "kind": "execute",
+            "title": "Run command",
+            "rawInput": {"CommandLine": command, "command": "echo other"},
+        },
+    )
+
+    def blast_policy(event):
+        return blast_radius()(event, {})
+
+    policy = {
+        "ask_on_os_tools": ask_on_os_tools,
+        "blast_radius": blast_policy,
+        "github_policy": github_policy(read_all=False, read_repos=["example/public"]),
+        "working_dir": block_working_dir_changes(),
+    }[policy_name]
+    verdicts = []
+
+    async def evaluate(phase, data):
+        assert phase == "PHASE_TOOL_CALL"
+        verdict = policy({"type": "tool_call", "data": data}) or {"result": "ALLOW"}
+        verdicts.append(verdict)
+        return Mock(
+            action=f"POLICY_ACTION_{verdict['result']}", data={"_omnigent_acp_tier": "allow"}
+        )
+
+    ex._policy_evaluator = evaluate
+    result = await ex._decide_permission(
+        {
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "shell-1"},
+            "options": [{"kind": "allow_once", "optionId": "once"}],
+        }
+    )
+    assert verdicts[0]["result"] == action
+    if action == "ASK":
+        assert command in verdicts[0]["reason"]
+    assert result == (False, None)
+    assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "scenario", ["updated-input", "foreign-update", "foreign-request", "update-during-policy"]
 )
 async def test_host_tier_binds_latest_pending_tool_in_its_session(scenario: str) -> None:
