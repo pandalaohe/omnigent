@@ -44,8 +44,9 @@ def test_refusal_wins_over_balance_without_reset_and_is_owner_scoped():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mapping_changes", [False, True])
+@pytest.mark.parametrize("actual_host", ["host", "host-b"])
 async def test_record_and_recover_requires_owner_route_account_and_new_turn(
-    monkeypatch, mapping_changes
+    monkeypatch, mapping_changes, actual_host
 ):
     import json
     from types import SimpleNamespace
@@ -71,12 +72,20 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(
             child_cap_locks=ChildCapLocks(),
         )
     )
-    session = SimpleNamespace(id="session", labels={CHOICE_LABEL: json.dumps({"pool": "account"})})
-    identity = SimpleNamespace(host="host", agent="agent", model="route/model", product="codex")
     original = parse_session_choice(
         {"codexRoutePools": {"route": "account", "route-alias": "account"}}
         if mapping_changes
         else {}
+    )
+    saved_route = provider_route(
+        "host", "agent", "route/model", route_pools=original.codex_route_pools, product="codex"
+    )
+    session = SimpleNamespace(
+        id="session",
+        labels={CHOICE_LABEL: json.dumps({"pool": "account", "poolRoute": saved_route})},
+    )
+    identity = SimpleNamespace(
+        host=actual_host, agent="agent", model="route/model", product="codex"
     )
     replacement = parse_session_choice({"codexRoutePools": {"route": "other-account"}})
     settings = original
@@ -119,7 +128,11 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(
         "owner",
         "account",
         provider_route(
-            "host", "agent", "route/model", route_pools=original.codex_route_pools, product="codex"
+            actual_host,
+            "agent",
+            "route/model",
+            route_pools=original.codex_route_pools,
+            product="codex",
         ),
     )
     assert state.refusals[key].reason == "billing_disabled"

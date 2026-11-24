@@ -579,14 +579,18 @@ def model_family(text: str) -> str:
 
 
 def codex_route_pool(
-    settings: SessionChoice, model: str | None, product: str | None
+    settings: SessionChoice,
+    model: str | None,
+    product: str | None,
+    groups: ProviderGroups | None = None,
 ) -> str | None:
     if product != "codex" or not isinstance(model, str):
         return None
     route, separator, name = model.partition("/")
     if not separator or not name:
         return None
-    return settings.codex_route_pools.get(route)
+    pool = settings.codex_route_pools.get(route)
+    return canonical_pool(pool, groups or {}) if pool is not None else None
 
 
 def pool_of(
@@ -594,7 +598,7 @@ def pool_of(
 ) -> str:
     return (
         (canonical_pool(link._bound_pool, groups or {}) if link._bound_pool else None)
-        or codex_route_pool(settings, link.model, product)
+        or codex_route_pool(settings, link.model, product, groups)
         or (canonical_pool(link.meter, groups or {}) if link.meter else None)
         or f"{product or link.agent_id}:{canonical_model(link.model or '', groups or {})}"
     )
@@ -653,7 +657,7 @@ def pool_of_session(
         model,
         session.reported_model,
     ):
-        pool = codex_route_pool(settings, pinned, product)
+        pool = codex_route_pool(settings, pinned, product, groups)
         if pool is not None:
             return pool
     if isinstance(saved_pool, str):
@@ -974,6 +978,19 @@ def check_candidate_limits(
     link = _candidate_link(settings, link, request)
     if (until := (request.link_exclusions or {}).get(link.agent_id, 0)) > now:
         return Skipped(link, "excluded", until)
+    product = request.products.get(link.agent_id, link.agent_id)
+    pool = pool_of(settings, link, product, request.provider_groups)
+    prefix, _, model = (link.model or "").partition("/")
+    if (
+        product == "codex"
+        and prefix
+        and model
+        and not settings.codex_route_pools
+        and not (link.meter or link._bound_pool)
+        and (settings.limits or request.exclude)
+        and pool not in canonical_pool_values(settings.limits, request.provider_groups)
+    ):
+        return Skipped(link, "identity_unavailable")
     if (
         settings.schema_version == 2
         and link.model is None
@@ -1005,8 +1022,6 @@ def check_candidate_limits(
         return failure
     if user_named:
         return None
-    product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(settings, link, product, request.provider_groups)
     legacy = pool_limits(settings, link, product, request.provider_groups)
     cap = legacy.max_running if link.meter else link.max_running
     if (

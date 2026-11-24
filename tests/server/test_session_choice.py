@@ -1831,6 +1831,30 @@ def test_route_pool_is_opt_in_and_survives_document_round_trip():
     )
 
 
+def test_mapped_pool_alias_uses_the_same_quota_and_running_ids_as_a_meter():
+    from omnigent.models.model_reference import provider_groups
+
+    pool = "codex:new/account"
+    settings = table(
+        (1,),
+        codexRoutePools={"route-a": "codex:old/account"},
+        tiers=[[{"links": [{"agent": "agent-0", "model": "route-a/gpt-example"}]}]],
+        limits={pool: {"maxRunning": 1}},
+    )
+    groups = provider_groups([("new", "old")])
+    request = ChoiceRequest(OWNER, "host-a", products={"agent-0": "codex"}, provider_groups=groups)
+    assert pick(settings, request=request).pool == pool
+    assert pick(settings, request=request, running={pool: ("child",)}).reason == "busy"
+    session = Conversation(
+        id="child",
+        created_at=NOW,
+        updated_at=NOW,
+        root_conversation_id="child",
+        model_override="route-a/gpt-example",
+    )
+    assert pool_of_session(session, settings, product="codex", groups=groups) == pool
+
+
 @pytest.mark.parametrize("meter", ["pool-primary", "pool-secondary"])
 def test_codex_meter_keeps_the_link_model_as_written(meter):
     raw = table((1,)).model_dump(mode="json", by_alias=True)

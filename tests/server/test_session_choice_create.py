@@ -100,6 +100,39 @@ async def save_choice(client, settings, revision):
     return await client.put(CHOICE_URL, json={"settings": settings, "expected_revision": revision})
 
 
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("protection", ["limits", "exclusion"])
+async def test_unmapped_codex_pin_cannot_bypass_pool_protection(
+    choice_env, monkeypatch, named, protection
+):
+    env = choice_env
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    link = {"agent": env.agents[0]["id"], "model": "route-a/gpt-example"}
+    env.settings["presets"][0]["links"] = [link]
+    env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
+    options: dict[str, str | bool | list[str]] = {}
+    if protection == "exclusion":
+        env.settings["limits"] = {}
+        options["exclude"] = ["pool-0"]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    if named:
+        options.update(agent_id=link["agent"], model_override=link["model"], user_named=True)
+    response = await create(env, **options)
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    if named:
+        assert detail["code"] == "identity_unavailable"
+    else:
+        assert detail["skipped"][0]["why"] == "identity_unavailable"
+
+
 @pytest.fixture
 def drain_choice_env(choice_env):
     env = choice_env
@@ -1926,6 +1959,7 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
     agent = env.agents[0]["id"]
     model = f"{route}/gpt-example"
     link = {"agent": agent, "model": model}
+    mapped = pool is not None
     if pool is None:
         pool = "pool-standalone"
         link["meter"] = pool
@@ -1966,7 +2000,7 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
     # Exercise the same report through the persisted snapshot and queue boundary.
     env.store.update_conversation(first["id"], reported_model="gpt-example")
     held = env.store.get_conversation(second["id"])
-    assert not await release_choice(env.app, held, HOST)
+    assert await release_choice(env.app, held, HOST) is not mapped
     if limit == "stop":
         now = time.time()
         env.app.state.agent_quota_service.report_account(
@@ -1987,7 +2021,10 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
             now=now,
         )
         line = stopped_line(env.app, reported)
-        assert line is not None and line.state == "stop"
+        if mapped:
+            assert line is not None and line.state == "stop"
+        else:
+            assert line is None
         stopped = await create(env)
         assert stopped.status_code == 201, stopped.text
         choice = stopped.json()["session_choice"]
@@ -1996,7 +2033,8 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
         assert not await release_choice(env.app, held, HOST)
     else:
         env.store.set_session_live_status(first["id"], "idle")
-        assert await release_choice(env.app, held, HOST)
+        if mapped:
+            assert await release_choice(env.app, held, HOST)
         released = choice_record(env.store.get_conversation(second["id"]))
         assert released is not None
         assert released["model"] == model

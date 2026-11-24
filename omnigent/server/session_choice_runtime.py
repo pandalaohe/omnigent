@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -35,6 +36,7 @@ from omnigent.server.session_choice import (
     active_on,
     candidate_lines,
     check_candidate_limits,
+    codex_route_pool,
     holds_slot,
     needs_route_model,
     ordered_links,
@@ -156,7 +158,8 @@ async def _persist_admitted_drain(app, owner, snapshot, admitted) -> bool:
         return False
 
 
-def session_identity(app, session):
+def session_identity(app, session, settings: SessionChoice | None = None):
+    """Use the configured pool for limit identity, and the launch route for events."""
     from omnigent.runner.routing import routing_host_id
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
@@ -177,7 +180,14 @@ def session_identity(app, session):
         )
     )
     route, _, launch_model = (session.model_override or "").partition("/")
-    if product == "codex" and route and launch_model and model and "/" not in model:
+    if (
+        product == "codex"
+        and route
+        and launch_model
+        and model
+        and "/" not in model
+        and (settings is None or codex_route_pool(settings, session.model_override, product))
+    ):
         # A bare runner report changes the model name, not the launch route.
         model = f"{route}/{model}"
     return RunningIdentity(
@@ -215,7 +225,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
     )
     if tile is None:
         return None, ()
-    identity = session_identity(app, session)
+    identity = session_identity(app, session, settings)
     if any(
         rule.agent == identity.agent
         and (rule.host is None or identity.host is None or rule.host == identity.host)
@@ -354,7 +364,10 @@ def tile_of_session(
     )
     if pool in readings:
         return pool
-    if product == "codex" and pool in settings.codex_route_pools.values():
+    if product == "codex" and any(
+        pool == canonical_pool(mapped, groups or {})
+        for mapped in settings.codex_route_pools.values()
+    ):
         return None
     if product is None:
         return None
@@ -712,12 +725,23 @@ async def record_provider_recovery(
         attempt = state.provider_attempts.get(execution)
         if attempt is None or input_generation > attempt.generation:
             bound_route = record.get("poolRoute") if record else None
+            try:
+                saved_route = json.loads(bound_route) if isinstance(bound_route, str) else None
+            except ValueError:
+                saved_route = None
+            route_key = route
+            if (
+                isinstance(saved_route, list)
+                and len(saved_route) == 3
+                and isinstance(saved_route[2], str)
+            ):
+                route_key = json.dumps([current.host, current.agent, saved_route[2]])
             state.provider_attempts[execution] = ProviderAttempt(
                 response_id,
                 input_generation,
                 time.time(),
                 pool,
-                bound_route if isinstance(bound_route, str) else route,
+                route_key,
                 route,
                 dict(route_pools),
             )
@@ -1193,7 +1217,6 @@ async def authorize_agents(app: Any, request: ChoiceRequest) -> ChoiceRequest:
 def running_pools(
     app: Any, owner: str, settings: SessionChoice, products: Any, now: float, groups=None
 ):
-    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
     from omnigent.server.session_collab import collab_owners_for
 
     store = app.state.conversation_store
@@ -1214,16 +1237,11 @@ def running_pools(
             resolved_owner = owners.get(session.id)
             if resolved_owner is not None and resolved_owner != owner:
                 continue
-            identity = session_identity(app, session)
-            product = agent_key_for_harness(
-                _resolve_harness_impl(
-                    session, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
-                )
-            )
+            identity = session_identity(app, session, settings)
             pool = pool_of_session(
                 session,
                 settings,
-                product=product,
+                product=identity.product,
                 model=identity.model,
                 products=products,
                 groups=groups,
@@ -1482,6 +1500,7 @@ async def admit_create(
                     probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
                 )
             )
+            request = replace(request, products={**request.products, body.agent_id: product})
             model = (
                 body.model_override
                 or request.effective_models.get(body.agent_id)
@@ -1504,7 +1523,6 @@ async def admit_create(
             )
             if settings.schema_version == 2:
                 link = link.model_copy(update={"model": model})
-                request = replace(request, products={**request.products, body.agent_id: product})
                 if pool is None:
                     pool = pool_of(settings, link, product, request.provider_groups)
             meter = next(
@@ -1674,7 +1692,7 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             update={"meter": record.get("pool") if record.get("meter") else None}
         )
         if settings.schema_version == 2:
-            identity = await asyncio.to_thread(session_identity, app, current)
+            identity = await asyncio.to_thread(session_identity, app, current, settings)
             if identity.agent is None or identity.host != host:
                 return False
             link = link.model_copy(update={"agent_id": identity.agent, "model": identity.model})

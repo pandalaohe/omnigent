@@ -41,6 +41,7 @@ export interface SessionChoiceDocument {
   [key: string]: unknown;
   schemaVersion?: number;
   limitRules?: ChoiceLimitRule[];
+  codexRoutePools?: Record<string, string>;
   enabled: boolean;
   strategy: "drain" | "balance";
   defaultWorkType?: string | null;
