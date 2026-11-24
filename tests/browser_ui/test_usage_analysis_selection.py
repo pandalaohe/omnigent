@@ -171,7 +171,7 @@ def test_analysis_selection(page: Page, appearance_url: str, analysis_reads, pre
     results = page.get_by_test_id("analysis-results")
     totals = results.get_by_role("region", name="Totals")
     expect(totals.get_by_text("$1.00", exact=True)).to_be_visible()
-    expect(totals.get_by_text("未知", exact=True)).to_have_count(2)
+    expect(totals.get_by_text("Unknown", exact=True)).to_have_count(2)
     expected_request = {
         "range": ["d7"],
         "group": ["model"],
