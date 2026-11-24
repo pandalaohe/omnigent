@@ -103,7 +103,7 @@ export function TaskBoardToday({
   const quotes = tasks
     .flatMap((task) =>
       (task["omnigent.ai:sourceDisplay"]?.quotes ?? [])
-        .filter((q) => q.text.length > 8 && !/^推荐|^按表格/.test(q.text))
+        .filter((q) => q.text.length > 8 && q.showInSummary !== false)
         .map((q) => ({ task, q })),
     )
     .sort(

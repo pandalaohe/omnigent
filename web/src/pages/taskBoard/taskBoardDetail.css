@@ -686,9 +686,7 @@
   }
 }
 
-.tb-source-id .tb-fold-value {
-  white-space: nowrap;
-  overflow-wrap: normal;
+.tb-source-monospace .tb-fold-value {
   font-family: var(--font-mono, monospace);
   font-size: 12px;
   font-weight: 500;

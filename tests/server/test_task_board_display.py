@@ -50,6 +50,16 @@ def test_legacy_and_rich_display_preserve_input():
         "version": 1,
         "state": "running",
         "identity": {"key": "ENG-42", "label": "Example", "groupId": "team"},
+        "rows": [
+            {
+                "id": "artifact",
+                "label": "Design",
+                "value": "/opt/work/releases/plan.md",
+                "file": {"name": "Release plan", "archived": True, "versionLabel": "v1"},
+            },
+            {"id": "reference", "label": "Reference", "value": "ENG-42", "monospace": True},
+            {"id": "path-0", "label": "Notes", "value": "/opt/work/notes.txt"},
+        ],
         "links": [{"id": "issue", "label": "Issue", "href": "https://issues.example.org/42"}],
         "sessions": [
             {
@@ -69,7 +79,7 @@ def test_legacy_and_rich_display_preserve_input():
         "intervals": [
             {"id": "interval-1", "from": STAMP, "to": None, "agentId": "agent", "origin": "event"}
         ],
-        "quotes": [{"id": "quote-1", "text": "A quote", "task": ref}],
+        "quotes": [{"id": "quote-1", "text": "A quote", "task": ref, "showInSummary": False}],
     }
     item = task(display, progress="in-process")
     assert report(item).tasks == [item]
@@ -239,6 +249,21 @@ def test_shape_rejection_matches_schema(display):
     value = task(display)
     with pytest.raises(ReportError):
         report(value)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(value, SCHEMA)
+
+
+@pytest.mark.parametrize("metadata", [{"archived": "true"}, {"name": " "}, {"unknown": True}])
+def test_invalid_file_metadata_rejected_by_parser_and_schema(metadata):
+    value = task(
+        {
+            "version": 1,
+            "rows": [{"id": "file", "label": "Notes", "value": "notes.md", "file": metadata}],
+        }
+    )
+    with pytest.raises(ReportError) as error:
+        report(value)
+    assert error.value.path.startswith(KEY + ".rows[0].file")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(value, SCHEMA)
 

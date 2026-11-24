@@ -81,7 +81,13 @@ export interface TaskDisplay {
     label: string;
     tone?: "neutral" | "info" | "success" | "warning" | "danger";
   }[];
-  rows?: { id: string; label: string; value: string }[];
+  rows?: {
+    id: string;
+    label: string;
+    value: string;
+    file?: { name?: string; archived?: boolean; versionLabel?: string };
+    monospace?: boolean;
+  }[];
   links?: { id: string; label: string; href: string }[];
   actors?: { id: string; agentId: string; label: string; host?: string }[];
   sessions?: DisplaySession[];
@@ -105,6 +111,7 @@ export interface TaskDisplay {
     at?: string;
     rank?: number;
     sourceLabel?: string;
+    showInSummary?: boolean;
   }[];
   commits?: { id: string; sha: string; subject: string; at: string }[];
   events?: {
