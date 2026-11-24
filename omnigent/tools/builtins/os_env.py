@@ -128,7 +128,10 @@ _OS_SHELL_SCHEMA: dict[str, Any] = {
         },
         "timeout": {
             "type": "integer",
-            "description": "Timeout in seconds.",
+            "description": (
+                "Maximum command runtime in seconds (default: 120). "
+                "Set a longer timeout explicitly for builds or tests."
+            ),
         },
     },
     "required": ["command"],
