@@ -2801,11 +2801,13 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
     """Use the native trajectory boundary to attribute background replies."""
     from omnigent.entities import ConversationItem, MessageData, PagedList
     from omnigent.harnesses.antigravity_native import reader
+    from omnigent.runner.tool_dispatch import execute_tool
     from omnigent.server.routes._sessions.orchestration import (
         _enrich_terminal_status_with_subagent_output,
     )
     from omnigent.stores.conversation_store import ConversationStore
     from tests._helpers.polling import poll_until_async
+    from tests.runner.conftest import _drain_session_event_queue
 
     fixture_dir = Path(__file__).parents[1] / "fixtures" / "antigravity" / "steps"
     user_step = json.loads((fixture_dir / "user_input.json").read_text(encoding="utf-8"))
@@ -2826,8 +2828,16 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
     cascade_id = "cascade-for-background-task"
     app, server = _delivery_app([])
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    parent_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    if scenario == "new_input":
+        server._child_body.update(title="reviewer:follow-up", status="idle")
+        monkeypatch.setattr(subagent_work, "_child_session_parents", {})
+        monkeypatch.setattr(
+            runner_app, "_child_session_parents", subagent_work._child_session_parents
+        )
+        monkeypatch.setitem(runner_app._session_event_queues_ref, PARENT_SESSION_ID, parent_events)
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
-    subagent_work.register_subagent_work(
+    original_dispatch = subagent_work.register_subagent_work(
         parent_session_id=PARENT_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
@@ -2917,7 +2927,8 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
             assert [status for status, _ in edges] == ["running", "idle"]
             assert inbox.empty() and wakes() == []
 
-            expected_replies = ["Background task finished."]
+            expected_reply = "Background task finished."
+            expected_dispatch = original_dispatch
             if scenario == "quiet":
                 quiet = "Still waiting.\n[quiet]"
                 steps.append(planner(51, quiet))
@@ -2948,24 +2959,49 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
                 if scenario == "tool_unsettled":
                     steps[-1]["status"] = "CORTEX_STEP_STATUS_DONE"
             else:
-                steps.append(planner(51, "First background reply"))
+                earlier_reply = "First background reply"
+                steps.append(planner(51, earlier_reply))
                 await replay()
                 if scenario == "new_input":
+                    # The real send pairs a new work id with the preceding item
+                    # before the accepted input arrives in the AG trajectory.
+                    previous_item = server.items[0]
+                    assert previous_item["content"][0]["text"] == earlier_reply
+                    new_prompt = "Run the follow-up task."
+                    handle = json.loads(
+                        await execute_tool(
+                            tool_name="sys_session_send",
+                            arguments=json.dumps(
+                                {"session_id": CHILD_SESSION_ID, "args": new_prompt}
+                            ),
+                            conversation_id=PARENT_SESSION_ID,
+                            server_client=server,  # type: ignore[arg-type]
+                            session_inbox=inbox,
+                        )
+                    )
+                    assert handle["status"] == "launching"
+                    new_dispatch = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+                    assert (
+                        new_dispatch is not None
+                        and new_dispatch.work_id != original_dispatch.work_id
+                    )
+                    assert new_dispatch.prior_result_key == previous_item["id"]
+                    expected_dispatch = new_dispatch
                     new_input = copy.deepcopy(user_step)
                     new_input["metadata"]["executionId"] = "second-user-input"
+                    new_input["userInput"]["items"] = [{"text": new_prompt}]
+                    new_input["userInput"]["userResponse"] = new_prompt
                     steps.append(new_input)
                     await replay()
-                    assert edges[2:5] == [
-                        ("running", None),
-                        ("idle", "First background reply"),
-                        ("running", None),
-                    ]
-                    assert user_edges == [1, 5]
-                    expected_replies = ["First background reply", "Reply to the new input."]
+                    assert edges[2:] == [("running", None)]
+                    assert user_edges == [1, 3]
+                    assert new_dispatch.status == "running"
+                    assert inbox.empty() and wakes() == []
+                    expected_reply = "Reply to the new input."
                 else:
                     assert len(edges) == 2, "planner text alone opened a turn"
 
-            steps.append(planner(53, expected_replies[-1]))
+            steps.append(planner(53, expected_reply))
             await replay()
             if scenario == "merged":
                 assert len(edges) == 2, "both replies arrived before the confirmed idle boundary"
@@ -2973,21 +3009,33 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
             await replay()
             await settle()
 
-        assert server.items[0]["content"][0]["text"] == expected_replies[-1]
+        assert server.items[0]["content"][0]["text"] == expected_reply
         results = [inbox.get_nowait() for _ in range(inbox.qsize())]
         assert [(item["status"], item["output"]) for item in results] == [
-            ("completed", reply) for reply in expected_replies
+            ("completed", expected_reply)
         ]
-        assert [output for status, output in edges if status == "idle"][
-            -len(expected_replies) :
-        ] == (expected_replies)
+        assert edges[-1] == ("idle", expected_reply)
         await poll_until_async(wakes, timeout_s=2)
         notices = wakes()
-        assert "finished (completed)" in notices[0]
-        if scenario == "new_input":
-            return
         assert len(notices) == 1
+        assert "finished (completed)" in notices[0]
         assert "1 result waiting in inbox" in notices[0]
+        if scenario == "new_input":
+            assert edges[2:] == [("running", None), ("idle", expected_reply)]
+            assert results[0]["work_id"] == expected_dispatch.work_id
+            assert "reviewer/follow-up finished (completed)" in notices[0]
+            assert server.items[1]["content"][0]["text"] == "First background reply"
+            completed_updates = [
+                event["child"]
+                for event in _drain_session_event_queue(parent_events)
+                if event["type"] == "session.child_session.updated"
+                and event["child_session_id"] == CHILD_SESSION_ID
+                and event["child"]["current_task_status"] == "completed"
+            ]
+            assert [
+                (child["session_name"], child["last_message_preview"])
+                for child in completed_updates
+            ] == [("follow-up", expected_reply)]
 
 
 @pytest.mark.asyncio

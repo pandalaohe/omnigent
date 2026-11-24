@@ -62,7 +62,6 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from itertools import pairwise
 from pathlib import Path
 from time import monotonic
 from typing import Literal
@@ -1575,7 +1574,6 @@ async def _commit_step(
     cascade_id: str,
     state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
-    previous_step: dict[str, object] | None = None,
 ) -> None:
     """
     Emit one step's committed items + status edges + interaction (poll path).
@@ -1600,7 +1598,6 @@ async def _commit_step(
     :param cascade_id: agy cascade id (namespaces ids).
     :param state: Per-run shared trackers.
     :param on_pending_interaction: Async callback for a distinct interaction.
-    :param previous_step: Preceding step when committing an ordered snapshot.
     :returns: None.
     """
     key = _step_key(step)
@@ -1621,13 +1618,8 @@ async def _commit_step(
             state.pending_metering.discard(key)
     if key not in state.seen:
         if _is_user_turn_step(step):
-            if state.continuation_tail is not None:
-                if previous_step is None:
-                    previous_step = await _step_before_input(state.port, cascade_id, key)
-                output = _continuation_output(state, previous_step)
-                if output is not None:
-                    await _post_continuation(client, session_id, output)
             state.turn_generation += 1
+            # A new input discards the unconfirmed candidate before opening its turn.
             state.closed_reply = state.continuation_tail = None
             state.turn_error = None
             state.idle_ticks = 0
@@ -1816,23 +1808,6 @@ async def _note_observed_work(
         state.observation_notice_at = float("-inf")
 
 
-async def _step_before_input(
-    port: int, cascade_id: str, input_key: _StepKey
-) -> dict[str, object] | None:
-    """A live input frame has no step index. Find its predecessor in native order."""
-    try:
-        steps = await asyncio.to_thread(
-            get_trajectory_steps, port, cascade_id, timeout_s=_IDLE_READ_TIMEOUT_S
-        )
-    except (httpx.HTTPError, ValueError) as exc:
-        _logger.warning("agy input boundary snapshot failed: cascade=%s error=%r", cascade_id, exc)
-        return None
-    return next(
-        (previous for previous, step in pairwise(steps) if _step_key(step) == input_key),
-        None,
-    )
-
-
 def _continuation_output(state: _ReaderState, tail: dict[str, object] | None) -> str | None:
     if (
         tail is not None
@@ -1905,7 +1880,6 @@ async def _reconcile_idle_turn(
                     cascade_id=cascade_id,
                     state=state,
                     on_pending_interaction=on_pending_interaction,
-                    previous_step=tail,
                 )
                 tail = step
         if generation != state.turn_generation:
