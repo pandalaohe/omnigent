@@ -23541,11 +23541,11 @@ async def test_relay_approval_outlives_execution_and_http_timeouts(
 async def test_relay_approval_does_not_extend_another_calls_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A parked create cannot keep an unrelated stuck shell call alive."""
+    """A parked create cannot keep an unrelated stuck read alive."""
     from omnigent.runner import pending_approvals
 
     monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
-    waiting, shell_cancelled = asyncio.Event(), asyncio.Event()
+    waiting, read_cancelled = asyncio.Event(), asyncio.Event()
 
     async def executor(name, arguments):
         if name == "sys_scheduled_task_create":
@@ -23561,7 +23561,7 @@ async def test_relay_approval_does_not_extend_another_calls_budget(
         try:
             await asyncio.Future()
         finally:
-            shell_cancelled.set()
+            read_cancelled.set()
 
     loop = asyncio.get_running_loop()
     approval = asyncio.create_task(
@@ -23573,13 +23573,13 @@ async def test_relay_approval_does_not_extend_another_calls_budget(
         await asyncio.wait_for(waiting.wait(), 1)
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_shell", {}
+                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_read", {}
             ),
             1,
         )
         assert result["isError"]
         assert "active work" in result["content"][0]["text"]
-        await asyncio.wait_for(shell_cancelled.wait(), 1)
+        await asyncio.wait_for(read_cancelled.wait(), 1)
         assert not approval.done()
         assert pending_approvals.resolve("elicit_concurrent", False)
         assert not (await asyncio.wait_for(approval, 1)).get("isError")
