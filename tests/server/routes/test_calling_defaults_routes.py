@@ -673,6 +673,50 @@ async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
     assert explicit.json()["permission_tier_state"] == "blocked"
 
 
+async def test_expired_acp_model_catalog_refreshes_once_and_preserves_last_success(
+    client, app, stores, monkeypatch
+):
+    import asyncio
+
+    from tests._helpers.polling import poll_until_async
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp:neutral": True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    stores.cache.upsert(HOST_A, "acp:neutral", previous, 100)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def failed_probe(**kwargs):
+        assert kwargs["refresh"] == "force"
+        started.set()
+        await release.wait()
+        return {"status": "failed", "error": "ACP probe timed out"}
+
+    proxy = AsyncMock(side_effect=failed_probe)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults.now_epoch", lambda: 1000)
+    params = {"host_id": HOST_A, "harness": "acp:neutral"}
+    try:
+        first = await client.get("/v1/calling-defaults/catalogs", params=params)
+        row = first.json()["rows"][0]
+        assert row["stale"] is True
+        assert row["models"] == previous
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = await client.get("/v1/calling-defaults/catalogs", params=params)
+        assert second.json()["rows"][0]["models"] == previous
+        proxy.assert_awaited_once()
+    finally:
+        release.set()
+    await poll_until_async(
+        lambda: stores.cache.list([HOST_A])[0]["error"] is not None, timeout_s=2
+    )
+    row = stores.cache.list([HOST_A])[0]
+    assert row["models"] == previous
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe timed out"
+
+
 async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
 
@@ -696,6 +740,7 @@ async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stor
     )
     assert synced.status_code == 200, synced.text
     assert synced.json()["rows"][0]["permission_options"] == options
+    assert proxy.await_args.kwargs["refresh"] == "force"
     stores.prefs.patch_namespace(
         "local", "calling_defaults", {"*": {"*": {"permission": "automatic"}}}
     )

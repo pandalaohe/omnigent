@@ -238,6 +238,8 @@ async def fetch_model_source(
                 if result["error"]:
                     raise AcpModelProbeError(result["error"])
                 rows = result["models"]
+                if not rows and read_catalog(namespace, key):
+                    raise AcpModelProbeError("ACP probe returned an empty model catalog")
                 write_catalog("acp-modes", key, result["permission_options"])
             source_label = {
                 "url": "URL",
