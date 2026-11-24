@@ -32,6 +32,8 @@ _Config: TypeAlias = dict[str, object]
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _GLOBAL_CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 _LOCAL_CONFIG_RELPATH = Path(".omnigent") / "config.yaml"
+CODEX_NATIVE_UNLISTED_MODEL_KEY = "codex_native_unlisted_model"
+CODEX_NATIVE_UNLISTED_MODEL_MODES = ("as_requested", "fallback")
 
 
 def global_config_path(default_path: Path | None = None) -> Path:
@@ -41,14 +43,49 @@ def global_config_path(default_path: Path | None = None) -> Path:
     return default_path or _GLOBAL_CONFIG_PATH
 
 
-def load_global_config(path: Path | None = None) -> _Config:
+def load_global_config(path: Path | None = None, *, require_mapping: bool = False) -> _Config:
     """Load the user-level config, returning an empty mapping when absent."""
     resolved_path = path or global_config_path()
-    if not resolved_path.exists():
+    try:
+        with resolved_path.open() as config_file:
+            if not require_mapping:
+                return yaml.safe_load(config_file) or {}
+            loader = yaml.SafeLoader(config_file)
+            try:
+                document = loader.get_single_node()
+                raw = {} if document is None else loader.construct_document(document)
+            finally:
+                loader.dispose()
+    except FileNotFoundError:
         return {}
-    with resolved_path.open() as config_file:
-        raw: _Config = yaml.safe_load(config_file) or {}
-        return raw
+    if not isinstance(raw, dict):
+        raise ValueError("user config must be a YAML mapping")
+    return raw
+
+
+def codex_native_allows_unlisted_model() -> bool:
+    """Read the host's opt-in for launching an explicit unlisted Codex model."""
+    try:
+        config = load_global_config(require_mapping=True)
+    except OSError as exc:
+        reason = f"cannot read user config ({type(exc).__name__})"
+    except (yaml.YAMLError, UnicodeError):
+        reason = "cannot parse user config as YAML"
+    except ValueError:
+        reason = "user config must be a YAML mapping"
+    else:
+        mode = config.get(CODEX_NATIVE_UNLISTED_MODEL_KEY, "fallback")
+        if mode in CODEX_NATIVE_UNLISTED_MODEL_MODES:
+            return mode == "as_requested"
+        reason = "invalid setting value"
+
+    _log.warning(
+        "%s: %s. Expected %s. Using fallback.",
+        CODEX_NATIVE_UNLISTED_MODEL_KEY,
+        reason,
+        " or ".join(CODEX_NATIVE_UNLISTED_MODEL_MODES),
+    )
+    return False
 
 
 def load_local_config(path: Path | None = None) -> _Config:
@@ -95,7 +132,11 @@ def _merge_effective_config(
     """
     merged: _Config = {
         **global_cfg,
-        **{key: value for key, value in local_cfg.items() if key not in {"server", "harness"}},
+        **{
+            key: value
+            for key, value in local_cfg.items()
+            if key not in {"server", "harness", CODEX_NATIVE_UNLISTED_MODEL_KEY}
+        },
     }
     g_harness = global_cfg.get("harness")
     l_harness = local_cfg.get("harness")
@@ -219,16 +260,25 @@ def load_effective_config(
     workspace: str | Path | None = None,
     preference_context: PreferenceContext | None = None,
     preference_layers: Sequence[PreferenceLayer] = (),
+    ignore_invalid_user_config: bool = False,
 ) -> _Config:
     """Merge global and project config, preserving user-owned launch settings.
 
     Project values take precedence except for server selection and harness
     executables and arguments. When supplied, *workspace* selects the project
-    config directory instead of the process cwd.
+    config directory instead of the process cwd. Native Codex launch callers
+    can use built-in defaults when the user configuration is unreadable.
     """
     local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
+    if ignore_invalid_user_config:
+        try:
+            global_cfg = load_global_config(require_mapping=True)
+        except (OSError, ValueError, yaml.YAMLError):
+            global_cfg = {}
+    else:
+        global_cfg = load_global_config()
     return resolve_effective_config(
-        load_global_config(),
+        global_cfg,
         load_local_config(local_path),
         preference_context=preference_context,
         preference_layers=preference_layers,

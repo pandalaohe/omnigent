@@ -2850,7 +2850,7 @@ def _configured_app_server_command() -> tuple[str, ...]:
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_codex_app_server_command
 
-    return resolve_codex_app_server_command(load_effective_config())
+    return resolve_codex_app_server_command(load_effective_config(ignore_invalid_user_config=True))
 
 
 def _codex_app_server_command_identity() -> tuple[object, ...]:

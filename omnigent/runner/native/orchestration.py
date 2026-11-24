@@ -60,6 +60,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.config import codex_native_allows_unlisted_model
 from omnigent.debug_logging import StageTimings, debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -6228,7 +6229,9 @@ async def _launch_codex_native_tui(
     )
 
     # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
+    _codex_harness_cfg = load_effective_config(
+        workspace=workspace, ignore_invalid_user_config=True
+    )
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
@@ -6604,9 +6607,12 @@ async def _auto_create_codex_terminal(
                     session_id,
                     extra={"session_id": session_id},
                 )
-            elif reachable is None and _codex_launch.profile is None:
-                # A list can lag what the provider serves and never shows router pins, so
-                # launch the explicit pick as requested; the provider's answer decides.
+            elif (
+                reachable is None
+                and _codex_launch.profile is None
+                and await asyncio.to_thread(codex_native_allows_unlisted_model)
+            ):
+                # An opted-in host lets the provider decide whether it serves the pick.
                 offered = ", ".join(
                     str(row.get("id") or row.get("model") or "") for row in _launch_models.rows
                 )

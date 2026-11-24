@@ -88,7 +88,10 @@ class ResolutionNote:
 
     def warning(self) -> str:
         if self.outcome == "missing":
-            return f"{self.saved} is not in this host's model catalog; trying it as unknown."
+            return (
+                f"{self.saved} is not in this host's model catalog; "
+                "passing it to the host unchanged."
+            )
         return f"{self.saved} resolved to {self.model} on this host."
 
 
