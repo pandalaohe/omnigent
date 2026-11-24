@@ -90,11 +90,14 @@ describe("host catalog refresh", () => {
       expect(result.current.data.rows[0].injects_prompt).toBe(true);
       fetchMock.mockImplementationOnce(async () => {
         injectsPrompt = false;
-        return mockResponse(status === 200 ? { models: [] } : { detail: "probe failed" }, status);
+        return mockResponse(
+          status === 200 ? { models: [{ id: "available" }] } : { detail: "probe failed" },
+          status,
+        );
       });
       await act(async () => {
         const refresh = refreshHostModelOptions(client, "host", "acp:neutral", "force");
-        if (status === 200) await expect(refresh).resolves.toEqual([]);
+        if (status === 200) await expect(refresh).resolves.toEqual([{ id: "available" }]);
         else await expect(refresh).rejects.toThrow("probe failed");
       });
       await waitFor(() => expect(result.current.data.rows[0].injects_prompt).toBe(false));
@@ -888,6 +891,23 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
 });
 
 describe("useHostModelOptions", () => {
+  it.each([200, 502])(
+    "keeps the last good ACP options after an empty refresh (%i)",
+    async (status) => {
+      const client = new QueryClient();
+      const harness = "acp:neutral";
+      const key = ["host-model-options", "host", harness, host.getOmnigentServerIdentity()];
+      const previous = [{ id: "previous" }];
+      client.setQueryData(key, previous);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(status === 200 ? { models: [] } : { detail: "empty catalog" }, status),
+      );
+
+      await expect(refreshHostModelOptions(client, "host", harness, "force")).rejects.toThrow();
+      expect(client.getQueryData(key)).toEqual(previous);
+    },
+  );
+
   it("ends a stalled request without automatic timeout retries and allows retry", async () => {
     const controller = new AbortController();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);

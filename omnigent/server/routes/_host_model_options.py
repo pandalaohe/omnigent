@@ -17,6 +17,8 @@ from omnigent.host.frames import HostModelOptionsFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 
+EMPTY_ACP_MODEL_CATALOG = "ACP probe returned an empty model catalog"
+
 
 async def request_host_model_options(
     *,
@@ -76,7 +78,7 @@ async def record_host_model_options(
                 injects_prompt=result.get("injects_prompt"),
             )
             return
-        error = "ACP probe returned an empty model catalog"
+        error = EMPTY_ACP_MODEL_CATALOG
     if not isinstance(error, str) or not error:
         error = "host model-options lookup failed"
     await asyncio.to_thread(

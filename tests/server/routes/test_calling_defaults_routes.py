@@ -184,7 +184,7 @@ async def test_acp_delivery_metadata_without_manual_sync(
     proxy = AsyncMock(
         return_value={
             "status": status,
-            "models": [],
+            "models": [{"id": "available"}] if status == "ok" else [],
             "error": "probe failed" if status == "failed" else None,
             "injects_prompt": False,
         }
@@ -771,11 +771,13 @@ async def test_empty_acp_refresh_cannot_replace_the_server_catalog(
         response = await client.post(
             "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
         )
+        assert response.status_code == 200, response.text
     else:
         response = await client.get(
             f"/v1/hosts/{HOST_A}/harnesses/{harness}/model-options?refresh=force"
         )
-    assert response.status_code == 200, response.text
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "ACP probe returned an empty model catalog"
     row = next(row for row in stores.cache.list([HOST_A]) if row["harness"] == harness)
     assert row["models"] == previous
     assert row["permission_options"] == previous_modes

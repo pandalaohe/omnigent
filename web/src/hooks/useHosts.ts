@@ -560,6 +560,9 @@ export async function refreshHostModelOptions(
   await queryClient.cancelQueries({ queryKey, exact: true });
   try {
     const models = await fetchHostModelOptions(hostId, harness, mode, timeoutMs);
+    if (harness.startsWith("acp:") && models.length === 0) {
+      throw new Error("ACP probe returned an empty model catalog");
+    }
     await queryClient.cancelQueries({ queryKey, exact: true });
     queryClient.setQueryData(queryKey, models);
     return models;

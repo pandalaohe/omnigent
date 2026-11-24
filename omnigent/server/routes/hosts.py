@@ -1668,10 +1668,14 @@ def create_hosts_router(
             else canonicalize_harness(harness) or harness,
             refresh=refresh,
         )
-        catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
-        if catalog_store is not None and harness.startswith("acp:"):
-            from omnigent.server.routes._host_model_options import record_host_model_options
+        from omnigent.server.routes._host_model_options import (
+            EMPTY_ACP_MODEL_CATALOG,
+            record_host_model_options,
+        )
 
+        acp = canonicalize_harness(harness) == "acp"
+        catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
+        if catalog_store is not None and acp:
             await record_host_model_options(
                 catalog_store, host_id, harness, result, fetched_at=now_epoch()
             )
@@ -1680,15 +1684,19 @@ def create_hosts_router(
                 status_code=502,
                 detail=str(result.get("error") or "host model-options lookup failed"),
             )
-        models = result.get("models")
+        raw_models = result.get("models")
+        models = (
+            [model for model in raw_models if isinstance(model, dict)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        if acp and refresh is not None and not models:
+            raise HTTPException(status_code=502, detail=EMPTY_ACP_MODEL_CATALOG)
+
         routable = result.get("routable_models")
         error = result.get("error")
         return HostModelOptionsResponse(
-            models=(
-                [model for model in models if isinstance(model, dict)]
-                if isinstance(models, list)
-                else []
-            ),
+            models=models,
             # Every id the harness's endpoint routes: the picker names one
             # row per model, while a launch takes an exact id.
             routable_models=(
