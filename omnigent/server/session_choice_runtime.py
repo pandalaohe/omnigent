@@ -1472,9 +1472,7 @@ async def admit_create(
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
             acp_catalog_override=(body.agent_id, body.harness_override)
-            if named
-            and body.model_override is not None
-            and is_acp_permission_harness(body.harness_override)
+            if named and is_acp_permission_harness(body.harness_override)
             else None,
             pin=pin,
             exclude=tuple(body.exclude),

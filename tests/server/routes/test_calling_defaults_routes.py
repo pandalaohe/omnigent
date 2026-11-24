@@ -829,7 +829,7 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
         headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
     )
     assert delegated.status_code == 201, delegated.text
-    assert delegated.json()["permission_tier"] == "auto"
+    assert delegated.json()["permission_tier"] == "plan"
     assert delegated.json()["permission_tier_state"] == "blocked"
 
     connection = app.state.host_registry.get(HOST_A)
@@ -846,6 +846,72 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert explicit.status_code == 201, explicit.text
     assert explicit.json()["permission_tier"] == "accept-edits"
     assert explicit.json()["permission_tier_state"] == "blocked"
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
+@pytest.mark.parametrize(
+    "mode,calling_default,expected",
+    [
+        ("plan", False, "plan"),
+        ("review", False, "plan"),
+        (None, True, "plan"),
+        (None, False, "auto"),
+    ],
+)
+async def test_delegated_acp_respects_unmanaged_source_restrictions(
+    client, app, stores, bundled, mode, calling_default, expected
+):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    if mode == "review":
+        stores.cache.upsert(
+            HOST_A,
+            "acp:neutral",
+            [],
+            1,
+            permission_options=[{"value": "review", "label": "Review", "concept": "read-only"}],
+        )
+    if calling_default:
+        stores.prefs.patch_namespace(
+            "local", "calling_defaults", {"*": {"*": {"permission": "read-only"}}}
+        )
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+        labels={ACP_SESSION_MODE_LABEL_KEY: mode} if mode else {},
+    )
+    headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+
+    async def create(**overrides):
+        metadata = {"parent_session_id": parent.id, **overrides}
+        if bundled:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(metadata)},
+                files={"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")},
+                headers=headers,
+            )
+        return await client.post(
+            "/v1/sessions", json={"agent_id": AGENT_ID, **metadata}, headers=headers
+        )
+
+    created = await create()
+    assert created.status_code == 201, created.text
+    snapshot = created
+    if bundled:
+        snapshot = await client.get(f"/v1/sessions/{created.json()['session_id']}")
+    assert snapshot.json()["permission_tier"] == expected
+    if expected == "plan":
+        denied = await create(permission_tier="auto")
+        assert denied.status_code == 403, denied.text
 
 
 async def test_delegated_acp_bundle_inherits_the_creator_tier(client, stores, monkeypatch):

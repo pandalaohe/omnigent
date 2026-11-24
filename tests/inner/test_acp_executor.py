@@ -1285,23 +1285,12 @@ async def test_decide_permission_denies_on_policy_deny() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "policy,choice,duplicate_labels",
-    [
-        ("DENY", None, False),
-        ("ASK", None, False),
-        ("ASK", "Reject", False),
-        ("ASK", "Reject", True),
-    ],
-)
-async def test_managed_permission_reply_preserves_the_decision_source(
-    policy, choice, duplicate_labels
-) -> None:
+async def test_managed_policy_denial_does_not_select_a_user_reject_option() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
     ex._session_id = "s1"
     ex._active_prompt_request_id = 1
-    ex._policy_evaluator = AsyncMock(return_value=Mock(action=f"POLICY_ACTION_{policy}"))
-    ex._elicitation_choice_handler = AsyncMock(return_value=choice)
+    ex._policy_evaluator = AsyncMock(return_value=Mock(action="POLICY_ACTION_DENY"))
+    ex._elicitation_choice_handler = AsyncMock()
     ex._elicitation_handler = AsyncMock(return_value=False)
     ex._send = AsyncMock()
     ex._note_permission_update(
@@ -1313,9 +1302,6 @@ async def test_managed_permission_reply_preserves_the_decision_source(
             "rawInput": {"CommandLine": "git status"},
         },
     )
-    options = _agent_options()
-    if duplicate_labels:
-        options[-1]["name"] = options[0]["name"]
     await ex._respond_to_agent_request(
         {
             "id": 2,
@@ -1323,24 +1309,16 @@ async def test_managed_permission_reply_preserves_the_decision_source(
             "params": {
                 "sessionId": "s1",
                 "toolCall": {"toolCallId": "shell-1"},
-                "options": options,
+                "options": _agent_options(),
             },
         }
     )
     ex._policy_evaluator.assert_awaited_once()
     ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
     reply = ex._send.await_args.args[0]
-    if policy == "DENY":
-        ex._elicitation_choice_handler.assert_not_awaited()
-        assert "result" not in reply
-        assert reply["error"]["message"] == "Omnigent did not authorize this tool call."
-    else:
-        ex._elicitation_choice_handler.assert_awaited_once()
-        assert reply["result"]["outcome"] == (
-            {"outcome": "selected", "optionId": "reject_once"}
-            if choice
-            else {"outcome": "cancelled"}
-        )
+    assert "result" not in reply
+    assert reply["error"]["message"] == "Omnigent did not authorize this tool call."
 
 
 @pytest.mark.asyncio

@@ -15581,6 +15581,7 @@ async def _create_session_from_existing_agent_impl(
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        session_creation_source_tier,
     )
 
     request_fields_set = body.model_fields_set
@@ -16275,7 +16276,6 @@ async def _create_session_from_existing_agent_impl(
         configured_acp_default_tier,
         is_acp_permission_harness,
         require_permission_protocol,
-        source_permission_tier,
     )
 
     require_permission_protocol(request, harness=selected_harness)
@@ -16798,14 +16798,8 @@ async def _create_session_from_existing_agent_impl(
     if permission_source is not None and (
         create_harness in TIER_HARNESSES or is_acp_permission_harness(create_harness)
     ):
-        source_harness = await asyncio.to_thread(
-            _resolve_harness, permission_source, agent_store=agent_store, agent_cache=agent_cache
-        )
-        inherited_tier = source_permission_tier(
-            source_harness,
-            permission_source.labels or {},
-            permission_source.terminal_launch_args or [],
-            require_ready=agent_create,
+        inherited_tier = await session_creation_source_tier(
+            request, permission_source, require_ready=agent_create
         )
     default_tier = project_resolution.permission if body.sub_agent_name is None else None
     acp_tier_enabled = False
