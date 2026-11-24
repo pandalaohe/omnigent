@@ -800,9 +800,10 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     from omnigent.session_default_modes import ACP_SESSION_MODE_LABEL_KEY
 
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
-    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:ag": True})
     _register_host(app, HOST_A)
-    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    _seed_agent(stores, AGENT_ID, "acp:ag")
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
     conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
     parent = conversations.create_conversation(
         agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
@@ -810,7 +811,7 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
     stores.cache.upsert(
         HOST_A,
-        "acp:neutral",
+        "acp:ag",
         [],
         1,
         permission_options=[{"value": "plan", "label": "Plan", "concept": "read-only"}],
@@ -833,7 +834,7 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert delegated.json()["permission_tier_state"] == "blocked"
 
     connection = app.state.host_registry.get(HOST_A)
-    connection.hello.acp_permission_tiers = {"acp:neutral": "auto"}
+    connection.hello.acp_permission_tiers = {"acp:ag": "auto"}
     defaulted = await client.post("/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS)
     assert defaulted.status_code == 201, defaulted.text
     assert defaulted.json()["permission_tier"] == "auto"
@@ -856,6 +857,7 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
         ("review", False, "plan"),
         (None, True, "plan"),
         (None, False, "auto"),
+        (None, False, None),
     ],
 )
 async def test_delegated_acp_respects_unmanaged_source_restrictions(
@@ -864,14 +866,16 @@ async def test_delegated_acp_respects_unmanaged_source_restrictions(
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
     from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
 
-    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    harness = "acp:opencode" if expected is None else "acp:ag"
+    _seed_agent(stores, AGENT_ID, harness)
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
-    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, harness: True})
     _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
     if mode == "review":
         stores.cache.upsert(
             HOST_A,
-            "acp:neutral",
+            harness,
             [],
             1,
             permission_options=[{"value": "review", "label": "Review", "concept": "read-only"}],
@@ -896,7 +900,7 @@ async def test_delegated_acp_respects_unmanaged_source_restrictions(
             return await client.post(
                 "/v1/sessions",
                 data={"metadata": json.dumps(metadata)},
-                files={"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")},
+                files={"bundle": ("agent.tar.gz", _bundle(harness), "application/gzip")},
                 headers=headers,
             )
         return await client.post(
@@ -914,7 +918,7 @@ async def test_delegated_acp_respects_unmanaged_source_restrictions(
         assert denied.status_code == 403, denied.text
 
 
-async def test_delegated_acp_bundle_inherits_the_creator_tier(client, stores, monkeypatch):
+async def test_delegated_acp_bundle_inherits_the_creator_tier(client, app, stores, monkeypatch):
     from omnigent.server.permission_tiers import (
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_CAPABILITY_VALUE,
@@ -924,9 +928,15 @@ async def test_delegated_acp_bundle_inherits_the_creator_tier(client, stores, mo
     from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
 
     _seed_agent(stores, AGENT_ID, "antigravity-native")
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
     conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
     parent = conversations.create_conversation(
         agent_id=AGENT_ID,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
         labels={
             **ConfirmedPermissionState("plan", 1, "ready").labels("antigravity-native"),
             PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
@@ -934,7 +944,7 @@ async def test_delegated_acp_bundle_inherits_the_creator_tier(client, stores, mo
     )
     metadata = {"parent_session_id": parent.id}
     headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
-    bundle = {"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")}
+    bundle = {"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")}
     created = await client.post(
         "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=bundle, headers=headers
     )
@@ -998,8 +1008,8 @@ async def test_named_acp_child_uses_its_own_host_tier(client, app, stores):
     assert created.json()["permission_tier"] == "plan"
 
 
-@pytest.mark.parametrize("harness", ["acp:neutral", "pi", "pi-native", "antigravity-native"])
-async def test_agent_created_child_cannot_widen_the_source_tier(client, stores, harness):
+@pytest.mark.parametrize("harness", ["acp:ag", "pi", "pi-native", "antigravity-native"])
+async def test_agent_created_child_cannot_widen_the_source_tier(client, app, stores, harness):
     from omnigent.server.permission_tiers import (
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_CAPABILITY_VALUE,
@@ -1011,7 +1021,17 @@ async def test_agent_created_child_cannot_widen_the_source_tier(client, stores, 
     conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
     labels = ConfirmedPermissionState("plan", 2, "ready").labels(harness)
     labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
-    parent = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+    placement = {}
+    if harness == "acp:ag":
+        stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+        _register_host(app, HOST_A)
+        app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
+        placement = {
+            "host_id": HOST_A,
+            "workspace": "/neutral/project",
+            "runner_id": "test-runner",
+        }
+    parent = conversations.create_conversation(agent_id=AGENT_ID, labels=labels, **placement)
 
     request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
     agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
@@ -1404,6 +1424,31 @@ async def test_acp_readback_selection_accepts_repeated_reports_and_fences_new_ch
     assert len(published) == 2
 
 
+async def test_acp_unrequested_mode_readback_cannot_replace_an_explicit_selection(stores):
+    from omnigent.sdk_permission_modes import (
+        ACP_SESSION_MODE_LABEL_KEY,
+        ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+    )
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = {ACP_SESSION_MODE_LABEL_KEY: "go", ACP_SESSION_MODE_SELECTION_LABEL_KEY: "new-choice"}
+    conv = store.create_conversation(harness_override="acp:neutral", labels=labels)
+    event = {
+        "type": "session.permission_mode",
+        "harness": "acp",
+        "conversation_id": conv.id,
+        "permission_mode": "plan",
+    }
+    stream = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=stream)),
+        base_url="http://runner",
+    ) as runner:
+        await orch._relay_runner_stream_once(conv.id, runner, store)
+    assert store.get_conversation(conv.id).labels == labels
+
+
 async def test_snapshot_uses_active_agent_model_until_the_turn_end_report(stores):
     from omnigent.server.routes._sessions import orchestration as orch
 
@@ -1464,7 +1509,9 @@ async def test_acp_running_model_refresh_keeps_catalog_sources_separate(
 
 
 @pytest.mark.parametrize("protocol", ["mode-config", "mode-legacy"])
-@pytest.mark.parametrize("failure", ["", "mode-notify-refusal", "mode-multiple-readbacks"])
+@pytest.mark.parametrize(
+    "failure", ["", "mode-notify-refusal", "mode-multiple-readbacks", "initial-plan"]
+)
 async def test_acp_mode_crosses_server_runner_and_scripted_agent(
     client, app, stores, tmp_path, protocol, failure, monkeypatch
 ):
@@ -1488,6 +1535,7 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
         ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     )
     from omnigent.server.routes.host_tunnel import _receive_loop
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
     from tests._helpers.polling import poll_until_async
     from tests.runner.conftest import _runner_client
     from tests.runtime.harnesses.test_acp_model_switching import _FAKE_ACP_AGENT
@@ -1513,6 +1561,8 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
     ]
     _register_host(app, HOST_A)
     conn = app.state.host_registry.get(HOST_A)
+    conn.hello.capabilities.append("agy_acp_permissions:acp:ag")
+    requested_mode = None if failure == "initial-plan" else "go"
 
     async def receive_host_reply():
         outgoing = await conn.outbound_queue.get()
@@ -1564,14 +1614,14 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
         json={
             "agent_id": AGENT_ID,
             "parent_session_id": parent.id,
-            "permission_mode": "go",
+            **({"permission_mode": requested_mode} if requested_mode else {}),
             "reasoning_effort": "high",
             "session_prompt": "Kept for this chat",
         },
     )
     assert created.status_code == 201, created.text
     saved = conversations.get_conversation(created.json()["id"])
-    assert saved.labels[ACP_SESSION_MODE_LABEL_KEY] == "go"
+    assert saved.labels.get(ACP_SESSION_MODE_LABEL_KEY) == requested_mode
     assert saved.session_prompt == "Kept for this chat"
     assert created.json()["warnings"] == [
         "session_prompt not sent: this agent builds its own prompt"
@@ -1633,10 +1683,12 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
 
                 observed = await asyncio.wait_for(mode_readback(), timeout=10)
                 assert observed["harness"] == "acp"
-                assert observed["requested_mode"] == "go"
-                assert observed["permission_mode"] == ("review" if failure else "go")
-                assert (
-                    observed["selection_id"] == saved.labels[ACP_SESSION_MODE_SELECTION_LABEL_KEY]
+                assert observed.get("requested_mode") == requested_mode
+                assert observed["permission_mode"] == (
+                    "plan" if requested_mode is None else "review" if failure else "go"
+                )
+                assert observed.get("selection_id") == saved.labels.get(
+                    ACP_SESSION_MODE_SELECTION_LABEL_KEY
                 )
                 from omnigent.server.routes._sessions import orchestration as orch
 
@@ -1661,6 +1713,36 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
                     conversations.get_conversation(saved.id).labels[ACP_SESSION_MODE_LABEL_KEY]
                     == observations[-1]["permission_mode"]
                 )
+                if requested_mode is None:
+                    stores.prefs.patch_namespace(
+                        "local", "session_collab", {"sessionRestrictions": "off"}
+                    )
+                    headers = {
+                        **PERMISSION_TIERS_HEADERS,
+                        CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT,
+                    }
+                    metadata = {"parent_session_id": saved.id}
+                    for tier, expected_status in [(None, 201), ("auto", 403)]:
+                        child = await client.post(
+                            "/v1/sessions",
+                            json={
+                                **metadata,
+                                "agent_id": AGENT_ID,
+                                "harness_override": "acp:ag",
+                                **({"permission_tier": tier} if tier else {}),
+                            },
+                            headers=headers,
+                        )
+                        assert child.status_code == expected_status, child.text
+                        if tier is None:
+                            assert child.json()["permission_tier"] == "plan"
+                        else:
+                            assert "cannot exceed its creator's permission tier" in child.text
+                    assert not any(
+                        row["method"] in ("session/set_mode", "session/set_config_option")
+                        for row in requests()
+                    )
+                    return
                 monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
                 changed = await client.patch(
                     f"/v1/sessions/{saved.id}", json={"permission_mode": "review"}

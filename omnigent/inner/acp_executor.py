@@ -2602,11 +2602,6 @@ class AcpExecutor(Executor):
                 preserve_session=True,
             )
             return
-        reported_mode = self._active_mode
-        if requested_mode and reported_mode:
-            yield SessionModeChanged(
-                mode=reported_mode, requested_mode=requested_mode, selection_id=mode_selection
-            )
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
@@ -2724,6 +2719,11 @@ class AcpExecutor(Executor):
         await self._drain_stale_queue()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
+        reported_mode = self._active_mode
+        if reported_mode:
+            yield SessionModeChanged(
+                mode=reported_mode, requested_mode=requested_mode, selection_id=mode_selection
+            )
 
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -2778,7 +2778,7 @@ class AcpExecutor(Executor):
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
-                if requested_mode and self._active_mode and self._active_mode != reported_mode:
+                if self._active_mode and self._active_mode != reported_mode:
                     yield SessionModeChanged(
                         mode=self._active_mode,
                         requested_mode=requested_mode,

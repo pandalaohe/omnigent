@@ -1043,14 +1043,15 @@ async def test_named_acp_model_uses_the_agent_catalog(choice_env, db_uri, harnes
 
 
 @pytest.mark.asyncio
-async def test_named_acp_override_uses_target_catalog_for_the_chain_model(choice_env, db_uri):
+@pytest.mark.parametrize("naming", [{}, {"user_named": True}, {"choice_reason": "Requested"}])
+async def test_acp_override_uses_target_catalog_and_declared_pool(choice_env, db_uri, naming):
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 
     env = choice_env
     agent = await create_test_agent(
         env.client,
-        name="custom-acp",
-        executor={"type": "omnigent", "config": {"harness": "acp:example"}},
+        name="custom-codex",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
         include_llm=False,
     )
     link = {"agent": agent["id"], "model": "selected-model"}
@@ -1062,17 +1063,15 @@ async def test_named_acp_override_uses_target_catalog_for_the_chain_model(choice
         env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
     )
     catalogs = HostModelCatalogCacheStore(db_uri)
-    catalogs.upsert(HOST, "acp:example", [{"id": "spec-model"}], 1)
+    catalogs.upsert(HOST, "codex-native", [{"id": "spec-model"}], 1)
     catalogs.upsert(HOST, "acp:alternate", [{"id": "selected-model"}], 1)
     env.app.state.host_model_catalog_cache_store = catalogs
-    response = await create(
-        env, agent_id=agent["id"], harness_override="acp:alternate", user_named=True
-    )
+    response = await create(env, agent_id=agent["id"], harness_override="acp:alternate", **naming)
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["session_choice"]["model"] == body["model_override"] == "selected-model"
-    assert body["session_choice"]["pool"] == "acp:selected-model"
     assert not body.get("notes") and not body["session_choice"]["warnings"]
+    assert body["session_choice"]["pool"] == "codex:selected-model"
 
 
 @pytest.mark.asyncio

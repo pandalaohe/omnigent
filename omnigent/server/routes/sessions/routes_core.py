@@ -3203,6 +3203,7 @@ def register_core_routes(
             creation_permission_tier,
             is_acp_permission_harness,
             require_permission_protocol,
+            supports_delegated_acp_tier,
         )
 
         require_permission_protocol(request, harness=spec.executor.harness_kind)
@@ -3595,16 +3596,22 @@ def register_core_routes(
         acp_tier_enabled = False
         default_tier = project_resolution.permission
         if is_acp_permission_harness(bundle_harness):
+            host_registry = getattr(request.app.state, "host_registry", None)
+            permission_host_id = parsed_metadata.host_id or (
+                effective_host_id(conversation_store, parent_conv) if parent_conv else None
+            )
             default_tier = configured_acp_default_tier(
-                getattr(request.app.state, "host_registry", None),
-                parsed_metadata.host_id
-                or (effective_host_id(conversation_store, parent_conv) if parent_conv else None),
-                bundle_harness,
+                host_registry, permission_host_id, bundle_harness
             )
             acp_tier_enabled = (
-                agent_create
-                or parsed_metadata.permission_tier is not None
+                parsed_metadata.permission_tier is not None
                 or default_tier is not None
+                or (
+                    agent_create
+                    and supports_delegated_acp_tier(
+                        host_registry, permission_host_id, bundle_harness, spec
+                    )
+                )
             )
             require_permission_protocol(request, harness=bundle_harness, required=acp_tier_enabled)
         if (

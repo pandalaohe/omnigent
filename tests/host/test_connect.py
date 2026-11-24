@@ -5483,6 +5483,31 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_hello_advertises_managed_tools_only_for_antigravity_acp(monkeypatch):
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    entries = [
+        AcpAgentEntry("ag", "AG", r'"C:\\Program Files\\AG\\agy.exe" acp --stdio'),
+        AcpAgentEntry("opencode", "OpenCode", "opencode acp"),
+        AcpAgentEntry("not-acp", "Not ACP", "agy chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda: entries)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert {
+        capability.removeprefix(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+        for capability in hello.capabilities
+        if capability.startswith(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+    } == {"acp", "acp:ag"}
+
+
 async def test_hello_does_not_wait_for_forkserver_control(
     tmp_path: Path,
 ) -> None:

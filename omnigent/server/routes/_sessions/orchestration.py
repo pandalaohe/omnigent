@@ -12742,6 +12742,7 @@ async def _relay_runner_stream_once(
                         from omnigent.server.routes._session_create_validation import (
                             session_acp_harness,
                         )
+                        from omnigent.stores.conversation_store import LabelGroupChange
 
                         requested = event.get("requested_mode")
                         actual = event.get("permission_mode")
@@ -12750,14 +12751,37 @@ async def _relay_runner_stream_once(
                             conversation_store.get_conversation, session_id
                         )
                         if (
-                            not isinstance(requested, str)
-                            or not isinstance(actual, str)
+                            not isinstance(actual, str)
                             or not actual
                             or conv is None
                             or not session_acp_harness(conv, None, None)
                         ):
                             continue
-                        if isinstance(selection_id, str):
+                        if requested is None and selection_id is None:
+                            # A startup report cannot replace an operator's newer choice.
+                            def observe_mode(
+                                labels: dict[str, str], mode: str = actual
+                            ) -> LabelGroupChange:
+                                return LabelGroupChange(
+                                    {ACP_SESSION_MODE_LABEL_KEY: mode}
+                                    if ACP_SESSION_MODE_SELECTION_LABEL_KEY not in labels
+                                    else {},
+                                    set(),
+                                )
+
+                            try:
+                                labels = await asyncio.to_thread(
+                                    conversation_store.mutate_label_group,
+                                    session_id,
+                                    ACP_SESSION_MODE_LABEL_KEY,
+                                    observe_mode,
+                                )
+                            except ConversationNotFoundError:
+                                continue
+                            accepted = ACP_SESSION_MODE_SELECTION_LABEL_KEY not in labels
+                        elif not isinstance(requested, str):
+                            accepted = False
+                        elif isinstance(selection_id, str):
                             if ACP_SESSION_MODE_SELECTION_LABEL_KEY not in conv.labels:
                                 await asyncio.to_thread(
                                     conversation_store.insert_label_if_absent,
@@ -16276,6 +16300,7 @@ async def _create_session_from_existing_agent_impl(
         configured_acp_default_tier,
         is_acp_permission_harness,
         require_permission_protocol,
+        supports_delegated_acp_tier,
     )
 
     require_permission_protocol(request, harness=selected_harness)
@@ -16794,34 +16819,38 @@ async def _create_session_from_existing_agent_impl(
         )
         if permission_source is None:
             raise OmnigentError("Source session not found", code=ErrorCode.NOT_FOUND)
-    inherited_tier = None
-    if permission_source is not None and (
-        create_harness in TIER_HARNESSES or is_acp_permission_harness(create_harness)
-    ):
-        inherited_tier = await session_creation_source_tier(
-            request, permission_source, require_ready=agent_create
-        )
     default_tier = project_resolution.permission if body.sub_agent_name is None else None
     acp_tier_enabled = False
     if is_acp_permission_harness(create_harness):
         from omnigent.models.model_catalog import spec_harness as declared_spec_harness
         from omnigent.permission_tiers import NON_FULL_TIERS
 
+        effective_spec = sub_spec or selection_spec
         if harness_override:
             acp_harness = harness_override
-        elif (effective_spec := sub_spec or selection_spec) is not None:
+        elif effective_spec is not None:
             acp_harness = declared_spec_harness(effective_spec)
         else:
             acp_harness = await asyncio.to_thread(
                 _create_resolved_harness, agent, harness_override, agent_cache
             )
-        default_tier = configured_acp_default_tier(
-            getattr(request.app.state, "host_registry", None), permission_host_id, acp_harness
-        )
+        if permission_host_id is None and parent_conv is not None:
+            permission_host_id = await asyncio.to_thread(
+                effective_host_id, conversation_store, parent_conv
+            )
+        host_registry = getattr(request.app.state, "host_registry", None)
+        default_tier = configured_acp_default_tier(host_registry, permission_host_id, acp_harness)
         if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
             raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
         acp_tier_enabled = (
-            body.permission_tier is not None or default_tier is not None or agent_create
+            body.permission_tier is not None
+            or default_tier is not None
+            or (
+                agent_create
+                and supports_delegated_acp_tier(
+                    host_registry, permission_host_id, acp_harness, effective_spec
+                )
+            )
         )
     require_permission_protocol(request, harness=create_harness, required=acp_tier_enabled)
     if create_harness in TIER_HARNESSES or acp_tier_enabled:
@@ -16831,6 +16860,13 @@ async def _create_session_from_existing_agent_impl(
             creation_permission_tier,
         )
 
+        inherited_tier = (
+            await session_creation_source_tier(
+                request, permission_source, require_ready=agent_create
+            )
+            if permission_source is not None
+            else None
+        )
         tier = creation_permission_tier(
             harness=create_harness,
             explicit=(

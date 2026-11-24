@@ -906,7 +906,10 @@ async def context_request(
         probe = Conversation(
             id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
         )
-        harness = await asyncio.to_thread(
+        override = options.get("catalog_harness_override")
+        if options.get("catalog_override_agent") not in (None, link.agent_id):
+            override = None
+        harness = override or await asyncio.to_thread(
             _resolve_harness_impl,
             probe,
             agent_store=app.state.agent_store,
@@ -962,7 +965,8 @@ def _context_request(
     master: dict | None = None,
     project_config: dict | None = None,
     additional_agents: tuple[str, ...] = (),
-    acp_catalog_override: tuple[str, str] | None = None,
+    catalog_harness_override: str | None = None,
+    catalog_override_agent: str | None = None,
 ) -> ChoiceRequest:
     from omnigent.harness_availability import harness_launch_availability
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
@@ -992,16 +996,7 @@ def _context_request(
             unavailable.add(agent_id)
             continue
         probe = Conversation(
-            id="",
-            created_at=0,
-            updated_at=0,
-            root_conversation_id="",
-            agent_id=agent_id,
-            harness_override=(
-                acp_catalog_override[1]
-                if acp_catalog_override and acp_catalog_override[0] == agent_id
-                else None
-            ),
+            id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=agent_id
         )
         harness = _resolve_harness_impl(
             probe, agent_store=agents, agent_cache=cache, agent=agent, preserve_acp_namespace=True
@@ -1021,9 +1016,15 @@ def _context_request(
         for harness, row in records.items()
         if usable_catalog(row) is not None
     }
+    catalog_harnesses = {
+        agent: catalog_harness_override
+        if catalog_harness_override and catalog_override_agent in (None, agent)
+        else harness
+        for agent, harness in harnesses.items()
+    }
     models = {
         agent: ids
-        for agent, harness in harnesses.items()
+        for agent, harness in catalog_harnesses.items()
         if (ids := usable_catalog(records.get(harness or ""))) is not None
     }
     groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
@@ -1045,7 +1046,7 @@ def _context_request(
             )
             defaults = [
                 entry.get("id") or entry.get("model")
-                for entry in catalog.get(harness, ())
+                for entry in catalog.get(catalog_harnesses[agent], ())
                 if entry.get("isDefault") is True and (entry.get("id") or entry.get("model"))
             ]
             effective_models[agent] = (
@@ -1374,10 +1375,11 @@ def _explicit_named_link(
         model_override=body.model_override,
         harness_override=body.harness_override,
     )
-    harness = _resolve_harness_impl(
-        probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
+    product = agent_key_for_harness(
+        _resolve_harness_impl(
+            probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
+        )
     )
-    product = agent_key_for_harness(canonicalize_harness(harness) or harness)
     if settings.schema_version == 2:
         request = replace(request, products={**request.products, link.agent_id: product})
     link = resolved_link(link, request)
@@ -1460,6 +1462,11 @@ async def admit_create(
         now = time.time()
         from omnigent.server.permission_tiers import is_acp_permission_harness
 
+        catalog_harness = body.harness_override
+        if catalog_harness == "auto":
+            catalog_harness = None
+        if catalog_harness and not is_acp_permission_harness(catalog_harness):
+            catalog_harness = canonicalize_harness(catalog_harness) or catalog_harness
         request = await context_request(
             app,
             owner,
@@ -1471,9 +1478,8 @@ async def admit_create(
             additional_agents=(body.agent_id,)
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
-            acp_catalog_override=(body.agent_id, body.harness_override)
-            if named and is_acp_permission_harness(body.harness_override)
-            else None,
+            catalog_harness_override=catalog_harness,
+            catalog_override_agent=body.agent_id if named else None,
             pin=pin,
             exclude=tuple(body.exclude),
             differ_from=body.differ_from,

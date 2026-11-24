@@ -22,6 +22,7 @@ from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN
 
 if TYPE_CHECKING:
     from omnigent.server.host_registry import HostRegistry
+    from omnigent.spec.types import AgentSpec
 
 PERMISSION_STATE_LABEL_KEY = "omnigent.permission_tier.state"
 PERMISSION_MIGRATION_LABEL_KEY = "omnigent.permission_tier.migrated_from"
@@ -62,6 +63,26 @@ def configured_acp_default_tier(
     tiers = getattr(connection.hello, "acp_permission_tiers", None) or {}
     tier = tiers.get(harness)
     return tier if tier in NON_FULL_TIERS else None
+
+
+def supports_delegated_acp_tier(
+    registry: HostRegistry | None, host_id: str | None, harness: str | None, spec: AgentSpec | None
+) -> bool:
+    """Default to managed tiers only for ACP launches with a known tool schema."""
+    from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+
+    config = spec.executor.config if spec is not None else {}
+    if "acp_agent" in config:
+        embedded = config["acp_agent"]
+        command = embedded.get("command") if isinstance(embedded, dict) else None
+        return isinstance(command, str) and is_antigravity_acp_command(command)
+    if registry is None or not host_id or harness is None:
+        return False
+    connection = registry.get(host_id)
+    return connection is not None and (
+        CAP_AGY_ACP_PERMISSIONS_PREFIX + harness in connection.hello.capabilities
+    )
 
 
 def permission_tier_active(harness: str | None, labels: Mapping[str, str]) -> bool:

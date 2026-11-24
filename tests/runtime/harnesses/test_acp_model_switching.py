@@ -24,7 +24,7 @@ record_path, protocol, *options = sys.argv[1:]
 failure = options[0] if options else ""
 failed_once = False
 model = "model-a"
-mode = "review"
+mode = "plan" if failure == "initial-plan" else "review"
 session_id = "fake-" + str(os.getpid())
 turn = 0
 
