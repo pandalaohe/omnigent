@@ -52,12 +52,15 @@ def load_global_config(path: Path | None = None) -> _Config:
         return raw
 
 
-def native_history_cleanup_enabled() -> bool:
+def native_history_cleanup_enabled(path: Path | None = None) -> bool:
     """Read the host's opt-in to expiring resumable native session files."""
     try:
-        config = load_global_config()
-    except (OSError, yaml.YAMLError):
-        _log.warning("Unable to read host config for native history cleanup")
+        config = load_global_config(path)
+    except (OSError, ValueError, OverflowError, RecursionError, yaml.YAMLError) as exc:
+        # Parser details can include private config values.
+        _log.warning(
+            "Unable to read host config for native history cleanup (%s)", type(exc).__name__
+        )
         return False
     host = config.get("host") if isinstance(config, Mapping) else None
     return isinstance(host, Mapping) and host.get("native_history_cleanup") is True

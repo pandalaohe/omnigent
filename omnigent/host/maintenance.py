@@ -951,6 +951,7 @@ class HostMaintenanceJanitor:
     def for_host(
         cls,
         *,
+        config_path: Path | None = None,
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: Callable[[], Collection[Path]] | None = None,
         on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
@@ -960,6 +961,7 @@ class HostMaintenanceJanitor:
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon.
 
+        :param config_path: The host daemon's startup config file.
         :param harness_tmp_parent: Override for the harness temp parent.
         :param live_runner_log_paths: Returns the log paths of this host's
             live runners, so the runner-log sweep never deletes a file a
@@ -986,7 +988,7 @@ class HostMaintenanceJanitor:
             else resolve_harness_tmp_parent()
         )
         runner_log_dir = process_log_dir("runner")
-        expire_native_history = native_history_cleanup_enabled()
+        expire_native_history = native_history_cleanup_enabled(config_path)
 
         async def _reap_harness_processes() -> None:
             from omnigent.runtime.harnesses.process_manager import (

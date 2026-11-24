@@ -935,6 +935,39 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
     assert hub.effective_load_lines(2, "host_a").heavy == 8
 
 
+@pytest.mark.parametrize("enable_notices", [False, True])
+async def test_saved_load_lines_remain_readable_after_rollback(
+    tmp_path: Path, enable_notices: bool
+) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    workspace_lines = {
+        "default": {"heavy": 2, "new_session": 3},
+        "hosts": {"host_a": {"heavy": 6, "new_session": 7}},
+        "queue_enabled": True,
+    }
+    hub.put_settings({"load_lines": workspace_lines}, workspace_id=1)
+    if enable_notices:
+        hub.put_settings({"load_lines": {"notices_enabled": True}}, workspace_id=1)
+    await hub.save_settings(hub.put_settings({"mem_pct": 75}, workspace_id=1))
+    stored = json.loads(hub.settings_path.read_text())
+    # The rollback reader rejects the entire workspace on any fourth field.
+    assert stored["load_lines"] == {"1": workspace_lines}
+    assert stored.get("load_notices_enabled") == ({"1": True} if enable_notices else None)
+    hub.close()
+
+    hub = SystemStatusHub(tmp_path, None)
+    try:
+        assert hub.notices_enabled(1) is enable_notices
+        projected = hub.get_settings(1)
+        assert "load_notices_enabled" not in projected
+        assert projected["load_lines"]["notices_enabled"] is enable_notices
+        cleared = hub.put_settings({"load_lines": {"notices_enabled": False}}, workspace_id=1)
+        assert "load_notices_enabled" not in cleared
+        assert cleared["load_lines"] == stored["load_lines"]
+    finally:
+        hub.close()
+
+
 @pytest.mark.parametrize(
     "patch",
     [

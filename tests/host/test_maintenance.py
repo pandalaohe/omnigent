@@ -98,6 +98,54 @@ def test_host_janitor_adds_session_retention_for_its_server(
     )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_host_janitor_uses_startup_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"host:\n  native_history_cleanup: {str(not enabled).lower()}\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "host.yaml"
+    config_path.write_text(
+        f"host:\n  native_history_cleanup: {str(enabled).lower()}\n", encoding="utf-8"
+    )
+    janitor = HostMaintenanceJanitor.for_host(
+        config_path=config_path, server_url=_SERVER, server_headers=dict
+    )
+
+    assert ("codex_session_retention" in dict(janitor._stages)) is enabled
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        (b"\xff", "UnicodeDecodeError"),
+        (b"host: {native_history_cleanup: true}\nmetadata: 2026-02-31\n", "ValueError"),
+    ],
+)
+def test_unreadable_config_keeps_host_maintenance_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    content: bytes,
+    error: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_bytes(content)
+    janitor = HostMaintenanceJanitor.for_host(server_url=_SERVER, server_headers=dict)
+
+    stages = dict(janitor._stages)
+    assert {
+        "harness_process_orphans",
+        "codex_home_orphans",
+        "runner_log_retention",
+    } <= stages.keys()
+    assert "codex_session_retention" not in stages
+    assert error in caplog.text
+
+
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [

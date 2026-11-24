@@ -5946,6 +5946,7 @@ class HostProcess:
         try:
             loop = asyncio.get_running_loop()
             self._maintenance_janitor = HostMaintenanceJanitor.for_host(
+                config_path=self._config_path,
                 harness_tmp_parent=self._harness_tmp_parent,
                 live_runner_log_paths=self._live_runner_log_paths,
                 on_runner_log_rotated=lambda path, size, file_id: loop.call_soon_threadsafe(
