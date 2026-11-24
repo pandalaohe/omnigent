@@ -79,6 +79,7 @@ from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_AGENT,
     CREATE_ORIGIN_HEADER,
 )
+from omnigent.shell_timeouts import MAX_SHELL_DISPATCH_TIMEOUT_S
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -227,8 +228,7 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
-_OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
-_RUNNER_EXECUTION_TIMEOUT_S = 7200.0
+_RUNNER_EXECUTION_TIMEOUT_S = MAX_SHELL_DISPATCH_TIMEOUT_S
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "stopped", "killed"}
@@ -248,7 +248,7 @@ _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, co
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
 # timeouts, so these must sit above the runner's execution timeout rather than
-# only above the 120-second shell default. Keep the outer hop larger so the
+# only above the default shell budget. Keep the outer hop larger so the
 # AP→runner leg fails first with the more specific error when the proxy wedges.
 MCP_PROXY_FORWARD_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 30.0
 MCP_PROXY_CALL_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 60.0

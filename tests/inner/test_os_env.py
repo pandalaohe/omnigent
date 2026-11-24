@@ -326,6 +326,39 @@ def test_shell_timeout_stops_descendants(tmp_path: Path, layout: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_shell_without_timeout_fits_a_thirty_minute_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import os_env as os_env_module
+
+    sandbox = _inactive_policy()
+    environment = CallerProcessOSEnvironment(
+        spec=OSEnvSpec(), cwd=tmp_path, shell_path=sys.executable, sandbox=sandbox
+    )
+    duration = 1800
+    executed_with = []
+
+    def shell_process(*, timeout, **_kwargs):
+        executed_with.append(timeout)
+        return {"timed_out": duration >= timeout}
+
+    def request(packet, **_kwargs):
+        return _handle_helper_request(
+            request=packet, cwd=tmp_path, shell_path=sys.executable, sandbox=sandbox
+        )
+
+    monkeypatch.setattr(os_env_module, "_shell_impl", shell_process)
+    monkeypatch.setattr(environment._helper, "request", request)
+
+    assert await environment.shell("run tests") == {"timed_out": False}
+    duration = 2200
+    assert await environment.shell("run tests") == {"timed_out": True}
+    assert await environment.shell("run tests", timeout=45) == {"timed_out": True}
+    assert request({"op": "shell", "command": "run tests"}) == {"timed_out": True}
+    assert executed_with == [2100, 2100, 45, 2100]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["cancel", "close"])
 async def test_shell_cancellation_stops_owned_tree(tmp_path: Path, action: str) -> None:
     """Cancelling a shell or closing its environment must stop detached descendants."""

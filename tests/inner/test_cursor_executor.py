@@ -1003,6 +1003,34 @@ async def test_custom_tool_execute_times_out_to_iserror(monkeypatch: pytest.Monk
     assert "timed out" in result["content"][0]["text"]
 
 
+@pytest.mark.parametrize(("arguments", "budget"), [({}, 2130), ({"timeout": 9000}, 7230)])
+async def test_cursor_shell_waits_for_the_shell_execution_budget(
+    monkeypatch: pytest.MonkeyPatch, arguments: dict[str, int], budget: int
+) -> None:
+    schedule = asyncio.run_coroutine_threadsafe
+    used_budgets = []
+
+    def capture_wait(coroutine, loop):
+        future = schedule(coroutine, loop)
+
+        def result(*, timeout):
+            used_budgets.append(timeout)
+            return future.result(timeout=timeout)
+
+        return SimpleNamespace(result=result, cancel=future.cancel)
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", capture_wait)
+
+    async def shell(_name, _arguments):
+        return {"exit_code": 0}
+
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._tool_executor = shell
+    execute = executor._make_execute("sys_os_shell", asyncio.get_running_loop())
+    assert json.loads(await asyncio.to_thread(execute, arguments, None)) == {"exit_code": 0}
+    assert used_budgets == [budget]
+
+
 async def test_custom_tool_execute_surfaces_coroutine_exception_as_iserror() -> None:
     """A raising coroutine becomes a structured tool error, not an uncaught
     exception on the SDK's daemon callback thread."""

@@ -23845,7 +23845,8 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     ("name", "arguments", "elapsed", "completes"),
     [
         ("sys_os_shell", {"command": "echo done", "timeout": 720}, 600, True),
-        ("sys_os_shell", {"command": "echo done"}, 600, False),
+        ("sys_os_shell", {"command": "echo done"}, 1800, True),
+        ("sys_os_shell", {"command": "echo done"}, 2200, False),
         ("sys_custom", {"timeout": 720}, 600, False),
         ("sys_os_shell", {"command": "echo done", "timeout": 12000}, 7300, False),
     ],

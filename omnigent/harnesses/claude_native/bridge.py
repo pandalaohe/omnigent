@@ -117,6 +117,7 @@ from omnigent.native.failure_telemetry import FailureContext
 from omnigent.permission_tiers.pi_private import pi_bridge_failure, redact_pi_authority
 from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
+from omnigent.shell_timeouts import shell_dispatch_timeout
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -385,9 +386,6 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
 
 # Active dispatch budget; each call excludes its own bounded approval waits.
 _TOOL_CALL_TIMEOUT_S = 320.0
-# Shell callers can request a longer runtime, within the MCP execution budget.
-_RELAY_SHELL_MAX_TIMEOUT_S = 7200
-_RELAY_SHELL_RESULT_GRACE_S = 30.0
 _TOOL_RELAY_HEARTBEAT_S = 1.0
 _MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "mcp_call_cancel_event", default=None
@@ -11767,13 +11765,7 @@ def _run_relay_tool(
     :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
     :returns: MCP tool-call response.
     """
-    timeout = _TOOL_CALL_TIMEOUT_S
-    shell_timeout = arguments.get("timeout")
-    if name == "sys_os_shell" and type(shell_timeout) is int and shell_timeout > 0:
-        timeout = max(
-            timeout,
-            min(shell_timeout, _RELAY_SHELL_MAX_TIMEOUT_S) + _RELAY_SHELL_RESULT_GRACE_S,
-        )
+    timeout = shell_dispatch_timeout(name, arguments, _TOOL_CALL_TIMEOUT_S)
     deadline = ToolCallDeadline(timeout)
 
     async def execute() -> object:
