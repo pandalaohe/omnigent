@@ -45,10 +45,7 @@ export function UsageBoardFrame({
   const theme = usageBoardTheme(search);
   const overview = boardPath("/usage/board");
   return (
-    <div
-      className="usage-board-scroll min-h-0 min-w-0 flex-1 overflow-y-auto"
-      data-usage-theme={theme}
-    >
+    <div className="usage-scroll min-h-0 min-w-0 flex-1 overflow-y-auto" data-usage-theme={theme}>
       <div className="usage-surface @container">
         <header className="usage-top">
           <h1>

@@ -29,6 +29,7 @@ import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { QuestionDictationControls } from "@/components/QuestionDictationControls";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
+import { useQuestionCardScroll } from "@/hooks/useQuestionCardScroll";
 import { classifyAttachment, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
@@ -263,10 +264,27 @@ export function AskUserQuestionForm({
   const [highlight, setHighlight] = useState(0);
   // True while focus is inside the card — the highlighted row shows then.
   const [keyboardActive, setKeyboardActive] = useState(false);
+  const [focusedText, setFocusedText] = useState<HTMLTextAreaElement | null>(null);
   const current = questions[currentIndex];
   const activeQuestionKey = current ? questionKey(current) : null;
   const asyncSessionId = asyncTarget?.sessionId;
   const asyncCardId = asyncTarget?.cardId;
+  const hasUnsentAnswer =
+    asyncTarget &&
+    draftQuestions.some((question) => {
+      const key = questionKey(question);
+      const selection = selections[key];
+      return (
+        customInputs[key] !== initial.customInputs[key] ||
+        (!!selection?.length &&
+          JSON.stringify(selection) !== JSON.stringify(initial.selections[key]))
+      );
+    });
+  useQuestionCardScroll(
+    rootRef,
+    Boolean(asyncTarget && !resolvedRef.current && (keyboardActive || hasUnsentAnswer)),
+    focusedText,
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -999,6 +1017,7 @@ export function AskUserQuestionForm({
                   value={customRowValue}
                   onChange={(e) => handleCustomInput(currentKey, e)}
                   onFocus={(event) => {
+                    if (asyncTarget) setFocusedText(event.currentTarget);
                     setHighlight(current.options.length);
                     if (pendingCaretRef.current?.key === currentKey) return;
                     caretRef.current[currentKey] = {
@@ -1006,6 +1025,7 @@ export function AskUserQuestionForm({
                       end: event.currentTarget.selectionEnd,
                     };
                   }}
+                  onBlur={() => setFocusedText(null)}
                   onSelect={(event) => {
                     if (pendingCaretRef.current?.key === currentKey) return;
                     caretRef.current[currentKey] = {

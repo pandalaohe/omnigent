@@ -5651,7 +5651,13 @@ describe("NewChatLandingScreen", () => {
       renderLanding();
       openAgentConfig("a_acp");
       expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent(label);
-      expect(screen.queryByTestId("new-chat-landing-permission-chip")).toBeNull();
+      if (harness.startsWith("acp:")) {
+        expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+          "Permission mode: Default",
+        );
+      } else {
+        expect(screen.queryByTestId("new-chat-landing-permission-chip")).toBeNull();
+      }
       pickSelectOption("new-chat-landing-config-harness", "Codex");
       saveConfig();
       openAgentConfig("a_acp");

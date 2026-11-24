@@ -195,6 +195,31 @@ def _runtime(
     return runtime
 
 
+@pytest.mark.parametrize(
+    ("tier", "name", "arguments", "expected"),
+    [
+        ("auto", "run_command", {"CommandLine": "git status"}, Verdict.ALLOW),
+        ("accept-edits", "run_command", {"CommandLine": "git status"}, Verdict.ASK),
+        ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
+        ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ASK),
+        ("auto", "unknown", {}, Verdict.DENY),
+    ],
+)
+def test_acp_host_permission_uses_shared_deny_rules(tmp_path, tier, name, arguments, expected):
+    runtime = _runtime(tmp_path, tier)
+    runtime._harnesses["session-a"] = "acp"
+    assert (
+        runtime.evaluate_acp_call(
+            "session-a", {"call_id": "tool-1", "name": name, "arguments": arguments}
+        )
+        == expected
+    )
+    assert (
+        runtime.evaluate_acp_call("session-a", {"name": name, "arguments": arguments})
+        == Verdict.DENY
+    )
+
+
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
 def test_agy_schema_read_rechecks_advertisement_on_authorize(tmp_path, tier):
     from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir

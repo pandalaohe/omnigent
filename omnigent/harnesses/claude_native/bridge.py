@@ -117,6 +117,7 @@ from omnigent.native.failure_telemetry import FailureContext
 from omnigent.permission_tiers.pi_private import pi_bridge_failure, redact_pi_authority
 from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
+from omnigent.shell_timeouts import shell_dispatch_timeout
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -385,6 +386,8 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
 
 # Active dispatch budget; each call excludes its own bounded approval waits.
 _TOOL_CALL_TIMEOUT_S = 320.0
+# Two 120s preflight reads and a 720s settings PATCH need room to finish.
+_SESSION_UPDATE_TOOL_CALL_TIMEOUT_S = 1080.0
 _TOOL_RELAY_HEARTBEAT_S = 1.0
 _MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "mcp_call_cancel_event", default=None
@@ -10889,6 +10892,16 @@ def _tool_relay_handler_factory(
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
+    from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
+
+    permission_state_timeout_s = 5.0
+    if bridge_dir is not None and _absolute_syntactic_path(bridge_dir).is_relative_to(
+        _absolute_syntactic_path(antigravity_bridge_root())
+    ):
+        from omnigent.harnesses.antigravity_native.guard import PERMISSION_STATE_RELAY_TIMEOUT_S
+
+        permission_state_timeout_s = PERMISSION_STATE_RELAY_TIMEOUT_S
+
     pending: dict[str, Future[object]] = {}
     pending_lock = threading.Lock()
     # Remember a cancellation that races ahead of its /tool request.
@@ -11575,12 +11588,20 @@ def _tool_relay_handler_factory(
             future = asyncio.run_coroutine_threadsafe(
                 policy_client.get(
                     f"/v1/sessions/{quote(session_id, safe='')}",
+                    # Permission state comes from the stored session. The live-status
+                    # probe can call back into the runner waiting for this response.
+                    params={
+                        "include_items": "false",
+                        "include_liveness": "false",
+                        "include_live_status": "false",
+                        "include_usage": "false",
+                    },
                     headers={"X-Omnigent-Permission-Tiers": "1"},
                 ),
                 loop,
             )
             try:
-                response = future.result(timeout=5.0)
+                response = future.result(timeout=permission_state_timeout_s)
                 response.raise_for_status()
                 state = response.json()
                 if not isinstance(state, dict):
@@ -11764,7 +11785,13 @@ def _run_relay_tool(
     :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
     :returns: MCP tool-call response.
     """
-    deadline = ToolCallDeadline(_TOOL_CALL_TIMEOUT_S)
+    timeout = (
+        _SESSION_UPDATE_TOOL_CALL_TIMEOUT_S
+        if name == "sys_session_update"
+        else _TOOL_CALL_TIMEOUT_S
+    )
+    timeout = shell_dispatch_timeout(name, arguments, timeout)
+    deadline = ToolCallDeadline(timeout)
 
     async def execute() -> object:
         with bind_tool_call_deadline(deadline):
@@ -11778,7 +11805,7 @@ def _run_relay_tool(
             remaining = deadline.remaining()
             if remaining <= 0:
                 return _mcp_error(
-                    f"Omnigent tool dispatch timed out after {_TOOL_CALL_TIMEOUT_S:g}s "
+                    f"Omnigent tool dispatch timed out after {timeout:g}s "
                     "of active work (approval waiting excluded). Cancellation requested; "
                     "completion is unknown. Check the affected state before retrying."
                 )

@@ -19,7 +19,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from enum import Enum
 from pathlib import Path
@@ -33,6 +33,7 @@ from omnigent.util.codex_home_lock import config_writer, replace_config
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.native.native_terminal_generation import NativeTerminalGeneration
 
 _logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
 )
 
 _STATE_FILE = "state.json"
+# The server compares turn revisions across transports for the same session.
+_CLEARED_TURN_REVISION_FILE = "cleared-turn-revision.json"
 # Survives runtime-state resets so a relaunched pane keeps its resource owner.
 _RESOURCE_OWNER_FILE = "resource-owner.json"
 _STATE_LOCK_FILE = "state.lock"
@@ -1773,6 +1776,12 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                     state.active_turn_revision,
                 ),
             )
+        elif current is None:
+            floor = _read_cleared_turn_revision(bridge_dir, state.session_id)
+            state = replace(
+                state,
+                active_turn_revision=max(state.active_turn_revision, floor.revision),
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1857,7 +1866,20 @@ def read_bridge_startup_timeout(bridge_dir: Path) -> float | None:
     return _validated_startup_timeout(raw.get("timeout_seconds"))
 
 
-def clear_bridge_state(bridge_dir: Path) -> None:
+@dataclass(frozen=True)
+class _ClearedTurnRevision:
+    revision: int = 0
+    turn_id: str | None = None
+    outcome: str | None = None
+    terminal_revision: int = 0
+
+
+def clear_bridge_state(
+    bridge_dir: Path,
+    *,
+    session_id: str | None = None,
+    terminal_generation: NativeTerminalGeneration | None = None,
+) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
 
@@ -1869,9 +1891,54 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     state.
 
     :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Session the new launch will own.
+    :param terminal_generation: Last terminal accepted by the server for this runner binding.
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        previous = read_bridge_state(bridge_dir)
+        if session_id is None and previous is not None:
+            session_id = previous.session_id
+        if session_id is not None:
+            saved = _read_cleared_turn_revision(bridge_dir, session_id)
+            floor = saved
+            if (
+                previous is not None
+                and previous.session_id == session_id
+                and previous.active_turn_revision >= floor.revision
+            ):
+                floor = replace(floor, revision=previous.active_turn_revision)
+                if previous.last_terminal_turn_id is not None:
+                    floor = _ClearedTurnRevision(
+                        revision=floor.revision,
+                        turn_id=previous.last_terminal_turn_id,
+                        outcome=previous.last_terminal_outcome,
+                        terminal_revision=previous.active_turn_revision,
+                    )
+            if terminal_generation is not None:
+                turn_id = terminal_generation.turn_id.removeprefix("codex_")
+                if terminal_generation.generation >= floor.revision or floor.turn_id in (
+                    None,
+                    turn_id,
+                ):
+                    outcome = terminal_generation.turn_outcome
+                    if terminal_generation.status == "failed":
+                        outcome = "failed"
+                    elif terminal_generation.turn_completed:
+                        outcome = "completed"
+                    # A later local start may raise the floor above the accepted edge.
+                    floor = _ClearedTurnRevision(
+                        revision=max(floor.revision, terminal_generation.generation),
+                        turn_id=turn_id,
+                        outcome=outcome,
+                        terminal_revision=terminal_generation.generation,
+                    )
+            if floor != saved:
+                _replace_bridge_record(
+                    bridge_dir,
+                    _CLEARED_TURN_REVISION_FILE,
+                    {"session_id": session_id, **asdict(floor)},
+                )
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
@@ -1884,6 +1951,33 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 (bridge_dir / name).unlink()
             except FileNotFoundError:
                 continue
+
+
+def _read_cleared_turn_revision(bridge_dir: Path, session_id: str) -> _ClearedTurnRevision:
+    """Read the revision and terminal identity left by the last transport."""
+    try:
+        record = json.loads((bridge_dir / _CLEARED_TURN_REVISION_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _ClearedTurnRevision()
+    if (
+        not isinstance(record, dict)
+        or record.get("session_id") != session_id
+        or type(revision := record.get("revision")) is not int
+        or revision < 0
+    ):
+        return _ClearedTurnRevision()
+    turn_id, outcome = record.get("turn_id"), record.get("outcome")
+    terminal_revision = record.get("terminal_revision")
+    return _ClearedTurnRevision(
+        revision=revision,
+        turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
+        outcome=outcome if outcome in ("completed", "cancelled", "failed") else None,
+        terminal_revision=(
+            terminal_revision
+            if type(terminal_revision) is int and 0 <= terminal_revision <= revision
+            else revision
+        ),
+    )
 
 
 def write_bridge_startup_error(
@@ -2849,8 +2943,13 @@ def record_resumed_terminal(
     observed: CodexNativeBridgeState,
     turn_ids: list[str],
     outcome: str,
+    *,
+    on_cold_retry: Callable[[int], None] | None = None,
 ) -> CodexNativeBridgeState | None:
-    """Bind a resume terminal only if its history includes the latest known boundary."""
+    """Bind a resume terminal or return the unchanged bridge for a cold retry.
+
+    If supplied, on_cold_retry receives the original terminal revision under the lock.
+    """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
         if state is None or state != observed or not turn_ids:
@@ -2866,6 +2965,14 @@ def record_resumed_terminal(
             return None
         if state.active_turn_id is None and state.last_terminal_turn_id == turn_id:
             return state if state.last_terminal_outcome == outcome else None
+        if state.active_turn_id is None and state.last_terminal_turn_id is None:
+            floor = _read_cleared_turn_revision(bridge_dir, state.session_id)
+            if floor.turn_id == turn_id:
+                if floor.outcome != outcome:
+                    return None
+                if on_cold_retry is not None:
+                    on_cold_retry(floor.terminal_revision)
+                return state
         updated = replace(
             state,
             active_turn_id=None,

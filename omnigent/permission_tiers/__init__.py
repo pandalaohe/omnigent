@@ -502,7 +502,8 @@ _UNBOUND_DELETE = "A delete needs a bindable target: an unresolved name could de
 
 
 def normalize_permission_tier(raw: object, *, harness: str, legacy: bool) -> PermissionTier:
-    if harness not in ("pi", "pi-native", "antigravity-native"):
+    acp = harness == "acp" or harness.startswith("acp:")
+    if harness not in ("pi", "pi-native", "antigravity-native") and not acp:
         raise ValueError("Unknown harness")
     if legacy and raw is None:
         return "ask"
@@ -510,6 +511,8 @@ def normalize_permission_tier(raw: object, *, harness: str, legacy: bool) -> Per
         return "auto"
     if not isinstance(raw, str) or raw not in PERMISSION_TIERS:
         raise ValueError("Missing permission tier")
+    if acp and raw == "full":
+        raise ValueError("Full permission is unavailable for ACP host tiers")
     return raw
 
 

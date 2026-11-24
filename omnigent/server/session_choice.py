@@ -866,6 +866,7 @@ class ChoiceRequest:
     # Model identities include route prefixes; None selects all models of an agent.
     quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
     link_exclusions: Mapping[str, float] | None = None
+    required_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1334,21 @@ def _filter_link(
     pool = pool_of(settings, link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
+    required_model = request.required_model
+    if required_model is not None and link.model != required_model:
+        resolved = resolve_saved_model(
+            required_model,
+            request.models.get(link.agent_id),
+            request.provider_groups,
+            allow_substitution=False,
+        )
+        required_route = codex_route_pool(
+            settings, required_model, product, request.provider_groups
+        )
+        if resolved.model != link.model or required_route != codex_route_pool(
+            settings, link.model, product, request.provider_groups
+        ):
+            return Skipped(link, "model_mismatch")
     if needs_route_model(settings, link, product, request.provider_groups):
         return Skipped(link, "model_unavailable")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
@@ -1640,6 +1656,11 @@ def plan_choice(
             ),
             drops=tuple(drops),
         )
+    reason = "No eligible link"
+    if request.required_model is not None:
+        reason = f"No eligible link for requested model {request.required_model!r}"
+    elif any(item.why == "model_unavailable" for item in skipped):
+        reason = "Choose a model for this Codex route"
     return ChoicePlan(
         Choice(
             "ask",
@@ -1647,12 +1668,7 @@ def plan_choice(
             None,
             None,
             None,
-            (
-                "Choose a model for this Codex route"
-                if any(item.why == "model_unavailable" for item in skipped)
-                else "No eligible link"
-            )
-            + drop_note,
+            reason + drop_note,
             tuple(skipped),
             flags,
             warnings,

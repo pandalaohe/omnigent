@@ -3880,6 +3880,32 @@ def register_events_routes(
                 background_title_coordinator=background_title_coordinator,
                 enabled=background_session_titles_enabled(request.headers),
             )
+            item_data = body.data.get("item_data")
+            if (
+                item_id is not None
+                and not replayed
+                and peer_message_store is not None
+                and body.data.get("item_type") == "message"
+                and isinstance(item_data, dict)
+                and item_data.get("role") == "user"
+            ):
+                from omnigent.server.peer_sweeper import settle_from_mirrored_envelope
+
+                try:
+                    # A committed peer envelope settles its record without the sweeper grace.
+                    await asyncio.to_thread(
+                        settle_from_mirrored_envelope,
+                        peer_message_store,
+                        conversation_store,
+                        session_id,
+                        item_id,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Peer receipt from a mirrored envelope failed",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
             if item_id is not None and not replayed and body.data.get("item_type") == "error":
                 from omnigent.server.session_choice_runtime import (
                     observe_external_admission,
@@ -6022,6 +6048,8 @@ def register_events_routes(
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True, "forwarded": dispatch.forwarded}
+        if getattr(dispatch, "native_receipt_pending", False) is True:
+            response["native_receipt_pending"] = True
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
         # Native-terminal web message: hand back the pending-input id. It
@@ -6642,15 +6670,29 @@ def register_events_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or not _has_bound_runner_authority(request, conv):
             raise HTTPException(403, "Bound receiver authority required")
-        return {
-            "claimed": pending_inputs.claim_runner_input(
-                session_id,
-                pending_id,
-                claim_id,
-                expected_attempt_id=attempt_id,
-                runner_id=conv.runner_id,
+        claimed = pending_inputs.claim_runner_input(
+            session_id, pending_id, claim_id, expected_attempt_id=attempt_id
+        )
+        peer_id = pending_inputs.peer_message_id_for(session_id, pending_id) if claimed else None
+        if peer_id is None or peer_message_store is None:
+            return {"claimed": claimed}
+        from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+
+        try:
+            # A peer copy may paste only once its record durably says so; a
+            # claimed record is never resent.
+            marked = await asyncio.to_thread(
+                mark_peer_copy_claimed, peer_message_store, session_id, peer_id, attempt_id
             )
-        }
+        except Exception:
+            _logger.warning(
+                "Peer copy claim mark failed", exc_info=True, extra={"session_id": session_id}
+            )
+            # The runner retries this claim id until its deadline.
+            raise HTTPException(503, "Peer copy claim could not be recorded") from None
+        if not marked:
+            pending_inputs.unclaim_runner_input(session_id, pending_id, claim_id)
+        return {"claimed": marked}
 
     @event_router.get("/sessions/{session_id}/input-controls", include_in_schema=False)
     async def pending_input_controls(request: Request, session_id: str):

@@ -11,6 +11,7 @@
 // on a single wheel tick.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { pauseQuestionCardScroll } from "@/components/ai-elements/conversation";
 import { cn } from "@/lib/utils";
 
 /** The scroll container plus the bottom-lock release, as lifted by ChatPage. */
@@ -122,6 +123,7 @@ export function TranscriptScrollbar({
       event.currentTarget.setPointerCapture(event.pointerId);
       // StickToBottom re-pins to the bottom on content resize unless the lock
       // is released, which would fight a drag away from the newest turn.
+      pauseQuestionCardScroll(el);
       scroller.stopScroll();
       dragRef.current = { lastY: event.clientY };
       setDragging(true);

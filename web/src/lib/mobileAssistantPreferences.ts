@@ -669,7 +669,7 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
     } else {
       window.localStorage.removeItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY);
     }
-    queueUserPreferencePatch("mobile_assistant", canonical);
+    queueUserPreferencePatch("mobile_assistant", { ...canonical, terminalKeyboard: undefined });
     window.dispatchEvent(new Event(MOBILE_ASSISTANT_CHANGED_EVENT));
   } catch {
     // Mobile controls retain their safe defaults when storage is unavailable.

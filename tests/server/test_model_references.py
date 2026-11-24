@@ -120,7 +120,7 @@ async def test_legacy_and_explicit_create_values_resolve_and_missing_is_unknown(
         warnings=warnings,
     )
     assert missing.model == "old/x" and missing.notes[0]["outcome"] == "missing"
-    assert any("trying it as unknown" in warning for warning in warnings)
+    assert any("passing it to the host unchanged" in warning for warning in warnings)
 
 
 async def test_resume_resolves_persists_and_labels_the_override(references_env, db_uri):
@@ -278,7 +278,7 @@ async def test_library_launch_retains_lead_and_member_resolution_notes(
         assert saved_spec.executor.model == "old/x"
         assert member["model"] == "old/y"
         assert "unavailable" not in member
-        assert any("trying it as unknown" in warning for warning in result.warnings)
+        assert any("passing it to the host unchanged" in warning for warning in result.warnings)
     notes = notes_from_labels(saved.labels)
     assert {note["setting"] for note in notes} >= {"member:worker", "library_agent"}
     assert {note["outcome"] for note in notes} == {"renamed" if provider_rename else "missing"}

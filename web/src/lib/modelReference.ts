@@ -33,7 +33,7 @@ export function modelResolutionNotes(labels: Record<string, string> = {}): Model
       }
       record = JSON.parse(text);
     }
-    return Array.isArray(record)
+    const notes = Array.isArray(record)
       ? record.filter(
           (note): note is ModelResolutionNote =>
             note &&
@@ -44,6 +44,13 @@ export function modelResolutionNotes(labels: Record<string, string> = {}): Model
             typeof note.setting === "string",
         )
       : [];
+    const seen = new Set<string>();
+    return notes.filter((note) => {
+      const dedupeKey = JSON.stringify([note.host, note.saved, note.model, note.outcome]);
+      if (seen.has(dedupeKey)) return false;
+      seen.add(dedupeKey);
+      return true;
+    });
   } catch {
     return [];
   }

@@ -88,6 +88,27 @@ export function isSdkHarnessSession(
   );
 }
 
+/** A Codex SDK override can be cleared even when its model has no effort ladder. */
+export function supportsSdkEffortReset(
+  session:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+  effortFamily: string | null,
+): boolean {
+  return (
+    effortFamily === "codex-native" &&
+    isSdkHarnessSession(session) &&
+    session?.parentSessionId == null &&
+    session?.labels?.["omnigent.closed"] !== "true"
+  );
+}
+
 // Reasoning-effort ladder per server ``EffortFamily`` (``/v1/harnesses`` →
 // ``capabilities.effort``). Mirrors ``omnigent/util/reasoning_effort.py``;
 // ``codex-native`` is per-model and ``none`` has no ladder, so neither is here.
@@ -106,9 +127,14 @@ const EFFORT_FAMILY_LEVELS: Readonly<Record<string, readonly string[]>> = {
  *
  * :param family: ``capabilities.effort`` from ``/v1/harnesses``, e.g.
  *     ``"anthropic"``; ``null`` / unknown / ``"none"`` yield no ladder.
- * :returns: Ordered effort ids, empty when the family has no ladder.
+ * :returns: Ordered effort ids; per-model families require a resolved model.
  */
-export function effortLevelsForFamily(family: string | null | undefined): readonly string[] {
+export function effortLevelsForFamily(
+  family: string | null | undefined,
+  models: readonly NativeModelOption[] = [],
+  model: string | null | undefined = null,
+): readonly string[] {
+  if (family === "codex-native") return effortLevelsFor("codex", models, model) ?? [];
   return (family && EFFORT_FAMILY_LEVELS[family]) || [];
 }
 
@@ -138,11 +164,14 @@ export function supportsEffortControl(
         inferenceConfigured?: boolean;
         parentSessionId?: string | null;
         codexModelOptions?: readonly NativeModelOption[];
+        modelOverride?: string | null;
+        llmModel?: string | null;
       }
     | null
     | undefined,
   effortFamily: string | null = null,
   models?: readonly NativeModelOption[],
+  currentModel?: string | null,
 ): boolean {
   if (session?.harness === "acp" || session?.harness?.startsWith("acp:")) {
     const rows = models ?? session.codexModelOptions ?? [];
@@ -170,7 +199,11 @@ export function supportsEffortControl(
     wrapper == null &&
     !session.inferenceConfigured &&
     session.parentSessionId == null &&
-    effortLevelsForFamily(effortFamily).length > 0
+    effortLevelsForFamily(
+      effortFamily,
+      models ?? session.codexModelOptions ?? [],
+      currentModel ?? session.modelOverride ?? session.llmModel,
+    ).length > 0
   );
 }
 

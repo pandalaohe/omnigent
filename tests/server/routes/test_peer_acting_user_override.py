@@ -192,3 +192,231 @@ async def test_stopped_receiver_is_rejected_without_uncertain_retry(env, db_uri)
     updated = env["peer_store"].get(record.id)
     assert updated.state == "failed"
     assert "Stopped:" in updated.reason
+
+
+async def test_claim_route_marks_the_copy_and_its_mirror_settles_it_at_once(env):
+    """The claim route marks a peer copy pasted; its committed envelope settles it at once."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions.routes_peer import format_peer_envelope
+
+    peer_store: SqlAlchemyPeerMessageStore = env["peer_store"]
+    receiver = env["receiver"]
+    receiver_token = "receiver-tok"
+    assert env["conv_store"].set_runner_id(receiver.id, token_bound_runner_id(receiver_token))
+    now = now_epoch()
+    legacy, native = (
+        peer_store.create(
+            SessionPeerMessage(
+                id=record_id,
+                sender_session_id=env["sender"].id,
+                receiver_session_id=receiver.id,
+                ref=f"ref-{record_id[0]}",
+                text="mirrored body",
+                state="delivering",
+                reason=reason,
+                created_at=now,
+                updated_at=now,
+                expires_at=now + 3600,
+            )
+        )
+        for record_id, reason in (("c" * 32, None), ("d" * 32, "native_attempt:" + "e" * 32))
+    )
+    envelopes = {
+        record.id: format_peer_envelope(
+            sender_session_id=record.sender_session_id,
+            sender_title="sender",
+            sender_agent_name=None,
+            sender_project_id=None,
+            ref=record.ref,
+            peer_id=record.id,
+            text=record.text,
+        )
+        for record in (legacy, native)
+    }
+    pending_id = pending_inputs.record(
+        receiver.id,
+        [{"type": "input_text", "text": envelopes[legacy.id]}],
+        peer_message_id=legacy.id,
+    )
+    pending_inputs.enable_runner_lease(receiver.id, pending_id)
+    attempt_id = pending_inputs.delivery_attributes_for(receiver.id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    transport = httpx.ASGITransport(app=env["app"])
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            claim = await client.post(
+                f"/v1/sessions/{receiver.id}/pending-inputs/{pending_id}/claim",
+                params={"attempt_id": attempt_id, "claim_id": "paste"},
+                headers={RUNNER_TUNNEL_TOKEN_HEADER: receiver_token},
+            )
+            assert claim.json() == {"claimed": True}, claim.text
+            # Claimed copies are never resent; the record carries that durably.
+            assert peer_store.get(legacy.id).reason == f"native_claimed:{attempt_id}"
+            for record in (legacy, native):
+                resp = await client.post(
+                    f"/v1/sessions/{receiver.id}/events",
+                    json={
+                        "type": "external_conversation_item",
+                        "data": {
+                            "item_type": "message",
+                            "item_data": {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": envelopes[record.id]}],
+                            },
+                            "response_id": f"resp-{record.id}",
+                        },
+                    },
+                    headers={"X-Forwarded-Email": ALICE},
+                )
+                assert resp.status_code < 300, resp.text
+    finally:
+        for leftover in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, leftover)
+    # No sweeper tick and no grace: the committed envelope is the receipt.
+    assert peer_store.get(legacy.id).state == "delivered"
+    # A native attempt keeps its own response-id receipt rule.
+    assert peer_store.get(native.id).state == "delivering"
+
+
+@pytest.mark.parametrize("record_case", ["mark-write-fails", "already-reverted"])
+async def test_claim_route_grants_a_peer_paste_only_after_its_durable_mark(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, record_case: str
+) -> None:
+    """A peer copy whose claim mark is not stored never gets the paste grant."""
+    from omnigent.runtime import pending_inputs
+
+    peer_store: SqlAlchemyPeerMessageStore = env["peer_store"]
+    receiver = env["receiver"]
+    receiver_token = "receiver-tok"
+    assert env["conv_store"].set_runner_id(receiver.id, token_bound_runner_id(receiver_token))
+    now = now_epoch()
+    record = peer_store.create(
+        SessionPeerMessage(
+            id="f" * 32,
+            sender_session_id=env["sender"].id,
+            receiver_session_id=receiver.id,
+            ref="ref-claim",
+            text="claimed body",
+            state="pending" if record_case == "already-reverted" else "delivering",
+            created_at=now,
+            updated_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    pending_id = pending_inputs.record(
+        receiver.id, [{"type": "input_text", "text": "claimed body"}], peer_message_id=record.id
+    )
+    pending_inputs.enable_runner_lease(receiver.id, pending_id)
+    attempt_id = pending_inputs.delivery_attributes_for(receiver.id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    store_down = {"value": record_case == "mark-write-fails"}
+    original_transition = SqlAlchemyPeerMessageStore.transition
+
+    def _transition(self: SqlAlchemyPeerMessageStore, *args: Any, **kwargs: Any) -> bool:
+        if store_down["value"]:
+            raise RuntimeError("peer store unavailable")
+        return original_transition(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyPeerMessageStore, "transition", _transition)
+    transport = httpx.ASGITransport(app=env["app"])
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+            async def _claim() -> httpx.Response:
+                return await client.post(
+                    f"/v1/sessions/{receiver.id}/pending-inputs/{pending_id}/claim",
+                    params={"attempt_id": attempt_id, "claim_id": "paste"},
+                    headers={RUNNER_TUNNEL_TOKEN_HEADER: receiver_token},
+                )
+
+            first = await _claim()
+            if record_case == "already-reverted":
+                # The sweeper will resend this record; the runner must not paste it too.
+                assert first.json() == {"claimed": False}, first.text
+                assert not pending_inputs.runner_input_is_claimed(receiver.id, pending_id)
+                stored = peer_store.get(record.id)
+                assert stored is not None
+                assert (stored.state, stored.reason) == ("pending", None)
+                return
+            # The runner retries a 5xx with the same claim id until its deadline.
+            assert first.status_code == 503, first.text
+            assert peer_store.get(record.id).reason is None  # type: ignore[union-attr]
+            store_down["value"] = False
+            retry = await _claim()
+            assert retry.json() == {"claimed": True}, retry.text
+            stored = peer_store.get(record.id)
+            assert stored is not None
+            assert stored.reason == f"native_claimed:{attempt_id}"
+    finally:
+        for leftover in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, leftover)
+
+
+async def test_a_stalled_forward_cannot_paste_beside_its_resend(env: dict[str, Any]) -> None:
+    """After the sweeper re-sends a stalled copy, only one forward's claim may paste."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.peer_sweeper import _RECONCILE_GRACE_S
+
+    peer_store: SqlAlchemyPeerMessageStore = env["peer_store"]
+    receiver = env["receiver"]
+    receiver_token = "receiver-tok"
+    assert env["conv_store"].set_runner_id(receiver.id, token_bound_runner_id(receiver_token))
+    now = now_epoch()
+    record = peer_store.create(
+        SessionPeerMessage(
+            id="9" * 32,
+            sender_session_id=env["sender"].id,
+            receiver_session_id=receiver.id,
+            ref="ref-resend",
+            text="resent body",
+            state="delivering",
+            created_at=now,
+            updated_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    # The first forward stalls before the runner acknowledges it: no lease yet.
+    stalled = pending_inputs.record(
+        receiver.id, [{"type": "input_text", "text": "resent body"}], peer_message_id=record.id
+    )
+    sweeper = env["app"].state.peer_sweeper
+    await sweeper._reconcile_stale_delivering(now + _RECONCILE_GRACE_S + 1)
+    assert peer_store.get(record.id).state == "pending"  # type: ignore[union-attr]
+    assert peer_store.claim_oldest(record.id, None, ("pending",))
+    resent = pending_inputs.record(
+        receiver.id, [{"type": "input_text", "text": "resent body"}], peer_message_id=record.id
+    )
+    pending_inputs.enable_runner_lease(receiver.id, resent)
+    transport = httpx.ASGITransport(app=env["app"])
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+            async def _claim(pending_id: str, claim_id: str) -> Any:
+                attempt = pending_inputs.delivery_attributes_for(receiver.id, pending_id)[
+                    "delivery_attempt_id"
+                ]
+                response = await client.post(
+                    f"/v1/sessions/{receiver.id}/pending-inputs/{pending_id}/claim",
+                    params={"attempt_id": attempt, "claim_id": claim_id},
+                    headers={RUNNER_TUNNEL_TOKEN_HEADER: receiver_token},
+                )
+                return response.json()
+
+            assert await _claim(resent, "paste-resent") == {"claimed": True}
+            # The stalled forward wakes up: its claim must not paste a second copy.
+            assert await _claim(stalled, "paste-stalled") == {"claimed": False}
+            assert not pending_inputs.runner_input_is_claimed(receiver.id, stalled)
+            # The winning attempt asking again keeps its grant.
+            assert await _claim(resent, "paste-resent") == {"claimed": True}
+    finally:
+        for leftover in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, leftover)
+    stored = peer_store.get(record.id)
+    assert stored is not None
+    resent_attempt_reason = stored.reason
+    assert stored.state == "delivering"
+    assert resent_attempt_reason is not None and resent_attempt_reason.startswith(
+        "native_claimed:"
+    )

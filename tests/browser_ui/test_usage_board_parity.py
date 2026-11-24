@@ -318,10 +318,10 @@ def test_usage_overview_geometry_and_navigation(
     ]:
         page.evaluate("theme => localStorage.setItem('web-theme', theme)", preference)
         page.goto(overview_url + f"?theme={theme}")
-        expect(page.locator(".usage-board-scroll")).to_have_css("background-color", background)
+        expect(page.locator(".usage-scroll")).to_have_css("background-color", background)
         expect(surface).to_have_css("color", ink)
 
-    scroll = page.locator(".usage-board-scroll")
+    scroll = page.locator(".usage-scroll")
     if prefix:
         expect(page.locator("header.chat-header")).to_have_count(0)
         assert scroll.evaluate("element => element.getBoundingClientRect().top") == 0

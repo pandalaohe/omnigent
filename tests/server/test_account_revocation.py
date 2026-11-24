@@ -889,7 +889,6 @@ async def test_stale_schedule_cannot_contact_replacement_host(
 @pytest.mark.parametrize("admitted", [False, True])
 async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypatch, admitted):
     import asyncio
-    import json
     import uuid
 
     from omnigent.host.frames import HostHelloFrame
@@ -958,6 +957,11 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         registry.launch_authorizer = pause_after_admission
     else:
         monkeypatch.setattr(_host_launch, "resolve_host_launch", pause_after_resolution)
+
+    def reject_host_frame(_conn, _data):
+        pytest.fail("a scheduled launch revoked before binding must not send a host frame")
+
+    monkeypatch.setattr(registry, "send_text", reject_host_frame)
     fire = asyncio.create_task(
         _run_fire(
             deps,
@@ -977,15 +981,8 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         assert stores["account_store"].get_user("alice") is None
         assert stores["host_store"].get_host(host_id) is None
         assert tasks.get(task.id).state == "deleted"
+        # Even after admission, launch still depends on the binding that deletion cleared.
         resume.set()
-        if admitted:
-            frame = json.loads(
-                (await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)).data
-            )
-            assert frame["kind"] == "host.launch_runner"
-            conn.pending_launches.pop(frame["request_id"]).set_result(
-                {"status": "failed", "error": "test transport: runner was not started"}
-            )
         await asyncio.wait_for(fire, timeout=10)
         assert conn.outbound_queue.empty()
         runs, _ = tasks.list_runs(task.id)

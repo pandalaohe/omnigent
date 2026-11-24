@@ -2,20 +2,13 @@
 
 from collections.abc import Mapping
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 
 from omnigent.entities import Conversation
-
-NATIVE_TERMINAL_GENERATION_LABEL = "omnigent.native_terminal_generation"
-
-
-class NativeTerminalGeneration(BaseModel):
-    generation: int = Field(strict=True, ge=0)
-    turn_id: str = Field(min_length=1)
-    runner_id: str | None
-    status: str
-    turn_completed: bool
-    turn_outcome: str | None
+from omnigent.native.native_terminal_generation import (
+    NATIVE_TERMINAL_GENERATION_LABEL,
+    NativeTerminalGeneration,
+)
 
 
 def _unversioned_thread_failure(data: Mapping[str, object]) -> bool:

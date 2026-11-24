@@ -13,6 +13,7 @@ import dataclasses
 import logging
 import math
 import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -1998,6 +1999,15 @@ def _subagent_delivery_not_confirmed_response(
     )
 
 
+_FAILURE_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _sanitize_failure_output(text: str) -> str:
+    """Strip ANSI CSI/OSC sequences and C0 control bytes dropped by terminal paste."""
+    stripped = _FAILURE_ANSI_ESCAPE_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in stripped if ord(ch) >= 0x20 or ch in "\n\t")
+
+
 def _format_subagent_wake_notice(
     *,
     agent: str,
@@ -2032,7 +2042,9 @@ def _format_subagent_wake_notice(
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
     if status == "failed" and output:
-        notice = f"{notice}\nFailure: {output}"
+        cleaned_output = _sanitize_failure_output(output)
+        if cleaned_output:
+            notice = f"{notice}\nFailure: {cleaned_output}"
     return notice
 
 

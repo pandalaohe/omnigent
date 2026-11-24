@@ -144,7 +144,11 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
         },
         {
             "type": "external_session_status",
-            "data": _expected_status_data("idle", "turn_123"),
+            "data": {
+                **_expected_status_data("idle", "turn_123"),
+                "turn_outcome": "cancelled",
+                "native_turn_generation": 1,
+            },
         },
     ]
     assert forwarder_state.partial_text_by_turn == {}
@@ -704,7 +708,10 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
         },
         {
             "type": "external_session_status",
-            "data": _expected_status_data("idle", "turn_123"),
+            "data": {
+                **_expected_status_data("idle", "turn_123"),
+                "native_turn_generation": 1,
+            },
         },
     ]
     # The stored diff is consumed on flush — no leak into the next turn.
@@ -741,6 +748,9 @@ def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
     assert posted == [
         {
             "type": "external_session_status",
-            "data": _expected_status_data("idle", "turn_123"),
+            "data": {
+                **_expected_status_data("idle", "turn_123"),
+                "native_turn_generation": 1,
+            },
         },
     ]

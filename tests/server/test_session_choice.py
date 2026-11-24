@@ -2027,7 +2027,7 @@ def test_ambiguous_catalog_miss_tries_the_saved_link_without_exclusion():
     )
     assert result.outcome == "pick" and result.link.model == "old/x"
     assert result.skipped == () and result.notes[0]["outcome"] == "missing"
-    assert any("trying it as unknown" in warning for warning in result.warnings)
+    assert any("passing it to the host unchanged" in warning for warning in result.warnings)
 
 
 @pytest.mark.parametrize(

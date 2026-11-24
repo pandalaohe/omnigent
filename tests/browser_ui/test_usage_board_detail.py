@@ -566,7 +566,7 @@ def test_account_detail_keyboard_ranges_and_return(
     expect(page).to_have_url(
         appearance_url + "/frame/usage/board?account=plan-1&view=details&theme=dark"
     )
-    expect(page.locator(".usage-board-scroll")).to_have_attribute("data-usage-theme", "dark")
+    expect(page.locator(".usage-scroll")).to_have_attribute("data-usage-theme", "dark")
     page.goto(appearance_url + "/settings/general#usage-settings")
     usage_settings = page.get_by_test_id("settings-group-usage-settings")
     expect(usage_settings).to_be_visible()

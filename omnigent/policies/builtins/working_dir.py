@@ -57,6 +57,7 @@ from omnigent.policies.builtins._shell import (
     SHELL_TOOLS,
     is_unresolved_invocation,
     real_invocation_tokens,
+    shell_command,
     spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
@@ -424,11 +425,11 @@ def block_working_dir_changes(
         if not isinstance(data, dict):
             return None
         raw_tool = data.get("name")
-        if raw_tool not in shell_tool_names:
+        if not isinstance(raw_tool, str) or raw_tool not in shell_tool_names:
             return None
         args = data.get("arguments")
         args = args if isinstance(args, dict) else {}
-        command = args.get("command")
+        command = shell_command(raw_tool, args)
         if not isinstance(command, str) or not command.strip():
             return None
         return _evaluate_command(command)

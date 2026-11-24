@@ -18,6 +18,7 @@ from omnigent.native.permission_modes import (
     AGENT_DEFAULT_PERMISSION_MODE_HINT,
     APPROVAL_SKIPPING_PERMISSION_MODES,
 )
+from omnigent.policies.builtins._shell import SHELL_TOOLS, shell_command
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -281,6 +282,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Goose native tools** (``developer__shell`` and the
       ``developer__*`` file tools) — surfaced via the goose
       extension hook.
+    - **Antigravity ACP shell** (``run_command``) — bound to the
+      pending tool call by the ACP executor.
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
@@ -303,7 +306,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         return _ALLOW
     tool = data.get("name", "")
     _all_os_tools = (
-        _SYS_OS_TOOLS
+        SHELL_TOOLS
+        | _SYS_OS_TOOLS
         | _SYS_TERMINAL_TOOLS
         | _NATIVE_OS_TOOLS
         | _CURSOR_NATIVE_OS_TOOLS
@@ -316,16 +320,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in (
-            "sys_os_shell",
-            "Bash",
-            "bash",
-            "Shell",
-            "terminal",
-            "developer__shell",
-            "shell",
-        ):
-            preview = args.get("command", "") if isinstance(args, dict) else ""
+        if tool in SHELL_TOOLS:
+            preview = shell_command(tool, args) or ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
         elif tool == "execute_code":

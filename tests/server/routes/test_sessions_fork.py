@@ -1283,7 +1283,7 @@ async def test_fork_session_run_config_overrides_pass_through(side_chat: bool) -
 @pytest.mark.asyncio
 async def test_fork_session_run_config_omitted_inherits() -> None:
     """A fork with no run-config fields leaves every override unset, so the
-    store keeps today's inherit behavior (and drops no mode labels)."""
+    store inherits the source's model settings and launch arguments."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(conv_store))
@@ -1295,8 +1295,8 @@ async def test_fork_session_run_config_omitted_inherits() -> None:
     assert fork_call["override_model_override_set"] is False
     assert fork_call["override_reasoning_effort_set"] is False
     assert fork_call["override_terminal_launch_args_set"] is False
-    # No run-config pick, so the route asks for no conditional drop at all.
-    assert fork_call["dropped_label_keys"] == frozenset()
+    assert fork_call["copy_model_settings"] is True
+    assert fork_call["copy_terminal_launch_args"] is True
 
 
 @pytest.mark.asyncio
@@ -1809,21 +1809,17 @@ async def test_fork_switch_drops_member_snapshot_labels() -> None:
 
 @pytest.mark.asyncio
 async def test_fork_same_agent_keeps_permission_mode_label() -> None:
-    """A same-agent fork with no explicit launch args drops NO mode labels.
-
-    The permission-mode label is Claude-specific but valid for a same-agent
-    fork (same CLI), so it must carry over — the drop is gated on an agent
-    switch or an explicit launch-args pick, neither of which applies here.
-    """
-    conv = _make_conversation()
-    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    """A same-agent Claude fork inherits the source's mode when the picker is untouched."""
+    mode_label = "omnigent.claude_native.permission_mode"
+    conv = _make_conversation(labels={mode_label: "acceptEdits"})
+    conv.harness_override = "claude-native"
+    conv_store = _ConversationStore(conversations={conv.id: conv})
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    # Nothing conditional to drop, so the permission-mode label carries over.
-    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
+    assert resp.json()["labels"][mode_label] == "acceptEdits"
 
 
 @pytest.mark.asyncio

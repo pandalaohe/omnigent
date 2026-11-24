@@ -5,6 +5,7 @@ import {
   effortLevelsForFamily,
   isSdkHarnessSession,
   supportsEffortControl,
+  supportsSdkEffortReset,
 } from "./sessionCapabilities";
 import { effortLevelsFor } from "./modelEffortOptions";
 
@@ -85,7 +86,8 @@ export function effortLevelsForConv(
   currentModel: string | null = null,
   effortFamily: string | null = null,
 ): readonly string[] {
-  if (isSdkHarnessSession(conv) && effortFamily) return effortLevelsForFamily(effortFamily);
+  if (isSdkHarnessSession(conv) && effortFamily)
+    return effortLevelsForFamily(effortFamily, codexModelOptions, currentModel);
   const harness =
     nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
     (isSdkHarnessSession(conv) || conv?.harness === "acp" || conv?.harness?.startsWith("acp:")
@@ -184,14 +186,24 @@ export function shouldShowEffortPicker(
         harness?: string | null;
         inferenceConfigured?: boolean;
         parentSessionId?: string | null;
+        modelOverride?: string | null;
+        llmModel?: string | null;
+        codexModelOptions?: readonly NativeModelOption[];
+        reasoningEffort?: string | null;
       }
     | null
     | undefined,
   effortFamily: string | null = null,
   models?: readonly NativeModelOption[],
+  currentModel?: string | null,
 ): boolean {
-  if (isSdkHarnessSession(conv)) {
+  // Side-chat settings already show declared fixed ladders for SDK children.
+  // The main store's per-model controls still require a top-level SDK session.
+  if (conv?.parentSessionId != null && isSdkHarnessSession(conv)) {
     return effortLevelsForFamily(effortFamily).length > 0;
   }
-  return supportsEffortControl(conv, effortFamily, models);
+  return (
+    supportsEffortControl(conv, effortFamily, models, currentModel) ||
+    (conv?.reasoningEffort != null && supportsSdkEffortReset(conv, effortFamily))
+  );
 }

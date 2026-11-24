@@ -1,6 +1,10 @@
 import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { toast } from "sonner";
 import type { TerminalSession } from "@/components/blocks/TerminalSession";
+import {
+  readTerminalKeyboardPreferences,
+  terminalPasteBoxModeFor,
+} from "./terminalKeyboardPreferences";
 import type { ClipboardOp } from "./terminalKeys";
 
 const HOST_CLIPBOARD_MAX_BYTES = 256 * 1024;
@@ -132,7 +136,7 @@ export function useTerminalPaste(
   const requestRef = useRef<PasteRequest | null>(null);
   const reviewRef = useRef<PasteReview | null>(null);
   const [review, setReview] = useState<PasteReview | null>(null);
-  const [showPasteBox, setShowPasteBox] = useState(false);
+  const [pasteBoxText, setPasteBoxText] = useState<string | null>(null);
   const cancel = useCallback((notifyDisconnect = false) => {
     const request = requestRef.current;
     const readingHost = request?.source === "pasteHost" && !reviewRef.current;
@@ -140,7 +144,7 @@ export function useTerminalPaste(
     requestRef.current = null;
     reviewRef.current = null;
     setReview(null);
-    setShowPasteBox(false);
+    setPasteBoxText(null);
     if (notifyDisconnect && readingHost) toast.error(NOT_CONNECTED);
   }, []);
 
@@ -178,7 +182,7 @@ export function useTerminalPaste(
 
   const offerText = (request: PasteRequest, raw: string) => {
     if (!isCurrent(request)) return;
-    setShowPasteBox(false);
+    setPasteBoxText(null);
     const text = stripPasteControlCharacters(raw).replace(/\n+$/, "");
     const hasLineBreakOrTab = /[\n\t]/.test(text);
     if (!text) {
@@ -236,19 +240,35 @@ export function useTerminalPaste(
       }
       return;
     }
+    const pasteBoxMode = terminalPasteBoxModeFor(readTerminalKeyboardPreferences());
+    let text: string;
     try {
-      offerText(request, await navigator.clipboard.readText());
+      text = await navigator.clipboard.readText();
     } catch {
-      if (isCurrent(request)) setShowPasteBox(true);
+      if (!isCurrent(request)) return;
+      if (pasteBoxMode === "never") {
+        cancel();
+        toast.error("Couldn't read the clipboard. Use your browser's Paste command.");
+      } else {
+        setPasteBoxText("");
+      }
+      return;
+    }
+    if (!isCurrent(request)) return;
+    if (pasteBoxMode === "always") {
+      setPasteBoxText(text);
+    } else {
+      offerText(request, text);
     }
   };
 
   return {
     paste,
     cancel,
-    showPasteBox,
-    pasteFromBox: (text: string) => {
-      if (requestRef.current) offerText(requestRef.current, text);
+    pasteBoxText,
+    setPasteBoxText,
+    pasteFromBox: () => {
+      if (requestRef.current && pasteBoxText !== null) offerText(requestRef.current, pasteBoxText);
     },
     review,
     confirm: () => {

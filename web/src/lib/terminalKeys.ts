@@ -31,6 +31,10 @@ import {
   type TerminalStickyModifiers,
 } from "@/lib/terminalKeyBar";
 import { collectLocalUserPreferences, queueUserPreferencePatch } from "@/lib/userPreferencesSync";
+import {
+  applyTerminalKeyboardChanges,
+  type TerminalKeyboardChange,
+} from "@/lib/terminalKeyboardChanges";
 
 export type KeySurface = "shell" | "native";
 export const TERMINAL_KEY_SURFACE = {
@@ -771,6 +775,7 @@ export function buildTerminalKeyPreferences(
 
 export function writeTerminalKeyPreferences(
   fields: TerminalKeyPreferencesFields,
+  keyboardChange?: TerminalKeyboardChange,
 ): "saved" | "too-large" | "unavailable" {
   if (typeof window === "undefined") return "unavailable";
   try {
@@ -781,7 +786,17 @@ export function writeTerminalKeyPreferences(
       // Malformed stored data is replaced by the default envelope on a save.
     }
     const current = { ...readMobileAssistantPreferences() };
-    const canonical = buildTerminalKeyPreferences(fields, current, raw);
+    const canonical = buildTerminalKeyPreferences(
+      keyboardChange
+        ? {
+            terminalKeyboard: applyTerminalKeyboardChanges(current.terminalKeyboard, [
+              keyboardChange,
+            ]),
+          }
+        : fields,
+      current,
+      raw,
+    );
     const envelope = collectLocalUserPreferences();
     if (
       preferencesEnvelopeBytes({
@@ -792,7 +807,22 @@ export function writeTerminalKeyPreferences(
       return "too-large";
     }
     window.localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, JSON.stringify(canonical));
-    queueUserPreferencePatch("mobile_assistant", canonical);
+    queueUserPreferencePatch(
+      "mobile_assistant",
+      keyboardChange
+        ? {
+            terminal_keyboard: {
+              defaults: {
+                version: 2,
+                enabled: true,
+                buttons: defaultMobileAssistantButtons(),
+                chatActionsRevision: 1,
+              },
+              changes: [keyboardChange],
+            },
+          }
+        : { ...canonical, terminalKeyboard: fields.terminalKeyboard },
+    );
     window.dispatchEvent(new Event(MOBILE_ASSISTANT_CHANGED_EVENT));
     return "saved";
   } catch {

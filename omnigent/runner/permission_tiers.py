@@ -43,9 +43,10 @@ from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
     PERMISSION_RUNTIME_ID_LABEL_KEY,
     PERMISSION_STATE_LABEL_KEY,
-    TIER_HARNESSES,
     BoundToolCall,
+    is_acp_permission_harness,
     permission_execution_host_id,
+    permission_tier_active,
     read_permission_state,
 )
 
@@ -82,6 +83,10 @@ class PermissionTierRuntime:
 
     @staticmethod
     def state_path(session_id: str, harness: str, labels: Mapping[str, str]) -> Path:
+        if is_acp_permission_harness(harness):
+            from omnigent.process_logging import data_dir
+
+            return data_dir() / "acp-permissions" / session_id / HOST_PERMISSION_STATE_FILE
         if harness == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import (
                 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -107,7 +112,7 @@ class PermissionTierRuntime:
         preserve_active_pi_scope: bool = False,
     ) -> bool:
         """Fence a launch, returning whether its active Pi authority was preserved."""
-        if harness not in TIER_HARNESSES:
+        if not permission_tier_active(harness, envelope.snapshot.labels if envelope else {}):
             if envelope is not None:
                 self.pi_scopes.invalidate(envelope.session_id)
                 self._harnesses.pop(envelope.session_id, None)
@@ -193,7 +198,7 @@ class PermissionTierRuntime:
         self, envelope: RunnerSessionInitEnvelope | None, harness: str
     ) -> HostPermissionState | None:
         """Validate server state and local rules before confirming the launch."""
-        if harness not in TIER_HARNESSES:
+        if not permission_tier_active(harness, envelope.snapshot.labels if envelope else {}):
             if envelope is not None:
                 self.pi_scopes.invalidate(envelope.session_id)
                 self._harnesses.pop(envelope.session_id, None)
@@ -265,6 +270,8 @@ class PermissionTierRuntime:
     @staticmethod
     def _verify_installation(path: Path, harness: str, tier: PermissionTier) -> None:
         """Do not acknowledge an unarmed native guard or missing Pi extension."""
+        if is_acp_permission_harness(harness):
+            return
         bridge_dir = path.parent
         if harness == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
@@ -697,9 +704,48 @@ class PermissionTierRuntime:
                 ):
                     raise ValueError("Pi permission extension is unverified")
                 installed.append(extension.parent)
+        elif is_acp_permission_harness(harness):
+            installed.extend(
+                (
+                    package_root / "inner" / "acp_executor.py",
+                    package_root / "inner" / "acp_harness.py",
+                    Path.home() / ".gemini",
+                    Path(state.workspace) / ".gemini",
+                )
+            )
         else:
             raise ValueError("Unknown permission harness")
         return trusted_permission_control_paths(state_path, installed_paths=tuple(installed))
+
+    def evaluate_acp_call(self, session_id: str, call: object) -> Verdict:
+        """Classify the tool bound by the ACP executor using current host state."""
+        state = self.state(session_id)
+        if (
+            not is_acp_permission_harness(self._harnesses.get(session_id))
+            or state is None
+            or state.status != "ready"
+            or not isinstance(call, dict)
+        ):
+            return Verdict.DENY
+        name, arguments = call.get("name"), call.get("arguments")
+        call_id = call.get("call_id")
+        if (
+            not isinstance(name, str)
+            or not isinstance(arguments, dict)
+            or not isinstance(call_id, str)
+            or not call_id
+        ):
+            return Verdict.DENY
+        decision = self._evaluate(session_id, state, name, arguments, local_execution=True)
+        if decision.action == Verdict.ALLOW and name == "run_command":
+            from omnigent.server.child_approvals import floor
+
+            if (
+                floor({"phase": "acp_permission", "command": arguments.get("CommandLine")})
+                == "user_only"
+            ):
+                return Verdict.ASK
+        return decision.action
 
     def _evaluate(
         self,

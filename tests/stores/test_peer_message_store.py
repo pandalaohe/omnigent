@@ -471,3 +471,33 @@ def test_row_lock_backend_requires_receiver(store: SqlAlchemyPeerMessageStore) -
     real_store = SqlAlchemyPeerMessageStore(store.storage_location)
     with pytest.raises(RuntimeError, match="receiver conversation missing"):
         real_store.create(_record("missing-receiver-lock"))
+
+
+def test_excluded_reason_prefix_blocks_transition_and_claim(
+    store: SqlAlchemyPeerMessageStore,
+) -> None:
+    """``exclude_reason_prefix`` refuses only reasons with that literal prefix."""
+    prefix = "native_claimed:"
+    unset = store.create(_record("exclude-null", state="delivering"))
+    other = store.create(_record("exclude-other", state="delivering", reason="released"))
+    # ``_`` is a LIKE wildcard; the prefix must still match literally.
+    lookalike = store.create(
+        _record("exclude-lookalike", state="delivering", reason="nativeXclaimed:" + "b" * 32)
+    )
+    marked = store.create(_record("exclude-marked", state="delivering", reason=prefix + "a" * 32))
+    for record in (unset, other, lookalike):
+        assert store.transition(
+            record.id, "pending", None, ("delivering",), exclude_reason_prefix=prefix
+        )
+    assert not store.transition(
+        marked.id, "pending", None, ("delivering",), exclude_reason_prefix=prefix
+    )
+    current = store.get(marked.id)
+    assert current is not None
+    assert (current.state, current.reason) == ("delivering", prefix + "a" * 32)
+
+    assert store.claim_oldest(unset.id, None, ("pending",), exclude_reason_prefix=prefix)
+    assert store.transition(marked.id, "pending", None, ("delivering",))
+    assert not store.claim_oldest(marked.id, None, ("pending",), exclude_reason_prefix=prefix)
+    assert store.get(marked.id).state == "pending"  # type: ignore[union-attr]
+    assert store.claim_oldest(marked.id, None, ("pending",))

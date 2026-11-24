@@ -14659,12 +14659,7 @@ async def test_interrupt_noop_returns_false_without_marking_pending_input(
         [{"type": "input_text", "text": "keep queued"}],
         runner_managed=True,
     )
-    assert pending_inputs.claim_runner_input(
-        session_id,
-        pending_id,
-        "claim-1",
-        runner_id="runner_a",
-    )
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "claim-1")
 
     async def _already_idle(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
         return _RunnerForwardResult(
@@ -14681,12 +14676,7 @@ async def test_interrupt_noop_returns_false_without_marking_pending_input(
     try:
         assert await routes_events._deliver_interrupt_once(session_id, None) is False
         assert pending_inputs.pending_ids(session_id) == [pending_id]
-        assert pending_inputs.claim_runner_input(
-            session_id,
-            pending_id,
-            "claim-1",
-            runner_id="runner_a",
-        )
+        assert pending_inputs.claim_runner_input(session_id, pending_id, "claim-1")
         assert session_id not in routes_events._interrupt_fenced_sessions
     finally:
         routes_events._interrupt_fenced_sessions.discard(session_id)

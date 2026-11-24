@@ -273,6 +273,7 @@ import { ChatPage, CodexPermissionReadbackChip, computeIsWorking } from "./ChatP
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { shouldShowEffortPicker } from "@/lib/composerCapabilities";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -8526,6 +8527,112 @@ describe("Composer config gear", () => {
         codexModelOptions: CLAUDE_MODEL_OPTIONS,
       });
 
+    it.each(["model first", "effort first"])(
+      "validates SDK combined shortcuts against the staged model (%s)",
+      async (order) => {
+        const options = [
+          {
+            id: "primary",
+            supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+          },
+          { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+        ];
+        const { setModel, setEffort } = useChatStore.getState();
+        useChatStore.setState({
+          sessionHarness: "codex",
+          sessionModelOverride: "primary",
+          llmModel: "primary",
+          sessionReasoningEffort: "high",
+          codexModelOptions: options,
+        });
+        renderWithTooltips(
+          <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+        );
+        act(() => textarea().focus());
+        if (order === "effort first") cycle("KeyE");
+        cycle("KeyM");
+        cycle("KeyE");
+        expect(screen.queryByTestId("composer-agent-effort-ultra")).toBeNull();
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", {
+          expectConfirmation: false,
+        });
+        expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+
+    it("reconciles an applied SDK ultra when the combined shortcut selects a high-only model", async () => {
+      const options = [
+        {
+          id: "primary",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+        { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      ];
+      const { setModel, setEffort } = useChatStore.getState();
+      useChatStore.setState({
+        sessionHarness: "codex",
+        sessionModelOverride: "primary",
+        llmModel: "primary",
+        sessionReasoningEffort: "ultra",
+      });
+      renderWithTooltips(
+        <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+      );
+      cycle("KeyM");
+      cycle("KeyE");
+      expect(screen.queryByTestId("composer-agent-effort-ultra")).toBeNull();
+      await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+      expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: false });
+      expect(vi.mocked(setEffort).mock.calls.map(([effort]) => effort)).toEqual([null, "high"]);
+    });
+
+    it("revalidates SDK staged effort when the target catalog narrows before commit", async () => {
+      const options = [
+        {
+          id: "primary",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+        {
+          id: "alternate",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+      ];
+      const { setModel, setEffort } = useChatStore.getState();
+      useChatStore.setState({
+        sessionHarness: "codex",
+        sessionModelOverride: "primary",
+        llmModel: "primary",
+        sessionReasoningEffort: "high",
+      });
+      const view = renderWithTooltips(
+        <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+      );
+      cycle("KeyM");
+      cycle("KeyE");
+      expect(screen.getByTestId("composer-agent-effort-ultra")).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      view.rerender(
+        <TooltipProvider>
+          <Composer
+            {...props()}
+            modelPickerKind="sdk"
+            codexModelOptions={[
+              options[0],
+              { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+            ]}
+          />
+        </TooltipProvider>,
+      );
+      await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+      expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: false });
+      expect(setEffort).not.toHaveBeenCalled();
+    });
+
     it.each(["two idle seconds", "Enter"])(
       "previews every model in a burst and applies only the final choice after %s",
       async (confirmation) => {
@@ -9284,6 +9391,7 @@ describe("Composer config gear", () => {
         sessionHarness: harness,
         sessionModelOverride: "new",
         llmModel: "old",
+        sessionReasoningEffort: "max",
         setModel,
         setEffort,
       });
@@ -9315,10 +9423,74 @@ describe("Composer config gear", () => {
       for (const effort of efforts) {
         expect(screen.getByTestId(`composer-agent-effort-${effort}`)).toBeVisible();
       }
+      fireEvent.click(screen.getByRole("button", { name: "Reset Effort" }));
+      await waitFor(() => expect(setEffort).toHaveBeenCalledWith(null));
       fireEvent.click(screen.getByTestId(`composer-agent-effort-${efforts[0]}`));
       await waitFor(() => expect(setEffort).toHaveBeenCalledWith(efforts[0]));
     },
   );
+
+  it("offers only Reset Effort after an SDK clear failure and allows retry after remount", async () => {
+    const previous = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState(previous, true));
+    const models = [{ id: "plain", supportedReasoningEfforts: [] }];
+    let serverEffort: string | null = "ultra";
+    let refuse = true;
+    const setEffort = vi.fn(async (effort: string | null) => {
+      useChatStore.setState({ sessionReasoningEffort: effort });
+      if (refuse) {
+        refuse = false;
+        useChatStore.setState({ sessionReasoningEffort: serverEffort });
+        throw new Error("Clear refused");
+      }
+      serverEffort = effort;
+    });
+    vi.spyOn(sessionsApi, "refreshSessionModelOptions").mockResolvedValue(models);
+    useChatStore.setState({
+      sessionHarness: "codex",
+      sessionModelOverride: "plain",
+      llmModel: "plain",
+      sessionReasoningEffort: serverEffort,
+      setEffort,
+    });
+    function SavedSdkComposer() {
+      const effort = useChatStore((state) => state.sessionReasoningEffort);
+      const session = {
+        labels: {},
+        harness: "codex",
+        modelOverride: "plain",
+        reasoningEffort: effort,
+      };
+      return (
+        <Composer
+          {...composerProps({
+            modelPickerKind: "sdk",
+            showModels: true,
+            showEffort: shouldShowEffortPicker(session, "codex-native", models),
+            effortLevels: [],
+            codexModelOptions: models,
+          })}
+        />
+      );
+    }
+    const first = renderWithTooltips(<SavedSdkComposer />);
+    await openSessionModels();
+    expect(
+      screen.getByTestId("composer-agent-efforts").querySelectorAll("[data-effort-level]"),
+    ).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("composer-agent-effort-default"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledExactlyOnceWith(null));
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    expect(screen.getByTestId("composer-agent-effort-default")).toBeVisible();
+    first.unmount();
+    renderWithTooltips(<SavedSdkComposer />);
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-effort-default"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledTimes(2));
+    expect(serverEffort).toBeNull();
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+  });
 
   it("renders an ACP composer before session and catalog data are available", () => {
     useChatStore.setState({ conversationId: null, sessionHarness: "acp" });
