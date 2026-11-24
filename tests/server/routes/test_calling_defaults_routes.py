@@ -89,11 +89,13 @@ class _Stores:
     prefs: SqlAlchemyUserPreferencesStore
 
 
-def _seed_agent(stores: _Stores, agent_id: str, harness: str) -> None:
+def _seed_agent(
+    stores: _Stores, agent_id: str, harness: str, *, name: str = "calling-defaults-agent"
+) -> None:
     """Register a template agent whose spec resolves to *harness*."""
     location = f"{agent_id}/bundle"
     stores.artifact_store.put(location, _bundle(harness))
-    stores.agent_store.create(agent_id, "calling-defaults-agent", location)
+    stores.agent_store.create(agent_id, name, location)
 
 
 @pytest.fixture()
@@ -895,7 +897,7 @@ async def test_managed_acp_derivation_builds_fresh_permission_state(client, stor
     source = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
     body = {}
     if operation == "switch":
-        _seed_agent(stores, HOST_B, "codex")
+        _seed_agent(stores, HOST_B, "codex", name="other-agent")
         body = {"agent_id": HOST_B}
     if operation == "continue":
         archived = await client.patch(
