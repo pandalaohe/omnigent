@@ -799,6 +799,36 @@ def test_full_state_publication_preserves_revision_for_the_same_owner(
     )
 
 
+@pytest.mark.parametrize(
+    ("session_id", "terminal_revision", "expected_revision"),
+    [("conv_test", 0, 4), ("conv_test", 8, 8), ("conv_new", 0, 0)],
+)
+def test_bridge_relaunch_preserves_only_the_same_sessions_revision(
+    bridge_dir: Path, session_id: str, terminal_revision: int, expected_revision: int
+) -> None:
+    _seed_active_turn(bridge_dir, "turn_old")
+    previous = read_bridge_state(bridge_dir)
+    assert previous is not None
+    write_bridge_state(bridge_dir, replace(previous, active_turn_revision=4))
+
+    clear_bridge_state(bridge_dir, session_id=session_id, terminal_revision=terminal_revision)
+    clear_bridge_state(bridge_dir)  # A failed launch can clear before publishing.
+    assert read_bridge_state(bridge_dir) is None
+
+    relaunched = replace(
+        previous,
+        session_id=session_id,
+        socket_path="ws://127.0.0.1:1234",
+        active_turn_id=None,
+        active_turn_revision=0,
+    )
+    write_bridge_state(bridge_dir, relaunched)
+
+    assert read_bridge_state(bridge_dir) == replace(
+        relaunched, active_turn_revision=expected_revision
+    )
+
+
 def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir: Path) -> None:
     _seed_active_turn(bridge_dir, "turn_a")
     observed = read_bridge_state(bridge_dir)

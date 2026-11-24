@@ -63,6 +63,8 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
 )
 
 _STATE_FILE = "state.json"
+# The server compares turn revisions across transports for the same session.
+_CLEARED_TURN_REVISION_FILE = "cleared-turn-revision.json"
 # Survives runtime-state resets so a relaunched pane keeps its resource owner.
 _RESOURCE_OWNER_FILE = "resource-owner.json"
 _STATE_LOCK_FILE = "state.lock"
@@ -1773,6 +1775,14 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                     state.active_turn_revision,
                 ),
             )
+        elif current is None:
+            state = replace(
+                state,
+                active_turn_revision=max(
+                    state.active_turn_revision,
+                    _read_cleared_turn_revision(bridge_dir, state.session_id),
+                ),
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1857,7 +1867,9 @@ def read_bridge_startup_timeout(bridge_dir: Path) -> float | None:
     return _validated_startup_timeout(raw.get("timeout_seconds"))
 
 
-def clear_bridge_state(bridge_dir: Path) -> None:
+def clear_bridge_state(
+    bridge_dir: Path, *, session_id: str | None = None, terminal_revision: int = 0
+) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
 
@@ -1869,9 +1881,23 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     state.
 
     :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Session the new launch will own.
+    :param terminal_revision: Last revision accepted by the server for this session.
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        previous = read_bridge_state(bridge_dir)
+        if previous is not None and session_id in (None, previous.session_id):
+            session_id = previous.session_id
+            terminal_revision = max(terminal_revision, previous.active_turn_revision)
+        if session_id is not None and terminal_revision > _read_cleared_turn_revision(
+            bridge_dir, session_id
+        ):
+            _replace_bridge_record(
+                bridge_dir,
+                _CLEARED_TURN_REVISION_FILE,
+                {"session_id": session_id, "revision": terminal_revision},
+            )
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
@@ -1884,6 +1910,18 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 (bridge_dir / name).unlink()
             except FileNotFoundError:
                 continue
+
+
+def _read_cleared_turn_revision(bridge_dir: Path, session_id: str) -> int:
+    """Read the revision floor left by the last transport for this session."""
+    try:
+        record = json.loads((bridge_dir / _CLEARED_TURN_REVISION_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return 0
+    if not isinstance(record, dict) or record.get("session_id") != session_id:
+        return 0
+    revision = record.get("revision")
+    return revision if type(revision) is int and revision >= 0 else 0
 
 
 def write_bridge_startup_error(

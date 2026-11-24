@@ -115,6 +115,7 @@ from omnigent.native.native_terminal import post_initial_prompt, request_with_42
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.native_terminal_generation import persisted_terminal_revision
 from omnigent.runner.identity import with_runner_binding_token
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.http_retry import jittered_retry_delay
@@ -1190,6 +1191,7 @@ async def _prepare_codex_terminal(
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         thread_id: str | None = None
+        terminal_revision = 0
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
@@ -1242,11 +1244,17 @@ async def _prepare_codex_terminal(
                 raise click.ClickException(
                     f"Conversation {session_id!r} is missing its Codex thread id."
                 )
+            bound_runner_id = payload.get("runner_id")
+            if runner_id is not None:
+                bound_runner_id = runner_id
+            terminal_revision = persisted_terminal_revision(
+                labels, bound_runner_id if isinstance(bound_runner_id, str) else None
+            )
 
         bridge_dir = prepare_bridge_dir(bridge_id)
         socket_path = socket_path_for_bridge_dir(bridge_dir)
         codex_home = codex_home_for_bridge_dir(bridge_dir)
-        clear_bridge_state(bridge_dir)
+        clear_bridge_state(bridge_dir, session_id=session_id, terminal_revision=terminal_revision)
         # Route across all offerings: a configured provider (configure
         # harness), the Databricks ucode profile, or Codex's own login —
         # so `omnigent codex` honors the provider selection like the

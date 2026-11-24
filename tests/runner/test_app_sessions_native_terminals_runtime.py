@@ -6519,10 +6519,13 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                 patch = AsyncMock(wraps=server.patch)
                 monkeypatch.setattr(server, "patch", patch)
 
-                def stop_before_spawn(path: Path) -> None:
+                def stop_before_spawn(
+                    path: Path, *, session_id: str, terminal_revision: int
+                ) -> None:
                     assert path == codex_native_bridge.bridge_dir_for_bridge_id(
                         f"{old_id}-cleared"
                     )
+                    assert (session_id, terminal_revision) == (old_id, 0)
                     raise RuntimeError("stop before spawning Codex")
 
                 with monkeypatch.context() as scoped:

@@ -31,8 +31,10 @@ import pytest
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
+from omnigent.native.native_terminal_generation import persisted_terminal_revision
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import ServerRunner, server_runner
 
 # Keep capability roles explicit: substituting a model must preserve the assertions.
@@ -49,8 +51,20 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
     rig = codex_effort_rig
     with _session(rig, _STANDARD_MODEL, "medium") as session:
         _assert_turn(rig, session, _STANDARD_MODEL, "medium", terminal=True)
+        poll_until(
+            lambda: persisted_terminal_revision(
+                _json(rig.api.get(f"/v1/sessions/{session.id}/labels"))["labels"],
+                rig.stack.runner_id,
+            ),
+            timeout_s=10,
+        )
         terminate_process(rig.stack.runner)
         rig.stack.runner = None
+        # Emulate a bridge whose revision was already reset by an older runner.
+        state_path = session.bridge / "state.json"
+        saved_state = json.loads(state_path.read_text())
+        saved_state["active_turn_revision"] = 0
+        state_path.write_text(json.dumps(saved_state))
         rig.stack.start_runner(cwd=_REPO_ROOT, env=rig.runner_env)
         session.ensure_terminal(rig)
         runner_log = max((rig.stack.runner_home / ".omnigent/logs/runner").glob("*.log"))
