@@ -11,6 +11,7 @@ from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.session_requests import normalize_session_id
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.session_collab import AGENT_SESSION_HEADER
 from omnigent.stores.conversation_store import PINNED_LABEL_KEY, PROJECT_LABEL_KEY
 from omnigent.tools.builtins.session_projects import (
     MAX_LISTED_SESSIONS,
@@ -629,6 +630,8 @@ async def execute_session_update(
                 )
     payload = _session_changes(current, changes, project_id)
     payload.update({_SESSION_SETTING_FIELDS[field]: value for field, value in settings.items()})
+    if "archived" in payload:
+        headers[AGENT_SESSION_HEADER] = source_id
     status, error, applied = await _patch_session(
         client, canonical, payload, headers=headers, read_settings=bool(settings)
     )

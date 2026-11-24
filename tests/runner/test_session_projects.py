@@ -11,6 +11,7 @@ from omnigent.runner.session_projects import (
     execute_project_update,
     execute_session_update,
 )
+from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
 pytestmark = pytest.mark.asyncio
 
@@ -573,6 +574,7 @@ async def test_update_lets_the_calling_session_archive_itself():
     (patch,) = [r for r in requests if r.method == "PATCH"]
     assert patch.url.path == f"/v1/sessions/{SOURCE}"
     assert patch.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert patch.headers[AGENT_SESSION_HEADER] == SOURCE
     assert json.loads(patch.content) == {"archived": True}
     # Its own runner is the one to stop, so the shared-runner lookup is skipped.
     assert not [r for r in requests if "include_live_status" in r.url.params]
@@ -888,6 +890,7 @@ async def test_update_restores_an_archived_session():
     (patched,) = [r for r in requests if r.method == "PATCH"]
     assert json.loads(patched.content) == {"archived": False}
     assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert patched.headers[AGENT_SESSION_HEADER] == SOURCE
 
 
 async def test_update_reports_a_project_it_created_before_a_refused_patch():
