@@ -62,6 +62,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from time import monotonic
 from typing import Literal
@@ -1318,7 +1319,8 @@ class _ReaderState:
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     turn_generation: int = 0
-    closed_after_reply: bool = False
+    closed_reply: _StepKey | None = None
+    continuation_tail: _StepKey | None = None
     native_work_observed: bool = False
     turn_error: str | None = None
     idle_ticks: int = 0
@@ -1573,6 +1575,7 @@ async def _commit_step(
     cascade_id: str,
     state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
+    previous_step: dict[str, object] | None = None,
 ) -> None:
     """
     Emit one step's committed items + status edges + interaction (poll path).
@@ -1597,6 +1600,7 @@ async def _commit_step(
     :param cascade_id: agy cascade id (namespaces ids).
     :param state: Per-run shared trackers.
     :param on_pending_interaction: Async callback for a distinct interaction.
+    :param previous_step: Preceding step when committing an ordered snapshot.
     :returns: None.
     """
     key = _step_key(step)
@@ -1616,17 +1620,25 @@ async def _commit_step(
             state.metered_steps.add(key)
             state.pending_metering.discard(key)
     if key not in state.seen:
-        # A background task can resume agy after idle without a USER_INPUT.
-        resumes_after_idle = state.closed_after_reply and _is_assistant_text_close_step(step)
-        if _is_user_turn_step(step) or resumes_after_idle:
+        if _is_user_turn_step(step):
+            if state.continuation_tail is not None:
+                if previous_step is None:
+                    previous_step = await _step_before_input(state.port, cascade_id, key)
+                output = _continuation_output(state, previous_step)
+                if output is not None:
+                    await _post_continuation(client, session_id, output)
             state.turn_generation += 1
-            state.closed_after_reply = False
+            state.closed_reply = state.continuation_tail = None
             state.turn_error = None
             state.idle_ticks = 0
             state.last_text = ""
-            if resumes_after_idle:
-                state.turn_active = True
-                await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+        elif (previous_tail := state.continuation_tail or state.closed_reply) is not None:
+            trajectory, index, _ = key
+            prior_trajectory, prior_index, _ = previous_tail
+            # A trajectory step at index zero can omit its index on the wire.
+            if trajectory == prior_trajectory and index is not None and index > (prior_index or 0):
+                state.continuation_tail = key
+                state.idle_ticks = 0
         elif state.turn_active and _is_settled(step):
             if step.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
                 error = error_message_text(step)
@@ -1804,6 +1816,41 @@ async def _note_observed_work(
         state.observation_notice_at = float("-inf")
 
 
+async def _step_before_input(
+    port: int, cascade_id: str, input_key: _StepKey
+) -> dict[str, object] | None:
+    """A live input frame has no step index. Find its predecessor in native order."""
+    try:
+        steps = await asyncio.to_thread(
+            get_trajectory_steps, port, cascade_id, timeout_s=_IDLE_READ_TIMEOUT_S
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.warning("agy input boundary snapshot failed: cascade=%s error=%r", cascade_id, exc)
+        return None
+    return next(
+        (previous for previous, step in pairwise(steps) if _step_key(step) == input_key),
+        None,
+    )
+
+
+def _continuation_output(state: _ReaderState, tail: dict[str, object] | None) -> str | None:
+    if (
+        tail is not None
+        and _step_key(tail) == state.continuation_tail
+        and _is_assistant_text_close_step(tail)
+    ):
+        return _committed_planner_text(tail)
+    return None
+
+
+async def _post_continuation(client: httpx.AsyncClient, session_id: str, output: str) -> None:
+    """Publish a background turn once its reply is confirmed at a boundary."""
+    await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+    event = _status_event(_STATUS_IDLE)
+    event.data["output"] = output
+    await _post_event(client, session_id, event)
+
+
 async def _reconcile_idle_turn(
     *,
     port: int,
@@ -1831,7 +1878,10 @@ async def _reconcile_idle_turn(
         if state.usage_thread_kind != "subagent" or state.native_work_observed:
             await _note_observed_work(client, session_id, state)
         state.idle_ticks = 0
-    if not poll_steps and (not state.turn_active or status == "CASCADE_RUN_STATUS_RUNNING"):
+    if not poll_steps and (
+        status == "CASCADE_RUN_STATUS_RUNNING"
+        or (not state.turn_active and state.continuation_tail is None)
+    ):
         return body
     try:
         steps = await asyncio.to_thread(
@@ -1845,6 +1895,7 @@ async def _reconcile_idle_turn(
             return body
         if steps:
             state.native_work_observed = True
+        tail = None
         for step in steps or ():
             if isinstance(step, dict):
                 await _commit_step(
@@ -1854,10 +1905,18 @@ async def _reconcile_idle_turn(
                     cascade_id=cascade_id,
                     state=state,
                     on_pending_interaction=on_pending_interaction,
+                    previous_step=tail,
                 )
-        if not state.turn_active or generation != state.turn_generation:
+                tail = step
+        if generation != state.turn_generation:
             return body
-        if steps and isinstance(steps[-1], dict) and not _is_settled(steps[-1]):
+        continuation_output = None
+        if not state.turn_active:
+            continuation_output = _continuation_output(state, tail)
+            if continuation_output is None or status != _CASCADE_RUN_STATUS_IDLE:
+                state.idle_ticks = 0
+                return body
+        if tail is not None and not _is_settled(tail):
             await _note_observed_work(client, session_id, state)
         # A helper may omit USER_INPUT, but registration alone is not native work.
         turn_observed = state.turn_generation > 0 or (
@@ -1883,7 +1942,7 @@ async def _reconcile_idle_turn(
                 event.data["output"] = "The native helper ended with a tool error."
             if state.turn_error:
                 event.data["output"] = state.turn_error
-        elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
+        elif state.turn_active and monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
             if state.observation_notice_at < state.last_work_at:
                 event = _status_event(_STATUS_RUNNING)
                 event.data["output"] = (
@@ -1897,12 +1956,18 @@ async def _reconcile_idle_turn(
         else:
             return body
         state.turn_active = False
-        state.closed_after_reply = bool(
-            event.data["status"] == _STATUS_IDLE
-            and steps
-            and _is_assistant_text_close_step(steps[-1])
+        state.closed_reply = (
+            _step_key(tail)
+            if event.data["status"] == _STATUS_IDLE
+            and tail is not None
+            and _is_assistant_text_close_step(tail)
+            else None
         )
-        await _post_event(client, session_id, event)
+        state.continuation_tail = None
+        if continuation_output is not None:
+            await _post_continuation(client, session_id, continuation_output)
+        else:
+            await _post_event(client, session_id, event)
     return body
 
 

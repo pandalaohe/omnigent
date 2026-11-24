@@ -17,6 +17,7 @@ delivery still can't be confirmed on this runner.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -2788,11 +2789,16 @@ async def test_quiet_result_is_recorded_without_inbox_or_wake(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    ["quiet", "tool_done", "tool_unsettled", "earlier_planner", "new_input", "merged"],
+)
 async def test_antigravity_background_continuation_delivers_only_the_final_reply(
     _clean_subagent_registry: None,
     monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
 ) -> None:
-    """Native work can resume after idle without appending another user input."""
+    """Use the native trajectory boundary to attribute background replies."""
     from omnigent.entities import ConversationItem, MessageData, PagedList
     from omnigent.harnesses.antigravity_native import reader
     from omnigent.server.routes._sessions.orchestration import (
@@ -2803,8 +2809,20 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
 
     fixture_dir = Path(__file__).parents[1] / "fixtures" / "antigravity" / "steps"
     user_step = json.loads((fixture_dir / "user_input.json").read_text(encoding="utf-8"))
-    planner_fixture = fixture_dir / "stream_planner_text_done.json"
+    planner_step = json.loads(
+        (fixture_dir / "stream_planner_text_done.json").read_text(encoding="utf-8")
+    )
+
+    def planner(index: int, reply: str, *, status: str = "DONE") -> dict[str, Any]:
+        step = copy.deepcopy(planner_step)
+        step["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = index
+        step["plannerResponse"]["modifiedResponse"] = reply
+        step["status"] = f"CORTEX_STEP_STATUS_{status}"
+        return step
+
     steps = [user_step]
+    if scenario == "earlier_planner":
+        steps.append(planner(49, "Earlier planner", status="GENERATING"))
     cascade_id = "cascade-for-background-task"
     app, server = _delivery_app([])
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -2819,6 +2837,8 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
     store = Mock(spec=ConversationStore)
     store.list_items.return_value = PagedList(data=[])
     state = reader._ReaderState(seen=set(), interacted=set())
+    edges: list[tuple[str, str | None]] = []
+    user_edges: list[int] = []
     monkeypatch.setattr(reader, "get_available_models", lambda *_a: {})
     monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_a, **_kw: list(steps))
     monkeypatch.setattr(
@@ -2857,10 +2877,13 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
                         server.items.insert(
                             0, _assistant_item(item.id, message.content[0]["text"])
                         )
+                    else:
+                        user_edges.append(len(edges))
             if body["type"] == "external_session_status":
                 body["data"] = await _enrich_terminal_status_with_subagent_output(
                     data, data["status"], CHILD_SESSION_ID, store
                 )
+                edges.append((data["status"], body["data"].get("output")))
                 response = await runner.post(request.url.path, json=body)
                 assert response.status_code == 204, response.text
             return httpx.Response(204)
@@ -2876,41 +2899,94 @@ async def test_antigravity_background_continuation_delivers_only_the_final_reply
                 "state": state,
                 "on_pending_interaction": AsyncMock(),
             }
-            for index, reply in enumerate(
-                [
-                    "Waiting for the task.\n[quiet]",
-                    "Still waiting.\n[quiet]",
-                    "Background task finished.",
-                ],
-                start=50,
-            ):
-                planner = json.loads(planner_fixture.read_text(encoding="utf-8"))
-                planner["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = index
-                planner["plannerResponse"]["modifiedResponse"] = reply
-                steps.append(planner)
-                # Each stream reconnect can replay the entire trajectory.
+
+            async def replay() -> None:
                 for step in steps:
                     await reader._process_committed_step(step, **reader_args)
+
+            async def settle() -> None:
                 for _ in range(3):
                     await reader._reconcile_idle_turn(port=52548, **reader_args)
-                if reply.endswith("[quiet]"):
-                    assert inbox.empty()
-                    assert wakes() == []
 
-            for step in steps:
-                await reader._process_committed_step(step, **reader_args)
-            for _ in range(3):
-                await reader._reconcile_idle_turn(port=52548, **reader_args)
+            first_quiet = planner(50, "Waiting for the task.\n[quiet]")
+            if scenario == "quiet":
+                del first_quiet["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"]
+            steps.append(first_quiet)
+            await replay()
+            await settle()
+            assert [status for status, _ in edges] == ["running", "idle"]
+            assert inbox.empty() and wakes() == []
 
-        assert server.items[0]["content"][0]["text"] == "Background task finished."
+            expected_replies = ["Background task finished."]
+            if scenario == "quiet":
+                quiet = "Still waiting.\n[quiet]"
+                steps.append(planner(51, quiet))
+                await replay()
+                assert len(edges) == 2
+                await settle()
+                assert edges[-2:] == [("running", None), ("idle", quiet)]
+                assert not state.turn_active
+                assert inbox.empty() and wakes() == []
+            elif scenario in {"tool_done", "tool_unsettled", "earlier_planner"}:
+                if scenario == "earlier_planner":
+                    steps[1] = planner(49, "Earlier planner")
+                    await reader._process_committed_step(steps[1], **reader_args)
+                else:
+                    progress = planner(51, "Checking the tool output")
+                    tool = json.loads(
+                        (fixture_dir / "run_command_done.json").read_text(encoding="utf-8")
+                    )
+                    tool["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 52
+                    if scenario == "tool_unsettled":
+                        tool["status"] = "CORTEX_STEP_STATUS_RUNNING"
+                    steps.extend((progress, tool))
+                    # The incremental frame can show text before the tool step.
+                    await reader._process_committed_step(progress, **reader_args)
+                await settle()
+                assert len(edges) == 2
+                assert inbox.empty() and wakes() == []
+                if scenario == "tool_unsettled":
+                    steps[-1]["status"] = "CORTEX_STEP_STATUS_DONE"
+            else:
+                steps.append(planner(51, "First background reply"))
+                await replay()
+                if scenario == "new_input":
+                    new_input = copy.deepcopy(user_step)
+                    new_input["metadata"]["executionId"] = "second-user-input"
+                    steps.append(new_input)
+                    await replay()
+                    assert edges[2:5] == [
+                        ("running", None),
+                        ("idle", "First background reply"),
+                        ("running", None),
+                    ]
+                    assert user_edges == [1, 5]
+                    expected_replies = ["First background reply", "Reply to the new input."]
+                else:
+                    assert len(edges) == 2, "planner text alone opened a turn"
+
+            steps.append(planner(53, expected_replies[-1]))
+            await replay()
+            if scenario == "merged":
+                assert len(edges) == 2, "both replies arrived before the confirmed idle boundary"
+            await settle()
+            await replay()
+            await settle()
+
+        assert server.items[0]["content"][0]["text"] == expected_replies[-1]
         results = [inbox.get_nowait() for _ in range(inbox.qsize())]
         assert [(item["status"], item["output"]) for item in results] == [
-            ("completed", "Background task finished."),
+            ("completed", reply) for reply in expected_replies
         ]
+        assert [output for status, output in edges if status == "idle"][
+            -len(expected_replies) :
+        ] == (expected_replies)
         await poll_until_async(wakes, timeout_s=2)
         notices = wakes()
-        assert len(notices) == 1
         assert "finished (completed)" in notices[0]
+        if scenario == "new_input":
+            return
+        assert len(notices) == 1
         assert "1 result waiting in inbox" in notices[0]
 
 
