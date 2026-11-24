@@ -821,6 +821,54 @@ _PROJECT_CONFIG_REFUSAL = (
 
 
 @pytest.mark.parametrize(
+    ("message", "failure_code"),
+    [
+        ("requested model unavailable", "codex_settings_update_failed"),
+        (_PROJECT_CONFIG_REFUSAL, "codex_project_config_invalid"),
+    ],
+)
+async def test_compact_steer_settings_refusal_keeps_input_undelivered(
+    draining_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    message: str,
+    failure_code: str,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.on_refusal = lambda: update_active_turn_id(tmp_path, None)
+    request = draining_client.request
+
+    async def reject_settings(self, method, params):
+        if method == "thread/settings/update":
+            draining_client.requests.append((method, params))
+            raise CodexAppServerResponseError({"code": -32600, "message": message})
+        return await request(self, method, params)
+
+    monkeypatch.setattr(draining_client, "request", reject_settings)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    [failure] = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "keep this input"}],
+            [],
+            "",
+            ExecutorConfig(model="model-new"),
+        )
+    ]
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.preserve_session is True
+    assert failure.code == failure_code
+    assert [method for method, _ in draining_client.requests] == [
+        "turn/steer",
+        "thread/settings/update",
+    ]
+    assert not draining_client.accepted_inputs
+
+
+@pytest.mark.parametrize(
     ("rpc_code", "data", "message", "failure_code"),
     [
         (

@@ -931,7 +931,11 @@ async def _inject_codex_turn(
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-    except (CodexAppServerResponseError, _CodexNativeInputUndelivered):
+    except (
+        CodexAppServerResponseError,
+        _CodexNativeInputUndelivered,
+        _CodexNativeSettingsUpdateFailed,
+    ):
         raise
     except Exception as exc:
         # Codex may have accepted the resubmitted input before its reply was lost.
