@@ -1629,6 +1629,13 @@ def test_windows_git_bash_reassigned_host_variable_cannot_bind_a_path():
         "printf '%b' 'echo ok\\n' | bash",
         "printf '%s' 'echo ok' | sh",
         "printf '%s' 'echo ok' | (echo ready; sh)",
+        "printf '%b' 'echo ok\\n' | bash -c 'bash'",
+        "printf '%s' 'echo ok' | sh -c 'env bash'",
+        "printf '%s' 'echo ok' | env bash",
+        "{ printf '%s' 'echo ok'; } | bash -c 'sh'",
+        "printf '%s' 'echo ok' | { echo ready; bash; }",
+        "printf '%s' 'echo ok' | (\necho ready\nsh\n)",
+        "(bash) < input.sh",
         "bash < input.sh",
         "bash -s",
         "bash <<< 'echo ok'",
@@ -1640,6 +1647,14 @@ def test_windows_git_bash_stdin_script_requires_approval(command):
     arguments = {"command": command}
     assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
     assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize("command", ["bash script.sh < input.txt", "sh -- script.sh < input.txt"])
+def test_windows_git_bash_script_file_uses_stdin_as_data(command):
+    host = windows_host(shell="bash")
+    arguments = {"command": command}
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.ALLOW
+    assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
 
 
 @pytest.mark.parametrize("shell", ["cmd", "pwsh"])

@@ -117,21 +117,25 @@ def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.fixture
 def fresh_windows_shell_selection():
-    from omnigent._platform import windows_os_env_shell_path
+    from omnigent._platform import _windows_os_env_shell_selection
 
-    windows_os_env_shell_path.cache_clear()
+    _windows_os_env_shell_selection.cache_clear()
     yield
-    windows_os_env_shell_path.cache_clear()
+    _windows_os_env_shell_selection.cache_clear()
 
 
 @pytest.mark.usefixtures("fresh_windows_shell_selection")
-@pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", None])
-def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypatch, shell):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["bash", "comspec", "removed-bash"])
+async def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypatch, selection):
     from omnigent import _platform
     from omnigent.inner import os_env
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     comspec = r"C:\Windows\System32\cmd.exe"
+    bash = tmp_path / "bash.exe"
+    bash.touch()
+    shell = None if selection == "comspec" else str(bash)
     monkeypatch.setattr(_platform, "IS_WINDOWS", True)
     monkeypatch.setattr(os_env, "IS_WINDOWS", True)
     monkeypatch.setattr(
@@ -151,21 +155,33 @@ def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypatch, sh
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
     )
     assert executor is not None
-    try:
-        assert executor.shell_path == (shell or comspec)
-    finally:
-        executor.close()
+    assert executor.shell_path == (shell or comspec)
+    if selection == "removed-bash":
+        bash.unlink()
     monkeypatch.setattr(
         _platform,
         "_shell_on_path",
-        lambda name: r"C:\work\Git\bin\bash.exe" if shell is None and name == "bash" else None,
+        lambda name: str(bash) if shell is None and name == "bash" else None,
     )
     state = host.HostPermissionState("s", "h", r"C:\work", "auto", 1, "ready")
     command = 'printf "%s" "$label"'
     result = host.evaluate_host_tool(
         state, "sys_os_shell", {"command": command}, control_paths=(r"C:\control",)
     )
-    assert result.action == (Verdict.ALLOW if shell else Verdict.DENY)
+    assert result.action == (Verdict.ALLOW if selection == "bash" else Verdict.DENY)
+    monkeypatch.setattr(os_env, "_shell_impl", lambda **kwargs: {"shell": kwargs["shell_path"]})
+    monkeypatch.setattr(
+        type(executor._helper),
+        "request",
+        lambda helper, request, **kwargs: os_env._handle_helper_request(
+            request=request, cwd=tmp_path, shell_path=helper.shell_path, sandbox=executor.sandbox
+        ),
+    )
+    try:
+        launched = await executor.shell("echo ok")
+        assert launched["shell"] == (str(bash) if selection == "bash" else comspec)
+    finally:
+        executor.close()
     native = host.evaluate_host_tool(
         state, "run_command", {"CommandLine": command}, control_paths=(r"C:\control",)
     )

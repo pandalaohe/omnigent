@@ -879,11 +879,11 @@ def _windows_like_tree(root: Path) -> tuple[Path, Path]:
 
 @pytest.fixture
 def fresh_windows_shell_selection():
-    from omnigent._platform import windows_os_env_shell_path
+    from omnigent._platform import _windows_os_env_shell_selection
 
-    windows_os_env_shell_path.cache_clear()
+    _windows_os_env_shell_selection.cache_clear()
     yield
-    windows_os_env_shell_path.cache_clear()
+    _windows_os_env_shell_selection.cache_clear()
 
 
 @pytest.mark.usefixtures("fresh_windows_shell_selection")
