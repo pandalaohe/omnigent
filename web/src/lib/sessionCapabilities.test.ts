@@ -106,6 +106,42 @@ describe("effortLevelsForFamily", () => {
 });
 
 describe("supportsEffortControl with a declared effort family", () => {
+  it("resolves the Codex SDK family from the selected model, without a guessed ladder", () => {
+    const models = [
+      {
+        id: "model-a",
+        supportedReasoningEfforts: ["none", "minimal", "max", "ultra"].map((reasoningEffort) => ({
+          reasoningEffort,
+        })),
+      },
+      { id: "model-b", supportedReasoningEfforts: [] },
+    ];
+    const session = {
+      harness: "codex",
+      modelOverride: "model-a",
+      llmModel: "model-b",
+      codexModelOptions: models,
+    };
+    expect(supportsEffortControl(session, "codex-native")).toBe(true);
+    expect(
+      supportsEffortControl(
+        { ...session, modelOverride: null, llmModel: "model-a" },
+        "codex-native",
+      ),
+    ).toBe(true);
+    expect(supportsEffortControl({ ...session, modelOverride: "model-b" }, "codex-native")).toBe(
+      false,
+    );
+    expect(supportsEffortControl({ ...session, modelOverride: "unknown" }, "codex-native")).toBe(
+      false,
+    );
+    expect(supportsEffortControl({ ...session, codexModelOptions: [] }, "codex-native")).toBe(
+      false,
+    );
+    expect(supportsEffortControl({ ...session, parentSessionId: "parent" }, "codex-native")).toBe(
+      false,
+    );
+  });
   it("shows the dial for a top-level label-less SDK session whose family has a ladder", () => {
     // WHY: claude-sdk / codex carry no wrapper label; their effort reaches the
     // executor through the session's reasoning_effort, so the family is the gate.

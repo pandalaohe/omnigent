@@ -424,6 +424,61 @@ it("enables Antigravity model, effort and permission controls", () => {
 });
 
 describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", () => {
+  it("offers only clearing an existing SDK override when the model has no ladder", () => {
+    const models = [{ id: "plain", supportedReasoningEfforts: [] }];
+    const session = {
+      labels: {},
+      harness: "codex",
+      modelOverride: "plain",
+      reasoningEffort: "ultra",
+    };
+    expect(shouldShowEffortPicker(session, "codex-native", models)).toBe(true);
+    expect(effortLevelsForConv(session, models, "plain", "codex-native")).toEqual([]);
+    expect(
+      shouldShowEffortPicker({ ...session, reasoningEffort: null }, "codex-native", models),
+    ).toBe(false);
+    expect(
+      shouldShowEffortPicker({ ...session, parentSessionId: "parent" }, "codex-native", models),
+    ).toBe(false);
+    expect(
+      shouldShowEffortPicker({ ...session, inferenceConfigured: true }, "codex-native", models),
+    ).toBe(false);
+    expect(
+      shouldShowEffortPicker(
+        { ...session, labels: { "omnigent.closed": "true" } },
+        "codex-native",
+        models,
+      ),
+    ).toBe(false);
+  });
+  it("uses the real Codex SDK family and per-model catalog for both visibility and levels", () => {
+    const models = [
+      {
+        id: "model-a",
+        supportedReasoningEfforts: ["none", "minimal", "max", "ultra"].map((reasoningEffort) => ({
+          reasoningEffort,
+        })),
+      },
+      { id: "model-b", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+    ];
+    const session = { harness: "codex", labels: {}, modelOverride: "model-a" };
+    expect(shouldShowEffortPicker(session, "codex-native", models)).toBe(true);
+    expect(
+      shouldShowEffortPicker({ ...session, parentSessionId: "parent" }, "codex-native", models),
+    ).toBe(false);
+    expect(effortLevelsForConv(session, models, "model-a", "codex-native")).toEqual([
+      "none",
+      "minimal",
+      "max",
+      "ultra",
+    ]);
+    expect(effortLevelsForConv(session, models, "model-b", "codex-native")).toEqual(["high"]);
+    expect(
+      shouldShowEffortPicker({ ...session, modelOverride: "unknown" }, "codex-native", models),
+    ).toBe(false);
+    expect(shouldShowEffortPicker(session, "codex-native", [])).toBe(false);
+    expect(shouldShowEffortPicker({ harness: "antigravity" }, "none", models)).toBe(false);
+  });
   it("opens the picker for a label-less claude-sdk / codex session with a family", () => {
     // WHY: the SDK executors already honor the session's reasoning_effort;
     // only the label-only gate kept the control hidden.

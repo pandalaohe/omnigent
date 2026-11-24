@@ -186,7 +186,7 @@ import {
   type ComposerDraftPart,
 } from "@/lib/composerContent";
 import type { ActiveResponse } from "./types";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { supportsEffortControl, supportsSdkEffortReset } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import {
@@ -4179,7 +4179,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // so this conversation doesn't claim an effort the server will never hold.
         // SDK harnesses carry no wrapper label, so resolve their declared effort
         // family to recognize that they do take a ``reasoning_effort`` override.
-        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
+        const effortFamily = await effortFamilyForSession(session);
+        const canResetSdkEffort = effort === null && supportsSdkEffortReset(session, effortFamily);
+        if (!canResetSdkEffort && !supportsEffortControl(session, effortFamily)) {
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
@@ -5997,7 +5999,9 @@ async function bindStream(
     // when no catalog has loaded yet rather than blanking a real setting.
     const cachedFamily = cachedEffortFamilyForSession(session);
     const canApplyEffort =
-      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
+      cachedFamily === undefined ||
+      supportsEffortControl(session, cachedFamily) ||
+      supportsSdkEffortReset(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
