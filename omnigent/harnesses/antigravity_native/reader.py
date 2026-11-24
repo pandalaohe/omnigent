@@ -1318,6 +1318,7 @@ class _ReaderState:
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     turn_generation: int = 0
+    closed_after_reply: bool = False
     native_work_observed: bool = False
     turn_error: str | None = None
     idle_ticks: int = 0
@@ -1615,11 +1616,17 @@ async def _commit_step(
             state.metered_steps.add(key)
             state.pending_metering.discard(key)
     if key not in state.seen:
-        if _is_user_turn_step(step):
+        # A background task can resume agy after idle without a USER_INPUT.
+        resumes_after_idle = state.closed_after_reply and _is_assistant_text_close_step(step)
+        if _is_user_turn_step(step) or resumes_after_idle:
             state.turn_generation += 1
+            state.closed_after_reply = False
             state.turn_error = None
             state.idle_ticks = 0
             state.last_text = ""
+            if resumes_after_idle:
+                state.turn_active = True
+                await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
         elif state.turn_active and _is_settled(step):
             if step.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
                 error = error_message_text(step)
@@ -1890,6 +1897,11 @@ async def _reconcile_idle_turn(
         else:
             return body
         state.turn_active = False
+        state.closed_after_reply = bool(
+            event.data["status"] == _STATUS_IDLE
+            and steps
+            and _is_assistant_text_close_step(steps[-1])
+        )
         await _post_event(client, session_id, event)
     return body
 

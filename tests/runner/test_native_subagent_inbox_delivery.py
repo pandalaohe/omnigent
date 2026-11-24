@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -2784,6 +2785,133 @@ async def test_quiet_result_is_recorded_without_inbox_or_wake(
 
     assert inbox.qsize() == 1
     assert inbox.get_nowait()["output"] == "real"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_background_continuation_delivers_only_the_final_reply(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native work can resume after idle without appending another user input."""
+    from omnigent.entities import ConversationItem, MessageData, PagedList
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.server.routes._sessions.orchestration import (
+        _enrich_terminal_status_with_subagent_output,
+    )
+    from omnigent.stores.conversation_store import ConversationStore
+    from tests._helpers.polling import poll_until_async
+
+    fixture_dir = Path(__file__).parents[1] / "fixtures" / "antigravity" / "steps"
+    user_step = json.loads((fixture_dir / "user_input.json").read_text(encoding="utf-8"))
+    planner_fixture = fixture_dir / "stream_planner_text_done.json"
+    steps = [user_step]
+    cascade_id = "cascade-for-background-task"
+    app, server = _delivery_app([])
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        registered_by="sys_session_send",
+    )
+    store = Mock(spec=ConversationStore)
+    store.list_items.return_value = PagedList(data=[])
+    state = reader._ReaderState(seen=set(), interacted=set())
+    monkeypatch.setattr(reader, "get_available_models", lambda *_a: {})
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_a, **_kw: list(steps))
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *_a, **_kw: {
+            "trajectorySummaries": {cascade_id: {"status": "CASCADE_RUN_STATUS_IDLE"}},
+        },
+    )
+
+    def wakes() -> list[str]:
+        return [
+            body["json"]["data"]["content"][0]["text"]
+            for url, body in server.posts
+            if url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
+        ]
+
+    async with _runner_client(app, permission_harness="antigravity-native") as runner:
+
+        async def forward(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            data = body["data"]
+            if body["type"] == "external_conversation_item":
+                if data["item_type"] == "message":
+                    message = MessageData.model_validate(data["item_data"])
+                    item = ConversationItem(
+                        id=data["source_id"],
+                        type="message",
+                        status="completed",
+                        response_id="",
+                        created_at=len(steps),
+                        data=message,
+                    )
+                    store.list_items.return_value.data.insert(0, item)
+                    if message.role == "assistant":
+                        server.items.insert(
+                            0, _assistant_item(item.id, message.content[0]["text"])
+                        )
+            if body["type"] == "external_session_status":
+                body["data"] = await _enrich_terminal_status_with_subagent_output(
+                    data, data["status"], CHILD_SESSION_ID, store
+                )
+                response = await runner.post(request.url.path, json=body)
+                assert response.status_code == 204, response.text
+            return httpx.Response(204)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(forward),
+            base_url="http://server.test",
+        ) as client:
+            reader_args = {
+                "client": client,
+                "session_id": CHILD_SESSION_ID,
+                "cascade_id": cascade_id,
+                "state": state,
+                "on_pending_interaction": AsyncMock(),
+            }
+            for index, reply in enumerate(
+                [
+                    "Waiting for the task.\n[quiet]",
+                    "Still waiting.\n[quiet]",
+                    "Background task finished.",
+                ],
+                start=50,
+            ):
+                planner = json.loads(planner_fixture.read_text(encoding="utf-8"))
+                planner["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = index
+                planner["plannerResponse"]["modifiedResponse"] = reply
+                steps.append(planner)
+                # Each stream reconnect can replay the entire trajectory.
+                for step in steps:
+                    await reader._process_committed_step(step, **reader_args)
+                for _ in range(3):
+                    await reader._reconcile_idle_turn(port=52548, **reader_args)
+                if reply.endswith("[quiet]"):
+                    assert inbox.empty()
+                    assert wakes() == []
+
+            for step in steps:
+                await reader._process_committed_step(step, **reader_args)
+            for _ in range(3):
+                await reader._reconcile_idle_turn(port=52548, **reader_args)
+
+        assert server.items[0]["content"][0]["text"] == "Background task finished."
+        results = [inbox.get_nowait() for _ in range(inbox.qsize())]
+        assert [(item["status"], item["output"]) for item in results] == [
+            ("completed", "Background task finished."),
+        ]
+        await poll_until_async(wakes, timeout_s=2)
+        notices = wakes()
+        assert len(notices) == 1
+        assert "finished (completed)" in notices[0]
+        assert "1 result waiting in inbox" in notices[0]
 
 
 @pytest.mark.asyncio
