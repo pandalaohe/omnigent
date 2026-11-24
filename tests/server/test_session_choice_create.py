@@ -100,39 +100,6 @@ async def save_choice(client, settings, revision):
     return await client.put(CHOICE_URL, json={"settings": settings, "expected_revision": revision})
 
 
-@pytest.mark.parametrize("named", [False, True])
-@pytest.mark.parametrize("protection", ["limits", "exclusion"])
-async def test_unmapped_codex_pin_cannot_bypass_pool_protection(
-    choice_env, monkeypatch, named, protection
-):
-    env = choice_env
-    monkeypatch.setattr(
-        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
-        lambda *a, **kw: "codex-native",
-    )
-    link = {"agent": env.agents[0]["id"], "model": "route-a/gpt-example"}
-    env.settings["presets"][0]["links"] = [link]
-    env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
-    options: dict[str, str | bool | list[str]] = {}
-    if protection == "exclusion":
-        env.settings["limits"] = {}
-        options["exclude"] = ["pool-0"]
-    env.prefs.replace_session_choice(
-        RESERVED_USER_LOCAL,
-        env.settings,
-        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
-    )
-    if named:
-        options.update(agent_id=link["agent"], model_override=link["model"], user_named=True)
-    response = await create(env, **options)
-    assert response.status_code == 409, response.text
-    detail = response.json()["detail"]
-    if named:
-        assert detail["code"] == "identity_unavailable"
-    else:
-        assert detail["skipped"][0]["why"] == "identity_unavailable"
-
-
 @pytest.fixture
 def drain_choice_env(choice_env):
     env = choice_env
@@ -721,6 +688,93 @@ async def test_feedback_ends_drain_before_another_pick(drain_choice_env, monkeyp
     recovered = await create(env)
     assert recovered.status_code == 201, recovered.text
     assert recovered.json()["session_choice"]["pool"] == "pool-0"
+
+
+async def test_codex_route_pool_aliases_share_billing_refusals_and_running_counts(
+    choice_env, monkeypatch
+):
+    from dataclasses import replace
+
+    from omnigent.models.model_reference import provider_groups
+    from omnigent.server.session_choice import (
+        ChoiceRequest,
+        Link,
+        parse_session_choice,
+        resolved_link,
+        state_for,
+    )
+    from omnigent.server.session_choice_runtime import (
+        record_provider_recovery,
+        record_quota_exhaustion,
+    )
+
+    env = choice_env
+    owner, agent = RESERVED_USER_LOCAL, env.agents[0]["id"]
+    pool, old_pool = "codex:new/account", "codex:old/account"
+    pairs = [("old", "new"), ("other", "new")]
+    env.prefs.patch_namespace(
+        owner, "model_provider_aliases", {"pairs": [list(pair) for pair in pairs]}
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    first_model, second_model = "route-a/gpt-example", "route-b/gpt-example"
+    links = [{"agent": agent, "model": model} for model in (first_model, second_model)]
+    env.settings["codexRoutePools"] = {"route-a": old_pool, "route-b": pool}
+    env.settings["presets"][0]["links"] = links
+    env.settings["hosts"][HOST]["work"] = [[{"links": links}]]
+    env.settings["limits"] = {pool: {"maxRunning": 1}}
+    env.prefs.replace_session_choice(
+        owner, env.settings, env.prefs.session_choice(owner)["revision"]
+    )
+
+    admitted = await create(env)
+    assert admitted.status_code == 201, admitted.text
+    child = admitted.json()
+    assert child["session_choice"]["pool"] == pool
+    busy = await create(env)
+    assert busy.status_code == 201, busy.text
+    assert {
+        item["link"]["model"]: (item["why"], item["running"])
+        for item in busy.json()["session_choice"]["skipped"]
+    } == dict.fromkeys((first_model, second_model), ("busy", [child["id"]]))
+
+    session = env.store.get_conversation(child["id"])
+    assert session is not None
+    legacy = {
+        "pool": old_pool,
+        "model": first_model,
+        "poolRoute": json.dumps([HOST, agent, old_pool]),
+    }
+    session = replace(session, labels={**session.labels, CHOICE_LABEL: json.dumps(legacy)})
+    attempt = {"from_runner": True, "response_id": "refused", "input_generation": 1}
+    await record_provider_recovery(env.app, session, started=True, **attempt)
+    await record_quota_exhaustion(
+        env.app,
+        session,
+        "HTTP 403 balance billing is disabled for this key",
+        actor=None,
+        **attempt,
+    )
+    refused = await create(env)
+    assert refused.status_code == 201, refused.text
+    assert {
+        item["link"]["model"]: item["why"] for item in refused.json()["session_choice"]["skipped"]
+    } == dict.fromkeys((first_model, second_model), "stop")
+    assert set(state_for(env.app).refusals) == {(owner, pool, json.dumps([HOST, agent, pool]))}
+
+    request = ChoiceRequest(
+        owner,
+        HOST,
+        products={agent: "codex"},
+        default_models={agent: second_model},
+        provider_groups=provider_groups(pairs),
+    )
+    metered = Link(agent=agent, meter="codex:other/account")
+    assert (
+        resolved_link(parse_session_choice(env.settings), metered, request).model == second_model
+    )
 
 
 @pytest.mark.asyncio

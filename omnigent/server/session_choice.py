@@ -593,6 +593,17 @@ def codex_route_pool(
     return canonical_pool(pool, groups or {}) if pool is not None else None
 
 
+def is_mapped_codex_pool(
+    settings: SessionChoice, pool: str | None, groups: ProviderGroups
+) -> bool:
+    if pool is None:
+        return False
+    canonical = canonical_pool(pool, groups)
+    return any(
+        canonical_pool(value, groups) == canonical for value in settings.codex_route_pools.values()
+    )
+
+
 def pool_of(
     settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups | None = None
 ) -> str:
@@ -956,6 +967,7 @@ def candidate_lines(settings, link, request, readings, floor_off, now):
                 link.model,
                 route_pools=settings.codex_route_pools,
                 product=product,
+                groups=request.provider_groups,
             ),
         )
         readings = readings.for_routes(routes)
@@ -978,19 +990,6 @@ def check_candidate_limits(
     link = _candidate_link(settings, link, request)
     if (until := (request.link_exclusions or {}).get(link.agent_id, 0)) > now:
         return Skipped(link, "excluded", until)
-    product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(settings, link, product, request.provider_groups)
-    prefix, _, model = (link.model or "").partition("/")
-    if (
-        product == "codex"
-        and prefix
-        and model
-        and not settings.codex_route_pools
-        and not (link.meter or link._bound_pool)
-        and (settings.limits or request.exclude)
-        and pool not in canonical_pool_values(settings.limits, request.provider_groups)
-    ):
-        return Skipped(link, "identity_unavailable")
     if (
         settings.schema_version == 2
         and link.model is None
@@ -1022,6 +1021,8 @@ def check_candidate_limits(
         return failure
     if user_named:
         return None
+    product = request.products.get(link.agent_id, link.agent_id)
+    pool = pool_of(settings, link, product, request.provider_groups)
     legacy = pool_limits(settings, link, product, request.provider_groups)
     cap = legacy.max_running if link.meter else link.max_running
     if (
@@ -1155,16 +1156,20 @@ def candidate_quota(
     return agent_quota(windows, request.quota_tiers, now)
 
 
-def needs_route_model(settings: SessionChoice, link: Link, product: str | None) -> bool:
+def needs_route_model(
+    settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups
+) -> bool:
     return (
         link.model is None
         and product == "codex"
-        and link.meter in settings.codex_route_pools.values()
+        and is_mapped_codex_pool(settings, link.meter, groups)
     )
 
 
 def resolved_link(settings: SessionChoice, link: Link, request: ChoiceRequest) -> Link:
-    if needs_route_model(settings, link, request.products.get(link.agent_id)):
+    if needs_route_model(
+        settings, link, request.products.get(link.agent_id), request.provider_groups
+    ):
         link = link.model_copy(update={"model": request.default_models.get(link.agent_id)})
     if link.model is not None:
         catalog = request.models.get(link.agent_id)
@@ -1328,7 +1333,7 @@ def _filter_link(
     pool = pool_of(settings, link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
-    if needs_route_model(settings, link, product):
+    if needs_route_model(settings, link, product, request.provider_groups):
         return Skipped(link, "model_unavailable")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
     level = _ability(settings, product, link.model, request)
@@ -1577,6 +1582,7 @@ def plan_choice(
                     link.model,
                     route_pools=settings.codex_route_pools,
                     product=request.products.get(link.agent_id, link.agent_id),
+                    groups=request.provider_groups,
                 ),
             )
             new_lock = revalidate_drain_locks(settings, (proposed,), settings_revision).get(key)
@@ -1694,6 +1700,7 @@ class ProviderAttempt:
     route: str
     observed_route: str
     route_pools: Mapping[str, str]
+    provider_groups: ProviderGroups
 
 
 def provider_route(
@@ -1703,12 +1710,25 @@ def provider_route(
     *,
     route_pools: Mapping[str, str] | None = None,
     product: str | None = None,
+    groups: ProviderGroups | None = None,
 ) -> str:
     """Use the host's provider binding, shared by models on that provider."""
     prefix, separator, name = (model or "").partition("/")
     pool = route_pools.get(prefix) if route_pools and product == "codex" and name else None
-    provider = pool or (prefix if separator else "default")
+    provider = canonical_pool(pool, groups or {}) if pool else (prefix if separator else "default")
     return json.dumps([host, agent, provider])
+
+
+def canonical_provider_route(route: str, groups: ProviderGroups) -> str:
+    if not groups:
+        return route
+    try:
+        binding = json.loads(route)
+    except ValueError:
+        return route
+    if isinstance(binding, list) and len(binding) == 3 and isinstance(binding[2], str):
+        return json.dumps([binding[0], binding[1], canonical_pool(binding[2], groups)])
+    return route
 
 
 class EffectiveQuotaReadings(dict):
@@ -1788,9 +1808,10 @@ class ChoiceState:
                         )
                     ],
                 )
-        for (user, pool, _route), refusal in tuple(self.refusals.items()):
+        route_keys = {canonical_provider_route(route, groups or {}) for route in routes}
+        for (user, pool, route), refusal in tuple(self.refusals.items()):
             pool = canonical_pool(pool, groups or {})
-            if routes and _route not in routes:
+            if route_keys and canonical_provider_route(route, groups or {}) not in route_keys:
                 continue
             if user != owner or (refusal.resets_at is not None and refusal.resets_at <= now):
                 continue

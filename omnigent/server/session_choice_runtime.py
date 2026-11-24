@@ -35,9 +35,11 @@ from omnigent.server.session_choice import (
     WorkType,
     active_on,
     candidate_lines,
+    canonical_provider_route,
     check_candidate_limits,
     codex_route_pool,
     holds_slot,
+    is_mapped_codex_pool,
     needs_route_model,
     ordered_links,
     parse_session_choice,
@@ -121,6 +123,7 @@ async def _close_drain_locks(
     prefs = getattr(app.state, "user_preferences_store", None)
     groups = await asyncio.to_thread(read_provider_groups, prefs, owner) if pools else {}
     closed_pools = {canonical_pool(pool, groups) for pool in pools}
+    closed_route = canonical_provider_route(route, groups) if route is not None else None
 
     def matches(lock: DrainLock) -> bool:
         if drops:
@@ -129,7 +132,10 @@ async def _close_drain_locks(
         return (
             (first_attempt or lock.since <= retry_cutoff)
             and (not closed_pools or canonical_pool(lock.pool, groups) in closed_pools)
-            and (route is None or lock.route == route)
+            and (
+                closed_route is None
+                or canonical_provider_route(lock.route, groups) == closed_route
+            )
             and (host is None or lock.host_id == host)
             and (agent is None or lock.saved_link.agent_id == agent)
         )
@@ -364,10 +370,7 @@ def tile_of_session(
     )
     if pool in readings:
         return pool
-    if product == "codex" and any(
-        pool == canonical_pool(mapped, groups or {})
-        for mapped in settings.codex_route_pools.values()
-    ):
+    if product == "codex" and is_mapped_codex_pool(settings, pool, groups or {}):
         return None
     if product is None:
         return None
@@ -656,17 +659,18 @@ async def record_quota_exhaustion(
         if attempt is None or (attempt.response_id, attempt.generation, attempt.pool) != (
             response_id,
             input_generation,
-            pool,
+            canonical_pool(pool, attempt.provider_groups),
         ):
             return
         current = session_identity(app, session)
-        key = (owner, pool, attempt.route)
+        key = (owner, attempt.pool, attempt.route)
         if provider_route(
             current.host,
             current.agent,
             current.model,
             route_pools=attempt.route_pools,
             product=current.product,
+            groups=attempt.provider_groups,
         ) != attempt.observed_route or attempt.started_at <= state.provider_recoveries.get(
             key, float("-inf")
         ):
@@ -706,6 +710,9 @@ async def record_provider_recovery(
             settings = await asyncio.to_thread(choice_settings, app, owner)
         except HTTPException:
             return
+        groups = await asyncio.to_thread(
+            read_provider_groups, getattr(app.state, "user_preferences_store", None), owner
+        )
         current = session_identity(app, session)
         route_pools = settings.codex_route_pools
         route = provider_route(
@@ -714,10 +721,16 @@ async def record_provider_recovery(
             current.model,
             route_pools=route_pools,
             product=current.product,
+            groups=groups,
         )
         model = record.get("model") if record else None
         if isinstance(model, str) and route != provider_route(
-            current.host, current.agent, model, route_pools=route_pools, product=current.product
+            current.host,
+            current.agent,
+            model,
+            route_pools=route_pools,
+            product=current.product,
+            groups=groups,
         ):
             return
         # Recheck the watermark after loading settings. Duplicate or superseded starts
@@ -735,21 +748,24 @@ async def record_provider_recovery(
                 and len(saved_route) == 3
                 and isinstance(saved_route[2], str)
             ):
-                route_key = json.dumps([current.host, current.agent, saved_route[2]])
+                route_key = json.dumps(
+                    [current.host, current.agent, canonical_pool(saved_route[2], groups)]
+                )
             state.provider_attempts[execution] = ProviderAttempt(
                 response_id,
                 input_generation,
                 time.time(),
-                pool,
+                canonical_pool(pool, groups),
                 route_key,
                 route,
                 dict(route_pools),
+                groups,
             )
         return
     if attempt is None or (attempt.response_id, attempt.generation, attempt.pool) != (
         response_id,
         input_generation,
-        pool,
+        canonical_pool(pool, attempt.provider_groups),
     ):
         return
     current = session_identity(app, session)
@@ -760,11 +776,12 @@ async def record_provider_recovery(
             current.model,
             route_pools=attempt.route_pools,
             product=current.product,
+            groups=attempt.provider_groups,
         )
         != attempt.observed_route
     ):
         return
-    key = (owner, pool, attempt.route)
+    key = (owner, attempt.pool, attempt.route)
     started_at = attempt.started_at
     state.provider_recoveries[key] = max(
         state.provider_recoveries.get(key, started_at), started_at
@@ -1500,7 +1517,6 @@ async def admit_create(
                     probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
                 )
             )
-            request = replace(request, products={**request.products, body.agent_id: product})
             model = (
                 body.model_override
                 or request.effective_models.get(body.agent_id)
@@ -1523,6 +1539,7 @@ async def admit_create(
             )
             if settings.schema_version == 2:
                 link = link.model_copy(update={"model": model})
+                request = replace(request, products={**request.products, body.agent_id: product})
                 if pool is None:
                     pool = pool_of(settings, link, product, request.provider_groups)
             meter = next(
@@ -1613,7 +1630,7 @@ async def admit_create(
         assert choice.link is not None
         link = choice.link
         product = request.products.get(link.agent_id)
-        if needs_route_model(settings, link, product):
+        if needs_route_model(settings, link, product, request.provider_groups):
             raise HTTPException(
                 409,
                 {"code": "session_choice_ask", "reason": "Choose a model for this Codex route"},
@@ -1648,6 +1665,7 @@ async def admit_create(
                 link.model,
                 route_pools=settings.codex_route_pools,
                 product=product,
+                groups=request.provider_groups,
             ),
             plan.lock if not named else None,
         )
@@ -1730,6 +1748,7 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
                             link.model,
                             route_pools={prefix: bound_pool},
                             product=product,
+                            groups=request.provider_groups,
                         ),
                     ),
                 )
