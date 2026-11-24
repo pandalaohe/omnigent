@@ -65,6 +65,7 @@ import {
   codexPermissionReadback,
 } from "@/lib/codexApprovalMode";
 import type { Session } from "@/lib/types";
+import { reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
   clearUnsentSends,
@@ -3385,6 +3386,217 @@ describe("chatStore — switchTo", () => {
       return defaultFetchHandler(input, init);
     };
   }
+
+  it("hydrates and PATCHes Codex SDK per-model effort and resets to Default", async () => {
+    seedSession("conv_sdk_codex", []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_sdk_codex" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_sdk_codex",
+          agent_id: "agent_xyz",
+          status: "running",
+          created_at: 0,
+          labels: {},
+          harness: "codex",
+          reasoning_effort: "ultra",
+          model_override: "model-a",
+          model_options: [
+            {
+              id: "model-a",
+              supportedReasoningEfforts: ["none", "minimal", "max", "ultra"].map(
+                (reasoningEffort) => ({ reasoningEffort }),
+              ),
+            },
+          ],
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_sdk_codex");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    fetchMock.mockClear();
+    await useChatStore.getState().setEffort("minimal");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("minimal");
+    await useChatStore.getState().setEffort(null);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(
+      fetchMock.mock.calls
+        .filter(
+          ([u, init]) => String(u) === "/v1/sessions/conv_sdk_codex" && init?.method === "PATCH",
+        )
+        .map(([, init]) => JSON.parse(String(init?.body))),
+    ).toEqual([{ reasoning_effort: "minimal" }, { reasoning_effort: "default" }]);
+  });
+
+  it.each([false, true])(
+    "clears Codex SDK effort after switching to a model with no ladder (refused=%s)",
+    async (refused) => {
+      const id = "conv_sdk_no_ladder";
+      seedSession(id, []);
+      client.setQueryData(["harness-labels"], {
+        labels: {},
+        setupSteps: {},
+        acpHarnesses: new Set<string>(),
+        effortFamilies: { codex: "codex-native" },
+      });
+      const models = [
+        { id: "model-a", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+        { id: "model-b", supportedReasoningEfforts: [] },
+      ];
+      const wire = {
+        id,
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        labels: {},
+        harness: "codex",
+        model_override: "model-a",
+        reasoning_effort: "high" as string | null,
+        model_options: models,
+      };
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+          if (init?.method === "PATCH") {
+            const body = JSON.parse(String(init.body));
+            if ("reasoning_effort" in body) {
+              if (refused)
+                return mockResponse({ detail: "Setting refused" }, { ok: false, status: 403 });
+              wire.reasoning_effort =
+                body.reasoning_effort === "default" ? null : body.reasoning_effort;
+            }
+            if ("model_override" in body) wire.model_override = body.model_override;
+          }
+          return mockResponse(wire);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().switchTo(id);
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+      await useChatStore.getState().setModel("model-b");
+      await useChatStore.getState().refreshSessionState();
+      expect(useChatStore.getState().sessionModelOverride).toBe("model-b");
+      const reconciled = reconcileEffortOnModelChange("codex", models, "model-b", "high");
+      expect(reconciled).toBeNull();
+      fetchMock.mockClear();
+      const patches = () =>
+        fetchMock.mock.calls
+          .filter(([u, init]) => String(u) === `/v1/sessions/${id}` && init?.method === "PATCH")
+          .map(([, init]) => JSON.parse(String(init?.body)));
+      await useChatStore.getState().setEffort("high");
+      expect(patches()).toEqual([]);
+      expect(wire.reasoning_effort).toBe("high");
+      const cleared = useChatStore.getState().setEffort(reconciled);
+      if (refused) await expect(cleared).rejects.toThrow();
+      else await cleared;
+      expect(patches()).toEqual([{ reasoning_effort: "default" }]);
+      expect(wire.reasoning_effort).toBe(refused ? "high" : null);
+      expect(useChatStore.getState().sessionReasoningEffort).toBe(refused ? "high" : null);
+    },
+  );
+
+  it("preserves a no-ladder SDK override across cold reload, clear refusal and retry", async () => {
+    const id = "conv_sdk_reload_clear";
+    seedSession(id, []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    const wire = {
+      id,
+      agent_id: "agent_xyz",
+      status: "idle",
+      created_at: 0,
+      labels: {},
+      harness: "codex",
+      model_override: "plain",
+      reasoning_effort: "ultra" as string | null,
+      model_options: [{ id: "plain", supportedReasoningEfforts: [] }],
+    };
+    let clears = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+        if (init?.method === "PATCH") {
+          expect(JSON.parse(String(init.body))).toEqual({ reasoning_effort: "default" });
+          clears += 1;
+          if (clears === 1)
+            return mockResponse({ detail: "Clear refused" }, { ok: false, status: 403 });
+          wire.reasoning_effort = null;
+        }
+        return mockResponse(wire);
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    await expect(useChatStore.getState().setEffort(null)).rejects.toThrow();
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    initChatStore(client);
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    await useChatStore.getState().setEffort(null);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    initChatStore(client);
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(clears).toBe(2);
+  });
+
+  it.each([
+    { inference_configured: true },
+    { parent_session_id: "parent" },
+    { labels: { "omnigent.wrapper": "codex-native-ui-subagent" } },
+    { labels: { "omnigent.closed": "true" } },
+  ])("keeps the no-ladder SDK reset restricted for %j", async (restriction) => {
+    const id = "conv_sdk_reset_restricted";
+    seedSession(id, []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === `/v1/sessions/${id}` &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          labels: {},
+          harness: "codex",
+          model_override: "model-b",
+          reasoning_effort: "high",
+          model_options: [{ id: "model-b", supportedReasoningEfforts: [] }],
+          ...restriction,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    fetchMock.mockClear();
+    await useChatStore.getState().setEffort(null);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([u, init]) => String(u) === `/v1/sessions/${id}` && init?.method === "PATCH",
+      ),
+    ).toEqual([]);
+  });
 
   it.each(["anthropic", "none", "unavailable"])(
     "hydrates an SDK session's saved effort without a catalog, but waits for %s before PATCHing",
