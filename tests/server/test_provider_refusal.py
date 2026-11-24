@@ -43,13 +43,21 @@ def test_refusal_wins_over_balance_without_reset_and_is_owner_scoped():
 
 
 @pytest.mark.asyncio
-async def test_record_and_recover_requires_owner_route_account_and_new_turn(monkeypatch):
+@pytest.mark.parametrize("mapping_changes", [False, True])
+async def test_record_and_recover_requires_owner_route_account_and_new_turn(
+    monkeypatch, mapping_changes
+):
     import json
     from types import SimpleNamespace
     from unittest.mock import Mock
 
     from omnigent.server.child_cap import ChildCapLocks
-    from omnigent.server.session_choice import CHOICE_LABEL, provider_route, state_for
+    from omnigent.server.session_choice import (
+        CHOICE_LABEL,
+        parse_session_choice,
+        provider_route,
+        state_for,
+    )
     from omnigent.server.session_choice_runtime import (
         record_provider_recovery,
         record_quota_exhaustion,
@@ -64,7 +72,17 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
         )
     )
     session = SimpleNamespace(id="session", labels={CHOICE_LABEL: json.dumps({"pool": "account"})})
-    identity = SimpleNamespace(host="host", agent="agent", model="route/model")
+    identity = SimpleNamespace(host="host", agent="agent", model="route/model", product="codex")
+    original = parse_session_choice(
+        {"codexRoutePools": {"route": "account", "route-alias": "account"}}
+        if mapping_changes
+        else {}
+    )
+    replacement = parse_session_choice({"codexRoutePools": {"route": "other-account"}})
+    settings = original
+    monkeypatch.setattr(
+        "omnigent.server.session_choice_runtime.choice_settings", lambda *_: settings
+    )
     monkeypatch.setattr(
         "omnigent.server.session_collab.collab_owner_for", Mock(return_value="owner")
     )
@@ -93,8 +111,17 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
     await record_provider_recovery(
         app, session, from_runner=True, response_id="failure", input_generation=2, started=True
     )
+    if mapping_changes:
+        settings = replacement
+        identity.model = "route-alias/model"
     await record_quota_exhaustion(app, session, message, **args)
-    key = ("owner", "account", provider_route("host", "agent", "route/model"))
+    key = (
+        "owner",
+        "account",
+        provider_route(
+            "host", "agent", "route/model", route_pools=original.codex_route_pools, product="codex"
+        ),
+    )
     assert state.refusals[key].reason == "billing_disabled"
     other_key = ("owner", "other-account", key[2])
     state.refusals[other_key] = state.refusals[key]
@@ -117,13 +144,19 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
         app, session, from_runner=True, input_generation=3, response_id="success"
     )
     assert key in state.refusals
+    settings = original
     await record_provider_recovery(
         app, session, from_runner=True, input_generation=3, response_id="success", started=True
     )
+    if mapping_changes:
+        settings = replacement
+        identity.model = "route-alias/another-model"
     await record_provider_recovery(
         app, session, from_runner=True, input_generation=3, response_id="success"
     )
     assert key not in state.refusals
+    settings = original
+    identity.model = "route/another-model"
 
     # Routine successful turns replace correlation, rather than retaining every turn.
     for generation in range(4, 104):
@@ -207,9 +240,9 @@ def test_refusal_is_scoped_for_candidates_but_shared_with_tile():
     "refused_model,candidate_model,expected",
     [
         ("model", "model", "stop"),
-        ("official/model", "model", "unknown"),
-        ("official/model", "official/model", "stop"),
-        ("model", "official/model", "unknown"),
+        ("route-primary/model", "model", "unknown"),
+        ("route-primary/model", "route-primary/model", "stop"),
+        ("model", "route-primary/model", "unknown"),
     ],
 )
 def test_codex_meter_keeps_refusal_on_the_verbatim_route(refused_model, candidate_model, expected):
@@ -223,14 +256,30 @@ def test_codex_meter_keeps_refusal_on_the_verbatim_route(refused_model, candidat
     )
 
     state = ChoiceState()
-    state.refusals[("owner", "codex-pro", provider_route("host", "agent", refused_model))] = (
+    state.refusals[("owner", "pool-primary", provider_route("host", "agent", refused_model))] = (
         ProviderRefusal("billing_disabled", 100, None, "session", "turn")
     )
     readings = state.quota_readings("owner", {}, 101)
-    assert readings["codex-pro"].state == "stopped"
+    assert readings["pool-primary"].state == "stopped"
     request = ChoiceRequest("owner", "host", products={"agent": "codex"})
-    link = Link(agent="agent", model=candidate_model, meter="codex-pro")
+    link = Link(agent="agent", model=candidate_model, meter="pool-primary")
     assert (
         candidate_lines(SessionChoice(), link, request, readings, {}, 101)[0][1].state == expected
     )
     assert link.model == candidate_model
+
+
+@pytest.mark.parametrize("product,expected", [("codex", True), ("pi", False)])
+def test_route_aliases_share_provider_refusal_only_for_codex(product, expected):
+    from omnigent.server.session_choice import parse_session_choice, provider_route
+
+    settings = parse_session_choice(
+        {"codexRoutePools": {"route-a": "pool-a", "route-b": "pool-a"}}
+    )
+    first = provider_route(
+        "host", "agent", "route-a/model", route_pools=settings.codex_route_pools, product=product
+    )
+    second = provider_route(
+        "host", "agent", "route-b/model", route_pools=settings.codex_route_pools, product=product
+    )
+    assert (first == second) is expected

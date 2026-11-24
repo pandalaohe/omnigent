@@ -77,7 +77,7 @@ def conversion_preview(app: Any, owner: str, settings: SessionChoice) -> dict[st
             "model": link.model,
             "meter": link.meter,
             "product": products.get(link.agent_id),
-            "pool": pool_of(link, products.get(link.agent_id)),
+            "pool": pool_of(settings, link, products.get(link.agent_id)),
         }
         for link in links
     ]
@@ -100,7 +100,8 @@ def conversion_preview(app: Any, owner: str, settings: SessionChoice) -> dict[st
                 else "default_model_unresolved"
                 if any(row["model"] is None for row in matches)
                 else "shared_pool"
-                if len({(row["agent"], row["model"]) for row in matches}) > 1
+                if path[1] in settings.codex_route_pools.values()
+                or len({(row["agent"], row["model"]) for row in matches}) > 1
                 else None
             )
             if reason is None:

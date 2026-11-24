@@ -691,14 +691,17 @@ async def test_feedback_ends_drain_before_another_pick(drain_choice_env, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prefix", ["krill", "ccs-krill"])
-@pytest.mark.parametrize("limit", ["busy", "reserve", "stop"])
+@pytest.mark.parametrize("prefix", ["route-secondary", "route-secondary-alt"])
+@pytest.mark.parametrize("limit", ["busy", "reserve", "stop", "billing"])
 async def test_codex_default_route_is_admitted_against_its_actual_tile(
     choice_env, monkeypatch, prefix, limit
 ):
+    from omnigent.server.session_choice import ProviderRefusal, provider_route, state_for
+    from omnigent.server.session_choice_runtime import release_choice
     from tests.server.test_agent_quota import usage_report
 
     env = choice_env
+    env.settings["codexRoutePools"] = {"route-primary": "pool-primary", prefix: "pool-secondary"}
     model = f"{prefix}/gpt-small"
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
@@ -708,11 +711,11 @@ async def test_codex_default_route_is_admitted_against_its_actual_tile(
         "omnigent.server.routes._sessions.helpers._resolve_llm_model",
         lambda *a, **kw: model,
     )
-    link = {"agent": env.agents[0]["id"], "meter": "codex-pro"}
+    link = {"agent": env.agents[0]["id"], "meter": "pool-primary"}
     env.settings["presets"][0]["links"] = [link]
     env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
     env.settings["limits"] = {
-        "krill": {
+        "pool-secondary": {
             "maxRunning": 1,
             "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
         }
@@ -722,14 +725,25 @@ async def test_codex_default_route_is_admitted_against_its_actual_tile(
         env.settings,
         env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
     )
-    if limit == "busy":
+    if limit == "billing":
+        route = provider_route(
+            HOST,
+            env.agents[0]["id"],
+            model,
+            route_pools=env.settings["codexRoutePools"],
+            product="codex",
+        )
+        state_for(env.app).refusals[(RESERVED_USER_LOCAL, "pool-secondary", route)] = (
+            ProviderRefusal("billing_disabled", time.time(), None, "child", "turn")
+        )
+    elif limit == "busy":
         first = await create(env)
         assert first.status_code == 201, first.text
     else:
         now = time.time()
         env.app.state.agent_quota_service.report_account(
             RESERVED_USER_LOCAL,
-            "krill",
+            "pool-secondary",
             usage_report(
                 account_product="codex",
                 observed_at=now,
@@ -748,9 +762,21 @@ async def test_codex_default_route_is_admitted_against_its_actual_tile(
     assert response.status_code == 201, response.text
     child = response.json()
     choice = child["session_choice"]
-    assert (choice["outcome"], choice["pool"], choice["reason"]) == ("hold", "krill", limit)
+    assert (choice["outcome"], choice["pool"], choice["reason"]) == (
+        "hold",
+        "pool-secondary",
+        "stop" if limit == "billing" else limit,
+    )
     assert child["model_override"] == choice["model"] == model
-    assert choice_record(env.store.get_conversation(child["id"]))["pool"] == "krill"
+    assert choice_record(env.store.get_conversation(child["id"]))["pool"] == "pool-secondary"
+    if limit in {"stop", "billing"}:
+        env.settings["codexRoutePools"][prefix] = "pool-replacement"
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            env.settings,
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
+        assert not await release_choice(env.app, env.store.get_conversation(child["id"]), HOST)
 
 
 @pytest.mark.asyncio
@@ -767,6 +793,10 @@ async def test_codex_meter_sessions_persist_through_create_queue_and_stop_target
     from tests.server.test_agent_quota import usage_report
 
     env = choice_env
+    env.settings["codexRoutePools"] = {
+        "route-primary": "pool-primary",
+        "route-secondary": "pool-secondary",
+    }
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
         lambda *a, **kw: "codex-native",
@@ -775,13 +805,13 @@ async def test_codex_meter_sessions_persist_through_create_queue_and_stop_target
     catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}], time.time())
     env.app.state.host_model_catalog_cache_store = catalogs
     env.settings["limits"] = {
-        "codex-pro": {
+        "pool-primary": {
             "maxRunning": 1,
             "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
         },
-        "krill": {"maxRunning": 1},
+        "pool-secondary": {"maxRunning": 1},
     }
-    for index, pool in enumerate(("codex-pro", "krill")):
+    for index, pool in enumerate(("pool-primary", "pool-secondary")):
         link = {"agent": env.agents[index]["id"], "model": "gpt-example", "meter": pool}
         if model_source != "explicit":
             link.pop("model")
@@ -808,19 +838,19 @@ async def test_codex_meter_sessions_persist_through_create_queue_and_stop_target
         assert child["model_override"] == child["session_choice"]["model"] == "gpt-example"
         assert choice_record(env.store.get_conversation(child["id"]))["model"] == "gpt-example"
         children.append(child)
-    official, krill, held = children
+    primary, secondary, held = children
     assert held["session_choice"]["outcome"] == "hold"
     queue = HostLoadQueue(env.store)
     monkeypatch.setattr(queue, "_start", AsyncMock())
     monkeypatch.setattr(env.app.state.host_load_inputs, "deliver_session", AsyncMock())
     assert not await queue.release(env.app, held["id"], HOST)
-    env.store.set_session_live_status(official["id"], "idle")
+    env.store.set_session_live_status(primary["id"], "idle")
     assert await queue.release(env.app, held["id"], HOST)
     queue._start.assert_awaited_once()
     now = time.time()
     env.app.state.agent_quota_service.report_account(
         RESERVED_USER_LOCAL,
-        "codex-pro",
+        "pool-primary",
         usage_report(
             account_product="codex",
             observed_at=now,
@@ -839,17 +869,19 @@ async def test_codex_meter_sessions_persist_through_create_queue_and_stop_target
     readings = env.app.state.agent_quota_service.pool_readings(
         QuotaContext(RESERVED_USER_LOCAL, None)
     )
-    for child in (held, krill):
+    for child in (held, secondary):
         env.store.set_runner_id(child["id"], "a" * 32)
         env.store.set_session_live_status(child["id"], "running")
     env.store.touch_runner_liveness(["a" * 32], int(now))
-    krill_session = replace(env.store.get_conversation(krill["id"]), reported_model="gpt-example")
-    assert tile_of_session(krill_session, settings, readings, {}) is None
-    assert stopped_line(env.app, krill_session) is None
+    secondary_session = replace(
+        env.store.get_conversation(secondary["id"]), reported_model="gpt-example"
+    )
+    assert tile_of_session(secondary_session, settings, readings, {}) is None
+    assert stopped_line(env.app, secondary_session) is None
     assert stopped_line(env.app, env.store.get_conversation(held["id"])).state == "stop"
     assert stop_targets(
-        env.app, RESERVED_USER_LOCAL, settings, readings, {}, {"codex-pro"}, now
-    ) == {"codex-pro": (held["id"],)}
+        env.app, RESERVED_USER_LOCAL, settings, readings, {}, {"pool-primary"}, now
+    ) == {"pool-primary": (held["id"],)}
 
 
 @pytest.mark.asyncio
@@ -874,16 +906,16 @@ async def test_plain_codex_model_launches_as_written_and_keeps_its_pool(
     catalogs = HostModelCatalogCacheStore(db_uri)
     catalogs.upsert(HOST, harness, [{"id": "gpt-6.1-sol"}], time.time())
     env.app.state.host_model_catalog_cache_store = catalogs
-    for index, pool in enumerate(("codex-pro", "krill")):
+    for index, pool in enumerate(("pool-primary", "pool-secondary")):
         link = {"agent": env.agents[index]["id"], "model": "gpt-6.1-sol", "meter": pool}
         env.settings["presets"][index]["links"] = [link]
         env.settings["hosts"][HOST]["work"][index][0]["links"] = [link]
     env.settings["limits"] = {
-        "codex-pro": {
+        "pool-primary": {
             "maxRunning": 1,
             "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
         },
-        "krill": {"maxRunning": 1},
+        "pool-secondary": {"maxRunning": 1},
     }
     env.prefs.replace_session_choice(
         RESERVED_USER_LOCAL,
@@ -896,23 +928,23 @@ async def test_plain_codex_model_launches_as_written_and_keeps_its_pool(
     assert child["model_override"] == child["session_choice"]["model"] == "gpt-6.1-sol"
     assert (child["session_choice"]["outcome"], child["session_choice"]["pool"]) == (
         "pick",
-        "codex-pro",
+        "pool-primary",
     )
     record = choice_record(env.store.get_conversation(child["id"]))
-    assert (record["pool"], record["model"]) == ("codex-pro", "gpt-6.1-sol")
+    assert (record["pool"], record["model"]) == ("pool-primary", "gpt-6.1-sol")
     named = await create(
         env, agent_id=env.agents[1]["id"], user_named=True, model_override="gpt-6.1-sol"
     )
     assert named.status_code == 201, named.text
     assert named.json()["model_override"] == named.json()["session_choice"]["model"]
-    assert named.json()["session_choice"]["pool"] == "krill"
+    assert named.json()["session_choice"]["pool"] == "pool-secondary"
 
     settings = parse_session_choice(env.settings)
     conv = env.store.get_conversation(child["id"])
     now = time.time()
     env.app.state.agent_quota_service.report_account(
         RESERVED_USER_LOCAL,
-        "codex-pro",
+        "pool-primary",
         usage_report(
             account_product="codex",
             observed_at=now,
@@ -930,7 +962,7 @@ async def test_plain_codex_model_launches_as_written_and_keeps_its_pool(
     readings = env.app.state.agent_quota_service.pool_readings(
         QuotaContext(RESERVED_USER_LOCAL, None)
     )
-    assert tile_of_session(conv, settings, readings, {}) == "codex-pro"
+    assert tile_of_session(conv, settings, readings, {}) == "pool-primary"
     assert stopped_line(env.app, conv).state == "stop"
 
 
@@ -946,9 +978,9 @@ async def test_catalog_miss_does_not_exclude_configured_model(
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 
     env = choice_env
-    official = "gpt-example"
+    primary = "gpt-example"
     custom = "provider-example/missing-model"
-    for index, model in enumerate((custom, official)):
+    for index, model in enumerate((custom, primary)):
         env.settings["hosts"][HOST]["work"][index][0]["links"][0]["model"] = model
     env.prefs.replace_session_choice(
         RESERVED_USER_LOCAL,
@@ -956,7 +988,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
         env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
     )
     catalogs = HostModelCatalogCacheStore(db_uri)
-    catalogs.upsert(HOST, harness, [{"id": official}], 1)
+    catalogs.upsert(HOST, harness, [{"id": primary}], 1)
     env.app.state.host_model_catalog_cache_store = catalogs
     connection = SimpleNamespace(
         hello=SimpleNamespace(
@@ -968,7 +1000,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
         "omnigent.server.routes._sessions.helpers._resolve_harness_impl", lambda *a, **kw: harness
     )
     available = offered is True
-    rows = [{"id": official}, *([{"id": custom}] if available else [])]
+    rows = [{"id": primary}, *([{"id": custom}] if available else [])]
     lookup = AsyncMock(return_value={"status": "ok", "models": rows})
     if offered == "failed":
         lookup.side_effect = RuntimeError("host disconnected")
@@ -989,7 +1021,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
     if available:
         from fastapi import HTTPException
 
-        catalogs.upsert(HOST, harness, [{"id": official}], 1)
+        catalogs.upsert(HOST, harness, [{"id": primary}], 1)
         lookup.reset_mock()
         with pytest.raises(HTTPException) as denied:
             await context_request(
@@ -1006,7 +1038,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
         legacy = await context_request(
             env.app, RESERVED_USER_LOCAL, HOST, parse_session_choice(env.settings), env.parent
         )
-        assert legacy.models[env.agents[0]["id"]] == frozenset({official})
+        assert legacy.models[env.agents[0]["id"]] == frozenset({primary})
         lookup.assert_not_awaited()
 
 
@@ -1203,14 +1235,18 @@ async def test_provider_quota_failure_blocks_pool_until_reset(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["external_session_status", "external_conversation_item"])
-@pytest.mark.parametrize("official_quota", ["exhausted", "reserve"])
-async def test_codex_reviewer_quota_does_not_close_krill_drain(
-    quota_runner, monkeypatch, event_type, official_quota
+@pytest.mark.parametrize("primary_quota", ["exhausted", "reserve"])
+async def test_codex_reviewer_quota_does_not_close_secondary_drain(
+    quota_runner, monkeypatch, event_type, primary_quota
 ):
     from omnigent.server.session_choice import state_for
     from tests.server.test_agent_quota import usage_report
 
     env = quota_runner
+    env.settings["codexRoutePools"] = {
+        "route-primary": "pool-primary",
+        "route-secondary-alt": "pool-secondary",
+    }
     owner = RESERVED_USER_LOCAL
     reset = datetime.fromisoformat("2026-11-22T03:19:03+00:00").timestamp()
     now = reset - 3600
@@ -1224,19 +1260,25 @@ async def test_codex_reviewer_quota_does_not_close_krill_drain(
         [
             {
                 "links": [
-                    {"agent": agent, "model": "gpt-small", "meter": "codex-pro"},
-                    {"agent": agent, "model": "ccs-krill/gpt-small", "fallbackMode": "drain"},
+                    {"agent": agent, "model": "gpt-small", "meter": "pool-primary"},
+                    {
+                        "agent": agent,
+                        "model": "route-secondary-alt/gpt-small",
+                        "fallbackMode": "drain",
+                    },
                 ]
             }
         ]
     ]
-    env.settings["limits"]["codex-pro"] = {"reserve": {"mode": "total", "window": "7d", "pct": 4}}
+    env.settings["limits"]["pool-primary"] = {
+        "reserve": {"mode": "total", "window": "7d", "pct": 4}
+    }
     env.prefs.replace_session_choice(
         owner, env.settings, env.prefs.session_choice(owner)["revision"]
     )
     state = state_for(env.app)
-    if official_quota == "exhausted":
-        state.exhausted[(owner, "codex-pro")] = reset
+    if primary_quota == "exhausted":
+        state.exhausted[(owner, "pool-primary")] = reset
     else:
         quota = usage_report(
             account_product="codex",
@@ -1245,15 +1287,15 @@ async def test_codex_reviewer_quota_does_not_close_krill_drain(
                 {"id": "7d", "percent_used": 98, "window_minutes": 10080, "resets_at": reset}
             ],
         )
-        env.app.state.agent_quota_service.report_account(owner, "codex-pro", quota, now=now)
+        env.app.state.agent_quota_service.report_account(owner, "pool-primary", quota, now=now)
 
     fallback = await create(env)
     assert fallback.status_code == 201, fallback.text
     child = fallback.json()
-    assert child["session_choice"]["pool"] == "krill"
-    assert child["session_choice"]["skipped"][0]["why"] == official_quota
+    assert child["session_choice"]["pool"] == "pool-secondary"
+    assert child["session_choice"]["skipped"][0]["why"] == primary_quota
     drain = env.prefs.session_choice_snapshot(owner).locks
-    assert [lock.pool for lock in drain.values()] == ["krill"]
+    assert [lock.pool for lock in drain.values()] == ["pool-secondary"]
     exhausted = state.exhausted.copy()
 
     async def report(message, response_id):
@@ -1285,16 +1327,16 @@ async def test_codex_reviewer_quota_does_not_close_krill_drain(
         "2026-11-22T03:19:03+00:00）",
         "reviewer-error",
     )
-    assert (owner, "krill") not in state.exhausted
+    assert (owner, "pool-secondary") not in state.exhausted
     assert state.exhausted == exhausted
     assert env.prefs.session_choice_snapshot(owner).locks == drain
 
     following = await create(env)
     assert following.status_code == 201, following.text
-    assert following.json()["session_choice"]["pool"] == "krill"
+    assert following.json()["session_choice"]["pool"] == "pool-secondary"
 
     await report("Individual quota reached. Resets in 20m", "model-error")
-    assert state.exhausted[(owner, "krill")] == now + 1200
+    assert state.exhausted[(owner, "pool-secondary")] == now + 1200
     assert not env.prefs.session_choice_snapshot(owner).locks
 
 
@@ -1858,7 +1900,14 @@ def occupied(env, *, host=HOST, model="test-model", agent=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pool,route", [("codex-pro", "official"), ("krill", "krill")])
+@pytest.mark.parametrize(
+    "pool,route",
+    [
+        ("pool-primary", "route-primary"),
+        ("pool-secondary", "route-secondary"),
+        (None, "route-other"),
+    ],
+)
 @pytest.mark.parametrize("limit", ["cap", "stop"])
 async def test_scoped_codex_limits_follow_an_explicit_route_pin(
     choice_env, db_uri, monkeypatch, pool, route, limit
@@ -1876,13 +1925,18 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
     env = choice_env
     agent = env.agents[0]["id"]
     model = f"{route}/gpt-example"
+    link = {"agent": agent, "model": model}
+    if pool is None:
+        pool = "pool-standalone"
+        link["meter"] = pool
+    else:
+        env.settings["codexRoutePools"] = {route: pool}
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
         lambda *a, **kw: "codex-native",
     )
     catalogs = HostModelCatalogCacheStore(db_uri)
     env.app.state.host_model_catalog_cache_store = catalogs
-    link = {"agent": agent, "model": model}
     env.settings["presets"][0]["links"] = [link]
     env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
     catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}, {"id": model}], int(time.time()))
@@ -1951,7 +2005,7 @@ async def test_scoped_codex_limits_follow_an_explicit_route_pin(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pool", ["codex-pro", "krill"])
+@pytest.mark.parametrize("pool", ["pool-primary", "pool-secondary"])
 @pytest.mark.parametrize("limit", ["cap", "stop"])
 async def test_scoped_codex_limits_follow_a_plain_launch_model(
     choice_env, db_uri, monkeypatch, pool, limit
@@ -1984,7 +2038,7 @@ async def test_scoped_codex_limits_follow_a_plain_launch_model(
     if limit == "stop":
         rule["reserve"] = {"mode": "total", "window": "7d", "stopPct": 5}
     # A route-pinned scope is an exact ID, not an alias for a plain launch.
-    save_rules(env, [{"id": "pinned", "agent": agent, "model": "official/gpt-example"}, rule])
+    save_rules(env, [{"id": "pinned", "agent": agent, "model": "route-primary/gpt-example"}, rule])
     first_response = await create(env)
     assert first_response.status_code == 201, first_response.text
     first = first_response.json()
@@ -2568,7 +2622,8 @@ async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "route,pool_id", [(None, "pool-0"), ("official", "codex-pro"), ("krill", "krill")]
+    "route,pool_id",
+    [(None, "pool-0"), ("route-primary", "pool-primary"), ("route-secondary", "pool-secondary")],
 )
 @pytest.mark.parametrize("omit_model", [False, True])
 async def test_persisted_period_rule_reaches_create_choice(
@@ -2580,6 +2635,7 @@ async def test_persisted_period_rule_reaches_create_choice(
     env = choice_env
     now = time.time()
     if route:
+        env.settings["codexRoutePools"] = {route: pool_id}
         monkeypatch.setattr(
             "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
             lambda *a, **kw: "codex-native",
