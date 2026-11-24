@@ -877,6 +877,16 @@ def _windows_like_tree(root: Path) -> tuple[Path, Path]:
     return system32, git_usr_bin
 
 
+@pytest.fixture
+def fresh_windows_shell_selection():
+    from omnigent._platform import _windows_os_env_shell_selection
+
+    _windows_os_env_shell_selection.cache_clear()
+    yield
+    _windows_os_env_shell_selection.cache_clear()
+
+
+@pytest.mark.usefixtures("fresh_windows_shell_selection")
 def test_create_os_environment_skips_wsl_launcher_bash_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -921,6 +931,7 @@ def test_create_os_environment_skips_wsl_launcher_bash_on_windows(
     assert shell == git_usr_bin.parent.parent / "bin" / "bash.exe"
 
 
+@pytest.mark.usefixtures("fresh_windows_shell_selection")
 def test_create_os_environment_falls_back_to_comspec_without_posix_shell_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

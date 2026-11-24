@@ -23,6 +23,7 @@ import shutil
 import sys
 from collections.abc import Callable
 from contextlib import suppress
+from functools import cache
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
@@ -289,6 +290,23 @@ def posix_shell_path() -> str | None:
         if git_bash is not None:
             return git_bash
     return _shell_on_path("sh")
+
+
+@cache
+def _windows_os_env_shell_selection() -> tuple[str, bool]:
+    posix = posix_shell_path()
+    if posix is not None:
+        return posix, True
+    return os.environ.get("COMSPEC", "cmd.exe"), False
+
+
+def windows_os_env_shell_path() -> str:
+    """Share the Windows shell selection until its POSIX executable disappears."""
+    shell, posix = _windows_os_env_shell_selection()
+    if posix and not os.path.isfile(shell):
+        _windows_os_env_shell_selection.cache_clear()
+        shell, _ = _windows_os_env_shell_selection()
+    return shell
 
 
 def default_shell_argv(command: str) -> list[str]:

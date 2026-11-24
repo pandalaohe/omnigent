@@ -1565,6 +1565,121 @@ def test_windows_live_data_and_environment(shell, command):
 @pytest.mark.parametrize(
     "command",
     [
+        'start=$(date +%s); sleep 615; echo "OMNIGENT_LONG_TOOL_OK $(( $(date +%s) - start ))s"',
+        "printf '%b' 'ok\\n'",
+        r"printf '\x6fk\n'",
+        'echo "$label" "/rooted text"',
+        "printf '%s' ok | cat",
+        "printf '%s' ok | bash -c 'cat'",
+    ],
+)
+def test_windows_git_bash_expansion_and_data_follow_posix_tiers(command):
+    arguments = {"command": command}
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    for host in (windows_host(shell=r"C:\work\Git\bin\bash.exe"), posix_host(shell="bash")):
+        assert (
+            tuple(
+                decision(tier, "sys_os_shell", arguments, host).action for tier in PERMISSION_TIERS
+            )
+            == expected
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'printf "%s" "$label" > "$target"',
+        'printf "%s" "$label" > "/unbound/report.txt"',
+        'printf "%s" "$label" > "report.txt:stream"',
+        r"""printf "%s" "$label" > '\\?\C:\work\project\report.txt' """,
+        'printf "%s" "$label" > NUL',
+        'echo "$(cat report.txt:stream)"',
+        'echo "$(printf ok > "$target")"',
+    ],
+)
+def test_windows_git_bash_keeps_strict_path_validation(command):
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(tier, "sys_os_shell", {"command": command}, windows_host(shell="bash")).action
+            == Verdict.DENY
+        )
+
+
+def test_windows_git_bash_binds_nested_write_and_keeps_workspace_policy():
+    host = windows_host(shell="bash")
+    output = {"command": 'echo "$(printf ok > C:/Windows/report.txt)"'}
+    assert decision("auto", "sys_os_shell", output, host).rule_id == "protected-path"
+    outside = {"command": 'printf "%s" "$label" > ../outside.txt'}
+    assert decision("accept-edits", "sys_os_shell", outside, host).action == Verdict.ASK
+
+
+def test_windows_git_bash_reassigned_host_variable_cannot_bind_a_path():
+    host = windows_host(
+        shell="bash", environment={"SystemRoot": r"C:\Windows", "TARGET": "local.txt"}
+    )
+    arguments = {"command": 'TARGET=$(printf other.txt); echo "$(cat "$TARGET")"'}
+    result = decision("auto", "sys_os_shell", arguments, host)
+    assert result.action == Verdict.DENY
+    assert "TARGET" in result.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf '%b' 'echo ok\\n' | bash",
+        "printf '%s' 'echo ok' | sh",
+        "printf '%s' 'echo ok' | (echo ready; sh)",
+        "printf '%b' 'echo ok\\n' | bash -c 'bash'",
+        "printf '%s' 'echo ok' | sh -c 'env bash'",
+        "printf '%s' 'echo ok' | env bash",
+        "{ printf '%s' 'echo ok'; } | bash -c 'sh'",
+        "printf '%s' 'echo ok' | { echo ready; bash; }",
+        "printf '%s' 'echo ok' | (\necho ready\nsh\n)",
+        "(bash) < input.sh",
+        "bash < input.sh",
+        "bash -s",
+        "bash <<< 'echo ok'",
+        "bash <<'END'\necho ok\nEND\n",
+    ],
+)
+def test_windows_git_bash_stdin_script_requires_approval(command):
+    host = windows_host(shell="bash")
+    arguments = {"command": command}
+    assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize("command", ["bash script.sh < input.txt", "sh -- script.sh < input.txt"])
+def test_windows_git_bash_script_file_uses_stdin_as_data(command):
+    host = windows_host(shell="bash")
+    arguments = {"command": command}
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.ALLOW
+    assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
+
+
+@pytest.mark.parametrize("shell", ["cmd", "pwsh"])
+@pytest.mark.parametrize("tier", ["auto", "accept-edits"])
+def test_windows_native_shell_keeps_conservative_nested_bash_paths(shell, tier):
+    arguments = {"command": 'bash -c "printf %b ok"'}
+    assert (
+        decision(tier, "sys_os_shell", arguments, windows_host(shell=shell)).action == Verdict.DENY
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["/c/Windows/x", "/c/Users/example/x", "/tmp/x", "~/x", "$HOME/x"]
+)
+def test_windows_git_bash_does_not_guess_msys_write_paths(path):
+    host = windows_host(
+        shell="bash", environment={"SystemRoot": r"C:\Windows", "HOME": r"C:\work\sample"}
+    )
+    arguments = {"command": f"printf ok > {path}"}
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "rg ordinary.txt -e needle",
         "rg ordinary.txt --regexp=needle",
         "rg ordinary.txt -f patterns.txt",

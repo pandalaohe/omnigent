@@ -31,6 +31,7 @@ from omnigent._platform import (
     IS_WINDOWS,
     WINDOWS_ENV_PASSTHROUGH,
     posix_shell_path,
+    windows_os_env_shell_path,
 )
 from omnigent.git_commands import run_git
 from omnigent.runner.identity import (
@@ -1113,6 +1114,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
             "command": command,
             "timeout": resolved_timeout,
         }
+        if IS_WINDOWS:
+            # A persistent helper may have started before the selected shell disappeared.
+            request["shell_path"] = windows_os_env_shell_path()
         if max_output is not None:
             request["max_output"] = max_output
         if env_overrides is not None:
@@ -1195,11 +1199,7 @@ def create_os_environment(
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = posix_shell_path()
-    if shell_path is None:
-        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
-        # keep the historical /bin/sh default.
-        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
+    shell_path = windows_os_env_shell_path() if IS_WINDOWS else posix_shell_path() or "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -1391,6 +1391,9 @@ def _handle_helper_request(
         command = request.get("command")
         if not isinstance(command, str) or not command.strip():
             return {"error": "command must be a non-empty string"}
+        selected_shell = request.get("shell_path", shell_path) if IS_WINDOWS else shell_path
+        if not isinstance(selected_shell, str) or not selected_shell:
+            return {"error": "Invalid shell executable"}
         timeout_raw = request.get("timeout")
         timeout = timeout_raw if isinstance(timeout_raw, int) else DEFAULT_SHELL_TIMEOUT_S
         if timeout < 1:
@@ -1416,7 +1419,7 @@ def _handle_helper_request(
         return _shell_impl(
             command=command,
             timeout=timeout,
-            shell_path=shell_path,
+            shell_path=selected_shell,
             cwd=cwd,
             max_output=max_output,
             env_overrides=env_overrides,
