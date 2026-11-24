@@ -1475,12 +1475,14 @@ class AcpExecutor(Executor):
             picked from the agent's options, or ``None`` to let
             :meth:`_permission_outcome` choose the narrowest grant.
         """
-        tool_name, tool_input = self._extract_tool_call(params)
         bound_call = None
         if self._config.host_permission_tier:
             bound_call = self._bound_permission_call(params)
             if bound_call is None:
                 return False, None
+            tool_name, tool_input = bound_call["name"], bound_call["arguments"]
+        else:
+            tool_name, tool_input = self._extract_tool_call(params)
         policy_eval = getattr(self, "_policy_evaluator", None)
         action: str | None = None
         verdict_data: object = None

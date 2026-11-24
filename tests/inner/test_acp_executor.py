@@ -1053,6 +1053,39 @@ async def test_host_tier_does_not_delegate_filesystem_requests(tier_managed: boo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["DENY", "ASK"])
+async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    arguments = {"CommandLine": "git status"}
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "shell-1",
+            "kind": "execute",
+            "title": "Agent display text",
+            "rawInput": arguments,
+        }
+    )
+
+    async def policy(phase, data):
+        assert phase == "PHASE_TOOL_CALL"
+        if data["name"] == "run_command" and data["arguments"] == arguments:
+            return Mock(action=f"POLICY_ACTION_{action}")
+        return Mock(action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"})
+
+    ex._policy_evaluator = policy
+    params = {
+        "sessionId": "s1",
+        "toolCall": {"toolCallId": "shell-1"},
+        "options": [{"kind": "allow_once", "optionId": "once"}],
+    }
+    assert await ex._decide_permission(params) == (False, None)
+    assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
