@@ -9791,6 +9791,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     )
     # Agent origin rides the multipart create too: the server counts it.
     assert create_requests[0].headers["X-Omnigent-Create-Origin"] == "agent"
+    assert create_requests[0].headers["X-Omnigent-Permission-Tiers"] == "1"
     parts = _parse_multipart_create(create_requests[0])
     attempt = parts["metadata"].pop("labels")["omnigent.create_attempt"]
     assert len(attempt) == 32 and int(attempt, 16) > 0

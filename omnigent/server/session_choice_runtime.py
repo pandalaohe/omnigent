@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.models.model_reference import canonical_model, canonical_pool, canonical_pool_values
 from omnigent.quota_pace import QuotaTiers
 from omnigent.runtime.instruction_layers import agent_key_for_harness
@@ -961,6 +962,7 @@ def _context_request(
     master: dict | None = None,
     project_config: dict | None = None,
     additional_agents: tuple[str, ...] = (),
+    acp_catalog_override: tuple[str, str] | None = None,
 ) -> ChoiceRequest:
     from omnigent.harness_availability import harness_launch_availability
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
@@ -990,11 +992,22 @@ def _context_request(
             unavailable.add(agent_id)
             continue
         probe = Conversation(
-            id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=agent_id
+            id="",
+            created_at=0,
+            updated_at=0,
+            root_conversation_id="",
+            agent_id=agent_id,
+            harness_override=(
+                acp_catalog_override[1]
+                if acp_catalog_override and acp_catalog_override[0] == agent_id
+                else None
+            ),
         )
-        harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
+        harness = _resolve_harness_impl(
+            probe, agent_store=agents, agent_cache=cache, agent=agent, preserve_acp_namespace=True
+        )
         harnesses[agent_id] = harness
-        products[agent_id] = agent_key_for_harness(harness)
+        products[agent_id] = agent_key_for_harness(canonicalize_harness(harness) or harness)
         if agent_id in default_agents:
             default_models[agent_id] = _resolve_llm_model(
                 probe, agent_store=agents, agent_cache=cache
@@ -1361,11 +1374,10 @@ def _explicit_named_link(
         model_override=body.model_override,
         harness_override=body.harness_override,
     )
-    product = agent_key_for_harness(
-        _resolve_harness_impl(
-            probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
-        )
+    harness = _resolve_harness_impl(
+        probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
     )
+    product = agent_key_for_harness(canonicalize_harness(harness) or harness)
     if settings.schema_version == 2:
         request = replace(request, products={**request.products, link.agent_id: product})
     link = resolved_link(link, request)
@@ -1446,6 +1458,8 @@ async def admit_create(
             yield None
             return
         now = time.time()
+        from omnigent.server.permission_tiers import is_acp_permission_harness
+
         request = await context_request(
             app,
             owner,
@@ -1457,6 +1471,11 @@ async def admit_create(
             additional_agents=(body.agent_id,)
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
+            acp_catalog_override=(body.agent_id, body.harness_override)
+            if named
+            and body.model_override is not None
+            and is_acp_permission_harness(body.harness_override)
+            else None,
             pin=pin,
             exclude=tuple(body.exclude),
             differ_from=body.differ_from,

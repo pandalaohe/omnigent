@@ -3195,12 +3195,21 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=True,
         )
-        from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+        from omnigent.server.permission_tiers import (
+            TIER_HARNESSES,
+            agent_originated_create,
+            configured_acp_default_tier,
+            creation_permission_tier,
+            is_acp_permission_harness,
+            require_permission_protocol,
+            source_permission_tier,
+        )
 
         require_permission_protocol(request, harness=spec.executor.harness_kind)
         if (
             parsed_metadata.permission_tier is not None
             and spec.executor.harness_kind not in TIER_HARNESSES
+            and not is_acp_permission_harness(spec.executor.harness_kind)
         ):
             raise OmnigentError(
                 "permission_tier is only supported by Pi and Antigravity sessions",
@@ -3582,34 +3591,22 @@ def register_core_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
         )
         bundle_harness = spec_harness(spec)
-        if bundle_harness in TIER_HARNESSES:
-            assert bundle_harness is not None
-            from omnigent.server.permission_tiers import (
-                agent_originated_create,
-                creation_permission_tier,
-                source_permission_tier,
+        agent_create = agent_originated_create(request.headers)
+        acp_tier_enabled = False
+        default_tier = project_resolution.permission
+        if is_acp_permission_harness(bundle_harness):
+            default_tier = configured_acp_default_tier(
+                getattr(request.app.state, "host_registry", None),
+                parsed_metadata.host_id
+                or (effective_host_id(conversation_store, parent_conv) if parent_conv else None),
+                bundle_harness,
             )
-
-            agent_create = agent_originated_create(request.headers)
-            inherited_tier = None
-            if parent_conv is not None:
-                parent_harness = await asyncio.to_thread(
-                    _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
-                )
-                inherited_tier = source_permission_tier(
-                    parent_harness,
-                    parent_conv.labels or {},
-                    parent_conv.terminal_launch_args or [],
-                    require_ready=agent_create,
-                )
-            tier = creation_permission_tier(
-                harness=bundle_harness,
-                explicit=parsed_metadata.permission_tier,
-                default=project_resolution.permission,
-                inherited=inherited_tier,
-                ceiling=inherited_tier if agent_create else None,
+            acp_tier_enabled = (
+                agent_create
+                or parsed_metadata.permission_tier is not None
+                or default_tier is not None
             )
-            parsed_metadata = parsed_metadata.model_copy(update={"permission_tier": tier})
+            require_permission_protocol(request, harness=bundle_harness, required=acp_tier_enabled)
         if (
             getattr(request.app.state, "startup_admission", None) is not None
             and parsed_metadata.host_id is not None
@@ -3727,12 +3724,39 @@ def register_core_routes(
                                 }
                             )
                 with creation_stage("create_persistence_ms"):
-                    result = await complete_child_write(
-                        asyncio.to_thread(
-                            _create_session_from_bundle,
+
+                    def persist_bundle() -> CreatedSessionResponse:
+                        metadata = parsed_metadata
+                        if bundle_harness in TIER_HARNESSES or acp_tier_enabled:
+                            assert bundle_harness is not None
+                            source = parent_conv
+                            if source is not None and agent_create:
+                                source = conversation_store.get_conversation(source.id)
+                                if source is None:
+                                    raise _session_not_found()
+                            inherited_tier = None
+                            if source is not None:
+                                parent_harness = _resolve_harness(
+                                    source, agent_store=agent_store, agent_cache=agent_cache
+                                )
+                                inherited_tier = source_permission_tier(
+                                    parent_harness,
+                                    source.labels or {},
+                                    source.terminal_launch_args or [],
+                                    require_ready=agent_create,
+                                )
+                            tier = creation_permission_tier(
+                                harness=bundle_harness,
+                                explicit=metadata.permission_tier,
+                                default=default_tier,
+                                inherited=inherited_tier,
+                                ceiling=inherited_tier if agent_create else None,
+                            )
+                            metadata = metadata.model_copy(update={"permission_tier": tier})
+                        return _create_session_from_bundle(
                             conversation_store,
                             artifact_store,
-                            parsed_metadata,
+                            metadata,
                             bundle_bytes,
                             inherited_runner_id,
                             spec,
@@ -3746,7 +3770,8 @@ def register_core_routes(
                             if "project_id" in request_fields_set or explicit_project_label
                             else "inherit",
                         )
-                    )
+
+                    result = await complete_child_write(asyncio.to_thread(persist_bundle))
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 
@@ -6217,13 +6242,14 @@ def register_core_routes(
                 blocked = ConfirmedPermissionState(
                     state.tier, state.revision, "blocked", transaction_id
                 )
-                changed = await asyncio.to_thread(
-                    conversation_store.compare_and_set_label,
-                    session_id,
-                    PERMISSION_STATE_LABEL_KEY,
-                    raw_state,
-                    switching.state_label(),
-                )
+                async with request.app.state.child_cap_locks.hold(session_id):
+                    changed = await asyncio.to_thread(
+                        conversation_store.compare_and_set_label,
+                        session_id,
+                        PERMISSION_STATE_LABEL_KEY,
+                        raw_state,
+                        switching.state_label(),
+                    )
                 if not changed:
                     raise OmnigentError(
                         "Permission tier revision changed",

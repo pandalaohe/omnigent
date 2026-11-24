@@ -1011,6 +1011,38 @@ async def test_catalog_miss_does_not_exclude_configured_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness_override", [None, "acp:alternate"])
+async def test_named_acp_model_uses_the_agent_catalog(choice_env, db_uri, harness_override):
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+
+    env = choice_env
+    agent = await create_test_agent(
+        env.client,
+        name="custom-acp",
+        executor={"type": "omnigent", "config": {"harness": "acp:example"}},
+        include_llm=False,
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, "acp", [{"id": "other-agent-model"}], time.time())
+    catalogs.upsert(
+        HOST, "acp:example", [{"id": "spec-model" if harness_override else "selected-model"}], 1
+    )
+    catalogs.upsert(HOST, "acp:alternate", [{"id": "selected-model"}], 1)
+    env.app.state.host_model_catalog_cache_store = catalogs
+    response = await create(
+        env,
+        agent_id=agent["id"],
+        model_override="selected-model",
+        user_named=True,
+        **({"harness_override": harness_override} if harness_override else {}),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["session_choice"]["model"] == body["model_override"] == "selected-model"
+    assert not body.get("notes") and not body["session_choice"]["warnings"]
+
+
+@pytest.mark.asyncio
 async def test_catalog_miss_preserves_configured_provider_model_with_visible_note(
     choice_env, db_uri, monkeypatch
 ):

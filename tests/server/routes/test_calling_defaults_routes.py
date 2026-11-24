@@ -795,7 +795,10 @@ async def test_acp_session_patch_preserves_literal_values_and_null_reset(
         assert response.json()["reasoning_effort"] == effort
 
 
-async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
+async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+    from omnigent.session_default_modes import ACP_SESSION_MODE_LABEL_KEY
+
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
     stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
     _register_host(app, HOST_A)
@@ -805,9 +808,29 @@ async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
         agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
     )
     request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    stores.cache.upsert(
+        HOST_A,
+        "acp:neutral",
+        [],
+        1,
+        permission_options=[{"value": "plan", "label": "Plan", "concept": "read-only"}],
+    )
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {"*": {"*": {"permission": "read-only"}}}
+    )
     legacy = await client.post("/v1/sessions", json=request)
     assert legacy.status_code == 201, legacy.text
     assert legacy.json()["permission_tier"] is None
+    assert legacy.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "plan"
+
+    delegated = await client.post(
+        "/v1/sessions",
+        json=request,
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert delegated.status_code == 201, delegated.text
+    assert delegated.json()["permission_tier"] == "auto"
+    assert delegated.json()["permission_tier_state"] == "blocked"
 
     connection = app.state.host_registry.get(HOST_A)
     connection.hello.acp_permission_tiers = {"acp:neutral": "auto"}
@@ -823,6 +846,90 @@ async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
     assert explicit.status_code == 201, explicit.text
     assert explicit.json()["permission_tier"] == "accept-edits"
     assert explicit.json()["permission_tier_state"] == "blocked"
+
+
+async def test_delegated_acp_bundle_inherits_the_creator_tier(client, stores, monkeypatch):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, "antigravity-native")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        labels={
+            **ConfirmedPermissionState("plan", 1, "ready").labels("antigravity-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    metadata = {"parent_session_id": parent.id}
+    headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    bundle = {"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")}
+    created = await client.post(
+        "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=bundle, headers=headers
+    )
+    assert created.status_code == 201, created.text
+    snapshot = await client.get(f"/v1/sessions/{created.json()['session_id']}")
+    assert snapshot.json()["permission_tier"] == "plan"
+    assert snapshot.json()["permission_tier_state"] == "blocked"
+
+    denied = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({**metadata, "permission_tier": "auto"})},
+        files=bundle,
+        headers=headers,
+    )
+    assert denied.status_code == 403, denied.text
+
+    original_member_labels = routes_core._member_snapshot_labels
+
+    async def change_source_tier(*args, **kwargs):
+        conversations.set_labels(
+            parent.id, ConfirmedPermissionState("ask", 2, "blocked").labels("antigravity-native")
+        )
+        return await original_member_labels(*args, **kwargs)
+
+    monkeypatch.setattr(routes_core, "_member_snapshot_labels", change_source_tier)
+    stale = await client.post(
+        "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=bundle, headers=headers
+    )
+    assert stale.status_code == 400, stale.text
+    assert "Source runtime permission state is not ready" in stale.text
+
+
+async def test_named_acp_child_uses_its_own_host_tier(client, app, stores):
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+    from tests.server.helpers import create_test_agent
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.acp_permission_tiers = {"acp:neutral": "plan"}
+    agent = await create_test_agent(
+        client,
+        sub_agents=[
+            {
+                "name": "worker",
+                "prompt": "Read the workspace",
+                "executor": {"type": "omnigent", "config": {"harness": "acp:neutral"}},
+            }
+        ],
+    )
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=agent["id"], host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "sub_agent_name": "worker", "parent_session_id": parent.id},
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["permission_tier"] == "plan"
 
 
 @pytest.mark.parametrize("harness", ["acp:neutral", "pi", "pi-native", "antigravity-native"])

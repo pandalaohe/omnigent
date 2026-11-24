@@ -163,7 +163,11 @@ async def resolve_session_model(
         host=conversation.host_id, owner=owner, preferences=preferences, catalogs=catalogs
     )
     harness = await asyncio.to_thread(
-        _resolve_harness_impl, conversation, agent_store=agents, agent_cache=agent_cache
+        _resolve_harness_impl,
+        conversation,
+        agent_store=agents,
+        agent_cache=agent_cache,
+        preserve_acp_namespace=True,
     )
     saved = conversation.model_override or await asyncio.to_thread(
         _resolve_llm_model, conversation, agent_store=agents, agent_cache=agent_cache

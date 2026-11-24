@@ -1217,7 +1217,14 @@ class AcpExecutor(Executor):
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
                 allow, option_id = await self._decide_permission(params)
-                result = self._permission_outcome(params, allow=allow, option_id=option_id)
+                if allow is None or (
+                    self._config.host_permission_tier and self._active_prompt_request_id is None
+                ):
+                    result = {"outcome": {"outcome": "cancelled"}}
+                elif self._config.host_permission_tier and not allow and option_id is None:
+                    raise _AcpRequestError(-32000, "Omnigent did not authorize this tool call.")
+                else:
+                    result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -1432,7 +1439,7 @@ class AcpExecutor(Executor):
         params: _AcpJsonObject,
         *,
         policy_ask: bool = False,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool | None, str | None]:
         """Route a permission request to the user; return ``(allowed, option_id)``.
 
         Prefers the choice bridge, which puts the agent's *own* options on the
@@ -1457,13 +1464,23 @@ class AcpExecutor(Executor):
                 tool_input = {**tool_input, "command": command_line}
         choice_handler = self._elicitation_choice_handler
         labeled = self._scoped_options(params) if choice_handler is not None else None
+        if labeled is None and choice_handler is not None and self._config.host_permission_tier:
+            once_options = self._permission_options(params)
+            if len(once_options) == 2:
+                grant = next(
+                    option for option in once_options if option.get("kind") == "allow_once"
+                )
+                reject = next(option for option in once_options if option is not grant)
+                reject_id = reject.get("optionId")
+                if isinstance(reject_id, str) and reject_id and reject_id != grant.get("optionId"):
+                    labeled = [("Allow once", grant), ("Reject", reject)]
         if choice_handler is not None and labeled is not None:
             allow_once = next((name for name, o in labeled if o.get("kind") == "allow_once"), None)
             chosen = await choice_handler(
                 tool_name, tool_input, [name for name, _ in labeled], allow_once, policy_ask
             )
             if chosen is None:
-                return False, None
+                return (None if self._config.host_permission_tier else False), None
             picked = next((o for name, o in labeled if name == chosen), None)
             if picked is None:
                 logger.warning(
@@ -1488,11 +1505,13 @@ class AcpExecutor(Executor):
         if handler is None:
             return False, None
         allowed = bool(await handler(tool_name, tool_input))
+        if not allowed and self._config.host_permission_tier:
+            return None, None
         return allowed, self._allow_once_id(
             params
         ) if allowed and self._config.host_permission_tier else None
 
-    async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
+    async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool | None, str | None]:
         if not self._config.host_permission_tier:
             return await self._evaluate_permission(params)
         bound_call = self._bound_permission_call(params)
@@ -1511,7 +1530,7 @@ class AcpExecutor(Executor):
 
     async def _evaluate_permission(
         self, params: _AcpJsonObject, bound_call: _AcpJsonObject | None = None
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool | None, str | None]:
         """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
@@ -1529,9 +1548,9 @@ class AcpExecutor(Executor):
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
 
-        :returns: ``(allowed, option_id)`` — *option_id* is the scope the user
-            picked from the agent's options, or ``None`` to let
-            :meth:`_permission_outcome` choose the narrowest grant.
+        :returns: ``(allowed, option_id)``. ``allowed=None`` cancels a managed
+            request without selecting a user rejection. An option id names a
+            specific one-time grant or rejection.
         """
         if bound_call is not None:
             tool_name, tool_input = bound_call["name"], bound_call["arguments"]

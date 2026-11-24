@@ -1084,7 +1084,7 @@ async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> Non
         "toolCall": {"toolCallId": "shell-1"},
         "options": [{"kind": "allow_once", "optionId": "once"}],
     }
-    assert await ex._decide_permission(params) == (False, None)
+    assert await ex._decide_permission(params) == (None if action == "ASK" else False, None)
     assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
 
 
@@ -1152,7 +1152,7 @@ async def test_host_tier_respects_builtin_shell_policies(
     assert verdicts[0]["result"] == action
     if action == "ASK":
         assert command in verdicts[0]["reason"]
-    assert result == (False, None)
+    assert result == (None if action == "ASK" else False, None)
     assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
 
 
@@ -1282,6 +1282,65 @@ async def test_decide_permission_denies_on_policy_deny() -> None:
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,choice,duplicate_labels",
+    [
+        ("DENY", None, False),
+        ("ASK", None, False),
+        ("ASK", "Reject", False),
+        ("ASK", "Reject", True),
+    ],
+)
+async def test_managed_permission_reply_preserves_the_decision_source(
+    policy, choice, duplicate_labels
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._policy_evaluator = AsyncMock(return_value=Mock(action=f"POLICY_ACTION_{policy}"))
+    ex._elicitation_choice_handler = AsyncMock(return_value=choice)
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    ex._send = AsyncMock()
+    ex._note_permission_update(
+        "s1",
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "shell-1",
+            "kind": "execute",
+            "rawInput": {"CommandLine": "git status"},
+        },
+    )
+    options = _agent_options()
+    if duplicate_labels:
+        options[-1]["name"] = options[0]["name"]
+    await ex._respond_to_agent_request(
+        {
+            "id": 2,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "shell-1"},
+                "options": options,
+            },
+        }
+    )
+    ex._policy_evaluator.assert_awaited_once()
+    ex._elicitation_handler.assert_not_awaited()
+    reply = ex._send.await_args.args[0]
+    if policy == "DENY":
+        ex._elicitation_choice_handler.assert_not_awaited()
+        assert "result" not in reply
+        assert reply["error"]["message"] == "Omnigent did not authorize this tool call."
+    else:
+        ex._elicitation_choice_handler.assert_awaited_once()
+        assert reply["result"]["outcome"] == (
+            {"outcome": "selected", "optionId": "reject_once"}
+            if choice
+            else {"outcome": "cancelled"}
+        )
 
 
 @pytest.mark.asyncio

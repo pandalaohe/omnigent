@@ -199,6 +199,7 @@ def _runtime(
     ("tier", "name", "arguments", "expected"),
     [
         ("auto", "run_command", {"CommandLine": "git status"}, Verdict.ALLOW),
+        ("auto", "run_command", {"CommandLine": "omni --version"}, Verdict.ALLOW),
         ("accept-edits", "run_command", {"CommandLine": "git status"}, Verdict.ASK),
         ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
         ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ASK),
@@ -2816,6 +2817,53 @@ async def test_runner_rejects_missing_trusted_init_and_accepts_current_server_in
     state_path = app.state.permission_tiers.state_path(body["session_id"], harness, {})
     assert state_path.is_relative_to(tmp_path)
     assert state_path.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", [None, "auto"])
+async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, tier):
+    from omnigent.onboarding import acp_auth
+    from omnigent.runner import create_runner_app
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+    )
+    from tests.runner.helpers import NullServerClient, permission_session_init_payload
+    from tests.runner.native_helpers import _harness_spec
+
+    entry = acp_auth.AcpAgentEntry(slug="example", name="Example", command="example-acp")
+    monkeypatch.setattr(acp_auth, "resolve_acp_agent", lambda _slug: entry)
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=await _spec_resolver_returning(_harness_spec("acp:example")),
+        server_client=NullServerClient(),
+        runner_workspace=tmp_path,
+    )
+    body = {"session_id": "acp-startup", "agent_id": "test-agent"}
+    if tier is not None:
+        body = permission_session_init_payload(
+            body, harness="acp", snapshot={"workspace": str(tmp_path)}
+        )
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=body)
+        assert response.status_code == 201, response.text
+        expected = "1" if tier else "0"
+        (_, harness, env), *_ = manager.get_client_calls
+        assert harness == "acp"
+        assert env["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
+
+        monkeypatch.setattr("omnigent.runner.app._SESSION_INIT_ENVELOPE_TTL_SECONDS", -1)
+        response = await client.post(
+            f"/v1/sessions/{body['session_id']}/events?stream=true",
+            json={"type": "message", "role": "user", "agent_id": "test-agent", "content": []},
+        )
+        assert response.status_code == 200, response.text
+        assert manager.get_client_calls[-1][2]["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
+    state = app.state.permission_tiers.state(body["session_id"])
+    assert (state.tier if state else None) == tier
 
 
 def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):

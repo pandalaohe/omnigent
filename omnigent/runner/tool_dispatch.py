@@ -7072,13 +7072,21 @@ async def _upload_config_bundle(
         if unsupported is not None:
             return unsupported
 
+    from omnigent.server.permission_tiers import (
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+    )
+
     async def post() -> httpx.Response:
         return await server_client.post(
             "/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
             timeout=_SESSION_CREATE_TIMEOUT,
-            headers=_AGENT_CREATE_HEADERS,
+            headers={
+                **_AGENT_CREATE_HEADERS,
+                PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION,
+            },
         )
 
     try:
