@@ -750,6 +750,37 @@ async def test_expired_acp_model_catalog_refreshes_once_and_preserves_last_succe
     assert row["error"] == "ACP probe timed out"
 
 
+@pytest.mark.parametrize("surface", ["sync", "model-refresh"])
+async def test_empty_acp_refresh_cannot_replace_the_server_catalog(
+    client, app, stores, monkeypatch, surface
+):
+    harness = "acp:neutral"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    previous_modes = [{"value": "default", "label": "Default"}]
+    stores.cache.upsert(HOST_A, harness, previous, 100, permission_options=previous_modes)
+    proxy = AsyncMock(return_value={"status": "ok", "models": [], "injects_prompt": False})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_model_options", proxy)
+
+    if surface == "sync":
+        response = await client.post(
+            "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
+        )
+    else:
+        response = await client.get(
+            f"/v1/hosts/{HOST_A}/harnesses/{harness}/model-options?refresh=force"
+        )
+    assert response.status_code == 200, response.text
+    row = next(row for row in stores.cache.list([HOST_A]) if row["harness"] == harness)
+    assert row["models"] == previous
+    assert row["permission_options"] == previous_modes
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe returned an empty model catalog"
+
+
 async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
 

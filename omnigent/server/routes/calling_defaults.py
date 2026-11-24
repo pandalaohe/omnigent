@@ -35,6 +35,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_model_options import record_host_model_options
 from omnigent.server.routes.hosts import _proxy_model_options
 from omnigent.server.schemas import (
     CallingDefaultsCatalogRow,
@@ -97,28 +98,8 @@ async def _sync_pair(
         except Exception as exc:  # noqa: BLE001 — one pair never fails the sync
             await asyncio.to_thread(catalog_store.mark_error, host_id, harness, str(exc))
             return
-        models = result.get("models")
-        if result.get("status") == "ok" and isinstance(models, list):
-            payload = [row for row in models if isinstance(row, dict)]
-            await asyncio.to_thread(
-                catalog_store.upsert,
-                host_id,
-                harness,
-                payload,
-                now_epoch(),
-                permission_options=result.get("permission_options"),
-                injects_prompt=result.get("injects_prompt"),
-            )
-            return
-        error = result.get("error")
-        if not isinstance(error, str) or not error:
-            error = "host model-options lookup failed"
-        await asyncio.to_thread(
-            catalog_store.mark_error,
-            host_id,
-            harness,
-            error,
-            injects_prompt=result.get("injects_prompt"),
+        await record_host_model_options(
+            catalog_store, host_id, harness, result, fetched_at=now_epoch()
         )
 
 

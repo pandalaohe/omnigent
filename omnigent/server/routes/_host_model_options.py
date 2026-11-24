@@ -15,6 +15,7 @@ from typing import Any
 
 from omnigent.host.frames import HostModelOptionsFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 
 
 async def request_host_model_options(
@@ -49,3 +50,39 @@ async def request_host_model_options(
         return await asyncio.wait_for(future, timeout=timeout_s)
     finally:
         host_conn.pending_model_options.pop(request_id, None)
+
+
+async def record_host_model_options(
+    catalog_store: HostModelCatalogCacheStore,
+    host_id: str,
+    harness: str,
+    result: dict[str, Any],
+    *,
+    fetched_at: int,
+) -> None:
+    """Record a host response while keeping the last good ACP catalog on an empty probe."""
+    models = result.get("models")
+    error = result.get("error")
+    if result.get("status") == "ok" and isinstance(models, list):
+        payload = [row for row in models if isinstance(row, dict)]
+        if payload or not (harness == "acp" or harness.startswith("acp:")):
+            await asyncio.to_thread(
+                catalog_store.upsert,
+                host_id,
+                harness,
+                payload,
+                fetched_at,
+                permission_options=result.get("permission_options"),
+                injects_prompt=result.get("injects_prompt"),
+            )
+            return
+        error = "ACP probe returned an empty model catalog"
+    if not isinstance(error, str) or not error:
+        error = "host model-options lookup failed"
+    await asyncio.to_thread(
+        catalog_store.mark_error,
+        host_id,
+        harness,
+        error,
+        injects_prompt=result.get("injects_prompt"),
+    )

@@ -1670,24 +1670,11 @@ def create_hosts_router(
         )
         catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
         if catalog_store is not None and harness.startswith("acp:"):
-            if result.get("status") == "ok":
-                await asyncio.to_thread(
-                    catalog_store.upsert,
-                    host_id,
-                    harness,
-                    result.get("models", []),
-                    now_epoch(),
-                    permission_options=result.get("permission_options"),
-                    injects_prompt=result.get("injects_prompt"),
-                )
-            else:
-                await asyncio.to_thread(
-                    catalog_store.mark_error,
-                    host_id,
-                    harness,
-                    str(result.get("error") or "host model-options lookup failed"),
-                    injects_prompt=result.get("injects_prompt"),
-                )
+            from omnigent.server.routes._host_model_options import record_host_model_options
+
+            await record_host_model_options(
+                catalog_store, host_id, harness, result, fetched_at=now_epoch()
+            )
         if result.get("status") != "ok":
             raise HTTPException(
                 status_code=502,
