@@ -94,7 +94,10 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
-from omnigent.native.native_terminal_generation import persisted_terminal_revision
+from omnigent.native.native_terminal_generation import (
+    NativeTerminalGeneration,
+    persisted_terminal_generation,
+)
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
@@ -1436,7 +1439,7 @@ class _CodexNativeLaunchConfig:
         reads. A session the forwarder rotated onto carries the original
         session's id here. ``None`` when unlabelled: the bridge is then keyed
         by the session id.
-    :param terminal_revision: Last terminal revision accepted for the runner binding.
+    :param terminal_generation: Last terminal accepted for the runner binding.
     """
 
     workspace: Path
@@ -1456,7 +1459,7 @@ class _CodexNativeLaunchConfig:
     service_tier: str | None = None
     parent_session_id: str | None = None
     bridge_id: str | None = None
-    terminal_revision: int = 0
+    terminal_generation: NativeTerminalGeneration | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2316,7 +2319,7 @@ async def _codex_native_launch_config(
         reasoning_effort=reasoning_effort,
         parent_session_id=parent_session_id,
         bridge_id=bridge_id,
-        terminal_revision=persisted_terminal_revision(
+        terminal_generation=persisted_terminal_generation(
             labels if isinstance(labels, dict) else {},
             runner_id if isinstance(runner_id, str) else None,
         ),
@@ -6681,7 +6684,9 @@ async def _auto_create_codex_terminal(
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
     clear_bridge_state(
-        bridge_dir, session_id=session_id, terminal_revision=launch_config.terminal_revision
+        bridge_dir,
+        session_id=session_id,
+        terminal_generation=launch_config.terminal_generation,
     )
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a

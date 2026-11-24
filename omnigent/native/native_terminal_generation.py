@@ -16,13 +16,15 @@ class NativeTerminalGeneration(BaseModel):
     turn_outcome: str | None
 
 
-def persisted_terminal_revision(labels: Mapping[str, object], runner_id: str | None) -> int:
-    """Recover the last accepted revision from this session's runner binding."""
+def persisted_terminal_generation(
+    labels: Mapping[str, object], runner_id: str | None
+) -> NativeTerminalGeneration | None:
+    """Recover the last accepted terminal from this session's runner binding."""
     raw = labels.get(NATIVE_TERMINAL_GENERATION_LABEL)
     if not isinstance(raw, str):
-        return 0
+        return None
     try:
         previous = NativeTerminalGeneration.model_validate_json(raw)
     except ValidationError:
-        return 0
-    return previous.generation if previous.runner_id == runner_id else 0
+        return None
+    return previous if previous.runner_id == runner_id else None

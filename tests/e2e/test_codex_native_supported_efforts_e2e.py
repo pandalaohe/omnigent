@@ -31,7 +31,7 @@ import pytest
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
-from omnigent.native.native_terminal_generation import persisted_terminal_revision
+from omnigent.native.native_terminal_generation import persisted_terminal_generation
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
@@ -52,7 +52,7 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
     with _session(rig, _STANDARD_MODEL, "medium") as session:
         _assert_turn(rig, session, _STANDARD_MODEL, "medium", terminal=True)
         poll_until(
-            lambda: persisted_terminal_revision(
+            lambda: persisted_terminal_generation(
                 _json(rig.api.get(f"/v1/sessions/{session.id}/labels"))["labels"],
                 rig.stack.runner_id,
             ),

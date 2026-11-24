@@ -54,6 +54,11 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.native.native_terminal_generation import (
+    NATIVE_TERMINAL_GENERATION_LABEL,
+    NativeTerminalGeneration,
+    persisted_terminal_generation,
+)
 from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
 
 
@@ -811,7 +816,19 @@ def test_bridge_relaunch_preserves_only_the_same_sessions_revision(
     assert previous is not None
     write_bridge_state(bridge_dir, replace(previous, active_turn_revision=4))
 
-    clear_bridge_state(bridge_dir, session_id=session_id, terminal_revision=terminal_revision)
+    terminal_generation = (
+        NativeTerminalGeneration(
+            generation=terminal_revision,
+            turn_id="codex_turn_old",
+            runner_id="runner",
+            status="idle",
+            turn_completed=True,
+            turn_outcome=None,
+        )
+        if terminal_revision
+        else None
+    )
+    clear_bridge_state(bridge_dir, session_id=session_id, terminal_generation=terminal_generation)
     clear_bridge_state(bridge_dir)  # A failed launch can clear before publishing.
     assert read_bridge_state(bridge_dir) is None
 
@@ -840,6 +857,85 @@ def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir:
         is None
     )
     assert read_bridge_state(bridge_dir) == current
+
+
+@pytest.mark.parametrize(
+    ("server_status", "local_outcome"),
+    [(None, "failed"), ("failed", "completed"), ("idle", None)],
+)
+def test_cold_restore_does_not_publish_the_same_terminal_as_new(
+    bridge_dir: Path, server_status: str | None, local_outcome: str | None
+) -> None:
+    _seed_active_turn(bridge_dir, "turn_old" if local_outcome else None)
+    seeded = read_bridge_state(bridge_dir)
+    assert seeded is not None
+    write_bridge_state(bridge_dir, replace(seeded, active_turn_revision=3 if local_outcome else 4))
+    if local_outcome is not None:
+        assert clear_active_turn_id_if_matches(
+            bridge_dir, "turn_old", terminal_outcome=local_outcome
+        )
+    previous = read_bridge_state(bridge_dir)
+    assert previous is not None
+
+    labels = {}
+    if server_status is not None:
+        labels[NATIVE_TERMINAL_GENERATION_LABEL] = NativeTerminalGeneration(
+            generation=3,
+            turn_id="codex_turn_old",
+            runner_id="runner",
+            status=server_status,
+            turn_completed=server_status == "idle",
+            turn_outcome=None,
+        ).model_dump_json()
+    clear_bridge_state(
+        bridge_dir,
+        session_id=previous.session_id,
+        terminal_generation=persisted_terminal_generation(labels, "runner"),
+    )
+    clear_bridge_state(bridge_dir)
+    write_bridge_state(
+        bridge_dir,
+        replace(
+            previous,
+            socket_path="ws://127.0.0.1:1234",
+            active_turn_revision=0,
+            last_terminal_turn_id=None,
+            last_terminal_outcome=None,
+        ),
+    )
+
+    restored = read_bridge_state(bridge_dir)
+    assert restored is not None
+    assert (
+        codex_native_bridge.record_resumed_terminal(
+            bridge_dir, restored, ["turn_old"], "completed"
+        )
+        is None
+    )
+    assert read_bridge_state(bridge_dir) == restored
+
+    history = ["turn_old", "turn_new"] if local_outcome else ["turn_new"]
+    new = codex_native_bridge.record_resumed_terminal(bridge_dir, restored, history, "completed")
+    assert new is not None
+    assert new.active_turn_revision == restored.active_turn_revision + 1 == 5
+    assert new.last_terminal_turn_id == "turn_new"
+
+
+def test_cold_restore_without_read_access_to_revision_floor(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_text = Path.read_text
+
+    def read_without_floor(path: Path, *args, **kwargs) -> str:
+        if path.name == codex_native_bridge._CLEARED_TURN_REVISION_FILE:
+            raise PermissionError(errno.EACCES, "revision floor is unreadable")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_without_floor)
+    clear_bridge_state(bridge_dir, session_id="conv_test")
+    _seed_active_turn(bridge_dir, None)
+    restored = read_bridge_state(bridge_dir)
+    assert restored is not None and restored.active_turn_revision == 0
 
 
 @pytest.mark.parametrize(
