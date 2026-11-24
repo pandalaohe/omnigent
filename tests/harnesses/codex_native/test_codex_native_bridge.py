@@ -16,6 +16,7 @@ import pytest
 
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
@@ -60,6 +61,7 @@ from omnigent.native.native_terminal_generation import (
     persisted_terminal_generation,
 )
 from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -863,7 +865,7 @@ def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir:
     ("server_status", "local_outcome"),
     [(None, "failed"), ("failed", "completed"), ("idle", None)],
 )
-def test_cold_restore_does_not_publish_the_same_terminal_as_new(
+async def test_cold_restore_retries_only_the_same_terminal_outcome_at_its_original_revision(
     bridge_dir: Path, server_status: str | None, local_outcome: str | None
 ) -> None:
     _seed_active_turn(bridge_dir, "turn_old" if local_outcome else None)
@@ -906,15 +908,38 @@ def test_cold_restore_does_not_publish_the_same_terminal_as_new(
 
     restored = read_bridge_state(bridge_dir)
     assert restored is not None
+    assert restored.active_turn_revision == 4
+    assert restored.active_turn_id is None
+    assert restored.last_terminal_turn_id is None
+    assert restored.last_terminal_outcome is None
+
+    outcome = "completed" if server_status == "idle" else "failed"
     assert (
-        codex_native_bridge.record_resumed_terminal(
-            bridge_dir, restored, ["turn_old"], "completed"
-        )
+        codex_native_bridge.record_resumed_terminal(bridge_dir, restored, ["turn_old"], outcome)
+        == restored
+    )
+    client = _RecordingClient()
+    await codex_native_forwarder._post_resume_turn_status(
+        client,
+        session_id=restored.session_id,
+        bridge_dir=bridge_dir,
+        thread_id=restored.thread_id,
+        turns=[{"id": "turn_old", "status": outcome}],
+    )
+    [(_, retry)] = client.posts
+    assert retry["data"]["response_id"] == "codex_turn_old"
+    assert retry["data"]["native_turn_generation"] == (3 if server_status else 4)
+    assert retry["data"]["status"] == ("idle" if outcome == "completed" else "failed")
+
+    different = "failed" if outcome == "completed" else "completed"
+    assert (
+        codex_native_bridge.record_resumed_terminal(bridge_dir, restored, ["turn_old"], different)
         is None
     )
     assert read_bridge_state(bridge_dir) == restored
 
-    history = ["turn_old", "turn_new"] if local_outcome else ["turn_new"]
+    # Compaction can drop the old ID even when it was known to the local bridge.
+    history = ["turn_old", "turn_new"] if server_status == "idle" else ["turn_new"]
     new = codex_native_bridge.record_resumed_terminal(bridge_dir, restored, history, "completed")
     assert new is not None
     assert new.active_turn_revision == restored.active_turn_revision + 1 == 5
