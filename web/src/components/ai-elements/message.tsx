@@ -7,8 +7,9 @@ import { copyText } from "@/lib/clipboard";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
+import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import type { UIMessage } from "ai";
-import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, PlayIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -343,6 +344,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   allowGitHubAttachmentImages?: boolean;
   /** Preserve workspace images for a session-aware, authenticated component override. */
   allowWorkspaceImages?: boolean;
+  /** Allow shell drafts in assistant chat when a shell action is available. */
+  allowShellCommands?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
 };
@@ -701,6 +704,16 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   const send = useContext(CodeBlockSendContext);
+  const shellCommands = useContext(ShellCommandContext);
+  const codeProps = isValidElement<{ language?: string; className?: string }>(children)
+    ? children.props
+    : undefined;
+  const language = (
+    codeProps?.language ??
+    /\blanguage-(\S+)/.exec(codeProps?.className ?? "")?.[1] ??
+    ""
+  ).toLowerCase();
+  const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
@@ -725,13 +738,33 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     : children;
 
   const codeBlock = (body: ReactNode) => (
-    <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
+    <div
+      className={cn(
+        "chat-code-block relative",
+        wrap && "chat-code-wrap",
+        showShellAction && "[&_[data-streamdown=code-block-header]]:pr-32",
+      )}
+    >
       {body}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="chat-code-actions absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         {send && <ChatCodeBlockSendButton getCode={getCode} send={send} />}
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+        {showShellAction && (
+          <Button
+            aria-label="Open in a new shell"
+            className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+            disabled={shellCommands.disabled || isStreaming || fenceOpen || !code.trim()}
+            onClick={() => shellCommands.open(code, language)}
+            size="icon-sm"
+            title="Open in a new shell"
+            type="button"
+            variant="ghost"
+          >
+            <PlayIcon aria-hidden="true" />
+          </Button>
+        )}
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>
     </div>
@@ -780,11 +813,23 @@ export const MessageResponse = memo(
     sendCodeBlocks = false,
     allowGitHubAttachmentImages = false,
     allowWorkspaceImages = false,
+    allowShellCommands = false,
     isStreaming = false,
     ...props
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
     const inheritedSend = useContext(CodeBlockSendContext);
+    const shellCommands = useContext(ShellCommandContext);
+    const shellAction = useMemo(
+      () =>
+        allowShellCommands && shellCommands
+          ? {
+              ...shellCommands,
+              disabled: shellCommands.disabled || hasOpenCodeFence(props.children ?? ""),
+            }
+          : null,
+      [allowShellCommands, shellCommands, props.children],
+    );
     const messageComponents = useMemo(
       () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
@@ -801,29 +846,31 @@ export const MessageResponse = memo(
     return (
       <CodeBlockSendContext.Provider value={sendCodeBlocks ? inheritedSend : null}>
         <MarkdownErrorBoundary source={props.children}>
-          <StreamingTextContext.Provider value={isStreaming}>
-            {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+          <ShellCommandContext.Provider value={shellAction}>
+            <StreamingTextContext.Provider value={isStreaming}>
+              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
-            <Streamdown
-              key={themeMode}
-              // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-              className={cn(
-                "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                className,
-              )}
-              plugins={STREAMDOWN_PLUGINS}
-              // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-              // instead of Streamdown's default "Open external link?" modal.
-              linkSafety={CHAT_LINK_SAFETY}
-              {...props}
-              BlockComponent={StreamingTextBlock}
-              components={messageComponents}
-              controls={messageControls}
-              mermaid={mermaidOptions}
-              // Block remote image fetches that can exfiltrate data through URLs.
-              rehypePlugins={rehypePlugins}
-            />
-          </StreamingTextContext.Provider>
+              <Streamdown
+                key={themeMode}
+                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                className={cn(
+                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                  className,
+                )}
+                plugins={STREAMDOWN_PLUGINS}
+                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                // instead of Streamdown's default "Open external link?" modal.
+                linkSafety={CHAT_LINK_SAFETY}
+                {...props}
+                BlockComponent={StreamingTextBlock}
+                components={messageComponents}
+                controls={messageControls}
+                mermaid={mermaidOptions}
+                // Block remote image fetches that can exfiltrate data through URLs.
+                rehypePlugins={rehypePlugins}
+              />
+            </StreamingTextContext.Provider>
+          </ShellCommandContext.Provider>
         </MarkdownErrorBoundary>
       </CodeBlockSendContext.Provider>
     );

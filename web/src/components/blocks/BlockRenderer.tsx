@@ -905,6 +905,7 @@ function renderItem(
             breaks
             className="chat-markdown text-message"
             allowWorkspaceImages
+            allowShellCommands
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             sendCodeBlocks={!isTextStreaming}
             isStreaming={isTextStreaming}

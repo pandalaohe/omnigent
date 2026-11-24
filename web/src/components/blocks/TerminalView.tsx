@@ -9,6 +9,7 @@
 import { Loader2Icon } from "lucide-react";
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -40,6 +41,7 @@ import {
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { canSignInForTerminal, signInForTerminal } from "@/lib/identity";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import {
   isTerminalLaunching,
   resolveInitialAttachUrl,
@@ -247,6 +249,11 @@ export function TerminalView({
     return true;
   }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
+  const commandDrafts = useContext(ShellCommandDraftContext);
+  const draftKey = `${sessionId}:${terminalId}`;
+  const draft = commandDrafts?.drafts[draftKey];
+  const pastedCommandRef = useRef<string | null>(null);
+  const setDraft = commandDrafts?.setDraft;
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
@@ -426,7 +433,21 @@ export function TerminalView({
   activeRef.current = active;
   const focusOnConnectRef = useRef(focusOnConnect);
   focusOnConnectRef.current = focusOnConnect;
-
+  useEffect(() => {
+    if (draft === undefined || !setDraft || !active || readOnly) return;
+    if (state.kind === "closed" || state.kind === "error") {
+      setDraft(draftKey, null);
+      return;
+    }
+    const session = sessionRef.current;
+    if (state.kind !== "connected" || !session || pastedCommandRef.current === draftKey) return;
+    return session.pasteCommand(draft, (error) => {
+      pastedCommandRef.current = draftKey;
+      setDraft(draftKey, null);
+      if (error) toast.error(error);
+      else session.focus();
+    });
+  }, [draft, draftKey, setDraft, active, readOnly, state.kind]);
   // Bumped by every attach so an in-flight attach can tell it has been
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.

@@ -11,10 +11,11 @@ import type * as TerminalsModule from "@/lib/terminals";
 import type * as IdentityModule from "@/lib/identity";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode, act, useMemo, type ReactElement } from "react";
+import { StrictMode, act, useMemo, useState, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
+import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import { toast } from "sonner";
 import { signInForTerminal } from "@/lib/identity";
 import { resolveTerminalKeys, writeTerminalKeyPreferences } from "@/lib/terminalKeys";
@@ -108,6 +109,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     focus: ReturnType<typeof vi.fn>;
     blur: ReturnType<typeof vi.fn>;
     isFocused: ReturnType<typeof vi.fn>;
+    pasteCommand: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -259,6 +261,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     pastesBracketed = vi.fn(() => true);
     paste = vi.fn(() => true);
     readHostClipboard = vi.fn();
+    pasteCommand = vi.fn((_text: string, onResult: (error: string | null) => void) => {
+      onResult(null);
+      return vi.fn();
+    });
 
     constructor(
       container: HTMLDivElement,
@@ -299,6 +305,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         focus: this.focus,
         blur: this.blur,
         isFocused: this.isFocused,
+        pasteCommand: this.pasteCommand,
       });
     }
   },
@@ -1489,6 +1496,96 @@ describe("terminal clipboard", () => {
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
     expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click");
   });
+});
+
+describe("shell command paste", () => {
+  function DraftTerminal({
+    active = true,
+    readOnly = false,
+    terminalId = "terminal_bash_s1",
+  } = {}) {
+    const [drafts, setDrafts] = useState<Record<string, string>>({
+      "conv_abc:terminal_bash_s1": "printf hello\npwd",
+    });
+    const draftContext = useMemo(
+      () => ({
+        drafts,
+        setDraft: (key: string, command: string | null) =>
+          setDrafts((current) => {
+            if (command !== null) return { ...current, [key]: command };
+            const { [key]: _removedDraft, ...remainingDrafts } = current;
+            return remainingDrafts;
+          }),
+      }),
+      [drafts],
+    );
+    return (
+      <ShellCommandDraftContext.Provider value={draftContext}>
+        <TerminalView
+          sessionId="conv_abc"
+          terminalId={terminalId}
+          active={active}
+          readOnly={readOnly}
+        />
+      </ShellCommandDraftContext.Provider>
+    );
+  }
+
+  it("pastes once into the connected shell without adding another editor", async () => {
+    render(<DraftTerminal />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    expect(terminal.focusOnConnect).toBe(true);
+    expect(terminal.pasteCommand).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Run command" })).toBeNull();
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledExactlyOnceWith(
+      "printf hello\npwd",
+      expect.any(Function),
+    );
+    expect(terminal.focus).toHaveBeenCalledOnce();
+    act(() => terminal.onState({ kind: "closed", code: 4405, reason: "detached" }));
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledOnce();
+  });
+
+  it("reports an unsupported paste without retrying on reconnect", async () => {
+    render(<DraftTerminal />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    terminal.pasteCommand.mockImplementation((_text, onResult) => {
+      onResult("This shell does not support multiline paste.");
+      return vi.fn();
+    });
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(await screen.findByText("This shell does not support multiline paste.")).toBeVisible();
+    act(() => terminal.onState({ kind: "closed", code: 4405, reason: "detached" }));
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a paste waiting for shell readiness when the view closes", async () => {
+    const { unmount } = render(<DraftTerminal />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    const cancel = vi.fn();
+    terminal.pasteCommand.mockReturnValue(cancel);
+    act(() => terminal.onState({ kind: "connected" }));
+    unmount();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ active: false }, { readOnly: true }, { terminalId: "terminal_bash_other" }])(
+    "does not paste on an ineligible surface: %j",
+    async (props) => {
+      render(<DraftTerminal {...props} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const terminal = terminalSessionMock.instances[0];
+      act(() => terminal.onState({ kind: "connected" }));
+      expect(terminal.pasteCommand).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("hidden pre-warmed surface", () => {

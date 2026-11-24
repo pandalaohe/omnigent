@@ -259,7 +259,7 @@ import {
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { useHiddenPickerAgents } from "@/hooks/useHiddenPickerAgents";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysUseWorktree, useAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { useAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   type LastSandboxRepo,
   readLastSandboxRepos,
@@ -400,6 +400,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import {
+  matchWorktree,
   useHostWorktrees,
   useVerifiedGitWorktrees,
   type HostWorktree,
@@ -809,15 +810,9 @@ export function composerWorktreeHeaderState({
   branchName,
   autoSeededBranch,
 }: ComposerWorktreeHeaderInput): ComposerWorktreeHeaderState {
-  const normalizedWorkspace = normalizeWorkspacePath(workspace);
   const currentWorktrees = worktreesResolved ? worktrees : [];
   const mainWorktree = currentWorktrees.find((worktree) => worktree.is_main) ?? null;
-  const selectedWorktree =
-    normalizedWorkspace === null
-      ? null
-      : (currentWorktrees.find(
-          (worktree) => normalizeWorkspacePath(worktree.path) === normalizedWorkspace,
-        ) ?? null);
+  const selectedWorktree = matchWorktree(currentWorktrees, workspace);
   const selectedDirectoryLabel =
     workspace.split("/").filter(Boolean).pop() ?? (workspace.trim() || "Working directory");
   const repositoryLabel =
@@ -3617,6 +3612,7 @@ function NewChatLandingContent({
   // sandboxes (no host worktrees).
   const forkFreshArmed =
     configProjectId === null &&
+    !siblingSourceId &&
     prefillSettled &&
     selectedHostId !== null &&
     !sandboxSelected &&
@@ -5872,11 +5868,11 @@ function NewChatLandingContent({
   // The worktree the picked directory currently points at, if any. Set when
   // the user navigated the picker straight into a worktree folder, or clicked
   // one in the list below.
-  const activeWorktree = useMemo(() => {
-    const target = normalizeWorkspacePath(workspaceValue);
-    if (target === null) return null;
-    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
-  }, [linkedWorktrees, workspaceValue]);
+  const currentWorktree = useMemo(
+    () => matchWorktree(verifiedGitWorktrees, workspaceValue),
+    [verifiedGitWorktrees, workspaceValue],
+  );
+  const activeWorktree = currentWorktree?.is_main ? null : currentWorktree;
   // An empty New field means the selected workspace itself is authoritative.
   // A non-empty field is exclusively a request to create a new worktree.
   const startInExistingWorktree =
@@ -5939,9 +5935,8 @@ function NewChatLandingContent({
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
   // away) re-arms the auto-fill, so naming a branch again starts fresh from the
-  // current default. The project's stored default (Project settings) wins, then
-  // the project's code repository default branch (Code settings), then the
-  // user-global one (Settings › Git), then blank (fork from current branch).
+  // Nested agents use the selected checkout's branch. Other sessions use
+  // the project or repository default, then the user-global preference.
   useEffect(() => {
     if (!shouldCreateWorktree) {
       if (worktreeVerificationPending && branchName.trim() !== "") return;
@@ -5952,7 +5947,9 @@ function NewChatLandingContent({
     }
     if (!baseBranchEdited) {
       _setBaseBranch(
-        projectBaseBranch ?? projectCodeDefaultBranch ?? readDefaultBaseBranch() ?? "",
+        siblingSourceId
+          ? (currentWorktree?.branch ?? "")
+          : (projectBaseBranch ?? projectCodeDefaultBranch ?? readDefaultBaseBranch() ?? ""),
       );
     }
   }, [
@@ -5962,6 +5959,8 @@ function NewChatLandingContent({
     baseBranchEdited,
     projectBaseBranch,
     projectCodeDefaultBranch,
+    siblingSourceId,
+    currentWorktree?.branch,
   ]);
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
@@ -6160,12 +6159,15 @@ function NewChatLandingContent({
   }, [cachedPreviewModel]);
 
   const alwaysUseWorktree = useAlwaysUseWorktree();
+  // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
+  const defaultUseWorktree =
+    !siblingSourceId && (prefillConfig?.useWorktree ?? alwaysUseWorktree) === true;
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) !== true) return;
+    if (!defaultUseWorktree) return;
     if (sandboxSelected || selectedHostId === null || workspaceValue === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceValue) return;
@@ -6176,7 +6178,7 @@ function NewChatLandingContent({
     worktreeSeededForRef.current = workspaceValue;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
-    prefillConfig,
+    defaultUseWorktree,
     prefill,
     projectParam,
     sandboxSelected,
@@ -6188,7 +6190,6 @@ function NewChatLandingContent({
     hostWorktreesArePlaceholder,
     workspaceIsGit,
     generateBranchName,
-    alwaysUseWorktree,
   ]);
 
   // Retract our own auto-seeded branch when the effective default is now off
@@ -6196,12 +6197,12 @@ function NewChatLandingContent({
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) === true) return;
+    if (defaultUseWorktree) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch, alwaysUseWorktree]);
+  }, [defaultUseWorktree, branchName, autoSeededBranch]);
 
   // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
@@ -6465,10 +6466,7 @@ function NewChatLandingContent({
   // A drafted branch needs the discovery result unless the repository is
   // already verified; the always-use-worktree default needs it to seed one.
   const worktreeRequestPending =
-    worktreeDiscoveryPending &&
-    (branchName.trim() !== ""
-      ? !workspaceIsGit
-      : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
+    worktreeDiscoveryPending && (branchName.trim() !== "" ? !workspaceIsGit : defaultUseWorktree);
   const worktreeHeader = composerWorktreeHeaderState({
     workspace: workspaceTrimmed,
     worktrees: hostWorktrees ?? [],
@@ -6889,9 +6887,9 @@ function NewChatLandingContent({
     if (hostId === selectedHostId) return;
     setSandboxSelected(false);
     setSelectedHostId(hostId);
-    // Workspace is host-specific — clear it and let the seeding effect run for
-    // the new host.
-    setWorkspace("");
+    // Returning to the source host restores its checkout, not an unrelated recent path.
+    setWorkspace(hostId === siblingSource?.hostId ? (siblingSource.workspace ?? "") : "");
+    if (siblingSourceId) setBranchName("");
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
   }

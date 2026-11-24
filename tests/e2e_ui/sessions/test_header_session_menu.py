@@ -119,6 +119,7 @@ def test_header_session_menu_manages_owner_and_child(
         assert all(
             label in labels
             for label in [
+                "Add nested agent",
                 "Pin",
                 "Fork",
                 "Export",

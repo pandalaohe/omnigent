@@ -620,12 +620,9 @@ class SysSessionListTool(Tool):
             "transcripts via sys_session_get_history or drive via sys_session_send "
             "by session_id. Pass agent_name to filter the global list, and "
             "archived='include' or 'only' to include or select archived sessions. "
-            "include_archived remains an alias for archived='include'. Calls "
-            "without pagination keep "
-            "the complete result while it fits the tool-output budget; "
-            "larger global session lists return a page with has_more "
-            "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
-            "complete."
+            "include_archived remains an alias for archived='include'. The global list "
+            "returns the newest 50 by default. When more remain, pass page.next_cursor "
+            "as cursor. The sub_agents list stays complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -676,8 +673,7 @@ class SysSessionListTool(Tool):
                             "minimum": 1,
                             "maximum": 100,
                             "description": (
-                                "Optional maximum rows returned from 'sessions'. "
-                                "Omit it to keep the complete result while it fits."
+                                "Optional maximum rows returned from 'sessions'. Defaults to 50."
                             ),
                         },
                         "archived": {
