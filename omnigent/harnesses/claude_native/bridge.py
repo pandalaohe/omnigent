@@ -8750,8 +8750,8 @@ def _user_prompt_visible(pane: str) -> bool:
         region = "\n".join(lines[_composer_frame_rule_indices(lines)[-1] + 1 :])
     else:
         region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(" ".join(region.splitlines()[-3:]).split())
+    # Narrow panes can wrap inside the decision footer's words.
+    footer = "".join(" ".join(region.splitlines()[-3:]).split())
     selector = re.search(r"(?m)^[ \t│]*❯[ \t]+\d+[.)][ \t]+", region)
     decision_region = "\n".join(line.strip(" \t│") for line in region.splitlines())
     # Bind the title, options and selection to one list, even without a frame.
@@ -8780,13 +8780,11 @@ def _user_prompt_visible(pane: str) -> bool:
         or (plan_exit is not None and "❯" in plan_exit.group())
         or (permission_card is not None and "\n❯" in permission_card.group())
         or _api_key_consent_visible(decision_region)
-        or (
-            consent_card is not None and "Enter to confirm" in footer and "Esc to cancel" in footer
-        )
+        or (consent_card is not None and "Entertoconfirm" in footer and "Esctocancel" in footer)
         or (
             (bool(rules) or selector is not None)
-            and any(hint in footer for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in footer
+            and any(hint in footer for hint in ("Entertoselect", "Entertosubmit"))
+            and "Esctocancel" in footer
         )
     )
 

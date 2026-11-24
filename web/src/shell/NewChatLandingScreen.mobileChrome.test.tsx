@@ -55,8 +55,10 @@ import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./Mobile
 
 const projectRoute = vi.hoisted(() => ({ search: "" }));
 
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(projectRoute.search), vi.fn()],
 }));
