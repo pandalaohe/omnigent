@@ -2079,6 +2079,82 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_status", "finishes"),
+    [
+        ("running", True),
+        ("running-update", True),
+        ("pending", False),
+        ("finished", False),
+        ("stalled", False),
+    ],
+)
+async def test_prompt_idle_deadline_during_tool_call(
+    monkeypatch: pytest.MonkeyPatch, tool_status: str, finishes: bool
+) -> None:
+    monkeypatch.setattr(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(acp_executor_module, "_RUNNING_TOOL_TIMEOUT_SECONDS", 0.4, raising=False)
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    loop = asyncio.get_running_loop()
+    response_timer: asyncio.TimerHandle | None = None
+
+    def update(kind: str, status: str) -> None:
+        ex._queue.put_nowait(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": kind,
+                        "toolCallId": "shell-1",
+                        "title": "shell",
+                        "status": status,
+                    },
+                },
+            }
+        )
+
+    async def send(message: dict) -> None:
+        nonlocal response_timer
+        assert message["method"] == "session/prompt"
+        update("tool_call", "in_progress" if tool_status == "running" else "pending")
+        if tool_status in {"running-update", "finished", "stalled"}:
+            update("tool_call_update", "in_progress")
+        if tool_status == "finished":
+            update("tool_call_update", "completed")
+        if tool_status == "stalled":
+            return
+
+        def finish() -> None:
+            if tool_status in {"running", "running-update"}:
+                update("tool_call_update", "completed")
+            ex._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+        response_timer = loop.call_later(0.2, finish)
+
+    monkeypatch.setattr(ex, "_send", send)
+    try:
+        async with asyncio.timeout(1):
+            events = [
+                event async for event in ex.run_turn([{"role": "user", "content": "run"}], [], "")
+            ]
+    finally:
+        if response_timer is not None:
+            response_timer.cancel()
+
+    assert isinstance(events[0], ToolCallRequest)
+    if finishes:
+        assert isinstance(events[-2], ToolCallComplete)
+        assert isinstance(events[-1], TurnComplete)
+    else:
+        assert isinstance(events[-1], ExecutorError)
+        assert events[-1].message == "Timeout waiting for ACP response"
+
+
+@pytest.mark.asyncio
 async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) -> None:
     """A model report queued behind ``session/new`` is read before the first switch.
 

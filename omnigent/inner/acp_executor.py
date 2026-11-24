@@ -175,6 +175,7 @@ _CONFIG_OPTION_MODEL = "model"
 _AGENT_METHOD_SET_MODEL = "session/set_model"
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
+_TOOL_STATUS_IN_PROGRESS = "in_progress"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
@@ -190,6 +191,9 @@ except ValueError as exc:
     raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
 if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
     raise ValueError(_PROMPT_TIMEOUT_ERR)
+
+# A running tool can be silent for the harness's normal one-hour idle window.
+_RUNNING_TOOL_TIMEOUT_SECONDS = 3600.0
 
 # Default deadline for each initial ACP handshake / session setup RPC.
 _INIT_TIMEOUT_SECONDS = 180.0
@@ -2668,6 +2672,7 @@ class AcpExecutor(Executor):
 
         opening_settled()
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        running_tool_deadlines: dict[str, float] = {}
         accumulated_text: list[str] = []
         if mode_notice:
             accumulated_text.append(mode_notice)
@@ -2679,11 +2684,6 @@ class AcpExecutor(Executor):
             yield TextChunk(text=notice)
 
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
-                return
-
             # Complete only once the future is resolved AND the queue is drained,
             # so trailing chunks aren't truncated.
             if fut.done() and self._queue.empty():
@@ -2711,6 +2711,12 @@ class AcpExecutor(Executor):
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
+            remaining = max(deadline, max(running_tool_deadlines.values(), default=deadline))
+            remaining -= loop.time()
+            if remaining <= 0:
+                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
+                return
+
             try:
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
@@ -2723,6 +2729,18 @@ class AcpExecutor(Executor):
 
             if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
                 update = params.get("update", {})
+                if params.get("sessionId") == session_id and update.get("sessionUpdate") in (
+                    _UPDATE_TOOL_CALL,
+                    _UPDATE_TOOL_CALL_UPDATE,
+                ):
+                    call_id, status = update.get("toolCallId"), update.get("status")
+                    if isinstance(call_id, str) and call_id:
+                        if status == _TOOL_STATUS_IN_PROGRESS:
+                            running_tool_deadlines.setdefault(
+                                call_id, loop.time() + _RUNNING_TOOL_TIMEOUT_SECONDS
+                            )
+                        elif status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED):
+                            running_tool_deadlines.pop(call_id, None)
                 for event in self._handle_session_update(update):
                     if isinstance(event, TextChunk):
                         accumulated_text.append(event.text)

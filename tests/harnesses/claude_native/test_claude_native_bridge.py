@@ -23761,6 +23761,55 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments", "elapsed", "completes"),
+    [
+        ("sys_os_shell", {"command": "echo done", "timeout": 720}, 600, True),
+        ("sys_os_shell", {"command": "echo done"}, 600, False),
+        ("sys_custom", {"timeout": 720}, 600, False),
+        ("sys_os_shell", {"command": "echo done", "timeout": 12000}, 7300, False),
+    ],
+)
+async def test_relay_preserves_explicit_long_shell_timeout(
+    monkeypatch, name, arguments, elapsed, completes
+):
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    class ElapsedDeadline(ToolCallDeadline):
+        def __init__(self, seconds):
+            super().__init__(seconds)
+            self._started -= elapsed
+
+        def remaining(self):
+            remaining = super().remaining()
+            if remaining > 0:
+                loop.call_soon_threadsafe(release.set)
+            return remaining
+
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", ElapsedDeadline)
+
+    async def executor(_name, _arguments):
+        await release.wait()
+        return {"completed": True}
+
+    result = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        executor,
+        loop,
+        name,
+        arguments,
+    )
+    if completes:
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    else:
+        assert result["isError"]
+        assert "timed out after" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_relay_returns_created_handle_after_inner_startup_budget(monkeypatch):
     from omnigent.runner import tool_dispatch
     from omnigent.runtime.tool_call_deadline import ToolCallDeadline

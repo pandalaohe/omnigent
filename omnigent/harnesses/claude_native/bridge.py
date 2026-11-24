@@ -385,6 +385,9 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
 
 # Active dispatch budget; each call excludes its own bounded approval waits.
 _TOOL_CALL_TIMEOUT_S = 320.0
+# Shell callers can request a longer runtime, within the MCP execution budget.
+_RELAY_SHELL_MAX_TIMEOUT_S = 7200
+_RELAY_SHELL_RESULT_GRACE_S = 30.0
 _TOOL_RELAY_HEARTBEAT_S = 1.0
 _MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "mcp_call_cancel_event", default=None
@@ -11764,7 +11767,14 @@ def _run_relay_tool(
     :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
     :returns: MCP tool-call response.
     """
-    deadline = ToolCallDeadline(_TOOL_CALL_TIMEOUT_S)
+    timeout = _TOOL_CALL_TIMEOUT_S
+    shell_timeout = arguments.get("timeout")
+    if name == "sys_os_shell" and type(shell_timeout) is int and shell_timeout > 0:
+        timeout = max(
+            timeout,
+            min(shell_timeout, _RELAY_SHELL_MAX_TIMEOUT_S) + _RELAY_SHELL_RESULT_GRACE_S,
+        )
+    deadline = ToolCallDeadline(timeout)
 
     async def execute() -> object:
         with bind_tool_call_deadline(deadline):
@@ -11778,7 +11788,7 @@ def _run_relay_tool(
             remaining = deadline.remaining()
             if remaining <= 0:
                 return _mcp_error(
-                    f"Omnigent tool dispatch timed out after {_TOOL_CALL_TIMEOUT_S:g}s "
+                    f"Omnigent tool dispatch timed out after {timeout:g}s "
                     "of active work (approval waiting excluded). Cancellation requested; "
                     "completion is unknown. Check the affected state before retrying."
                 )
