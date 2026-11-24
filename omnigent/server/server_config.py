@@ -36,7 +36,7 @@ import os
 import re
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePath
 from types import MappingProxyType
@@ -250,6 +250,8 @@ class UsageRequestSource:
     base_url: str
     credential_env: str | None = None
     credential_file: str | None = None
+    owners: frozenset[str] = frozenset()
+    account_ids: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None:
@@ -266,11 +268,11 @@ def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None
         return None
     if not isinstance(raw, Mapping):
         raise ValueError("usage.request_source must be a mapping")
-    allowed = {"base_url", "credential_env", "credential_file"}
+    allowed = {"base_url", "owners", "account_ids", "credential_env", "credential_file"}
     if set(raw) - allowed:
         raise ValueError(
-            "usage.request_source accepts only base_url and an optional "
-            "credential_env or credential_file"
+            "usage.request_source accepts only base_url, owners, account_ids, "
+            "and an optional credential_env or credential_file"
         )
     base_url = raw.get("base_url")
     if (
@@ -315,10 +317,34 @@ def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None
         or not PurePath(credential_file).is_absolute()
     ):
         raise ValueError("usage.request_source.credential_file must be an absolute path")
+    owners = raw.get("owners", [])
+    if not isinstance(owners, list) or any(
+        not isinstance(owner, str)
+        or not owner
+        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in owner)
+        for owner in owners
+    ):
+        raise ValueError("usage.request_source.owners must be a list of nonempty owner IDs")
+    raw_account_ids = raw.get("account_ids", {})
+    if not isinstance(raw_account_ids, Mapping):
+        raise ValueError("usage.request_source.account_ids must be a mapping by owner ID")
+    account_ids: dict[str, frozenset[str]] = {}
+    for owner, ids in raw_account_ids.items():
+        if owner not in owners:
+            raise ValueError("usage.request_source.account_ids must name listed owners")
+        if not isinstance(ids, list) or any(
+            not isinstance(account_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", account_id) is None
+            for account_id in ids
+        ):
+            raise ValueError("usage.request_source.account_ids must list report account IDs")
+        account_ids[owner] = frozenset(ids)
     return UsageRequestSource(
         base_url=base_url.rstrip("/"),
         credential_env=credential_env,
         credential_file=credential_file,
+        owners=frozenset(owners),
+        account_ids=account_ids,
     )
 
 

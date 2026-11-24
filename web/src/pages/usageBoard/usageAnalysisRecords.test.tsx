@@ -384,3 +384,48 @@ it("aborts in-flight 逐条 read on collapse, shows 504 timeout with non-duplica
   expect(await within(hoursPanel).findByText("逐条读取没有配置")).toBeVisible();
   expect(within(hoursPanel).queryByRole("button", { name: "逐条" })).toBeNull();
 });
+
+it.each([
+  { state: "expired", text: "Gateway records for this hour have expired.", count: 0 },
+  { state: "partial", text: "Gateway records for this hour are incomplete.", count: 0 },
+  { state: "partial", text: "Gateway records for this hour are incomplete.", count: 1 },
+  { state: "ok", text: "No gateway requests in this hour.", count: 0 },
+  { state: "unbound", text: "No gateway account is linked to this selection.", count: 0 },
+])("shows the $state gateway result with $count rows", async ({ state, text, count }) => {
+  const hour = 1793851200;
+  const day = makeDay("2026-11-05", [makeHour(hour, "11:00 +0000", 500)]);
+  fetchMock.mockImplementation((path: string) => {
+    const url = new URL(path, "https://app.example.test");
+    if (url.pathname.endsWith("/analysis")) {
+      const fixture = usageAnalysisV2Fixture(url.searchParams);
+      return Response.json({ ...fixture, days: [day], requests_configured: true });
+    }
+    if (url.pathname.endsWith("/analysis/hours")) {
+      return Response.json({ hours: day.hours, requests_configured: true });
+    }
+    if (url.pathname.endsWith("/requests")) {
+      if (state === "unbound") {
+        return Response.json({ detail: "no_gateway_binding" }, { status: 404 });
+      }
+      return Response.json({
+        hour,
+        state,
+        rows: makeRequestRows(count),
+        next_cursor: null,
+      });
+    }
+    return Response.json({ accounts: [] });
+  });
+
+  mount("?range=d7");
+  const section = await screen.findByRole("region", { name: "Usage records" });
+  fireEvent.click(within(section).getByRole("button", { name: "Expand 2026-11-05" }));
+  const hoursPanel = await within(section).findByTestId("day-hours-2026-11-05");
+  fireEvent.click(await within(hoursPanel).findByRole("button", { name: "逐条" }));
+  const panel = await within(hoursPanel).findByTestId(`hour-requests-${hour}`);
+  expect(await within(panel).findByText(text)).toBeVisible();
+  expect(within(panel).queryAllByText("OK")).toHaveLength(count);
+  expect(within(panel).queryByText("No gateway requests in this hour.") !== null).toBe(
+    state === "ok",
+  );
+});

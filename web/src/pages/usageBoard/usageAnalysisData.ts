@@ -301,6 +301,7 @@ export interface UsageRequestSection {
 export interface UsageRequestsPage {
   hour: number;
   tz: string;
+  state: "ok" | "expired" | "partial";
   rows: UsageRequestRow[];
   next_cursor: string | null;
   retained_from: number | null;

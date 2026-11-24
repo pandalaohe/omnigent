@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -81,6 +81,7 @@ class UsageRequestSection(BaseModel):
 class UsageRequestsView(BaseModel):
     hour: int
     tz: str = "UTC"
+    state: Literal["ok", "expired", "partial"]
     rows: list[UsageRequestRow] = Field(default_factory=list)
     next_cursor: str | None = None
     retained_from: int | None = None
@@ -172,18 +173,22 @@ class UsageRequestsFilter:
 
 
 def resolve_owner_accounts(
-    service: AgentQuotaService, owner: str, requested: tuple[str, ...], now: float
+    service: AgentQuotaService,
+    owner: str,
+    requested: tuple[str, ...],
+    bound_ids: frozenset[str],
+    now: float,
 ) -> tuple[str, ...]:
     """Resolve the caller's allowed upstream account scope from server state."""
     overview = service.overview(owner, now=now, include_marks=False)
     relations = service.pool_store.read_map(owner) if service.pool_store is not None else {}
     non_usage = {account_id for account_id, rel in relations.items() if rel.channel != "usage"}
     tile_ids = {account.id for account in overview.accounts}
-    reported_ids = {
+    gateway_ids = bound_ids.intersection(
         account.id
         for account in overview.accounts
         if account.kind != "native" and account.id not in non_usage
-    }
+    )
     owned_ids = tile_ids | set(relations)
 
     if requested:
@@ -191,17 +196,17 @@ def resolve_owner_accounts(
             raise UsageRequestsError(403, "Usage account is outside your scope")
         resolved: set[str] = set()
         for account_id in requested:
-            if account_id in reported_ids:
+            if account_id in gateway_ids:
                 resolved.add(account_id)
             for child_id, relation in relations.items():
                 if (
                     relation.channel == "usage"
                     and relation.parent_account_id == account_id
-                    and child_id in reported_ids
+                    and child_id in gateway_ids
                 ):
                     resolved.add(child_id)
         return tuple(sorted(resolved))
-    return tuple(sorted(reported_ids))
+    return tuple(sorted(gateway_ids))
 
 
 def _resolve_auth_header(source: UsageRequestSource) -> dict[str, str]:
@@ -209,10 +214,7 @@ def _resolve_auth_header(source: UsageRequestSource) -> dict[str, str]:
     if source.credential_env is not None:
         token = os.environ.get(source.credential_env, "").strip()
         if not token or "\r" in token or "\n" in token:
-            _logger.warning(
-                "usage.request_source credential_env %s is unset or invalid",
-                source.credential_env,
-            )
+            _logger.warning("usage.request_source credential_env is unset or invalid")
             raise UsageRequestsError(503, "Usage request credential is unavailable")
     elif source.credential_file is not None:
         try:
@@ -341,13 +343,25 @@ def _project_page(payload: Any, filters: UsageRequestsFilter) -> UsageRequestsVi
         next_cursor = raw_cursor
     raw_retained = payload.get("retained_from")
     retained_from = raw_retained if type(raw_retained) is int else None
+    sections = _project_sections(payload.get("sections"))
+    section_states = {section.state for section in (sections or {}).values()}
+    state: Literal["ok", "expired", "partial"] = "ok"
+    if payload.get("state") == "expired" or section_states == {"expired"}:
+        state = "expired"
+    elif payload.get("state") in ("partial", "unavailable") or section_states & {
+        "expired",
+        "partial",
+        "unavailable",
+    }:
+        state = "partial"
     return UsageRequestsView(
         hour=filters.hour,
         tz=filters.tz,
+        state=state,
         rows=rows,
         next_cursor=next_cursor,
         retained_from=retained_from,
-        sections=_project_sections(payload.get("sections")),
+        sections=sections,
     )
 
 
@@ -361,6 +375,11 @@ async def fetch_usage_requests(
     timeout_s: float | None = None,
 ) -> UsageRequestsView:
     """Validate, scope, proxy and project one page of per-request usage rows."""
+    if request_source is None:
+        raise UsageRequestsError(404, "not_configured")
+    if owner not in request_source.owners:
+        raise UsageRequestsError(403, "Usage request records are unavailable for this owner")
+
     effective_timeout = REQUEST_SOURCE_TIMEOUT_S if timeout_s is None else timeout_s
     try:
         filters = UsageRequestsFilter.parse(query, now)
@@ -368,12 +387,15 @@ async def fetch_usage_requests(
         raise UsageRequestsError(422, str(exc)) from None
 
     upstream_accounts = await asyncio.to_thread(
-        resolve_owner_accounts, service, owner, filters.account, now
+        resolve_owner_accounts,
+        service,
+        owner,
+        filters.account,
+        request_source.account_ids.get(owner, frozenset()),
+        now,
     )
-    if request_source is None:
-        raise UsageRequestsError(404, "not_configured")
     if not upstream_accounts:
-        return UsageRequestsView(hour=filters.hour, tz=filters.tz, rows=[], next_cursor=None)
+        raise UsageRequestsError(404, "no_gateway_binding")
 
     headers = {"Accept": "application/json", **_resolve_auth_header(request_source)}
     params: list[tuple[str, str | int | float | bool | None]] = [
@@ -424,7 +446,7 @@ async def fetch_usage_requests(
         return _project_page(body, filters)
     upstream_error = body.get("error") if isinstance(body, Mapping) else None
     if status_code == 404 and upstream_error == "unknown-account":
-        return UsageRequestsView(hour=filters.hour, tz=filters.tz, rows=[], next_cursor=None)
+        raise UsageRequestsError(404, "no_gateway_binding")
     if status_code == 422:
         code = upstream_error if upstream_error in _UPSTREAM_422_ERRORS else "invalid-query"
         raise UsageRequestsError(422, str(code))

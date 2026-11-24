@@ -20835,6 +20835,15 @@
             ],
             "title": "Sections"
           },
+          "state": {
+            "enum": [
+              "ok",
+              "expired",
+              "partial"
+            ],
+            "title": "State",
+            "type": "string"
+          },
           "tz": {
             "default": "UTC",
             "title": "Tz",
@@ -20842,7 +20851,8 @@
           }
         },
         "required": [
-          "hour"
+          "hour",
+          "state"
         ],
         "title": "UsageRequestsView",
         "type": "object"

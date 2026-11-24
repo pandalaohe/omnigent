@@ -511,7 +511,10 @@ function HourRequestsPanel({
   const [attempt, setAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [pageData, setPageData] = useState<UsageRequestsPage | null>(null);
-  const [error, setError] = useState<{ kind: "timeout" | "other"; message: string } | null>(null);
+  const [error, setError] = useState<{
+    kind: "unbound" | "other";
+    message: string;
+  } | null>(null);
 
   const cursor = cursorStack[pageIndex] ?? null;
   const scopeKey = JSON.stringify({
@@ -553,7 +556,15 @@ function HourRequestsPanel({
             return;
           }
           if (err.status === 504) {
-            setError({ kind: "timeout", message: "逐条读取超时" });
+            setError({ kind: "other", message: "逐条读取超时" });
+            setLoading(false);
+            return;
+          }
+          if (err.status === 404 && err.detail === "no_gateway_binding") {
+            setError({
+              kind: "unbound",
+              message: "No gateway account is linked to this selection.",
+            });
             setLoading(false);
             return;
           }
@@ -592,9 +603,18 @@ function HourRequestsPanel({
 
   return (
     <div className="ua-rec-reqs" data-testid={`hour-requests-${hour}`}>
+      {!loading && !error && pageData?.state === "partial" ? (
+        <p className="usage-caption" role="status">
+          Gateway records for this hour are incomplete.
+        </p>
+      ) : null}
       {loading ? (
         <p className="usage-caption" role="status">
           Reading requests…
+        </p>
+      ) : error?.kind === "unbound" ? (
+        <p className="usage-caption" role="status">
+          {error.message}
         </p>
       ) : error ? (
         <div className="ua-rec-req-error" role="alert">
@@ -603,8 +623,14 @@ function HourRequestsPanel({
             重试
           </button>
         </div>
+      ) : pageData?.state === "expired" ? (
+        <p className="usage-caption" role="status">
+          Gateway records for this hour have expired.
+        </p>
       ) : !pageData || pageData.rows.length === 0 ? (
-        <p className="usage-caption">No gateway requests in this hour.</p>
+        pageData?.state === "partial" ? null : (
+          <p className="usage-caption">No gateway requests in this hour.</p>
+        )
       ) : (
         <>
           <div className="ua-rec-req-table" role="table" aria-label="Per-request usage">

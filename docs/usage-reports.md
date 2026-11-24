@@ -53,6 +53,28 @@ entry to revoke. Ordinary authenticated user sessions also work. The old
 
 ## Choose one route
 
+### Gateway request records
+
+To let selected owners read individual gateway requests from Usage Analysis,
+configure the upstream and each owner's report-v2 destination account IDs in
+the server's `config.yaml`.
+
+```yaml
+usage:
+  request_source:
+    base_url: "https://gateway.example.test"
+    owners: ["example-owner"]
+    account_ids:
+      example-owner: ["example-gateway-account"]
+```
+
+`owners` defaults to an empty list. Use the authenticated owner IDs and register
+only the destination IDs that the gateway feed writes for each owner. Omnigent
+intersects these IDs with that owner's stored report accounts before forwarding
+them to the gateway. If the gateway requires an authorization header, set either
+`credential_env` to the environment variable name or `credential_file` to an
+absolute path containing the bearer token.
+
 ### Subscription quota
 
 Claude and Codex plans are read natively on connected hosts. Sign in on the host

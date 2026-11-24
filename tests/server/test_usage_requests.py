@@ -14,8 +14,9 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.requests import HTTPConnection
 
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.agent_quota import create_agent_quota_router
 from omnigent.server.server_config import UsageRequestSource, usage_request_source
 from omnigent.server.usage_requests import UsageRequestsError
@@ -200,18 +201,152 @@ def _sample_rows(count: int = 12) -> list[dict[str, Any]]:
     ]
 
 
-def _make_app(service, request_source: UsageRequestSource | None) -> FastAPI:
+class _TestAuthProvider(AuthProvider):
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        return request.headers.get("x-test-owner")
+
+
+def _make_app(
+    service,
+    request_source: UsageRequestSource | None,
+    auth_provider: AuthProvider | None = None,
+) -> FastAPI:
     app = FastAPI()
     app.include_router(
         create_agent_quota_router(
             service,
-            auth_provider=None,
+            auth_provider=auth_provider,
             host_store=None,
             request_source=request_source,
         ),
         prefix="/v1",
     )
     return app
+
+
+def _bound_source(base_url: str, owner: str = OWNER, **credential: str) -> UsageRequestSource:
+    source = usage_request_source(
+        {
+            "usage": {
+                "request_source": {
+                    "base_url": base_url,
+                    "owners": [owner],
+                    "account_ids": {owner: ["acct-alpha", "not-reported"]},
+                    **credential,
+                }
+            }
+        }
+    )
+    assert source is not None
+    return source
+
+
+@pytest.mark.asyncio
+async def test_requests_owner_allowlist_blocks_colliding_account(service, monkeypatch) -> None:
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
+    report = UsageReportV2(schema_version=2, observed_at=NOW)
+    for owner in ("listed-owner", "other-owner"):
+        service.report_account(owner, "acct-alpha", report, now=NOW)
+    gateway = _FakeGateway(_sample_rows(1))
+    try:
+        source = _bound_source(gateway.base_url, owner="listed-owner")
+        app = _make_app(service, source, _TestAuthProvider())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            request_path = f"/v1/me/usage/requests?hour={HOUR}&account=acct-alpha"
+            allowed = {"x-test-owner": "listed-owner"}
+            denied = {"x-test-owner": "other-owner"}
+            response = await client.get(request_path, headers=allowed)
+            assert response.status_code == 200
+            assert [row["id"] for row in response.json()["rows"]] == ["req-00"]
+            response = await client.get(request_path, headers=denied)
+            assert response.status_code == 403
+            assert (
+                response.json()["detail"] == "Usage request records are unavailable for this owner"
+            )
+            assert len(gateway.requests) == 1
+
+            for path in (
+                "/v1/me/usage/analysis?group=account&range=d7",
+                "/v1/me/usage/analysis/hours?group=account&range=d7&day=2026-11-05",
+            ):
+                for headers, configured in ((allowed, True), (denied, False)):
+                    response = await client.get(path, headers=headers)
+                    assert response.status_code == 200
+                    assert response.json()["requests_configured"] is configured
+    finally:
+        gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_requests_all_only_forwards_bound_accounts(service, monkeypatch) -> None:
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
+    report = UsageReportV2(schema_version=2, observed_at=NOW)
+    for account_id in ("acct-alpha", "local-only"):
+        service.report_account(OWNER, account_id, report, now=NOW)
+    gateway = _FakeGateway(_sample_rows(1))
+    gateway.known_accounts = {"acct-alpha"}
+    try:
+        source = _bound_source(gateway.base_url)
+        app = _make_app(service, source)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            request_path = f"/v1/me/usage/requests?hour={HOUR}"
+            response = await client.get(request_path)
+            assert response.status_code == 200
+            assert [row["id"] for row in response.json()["rows"]] == ["req-00"]
+            assert gateway.requests[-1][1]["account"] == ["acct-alpha"]
+
+            response = await client.get(f"{request_path}&account=local-only")
+            assert response.status_code == 404
+            assert response.json()["detail"] == "no_gateway_binding"
+            assert len(gateway.requests) == 1
+    finally:
+        gateway.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("litellm", "relay", "upstream_state", "state"),
+    [
+        ("expired", "expired", None, "expired"),
+        ("partial", "ok", None, "partial"),
+        ("unavailable", "ok", None, "partial"),
+        ("ok", "ok", "partial", "partial"),
+        ("ok", "ok", None, "ok"),
+    ],
+)
+async def test_requests_reports_gateway_page_state(
+    service, monkeypatch, litellm, relay, upstream_state, state
+) -> None:
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
+    service.report_account(
+        OWNER, "acct-alpha", UsageReportV2(schema_version=2, observed_at=NOW), now=NOW
+    )
+    gateway = _FakeGateway([])
+    gateway.status_override = (
+        200,
+        {
+            "rows": [],
+            "state": upstream_state,
+            "sections": {"litellm": {"state": litellm}, "relay": {"state": relay}},
+        },
+    )
+    try:
+        app = _make_app(service, _bound_source(gateway.base_url))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["state"] == state
+            assert data["sections"]["litellm"]["state"] == litellm
+            assert data["sections"]["relay"]["state"] == relay
+    finally:
+        gateway.close()
 
 
 def test_usage_request_source_config_validation() -> None:
@@ -223,6 +358,9 @@ def test_usage_request_source_config_validation() -> None:
         {"usage": {"request_source": {"base_url": "http://127.0.0.1:18405/"}}}
     )
     assert parsed == UsageRequestSource(base_url="http://127.0.0.1:18405")
+    bound = _bound_source("https://board.example.test")
+    assert bound.owners == {OWNER}
+    assert bound.account_ids == {OWNER: {"acct-alpha", "not-reported"}}
 
     with_env = usage_request_source(
         {
@@ -302,6 +440,25 @@ def test_usage_request_source_config_validation() -> None:
         assert "pass" not in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"owners": "local"},
+        {"owners": [None]},
+        {"owners": [""]},
+        {"owners": [" local"]},
+        {"account_ids": ["acct-alpha"]},
+        {"account_ids": {"other-owner": ["acct-alpha"]}},
+        {"account_ids": {OWNER: "acct-alpha"}},
+        {"account_ids": {OWNER: ["bad/account"]}},
+    ],
+)
+def test_usage_request_source_rejects_invalid_owner_bindings(invalid) -> None:
+    config = {"base_url": "https://board.example.test", "owners": [OWNER], **invalid}
+    with pytest.raises(ValueError, match=r"usage\.request_source\.(owners|account_ids)"):
+        usage_request_source({"usage": {"request_source": config}})
+
+
 @pytest.mark.asyncio
 async def test_requests_unset_returns_404_not_configured_and_flags_analysis(
     service, monkeypatch
@@ -340,7 +497,7 @@ async def test_requests_proxy_paging_scope_cursor_and_no_prompt_text(service, mo
     )
     gateway = _FakeGateway(_sample_rows(12))
     try:
-        source = UsageRequestSource(base_url=gateway.base_url)
+        source = _bound_source(gateway.base_url)
         app = _make_app(service, request_source=source)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -421,7 +578,7 @@ async def test_requests_validation_422_and_hour_bounds(service, monkeypatch) -> 
     )
     gateway = _FakeGateway([])
     try:
-        app = _make_app(service, request_source=UsageRequestSource(base_url=gateway.base_url))
+        app = _make_app(service, request_source=_bound_source(gateway.base_url))
         future_hour = hours_of(NOW) + 3600
         expired_hour = hours_of(NOW - _ACTIVITY_MAX_AGE_S) - 3600
         async with httpx.AsyncClient(
@@ -451,19 +608,22 @@ async def test_requests_validation_422_and_hour_bounds(service, monkeypatch) -> 
 @pytest.mark.asyncio
 async def test_requests_timeout_504_redirects_and_unknown_account(service, monkeypatch) -> None:
     monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
-    monkeypatch.setattr("omnigent.server.usage_requests.REQUEST_SOURCE_TIMEOUT_S", 0.08)
     service.report_account(
         OWNER, "acct-alpha", UsageReportV2(schema_version=2, observed_at=NOW), now=NOW
     )
     gateway = _FakeGateway(_sample_rows(3))
     try:
-        app = _make_app(service, request_source=UsageRequestSource(base_url=gateway.base_url))
+        app = _make_app(service, request_source=_bound_source(gateway.base_url))
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             # Timeout -> 504.
             gateway.delay_s = 0.25
-            timed_out = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
+            with monkeypatch.context() as timeout_patch:
+                timeout_patch.setattr(
+                    "omnigent.server.usage_requests.REQUEST_SOURCE_TIMEOUT_S", 0.08
+                )
+                timed_out = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
             assert timed_out.status_code == 504
             assert timed_out.json()["detail"] == "request_source_timeout"
 
@@ -474,19 +634,20 @@ async def test_requests_timeout_504_redirects_and_unknown_account(service, monke
             assert redirected.status_code == 502
             assert "other.example.test" not in redirected.text
 
-            # Gateway 404 unknown-account -> 200 empty rows (not 404 not_configured).
+            # A destination that the gateway no longer recognizes has no binding.
             gateway.redirect_to = None
             gateway.known_accounts = {"some-other-gateway-account"}
             unknown = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
-            assert unknown.status_code == 200
-            assert unknown.json()["rows"] == []
-            assert unknown.json()["next_cursor"] is None
+            assert unknown.status_code == 404
+            assert unknown.json()["detail"] == "no_gateway_binding"
     finally:
         gateway.close()
 
 
 @pytest.mark.asyncio
-async def test_requests_credential_refs_and_fail_closed(service, monkeypatch, tmp_path) -> None:
+async def test_requests_credential_refs_and_fail_closed(
+    service, monkeypatch, tmp_path, caplog
+) -> None:
     monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
     service.report_account(
         OWNER, "acct-alpha", UsageReportV2(schema_version=2, observed_at=NOW), now=NOW
@@ -498,10 +659,7 @@ async def test_requests_credential_refs_and_fail_closed(service, monkeypatch, tm
         monkeypatch.setenv(env_name, "fake-test-bearer-value")
         app_env = _make_app(
             service,
-            request_source=UsageRequestSource(
-                base_url=gateway.base_url,
-                credential_env=env_name,
-            ),
+            request_source=_bound_source(gateway.base_url, credential_env=env_name),
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app_env), base_url="http://test"
@@ -514,16 +672,15 @@ async def test_requests_credential_refs_and_fail_closed(service, monkeypatch, tm
             monkeypatch.delenv(env_name)
             missing = await client.get(f"/v1/me/usage/requests?hour={HOUR}")
             assert missing.status_code == 503
+            assert "credential_env is unset or invalid" in caplog.text
+            assert env_name not in caplog.text
 
         # File credential ref.
         cred_file = tmp_path / "request-cred"
         cred_file.write_text("fake-file-bearer-value\n", encoding="utf-8")
         app_file = _make_app(
             service,
-            request_source=UsageRequestSource(
-                base_url=gateway.base_url,
-                credential_file=str(cred_file),
-            ),
+            request_source=_bound_source(gateway.base_url, credential_file=str(cred_file)),
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app_file), base_url="http://test"
