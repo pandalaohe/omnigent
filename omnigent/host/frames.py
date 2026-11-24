@@ -128,6 +128,7 @@ CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
 CAP_WORKTREE_ARCHIVE_CONTENT = "worktree_archive_content_v1"
 CAP_TERMINAL_ELEVATED = "terminal_elevated_v1"
 CAP_CACHED_MODEL_OPTIONS = "cached_model_options_v1"
+CAP_AGY_ACP_PERMISSIONS_PREFIX = "agy_acp_permissions:"
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CACHED_MODEL_OPTIONS,

@@ -6645,18 +6645,28 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+        from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
         from omnigent.host.restart import supervisor_kind
         from omnigent.onboarding.acp_auth import acp_agents
 
         supervisor = await asyncio.to_thread(supervisor_kind)
         try:
-            acp_permission_tiers = {
-                f"acp:{entry.slug}": entry.permission_tier
-                for entry in await asyncio.to_thread(acp_agents)
-                if entry.permission_tier is not None
-            }
+            acp_entries = await asyncio.to_thread(acp_agents)
         except (OSError, ValueError, TypeError):
-            acp_permission_tiers = {}
+            acp_entries = []
+        acp_permission_tiers = {
+            f"acp:{entry.slug}": entry.permission_tier
+            for entry in acp_entries
+            if entry.permission_tier is not None
+        }
+        agy_acp_harnesses = {
+            f"acp:{entry.slug}"
+            for entry in acp_entries
+            if is_antigravity_acp_command(entry.command)
+        }
+        if acp_entries and f"acp:{acp_entries[0].slug}" in agy_acp_harnesses:
+            agy_acp_harnesses.add("acp")
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -6676,6 +6686,10 @@ class HostProcess:
             project_code=True,
             capabilities=[
                 *self._terminal_capabilities(),
+                *(
+                    CAP_AGY_ACP_PERMISSIONS_PREFIX + harness
+                    for harness in sorted(agy_acp_harnesses)
+                ),
                 *(["host_restart"] if supervisor else []),
                 *(
                     [CAP_HOST_TERMINALS, CAP_HOST_TERMINAL_LINKS]

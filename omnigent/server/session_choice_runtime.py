@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.models.model_reference import canonical_model, canonical_pool, canonical_pool_values
 from omnigent.quota_pace import QuotaTiers
 from omnigent.runtime.instruction_layers import agent_key_for_harness
@@ -994,7 +995,10 @@ async def context_request(
         probe = Conversation(
             id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
         )
-        harness = await asyncio.to_thread(
+        override = options.get("catalog_harness_override")
+        if options.get("catalog_override_agent") not in (None, link.agent_id):
+            override = None
+        harness = override or await asyncio.to_thread(
             _resolve_harness_impl,
             probe,
             agent_store=app.state.agent_store,
@@ -1050,6 +1054,8 @@ def _context_request(
     master: dict | None = None,
     project_config: dict | None = None,
     additional_agents: tuple[str, ...] = (),
+    catalog_harness_override: str | None = None,
+    catalog_override_agent: str | None = None,
 ) -> ChoiceRequest:
     from omnigent.harness_availability import harness_launch_availability
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
@@ -1081,9 +1087,11 @@ def _context_request(
         probe = Conversation(
             id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=agent_id
         )
-        harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
+        harness = _resolve_harness_impl(
+            probe, agent_store=agents, agent_cache=cache, agent=agent, preserve_acp_namespace=True
+        )
         harnesses[agent_id] = harness
-        products[agent_id] = agent_key_for_harness(harness)
+        products[agent_id] = agent_key_for_harness(canonicalize_harness(harness) or harness)
         if agent_id in default_agents:
             default_models[agent_id] = _resolve_llm_model(
                 probe, agent_store=agents, agent_cache=cache
@@ -1097,9 +1105,15 @@ def _context_request(
         for harness, row in records.items()
         if usable_catalog(row) is not None
     }
+    catalog_harnesses = {
+        agent: catalog_harness_override
+        if catalog_harness_override and catalog_override_agent in (None, agent)
+        else harness
+        for agent, harness in harnesses.items()
+    }
     models = {
         agent: ids
-        for agent, harness in harnesses.items()
+        for agent, harness in catalog_harnesses.items()
         if (ids := usable_catalog(records.get(harness or ""))) is not None
     }
     groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
@@ -1121,7 +1135,7 @@ def _context_request(
             )
             defaults = [
                 entry.get("id") or entry.get("model")
-                for entry in catalog.get(harness, ())
+                for entry in catalog.get(catalog_harnesses[agent], ())
                 if entry.get("isDefault") is True and (entry.get("id") or entry.get("model"))
             ]
             effective_models[agent] = (
@@ -1533,6 +1547,13 @@ async def admit_create(
             yield None
             return
         now = time.time()
+        from omnigent.server.permission_tiers import is_acp_permission_harness
+
+        catalog_harness = body.harness_override
+        if catalog_harness == "auto":
+            catalog_harness = None
+        if catalog_harness and not is_acp_permission_harness(catalog_harness):
+            catalog_harness = canonicalize_harness(catalog_harness) or catalog_harness
         request = await context_request(
             app,
             owner,
@@ -1544,6 +1565,8 @@ async def admit_create(
             additional_agents=(body.agent_id,)
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
+            catalog_harness_override=catalog_harness,
+            catalog_override_agent=body.agent_id if named else None,
             pin=pin,
             exclude=tuple(body.exclude),
             differ_from=body.differ_from,

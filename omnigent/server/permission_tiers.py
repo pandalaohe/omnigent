@@ -6,18 +6,23 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.permission_tiers import (
     AGY_PERMISSION_TIER_LABEL_KEY,
     DEFAULT_PERMISSION_TIER,
+    NON_FULL_TIERS,
     PI_PERMISSION_TIER_LABEL_KEY,
     PermissionTier,
     normalize_permission_tier,
 )
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+if TYPE_CHECKING:
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.spec.types import AgentSpec
 
 PERMISSION_STATE_LABEL_KEY = "omnigent.permission_tier.state"
 PERMISSION_MIGRATION_LABEL_KEY = "omnigent.permission_tier.migrated_from"
@@ -45,6 +50,39 @@ PERMISSION_LABEL_KEYS = frozenset(
 
 def is_acp_permission_harness(harness: str | None) -> bool:
     return harness is not None and (harness == "acp" or harness.startswith("acp:"))
+
+
+def configured_acp_default_tier(
+    registry: HostRegistry | None, host_id: str | None, harness: str | None
+) -> str | None:
+    if registry is None or not host_id or not is_acp_permission_harness(harness):
+        return None
+    connection = registry.get(host_id)
+    if connection is None:
+        return None
+    tiers = getattr(connection.hello, "acp_permission_tiers", None) or {}
+    tier = tiers.get(harness)
+    return tier if tier in NON_FULL_TIERS else None
+
+
+def supports_delegated_acp_tier(
+    registry: HostRegistry | None, host_id: str | None, harness: str | None, spec: AgentSpec | None
+) -> bool:
+    """Default to managed tiers only for ACP launches with a known tool schema."""
+    from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+
+    config = spec.executor.config if spec is not None else {}
+    if "acp_agent" in config:
+        embedded = config["acp_agent"]
+        command = embedded.get("command") if isinstance(embedded, dict) else None
+        return isinstance(command, str) and is_antigravity_acp_command(command)
+    if registry is None or not host_id or harness is None:
+        return False
+    connection = registry.get(host_id)
+    return connection is not None and (
+        CAP_AGY_ACP_PERMISSIONS_PREFIX + harness in connection.hello.capabilities
+    )
 
 
 def permission_tier_active(harness: str | None, labels: Mapping[str, str]) -> bool:

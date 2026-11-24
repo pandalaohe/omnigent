@@ -4849,6 +4849,13 @@ def create_runner_app(
                 },
             )
 
+        if is_acp_permission_harness(harness_name):
+            spawn_env = {
+                **(spawn_env or {}),
+                "HARNESS_ACP_HOST_PERMISSION_TIER": (
+                    "1" if permission_tier_active(harness_name, init_context.labels or {}) else "0"
+                ),
+            }
         try:
             init_harness_client = await process_manager.get_client(
                 session_id,
@@ -10947,15 +10954,18 @@ def create_runner_app(
 
         if harness_name is not None:
             await prepare_capture(server_client, conv_id, harness_name)
-        managed_tier = permission_tier_active(harness_name, startup_labels or {})
+        acp_harness = is_acp_permission_harness(harness_name)
+        managed_tier = permission_tier_active(harness_name, startup_labels or {}) or (
+            acp_harness and permission_tiers.observation_harness(conv_id) == harness_name
+        )
         if managed_tier:
             permission_state = permission_tiers.state(conv_id)
             if permission_state is None or permission_state.status != "ready":
                 init_error = await _wait_for_permission_initialization(conv_id)
                 if init_error is not None:
                     return init_error
-        acp_host_tier = managed_tier and is_acp_permission_harness(harness_name)
-        if is_acp_permission_harness(harness_name):
+        acp_host_tier = managed_tier and acp_harness
+        if acp_harness:
             spawn_env = {
                 **(spawn_env or {}),
                 "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier else "0",
