@@ -88,6 +88,8 @@ def quota_reset_at(message: str, now: float) -> float | None:
 
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 Identifier = Annotated[StrictStr, Field(min_length=1, max_length=32)]
+RoutePrefix = Annotated[StrictStr, Field(pattern=r"^[^/\s]+$")]
+PoolName = Annotated[StrictStr, Field(min_length=1)]
 
 
 class ChoiceRevisionConflict(ValueError):
@@ -100,6 +102,8 @@ class _DocumentModel(BaseModel):
 
 class Link(_DocumentModel):
     _model_resolution: ModelResolution | None = PrivateAttr(default=None)
+    _bound_pool: str | None = PrivateAttr(default=None)
+    _bound_routes: tuple[str, ...] = PrivateAttr(default=())
     agent_id: Annotated[StrictStr, Field(alias="agent", min_length=1)]
     model: StrictStr | None = None
     effort: StrictStr | None = None
@@ -352,6 +356,7 @@ class SessionChoice(_DocumentModel):
     hosts: dict[str, dict[str, tuple[tuple[Row, ...], ...]]] = Field(default_factory=dict)
     ability_order: tuple[tuple[Identifier, ...], ...] = ()
     external_admission: tuple[ExternalAdmission, ...] = ()
+    codex_route_pools: dict[RoutePrefix, PoolName] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def legacy_shape(
@@ -360,6 +365,8 @@ class SessionChoice(_DocumentModel):
         result = handler(self)
         if not self.external_admission and "external_admission" not in self.model_fields_set:
             result.pop("externalAdmission" if info.by_alias else "external_admission", None)
+        if not self.codex_route_pools and "codex_route_pools" not in self.model_fields_set:
+            result.pop("codexRoutePools" if info.by_alias else "codex_route_pools", None)
         if self.schema_version == 1:
             result.pop("limitRules" if info.by_alias else "limit_rules", None)
             if "schema_version" not in self.model_fields_set:
@@ -571,18 +578,38 @@ def model_family(text: str) -> str:
     return text
 
 
-def codex_route_pool(model: str | None, product: str | None) -> str | None:
+def codex_route_pool(
+    settings: SessionChoice,
+    model: str | None,
+    product: str | None,
+    groups: ProviderGroups | None = None,
+) -> str | None:
     if product != "codex" or not isinstance(model, str):
         return None
     route, separator, name = model.partition("/")
     if not separator or not name:
         return None
-    return {"official": "codex-pro", "krill": "krill", "ccs-krill": "krill"}.get(route)
+    pool = settings.codex_route_pools.get(route)
+    return canonical_pool(pool, groups or {}) if pool is not None else None
 
 
-def pool_of(link: Link, product: str | None, groups: ProviderGroups | None = None) -> str:
+def is_mapped_codex_pool(
+    settings: SessionChoice, pool: str | None, groups: ProviderGroups
+) -> bool:
+    if pool is None:
+        return False
+    canonical = canonical_pool(pool, groups)
+    return any(
+        canonical_pool(value, groups) == canonical for value in settings.codex_route_pools.values()
+    )
+
+
+def pool_of(
+    settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups | None = None
+) -> str:
     return (
-        codex_route_pool(link.model, product)
+        (canonical_pool(link._bound_pool, groups or {}) if link._bound_pool else None)
+        or codex_route_pool(settings, link.model, product, groups)
         or (canonical_pool(link.meter, groups or {}) if link.meter else None)
         or f"{product or link.agent_id}:{canonical_model(link.model or '', groups or {})}"
     )
@@ -591,9 +618,9 @@ def pool_of(link: Link, product: str | None, groups: ProviderGroups | None = Non
 def pool_limits(
     settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups
 ) -> TileLimits:
-    pool = pool_of(link, product, groups)
+    pool = pool_of(settings, link, product, groups)
     saved = link._model_resolution.saved if link._model_resolution else link.model
-    raw_pool = pool_of(link.model_copy(update={"model": saved}), product)
+    raw_pool = pool_of(settings, link.model_copy(update={"model": saved}), product)
     return canonical_pool_values(settings.limits, groups, preferred=raw_pool).get(
         pool, TileLimits()
     )
@@ -619,13 +646,17 @@ def pool_of_session(
     groups: ProviderGroups | None = None,
 ) -> str | None:
     """A Codex route pin wins over meters; unpinned sessions keep their saved pool."""
-    record = None
-    raw = session.labels.get(CHOICE_LABEL)
-    if raw:
-        try:
-            record = json.loads(raw)
-        except ValueError:
-            record = None
+    from omnigent.server.json_labels import decode_json_labels
+
+    record = decode_json_labels(session.labels, CHOICE_LABEL)
+    saved_pool = record.get("pool") if isinstance(record, dict) else None
+    saved_model = record.get("model") if isinstance(record, dict) else None
+    if (
+        isinstance(saved_pool, str)
+        and session.labels.get(SLOT_LABEL, "").startswith(("queued@", "admitted@", "releasing@"))
+        and (session.model_override is None or session.model_override == saved_model)
+    ):
+        return canonical_pool(saved_pool, groups or {})
     if product is None:
         from omnigent.runtime.instruction_layers import agent_key_for_harness
         from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
@@ -633,15 +664,15 @@ def pool_of_session(
         product = agent_key_for_harness(_resolve_harness_impl(session))
     for pinned in (
         session.model_override,
-        record.get("model") if isinstance(record, dict) else None,
+        saved_model,
         model,
         session.reported_model,
     ):
-        pool = codex_route_pool(pinned, product)
+        pool = codex_route_pool(settings, pinned, product, groups)
         if pool is not None:
             return pool
-    if isinstance(record, dict) and isinstance(record.get("pool"), str):
-        return canonical_pool(record["pool"], groups or {})
+    if isinstance(saved_pool, str):
+        return canonical_pool(saved_pool, groups or {})
     model = model if model is not None else session.reported_model or session.model_override
     if product is None:
         return None
@@ -660,8 +691,8 @@ def pool_of_session(
     # Several agents can share one plain model, so the session's own link decides the pool.
     own = next((link for link in matches if link.agent_id == session.agent_id), None)
     if own is not None:
-        return pool_of(own, product, groups)
-    return pool_of(matches[0], product, groups) if matches else None
+        return pool_of(settings, own, product, groups)
+    return pool_of(settings, matches[0], product, groups) if matches else None
 
 
 def reserve_now(mode: str, pct: float, resets_at: float, now: float) -> float:
@@ -846,6 +877,7 @@ class RunningIdentity:
     model: str | None
     owner_known: bool = True
     pool: str | None = None
+    product: str | None = None
 
 
 @dataclass(frozen=True)
@@ -927,19 +959,21 @@ def rule_limits(
 def candidate_lines(settings, link, request, readings, floor_off, now):
     """Legacy pool constraints remain independent of resolved rule overrides."""
     link = _candidate_link(settings, link, request)
+    product = request.products.get(link.agent_id, link.agent_id)
     if isinstance(readings, EffectiveQuotaReadings):
-        readings = readings.for_route(provider_route(request.host, link.agent_id, link.model))
-    pool = pool_of(
-        link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
-    )
-    limits = [
-        pool_limits(
-            settings,
-            link,
-            request.products.get(link.agent_id, link.agent_id),
-            request.provider_groups,
+        routes = link._bound_routes or (
+            provider_route(
+                request.host,
+                link.agent_id,
+                link.model,
+                route_pools=settings.codex_route_pools,
+                product=product,
+                groups=request.provider_groups,
+            ),
         )
-    ]
+        readings = readings.for_routes(routes)
+    pool = pool_of(settings, link, product, request.provider_groups)
+    limits = [pool_limits(settings, link, product, request.provider_groups)]
     if settings.schema_version == 2:
         limits.append(
             rule_limits(
@@ -989,10 +1023,12 @@ def check_candidate_limits(
     if user_named:
         return None
     product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(link, product, request.provider_groups)
+    pool = pool_of(settings, link, product, request.provider_groups)
     legacy = pool_limits(settings, link, product, request.provider_groups)
     cap = legacy.max_running if link.meter else link.max_running
-    if codex_route_pool(link.model, product) and legacy.max_running is not None:
+    if (
+        link._bound_pool is not None or codex_route_pool(settings, link.model, product)
+    ) and legacy.max_running is not None:
         cap = legacy.max_running
     if cap is not None:
         if isinstance(running, RunningSnapshot) and (
@@ -1058,10 +1094,10 @@ def _quota_failure(
 
 def _candidate_link(settings: SessionChoice, link: Link, request: ChoiceRequest) -> Link:
     """One offered link as the selector scores it: route pins first, then schema-2 defaults."""
-    link = resolved_link(link, request)
+    link = resolved_link(settings, link, request)
     if settings.schema_version == 2 and link.model is None:
         link = link.model_copy(update={"model": request.effective_models.get(link.agent_id)})
-    return resolved_link(link, request)
+    return resolved_link(settings, link, request)
 
 
 def _effective_model(settings: SessionChoice, link: Link, request: ChoiceRequest) -> str | None:
@@ -1121,11 +1157,19 @@ def candidate_quota(
     return agent_quota(windows, request.quota_tiers, now)
 
 
-def resolved_link(link: Link, request: ChoiceRequest) -> Link:
-    if (
+def needs_route_model(
+    settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups
+) -> bool:
+    return (
         link.model is None
-        and request.products.get(link.agent_id) == "codex"
-        and link.meter in {"codex-pro", "krill"}
+        and product == "codex"
+        and is_mapped_codex_pool(settings, link.meter, groups)
+    )
+
+
+def resolved_link(settings: SessionChoice, link: Link, request: ChoiceRequest) -> Link:
+    if needs_route_model(
+        settings, link, request.products.get(link.agent_id), request.provider_groups
     ):
         link = link.model_copy(update={"model": request.default_models.get(link.agent_id)})
     if link.model is not None:
@@ -1256,7 +1300,8 @@ def _ability(
     settings: SessionChoice, product: str | None, model: str | None, request: ChoiceRequest
 ):
     def identity(value: str | None) -> str | None:
-        value = value.partition("/")[2] if value and codex_route_pool(value, product) else value
+        if value and codex_route_pool(settings, value, product):
+            value = value.partition("/")[2]
         return canonical_model(value, request.provider_groups) if value else value
 
     levels = {
@@ -1265,7 +1310,7 @@ def _ability(
     for preset in settings.presets:
         if preset.id in levels:
             for configured_link in preset.links:
-                link = resolved_link(configured_link, request)
+                link = resolved_link(settings, configured_link, request)
                 if request.products.get(link.agent_id, link.agent_id) == product and identity(
                     _effective_model(settings, link, request)
                 ) == identity(model):
@@ -1284,9 +1329,9 @@ def _filter_link(
     cooldowns: Mapping[str, float],
     now: float,
 ) -> Skipped | None:
-    link = resolved_link(link, request)
+    link = resolved_link(settings, link, request)
     product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(link, product, request.provider_groups)
+    pool = pool_of(settings, link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
     required_model = request.required_model
@@ -1297,10 +1342,14 @@ def _filter_link(
             request.provider_groups,
             allow_substitution=False,
         )
-        required_route = codex_route_pool(required_model, product)
-        if resolved.model != link.model or required_route != codex_route_pool(link.model, product):
+        required_route = codex_route_pool(
+            settings, required_model, product, request.provider_groups
+        )
+        if resolved.model != link.model or required_route != codex_route_pool(
+            settings, link.model, product, request.provider_groups
+        ):
             return Skipped(link, "model_mismatch")
-    if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
+    if needs_route_model(settings, link, product, request.provider_groups):
         return Skipped(link, "model_unavailable")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
     level = _ability(settings, product, link.model, request)
@@ -1348,7 +1397,7 @@ def link_closed(
     """Evaluate shared closure independently of this request's skipped reason."""
     link = _candidate_link(settings, link, request)
     pool = pool_of(
-        link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+        settings, link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
     )
     return (
         (request.link_exclusions or {}).get(link.agent_id, 0) > now
@@ -1456,7 +1505,10 @@ def plan_choice(
         """The candidate's deciding-period quota and the shared pool reading."""
         reading = readings.get(
             pool_of(
-                link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+                settings,
+                link,
+                request.products.get(link.agent_id, link.agent_id),
+                request.provider_groups,
             )
         )
         return candidate_quota(request, link, reading, now), reading
@@ -1504,7 +1556,10 @@ def plan_choice(
             credits[picked[1]] -= sum(item[2] for item in weighted)
         link = picked[3]
         pool = pool_of(
-            link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+            settings,
+            link,
+            request.products.get(link.agent_id, link.agent_id),
+            request.provider_groups,
         )
         quota, reading = candidate_view(link)
         if quota is not None:
@@ -1537,7 +1592,14 @@ def plan_choice(
                 settings_revision=settings_revision,
                 since=now,
                 pool=pool,
-                route=provider_route(request.host, link.agent_id, link.model),
+                route=provider_route(
+                    request.host,
+                    link.agent_id,
+                    link.model,
+                    route_pools=settings.codex_route_pools,
+                    product=request.products.get(link.agent_id, link.agent_id),
+                    groups=request.provider_groups,
+                ),
             )
             new_lock = revalidate_drain_locks(settings, (proposed,), settings_revision).get(key)
         return ChoicePlan(
@@ -1566,6 +1628,7 @@ def plan_choice(
     if holdable and work.if_full == "queue" and not request.independent:
         first = min(holdable, key=lambda item: (item.why != "busy", item.until or now))
         pool = pool_of(
+            settings,
             first.link,
             request.products.get(first.link.agent_id, first.link.agent_id),
             request.provider_groups,
@@ -1644,12 +1707,44 @@ class ProviderRefusal:
     response_id: str
 
 
-def provider_route(host: str | None, agent: str | None, model: str | None) -> str:
+@dataclass(frozen=True)
+class ProviderAttempt:
+    response_id: str
+    generation: int
+    started_at: float
+    pool: str
+    route: str
+    observed_route: str
+    route_pools: Mapping[str, str]
+    provider_groups: ProviderGroups
+
+
+def provider_route(
+    host: str | None,
+    agent: str | None,
+    model: str | None,
+    *,
+    route_pools: Mapping[str, str] | None = None,
+    product: str | None = None,
+    groups: ProviderGroups | None = None,
+) -> str:
     """Use the host's provider binding, shared by models on that provider."""
-    provider = codex_route_pool(model, "codex") or (
-        model.partition("/")[0] if model and "/" in model else "default"
-    )
+    prefix, separator, name = (model or "").partition("/")
+    pool = route_pools.get(prefix) if route_pools and product == "codex" and name else None
+    provider = canonical_pool(pool, groups or {}) if pool else (prefix if separator else "default")
     return json.dumps([host, agent, provider])
+
+
+def canonical_provider_route(route: str, groups: ProviderGroups) -> str:
+    if not groups:
+        return route
+    try:
+        binding = json.loads(route)
+    except ValueError:
+        return route
+    if isinstance(binding, list) and len(binding) == 3 and isinstance(binding[2], str):
+        return json.dumps([binding[0], binding[1], canonical_pool(binding[2], groups)])
+    return route
 
 
 class EffectiveQuotaReadings(dict):
@@ -1661,8 +1756,10 @@ class EffectiveQuotaReadings(dict):
         self.now = now
         self.groups = groups
 
-    def for_route(self, route: str) -> dict:
-        return self.state.quota_readings(self.owner, self.raw, self.now, self.groups, route=route)
+    def for_routes(self, routes: tuple[str, ...]) -> dict:
+        return self.state.quota_readings(
+            self.owner, self.raw, self.now, self.groups, routes=routes
+        )
 
 
 class ChoiceState:
@@ -1677,7 +1774,7 @@ class ChoiceState:
             str, list[tuple[tuple[str, str] | None, Callable[[DrainLock], bool]]]
         ] = {}
         self.refusals: dict[tuple[str, str, str], ProviderRefusal] = {}
-        self.provider_attempts: dict[tuple[str, str, str, str], tuple[str, int, float]] = {}
+        self.provider_attempts: dict[tuple[str, str], ProviderAttempt] = {}
         self.provider_recoveries: dict[tuple[str, str, str], float] = {}
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
         self.external_admission = ExternalAdmissionState()
@@ -1689,7 +1786,7 @@ class ChoiceState:
         now: float,
         groups: ProviderGroups | None = None,
         *,
-        route: str | None = None,
+        routes: tuple[str, ...] = (),
     ) -> dict[str, UsageAccountView]:
         """Provider rejection wins over a polled balance until its explicit reset."""
         from omnigent.usage.contract import UsageAccountView, UsageWindowView
@@ -1727,9 +1824,10 @@ class ChoiceState:
                         )
                     ],
                 )
-        for (user, pool, _route), refusal in tuple(self.refusals.items()):
+        route_keys = {canonical_provider_route(route, groups or {}) for route in routes}
+        for (user, pool, route), refusal in tuple(self.refusals.items()):
             pool = canonical_pool(pool, groups or {})
-            if route is not None and route != _route:
+            if route_keys and canonical_provider_route(route, groups or {}) not in route_keys:
                 continue
             if user != owner or (refusal.resets_at is not None and refusal.resets_at <= now):
                 continue

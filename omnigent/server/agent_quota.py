@@ -1295,7 +1295,7 @@ class AgentQuotaService:
                 products[link.agent_id] = agent_key_for_harness(
                     _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
                 )
-            pools.append(pool_of(link, products[link.agent_id], groups))
+            pools.append(pool_of(choice, link, products[link.agent_id], groups))
         payload: dict[str, Any] = {
             "tiers": asdict(tiers),
             "agents": {

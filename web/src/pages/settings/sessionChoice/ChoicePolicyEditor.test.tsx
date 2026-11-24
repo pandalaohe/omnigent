@@ -152,6 +152,13 @@ it("offers generic starters and keyboard drag handles without move buttons", () 
   expect(screen.queryByRole("button", { name: /move up|move down/i })).not.toBeInTheDocument();
 });
 
+it.each(["Simple", "Recommended"])("keeps the owner's route mapping when applying %s", (name) => {
+  const codexRoutePools = { "route-a": "pool-a" };
+  mount({ ...structuredClone(EMPTY_CHOICE), schemaVersion: 1, codexRoutePools });
+  fireEvent.click(screen.getByRole("button", { name }));
+  expect(value().codexRoutePools).toEqual(codexRoutePools);
+});
+
 it("guesses a meter as identity changes until the user chooses it by hand", () => {
   function Chain() {
     const [links, setLinks] = useState<ChoiceLink[]>([{ agent: "" }]);

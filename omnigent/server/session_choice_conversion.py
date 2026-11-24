@@ -6,12 +6,14 @@ import time
 from copy import deepcopy
 from typing import Any
 
+from omnigent.server.model_resolution import read_provider_groups
 from omnigent.server.session_choice import (
     ChoiceRevisionConflict,
     LimitScope,
     SessionChoice,
     choice_document,
     choice_revision,
+    is_mapped_codex_pool,
     ordered_links,
     parse_session_choice,
     pool_of,
@@ -77,11 +79,16 @@ def conversion_preview(app: Any, owner: str, settings: SessionChoice) -> dict[st
             "model": link.model,
             "meter": link.meter,
             "product": products.get(link.agent_id),
-            "pool": pool_of(link, products.get(link.agent_id)),
+            "pool": pool_of(settings, link, products.get(link.agent_id)),
         }
         for link in links
     ]
     entries = _legacy_choice_values(document)
+    groups = (
+        read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
+        if settings.codex_route_pools
+        else {}
+    )
     catalog = _catalog(app, owner) if hasattr(app.state, "agent_store") else []
     running = running_pools(app, owner, settings, products, time.time()) if catalog else None
     target = deepcopy(document)
@@ -100,7 +107,8 @@ def conversion_preview(app: Any, owner: str, settings: SessionChoice) -> dict[st
                 else "default_model_unresolved"
                 if any(row["model"] is None for row in matches)
                 else "shared_pool"
-                if len({(row["agent"], row["model"]) for row in matches}) > 1
+                if is_mapped_codex_pool(settings, path[1], groups)
+                or len({(row["agent"], row["model"]) for row in matches}) > 1
                 else None
             )
             if reason is None:

@@ -177,7 +177,10 @@ export function ChoicePolicyEditor({
               disabled={!targetHost || !agents.length}
               onClick={() => {
                 if (targetHost) {
-                  change(starter(targetHost, agents, meters, simple));
+                  change({
+                    ...starter(targetHost, agents, meters, simple),
+                    codexRoutePools: document.codexRoutePools,
+                  });
                   setSelected("");
                 }
               }}
