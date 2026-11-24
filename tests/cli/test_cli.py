@@ -6065,6 +6065,34 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     assert _resolve_auto_open_conversation_from_config(cfg) is True
 
 
+def test_config_edits_native_history_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.config import native_history_cleanup_enabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("host:\n  name: test-host\n", encoding="utf-8")
+    runner = CliRunner()
+    key = "host.native_history_cleanup"
+
+    assert not native_history_cleanup_enabled()
+    assert runner.invoke(cli, ["config", "set", f"{key}=true"]).exit_code != 0
+    assert runner.invoke(cli, ["config", "set", "--global", f"{key}=invalid"]).exit_code != 0
+
+    result = runner.invoke(cli, ["config", "set", "--global", f"{key}=true"])
+    assert result.exit_code == 0, result.output
+    assert native_history_cleanup_enabled()
+    assert f"{key}=True" in runner.invoke(cli, ["config", "list"]).output
+
+    result = runner.invoke(cli, ["config", "unset", "--global", key])
+    assert result.exit_code == 0, result.output
+    assert not native_history_cleanup_enabled()
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {
+        "host": {"name": "test-host"}
+    }
+
+
 def test_config_set_global_writes_session_title_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

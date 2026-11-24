@@ -58,7 +58,7 @@ async def test_host_start_does_not_block_on_orphan_bridge_reap(
     sweep_started = threading.Event()
     sweep_release = threading.Event()
 
-    def _blocking_sweep() -> int:
+    def _blocking_sweep(*, expire_history: bool) -> int:
         sweep_started.set()
         # Bounded so a hung test still tears down instead of blocking forever.
         sweep_release.wait(timeout=30.0)

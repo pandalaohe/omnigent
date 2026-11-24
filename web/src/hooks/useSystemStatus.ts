@@ -202,6 +202,7 @@ export interface SystemLoadLinesSettings {
   hosts: Record<string, SystemLoadLinePair>;
   /** Whether agent-created child sessions queue on a host above its new-session line. */
   queue_enabled: boolean;
+  notices_enabled?: boolean;
 }
 
 /** `GET|PUT /v1/system/settings` mapping. */
@@ -229,6 +230,7 @@ export interface SystemLoadLinesUpdate {
   default?: SystemLoadLinePair;
   hosts?: Record<string, SystemLoadLinePair | null>;
   queue_enabled?: boolean;
+  notices_enabled?: boolean;
 }
 
 /** A partial settings PUT body; the server merges the groups it receives. */

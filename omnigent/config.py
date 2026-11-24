@@ -32,6 +32,7 @@ _Config: TypeAlias = dict[str, object]
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _GLOBAL_CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 _LOCAL_CONFIG_RELPATH = Path(".omnigent") / "config.yaml"
+NATIVE_HISTORY_CLEANUP_KEY = "host.native_history_cleanup"
 
 
 def global_config_path(default_path: Path | None = None) -> Path:
@@ -49,6 +50,17 @@ def load_global_config(path: Path | None = None) -> _Config:
     with resolved_path.open() as config_file:
         raw: _Config = yaml.safe_load(config_file) or {}
         return raw
+
+
+def native_history_cleanup_enabled() -> bool:
+    """Read the host's opt-in to expiring resumable native session files."""
+    try:
+        config = load_global_config()
+    except (OSError, yaml.YAMLError):
+        _log.warning("Unable to read host config for native history cleanup")
+        return False
+    host = config.get("host") if isinstance(config, Mapping) else None
+    return isinstance(host, Mapping) and host.get("native_history_cleanup") is True
 
 
 def load_local_config(path: Path | None = None) -> _Config:

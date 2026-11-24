@@ -60,6 +60,7 @@ def _spawn_host_daemon(
     env = os.environ.copy()
     codex_home_source = env.get("CODEX_HOME") or str(Path.home() / ".codex")
     env["HOME"] = str(home_dir)
+    env["OMNIGENT_CONFIG_HOME"] = str(home_dir / ".omnigent")
     env["OMNIGENT_DATA_DIR"] = str(home_dir / ".omnigent")
     env["CODEX_HOME"] = codex_home_source
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
@@ -200,7 +201,11 @@ def test_host_restart_retains_recent_codex_bridge_then_reclaims_it(
     workspace = tmp_path / "codex_ws"
     workspace.mkdir()
     home_dir = tmp_path / "home"
-    home_dir.mkdir()
+    config_dir = home_dir / ".omnigent"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "host:\n  native_history_cleanup: true\n", encoding="utf-8"
+    )
     monkeypatch.setattr(
         codex_native_bridge,
         "_BRIDGE_ROOT",

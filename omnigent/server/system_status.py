@@ -1050,6 +1050,11 @@ class SystemStatusHub:
         """Whether agent-created children may be held in this workspace."""
         return self._workspace_lines(workspace_id)["queue_enabled"]
 
+    def notices_enabled(self, workspace_id: int) -> bool:
+        """Whether host-load transitions can send messages in this workspace."""
+        workspace = self._settings["load_lines"].get(str(workspace_id))
+        return workspace is not None and workspace["notices_enabled"]
+
     def host_load_keys(self) -> list[tuple[int, str]]:
         return list(self._entries)
 
@@ -1384,7 +1389,8 @@ def _factory_workspace_lines() -> dict[str, Any]:
     return {
         "default": {"heavy": FACTORY_LINES.heavy, "new_session": FACTORY_LINES.new_session},
         "hosts": {},
-        "queue_enabled": True,
+        "queue_enabled": False,
+        "notices_enabled": False,
     }
 
 
@@ -1406,15 +1412,19 @@ def _coerce_load_pair(value: Any) -> dict[str, float]:
 
 def _patch_load_lines(current: dict[str, Any], patch: Any) -> dict[str, Any]:
     """Validate the whole patch before the caller publishes any settings."""
-    if not isinstance(patch, dict) or set(patch) - {"default", "hosts", "queue_enabled"}:
-        raise ValueError("load_lines must contain only default, hosts and queue_enabled")
+    switches = ("queue_enabled", "notices_enabled")
+    if not isinstance(patch, dict) or set(patch) - {"default", "hosts", *switches}:
+        raise ValueError(
+            "load_lines must contain only default, hosts, queue_enabled and notices_enabled"
+        )
     result = copy.deepcopy(current)
     if "default" in patch:
         result["default"] = _coerce_load_pair(patch["default"])
-    if "queue_enabled" in patch:
-        if not isinstance(patch["queue_enabled"], bool):
-            raise ValueError("load_lines.queue_enabled must be a boolean")
-        result["queue_enabled"] = patch["queue_enabled"]
+    for key in switches:
+        if key in patch:
+            if not isinstance(patch[key], bool):
+                raise ValueError(f"load_lines.{key} must be a boolean")
+            result[key] = patch[key]
     if "hosts" in patch:
         if not isinstance(patch["hosts"], dict):
             raise ValueError("load_lines.hosts must be an object")

@@ -47,6 +47,14 @@ def notices(db_uri, tmp_path):
     hub.close()
 
 
+@pytest.fixture
+def enabled_notices(notices):
+    notices.hub.put_settings(
+        {"load_lines": {"notices_enabled": True, "queue_enabled": True}}, workspace_id=0
+    )
+    return notices
+
+
 def _parent(h, host=HOST_A):
     parent = h.store.create_conversation(
         title="mother", host_id=host, workspace="/opt/work/project", runner_id=RUNNER
@@ -78,8 +86,24 @@ async def _tick(h):
     await asyncio.gather(*list(h.notifier._tasks.values()))
 
 
-async def test_busy_hold_clear_hold_composes_current_level_once(notices):
+async def test_default_off_keeps_load_visible_and_discards_old_transitions(notices):
     h = notices
+    _parent(h)
+    _report(h, "heavy_hold")
+    await _tick(h)
+    assert h.posts == []
+    assert h.hub.host_load(0, HOST_A, now=h.clock.now)["level"] == "heavy_hold"
+
+    h.hub.put_settings({"load_lines": {"notices_enabled": True}}, workspace_id=0)
+    await _tick(h)
+    assert h.posts == []
+    _report(h, "new_session_hold")
+    await _tick(h)
+    assert len(h.posts) == 1
+
+
+async def test_busy_hold_clear_hold_composes_current_level_once(enabled_notices):
+    h = enabled_notices
     parent = _parent(h)
     h.clock.state = "busy"
     for level in ("heavy_hold", "normal", "new_session_hold", "heavy_hold"):
@@ -98,8 +122,24 @@ async def test_busy_hold_clear_hold_composes_current_level_once(notices):
     assert len(h.posts) == 1
 
 
-async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
-    h = notices
+async def test_turning_off_notices_discards_a_pending_delivery(enabled_notices):
+    h = enabled_notices
+    _parent(h)
+    h.clock.state = "busy"
+    _report(h, "heavy_hold")
+    await _tick(h)
+    assert h.posts == []
+
+    h.hub.put_settings({"load_lines": {"notices_enabled": False}}, workspace_id=0)
+    h.clock.state = "idle"
+    await _tick(h)
+    h.hub.put_settings({"load_lines": {"notices_enabled": True}}, workspace_id=0)
+    await _tick(h)
+    assert h.posts == []
+
+
+async def test_cooldown_and_spare_clear_then_normal_are_quiet(enabled_notices):
+    h = enabled_notices
     _parent(h)
     _report(h, "heavy_hold", reason="memory")
     await _tick(h)
@@ -118,8 +158,8 @@ async def test_cooldown_and_spare_clear_then_normal_are_quiet(notices):
     assert len(h.posts) == 2
 
 
-async def test_recipients_inherit_host_and_include_parent_own_host(notices):
-    h = notices
+async def test_recipients_inherit_host_and_include_parent_own_host(enabled_notices):
+    h = enabled_notices
     inherited = _parent(h)
     other = _parent(h, HOST_B)
     cross = h.store.create_conversation(
@@ -143,8 +183,8 @@ async def test_recipients_inherit_host_and_include_parent_own_host(notices):
 
 
 @pytest.mark.parametrize("outcome", ["rejected", "uncertain"])
-async def test_definite_failure_retries_but_lost_response_spends_budget(notices, outcome):
-    h = notices
+async def test_definite_failure_retries_but_lost_response_spends_budget(enabled_notices, outcome):
+    h = enabled_notices
     _parent(h)
     _report(h, "new_session_hold")
     h.clock.result = {"forwarded": False}
@@ -156,12 +196,13 @@ async def test_definite_failure_retries_but_lost_response_spends_budget(notices,
     assert len(h.posts) == (2 if outcome == "rejected" else 1)
 
 
-async def test_workspace_and_archived_after_mark_are_isolated(notices):
-    h = notices
+async def test_workspace_and_archived_after_mark_are_isolated(enabled_notices):
+    h = enabled_notices
     _parent(h)
     with workspace_scope(2):
         parent = _parent(h)
     h.clock.state = "busy"
+    h.hub.put_settings({"load_lines": {"notices_enabled": True}}, workspace_id=2)
     _report(h, "heavy_hold", workspace=2)
     await _tick(h)
     with workspace_scope(2):
@@ -171,8 +212,8 @@ async def test_workspace_and_archived_after_mark_are_isolated(notices):
     assert not h.posts
 
 
-async def test_readiness_probe_does_not_deliver_an_old_level(notices):
-    h = notices
+async def test_readiness_probe_does_not_deliver_an_old_level(enabled_notices):
+    h = enabled_notices
     _parent(h)
     _report(h, "new_session_hold")
 
@@ -186,8 +227,8 @@ async def test_readiness_probe_does_not_deliver_an_old_level(notices):
     assert "memory 92.0%" in h.posts[0][1]
 
 
-async def test_owner_read_failure_keeps_pending_until_retry(notices):
-    h = notices
+async def test_owner_read_failure_keeps_pending_until_retry(enabled_notices):
+    h = enabled_notices
     _parent(h)
     _report(h, "heavy_hold")
 
@@ -202,8 +243,8 @@ async def test_owner_read_failure_keeps_pending_until_retry(notices):
     assert len(h.posts) == 1
 
 
-async def test_slow_posts_are_bounded_without_blocking_tick_or_duplicate_delivery(notices):
-    h = notices
+async def test_slow_posts_are_bounded_without_blocking_tick_or_duplicate_delivery(enabled_notices):
+    h = enabled_notices
     parents = [_parent(h) for _ in range(6)]
     _report(h, "heavy_hold")
     started, release = asyncio.Event(), asyncio.Event()
@@ -238,8 +279,8 @@ async def test_slow_posts_are_bounded_without_blocking_tick_or_duplicate_deliver
         await h.notifier.shutdown()
 
 
-async def test_queue_disabled_notice_does_not_promise_automatic_start(notices):
-    h = notices
+async def test_queue_disabled_notice_does_not_promise_automatic_start(enabled_notices):
+    h = enabled_notices
     _parent(h)
     h.hub.put_settings({"load_lines": {"queue_enabled": False}}, workspace_id=0)
     _report(h, "new_session_hold")

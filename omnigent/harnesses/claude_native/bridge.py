@@ -2320,7 +2320,7 @@ def _drop_claude_orphan_runtime_files(bridge_dir: Path) -> None:
             (bridge_dir / filename).unlink()
 
 
-def prune_orphaned_bridge_dirs() -> int:
+def prune_orphaned_bridge_dirs(*, expire_history: bool = True) -> int:
     """
     Remove claude-native bridge dirs whose owner is dead and that sat idle for 7 days.
 
@@ -2337,9 +2337,13 @@ def prune_orphaned_bridge_dirs() -> int:
     """
     return native_bridge_common.prune_orphaned_dirs(
         _BRIDGE_ROOT,
-        should_prune=_claude_orphan_retention_expired,
+        should_prune=_claude_orphan_retention_expired if expire_history else lambda _: False,
         on_keep=_drop_claude_orphan_runtime_files,
     )
+
+
+def prune_orphaned_bridge_runtime_files() -> int:
+    return prune_orphaned_bridge_dirs(expire_history=False)
 
 
 def claude_global_config_path(

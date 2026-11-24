@@ -265,7 +265,8 @@ def harness(db_uri: str, published: list[tuple[str, str | None]]) -> _Harness:
             "agents": {
                 _CLAUDE_AGENT: {"main": True, "child": True},
                 _CODEX_AGENT: {"main": True, "child": True},
-            }
+            },
+            "hostOfflineArchiveSeconds": 14400,
         }
     )
     liveness = _Liveness()
@@ -4174,7 +4175,7 @@ def _archived(harness: _Harness, session_id: str) -> bool:
 
 
 async def test_host_offline_past_threshold_archives_the_child(harness: _Harness) -> None:
-    """A child whose host is offline past the 4 h default is archived, stamped."""
+    """A child whose host is offline past the configured 4 h delay is archived, stamped."""
     parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
     child = _child(harness, parent.id, live_status="idle")
     _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
@@ -4296,19 +4297,21 @@ async def test_host_offline_archive_never_touches_top_level_sessions(
     assert _archived(harness, main.id) is False
 
 
-async def test_host_offline_archive_setting_zero_disables(harness: _Harness) -> None:
-    """``hostOfflineArchiveSeconds: 0`` turns the pass off for that owner."""
+@pytest.mark.parametrize("threshold", [None, 0, 7200, 14400])
+async def test_host_offline_archive_setting(harness: _Harness, threshold: int | None) -> None:
+    """An absent preference is off and explicit thresholds still take effect."""
     harness.prefs.keep_warm = {
         "agents": {_CLAUDE_AGENT: {"main": True, "child": True}},
-        "hostOfflineArchiveSeconds": 0,
     }
+    if threshold is not None:
+        harness.prefs.keep_warm["hostOfflineArchiveSeconds"] = threshold
     parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
     child = _child(harness, parent.id, live_status="idle")
     _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
 
     await _tick_archive_pass(harness)
 
-    assert _archived(harness, child.id) is False
+    assert _archived(harness, child.id) is bool(threshold)
 
 
 async def test_host_offline_archive_has_no_recency_window(harness: _Harness) -> None:

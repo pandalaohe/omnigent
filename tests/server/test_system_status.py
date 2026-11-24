@@ -887,6 +887,7 @@ def test_fast_hosts_leases(tmp_path: Path) -> None:
 
 def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> None:
     hub = SystemStatusHub(tmp_path, None)
+    assert hub.queue_enabled(1) is False
     hub.put_settings(
         {
             "load_lines": {
@@ -898,7 +899,13 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         workspace_id=1,
     )
     stored = hub.put_settings(
-        {"load_lines": {"hosts": {"host_a": {"heavy": 8, "new_session": 9}}}},
+        {
+            "load_lines": {
+                "hosts": {"host_a": {"heavy": 8, "new_session": 9}},
+                "queue_enabled": True,
+                "notices_enabled": True,
+            }
+        },
         workspace_id=2,
     )
     system_status.write_settings(hub.settings_path, stored)
@@ -908,6 +915,8 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
     assert hub.effective_load_lines(2, "host_a").heavy == 8
     assert hub.queue_enabled(1) is False
     assert hub.queue_enabled(2) is True
+    assert hub.get_settings(2)["load_lines"]["notices_enabled"] is True
+    assert hub.get_settings(3)["load_lines"]["notices_enabled"] is False
     assert hub.host_load(1, "host_a")["lines_source"] == "host"
     assert hub.host_load(3, "host_a")["lines_source"] == "factory"
 
@@ -919,6 +928,7 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         "default": {"heavy": 2.0, "new_session": 3.0},
         "hosts": {},
         "queue_enabled": False,
+        "notices_enabled": False,
     }
     copied = hub.get_settings(2)
     copied["load_lines"]["hosts"].clear()
@@ -941,6 +951,7 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         {"hosts": {"": {"heavy": 2, "new_session": 3}}},
         {"hosts": []},
         {"queue_enabled": 1},
+        {"notices_enabled": 1},
     ],
 )
 def test_load_lines_validation_is_atomic(tmp_path: Path, patch: object) -> None:

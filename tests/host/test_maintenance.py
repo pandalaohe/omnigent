@@ -83,12 +83,18 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
 _SERVER = "https://omnigent.example.com"
 
 
-def test_host_janitor_adds_session_retention_for_its_server() -> None:
+@pytest.mark.parametrize("enabled", [False, True])
+def test_host_janitor_adds_session_retention_for_its_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    if enabled:
+        (tmp_path / "config.yaml").write_text("host:\n  native_history_cleanup: true\n")
     janitor = HostMaintenanceJanitor.for_host(server_url=_SERVER, server_headers=dict)
 
-    assert janitor._stages[-1][0] == "codex_session_retention"
-    assert janitor._stage_skip_reasons["codex_session_retention"] == frozenset(
-        {"runner_superseded"}
+    assert ("codex_session_retention" in dict(janitor._stages)) is enabled
+    assert janitor._stage_skip_reasons.get("codex_session_retention") == (
+        frozenset({"runner_superseded"}) if enabled else None
     )
 
 
@@ -420,7 +426,7 @@ async def test_host_janitor_uses_absolute_unresolved_harness_tmp_parent(
     )
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        lambda: 0,
+        lambda *, expire_history: 0,
     )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=configured_root)
 
@@ -458,7 +464,7 @@ async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
     monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", lambda: None)
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        lambda: bridge_sweeps.append(1) or 2,
+        lambda *, expire_history: bridge_sweeps.append(1) or 2,
     )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=tmp_path / "harness-sockets")
     janitor._lock_path = tmp_path / "maintenance.lock"
@@ -498,7 +504,7 @@ async def test_codex_stage_logs_reaped_process_counts(
     monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", lambda: None)
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        lambda: 0,
+        lambda *, expire_history: 0,
     )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=tmp_path / "harness-sockets")
     janitor._lock_path = tmp_path / "maintenance.lock"
