@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from omnigent._platform import posix_shell_path
 from omnigent.permission_tiers import (
     NativeCallBinding,
     NativeSupport,
@@ -158,6 +159,9 @@ def evaluate_host_tool(
         if state.tier == "full":
             return TierDecision(Verdict.ALLOW)
         context = local_host_context(state, control_paths=control_paths)
+        if name == "sys_os_shell" and context.platform == "windows" and local_execution:
+            # The bridged OS tool prefers Git Bash over COMSPEC when available.
+            context = replace(context, shell=posix_shell_path() or context.shell)
         if extension_tools is not None:
             context = replace(context, extension_tools=extension_tools)
         context = replace(

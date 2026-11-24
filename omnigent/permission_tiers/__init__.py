@@ -1151,11 +1151,14 @@ def _heredoc_runs_shell(text: str, start: int) -> bool:
             return True
 
 
-def _shell_scan(text: str, index: int = 0, closer: str = "") -> tuple[int, str, list[str]]:
+def _shell_scan(
+    text: str, index: int = 0, closer: str = "", *, binding_paths: bool = False
+) -> tuple[int, str, list[str]]:
     """Return the end, executable shell text and direct substitution bodies.
 
     Quoted heredoc data is omitted unless a shell interpreter reads it. Quotes in
     unquoted heredoc bodies are literal; case patterns do not close substitutions.
+    For path binding, leave an unresolved word in place of each substitution.
     """
     kept: list[str] = []
     bodies: list[str] = []
@@ -1252,8 +1255,11 @@ def _shell_scan(text: str, index: int = 0, closer: str = "") -> tuple[int, str, 
             )
             if end >= len(text):
                 break  # unterminated: the shell rejects the command
-            bodies.append(re.sub(r"\\([`$\\])", r"\1", body) if backtick else body)
-            kept.append(text[index : end + 1])
+            if binding_paths and text.startswith("$((", index):
+                bodies.extend(_shell_scan(body, binding_paths=True)[2])
+            else:
+                bodies.append(re.sub(r"\\([`$\\])", r"\1", body) if backtick else body)
+            kept.append("$?" if binding_paths else text[index : end + 1])
             index = end + 1
             continue
         kept.append(char)
@@ -1624,13 +1630,26 @@ def _sed_script_writes(script: str) -> bool:
 
 def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str) -> list[str]:
     """Exclude established data roles; unknown syntax keeps conservative candidates."""
+    dialect = _command_name(shell)
+    if dialect in _HEREDOC_SHELLS:
+        offset = 0
+        while offset < len(raw_tokens) and re.match(
+            r"[A-Za-z_][A-Za-z0-9_]*=", raw_tokens[offset]
+        ):
+            offset += 1
+        tokens, raw_tokens = tokens[offset:], raw_tokens[offset:]
+        if tokens[:1] == ["echo"]:
+            return tokens[:1]
+        if (
+            len(tokens) > 1
+            and tokens[0] == "printf"
+            and not re.search(r"[$`*?\[{}]", raw_tokens[1])
+            and not _script_word(raw_tokens[1]).startswith("-")
+        ) or (len(tokens) == 2 and tokens[0] == "date" and tokens[1].startswith("+%")):
+            return tokens[:1]
     if not tokens:
         return []
     conservative = [value for value in tokens if not value.startswith("-")]
-    dialect = ntpath.basename(shell).lower().removesuffix(".exe")
-    if dialect in _HEREDOC_SHELLS and tokens[0] == "echo":
-        if all(not re.search(r"\$(?!\?)|[`{}\r\n]", raw) for raw in raw_tokens[1:]):
-            return tokens[:1]
     if dialect not in ("pwsh", "powershell", "cmd", "sh", "bash", "zsh") or any(
         any(char in raw for char in "$`^!{}\r\n")
         or (dialect == "cmd" and any(char in raw for char in "%'"))
@@ -1774,8 +1793,19 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
 
 
 def _windows_command_paths(
-    command: str, context: TrustedHostContext, depth: int
+    command: str, context: TrustedHostContext, depth: int, assigned: frozenset[str] = frozenset()
 ) -> tuple[str, ...]:
+    if depth > 3:
+        raise ValueError("Shell wrapper nesting cannot be checked")
+    paths = []
+    if _command_name(context.shell) in _HEREDOC_SHELLS:
+        assigned |= _shell_assignments(command, context)
+        end, outer, bodies = _shell_scan(command, binding_paths=True)
+        if end != len(command):
+            raise ValueError("Uncheckable POSIX shell expansion")
+        command = outer
+        for body in bodies:
+            paths.extend(_windows_command_paths(body, context, depth + 1, assigned))
     raw_tokens = []
     end = 0
     pattern = (
@@ -1815,7 +1845,6 @@ def _windows_command_paths(
             segments[-1].append(tokens[index])
             raw_segments[-1].append(raw)
         index += 1
-    paths = []
     for segment, raw_segment in zip(segments, raw_segments, strict=True):
         if not segment:
             continue
@@ -1845,7 +1874,9 @@ def _windows_command_paths(
                 if shell in ("cmd", "powershell", "pwsh") and len(segment) > option_index + 2
                 else segment[option_index + 1]
             )
-            paths.extend(_command_paths(inner, replace(context, shell=shell), depth=depth + 1)[0])
+            paths.extend(
+                _windows_command_paths(inner, replace(context, shell=shell), depth + 1, assigned)
+            )
             candidates.extend(
                 value for value in segment[:option_index] if not value.startswith("-")
             )
@@ -1855,7 +1886,7 @@ def _windows_command_paths(
             candidates.extend(_windows_path_operands(segment, raw_segment, context.shell))
     for token in candidates:
         if token:
-            expanded = _expand_trusted(token, context, frozenset())
+            expanded = _expand_trusted(token, context, assigned)
             if expanded is None:
                 raise ValueError(f"Unresolved Windows path variable: {token}")
             token = expanded
@@ -2076,6 +2107,18 @@ def _delete_segment(tokens: list[str]) -> bool:
     return False
 
 
+def _shell_assignments(command: str, context: TrustedHostContext) -> frozenset[str]:
+    return frozenset(
+        name
+        for name in (*_TRUSTED_VARIABLES, *context.environment)
+        if (
+            re.search(r"\b" + re.escape(name) + r"\s*=", command, re.I)
+            if context.platform == "windows"
+            else name + "=" in command
+        )
+    )
+
+
 def _expand_trusted(
     token: str, context: TrustedHostContext, assigned: frozenset[str]
 ) -> str | None:
@@ -2155,17 +2198,10 @@ def _shell_writes(
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
     windows = context.platform == "windows"
+    windows_posix = windows and _command_name(context.shell) in _HEREDOC_SHELLS
     command = command.replace("\\\n", "")
     tokens, raw_tokens = _write_tokens(command, windows=windows or powershell)
-    assigned = untrusted | {
-        name
-        for name in (*_TRUSTED_VARIABLES, *context.environment)
-        if (
-            re.search(r"\b" + re.escape(name) + r"\s*=", command, re.I)
-            if windows
-            else name + "=" in command
-        )
-    }
+    assigned = untrusted | _shell_assignments(command, context)
     nested = _ShellWrites()
     for body in _shell_scan(command)[2]:
         try:
@@ -2175,6 +2211,8 @@ def _shell_writes(
         except _UnboundShellWrite:
             raise
         except (OSError, RuntimeError, TypeError, ValueError):
+            if windows_posix:
+                raise
             continue
     cwds: frozenset[str] = frozenset((context.cwd,)) if known else frozenset()
     segments = _shell_segments(tokens, raw_tokens, windows=windows)
@@ -2203,6 +2241,8 @@ def _shell_writes(
                 continue
             bound = _bound_targets(target, cwds, context, assigned)
             if bound is None:
+                if windows_posix and not deleting:
+                    raise _UnboundShellWrite("Shell write target cannot be bound")
                 expansion = re.search(r"[$`]", target)
                 literal = target[: expansion.start()] if expansion else ""
                 if literal.strip("/\\"):

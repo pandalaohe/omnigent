@@ -113,3 +113,27 @@ def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) 
     for path in (r"D:\Apps\Application\config", r"E:\LegacyApps\Application\config"):
         intent = adapt_tool_call("write", {"path": path, "content": "x"}, context)
         assert decide_tier("auto", intent, load_rules()).rule_id == "protected-path"
+
+
+@pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", None])
+def test_windows_os_shell_checks_the_selected_executor(monkeypatch, shell):
+    monkeypatch.setattr(host.sys, "platform", "win32")
+    monkeypatch.setattr(host.Path, "home", lambda: Path("C:/work/sample"))
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(host, "posix_shell_path", lambda: shell)
+    monkeypatch.setattr(
+        host,
+        "resolve_local_path",
+        lambda value: ResolvedPath(value, "directory" if value == r"C:\work" else "new-file"),
+    )
+    state = host.HostPermissionState("s", "h", r"C:\work", "auto", 1, "ready")
+    command = 'printf "%s" "$label"'
+    result = host.evaluate_host_tool(
+        state, "sys_os_shell", {"command": command}, control_paths=(r"C:\control",)
+    )
+    assert result.action == (Verdict.ALLOW if shell else Verdict.DENY)
+    native = host.evaluate_host_tool(
+        state, "run_command", {"CommandLine": command}, control_paths=(r"C:\control",)
+    )
+    assert native.action == Verdict.DENY
