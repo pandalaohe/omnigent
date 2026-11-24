@@ -142,6 +142,7 @@ from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_terminal_failure,
 )
+from omnigent.runner.live_mcp_routes import register_live_mcp_routes
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -14667,6 +14668,7 @@ def create_runner_app(
         rows = response.json().get("models", [])
         return [row for row in rows if isinstance(row, dict)]
 
+    register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,

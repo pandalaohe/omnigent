@@ -260,7 +260,7 @@ function loadNavigationHarness({
   const bannerCalls = { show: [], hide: 0 };
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
-  const browserRegistryCalls = { setActive: [], closeAll: [] };
+  const browserRegistryCalls = { setActive: [], closeAll: [], setOpenTabSupported: [] };
   let browserRegistryDeps;
   let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
@@ -651,6 +651,8 @@ function loadNavigationHarness({
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
               ownsWebContents: () => false,
               setRecentSessionSwitchSupported: () => {},
+              setOpenTabSupported: (supported) =>
+                browserRegistryCalls.setOpenTabSupported.push(supported),
               activeConversationId: () => null,
             };
           },
@@ -3854,6 +3856,19 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     // re-signed-in SPA. A re-mounted BrowserPane re-attaches via
     // browser-set-active, so detaching on the SPA commit is safe.
     assert.deepEqual(harness.browserRegistryCalls.setActive, [null, null]);
+    harness.cleanup();
+  });
+
+  it("withdraws modifier-click tab support when the shell starts a new document", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.emit("did-start-navigation", "https://host.example/ml/omnigents#c/1", true, true);
+    harness.emit("did-start-navigation", "https://frame.example/", false, false);
+    assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, []);
+
+    harness.emit("did-start-navigation", "https://host.example/login.html", false, true);
+    assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
 });
