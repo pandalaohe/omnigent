@@ -673,6 +673,39 @@ async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
     assert explicit.json()["permission_tier_state"] == "blocked"
 
 
+@pytest.mark.parametrize("harness", ["acp:neutral", "pi", "pi-native", "antigravity-native"])
+async def test_agent_created_child_cannot_widen_the_source_tier(client, stores, harness):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 2, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    parent = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    denied = await client.post(
+        "/v1/sessions", json={**request, "permission_tier": "auto"}, headers=agent_headers
+    )
+    assert denied.status_code == 403, denied.text
+    allowed = await client.post("/v1/sessions", json=request, headers=agent_headers)
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["permission_tier"] == "plan"
+    user_selected = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "auto"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert user_selected.status_code == 201, user_selected.text
+    assert user_selected.json()["permission_tier"] == "auto"
+
+
 async def test_expired_acp_model_catalog_refreshes_once_and_preserves_last_success(
     client, app, stores, monkeypatch
 ):

@@ -16243,9 +16243,10 @@ async def _create_session_from_existing_agent_impl(
     )
     from omnigent.server.permission_tiers import (
         TIER_HARNESSES,
+        agent_originated_create,
         is_acp_permission_harness,
-        permission_tier_active,
         require_permission_protocol,
+        source_permission_tier,
     )
 
     require_permission_protocol(request, harness=selected_harness)
@@ -16755,6 +16756,28 @@ async def _create_session_from_existing_agent_impl(
         initial_labels.update(sdk_permission_labels)
 
     create_harness = selected_harness
+    agent_create = agent_originated_create(request.headers)
+    permission_source = parent_conv
+    permission_source_id = body.parent_session_id or created_by_session_id
+    if agent_create and permission_source_id is not None:
+        permission_source = await asyncio.to_thread(
+            conversation_store.get_conversation, permission_source_id
+        )
+        if permission_source is None:
+            raise OmnigentError("Source session not found", code=ErrorCode.NOT_FOUND)
+    inherited_tier = None
+    if permission_source is not None and (
+        create_harness in TIER_HARNESSES or is_acp_permission_harness(create_harness)
+    ):
+        source_harness = await asyncio.to_thread(
+            _resolve_harness, permission_source, agent_store=agent_store, agent_cache=agent_cache
+        )
+        inherited_tier = source_permission_tier(
+            source_harness,
+            permission_source.labels or {},
+            permission_source.terminal_launch_args or [],
+            require_ready=agent_create,
+        )
     acp_default_tier = None
     acp_tier_enabled = False
     if is_acp_permission_harness(create_harness):
@@ -16775,34 +16798,19 @@ async def _create_session_from_existing_agent_impl(
             acp_default_tier = None
         if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
             raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
-        acp_tier_enabled = body.permission_tier is not None or acp_default_tier is not None
+        acp_tier_enabled = (
+            body.permission_tier is not None
+            or acp_default_tier is not None
+            or (agent_create and inherited_tier is not None)
+        )
     require_permission_protocol(request, harness=create_harness, required=acp_tier_enabled)
     if create_harness in TIER_HARNESSES or acp_tier_enabled:
         assert create_harness is not None
         from omnigent.server.permission_tiers import (
             ConfirmedPermissionState,
             creation_permission_tier,
-            legacy_permission_tier,
         )
 
-        inherited_tier = None
-        if parent_conv is not None:
-            parent_harness = await asyncio.to_thread(
-                _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
-            )
-            if permission_tier_active(parent_harness, parent_conv.labels or {}):
-                assert parent_harness is not None
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=parent_harness,
-                        labels=parent_conv.labels or {},
-                        launch_args=parent_conv.terminal_launch_args or [],
-                    )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Parent permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
         tier = creation_permission_tier(
             harness=create_harness,
             explicit=(
@@ -16820,6 +16828,7 @@ async def _create_session_from_existing_agent_impl(
                 else None
             ),
             inherited=inherited_tier,
+            ceiling=inherited_tier if agent_create else None,
         )
         initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))
         if create_harness == "antigravity-native":

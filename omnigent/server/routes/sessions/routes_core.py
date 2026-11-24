@@ -3584,28 +3584,29 @@ def register_core_routes(
         if bundle_harness in TIER_HARNESSES:
             assert bundle_harness is not None
             from omnigent.server.permission_tiers import (
+                agent_originated_create,
                 creation_permission_tier,
-                legacy_permission_tier,
+                source_permission_tier,
             )
 
+            agent_create = agent_originated_create(request.headers)
             inherited_tier = None
             if parent_conv is not None:
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=bundle_harness,
-                        labels=parent_conv.labels or {},
-                        launch_args=parent_conv.terminal_launch_args or [],
-                    )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Parent permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
+                parent_harness = await asyncio.to_thread(
+                    _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                inherited_tier = source_permission_tier(
+                    parent_harness,
+                    parent_conv.labels or {},
+                    parent_conv.terminal_launch_args or [],
+                    require_ready=agent_create,
+                )
             tier = creation_permission_tier(
                 harness=bundle_harness,
                 explicit=parsed_metadata.permission_tier,
                 default=project_resolution.permission,
                 inherited=inherited_tier,
+                ceiling=inherited_tier if agent_create else None,
             )
             parsed_metadata = parsed_metadata.model_copy(update={"permission_tier": tier})
         if (
