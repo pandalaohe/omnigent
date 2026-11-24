@@ -1611,6 +1611,7 @@ def _populate_codex_home_config(
         target_dir / "config.toml",
         minimal_config=minimal_config,
         include_credentials=include_credentials,
+        locked_gateway=require_native_tools_disabled,
     )
     if not source_dir.is_dir():
         return

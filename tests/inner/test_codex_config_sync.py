@@ -316,6 +316,42 @@ def test_stance_refresh_without_pins_tracks_source_and_removes_stale_keys(
 
 
 @pytest.mark.parametrize(
+    ("selected", "available", "expected"),
+    [
+        ("host-only", False, None),
+        ("host-only", True, None),
+        (":unknown", True, None),
+        (":workspace", False, ":workspace"),
+        ("private", True, "private"),
+    ],
+)
+def test_locked_gateway_syncs_only_available_permission_profiles(
+    homes: tuple[Path, Path], selected: str, available: bool, expected: str | None
+) -> None:
+    source, target = homes
+    (source / "config.toml").write_text(
+        f'default_permissions = "{selected}"\n[permissions.host-only]\nextends = ":workspace"\n'
+    )
+    path = target / "config.toml"
+    if available:
+        path.write_text(
+            'default_permissions = "stale"\n[permissions.private]\nextends = ":workspace"\n'
+        )
+
+    _populate_codex_home_config(
+        target,
+        source,
+        minimal_config=True,
+        include_credentials=False,
+        require_native_tools_disabled=True,
+    )
+
+    config = tomllib.loads(path.read_text())
+    assert config.get("default_permissions") == expected
+    assert set(config.get("permissions", {})) == ({"private"} if available else set())
+
+
+@pytest.mark.parametrize(
     "conflict", ["invalid_pin", "source_policy", "target_policy", "missing_source"]
 )
 def test_policy_conflict_does_not_block_permission_refresh(

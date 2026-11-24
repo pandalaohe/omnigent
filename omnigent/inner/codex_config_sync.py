@@ -25,6 +25,7 @@ from omnigent.util.codex_home_lock import ConfigChanged, config_writer, replace_
 _logger = logging.getLogger(__name__)
 _LEAF = "auto_review.extra_policy"
 _STANCE_KEYS = ("approval_policy", "sandbox_mode", "approvals_reviewer", "default_permissions")
+_BUILTIN_PERMISSION_PROFILES = frozenset({":read-only", ":workspace", ":danger-full-access"})
 SyncResult = Literal["created", "unchanged", "updated", "conflict"]
 
 
@@ -170,6 +171,15 @@ def _sync_pinned_policy(source_data: dict, document: MutableMapping) -> None:
         review["extra_policy"] = value
 
 
+def _has_permission_profile(document: MutableMapping, name: object) -> bool:
+    if not isinstance(name, str):
+        return False
+    if name.startswith(":"):
+        return name in _BUILTIN_PERMISSION_PROFILES
+    profiles = document.get("permissions")
+    return isinstance(profiles, MutableMapping) and isinstance(profiles.get(name), MutableMapping)
+
+
 @config_writer("target", busy="conflict")
 def sync_codex_config(
     source: Path,
@@ -177,6 +187,7 @@ def sync_codex_config(
     *,
     minimal_config: bool,
     include_credentials: bool,
+    locked_gateway: bool = False,
 ) -> SyncResult | None:
     """Refresh permission defaults and apply user-level policy digest pins.
 
@@ -184,6 +195,7 @@ def sync_codex_config(
     ``auto_review.extra_policy`` additionally requires a digest pin. Minimal
     probes/titles skip refresh; signer-backed user sessions receive these
     settings independently of host provider credentials.
+    Locked gateways keep permission profiles available in their private config.
     Policy conflicts skip that leaf while permission defaults still refresh.
     Unsafe files and concurrent changes skip publication without blocking startup.
     Sync diagnostics never log configuration contents.
@@ -206,11 +218,14 @@ def sync_codex_config(
         if target_snapshot is None and include_credentials:
             normalize_codex_catalog_paths(document, source.parent)
         for key in _STANCE_KEYS:
-            if key in source_data:
-                if document.get(key) != source_data[key]:
-                    document[key] = source_data[key]
-            else:
+            if key not in source_data or (
+                locked_gateway
+                and key == "default_permissions"
+                and not _has_permission_profile(document, source_data[key])
+            ):
                 document.pop(key, None)
+            elif document.get(key) != source_data[key]:
+                document[key] = source_data[key]
         policy_conflict = False
         try:
             _sync_pinned_policy(source_data, document)
