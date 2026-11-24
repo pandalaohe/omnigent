@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    set_helper_stop_pending,
     update_active_turn_id,
     write_bridge_state,
 )
@@ -1419,6 +1421,8 @@ async def test_terminal_status_survives_flush_auth_failure(
         "cancelled",
         "cancelled_flush",
         "both_posts",
+        "helper_stop_pending",
+        "bridge_rebound",
         "newer_turn",
         "newer_turn_completed",
     ],
@@ -1441,7 +1445,14 @@ async def test_terminal_status_publication_diagnostics(
     )
 
     async def fail(*args: Any, **kwargs: Any) -> None:
-        if failure_phase in {"newer_turn", "newer_turn_completed"}:
+        if failure_phase == "helper_stop_pending":
+            set_helper_stop_pending(tmp_path, True)
+        elif failure_phase == "bridge_rebound":
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            rebound = replace(state, socket_path=str(tmp_path / "rebound.sock"))
+            write_bridge_state(tmp_path, rebound)
+        elif failure_phase in {"newer_turn", "newer_turn_completed"}:
             update_active_turn_id(tmp_path, "newer_turn")
             if failure_phase == "newer_turn_completed":
                 update_active_turn_id(tmp_path, None)
@@ -1452,6 +1463,8 @@ async def test_terminal_status_publication_diagnostics(
         "stale",
         "cancelled_flush",
         "both_posts",
+        "helper_stop_pending",
+        "bridge_rebound",
         "newer_turn",
         "newer_turn_completed",
     }:
@@ -1496,7 +1509,7 @@ async def test_terminal_status_publication_diagnostics(
                 }
             )
         ]
-        if failure_phase in {"before_status", "after_status"}
+        if failure_phase in {"before_status", "after_status", "helper_stop_pending"}
         else []
     )
     records = [
@@ -1514,7 +1527,14 @@ async def test_terminal_status_publication_diagnostics(
             "RuntimeError",
         ]
         return
-    if failure_phase not in {"before_status", "status_post", "newer_turn", "newer_turn_completed"}:
+    if failure_phase not in {
+        "before_status",
+        "status_post",
+        "helper_stop_pending",
+        "bridge_rebound",
+        "newer_turn",
+        "newer_turn_completed",
+    }:
         assert records == []
         return
     (record,) = records
@@ -1526,7 +1546,13 @@ async def test_terminal_status_publication_diagnostics(
         "protocol_source": "turn/completed",
         "delivery_phase": (
             "before_status"
-            if failure_phase in {"newer_turn", "newer_turn_completed"}
+            if failure_phase
+            in {
+                "helper_stop_pending",
+                "bridge_rebound",
+                "newer_turn",
+                "newer_turn_completed",
+            }
             else failure_phase
         ),
         "exception_type": "DatabricksAuthError",

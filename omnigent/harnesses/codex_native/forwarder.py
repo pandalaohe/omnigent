@@ -6702,7 +6702,19 @@ async def _handle_terminal_turn_boundary_inner(
     except Exception as exc:  # noqa: BLE001 -- re-raised after publishing the native outcome.
         preparation_error = exc
     if preparation_error is not None and bridge_dir is not None:
-        if prepared_bridge is None or read_bridge_state(bridge_dir) != prepared_bridge:
+        current = read_bridge_state(bridge_dir)
+        if (
+            prepared_bridge is None
+            or current is None
+            or current.session_id != prepared_bridge.session_id
+            or current.socket_path != prepared_bridge.socket_path
+            or current.thread_id != prepared_bridge.thread_id
+            or current.codex_home != prepared_bridge.codex_home
+            or current.active_turn_revision != prepared_bridge.active_turn_revision
+            or current.active_turn_id != prepared_bridge.active_turn_id
+            or current.last_terminal_turn_id != prepared_bridge.last_terminal_turn_id
+            or current.last_terminal_outcome != prepared_bridge.last_terminal_outcome
+        ):
             raise preparation_error
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
