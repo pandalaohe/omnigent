@@ -6645,14 +6645,24 @@ class HostProcess:
         except Exception:  # noqa: BLE001
             pass
         from omnigent.host.restart import supervisor_kind
+        from omnigent.onboarding.acp_auth import acp_agents
 
         supervisor = await asyncio.to_thread(supervisor_kind)
+        try:
+            acp_permission_tiers = {
+                f"acp:{entry.slug}": entry.permission_tier
+                for entry in await asyncio.to_thread(acp_agents)
+                if entry.permission_tier is not None
+            }
+        except (OSError, ValueError, TypeError):
+            acp_permission_tiers = {}
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
             configured_harnesses=self._configured_harnesses,
+            acp_permission_tiers=acp_permission_tiers,
             platform=sys.platform,
             harness_accounts=self._harness_accounts,
             gateway_inference=self._gateway_inference,

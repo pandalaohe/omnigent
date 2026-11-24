@@ -39,6 +39,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_model_options import record_host_model_options
 from omnigent.server.routes.hosts import _proxy_model_options
 from omnigent.server.schemas import (
     CallingDefaultsCatalogRow,
@@ -107,28 +108,8 @@ async def _sync_pair(
         except Exception as exc:  # noqa: BLE001 — one pair never fails the sync
             await asyncio.to_thread(catalog_store.mark_error, host_id, harness, str(exc))
             return
-        models = result.get("models")
-        if result.get("status") == "ok" and isinstance(models, list):
-            payload = [row for row in models if isinstance(row, dict)]
-            await asyncio.to_thread(
-                catalog_store.upsert,
-                host_id,
-                harness,
-                payload,
-                now_epoch(),
-                permission_options=result.get("permission_options"),
-                injects_prompt=result.get("injects_prompt"),
-            )
-            return
-        error = result.get("error")
-        if not isinstance(error, str) or not error:
-            error = "host model-options lookup failed"
-        await asyncio.to_thread(
-            catalog_store.mark_error,
-            host_id,
-            harness,
-            error,
-            injects_prompt=result.get("injects_prompt"),
+        await record_host_model_options(
+            catalog_store, host_id, harness, result, fetched_at=now_epoch()
         )
 
 
@@ -280,7 +261,9 @@ def create_calling_defaults_router(
                         syncs.append(asyncio.shield(task))
                     continue
                 syncs.append(
-                    _sync_pair(
+                    await_acp_catalog(host.host_id, conn, harness, manual=True)
+                    if canonicalize_harness(harness) == "acp"
+                    else _sync_pair(
                         host_registry=host_registry,
                         host_conn=conn,
                         catalog_store=catalog_store,
@@ -356,7 +339,7 @@ def create_calling_defaults_router(
         if host_id is not None or harness is not None:
             return CallingDefaultsCatalogsResponse(
                 rows=[
-                    _catalog_row(record, host_registry)
+                    read_catalog_row(record)
                     for record in records
                     if wanted is None or record["harness"] == wanted
                 ],
@@ -366,19 +349,11 @@ def create_calling_defaults_router(
         known = {
             (row["host_id"], row["harness"])
             for row in records
-            if row.get("injects_prompt") is not None
+            if row.get("injects_prompt") is not None or acp_catalog_expired(row)
         }
-        semaphore = asyncio.Semaphore(_SYNC_CONCURRENCY)
         await asyncio.gather(
             *(
-                _sync_pair(
-                    host_registry=host_registry,
-                    host_conn=conn,
-                    catalog_store=catalog_store,
-                    semaphore=semaphore,
-                    host_id=host.host_id,
-                    harness=harness,
-                )
+                await_acp_catalog(host.host_id, conn, harness)
                 for host in hosts
                 if (conn := host_registry.get(host.host_id)) is not None
                 for harness, ready in (host.configured_harnesses or {}).items()
@@ -389,7 +364,7 @@ def create_calling_defaults_router(
         )
         records = await asyncio.to_thread(catalog_store.list, host_ids)
         return CallingDefaultsCatalogsResponse(
-            rows=[_catalog_row(record, host_registry) for record in records]
+            rows=[read_catalog_row(record) for record in records]
         )
 
     @router.get("/calling-defaults/resolve")
@@ -554,5 +529,58 @@ def create_calling_defaults_router(
             warnings=warnings,
             notes=list(resolution.notes),
         )
+
+    # Share one probe per workspace, host and ACP agent across readers and manual sync.
+    acp_refreshes: dict[tuple[int, str, str], asyncio.Task[None]] = {}
+    acp_attempts: TTLCache[tuple[int, str, str], bool] = TTLCache(maxsize=4096, ttl=60)
+    acp_sync_limit = asyncio.Semaphore(_SYNC_CONCURRENCY)
+
+    def acp_catalog_expired(record: dict[str, Any]) -> bool:
+        if canonicalize_harness(record["harness"]) != "acp":
+            return False
+        fetched_at = record["fetched_at"]
+        return fetched_at is None or now_epoch() - fetched_at >= 300
+
+    def start_acp_catalog_refresh(
+        host_id: str, conn: HostConnection, harness: str, *, manual: bool = False
+    ) -> asyncio.Task[None] | None:
+        key = (current_workspace_id(), host_id, harness)
+        if task := acp_refreshes.get(key):
+            return task
+        if not manual and key in acp_attempts:
+            return None
+
+        async def refresh() -> None:
+            try:
+                await _sync_pair(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    catalog_store=catalog_store,
+                    semaphore=acp_sync_limit,
+                    host_id=host_id,
+                    harness=harness,
+                    refresh="force",
+                )
+            finally:
+                acp_attempts[key] = True
+                acp_refreshes.pop(key, None)
+
+        task = asyncio.create_task(refresh(), name=f"acp-catalog-{host_id}")
+        acp_refreshes[key] = task
+        return task
+
+    def read_catalog_row(record: dict[str, Any]) -> CallingDefaultsCatalogRow:
+        row = _catalog_row(record, host_registry)
+        if acp_catalog_expired(record):
+            row.stale = True
+            if conn := host_registry.get(row.host_id):
+                start_acp_catalog_refresh(row.host_id, conn, row.harness)
+        return row
+
+    async def await_acp_catalog(
+        host_id: str, conn: HostConnection, harness: str, *, manual: bool = False
+    ) -> None:
+        if task := start_acp_catalog_refresh(host_id, conn, harness, manual=manual):
+            await asyncio.shield(task)
 
     return router

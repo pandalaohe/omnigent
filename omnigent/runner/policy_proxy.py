@@ -14,6 +14,7 @@ from typing import Any
 import httpcore
 import httpx
 
+from omnigent.permission_tiers import Verdict
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -58,6 +59,7 @@ async def _evaluate_policy_via_omnigent(
     phase: str,
     data: dict[str, Any],
     on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
+    acp_tier: Verdict | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -130,26 +132,32 @@ async def _evaluate_policy_via_omnigent(
         # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
         # remains the single real cap. Fast connect so an unreachable
         # server still fails out promptly into the fail-open path below.
-        ap_resp, ap_error = await post_evaluate_with_retry_async(
-            server_client,
-            f"/v1/sessions/{conversation_id}/policies/evaluate",
-            {
-                "event": {
-                    "type": phase,
-                    "data": data,
-                    **(
-                        {"target": data["name"]}
-                        if phase == "PHASE_TOOL_RESULT"
-                        and isinstance(data.get("name"), str)
-                        and data["name"]
-                        else {}
-                    ),
+        ap_resp, ap_error = (
+            (None, None)
+            if acp_tier == Verdict.DENY
+            else await post_evaluate_with_retry_async(
+                server_client,
+                f"/v1/sessions/{conversation_id}/policies/evaluate",
+                {
+                    "event": {
+                        "type": phase,
+                        "data": data,
+                        **(
+                            {"target": data["name"]}
+                            if phase == "PHASE_TOOL_RESULT"
+                            and isinstance(data.get("name"), str)
+                            and data["name"]
+                            else {}
+                        ),
+                    },
                 },
-            },
-            _ASK_GATE_DELIVERY_TIMEOUT,
-            "runner policy evaluate",
+                _ASK_GATE_DELIVERY_TIMEOUT,
+                "runner policy evaluate",
+            )
         )
-        if ap_resp is None:
+        if acp_tier == Verdict.DENY:
+            verdict_reason = "The host permission tier denied the ACP tool call."
+        elif ap_resp is None:
             _logger.warning(
                 "AP policy evaluate failed for %s; defaulting to %s: %s",
                 evaluation_id,
@@ -196,6 +204,15 @@ async def _evaluate_policy_via_omnigent(
         )
 
     # Post the verdict back to the harness as a policy_verdict event.
+    if phase == "PHASE_TOOL_CALL" and (
+        acp_tier is not None
+        or (isinstance(verdict_data, dict) and "_omnigent_acp_tier" in verdict_data)
+    ):
+        # An independent policy can veto a call, but cannot forge a host grant.
+        verdict_data = dict(verdict_data) if isinstance(verdict_data, dict) else {}
+        verdict_data.pop("_omnigent_acp_tier", None)
+        if acp_tier in (Verdict.ALLOW, Verdict.ASK):
+            verdict_data["_omnigent_acp_tier"] = acp_tier.value.lower()
     if (
         phase == "PHASE_TOOL_RESULT"
         and isinstance(data.get("call_id"), str)

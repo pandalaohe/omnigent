@@ -117,6 +117,7 @@ from omnigent.native.failure_telemetry import FailureContext
 from omnigent.permission_tiers.pi_private import pi_bridge_failure, redact_pi_authority
 from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
+from omnigent.shell_timeouts import shell_dispatch_timeout
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -11789,6 +11790,7 @@ def _run_relay_tool(
         if name == "sys_session_update"
         else _TOOL_CALL_TIMEOUT_S
     )
+    timeout = shell_dispatch_timeout(name, arguments, timeout)
     deadline = ToolCallDeadline(timeout)
 
     async def execute() -> object:

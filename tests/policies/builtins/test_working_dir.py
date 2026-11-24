@@ -88,7 +88,8 @@ def test_shell_surface_covers_every_harness(tool: str) -> None:
     :param tool: A shell tool name from the shared default set.
     """
     policy = block_working_dir_changes()
-    result = policy(tc(tool, {"command": "cd /etc"}))
+    command_key = "CommandLine" if tool == "run_command" else "command"
+    result = policy(tc(tool, {command_key: "cd /etc"}))
     assert result is not None and result["result"] == "DENY"
 
 

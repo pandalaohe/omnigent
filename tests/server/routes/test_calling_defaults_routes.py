@@ -93,11 +93,13 @@ class _Stores:
     prefs: SqlAlchemyUserPreferencesStore
 
 
-def _seed_agent(stores: _Stores, agent_id: str, harness: str) -> None:
+def _seed_agent(
+    stores: _Stores, agent_id: str, harness: str, *, name: str = "calling-defaults-agent"
+) -> None:
     """Register a template agent whose spec resolves to *harness*."""
     location = f"{agent_id}/bundle"
     stores.artifact_store.put(location, _bundle(harness))
-    stores.agent_store.create(agent_id, "calling-defaults-agent", location)
+    stores.agent_store.create(agent_id, name, location)
 
 
 @pytest.fixture()
@@ -186,7 +188,7 @@ async def test_acp_delivery_metadata_without_manual_sync(
     proxy = AsyncMock(
         return_value={
             "status": status,
-            "models": [],
+            "models": [{"id": "available"}] if status == "ok" else [],
             "error": "probe failed" if status == "failed" else None,
             "injects_prompt": False,
         }
@@ -793,6 +795,146 @@ async def test_acp_session_patch_preserves_literal_values_and_null_reset(
         assert response.json()["reasoning_effort"] == effort
 
 
+async def test_acp_host_tier_is_an_opt_in_on_child_create(client, app, stores):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    legacy = await client.post("/v1/sessions", json=request)
+    assert legacy.status_code == 201, legacy.text
+    assert legacy.json()["permission_tier"] is None
+
+    connection = app.state.host_registry.get(HOST_A)
+    connection.hello.acp_permission_tiers = {"acp:neutral": "auto"}
+    defaulted = await client.post("/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS)
+    assert defaulted.status_code == 201, defaulted.text
+    assert defaulted.json()["permission_tier"] == "auto"
+
+    explicit = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "accept-edits"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert explicit.status_code == 201, explicit.text
+    assert explicit.json()["permission_tier"] == "accept-edits"
+    assert explicit.json()["permission_tier_state"] == "blocked"
+
+
+@pytest.mark.parametrize("harness", ["acp:neutral", "pi", "pi-native", "antigravity-native"])
+async def test_agent_created_child_cannot_widen_the_source_tier(client, stores, harness):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 2, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    parent = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    denied = await client.post(
+        "/v1/sessions", json={**request, "permission_tier": "auto"}, headers=agent_headers
+    )
+    assert denied.status_code == 403, denied.text
+    allowed = await client.post("/v1/sessions", json=request, headers=agent_headers)
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["permission_tier"] == "plan"
+    user_selected = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "auto"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert user_selected.status_code == 201, user_selected.text
+    assert user_selected.json()["permission_tier"] == "auto"
+
+
+async def test_expired_acp_model_catalog_refreshes_once_and_preserves_last_success(
+    client, app, stores, monkeypatch
+):
+    import asyncio
+
+    from tests._helpers.polling import poll_until_async
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp:neutral": True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    stores.cache.upsert(HOST_A, "acp:neutral", previous, 100)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def failed_probe(**kwargs):
+        assert kwargs["refresh"] == "force"
+        started.set()
+        await release.wait()
+        return {"status": "failed", "error": "ACP probe timed out"}
+
+    proxy = AsyncMock(side_effect=failed_probe)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults.now_epoch", lambda: 1000)
+    params = {"host_id": HOST_A, "harness": "acp:neutral"}
+    try:
+        first = await client.get("/v1/calling-defaults/catalogs", params=params)
+        row = first.json()["rows"][0]
+        assert row["stale"] is True
+        assert row["models"] == previous
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = await client.get("/v1/calling-defaults/catalogs", params=params)
+        assert second.json()["rows"][0]["models"] == previous
+        proxy.assert_awaited_once()
+    finally:
+        release.set()
+    await poll_until_async(
+        lambda: stores.cache.list([HOST_A])[0]["error"] is not None, timeout_s=2
+    )
+    row = stores.cache.list([HOST_A])[0]
+    assert row["models"] == previous
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe timed out"
+
+
+@pytest.mark.parametrize("surface", ["sync", "model-refresh"])
+async def test_empty_acp_refresh_cannot_replace_the_server_catalog(
+    client, app, stores, monkeypatch, surface
+):
+    harness = "acp:neutral"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    previous_modes = [{"value": "default", "label": "Default"}]
+    stores.cache.upsert(HOST_A, harness, previous, 100, permission_options=previous_modes)
+    proxy = AsyncMock(return_value={"status": "ok", "models": [], "injects_prompt": False})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_model_options", proxy)
+
+    if surface == "sync":
+        response = await client.post(
+            "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
+        )
+        assert response.status_code == 200, response.text
+    else:
+        response = await client.get(
+            f"/v1/hosts/{HOST_A}/harnesses/{harness}/model-options?refresh=force"
+        )
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "ACP probe returned an empty model catalog"
+    row = next(row for row in stores.cache.list([HOST_A]) if row["harness"] == harness)
+    assert row["models"] == previous
+    assert row["permission_options"] == previous_modes
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe returned an empty model catalog"
+
+
 async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
 
@@ -816,6 +958,7 @@ async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stor
     )
     assert synced.status_code == 200, synced.text
     assert synced.json()["rows"][0]["permission_options"] == options
+    assert proxy.await_args.kwargs["refresh"] == "force"
     stores.prefs.patch_namespace(
         "local", "calling_defaults", {"*": {"*": {"permission": "automatic"}}}
     )
@@ -884,6 +1027,51 @@ async def test_acp_mode_label_survives_fork_and_continue(client, stores):
         response = await client.post(f"/v1/sessions/{source.id}/{operation}", json={})
         assert response.status_code == 201, response.text
         assert response.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "review"
+
+
+@pytest.mark.parametrize("operation", ["fork", "continue", "switch"])
+async def test_managed_acp_derivation_builds_fresh_permission_state(client, stores, operation):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    harness = "acp:neutral"
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 7, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    labels[PERMISSION_RUNTIME_ID_LABEL_KEY] = "source-runtime"
+    source = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+    body = {}
+    if operation == "switch":
+        _seed_agent(stores, HOST_B, "codex", name="other-agent")
+        body = {"agent_id": HOST_B}
+    if operation == "continue":
+        archived = await client.patch(
+            f"/v1/sessions/{source.id}", json={"archived": True}, headers=PERMISSION_TIERS_HEADERS
+        )
+        assert archived.status_code == 200, archived.text
+    response = await client.post(
+        f"/v1/sessions/{source.id}/{'continue' if operation == 'continue' else 'fork'}",
+        json=body,
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert response.status_code == 201, response.text
+    derived = conversations.get_conversation(response.json()["id"])
+    assert PERMISSION_RUNTIME_ID_LABEL_KEY not in derived.labels
+    assert PERMISSION_CAPABILITY_LABEL_KEY not in derived.labels
+    if operation == "switch":
+        assert PERMISSION_STATE_LABEL_KEY not in derived.labels
+        assert response.json()["permission_tier"] is None
+    else:
+        assert read_permission_state(derived.labels, harness=harness) == ConfirmedPermissionState(
+            "plan", 1, "blocked"
+        )
 
 
 async def test_acp_mode_unreported_by_an_older_host_is_refused(client, stores):

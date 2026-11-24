@@ -11874,6 +11874,86 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
 
 
 @pytest.mark.asyncio
+async def test_antigravity_native_mcp_honors_explicit_long_shell_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    data = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data))
+    monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", data / "antigravity-native")
+    bridge_dir = agy_bridge.prepare_bridge_dir("conv_agy")
+    agy_bridge.write_mcp_bridge_config(bridge_dir)
+    server = agy_bridge.build_mcp_config(bridge_dir)["mcpServers"]["omnigent"]
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    class ElapsedDeadline(ToolCallDeadline):
+        def __init__(self, seconds: float) -> None:
+            super().__init__(seconds)
+            self._started -= 600
+
+        def remaining(self) -> float:
+            remaining = super().remaining()
+            if remaining > 0:
+                loop.call_soon_threadsafe(release.set)
+            return remaining
+
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", ElapsedDeadline)
+
+    async def execute(name, arguments):
+        assert name == "sys_os_shell"
+        assert arguments == {"command": "echo done", "timeout": 720}
+        await release.wait()
+        return {"stdout": "done", "exit_code": 0}
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_os_shell"}],
+        tool_executor=execute,
+        loop=loop,
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            server["command"],
+            *server["args"],
+            env={**os.environ, **server["env"]},
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            for request in (
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sys_os_shell",
+                        "arguments": {"command": "echo done", "timeout": 720},
+                    },
+                },
+            ):
+                proc.stdin.write((json.dumps(request) + "\n").encode())
+                await proc.stdin.drain()
+                response = json.loads(await asyncio.wait_for(proc.stdout.readline(), timeout=8))
+                assert response["id"] == request["id"]
+            result = response["result"]
+            assert json.loads(result["content"][0]["text"]) == {"stdout": "done", "exit_code": 0}
+        finally:
+            proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_start_tool_relay_accepts_opencode_native_bridge_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23855,6 +23935,56 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         }
     else:
         assert settings_path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments", "elapsed", "completes"),
+    [
+        ("sys_os_shell", {"command": "echo done", "timeout": 720}, 600, True),
+        ("sys_os_shell", {"command": "echo done"}, 1800, True),
+        ("sys_os_shell", {"command": "echo done"}, 2200, False),
+        ("sys_custom", {"timeout": 720}, 600, False),
+        ("sys_os_shell", {"command": "echo done", "timeout": 12000}, 7300, False),
+    ],
+)
+async def test_relay_preserves_explicit_long_shell_timeout(
+    monkeypatch, name, arguments, elapsed, completes
+):
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    class ElapsedDeadline(ToolCallDeadline):
+        def __init__(self, seconds):
+            super().__init__(seconds)
+            self._started -= elapsed
+
+        def remaining(self):
+            remaining = super().remaining()
+            if remaining > 0:
+                loop.call_soon_threadsafe(release.set)
+            return remaining
+
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", ElapsedDeadline)
+
+    async def executor(_name, _arguments):
+        await release.wait()
+        return {"completed": True}
+
+    result = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        executor,
+        loop,
+        name,
+        arguments,
+    )
+    if completes:
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    else:
+        assert result["isError"]
+        assert "timed out after" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ import logging
 from typing import Any
 
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
+from omnigent.shell_timeouts import DEFAULT_SHELL_TIMEOUT_S
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.json_serialization import json_dumps_transport_safe
 
@@ -128,7 +129,9 @@ _OS_SHELL_SCHEMA: dict[str, Any] = {
         },
         "timeout": {
             "type": "integer",
-            "description": "Timeout in seconds.",
+            "description": (
+                f"Maximum command runtime in seconds (default: {DEFAULT_SHELL_TIMEOUT_S})."
+            ),
         },
     },
     "required": ["command"],

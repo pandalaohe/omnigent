@@ -289,7 +289,8 @@ from omnigent.sdk_permission_modes import (
 from omnigent.server.permission_tiers import (
     PERMISSION_STATE_LABEL_KEY,
     REGISTRY_TOOL_INSPECTION_HEADER,
-    TIER_HARNESSES,
+    is_acp_permission_harness,
+    permission_tier_active,
 )
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -10946,12 +10947,19 @@ def create_runner_app(
 
         if harness_name is not None:
             await prepare_capture(server_client, conv_id, harness_name)
-        if harness_name in TIER_HARNESSES:
+        managed_tier = permission_tier_active(harness_name, startup_labels or {})
+        if managed_tier:
             permission_state = permission_tiers.state(conv_id)
             if permission_state is None or permission_state.status != "ready":
                 init_error = await _wait_for_permission_initialization(conv_id)
                 if init_error is not None:
                     return init_error
+        acp_host_tier = managed_tier and is_acp_permission_harness(harness_name)
+        if is_acp_permission_harness(harness_name):
+            spawn_env = {
+                **(spawn_env or {}),
+                "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier else "0",
+            }
         _clean_terminal_exit_responses.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
@@ -11798,6 +11806,16 @@ def create_runner_app(
                                     _eval_id = event.get("evaluation_id", "")
                                     _eval_phase = event.get("phase", "")
                                     _eval_data = event.get("data") or {}
+                                    acp_tier = None
+                                    if (
+                                        acp_host_tier
+                                        and _eval_phase == "PHASE_TOOL_CALL"
+                                        and "_omnigent_acp_call" in _eval_data
+                                    ):
+                                        _eval_data = dict(_eval_data)
+                                        acp_tier = permission_tiers.evaluate_acp_call(
+                                            conv_id, _eval_data.pop("_omnigent_acp_call", None)
+                                        )
                                     _track_dispatch_task(
                                         _asyncio.create_task(
                                             _evaluate_policy_via_omnigent(
@@ -11807,6 +11825,11 @@ def create_runner_app(
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                **(
+                                                    {"acp_tier": acp_tier}
+                                                    if acp_tier is not None
+                                                    else {}
+                                                ),
                                                 # A dead verdict-delivery channel
                                                 # parks the harness turn forever;
                                                 # route it to the recovery entry,
@@ -13599,14 +13622,22 @@ def create_runner_app(
             from omnigent.server.permission_tiers import read_permission_state
 
             harness = _session_harness_name(conversation_id)
-            if harness not in {"pi", "pi-native", "antigravity-native"}:
+            if harness not in {"pi", "pi-native", "antigravity-native"} and not (
+                is_acp_permission_harness(harness)
+                and permission_tiers.observation_harness(conversation_id) == harness
+            ):
                 return JSONResponse(status_code=400, content={"error": "unsupported_harness"})
             if not isinstance(body, dict):
                 return JSONResponse(status_code=400, content={"error": "invalid_input"})
             target = body.get("permission_tier")
             transaction_id = body.get("transaction_id")
             expected_revision = body.get("expected_revision")
-            allowed_tiers = NON_FULL_TIERS if harness == "antigravity-native" else PERMISSION_TIERS
+            assert harness is not None
+            allowed_tiers = (
+                NON_FULL_TIERS
+                if harness == "antigravity-native" or is_acp_permission_harness(harness)
+                else PERMISSION_TIERS
+            )
             if (
                 target not in allowed_tiers
                 or not isinstance(transaction_id, str)
@@ -13709,7 +13740,7 @@ def create_runner_app(
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
                                 deadline=agy_switch_deadline,
                             )
-                        else:
+                        elif harness in ("pi", "pi-native"):
                             from omnigent.harnesses.pi_native.bridge import (
                                 apply_pi_permission_tier,
                             )
@@ -13813,7 +13844,7 @@ def create_runner_app(
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
                                 deadline=agy_switch_deadline,
                             )
-                        else:
+                        elif harness in ("pi", "pi-native"):
                             from omnigent.harnesses.pi_native.bridge import (
                                 apply_pi_permission_tier,
                             )
