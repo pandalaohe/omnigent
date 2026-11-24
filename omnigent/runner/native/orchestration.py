@@ -3770,13 +3770,14 @@ async def _auto_create_pi_terminal(
 
     register_pi_native_sessions(session_dir, session_id)
     raw_instructions = raw_author_instructions(pi_spec) if pi_spec is not None else None
-    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
-    pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
     if pi_spec is not None:
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+        if system_prompt_mode == "replace" and raw_instructions is None:
+            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
@@ -5325,18 +5326,22 @@ async def _auto_create_devin_terminal(
     # ride the first message instead, which is weaker but stays in this session.
     # Framework text is always session-scoped, so it rides that preamble; the
     # rule must stay free of it for a Devin launched here outside Omnigent.
-    from omnigent.runtime.prompt import _framework_instructions_for, raw_author_instructions
+    from omnigent.runtime.prompt import (
+        InstructionPart,
+        native_startup_instruction_parts,
+        raw_author_instructions,
+    )
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     raw_instructions = raw_author_instructions(spec) if spec is not None else None
     rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
-    preamble_parts: list[str] = []
-    if raw_instructions and not rule_is_live:
-        preamble_parts.append(raw_instructions)
-    if spec is not None:
-        preamble_parts.extend(_framework_instructions_for(spec))
-    if global_instructions and global_instructions.strip():
-        preamble_parts.append(global_instructions)
+    preamble_parts = [
+        part.text
+        for part in native_startup_instruction_parts(
+            spec, [InstructionPart("user_layers", global_instructions)]
+        )
+        if part.text is not None and (part.kind != "author" or not rule_is_live)
+    ]
     if preamble_parts:
         write_agent_instructions_preamble(bridge_dir, "\n\n".join(preamble_parts))
     if rule_is_live:
@@ -9064,28 +9069,6 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
-def _opencode_session_instructions_from_spec(
-    agent_spec: AgentSpec | ResolvedSpec | None,
-) -> str | None:
-    """Compose the session-snapshot instructions written to OpenCode's AGENTS.md.
-
-    Author instructions plus the spec-level framework instructions from
-    ``omnigent.runtime.prompt``. No per-request text or turn-bound framework
-    text is included: AGENTS.md is written once per launch and read for every
-    later turn. Tool schemas are empty, matching the runner's own composition.
-
-    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
-        ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The composed text, or ``None`` when there is no spec.
-    """
-    from omnigent.runtime.prompt import build_instructions_nullable
-
-    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    if spec is None:
-        return None
-    return build_instructions_nullable(spec, None, [])
-
-
 def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
     *,
@@ -10552,6 +10535,7 @@ async def _auto_create_claude_terminal(
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
         bridge_dir_for_bridge_id,
+        claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -11360,10 +11344,13 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(
-            claude_config,
-            client_surface=resource_registry.client_surface(session_id),
-        ),
+        env={
+            **build_native_claude_terminal_env(
+                claude_config,
+                client_surface=resource_registry.client_surface(session_id),
+            ),
+            **claude_terminal_relay_env(bridge_dir),
+        },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning

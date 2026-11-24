@@ -3,6 +3,11 @@ import {
   listCallingDefaultCatalogs,
   type CallingDefaultsCatalogRow,
 } from "@/lib/callingDefaultsApi";
+import {
+  EditSentMessageContext,
+  useEditSentMessage,
+  type SentMessage,
+} from "@/components/chat/editSentMessage";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -192,6 +197,7 @@ import {
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
+  recallFileMentions,
 } from "@/lib/composerMentions";
 import {
   MENTION_SEARCH_DEBOUNCE_MS,
@@ -1939,6 +1945,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     if (!sent) toast.error("This session can't take a message right now.");
     return sent;
   }, []);
+
+  // Stable, so the memoized transcript doesn't re-render when the composer does.
+  const editSentMessage = useCallback(
+    (message: SentMessage) => composerRef.current?.editSentMessage(message),
+    [],
+  );
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
@@ -2179,6 +2191,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     );
   });
 
+  const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
   // the terminal overlays, disposing the live attaches they exist to
@@ -2193,28 +2207,30 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <CodeBlockSendContext.Provider value={sendCodeBlock}>
-            <Transcript
-              hostId={hostId}
-              setConversationEl={setConversationEl}
-              containerEl={containerEl}
-              scroller={scroller}
-              setScroller={setScroller}
-              sendScrollNonce={sendScrollNonce}
-              hasMoreHistory={hasMoreHistory}
-              loadingMoreHistory={loadingMoreHistory}
-              isMobileViewport={isMobileViewport}
-              showsWorking={showsWorking}
-              agentsError={agentsError}
-              sandboxLaunching={sandboxLaunching}
-              canCancelStartup={isOwnerLevel(permissionLevel)}
-              conversationId={conversationId}
-              scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
-              openedConversationIdRef={autoScrolledConversationIdRef}
-              spacerMeasureRef={spacerMeasureRef}
-            />
+            <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
+              <Transcript
+                hostId={hostId}
+                setConversationEl={setConversationEl}
+                containerEl={containerEl}
+                scroller={scroller}
+                setScroller={setScroller}
+                sendScrollNonce={sendScrollNonce}
+                hasMoreHistory={hasMoreHistory}
+                loadingMoreHistory={loadingMoreHistory}
+                isMobileViewport={isMobileViewport}
+                showsWorking={showsWorking}
+                agentsError={agentsError}
+                sandboxLaunching={sandboxLaunching}
+                canCancelStartup={isOwnerLevel(permissionLevel)}
+                conversationId={conversationId}
+                scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
+                openedConversationIdRef={autoScrolledConversationIdRef}
+                spacerMeasureRef={spacerMeasureRef}
+              />
+            </EditSentMessageContext.Provider>
           </CodeBlockSendContext.Provider>
           {/* Floating reply button — scoped to the conversation container. */}
-          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+          {!composerReadOnly && (
             <SelectionPopup
               containerRef={conversationRef}
               onReply={(text) => {
@@ -2351,6 +2367,8 @@ export function ConversationLoadError({
 
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
+  /** Load a sent message into the composer, confirming before replacing a draft. */
+  editSentMessage: (message: SentMessage) => void;
   startSideChat: (selectedText: string) => void;
   sendText: (text: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
@@ -4667,6 +4685,47 @@ function ComposerImpl(
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
+  // Replace the draft with a message brought back for editing, and focus it.
+  // Files recovered from history are validated; queued drafts were checked when added.
+  const loadIntoComposer = (
+    text: string,
+    loadedFiles: File[],
+    {
+      replyDraft,
+      source,
+      validateFiles = false,
+    }: {
+      replyDraft?: StoredReplyDraft;
+      source?: Partial<Parameters<typeof restoreRecordDraft>[0]>;
+      validateFiles?: boolean;
+    } = {},
+  ) => {
+    restoreRecalledText(text, replyDraft, source);
+    dirtyRef.current = true;
+    resetCursor();
+    recallingRef.current = false;
+    textareaRef.current = tailTextareaRef.current;
+    if (validateFiles) replaceFiles(loadedFiles);
+    else restoreFiles(loadedFiles);
+    textareaRef.current?.focus();
+  };
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    target: conversationId,
+    // An edited message may land wherever the user could type it.
+    canAccept: () => !inputDisabled,
+    hasDraft: () => hasDraft,
+    loadText: (text) => {
+      setCommandError(null);
+      dismissMention();
+      const sessionTokens = recallSessionMentions(text).sessions.map((it) => it.token!);
+      const recalled = recallFileMentions(text, sessionTokens);
+      loadIntoComposer(recalled.text, [], { validateFiles: true });
+      // After the load, which clears file mentions while restoring session mentions.
+      setMentionedItems(recalled.files);
+    },
+    focusComposer: () => textareaRef.current?.focus(),
+  });
+
   const replyQuoteInsertedRef = useRef(false);
   // Set when an empty composer is stuffed with a block awaiting the same-commit
   // submit() the layout effect below runs.
@@ -4687,6 +4746,9 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+    },
+    editSentMessage(message) {
+      editSentMessage(message);
     },
     startSideChat(selectedText) {
       // Quote in the visible side chat, or open a pending tab immediately.
@@ -5210,6 +5272,7 @@ function ComposerImpl(
         isMobile && "z-20 px-4 pb-[max(16px,env(safe-area-inset-bottom))]",
       )}
     >
+      {replaceDraftDialog}
       {/* Hidden file input for the attach button */}
       <input
         ref={fileInputRef}
@@ -5253,13 +5316,11 @@ function ComposerImpl(
             // Re-sending re-queues it (busy) or sends it (idle).
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
-            restoreRecalledText(target.text, target.replyDraft, target);
-            dirtyRef.current = true;
-            resetCursor();
-            recallingRef.current = false;
-            restoreFiles(target.files ?? []);
             dequeueMessage(queueId);
-            textareaRef.current?.focus();
+            loadIntoComposer(target.text, target.files ?? [], {
+              replyDraft: target.replyDraft,
+              source: target,
+            });
           }}
           onSteer={(queueId) => steerMessage(queueId)}
           onReorder={reorderQueuedMessage}

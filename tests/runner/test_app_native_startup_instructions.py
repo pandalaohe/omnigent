@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 
 from omnigent.runner.app import ResolvedSpec, _native_startup_instructions_from_spec
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runner.native.orchestration import _opencode_session_instructions
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -36,10 +40,11 @@ def _spec(instructions: str | None) -> AgentSpec:
     [
         (
             "Be a concise assistant.",
-            f"Be a concise assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}",
+            "Be a concise assistant.\n\n"
+            f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}",
         ),
-        (None, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION),
-        ("   \n  ", EMBEDDED_BROWSER_PRIORITY_INSTRUCTION),
+        (None, f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"),
+        ("   \n  ", f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"),
     ],
     ids=["present", "absent", "whitespace-only"],
 )
@@ -49,15 +54,24 @@ def test_native_startup_instructions_from_spec(instructions: str | None, expecte
 
 
 def test_native_startup_instructions_from_spec_none_spec() -> None:
-    """A missing spec yields no instructions (neither channel is injected)."""
-    assert _native_startup_instructions_from_spec(None) is None
+    """A missing spec still receives stable image guidance."""
+    assert _native_startup_instructions_from_spec(None) == WORKSPACE_IMAGE_INSTRUCTION
+
+
+@pytest.mark.parametrize("has_spec", [False, True])
+def test_opencode_startup_carries_image_guidance(has_spec: bool) -> None:
+    """OpenCode's session snapshot carries guidance even without authored text."""
+    result = _opencode_session_instructions(_spec(None) if has_spec else None)
+    assert result is not None
+    assert result.count(WORKSPACE_IMAGE_INSTRUCTION) == 1
 
 
 def test_native_startup_instructions_from_spec_resolved_wrapper() -> None:
-    """A ResolvedSpec wrapper unwraps to the same composed text."""
+    """A ResolvedSpec wrapper unwraps to the same instructions text."""
     wrapped = ResolvedSpec(spec=_spec("Be a concise assistant."), workdir=Path("/tmp"))
     assert _native_startup_instructions_from_spec(wrapped) == (
-        f"Be a concise assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        "Be a concise assistant.\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     )
 
 
@@ -65,5 +79,5 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() -> 
     """The author text is preserved verbatim, not the stripped form."""
     padded = "  Keep leading/trailing whitespace exactly.  "
     assert _native_startup_instructions_from_spec(_spec(padded)) == (
-        f"{padded}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"{padded}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     )

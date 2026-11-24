@@ -206,6 +206,8 @@ export type Bubble =
       sendingSinceMs?: number;
       /** Attachment upload progress for this pending user bubble. */
       uploadProgress?: PendingUploadProgress;
+      /** Pending input the server accepted (its send request succeeded). */
+      accepted?: boolean;
       /** Saved startup message the server never delivered (the launch failed). */
       undelivered?: boolean;
       content: MessageContentBlock[];
@@ -2099,6 +2101,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.stillSending) !== Boolean(b.stillSending) ||
       a.sendingSinceMs !== b.sendingSinceMs ||
       a.uploadProgress !== b.uploadProgress ||
+      Boolean(a.accepted) !== Boolean(b.accepted) ||
       Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||

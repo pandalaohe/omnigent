@@ -47,6 +47,7 @@ import {
   GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
+  WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS,
 } from "./streamdown-security";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
@@ -340,6 +341,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   sendCodeBlocks?: boolean;
   /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
+  /** Preserve workspace images for a session-aware, authenticated component override. */
+  allowWorkspaceImages?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
 };
@@ -776,6 +779,7 @@ export const MessageResponse = memo(
     markFileLinks = false,
     sendCodeBlocks = false,
     allowGitHubAttachmentImages = false,
+    allowWorkspaceImages = false,
     isStreaming = false,
     ...props
   }: MessageResponseProps) => {
@@ -788,6 +792,11 @@ export const MessageResponse = memo(
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
+    let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
+    if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
+    else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
+    else if (allowGitHubAttachmentImages)
+      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
 
     return (
       <CodeBlockSendContext.Provider value={sendCodeBlocks ? inheritedSend : null}>
@@ -812,13 +821,7 @@ export const MessageResponse = memo(
               controls={messageControls}
               mermaid={mermaidOptions}
               // Block remote image fetches that can exfiltrate data through URLs.
-              rehypePlugins={
-                markFileLinks
-                  ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-                  : allowGitHubAttachmentImages
-                    ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-                    : SECURE_STREAMDOWN_REHYPE_PLUGINS
-              }
+              rehypePlugins={rehypePlugins}
             />
           </StreamingTextContext.Provider>
         </MarkdownErrorBoundary>
