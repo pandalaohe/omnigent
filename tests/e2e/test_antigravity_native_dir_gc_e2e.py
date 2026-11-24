@@ -72,6 +72,7 @@ def _spawn_host_daemon(
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
+    env["OMNIGENT_CONFIG_HOME"] = str(home_dir / ".omnigent")
     # The host only launches antigravity-native when agy looks signed in; a
     # placeholder key passes that gate, while an operator-supplied key is kept
     # so a signed-in run can exercise real agy.
@@ -285,7 +286,11 @@ def test_host_restart_retains_recent_antigravity_bridge_then_reclaims_it(
     workspace = tmp_path / "agy_ws"
     workspace.mkdir()
     home_dir = tmp_path / "home"
-    home_dir.mkdir()
+    config_dir = home_dir / ".omnigent"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "host:\n  native_history_cleanup: true\n", encoding="utf-8"
+    )
     monkeypatch.setattr(
         antigravity_bridge,
         "_BRIDGE_ROOT",
