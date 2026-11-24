@@ -2640,6 +2640,43 @@ def test_ordered_prompt_blocks_preserve_text_image_text_order() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_windows_acp_spawn_hides_window_and_keeps_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from omnigent.inner import acp_executor
+
+    executor = AcpExecutor(AcpAgentConfig(command="example-agent"), cwd=str(tmp_path))
+    no_window = 0x08000000
+    new_group = 0x00000200
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    monkeypatch.setattr(acp_executor, "IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr(acp_executor._proc, "IS_POSIX", False)
+    monkeypatch.setattr(acp_executor._proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    spawn = AsyncMock()
+    monkeypatch.setattr(
+        acp_executor,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            create_task=asyncio.create_task,
+            subprocess=asyncio.subprocess,
+        ),
+    )
+    monkeypatch.setattr(executor, "_read_stdout", AsyncMock())
+    monkeypatch.setattr(executor, "_read_stderr", AsyncMock())
+
+    await executor._start_process()
+
+    spawn.assert_awaited_once()
+    kwargs = spawn.await_args.kwargs
+    assert kwargs["creationflags"] == no_window | new_group
+    assert all(kwargs[name] == asyncio.subprocess.PIPE for name in ("stdin", "stdout", "stderr"))
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 @pytest.mark.asyncio
 async def test_spawned_agent_leads_its_own_process_group(tmp_path: Path) -> None:

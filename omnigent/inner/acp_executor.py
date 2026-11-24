@@ -54,12 +54,14 @@ import math
 import os
 import secrets
 import shlex
+import subprocess
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
@@ -645,6 +647,12 @@ class AcpExecutor(Executor):
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
+        # Keep the process group for teardown without opening a Windows console.
+        spawn_options = _proc.spawn_kwargs()
+        if IS_WINDOWS:
+            spawn_options["creationflags"] = spawn_options.get("creationflags", 0) | int(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
         self._proc = await asyncio.create_subprocess_exec(
             launch_path,
             *argv,
@@ -656,7 +664,7 @@ class AcpExecutor(Executor):
             limit=_STREAM_LIMIT,
             # Own session/group: the sandbox launcher forks the real agent,
             # and without a group boundary teardown reaches only the wrapper.
-            **_proc.spawn_kwargs(),
+            **spawn_options,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
