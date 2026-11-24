@@ -115,6 +115,9 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_tmux_target,
 )
 from omnigent.harnesses.antigravity_native.launch import (
+    AGY_CLI_BIND_TIMEOUT_S,
+    AGY_MODEL_LAUNCH_TIMEOUT_S,  # noqa: F401 — preserve the module-level export
+    AGY_TERMINAL_ENSURE_TIMEOUT_S,
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
@@ -639,13 +642,14 @@ async def _prepare_antigravity_terminal(
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
-    timeout = httpx.Timeout(30.0, read=120.0)
+    timeout = httpx.Timeout(30.0, read=AGY_CLI_BIND_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str
         resume = False
+        runner_model = None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException(
@@ -694,6 +698,7 @@ async def _prepare_antigravity_terminal(
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
+            runner_model = payload.get("model_override")
 
         if runner_id is not None:
             await _bind_session_runner(client, session_id, runner_id)
@@ -712,8 +717,8 @@ async def _prepare_antigravity_terminal(
             # only auto-creates AFTER the bind. A CLI launch stays
             # as a defensive fallback when the runner produced no terminal in the
             # window. Mirrors ``_prepare_antigravity_terminal_via_daemon``.
-            autocreated = await _await_runner_antigravity_terminal(
-                client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
+            autocreated = await _attachable_runner_antigravity_terminal(
+                client, session_id, runner_model
             )
             if autocreated is not None:
                 if antigravity_args or model is not None:
@@ -759,6 +764,30 @@ async def _prepare_antigravity_terminal(
 # CLI-side launch — the fallback only fires when the runner produced none.
 _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S = 20.0
 _RUNNER_TERMINAL_POLL_INTERVAL_S = 0.25
+
+
+async def _attachable_runner_antigravity_terminal(
+    client: httpx.AsyncClient, session_id: str, model: object
+) -> LaunchedAntigravityTerminal | None:
+    if not isinstance(model, str) or not model:
+        return await _await_runner_antigravity_terminal(
+            client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
+        )
+
+    # Join the runner's startup so a slow model probe cannot trigger a second
+    # launch. The ensure also returns the runner's explicit rejection to the CLI.
+    response = await client.post(
+        f"/v1/sessions/{url_component(session_id)}/resources/terminals",
+        json={
+            "terminal": _TERMINAL_NAME,
+            "session_key": _TERMINAL_SESSION_KEY,
+            "ensure_native_terminal": True,
+        },
+        timeout=httpx.Timeout(30.0, read=AGY_TERMINAL_ENSURE_TIMEOUT_S),
+    )
+    if response.status_code >= 400:
+        raise click.ClickException(f"Antigravity terminal launch failed: {error_text(response)}")
+    return _launched_antigravity_terminal_from_payload(response.json())
 
 
 async def _await_runner_antigravity_terminal(
@@ -834,11 +863,12 @@ async def _prepare_antigravity_terminal_via_daemon(
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
-    timeout = httpx.Timeout(30.0, read=120.0)
+    timeout = httpx.Timeout(30.0, read=AGY_CLI_BIND_TIMEOUT_S)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str
         resume = False
+        runner_model = None
         fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
@@ -900,6 +930,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
+            runner_model = payload.get("model_override")
 
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
@@ -927,8 +958,8 @@ async def _prepare_antigravity_terminal_via_daemon(
         # this — the runner only auto-creates AFTER the bind. Falling through to a
         # CLI launch stays as a defensive fallback for the (unexpected) case where
         # the runner produced no terminal in the window.
-        autocreated = await _await_runner_antigravity_terminal(
-            client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
+        autocreated = await _attachable_runner_antigravity_terminal(
+            client, session_id, runner_model
         )
         if autocreated is not None:
             if antigravity_args or model is not None:
@@ -1160,7 +1191,7 @@ async def _launch_and_record(
     effort = snapshot.get("reasoning_effort")
     raw_model_options = snapshot.get("model_options")
     catalog_models = raw_model_options if isinstance(raw_model_options, list) else None
-    argv, launch_env = await asyncio.to_thread(
+    launch = await asyncio.to_thread(
         build_agy_launch,
         conversation_id=conversation_id if resume else None,
         model=model,
@@ -1168,19 +1199,26 @@ async def _launch_and_record(
         extra_args=passthrough_args + tuple(agy_tier_launch_args(tier)),
         effort=effort if isinstance(effort, str) and effort else None,
         log_dir=bridge_dir,
+        command=command,
         catalog_models=catalog_models,
     )
-    env_overrides.update(launch_env)
+    try:
+        model_warning = await launch.check_subscription_model()
+    except OmnigentError as exc:
+        raise click.ClickException(exc.message) from exc
+    if model_warning is not None:
+        click.echo(f"Warning: {model_warning}", err=True)
+    env_overrides.update(launch.env)
     await asyncio.to_thread(
         ensure_agy_feedback_survey_disabled,
         agy_home_dir(bridge_dir),
         launch_env={**os.environ, **env_overrides},
     )
     # Lead the args so the flag is never swallowed by a later positional.
-    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    argv = [command, f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
-    argv = wrap_agy_gateway_launch([command, *argv[1:]], env_overrides)
+    argv = wrap_agy_gateway_launch(argv, env_overrides)
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,

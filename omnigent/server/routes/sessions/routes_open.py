@@ -568,6 +568,17 @@ def register_open_routes(
                 if actual is not None:
                     agent_name = public_agent_name(actual.name) or actual.name
         except Exception as exc:
+            if permission_store is not None:
+                try:
+                    if (await asyncio.to_thread(conversation_store.get_conversation, sid)) is None:
+                        # Revoke only a provisional grant without a persisted session.
+                        await asyncio.to_thread(permission_store.revoke, owner, sid)
+                except Exception:
+                    _logger.warning(
+                        "Session-open grant cleanup failed",
+                        exc_info=True,
+                        extra={"session_id": sid},
+                    )
             if (
                 isinstance(exc, HTTPException)
                 and isinstance(exc.detail, dict)
@@ -581,20 +592,6 @@ def register_open_routes(
                 if (body.from_ref or body.branch) and "already exists" in detail.lower()
                 else "create_failed"
             )
-            if (
-                permission_store is not None
-                and (await asyncio.to_thread(conversation_store.get_conversation, sid)) is None
-            ):
-                # No row was persisted: drop the provisional grant so a retry
-                # does not leave an orphan owner behind.
-                try:
-                    await asyncio.to_thread(permission_store.revoke, owner, sid)
-                except Exception:
-                    _logger.warning(
-                        "Session-open grant cleanup failed",
-                        exc_info=True,
-                        extra={"session_id": sid},
-                    )
             message = f"Could not open the session: {detail}"
             if reason == "branch_exists":
                 message += " To join that branch's worktree, pass workspace=<its directory>."

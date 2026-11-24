@@ -38,6 +38,7 @@ from omnigent.runner.identity import (
     strip_runner_auth_secrets,
 )
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
+from omnigent.shell_timeouts import DEFAULT_SHELL_TIMEOUT_S
 from omnigent.util.json_types import JsonValue
 
 from . import _proc
@@ -1104,7 +1105,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
     ) -> OpResult:
         if not isinstance(command, str) or not command.strip():
             return {"error": "command must be a non-empty string"}
-        resolved_timeout = 120 if timeout is None else timeout
+        resolved_timeout = DEFAULT_SHELL_TIMEOUT_S if timeout is None else timeout
         if resolved_timeout < 1:
             return {"error": "timeout must be >= 1"}
         request: dict[str, object] = {
@@ -1390,8 +1391,8 @@ def _handle_helper_request(
         command = request.get("command")
         if not isinstance(command, str) or not command.strip():
             return {"error": "command must be a non-empty string"}
-        timeout_raw = request.get("timeout", 120)
-        timeout = timeout_raw if isinstance(timeout_raw, int) else 120
+        timeout_raw = request.get("timeout")
+        timeout = timeout_raw if isinstance(timeout_raw, int) else DEFAULT_SHELL_TIMEOUT_S
         if timeout < 1:
             return {"error": "timeout must be >= 1"}
         max_output_raw = request.get("max_output")

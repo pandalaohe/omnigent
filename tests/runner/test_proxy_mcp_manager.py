@@ -885,18 +885,18 @@ def test_proxy_call_timeout_exceeds_forward_timeout() -> None:
     """The outer MCP proxy timeout must exceed the AP→runner timeout."""
     from omnigent.harnesses.claude_native.bridge import _TOOL_CALL_TIMEOUT_S
     from omnigent.runner.tool_dispatch import (
-        _OS_ENV_SHELL_DEFAULT_TIMEOUT_S,
         _RUNNER_EXECUTION_TIMEOUT_S,
         _SESSION_CREATE_TIMEOUT,
         _SESSION_CREATE_TOOL_TIMEOUT_S,
         MCP_PROXY_CALL_TIMEOUT_S,
         MCP_PROXY_FORWARD_TIMEOUT_S,
     )
+    from omnigent.shell_timeouts import DEFAULT_SHELL_TIMEOUT_S
 
     assert 0 < _SESSION_CREATE_TIMEOUT.read < _SESSION_CREATE_TOOL_TIMEOUT_S
     assert _SESSION_CREATE_TOOL_TIMEOUT_S < _TOOL_CALL_TIMEOUT_S < MCP_PROXY_FORWARD_TIMEOUT_S
 
-    assert MCP_PROXY_FORWARD_TIMEOUT_S > _OS_ENV_SHELL_DEFAULT_TIMEOUT_S, (
+    assert MCP_PROXY_FORWARD_TIMEOUT_S > DEFAULT_SHELL_TIMEOUT_S, (
         "AP→runner read timeout must exceed the default sys_os_shell timeout; "
         "otherwise a valid synchronous shell tool can be cut off by transport."
     )

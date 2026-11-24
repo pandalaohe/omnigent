@@ -2936,7 +2936,15 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(TimeoutError, OSError):
+                    await asyncio.wait_for(proc.wait(), timeout=1)
+            raise
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
         return stdout.decode()

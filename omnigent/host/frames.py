@@ -421,6 +421,7 @@ class HostHelloFrame:
     terminal_runner_id: str | None = None
     supervised: str | None = None
     started_at: int | None = None
+    acp_permission_tiers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -772,6 +773,9 @@ class LoadLevelReport:
     heavy: float
     new_session: float
     lines_synced_at: str | None
+    # Averages from the completed minute behind the scheduling transition, when attributable.
+    decision_load_per_core: float | None = None
+    decision_mem_pct: float | None = None
 
 
 @dataclass
@@ -2257,6 +2261,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 **_encode_configured_harnesses(frame.configured_harnesses),
+                **(
+                    {"acp_permission_tiers": frame.acp_permission_tiers}
+                    if frame.acp_permission_tiers
+                    else {}
+                ),
                 **({"platform": frame.platform} if frame.platform is not None else {}),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
@@ -3881,12 +3890,28 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     :param msg: Decoded frame object.
     :returns: Typed host hello frame.
     """
+    from omnigent.permission_tiers import NON_FULL_TIERS
+
+    raw_tiers = msg.get("acp_permission_tiers")
+    acp_permission_tiers: dict[str, str] = (
+        {
+            key: value
+            for key, value in raw_tiers.items()
+            if isinstance(key, str)
+            and key.startswith("acp:")
+            and isinstance(value, str)
+            and value in NON_FULL_TIERS
+        }
+        if isinstance(raw_tiers, dict)
+        else {}
+    )
     return HostHelloFrame(
         version=_required_str(msg, "version"),
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_decode_configured_harnesses(msg),
+        acp_permission_tiers=acp_permission_tiers,
         platform=_optional_nullable_str(msg, "platform"),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
@@ -5149,6 +5174,8 @@ def _decode_load_level(msg: _JsonObject) -> LoadLevelReport | None:
         heavy=_required_float(raw, "heavy"),
         new_session=_required_float(raw, "new_session"),
         lines_synced_at=_optional_nullable_str(raw, "lines_synced_at"),
+        decision_load_per_core=_optional_nullable_float(raw, "decision_load_per_core"),
+        decision_mem_pct=_optional_nullable_float(raw, "decision_mem_pct"),
     )
 
 

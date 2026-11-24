@@ -1118,13 +1118,19 @@ class SystemStatusHub:
         return entry.name if entry is not None else host_id
 
     def host_load(
-        self, workspace_id: int, host_id: str, *, now: float | None = None
+        self,
+        workspace_id: int,
+        host_id: str,
+        *,
+        now: float | None = None,
+        include_decision: bool = False,
     ) -> dict[str, Any]:
         """Current host-reported load; stale or disconnected telemetry fails open."""
         entry = self._entries.get((workspace_id, host_id))
         if entry is not None:
             self._expire_load(entry, time.time() if now is None else now)
-        machine = (entry.last_snapshot or {}).get("machine", {}) if entry is not None else {}
+        snapshot = entry.last_snapshot or {} if entry is not None else {}
+        machine = snapshot.get("machine", {})
         workspace = self._settings["load_lines"].get(str(workspace_id))
         source = (
             "host"
@@ -1134,7 +1140,7 @@ class SystemStatusHub:
             else "factory"
         )
         lines = self.effective_load_lines(workspace_id, host_id)
-        return {
+        load = {
             "load_per_core": machine.get("load_per_core"),
             "load_equiv": machine.get("load_equiv"),
             "estimate": machine.get("estimate", False),
@@ -1146,10 +1152,13 @@ class SystemStatusHub:
             "lines_source": source,
             "queued_children": self._queued_children.get((workspace_id, host_id), 0),
             "mem_pct": _mem_pct(machine) if machine else None,
-            "sampled_at": entry.last_snapshot.get("sampled_at")
-            if entry is not None and entry.last_snapshot
-            else None,
+            "sampled_at": snapshot.get("sampled_at"),
         }
+        if include_decision and load["level"] != "unknown":
+            report = snapshot.get("load_level") or {}
+            load["decision_load_per_core"] = report.get("decision_load_per_core")
+            load["decision_mem_pct"] = report.get("decision_mem_pct")
+        return load
 
     def drain_level_changes(self) -> list[LevelChange]:
         """Transfer pending transitions to the notifier once per tick."""

@@ -5213,23 +5213,35 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc._read_task = asyncio.create_task(asyncio.sleep(30))
 
             async def feed_after_delay():
-                # Stay silent across several idle-timeout windows (the
-                # patched budget is 0.05s), then deliver the turn.
-                await asyncio.sleep(0.3)
-                for line in (
-                    json.dumps({"type": "response", "success": True}),
-                    json.dumps(
-                        {
-                            "type": "message_update",
-                            "assistantMessageEvent": {
-                                "type": "text_delta",
-                                "delta": "Done after long tool",
-                            },
-                        }
-                    ),
-                    json.dumps({"type": "agent_end", "messages": []}),
+                for event in (
+                    {"type": "response", "success": True},
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "bash",
+                        "toolCallId": "long-shell",
+                        "args": {"command": "echo done"},
+                    },
                 ):
-                    fake_rpc._line_queue.put_nowait(line)
+                    fake_rpc._line_queue.put_nowait(json.dumps(event))
+                # No stdout during several polling intervals.
+                await asyncio.sleep(0.3)
+                for event in (
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "bash",
+                        "toolCallId": "long-shell",
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    },
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Done after long tool",
+                        },
+                    },
+                    {"type": "agent_end", "messages": []},
+                ):
+                    fake_rpc._line_queue.put_nowait(json.dumps(event))
 
             feeder = asyncio.create_task(feed_after_delay())
 
@@ -5262,6 +5274,11 @@ class TestRunTurn(unittest.TestCase):
                 [],
                 f"idle timeout with a live pi process ended the turn: {errors}",
             )
+            requests = [event for event in events if isinstance(event, ToolCallRequest)]
+            completions = [event for event in events if isinstance(event, ToolCallComplete)]
+            self.assertEqual([event.metadata["call_id"] for event in requests], ["long-shell"])
+            self.assertEqual([event.metadata["call_id"] for event in completions], ["long-shell"])
+            self.assertEqual(completions[0].status, ToolCallStatus.SUCCESS)
             turn_complete = [e for e in events if isinstance(e, TurnComplete)]
             self.assertEqual(len(turn_complete), 1)
             self.assertEqual(turn_complete[0].response, "Done after long tool")

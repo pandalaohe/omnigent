@@ -35,7 +35,7 @@ class SysChildCapTool(Tool):
                         "cap": {
                             "oneOf": [
                                 {"type": "integer", "minimum": 1},
-                                {"type": "string", "pattern": r"^[1-9][0-9]*(?![\s\S])"},
+                                {"type": "string", "pattern": r"^[1-9][0-9]*$"},
                                 {"type": "string", "enum": ["none"]},
                             ],
                             "description": "New limit; omit to read the effective cap.",

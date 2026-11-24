@@ -337,6 +337,22 @@ describe("KeepBottomOnResize", () => {
     expect(observed).toEqual([scrollRoot, content]);
   });
 
+  it("leaves resize scrolling to the held question card until the hold ends", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    lockToBottom();
+    render(<KeepBottomOnResize />);
+
+    scrollRoot.setAttribute("data-question-card-scroll-held", "");
+    metrics.scrollHeight += 100;
+    act(() => resize?.());
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+
+    scrollRoot.removeAttribute("data-question-card-scroll-held");
+    metrics.scrollHeight += 100;
+    act(() => resize?.());
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+  });
+
   it("pins a bottom-locked transcript before paint when its content grows in steps", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     makeContentRoot();

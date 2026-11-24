@@ -1,5 +1,5 @@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
 import { Kbd, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
@@ -16,15 +16,18 @@ import { SettingRow } from "@/components/SettingsFields";
 import { SessionNavigationSettings } from "@/components/SessionNavigationSettings";
 import { useMobileAssistantPreferences } from "@/lib/mobileAssistantPreferences";
 import {
+  DEFAULT_TERMINAL_PASTE_BOX_MODE,
   defaultTerminalModifierMap,
   readTerminalKeyboardPreferences,
   terminalBindingsFor,
+  terminalPasteBoxModeFor,
   TERMINAL_BINDING_IDS,
   TERMINAL_BINDINGS,
-  writeTerminalKeyboardPreferences,
+  writeTerminalKeyboardChange,
   type TerminalBindingId,
-  type TerminalKeyboardPreferences,
+  type TerminalPasteBoxMode,
 } from "@/lib/terminalKeyboardPreferences";
+import type { TerminalKeyboardChange } from "@/lib/terminalKeyboardChanges";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   SHORTCUT_ACTION_IDS,
@@ -58,6 +61,7 @@ import {
 } from "@/lib/keyboardShortcutPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 
 const GROUPS: { id: ShortcutGroupId; label: string; note?: string }[] = [
   { id: "general", label: "General" },
@@ -85,6 +89,11 @@ const TERMINAL_PHYSICAL_NAMES = {
   linux: { ctrl: "Ctrl", alt: "Alt", meta: "Super" },
 } satisfies Record<ShortcutPlatform, Record<keyof ModifierMap, string>>;
 const TERMINAL_SELECT_CLASS = "h-9 rounded-md border border-border bg-background px-2 text-ui";
+const TERMINAL_PASTE_BOX_LABELS = {
+  always: "Always",
+  whenBlocked: "When clipboard is blocked",
+  never: "Never",
+} satisfies Record<TerminalPasteBoxMode, string>;
 
 function remappedTerminalBindingLabels(
   binding: ShortcutChord,
@@ -128,11 +137,11 @@ function remappedTerminalBindingLabels(
     });
 }
 
-function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardPreferences>) {
+function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardChange>) {
   if (result === "saved") return null;
   if (result === "too-large")
     return "Too large to sync. Your preferences would exceed the 64 KiB limit.";
-  return "Could not save terminal shortcuts.";
+  return "Could not save terminal keyboard settings.";
 }
 
 type RecordingTarget =
@@ -204,11 +213,23 @@ export function KeyboardShortcutEditor() {
   useMobileAssistantPreferences();
   const terminalPreferences = readTerminalKeyboardPreferences();
   const [terminalPlatform, setTerminalPlatform] = useState(currentShortcutPlatform);
+  const pasteBoxDescriptionId = useId();
   const [editingCustomMap, setEditingCustomMap] = useState(false);
   const [recording, setRecording] = useState<RecordingTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [changedOnly, setChangedOnly] = useState(false);
+  useEffect(() => {
+    const onRejected = (event: Event) => {
+      const rejection = (event as CustomEvent<{ terminalKeyboard?: boolean; detail?: string }>)
+        .detail;
+      if (rejection?.terminalKeyboard) {
+        setError(rejection.detail ?? "Could not save terminal keyboard settings.");
+      }
+    };
+    window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
+    return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
+  }, []);
   const preferences = readKeyboardShortcutPreferences();
   const defaultContext = useMemo(
     () => ({
@@ -261,6 +282,13 @@ export function KeyboardShortcutEditor() {
         "Swap Alt and Cmd",
         "Custom",
       ].some((value) => normalizeSearch(value).includes(query)));
+  const pasteBoxMode = terminalPasteBoxModeFor(terminalPreferences, terminalPlatform);
+  const matchesPasteBox =
+    (!changedOnly || pasteBoxMode !== DEFAULT_TERMINAL_PASTE_BOX_MODE) &&
+    (!query ||
+      ["Terminal paste box", ...Object.values(TERMINAL_PASTE_BOX_LABELS)].some((value) =>
+        normalizeSearch(value).includes(query),
+      ));
   const terminalRows = TERMINAL_BINDING_IDS.filter((id) => {
     const binding = terminalPreferences.bindings?.[id];
     if (changedOnly && !binding?.common && !binding?.platformOverrides?.[terminalPlatform])
@@ -276,15 +304,12 @@ export function KeyboardShortcutEditor() {
       ].some((value) => normalizeSearch(value).includes(query))
     );
   });
-  const saveTerminalPreferences = (next: TerminalKeyboardPreferences) => {
-    setError(terminalSaveError(writeTerminalKeyboardPreferences(next)));
+  const saveTerminalChange = (change: TerminalKeyboardChange) => {
+    setError(terminalSaveError(writeTerminalKeyboardChange(change)));
   };
   const saveTerminalMap = (map: typeof terminalMap) => {
     stopRecording();
-    saveTerminalPreferences({
-      ...terminalPreferences,
-      modifierMap: { ...terminalPreferences.modifierMap, [terminalPlatform]: map },
-    });
+    saveTerminalChange({ platform: terminalPlatform, field: "modifierMap", value: map });
   };
   const isChanged = (actionId: ShortcutActionId) => {
     const preference = preferences.actions[actionId];
@@ -352,16 +377,10 @@ export function KeyboardShortcutEditor() {
           setError(`That shortcut is already used by ${TERMINAL_BINDINGS[conflict].label}.`);
           return;
         }
-        const binding = current.bindings?.[terminalId];
-        const result = writeTerminalKeyboardPreferences({
-          ...current,
-          bindings: {
-            ...current.bindings,
-            [terminalId]: {
-              ...binding,
-              platformOverrides: { ...binding?.platformOverrides, [target]: [chord] },
-            },
-          },
+        const result = writeTerminalKeyboardChange({
+          platform: target,
+          field: terminalId,
+          value: [chord],
         });
         setError(terminalSaveError(result));
         if (result === "saved") {
@@ -725,7 +744,7 @@ export function KeyboardShortcutEditor() {
           </ul>
         </details>
       ))}
-      {(matchesTerminalMap || terminalRows.length > 0) && (
+      {(matchesTerminalMap || matchesPasteBox || terminalRows.length > 0) && (
         <details
           open={query || changedOnly ? true : undefined}
           className="mb-2 rounded-xl border border-border bg-card px-3 py-2 last:mb-0"
@@ -736,9 +755,9 @@ export function KeyboardShortcutEditor() {
         >
           <summary className="cursor-pointer select-none text-ui font-medium">Terminal</summary>
           <p className="mt-2 text-sm text-muted-foreground">
-            Applies to hardware keys while the terminal has focus. Physical Cmd+C, Cmd+V, Cmd+K and
-            Cmd+R keep their usual behavior with By name. The browser or system can reserve
-            shortcuts such as Cmd+N and Win combinations.
+            Applies to hardware keys while the terminal has focus. Physical Cmd+C, Cmd+K and Cmd+R
+            keep their usual behavior with By name. The browser or system can reserve shortcuts such
+            as Cmd+N and Win combinations.
           </p>
           <label className="mt-2 flex flex-wrap items-center justify-between gap-2 text-ui">
             Client platform
@@ -810,6 +829,35 @@ export function KeyboardShortcutEditor() {
               )}
             </div>
           )}
+          {matchesPasteBox && (
+            <div className="border-b border-border/60 py-2">
+              <label className="flex flex-wrap items-center justify-between gap-2 text-ui">
+                Paste box
+                <select
+                  aria-describedby={pasteBoxDescriptionId}
+                  className={TERMINAL_SELECT_CLASS}
+                  value={pasteBoxMode}
+                  onChange={(event) => {
+                    stopRecording();
+                    saveTerminalChange({
+                      platform: terminalPlatform,
+                      field: "pasteBoxMode",
+                      value: event.target.value as TerminalPasteBoxMode,
+                    });
+                  }}
+                >
+                  {Object.entries(TERMINAL_PASTE_BOX_LABELS).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p id={pasteBoxDescriptionId} className="mt-1 text-xs text-muted-foreground">
+                Choose when a terminal paste shortcut or button opens an editable text box.
+              </p>
+            </div>
+          )}
           {terminalRows.length > 0 && (
             <ul className="mt-1">
               {terminalRows.map((id) => {
@@ -856,15 +904,7 @@ export function KeyboardShortcutEditor() {
                       aria-label={`Restore ${platformLabel(terminalPlatform)} shortcut for ${label}`}
                       onClick={() => {
                         stopRecording();
-                        const { [terminalPlatform]: _removed, ...overrides } =
-                          binding?.platformOverrides ?? {};
-                        saveTerminalPreferences({
-                          ...terminalPreferences,
-                          bindings: {
-                            ...terminalPreferences.bindings,
-                            [id]: { ...binding, platformOverrides: overrides },
-                          },
-                        });
+                        saveTerminalChange({ platform: terminalPlatform, field: id, value: null });
                       }}
                     >
                       <RotateCcwIcon />

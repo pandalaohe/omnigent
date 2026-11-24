@@ -82,9 +82,11 @@ class SysListModelsTool(Tool):
             "harness, source, fetched_at, stale, error, models: [{id, "
             "provider, displayName, isDefault, hidden}]}: filter the rows "
             "by provider and name, then pass a row's 'id' verbatim as the "
-            "model for a session of that agent on that host. 'stale' is "
-            "true only when the last catalog sync failed or the host is "
-            "offline; judge the list's age from 'fetched_at' (Unix seconds)."
+            "model for a session of that agent on that host. A native "
+            "Antigravity catalog starts a background refresh after expiry. "
+            "A slow refresh returns the last known rows. 'stale' "
+            "indicates a failed sync, an offline host, or an expired native "
+            "Antigravity catalog. 'fetched_at' is in Unix seconds."
         )
 
     def get_schema(self) -> dict[str, Any]:

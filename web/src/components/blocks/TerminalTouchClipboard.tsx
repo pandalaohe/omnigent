@@ -132,36 +132,33 @@ export function TerminalCopySheet({
 }
 
 export function TerminalPasteBox({
-  open,
+  text,
   enabled,
+  onChange,
   onSend,
   onClose,
 }: {
-  open: boolean;
+  text: string | null;
   enabled: boolean;
-  onSend: (text: string) => void;
+  onChange: (text: string) => void;
+  onSend: () => void;
   onClose: () => void;
 }) {
-  const [value, setValue] = useState("");
   const descriptionId = useId();
 
-  useEffect(() => {
-    setValue("");
-  }, [open]);
-
   return (
-    <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
+    <Dialog open={text !== null} onOpenChange={(next) => !next && onClose()}>
       <DialogContent data-testid="terminal-paste-box">
         <DialogHeader>
           <DialogTitle>Paste into terminal</DialogTitle>
           <DialogDescription id={descriptionId}>
-            Paste your text here, then send it to the terminal.
+            Type, paste or edit your text, then send it to the terminal.
           </DialogDescription>
         </DialogHeader>
         <Textarea
           autoFocus
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
+          value={text ?? ""}
+          onChange={(event) => onChange(event.target.value)}
           aria-label="Text to paste"
           aria-describedby={descriptionId}
           className="min-h-24 font-mono"
@@ -172,8 +169,8 @@ export function TerminalPasteBox({
           </Button>
           <Button
             type="button"
-            disabled={!enabled || value === ""}
-            onClick={() => onSend(value)}
+            disabled={!enabled || !text}
+            onClick={onSend}
             componentId="terminal.touch_clipboard.paste_box"
           >
             Send to terminal

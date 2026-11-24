@@ -35,19 +35,35 @@ Key design points:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import shutil
+import subprocess
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
+from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 from omnigent.util.reasoning_effort import EFFORT_ALIASES, clamp_antigravity_effort
 
 _logger = logging.getLogger(__name__)
+AGY_MODEL_PROBE_TIMEOUT_S = 90.0
+# Allow native setup, cold-start and notice delivery around the probe.
+AGY_MODEL_LAUNCH_TIMEOUT_S = AGY_MODEL_PROBE_TIMEOUT_S + 90.0
+# The binding PATCH waits for the runner's session initialization, which can
+# include the same model probe and cold start before it returns.
+AGY_RUNNER_INIT_TIMEOUT_S = AGY_MODEL_LAUNCH_TIMEOUT_S + 60.0
+# The CLI's post-bind ensure request must also outlive the runner-side launch.
+AGY_TERMINAL_ENSURE_TIMEOUT_S = AGY_MODEL_LAUNCH_TIMEOUT_S + 10.0
+# Keep the CLI's binding wait outside the server-side initialization budget.
+AGY_CLI_BIND_TIMEOUT_S = AGY_RUNNER_INIT_TIMEOUT_S + 60.0
+_agy_model_probes: dict[
+    tuple[asyncio.AbstractEventLoop, str, str, str | None], asyncio.Task[bool | None]
+] = {}
 
 # Tier settings and the PreToolUse guard are installed by the bridge.
 # This flag bypasses agy's native permission prompts for the full tier.
@@ -184,6 +200,83 @@ def should_skip_permissions(
     return headless
 
 
+async def _probe_agy_subscription_model(
+    command: str, model: str, effort: str | None
+) -> bool | None:
+    """Return acceptance, explicit rejection, or an inconclusive probe."""
+    args = [command, f"--gemini_dir={Path.home() / '.gemini'}", "--model", model]
+    if effort is not None:
+        args.extend(["--effort", effort])
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            "-p",
+            "/model",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, NotImplementedError):
+        return None
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=AGY_MODEL_PROBE_TIMEOUT_S
+        )
+    except (OSError, TimeoutError):
+        return None
+    finally:
+        await terminate_direct_subprocess(process, terminate_timeout=0.5, kill_timeout=0.5)
+    if process.returncode == 0:
+        return True
+    if b"invalid model selection" in stderr.lower():
+        return False
+    # An older CLI, sign-in, or transport failure is not a verdict about the ID.
+    return None
+
+
+@dataclass(frozen=True)
+class AgyLaunchCommand:
+    """Command and environment for the native agy terminal."""
+
+    argv: list[str] = field(repr=False)
+    env: dict[str, str] = field(repr=False)
+    subscription_model: str | None = None
+    effort: str | None = None
+
+    async def check_subscription_model(self) -> str | None:
+        """Reject an unavailable model or return a caller-visible warning."""
+        model = self.subscription_model
+        if model is None:
+            return None
+        command = self.argv[0]
+        key = (asyncio.get_running_loop(), command, model, self.effort)
+
+        async def probe() -> bool | None:
+            try:
+                return await _probe_agy_subscription_model(command, model, self.effort)
+            finally:
+                _agy_model_probes.pop(key, None)
+
+        task = _agy_model_probes.get(key)
+        if task is None:
+            task = asyncio.create_task(probe())
+            _agy_model_probes[key] = task
+        accepted = await asyncio.shield(task)
+        if accepted is False:
+            raise OmnigentError(
+                f"Antigravity does not offer model {model!r} for this login. "
+                "Choose a model from the host's `agy models` list.",
+                code=ErrorCode.HARNESS_NOT_CONFIGURED,
+            )
+        if accepted is None:
+            return (
+                f"Could not verify Antigravity model {model!r} before launch. "
+                "Antigravity may use its default model."
+            )
+        return None
+
+
 def _is_xhigh_effort(effort: str | None) -> bool:
     """Return whether *effort* is ``xhigh`` or one of its higher aliases."""
     return effort is not None and EFFORT_ALIASES.get(effort, effort) == "xhigh"
@@ -272,8 +365,9 @@ def build_agy_launch(
     effort: str | None = None,
     extra_args: tuple[str, ...] = (),
     log_dir: Path | None = None,
+    command: str | None = None,
     catalog_models: Iterable[Mapping[str, object]] | None = None,
-) -> tuple[list[str], dict[str, str]]:
+) -> AgyLaunchCommand:
     """Build the argv and environment overrides for an agy launch.
 
     Each launch receives a fresh CSRF token for its local RPC server unless
@@ -309,15 +403,14 @@ def build_agy_launch(
     :param extra_args: Additional raw CLI args appended after all generated
         flags, e.g. ``("--print-timeout", "30")``.
     :param log_dir: Private directory for this launch's RPC discovery log.
+    :param command: Override the resolved agy executable for both probe and launch.
     :param catalog_models: Optional agy model-catalog snapshot used to require
         explicit per-model ``xhigh`` support when a row is present.
-    :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
-        command list starting with the agy binary path and *env_overrides*
-        is a dict of env variables to layer on top of the process
-        environment.
+    :returns: The launch command. Call ``check_subscription_model`` before
+        starting the terminal.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
-    :raises OmnigentError: When saved credentials need repair through setup.
+    :raises OmnigentError: When credentials need repair.
     :raises RuntimeError: When the agy executable cannot be found.
     """
     (
@@ -346,7 +439,7 @@ def build_agy_launch(
                 model=extra_model,
                 extra_env=launch.extra_env,
             )
-    argv: list[str] = [agy_binary_path()]
+    argv: list[str] = [command if command is not None else agy_binary_path()]
     if not csrf_token_seen:
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if log_dir is not None:
@@ -355,14 +448,12 @@ def build_agy_launch(
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
         argv.extend(["--conversation", conversation_id])
+    model_arg = launch.model
+    final_effort = extra_effort if extra_effort is not None else effort
     if not rewrite_model_and_effort:
-        if launch.model is not None:
-            argv.extend(
-                [
-                    "--model",
-                    split_agy_effort_suffix(launch.model)[0] if effort else launch.model,
-                ]
-            )
+        if model_arg is not None:
+            model_arg = split_agy_effort_suffix(model_arg)[0] if effort else model_arg
+            argv.extend(["--model", model_arg])
         if effort is not None:
             argv.extend(["--effort", effort])
         skip_permissions_seen = False
@@ -375,34 +466,29 @@ def build_agy_launch(
                     continue
                 skip_permissions_seen = True
             argv.append(arg)
-        return argv, launch.extra_env
-    final_model = launch.model
-    final_effort = extra_effort if extra_effort is not None else effort
-    if final_model is not None:
-        base_model, suffix_effort = split_agy_effort_suffix(final_model)
-        if final_effort:
+        model_arg = extra_model if extra_model is not None else model_arg
+    else:
+        if model_arg is not None:
+            base_model, suffix_effort = split_agy_effort_suffix(model_arg)
+            if final_effort:
+                final_effort = clamp_antigravity_effort(
+                    final_effort, base_model, catalog_models=catalog_models
+                )
+                model_arg = base_model
+            elif suffix_effort is not None:
+                clamped_suffix = clamp_antigravity_effort(
+                    suffix_effort, base_model, catalog_models=catalog_models
+                )
+                if clamped_suffix != suffix_effort:
+                    model_arg = f"{base_model}-{clamped_suffix}"
+            argv.extend(["--model", model_arg])
+        elif final_effort:
             final_effort = clamp_antigravity_effort(
-                final_effort, base_model, catalog_models=catalog_models
+                final_effort, None, catalog_models=catalog_models
             )
-            argv.extend(["--model", base_model])
-        elif suffix_effort is not None:
-            clamped_suffix = clamp_antigravity_effort(
-                suffix_effort, base_model, catalog_models=catalog_models
-            )
-            argv.extend(
-                [
-                    "--model",
-                    f"{base_model}-{clamped_suffix}"
-                    if clamped_suffix != suffix_effort
-                    else final_model,
-                ]
-            )
-        else:
-            argv.extend(["--model", final_model])
-    elif final_effort:
-        final_effort = clamp_antigravity_effort(final_effort, None, catalog_models=catalog_models)
-    if final_effort is not None:
-        argv.extend(["--effort", final_effort])
-    argv.extend(remaining_extra_args)
+        if final_effort is not None:
+            argv.extend(["--effort", final_effort])
+        argv.extend(remaining_extra_args)
 
-    return argv, launch.extra_env
+    subscription_model = model_arg if launch.auth_mode == "subscription" else None
+    return AgyLaunchCommand(argv, launch.extra_env, subscription_model, final_effort)

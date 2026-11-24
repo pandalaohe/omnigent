@@ -331,6 +331,7 @@ import { ArchivedCommentsBanner } from "@/components/ArchivedCommentsBanner";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
+import { isQuestionCardScrollHeld } from "@/components/ai-elements/conversation";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -395,6 +396,7 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import {
   isSdkHarnessSession,
+  supportsSdkEffortReset,
   permissionTierSwitchDisabledReason,
   PERMISSION_TIER_BLOCKED,
 } from "@/lib/sessionCapabilities";
@@ -1079,6 +1081,7 @@ export function ChatPage() {
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const llmModel = useChatStore((s) => s.llmModel);
   const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
+  const sessionEffortForControl = useChatStore((s) => s.sessionReasoningEffort);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
   // once its CLI is up (codex answers model/list after app-server boot,
   // ~15s cold), which left the gear's Model list sparse and its Effort row
@@ -1427,8 +1430,15 @@ export function ChatPage() {
     ],
   );
   const showEffort =
-    shouldShowEffortPicker(capabilitySource, sdkEffortFamily, codexModelOptions) &&
-    effortLevels.length > 0;
+    shouldShowEffortPicker(
+      { ...capabilitySource, reasoningEffort: sessionEffortForControl },
+      sdkEffortFamily,
+      codexModelOptions,
+      modelPickerKind === "sdk"
+        ? (sessionModelOverrideForEffort ?? llmModel)
+        : (llmModel ?? sessionModelOverrideForEffort),
+    ) &&
+    (effortLevels.length > 0 || supportsSdkEffortReset(capabilitySource, sdkEffortFamily));
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -2086,7 +2096,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     // An escaped reader keeps their position. Check the physical position, not
     // the lock: rows measuring shorter than estimated clamp scrollTop down, which
     // StickToBottom can misread as an escape while still at the bottom.
-    if (!pinnedToBottomRef.current) return;
+    if (!pinnedToBottomRef.current || isQuestionCardScrollHeld(scrollEl)) return;
     // Park at the same position stick-to-bottom settles on (one pixel short
     // of the maximum); writing the exact bottom would leave the settle one
     // pixel lower than the library's park and trail a 1px snap-back.
@@ -3356,7 +3366,10 @@ function ComposerImpl(
   const acpHarnessId =
     composerSession?.harnessNamespace ??
     (sessionHarness?.startsWith("acp:") ? sessionHarness : undefined);
-  const acpPermissionControl = sessionHarness === "acp" || sessionHarness?.startsWith("acp:");
+  const tierPermissionControl = composerSession?.permissionTierState != null;
+  const hostPermissionControl = showClaudePermissionMode || tierPermissionControl;
+  const acpSession = sessionHarness === "acp" || sessionHarness?.startsWith("acp:");
+  const acpPermissionControl = acpSession && !tierPermissionControl;
   const acpHostId = composerSession?.effectiveHostId ?? composerSession?.hostId;
   const [acpCatalog, setAcpCatalog] = useState<CallingDefaultsCatalogRow | null>(null);
   useEffect(() => {
@@ -3383,7 +3396,6 @@ function ComposerImpl(
     acpCatalog !== null && acpCatalog.host_id === acpHostId && acpCatalog.harness === acpHarnessId
       ? (acpCatalog.permission_options ?? [])
       : [];
-  const tierPermissionControl = composerSession?.permissionTierState != null;
   const claudePermissionMode = tierPermissionControl
     ? (composerSession?.permissionTier ?? "")
     : storedPermissionMode;
@@ -3491,16 +3503,16 @@ function ComposerImpl(
         }))
       : null) ??
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
-    (showClaudePermissionMode
+    (hostPermissionControl
       ? tierPermissionControl
-        ? AGY_NATIVE_PERMISSION_TIERS
+        ? AGY_NATIVE_PERMISSION_TIERS.filter((option) => !acpSession || option.value !== "full")
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
       : CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS);
   const permissionLabel = acpPermissionControl
     ? (acpOptions.find((option) => option.value === acpMode)?.label ?? acpMode)
-    : showClaudePermissionMode
+    : hostPermissionControl
       ? tierPermissionControl
         ? composerSession?.permissionTierState === "blocked"
           ? PERMISSION_TIER_BLOCKED
@@ -3514,11 +3526,9 @@ function ComposerImpl(
         ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
           codexApprovalMode)
         : (nativePermissionReadback?.value ?? codexApprovalModeLabel(codexApprovalMode));
-  const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
-    : codexApprovalMode;
+  const selectedPermissionMode = hostPermissionControl ? claudePermissionMode : codexApprovalMode;
   const permissionControlInteractive =
-    (showClaudePermissionMode ||
+    (hostPermissionControl ||
       showCodexApprovalMode ||
       (acpPermissionControl && acpOptions.length > 0)) &&
     !isReadOnly &&
@@ -3543,6 +3553,12 @@ function ComposerImpl(
   );
   const currentPermissionMode = (): string => {
     const state = useChatStore.getState();
+    if (tierPermissionControl) {
+      return (
+        chatQueryClient()?.getQueryData<Session>(["session", state.conversationId])
+          ?.permissionTier ?? claudePermissionMode
+      );
+    }
     return acpPermissionControl
       ? acpMode
       : showClaudePermissionMode
@@ -5615,7 +5631,7 @@ function ComposerImpl(
                   <BackgroundTaskIndicator className="h-11 rounded-full bg-transparent [--icon-container-default:20px] [&_svg]:p-0" />
                 </MobileHeaderControlPortal>
               )}
-              {(showClaudePermissionMode ||
+              {(hostPermissionControl ||
                 showCodexApprovalMode ||
                 (acpPermissionControl && acpOptions.length > 0) ||
                 false) &&
@@ -5636,7 +5652,7 @@ function ComposerImpl(
                         ? acpMode
                         : nativePermissionControl
                           ? nativePermissionReadback?.selectedValue
-                          : showClaudePermissionMode
+                          : hostPermissionControl
                             ? claudePermissionMode
                             : codexApprovalMode
                     }
@@ -5697,6 +5713,9 @@ function ComposerImpl(
                     showModels={showModels}
                     showEffort={showEffort}
                     effortLevels={effortLevels}
+                    supportsEffortReset={
+                      modelPickerKind === "sdk" && composerSession?.parentSessionId == null
+                    }
                     modelPickerKind={modelPickerKind}
                     supportsModelReset={supportsModelReset}
                     codexModelOptions={codexModelOptions}
@@ -6298,6 +6317,7 @@ function SessionHarnessPicker({
   showModels,
   showEffort,
   effortLevels,
+  supportsEffortReset,
   modelPickerKind,
   supportsModelReset,
   codexModelOptions,
@@ -6325,6 +6345,7 @@ function SessionHarnessPicker({
   showModels: boolean;
   showEffort: boolean;
   effortLevels: readonly string[];
+  supportsEffortReset: boolean;
   modelPickerKind: NativeModelPickerKind | null;
   supportsModelReset: boolean;
   codexModelOptions: readonly NativeModelOption[];
@@ -6599,7 +6620,7 @@ function SessionHarnessPicker({
     cancelCycle();
     void apply(() => changeModel(modelId), modelPickWakesSession);
   };
-  const selectEffort = (effort: string) => {
+  const selectEffort = (effort: string | null) => {
     cancelCycle();
     void apply(() => useChatStore.getState().setEffort(effort));
   };
@@ -6731,6 +6752,7 @@ function SessionHarnessPicker({
     routed: boolean,
     onSelect: (effort: string) => void,
     model: string | null | undefined,
+    onUnset?: () => void,
   ): ComposerConfigSection => {
     const header = modelPickerKind === "pi" ? "Thinking level" : "Effort";
     const inherited = model
@@ -6739,7 +6761,7 @@ function SessionHarnessPicker({
     return {
       testId: "composer-agent-efforts",
       header,
-      level: { label: header, inherited },
+      level: { label: header, inherited, onUnset },
       choices: levels.map((effort) => ({
         key: effort,
         label: formatStatusEffortLabel(effort) ?? effort,
@@ -6751,19 +6773,39 @@ function SessionHarnessPicker({
       })),
     };
   };
-  const effortSection =
-    showEffort && availableEfforts.length > 0
+  const effortSection: ComposerConfigSection | undefined = showEffort
+    ? availableEfforts.length > 0
       ? buildEffortSection(
           availableEfforts,
           selectedEffort,
           routingOn,
           selectEffort,
           pickerSelectedModel,
+          supportsEffortReset ? () => selectEffort(null) : undefined,
         )
-      : undefined;
+      : supportsEffortReset &&
+          sessionHarness === "codex" &&
+          !inferenceConfigured &&
+          selectedEffort !== null
+        ? {
+            testId: "composer-agent-efforts",
+            header: "Effort",
+            choices: [
+              {
+                key: "__default__",
+                label: "Reset Effort",
+                checked: false,
+                disabled: routingOn || busy || pendingModelChange !== null,
+                onSelect: () => selectEffort(null),
+                testId: "composer-agent-effort-default",
+              },
+            ],
+          }
+        : undefined
+    : undefined;
   const currentEffort = selectedEffort ?? effortSection?.level?.inherited ?? null;
   const effortLevel =
-    effortSection && !routingOn
+    effortSection && availableEfforts.length > 0 && !routingOn
       ? {
           level: availableEfforts.findIndex((level) => level === currentEffort) + 1,
           total: availableEfforts.length,
@@ -6788,19 +6830,23 @@ function SessionHarnessPicker({
       : pickerSelectedModel;
   const cycleModel = staged?.model ? staged.model.id : pickerSelectedModel;
   const cycleRoutingOn = routingOn && staged?.model === undefined;
-  const cycleEffortLevels =
-    modelPickerKind === "codex" || modelPickerKind === "devin"
-      ? codexEffortLevelsForModel(codexModelOptions, cycleModel)
-      : availableEfforts;
+  const cycleEffortHarness =
+    modelPickerKind === "codex"
+      ? "codex-native"
+      : modelPickerKind === "devin"
+        ? "devin-native"
+        : modelPickerKind === "sdk"
+          ? sessionHarness
+          : null;
+  const levelsForCycleModel = (model: string | null) =>
+    effortLevelsFor(cycleEffortHarness, codexModelOptions, model) ?? availableEfforts;
+  const cycleEffortLevels = levelsForCycleModel(cycleModel);
   const stageModel = (
     key: string,
     id = key === appliedModelKey ? appliedModelId : modelValueForKey(key),
   ) => {
     const previous = cycleDraftRef.current;
-    const levels =
-      modelPickerKind === "codex" || modelPickerKind === "devin"
-        ? codexEffortLevelsForModel(codexModelOptions, id)
-        : availableEfforts;
+    const levels = levelsForCycleModel(id);
     const effort = previous?.sessionId === conversationId ? previous.effort : undefined;
     const next = {
       sessionId: conversationId,
@@ -6857,8 +6903,11 @@ function SessionHarnessPicker({
     const modelChanged =
       draft.model !== undefined &&
       (draft.model.key !== appliedModelKey || draft.model.id !== appliedModelId);
+    const targetEffortLevels = levelsForCycleModel(
+      draft.model ? draft.model.id : pickerSelectedModel,
+    );
     const effort =
-      draft.effort !== undefined && cycleEffortLevels.includes(draft.effort)
+      draft.effort !== undefined && targetEffortLevels.includes(draft.effort)
         ? draft.effort
         : undefined;
     const effortChanged = effort !== undefined && effort !== selectedEffort;

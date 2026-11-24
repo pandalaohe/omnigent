@@ -925,6 +925,16 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     assert decoded.connection_id is None
 
 
+def test_hello_frame_preserves_acp_permission_tier_defaults() -> None:
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="test-host",
+        acp_permission_tiers={"acp:example": "auto"},
+    )
+    assert decode_host_frame(encode_host_frame(hello)) == hello
+
+
 def test_hello_frame_capabilities_round_trip() -> None:
     """Advertised capability tokens survive encode → decode."""
     from omnigent.host.frames import CAP_CODEX_SIDE_CHAT

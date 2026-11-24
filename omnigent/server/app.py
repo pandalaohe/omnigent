@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -73,7 +73,6 @@ from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
-    pending_inputs,
     set_harness_process_manager,
     set_runner_direct_attach_resolver,
     set_runner_router,
@@ -151,10 +150,8 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
-    _MID_TURN_STATUSES,
     CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
-    _session_status_cache,
     announce_hosts_changed,
     create_sessions_router,
     set_relay_host_offline_probe,
@@ -201,6 +198,7 @@ from omnigent.server.user_preferences_store import (
     USER_PREFERENCES_MAX_BYTES,
     KeepWarmIdentity,
     SqlAlchemyUserPreferencesStore,
+    TerminalKeyboardConflictError,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
     read_keep_warm_settings,
@@ -2176,6 +2174,7 @@ def create_app(
         usage_evidence_body_limit,
         usage_evidence_retention_days,
         usage_import_body_limit,
+        usage_request_source,
     )
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
     from omnigent.server.usage_evidence import UsageEvidenceService
@@ -3057,6 +3056,7 @@ def create_app(
             import_max_body_bytes=usage_import_body_limit(resolved_server_config),
             evidence_service=usage_evidence_service,
             evidence_max_body_bytes=usage_evidence_body_limit(resolved_server_config),
+            request_source=usage_request_source(resolved_server_config),
         ),
         prefix="/v1",
     )
@@ -3405,11 +3405,6 @@ def create_app(
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
-    # A Claude turn absorbs a pasted message only at its next step; keep that
-    # confirmed paste's lease while the turn runs.
-    pending_inputs.set_session_busy_check(
-        lambda session_id: _session_status_cache.get(session_id) in _MID_TURN_STATUSES
-    )
 
     @app.middleware("http")
     async def _record_server_metrics(
@@ -4668,7 +4663,12 @@ def create_app(
 
     _preferences_http_max_bytes = USER_PREFERENCES_MAX_BYTES + 4096
 
-    async def _read_preferences_body(request: Request, model: type[BaseModel]) -> BaseModel:
+    async def _read_preferences_body(
+        request: Request,
+        model: type[BaseModel],
+        *,
+        invalid_detail: str = "Invalid preferences payload",
+    ) -> BaseModel:
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
@@ -4692,7 +4692,7 @@ def create_app(
         except ValidationError as exc:
             raise StarletteHTTPException(
                 status_code=422,
-                detail="Invalid preferences payload",
+                detail=invalid_detail,
             ) from exc
 
     _preference_write_hits: dict[str, list[float]] = {}
@@ -4715,7 +4715,7 @@ def create_app(
         "type": "object",
         "additionalProperties": False,
         "required": ["value"],
-        "properties": {"value": {}},
+        "properties": {"value": {}, "terminal_keyboard": {"type": "object"}},
     }
     _preferences_error_responses: dict[int | str, dict[str, Any]] = {
         400: {"description": "Invalid Content-Length header"},
@@ -4817,7 +4817,12 @@ def create_app(
         store = _preferences_store()
         owner, create_if_missing = _preferences_owner(request)
         _check_preference_write_rate(owner)
-        body = await _read_preferences_body(request, UserPreferenceNamespacePatchRequest)
+        # Older servers use the default detail when they reject the new patch format.
+        body = await _read_preferences_body(
+            request,
+            UserPreferenceNamespacePatchRequest,
+            invalid_detail="Invalid preference update",
+        )
         assert isinstance(body, UserPreferenceNamespacePatchRequest)
         try:
             persisted = await asyncio.to_thread(
@@ -4825,12 +4830,22 @@ def create_app(
                 owner,
                 namespace,
                 body.value,
+                terminal_keyboard=body.terminal_keyboard,
                 create_if_missing=create_if_missing,
             )
         except UserPreferencesUserNotFoundError as exc:
             raise StarletteHTTPException(
                 status_code=401,
                 detail="Account no longer exists",
+            ) from exc
+        except TerminalKeyboardConflictError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "terminal_keyboard_conflict",
+                    "change_index": exc.change_index,
+                    "message": str(exc),
+                },
             ) from exc
         except UserPreferencesValidationError as exc:
             raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc

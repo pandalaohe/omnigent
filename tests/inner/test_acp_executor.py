@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -1022,9 +1023,254 @@ async def test_native_call_before_a_bridge_call_keeps_each_call_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tier_managed", [False, True])
+async def test_host_tier_does_not_delegate_filesystem_requests(tier_managed: bool) -> None:
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", host_permission_tier=tier_managed), os_env=OSEnvSpec()
+    )
+    ex._rpc = AsyncMock(return_value={"result": {"protocolVersion": 1}})
+    ex._send = AsyncMock()
+    environment = AsyncMock()
+    environment.read.return_value = {"content": "content", "encoding": "utf-8"}
+    environment.write.return_value = {}
+    ex._ensure_os_environment = AsyncMock(return_value=environment)
+
+    await ex._ensure_initialized()
+    capabilities = ex._rpc.await_args.args[1]["clientCapabilities"]["fs"]
+    assert capabilities == {"readTextFile": not tier_managed, "writeTextFile": not tier_managed}
+
+    for method in ("read_text_file", "write_text_file"):
+        await ex._respond_to_agent_request(
+            {"id": method, "method": f"fs/{method}", "params": {"path": "file", "content": "new"}}
+        )
+        reply = ex._send.await_args.args[0]
+        if tier_managed:
+            assert reply["error"]["code"] == -32601
+        else:
+            assert "result" in reply
+
+    assert environment.read.await_count == (0 if tier_managed else 1)
+    assert environment.write.await_count == (0 if tier_managed else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["DENY", "ASK"])
+async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    arguments = {"CommandLine": "git status"}
+    ex._note_permission_update(
+        "s1",
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "shell-1",
+            "kind": "execute",
+            "title": "Agent display text",
+            "rawInput": arguments,
+        },
+    )
+
+    async def policy(phase, data):
+        assert phase == "PHASE_TOOL_CALL"
+        if data["name"] == "run_command" and data["arguments"] == arguments:
+            return Mock(action=f"POLICY_ACTION_{action}")
+        return Mock(action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"})
+
+    ex._policy_evaluator = policy
+    params = {
+        "sessionId": "s1",
+        "toolCall": {"toolCallId": "shell-1"},
+        "options": [{"kind": "allow_once", "optionId": "once"}],
+    }
+    assert await ex._decide_permission(params) == (False, None)
+    assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy_name", "command", "action"),
+    [
+        ("ask_on_os_tools", "git status", "ASK"),
+        ("blast_radius", "git push origin work", "ASK"),
+        ("blast_radius", "git push --force origin work", "DENY"),
+        ("github_policy", "gh pr view 1 --repo example/private", "DENY"),
+        ("working_dir", "cd ../other", "DENY"),
+    ],
+)
+async def test_host_tier_respects_builtin_shell_policies(
+    policy_name: str, command: str, action: str
+) -> None:
+    from omnigent.policies.builtins.github import github_policy
+    from omnigent.policies.builtins.orchestration import blast_radius
+    from omnigent.policies.builtins.safety import ask_on_os_tools
+    from omnigent.policies.builtins.working_dir import block_working_dir_changes
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    ex._note_permission_update(
+        "s1",
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "shell-1",
+            "kind": "execute",
+            "title": "Run command",
+            "rawInput": {"CommandLine": command, "command": "echo other"},
+        },
+    )
+
+    def blast_policy(event):
+        return blast_radius()(event, {})
+
+    policy = {
+        "ask_on_os_tools": ask_on_os_tools,
+        "blast_radius": blast_policy,
+        "github_policy": github_policy(read_all=False, read_repos=["example/public"]),
+        "working_dir": block_working_dir_changes(),
+    }[policy_name]
+    verdicts = []
+
+    async def evaluate(phase, data):
+        assert phase == "PHASE_TOOL_CALL"
+        verdict = policy({"type": "tool_call", "data": data}) or {"result": "ALLOW"}
+        verdicts.append(verdict)
+        return Mock(
+            action=f"POLICY_ACTION_{verdict['result']}", data={"_omnigent_acp_tier": "allow"}
+        )
+
+    ex._policy_evaluator = evaluate
+    result = await ex._decide_permission(
+        {
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "shell-1"},
+            "options": [{"kind": "allow_once", "optionId": "once"}],
+        }
+    )
+    assert verdicts[0]["result"] == action
+    if action == "ASK":
+        assert command in verdicts[0]["reason"]
+    assert result == (False, None)
+    assert ex._elicitation_handler.await_count == (1 if action == "ASK" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario", ["updated-input", "foreign-update", "foreign-request", "update-during-policy"]
+)
+async def test_host_tier_binds_latest_pending_tool_in_its_session(scenario: str) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    arguments = {"CommandLine": "git status"}
+    updated_arguments = {"CommandLine": "git diff"}
+    initial = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "shell-1",
+        "kind": "execute",
+        "title": "Run command",
+        "status": "pending",
+        "rawInput": arguments,
+    }
+    updated = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "shell-1",
+        "rawInput": updated_arguments,
+    }
+    ex._active_prompt_request_id = 1
+
+    async def observe(session_id: str, update: dict) -> None:
+        stdout = asyncio.StreamReader()
+        ex._proc = Mock(returncode=None, stdout=stdout)
+        frame = {"method": "session/update", "params": {"sessionId": session_id, "update": update}}
+        stdout.feed_data((json.dumps(frame) + "\n").encode())
+        stdout.feed_eof()
+        await ex._read_stdout_unobserved()
+        ex._handle_session_update(ex._queue.get_nowait()["params"]["update"])
+
+    await observe("s1", initial)
+    if scenario != "update-during-policy":
+        await observe("s2" if scenario == "foreign-update" else "s1", updated)
+
+    async def allow(_phase, _data):
+        if scenario == "update-during-policy":
+            await observe("s1", updated)
+        return Mock(action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"})
+
+    ex._policy_evaluator = AsyncMock(side_effect=allow)
+    params = {
+        "sessionId": "s2" if scenario == "foreign-request" else "s1",
+        "toolCall": {"toolCallId": "shell-1"},
+        "options": [{"kind": "allow_once", "optionId": "once"}],
+    }
+    result = await ex._decide_permission(params)
+    if scenario == "foreign-request":
+        assert result == (False, None)
+        ex._policy_evaluator.assert_not_awaited()
+    elif scenario == "update-during-policy":
+        assert result == (False, None)
+        ex._policy_evaluator.assert_awaited_once()
+    else:
+        assert result == (True, "once")
+        bound = ex._policy_evaluator.await_args.args[1]["_omnigent_acp_call"]
+        assert bound["arguments"] == (
+            arguments if scenario == "foreign-update" else updated_arguments
+        )
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_host_tier_allows_only_the_bound_call_once() -> None:
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_ALLOW",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+    observed = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "shell-1",
+        "kind": "execute",
+        "title": "Run command",
+        "rawInput": {"CommandLine": "git status"},
+    }
+    ex._note_permission_update("s1", observed)
+    options = [
+        {"kind": "allow_always", "optionId": "persistent"},
+        {"kind": "allow_once", "optionId": "once"},
+    ]
+    request = {"sessionId": "s1", "toolCall": {"toolCallId": "shell-1"}, "options": options}
+    assert await ex._decide_permission(request) == (True, "once")
+    assert await ex._decide_permission(request) == (False, None)
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-2"})
+    assert await ex._decide_permission(
+        {**request, "toolCall": {"toolCallId": "shell-2", "rawInput": {"CommandLine": "git diff"}}}
+    ) == (False, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-3"})
+    assert await ex._decide_permission(
+        {**request, "toolCall": {"toolCallId": "shell-3"}, "options": options[:1]}
+    ) == (False, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-4"})
+    ex._policy_evaluator.return_value = PolicyVerdictPayload(action="POLICY_ACTION_ASK")
+    assert await ex._decide_permission({**request, "toolCall": {"toolCallId": "shell-4"}}) == (
+        True,
+        "once",
+    )
+    ex._elicitation_handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2033,6 +2279,82 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_status", "finishes"),
+    [
+        ("running", True),
+        ("running-update", True),
+        ("pending", False),
+        ("finished", False),
+        ("stalled", False),
+    ],
+)
+async def test_prompt_idle_deadline_during_tool_call(
+    monkeypatch: pytest.MonkeyPatch, tool_status: str, finishes: bool
+) -> None:
+    monkeypatch.setattr(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(acp_executor_module, "_RUNNING_TOOL_TIMEOUT_SECONDS", 0.4, raising=False)
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    loop = asyncio.get_running_loop()
+    response_timer: asyncio.TimerHandle | None = None
+
+    def update(kind: str, status: str) -> None:
+        ex._queue.put_nowait(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": kind,
+                        "toolCallId": "shell-1",
+                        "title": "shell",
+                        "status": status,
+                    },
+                },
+            }
+        )
+
+    async def send(message: dict) -> None:
+        nonlocal response_timer
+        assert message["method"] == "session/prompt"
+        update("tool_call", "in_progress" if tool_status == "running" else "pending")
+        if tool_status in {"running-update", "finished", "stalled"}:
+            update("tool_call_update", "in_progress")
+        if tool_status == "finished":
+            update("tool_call_update", "completed")
+        if tool_status == "stalled":
+            return
+
+        def finish() -> None:
+            if tool_status in {"running", "running-update"}:
+                update("tool_call_update", "completed")
+            ex._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+        response_timer = loop.call_later(0.2, finish)
+
+    monkeypatch.setattr(ex, "_send", send)
+    try:
+        async with asyncio.timeout(1):
+            events = [
+                event async for event in ex.run_turn([{"role": "user", "content": "run"}], [], "")
+            ]
+    finally:
+        if response_timer is not None:
+            response_timer.cancel()
+
+    assert isinstance(events[0], ToolCallRequest)
+    if finishes:
+        assert isinstance(events[-2], ToolCallComplete)
+        assert isinstance(events[-1], TurnComplete)
+    else:
+        assert isinstance(events[-1], ExecutorError)
+        assert events[-1].message == "Timeout waiting for ACP response"
+
+
+@pytest.mark.asyncio
 async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) -> None:
     """A model report queued behind ``session/new`` is read before the first switch.
 
@@ -2592,6 +2914,43 @@ def test_ordered_prompt_blocks_preserve_text_image_text_order() -> None:
 # ---------------------------------------------------------------------------
 # Process lifecycle: a torn-down executor must not strand the agent
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_windows_acp_spawn_hides_window_and_keeps_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from omnigent.inner import acp_executor
+
+    executor = AcpExecutor(AcpAgentConfig(command="example-agent"), cwd=str(tmp_path))
+    no_window = 0x08000000
+    new_group = 0x00000200
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    monkeypatch.setattr(acp_executor, "IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr(acp_executor._proc, "IS_POSIX", False)
+    monkeypatch.setattr(acp_executor._proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    spawn = AsyncMock()
+    monkeypatch.setattr(
+        acp_executor,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            create_task=asyncio.create_task,
+            subprocess=asyncio.subprocess,
+        ),
+    )
+    monkeypatch.setattr(executor, "_read_stdout", AsyncMock())
+    monkeypatch.setattr(executor, "_read_stderr", AsyncMock())
+
+    await executor._start_process()
+
+    spawn.assert_awaited_once()
+    kwargs = spawn.await_args.kwargs
+    assert kwargs["creationflags"] == no_window | new_group
+    assert all(kwargs[name] == asyncio.subprocess.PIPE for name in ("stdin", "stdout", "stderr"))
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")

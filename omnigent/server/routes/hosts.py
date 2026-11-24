@@ -165,6 +165,8 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 35.0
+# ACP probes allow 55 seconds of work and five seconds for cleanup.
+_ACP_MODEL_REFRESH_TIMEOUT_S = 65.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -288,12 +290,17 @@ async def _proxy_model_options(
     """Ask a host for the model catalog it would use for a new session."""
     from omnigent.server.routes._host_model_options import request_host_model_options
 
+    timeout_s = (
+        _ACP_MODEL_REFRESH_TIMEOUT_S
+        if refresh in ("force", "auto") and canonicalize_harness(harness) == "acp"
+        else _MODEL_OPTIONS_TIMEOUT_S
+    )
     try:
         return await request_host_model_options(
             host_registry=host_registry,
             host_conn=host_conn,
             harness=harness,
-            timeout_s=_MODEL_OPTIONS_TIMEOUT_S,
+            timeout_s=timeout_s,
             refresh=refresh,
         )
     except ConnectionError as exc:
@@ -305,8 +312,7 @@ async def _proxy_model_options(
         raise HTTPException(
             status_code=504,
             detail=(
-                f"host '{host_conn.host_id}' did not resolve model options within "
-                f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
+                f"host '{host_conn.host_id}' did not resolve model options within {timeout_s:.0f}s"
             ),
         ) from exc
 
@@ -1662,40 +1668,35 @@ def create_hosts_router(
             else canonicalize_harness(harness) or harness,
             refresh=refresh,
         )
+        from omnigent.server.routes._host_model_options import (
+            EMPTY_ACP_MODEL_CATALOG,
+            record_host_model_options,
+        )
+
+        acp = canonicalize_harness(harness) == "acp"
         catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
-        if catalog_store is not None and harness.startswith("acp:"):
-            if result.get("status") == "ok":
-                await asyncio.to_thread(
-                    catalog_store.upsert,
-                    host_id,
-                    harness,
-                    result.get("models", []),
-                    now_epoch(),
-                    permission_options=result.get("permission_options"),
-                    injects_prompt=result.get("injects_prompt"),
-                )
-            else:
-                await asyncio.to_thread(
-                    catalog_store.mark_error,
-                    host_id,
-                    harness,
-                    str(result.get("error") or "host model-options lookup failed"),
-                    injects_prompt=result.get("injects_prompt"),
-                )
+        if catalog_store is not None and acp:
+            await record_host_model_options(
+                catalog_store, host_id, harness, result, fetched_at=now_epoch()
+            )
         if result.get("status") != "ok":
             raise HTTPException(
                 status_code=502,
                 detail=str(result.get("error") or "host model-options lookup failed"),
             )
-        models = result.get("models")
+        raw_models = result.get("models")
+        models = (
+            [model for model in raw_models if isinstance(model, dict)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        if acp and refresh is not None and not models:
+            raise HTTPException(status_code=502, detail=EMPTY_ACP_MODEL_CATALOG)
+
         routable = result.get("routable_models")
         error = result.get("error")
         return HostModelOptionsResponse(
-            models=(
-                [model for model in models if isinstance(model, dict)]
-                if isinstance(models, list)
-                else []
-            ),
+            models=models,
             # Every id the harness's endpoint routes: the picker names one
             # row per model, while a launch takes an exact id.
             routable_models=(

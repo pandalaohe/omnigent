@@ -116,6 +116,19 @@ def _goal_state_post(state: str | None) -> tuple[str, dict[str, Any]]:
     return (_EVENTS_URL, {"type": "external_goal_state", "data": {"state": state}})
 
 
+def _completed_turn_status_post(
+    turn_id: str, *, generation: int = 1
+) -> tuple[str, dict[str, Any]]:
+    return _status_post(
+        {
+            "status": "idle",
+            "response_id": f"codex_{turn_id}",
+            "turn_completed": True,
+            "native_turn_generation": generation,
+        }
+    )
+
+
 class _AppServerStub:
     """
     App-server stub for the goal and background-terminal reads.
@@ -916,7 +929,8 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
         ]
     )
     client = _RecordingClient()
-    state = fwd._CodexForwarderState()
+    background_terminal_signals: list[bool] = []
+    state = fwd._CodexForwarderState(on_background_terminals=background_terminal_signals.append)
 
     await _deliver_to_parent(
         client,
@@ -930,7 +944,14 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
     await poll
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _status_post(
+            {
+                "status": "idle",
+                "response_id": "codex_turn_1",
+                "turn_completed": True,
+                "native_turn_generation": 1,
+            }
+        ),
         _background_work_post(True, _terminal_tasks("npm run dev")),
         _background_work_post(None, _terminal_tasks("make watch")),
         _background_work_post(False, []),
@@ -939,6 +960,60 @@ async def test_running_background_terminal_keeps_the_session_working_after_its_t
     assert [method for method, _params in app_server.requests] == [
         "thread/backgroundTerminals/list"
     ] * 4
+    assert background_terminal_signals == [True, True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_background_terminal_poll_stops_only_when_its_thread_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiting = _park_poll(monkeypatch)
+    app_server = _AppServerStub(listings=[_terminal_listing("npm run dev")])
+    client = _RecordingClient()
+    signals: list[bool] = []
+    state = fwd._CodexForwarderState(on_background_terminals=signals.append)
+    await fwd._track_background_terminals(
+        client,
+        app_server,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        forwarder_state=state,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        await _deliver_to_parent(
+            client, tmp_path, state, {"method": "thread/closed", "params": {"threadId": "other"}}
+        )
+        assert state.background_terminal_poll is poll
+        assert signals == [True]
+
+        await _deliver_to_parent(
+            client,
+            tmp_path,
+            state,
+            {"method": "thread/closed", "params": {"threadId": "thread_123"}},
+        )
+        assert state.background_terminal_poll is None
+        assert signals == [True, False]
+        assert client.posts[-1] == _background_work_post(False, [])
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+        await fwd._track_background_terminals(
+            client,
+            app_server,
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            forwarder_state=state,
+        )
+        assert len(app_server.requests) == 1
+        assert state.background_terminal_poll is None
+    finally:
+        poll.cancel()
+        await asyncio.gather(poll, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -974,7 +1049,7 @@ async def test_server_without_the_list_still_gets_flag_changes(
     await poll
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(True, _terminal_tasks("npm run dev")),
         _background_work_post(None, _terminal_tasks("npm run dev", "make watch")),
         _background_work_post(False),
@@ -1253,7 +1328,7 @@ async def test_goal_and_terminal_share_one_flag(
     assert client.posts == [
         _background_work_post(True),
         _goal_state_post("active"),
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(None, _terminal_tasks("npm run dev")),
         _background_work_post(None, []),
         _background_work_post(False),
@@ -1295,9 +1370,9 @@ async def test_codex_without_terminal_listing_is_not_asked_again(
         "thread/backgroundTerminals/list"
     ]
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(False),
-        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+        _completed_turn_status_post("turn_2", generation=3),
     ]
 
 
@@ -1312,10 +1387,12 @@ async def test_failed_terminal_listing_keeps_the_last_known_state(
         list_error=ConnectionError("app-server socket closed"), list_error_count=1
     )
     client = _RecordingClient()
+    signals: list[bool] = []
     state = fwd._CodexForwarderState(
         background_terminals=_terminal_tasks("npm run dev"),
         posted_background_work_running=True,
         posted_background_tasks=_terminal_tasks("npm run dev"),
+        on_background_terminals=signals.append,
     )
 
     await _deliver_to_parent(
@@ -1325,13 +1402,15 @@ async def test_failed_terminal_listing_keeps_the_last_known_state(
         _turn_completed("turn_1", "completed"),
         codex_client=app_server,
     )
-    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+    assert client.posts == [_completed_turn_status_post("turn_1")]
+    assert signals == []
 
     # The next listing succeeds and finds no terminal, which clears the flag.
     poll = state.background_terminal_poll
     assert poll is not None
     await poll
     assert client.posts[-1] == _background_work_post(False, [])
+    assert signals == [False]
 
 
 @pytest.mark.asyncio
@@ -1376,7 +1455,7 @@ async def test_hung_terminal_listing_does_not_hold_the_turn_end(
     )
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _completed_turn_status_post("turn_1"),
         _background_work_post(False),
     ]
     assert state.background_terminal_poll is None

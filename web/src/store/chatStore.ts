@@ -60,6 +60,7 @@ import {
   isTerminalCommandInput,
   LIVE_ITEM_PREFIX,
   PENDING_FILE_PREFIX,
+  slashCommandEchoItemId,
   structuredErrorFields,
 } from "@/lib/blocks";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
@@ -185,7 +186,7 @@ import {
   type ComposerDraftPart,
 } from "@/lib/composerContent";
 import type { ActiveResponse } from "./types";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { supportsEffortControl, supportsSdkEffortReset } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import {
@@ -4178,7 +4179,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // so this conversation doesn't claim an effort the server will never hold.
         // SDK harnesses carry no wrapper label, so resolve their declared effort
         // family to recognize that they do take a ``reasoning_effort`` override.
-        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
+        const effortFamily = await effortFamilyForSession(session);
+        const canResetSdkEffort = effort === null && supportsSdkEffortReset(session, effortFamily);
+        if (!canResetSdkEffort && !supportsEffortControl(session, effortFamily)) {
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
@@ -5996,7 +5999,9 @@ async function bindStream(
     // when no catalog has loaded yet rather than blanking a real setting.
     const cachedFamily = cachedEffortFamilyForSession(session);
     const canApplyEffort =
-      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
+      cachedFamily === undefined ||
+      supportsEffortControl(session, cachedFamily) ||
+      supportsSdkEffortReset(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -6007,6 +6012,7 @@ async function bindStream(
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     const reloadedSend = hydratePending ? restoredSendAfterReload(id, items) : null;
+    const persistedSendIds = new Set(confirmedWebSendIds(items));
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(
@@ -6063,9 +6069,7 @@ async function bindStream(
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
-      // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
+      // Rebind preserves live pending sends unless history names their send id.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -6132,7 +6136,7 @@ async function bindStream(
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
         blocks: reconcileDeliveryCards(syntheticError ? [...allBlocks, syntheticError] : allBlocks),
-        pendingUserMessages: snapshotPending,
+        pendingUserMessages: withoutPersistedPendingSends(snapshotPending, persistedSendIds),
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
           : {}),
@@ -7160,6 +7164,7 @@ async function rehydrateWindowOnReconnect(
     const pendingPatch = recoveredPendingInputPatch(
       s,
       settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+      settlementItems,
       pendingAtReconnectStart,
       session.pendingInputs,
     );
@@ -7362,6 +7367,7 @@ async function reconcileOnReconnect(
       recoveredPendingInputPatch(
         s,
         settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+        items,
         pendingAtReconnectStart,
         session.pendingInputs,
       ),
@@ -9419,9 +9425,15 @@ function pendingMatchesConsumedEvent(
   event: SessionInputConsumedEvent,
   pending: PendingUserMessage,
 ): boolean {
-  // The runner already named this queued input. A mirror for an unknown or
-  // different send cannot prove that Claude has taken it out of the queue.
   if (pending.received) return false;
+  // An unnamed terminal echo cannot acknowledge a native send already known
+  // to the server through its POST id or a runner sending timestamp.
+  if (
+    event.clearedPendingId == null &&
+    (pending.pendingId || pending.sendingSinceMs !== undefined)
+  ) {
+    return false;
+  }
   const hasFiles = pending.content.some(
     (block) => block.type === "input_image" || block.type === "input_file",
   );
@@ -9694,14 +9706,44 @@ function syncPendingSendTimes(
   });
 }
 
-// Lost stream receipts have durable equivalents in the recovered input blocks.
+function withoutPersistedPendingSends(
+  messages: PendingUserMessage[],
+  persistedSendIds: ReadonlySet<string>,
+): PendingUserMessage[] {
+  if (persistedSendIds.size === 0) return messages;
+  return messages.filter((pending) => !pending.stableId || !persistedSendIds.has(pending.stableId));
+}
+
+// Use persisted order even when a named receipt was already shown or hidden.
+function* recoveredInputReceipts(
+  history: ConversationItem[],
+  recovered: AnyBlock[],
+): Iterable<string | AnyBlock> {
+  const recoveredById = new Map(recovered.map((block) => [block.ctx.itemId, block]));
+  for (const item of history) {
+    if (isMessageItem(item) && item.role === "user" && typeof item.web_stable_id === "string") {
+      yield item.web_stable_id;
+      continue;
+    }
+    if (item.type === "slash_command") {
+      const echo = recoveredById.get(slashCommandEchoItemId(item.id));
+      if (echo) yield echo;
+    }
+    const block = recoveredById.get(item.id);
+    if (block) yield block;
+  }
+}
+
 function recoveredPendingInputPatch(
   s: PendingInputState,
   recovered: AnyBlock[],
+  history: ConversationItem[],
   pendingAtReconnectStart: Set<string>,
   serverInputs: PendingInput[] | undefined,
 ): PendingInputState {
   const pendingById = pendingInputsById(serverInputs);
+  // Hold named entries in their queue positions until their receipt is visited.
+  const persistedSendIds = new Set(confirmedWebSendIds(history));
   const isStillPending = (p: PendingUserMessage | undefined) =>
     p !== undefined && pendingById.has(p.pendingId ?? p.tempId);
   let state: PendingInputState = {
@@ -9711,6 +9753,7 @@ function recoveredPendingInputPatch(
           serverInputs === undefined ||
           !pendingAtReconnectStart.has(p.tempId) ||
           p.sendingSinceMs === undefined ||
+          (p.stableId !== undefined && persistedSendIds.has(p.stableId)) ||
           isStillPending(p),
       ),
       pendingById,
@@ -9719,7 +9762,16 @@ function recoveredPendingInputPatch(
   };
   const eligible = (p: PendingUserMessage) =>
     !p.initialDraft && !p.beforePost && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
-  for (const block of recovered) {
+  const namedReceiptSuccessors = new Set<string>();
+  for (const block of recoveredInputReceipts(history, recovered)) {
+    if (typeof block === "string") {
+      state.pendingUserMessages = state.pendingUserMessages.filter((pending, index, queue) => {
+        if (pending.stableId === block) return false;
+        if (queue[index - 1]?.stableId === block) namedReceiptSuccessors.add(pending.tempId);
+        return true;
+      });
+      continue;
+    }
     if (isTerminalCommandInput(block) && block.ctx.itemId) {
       state = { ...state, ...settledShellInputPatch(state, block.ctx.itemId, block.input) };
       continue;
@@ -9743,10 +9795,17 @@ function recoveredPendingInputPatch(
           (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
         )
       ) {
-        // Old mirrors have independent IDs. Match content to the queued head
-        // only, so an unrelated native input cannot consume a different send.
+        // A named receipt can expose a later send the server has yet to see.
+        // Require arrival evidence before matching that new head by content.
         const head = state.pendingUserMessages[0];
-        if (head && eligible(head) && contentKeyOf(head.content) === contentKeyOf(block.content))
+        if (
+          head &&
+          eligible(head) &&
+          (!namedReceiptSuccessors.has(head.tempId) ||
+            head.pendingId !== undefined ||
+            head.received) &&
+          contentKeyOf(head.content) === contentKeyOf(block.content)
+        )
           at = 0;
       }
     }

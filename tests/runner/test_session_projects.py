@@ -1,10 +1,12 @@
 """Runner-side argument handling and error mapping for the project tools."""
 
+import asyncio
 import json
 
 import httpx
 import pytest
 
+from omnigent.runner import session_projects
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.session_projects import execute_project_list, execute_session_update
 
@@ -50,15 +52,13 @@ async def test_update_rejects_invalid_arguments_before_any_request(args, message
     assert requests == []
 
 
-@pytest.mark.parametrize("info", [{}, {"session_move_source_checks": False}, None])
+@pytest.mark.parametrize("info", [{}, {"session_move_source_checks": False}])
 async def test_update_refuses_a_server_without_source_checks_before_any_write(info):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/v1/info" and info is not None:
-            return httpx.Response(200, json=info)
-        return httpx.Response(404 if info is None else 200, json={})
+        return httpx.Response(200, json=info)
 
     async with _client(handler) as client:
         result = json.loads(
@@ -66,6 +66,34 @@ async def test_update_refuses_a_server_without_source_checks_before_any_write(in
         )
     assert "cannot check the calling session's sharing" in result["error"]
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason"),
+    [
+        (httpx.ReadTimeout(""), "ReadTimeout"),
+        (httpx.Response(404), "HTTP 404"),
+        (httpx.Response(503), "HTTP 503"),
+        (httpx.Response(200, text="not JSON"), "invalid capability response"),
+        (httpx.Response(200, json=[]), "invalid capability response"),
+    ],
+)
+async def test_update_reports_why_the_capability_probe_failed(reply, reason):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (request.method, request.url.path) == ("GET", "/v1/info")
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "model": "host-model"}, client, SOURCE
+            )
+        )
+    assert "GET /v1/info" in result["error"]
+    assert reason in result["error"]
+    assert "upgrade" not in result["error"]
 
 
 def _session_server(requests: list[httpx.Request]):
@@ -254,6 +282,89 @@ async def test_update_settings_uses_existing_session_patch_for_children(parent, 
         "reasoning_effort": effort,
     }
     assert patches[0].headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+
+
+async def test_update_settings_waits_for_slow_probe_snapshot_and_patch():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        timeout = request.extensions["timeout"]
+        io_timeout = 60.0 if request.method == "PATCH" else 30.0
+        assert all(timeout[phase] == io_timeout for phase in ("connect", "pool", "write"))
+        if request.url.path == "/v1/info":
+            delay, reply = 80, CHECKED_INFO
+        elif request.method == "GET":
+            assert request.url.params["include_usage"] == "false"
+            assert request.url.params["include_live_status"] == "false"
+            delay, reply = 80, {"permission_level": 4, "parent_session_id": PARENT}
+        else:
+            assert request.url.params["include_usage"] == "false"
+            assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+            delay, reply = 630, {"model_override": "host-model", "reasoning_effort": "high"}
+        # Simulate reply latencies against the bound HTTPX passes to the transport.
+        if timeout["read"] < delay:
+            raise httpx.ReadTimeout("")
+        return httpx.Response(200, json=reply)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "model": "host-model", "reasoning_effort": "high"},
+                client,
+                SOURCE,
+            )
+        )
+    assert result == {
+        "session_id": SUB_AGENT,
+        "status": "updated",
+        "model": "host-model",
+        "reasoning_effort": "high",
+    }
+    assert requests == [
+        ("GET", "/v1/info"),
+        ("GET", f"/v1/sessions/{SUB_AGENT}"),
+        ("PATCH", f"/v1/sessions/{SUB_AGENT}"),
+    ]
+
+
+async def test_update_settings_reports_a_snapshot_failure_before_any_patch():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=CHECKED_INFO)
+        raise httpx.ReadTimeout("")
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "model": "host-model"}, client, SOURCE
+            )
+        )
+    assert result == {"session_id": SUB_AGENT, "error": "session could not be read: ReadTimeout"}
+
+
+async def test_update_settings_stops_waiting_at_the_patch_deadline(monkeypatch):
+    monkeypatch.setattr(session_projects, "_SETTINGS_PATCH_TIMEOUT_S", 0.01, raising=False)
+    patches = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=CHECKED_INFO)
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4})
+        patches.append(request)
+        await asyncio.sleep(0.2)
+        return httpx.Response(200, json={"model_override": "host-model"})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "model": "host-model"}, client, SOURCE
+            )
+        )
+    assert "PATCH" in result["error"] and "0.01s" in result["error"]
+    assert len(patches) == 1
 
 
 async def test_update_settings_denies_foreign_readable_session():

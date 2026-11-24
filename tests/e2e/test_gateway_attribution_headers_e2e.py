@@ -179,6 +179,11 @@ def test_gateway_headers_reach_real_cli_requests(
         command: tuple[str, ...] = ()
         policy_path = tmp_path / "provider-policy.toml"
         if config_source == "codex-inherited":
+            # Allow a cold CLI launch in this wire test. Production bounds optional attribution.
+            monkeypatch.setattr(
+                "omnigent.harnesses.codex_native.app_server._PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS",
+                10.0,
+            )
             policy = tomlkit.inline_table()
             policy.update(
                 {

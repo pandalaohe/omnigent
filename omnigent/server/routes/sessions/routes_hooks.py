@@ -2764,9 +2764,11 @@ def register_hooks_routes(
         # dispatch, drained when the forwarder mirrors it back); a prompt
         # typed directly in the TUI has none and never hit POST /events, so it
         # is gated here — the hook is its only request-phase gate. The signal
-        # is "is a web prompt in flight", not text correlation (the native
-        # transcript gives no reliable id channel — see ``pending_inputs``).
-        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+        # is "is a current web prompt in flight", not text correlation (the
+        # native transcript gives no reliable id channel — see
+        # ``pending_inputs``). A retained claim past the text-match window is
+        # kept only for its original attempt evidence and is not current here.
+        if phase == Phase.REQUEST and pending_inputs.has_request_phase_pending(session_id):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",

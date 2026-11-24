@@ -2062,7 +2062,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
     except Exception:
         return None
-    raw_auth = raw.get("auth")
+    raw_auth = raw.get("auth") if isinstance(raw, dict) else None
     if not isinstance(raw_auth, dict):
         return None
     auth_type = str(raw_auth.get("type", ""))

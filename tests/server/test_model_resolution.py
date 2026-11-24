@@ -45,4 +45,4 @@ def test_missing_is_a_note_not_a_changed_launch_and_notes_fit_label_columns():
     labels = context.labels()
     assert all(len(value) <= 256 for value in labels.values())
     assert notes_from_labels(labels) == [note.payload() for note in context.notes]
-    assert all("trying it as unknown" in warning for warning in context.warnings())
+    assert all("passing it to the host unchanged" in warning for warning in context.warnings())

@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+from omnigent.config import global_config_path, load_effective_config
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native import app_server as codex_app
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
@@ -37,6 +38,7 @@ _SESSION_ID = "c91a9d508b344ad59c65628ed80b5230"
 _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
 _DISCOVER_THREAD_AND_FORWARD = runner_native._codex_discover_thread_and_forward
+_RESOLVE_NATIVE_CODEX_LAUNCH = codex_app.resolve_native_codex_launch
 
 
 def _unavailable_notice(pick: str, launched: str) -> dict[str, str]:
@@ -116,7 +118,6 @@ async def codex_launch_harness(
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
-    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: _CODEX_PATH)
     monkeypatch.setattr(codex_app, "_find_codex_cli", lambda: _CODEX_PATH)
@@ -287,6 +288,17 @@ async def codex_launch_harness(
     await asyncio.sleep(0)
 
 
+def _set_unlisted_mode(mode: str) -> None:
+    path = global_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"codex_native_unlisted_model: {mode}\n")
+
+
+@pytest.fixture
+def unlisted_as_requested(codex_launch_harness: _LaunchHarness) -> None:
+    _set_unlisted_mode("as_requested")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pick", ["databricks-gpt-5-6-sol", "system.ai.gpt-5-6-sol"])
 async def test_equivalent_gateway_pick_launches_without_reset(
@@ -368,6 +380,7 @@ async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 async def test_profile_fallback_prefers_the_agents_listed_model(
     codex_launch_harness: _LaunchHarness,
 ) -> None:
@@ -409,6 +422,105 @@ async def test_codex_policy_hook_token_refresh_keeps_runner_responsive(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_model", [None, "gpt-5.6-astra", _RETIRED_PICK])
+async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
+    agent_model: str | None, codex_launch_harness: _LaunchHarness
+) -> None:
+    """Without opt-in a live miss retires the pick after the replacement terminal starts."""
+    harness = codex_launch_harness
+    assert isinstance(harness.agent_spec, AgentSpec)
+    if agent_model is not None:
+        harness.agent_spec.executor.config["model"] = agent_model
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}, {"id": "gpt-5.6-astra"}])
+
+    await harness.launch()
+
+    launched = agent_model if agent_model == "gpt-5.6-astra" else _PROVIDER_DEFAULT
+    assert harness.builds[0]["model"] == launched
+    assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.snapshot["model_override"] is None
+    assert harness.unlisted_bindings == [None]
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, launched)]
+    assert harness.events[-3:] == ["terminal-launch", "reset", "notice"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_text", "reason"),
+    [
+        ("", None),
+        ("codex_native_unlisted_model: fallback", None),
+        ("codex_native_unlisted_model: yes", "invalid setting value"),
+        ("codex_native_unlisted_model: null", "invalid setting value"),
+        ("codex_native_unlisted_model: [", "cannot parse user config as YAML"),
+        ("[as_requested]", "user config must be a YAML mapping"),
+        ("[]", "user config must be a YAML mapping"),
+        ("null", "user config must be a YAML mapping"),
+        (None, "cannot read user config"),
+    ],
+)
+async def test_codex_terminal_unlisted_setting_uses_fallback(
+    config_text: str | None,
+    reason: str | None,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _no_configured_codex_app_server_command: Callable[[], tuple[str, ...]],
+) -> None:
+    """Invalid values and errors reading the setting at terminal launch log the fallback."""
+    harness = codex_launch_harness
+    path = global_config_path()
+    path.parent.mkdir()
+    if config_text is None:
+        path.mkdir()  # The config path exists but cannot be read as a file.
+    else:
+        path.write_text(config_text)
+    monkeypatch.setattr(codex_app, "resolve_native_codex_launch", _RESOLVE_NATIVE_CODEX_LAUNCH)
+    monkeypatch.setattr(
+        codex_app, "_configured_app_server_command", _no_configured_codex_app_server_command
+    )
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.unlisted_bindings == [None]
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, _PROVIDER_DEFAULT)]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "omnigent.config"
+        and "codex_native_unlisted_model" in record.getMessage()
+    ]
+    if reason is None:
+        assert warnings == []
+    else:
+        (warning,) = warnings
+        assert reason in warning
+        assert "as_requested or fallback" in warning
+
+
+@pytest.mark.asyncio
+async def test_project_cannot_opt_in_to_unlisted_model_launches(
+    codex_launch_harness: _LaunchHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = codex_launch_harness
+    monkeypatch.chdir(tmp_path)
+    project_config = tmp_path / ".omnigent" / "config.yaml"
+    project_config.parent.mkdir()
+    project_config.write_text("codex_native_unlisted_model: as_requested\n")
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+
+    await harness.launch()
+
+    assert "codex_native_unlisted_model" not in load_effective_config()
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, _PROVIDER_DEFAULT)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("agent_model", [None, "gpt-5.6-astra"])
 # A router pin is never listed; a typo or a model the list lags looks the same.
 @pytest.mark.parametrize("pick", [_RETIRED_PICK, "router-a/gpt-6.2-sol"])
@@ -457,6 +569,7 @@ async def test_unlisted_pick_launches_as_requested_with_a_notice(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 async def test_unlisted_pick_also_pinned_by_the_spec_launches_as_requested(
     codex_launch_harness: _LaunchHarness,
 ) -> None:
@@ -490,12 +603,15 @@ async def test_spec_only_model_launches_unchecked(codex_launch_harness: _LaunchH
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("as_requested", [False, True])
 @pytest.mark.parametrize("refresh", ["hit", "miss", "empty", "error"])
 async def test_stale_miss_awaits_reprobe_before_judging_the_pick(
-    refresh: str, codex_launch_harness: _LaunchHarness
+    refresh: str, as_requested: bool, codex_launch_harness: _LaunchHarness
 ) -> None:
-    """A stale miss reloads once; only a fresh miss is named unlisted, and the pick launches."""
+    """Only a live miss after the stale-list reload can apply the host's launch policy."""
     harness = codex_launch_harness
+    if as_requested:
+        _set_unlisted_mode("as_requested")
     pick = "databricks-gpt-5-6-sol"
     harness.snapshot["model_override"] = pick
     stale_rows = [{"id": "gpt-5.4-yesterday", "isDefault": True}]
@@ -525,9 +641,10 @@ async def test_stale_miss_awaits_reprobe_before_judging_the_pick(
         release_probe.set()
         await launch
 
-    assert harness.builds[0]["model"] == pick
-    assert harness.resets == []
-    assert harness.unlisted_bindings == ([pick] if refresh == "miss" else [None])
+    falls_back = refresh == "miss" and not as_requested
+    assert harness.builds[0]["model"] == (_PROVIDER_DEFAULT if falls_back else pick)
+    assert harness.resets == ([{"expected_model_override": pick}] if falls_back else [])
+    assert harness.unlisted_bindings == ([pick] if refresh == "miss" and as_requested else [None])
     harness.probe.assert_awaited_once()
     assert model_catalog_store.read_catalog("codex-native", fingerprint) == (
         fresh_rows if refresh in {"hit", "miss"} else stale_rows
@@ -557,6 +674,7 @@ async def test_stale_catalog_hit_does_not_wait_for_background_refresh(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("probe_fails", [False, True])
 async def test_no_catalog_keeps_explicit_pick(
     probe_fails: bool, codex_launch_harness: _LaunchHarness
@@ -574,6 +692,7 @@ async def test_no_catalog_keeps_explicit_pick(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("failure", ["app-server", "discovery", "terminal"])
 async def test_failed_unlisted_launch_posts_no_notice(
     failure: str, codex_launch_harness: _LaunchHarness
@@ -632,6 +751,7 @@ def _bind_discovered_thread(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("thread_starts", [False, True])
 async def test_fresh_unlisted_launch_names_its_pick_only_in_a_started_threads_binding(
     thread_starts: bool,
@@ -677,6 +797,7 @@ async def test_fresh_unlisted_launch_names_its_pick_only_in_a_started_threads_bi
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("server", ["current", "older"])
 async def test_unlisted_thread_binding_leaves_no_task_beside_forwarding(
     server: str,
@@ -718,6 +839,7 @@ async def test_unlisted_thread_binding_leaves_no_task_beside_forwarding(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("wrapped_spec", [False, True])
 @pytest.mark.parametrize("stale", [False, True])
 @pytest.mark.parametrize("spec_serves_pick", [False, True])
@@ -761,6 +883,7 @@ async def test_spec_catalog_is_not_replaced_by_ambient_provider_catalog(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 async def test_unlisted_pick_keeps_its_resolved_model_config(
     codex_launch_harness: _LaunchHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -817,6 +940,7 @@ async def test_conditional_reset_still_propagates_cancellation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 @pytest.mark.parametrize("stale", [False, True])
 async def test_subscription_unlisted_pick_launches_as_requested(
     stale: bool,
@@ -851,6 +975,7 @@ async def test_subscription_unlisted_pick_launches_as_requested(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unlisted_as_requested")
 async def test_resumed_unlisted_launch_runs_the_pick_without_a_notice(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,

@@ -47,15 +47,14 @@ persist site drains the oldest entry whose text equals the mirror
 generated marker lines — one per file block — are dropped from the mirror
 first) and reports the older entries it skipped, which the caller
 persists as undelivered. Two queued messages with identical text drain in
-queue order: text alone cannot tell them apart, so if the older one was
-lost the receipt names it and the later one is surfaced as undelivered
-at the next match — the only ambiguity this scheme accepts. When
-no entry matches — the transcript may still reformat text in ways not
-normalized here — the oldest entry is drained, as before, and every entry
-still queued is marked uncertain (:func:`mark_uncertain`): the drained
-receipt may really have belonged to one of them, so a later match that
-jumps over them drains them quietly instead of recording them as
-undelivered.
+queue order while their claims are inside the text-match window. A claim
+retained past that window is omitted from text-only settlement and request-phase
+lookups, but remains available for its own attempt-linked evidence until the
+two-hour proof bound. A late claim that explains the text without a current
+claimed match leaves the queue alone. Other text misses can drain the oldest
+entry and mark the rest uncertain (:func:`mark_uncertain`): the drained receipt
+may really have belonged to one of them, so a later match that jumps over them
+drains them quietly instead of recording them as undelivered.
 
 A message the person cancelled with Stop before the agent recorded it would
 otherwise be recorded as undelivered at the next match. The interrupt route
@@ -87,16 +86,11 @@ Limitations (identical to :mod:`pending_elicitations`):
   subscribers live on one process), so this rides the same affinity.
 * Ordinary native entries do not survive a server restart. Durable startup
   entries are restored from conversation items when a transcript arrives.
-* At most :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries per
-  conversation; :func:`record` evicts the oldest unheld entries beyond that
-  and never the entry it just recorded. Entries a persist in progress has
-  drained with ``hold=True`` keep their slot until :func:`release` (it
-  landed) or :func:`restore` (it did not) settles them, so a queue that
-  refills during the persist can never discard the entries a failed append
-  has to put back; they are a transient overlay of at most one drain, so
-  the queue never exceeds twice the cap. A drain reports at most a cap's
-  worth of skipped entries, so the persist site's append stays bounded
-  even right after a rolled-back drain left the queue over the cap.
+* :func:`record` caps unheld entries without a runner lease per conversation.
+  A persist in progress keeps its held entries so it can restore them if the
+  append fails. :func:`claim_runner_input` separately caps outstanding paste
+  claims, including interrupted claims still awaiting settlement. A drain
+  reports at most a cap's worth of skipped entries to bound each append.
 * An image-only message has no text to match, so it drains by position;
   behind a stale head
   entry its image can land on the wrong message. This is the positional
@@ -119,7 +113,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -140,14 +134,16 @@ from omnigent.native.input_diagnostics import input_attributes, log_input_event
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
-_CLAIMED_INPUT_TIMEOUT_S = 720.0
+# After granting the paste, the server cannot infer a read or loss from the
+# turn ending, a missing receipt, or a reconnect. Keep the matchable identity
+# for a fixed two hours from the claim so a late transcript can settle it.
+_CLAIMED_INPUT_TIMEOUT_S = 2 * 60 * 60.0
+# Legacy echoes carry text without a delivery identity. Restrict this
+# fallback to the original claim timeout; extra time is for linked evidence.
+_CLAIMED_TEXT_MATCH_TIMEOUT_S = 12 * 60.0
 
-# Hard cap on unheld queued entries per conversation, enforced by
-# :func:`record`: the oldest unheld entries are evicted when a new one would
-# exceed it (never the new one itself). Bounds the snapshot replay and the
-# persist site's append (each skipped entry becomes two rows). Far above any
-# real queue: nobody sends this many messages within the TTL with none echoed
-# back.
+# Per-conversation cap for unheld entries without a runner lease, and a
+# separate cap of the same size for claims awaiting settlement.
 _MAX_ENTRIES_PER_CONVERSATION = 64
 
 # One attachment reference line a native executor prepends to a pasted message
@@ -276,7 +272,6 @@ class DrainedInput:
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
-    runner_claim_owner: str | None = None
 
 
 @dataclass
@@ -364,8 +359,6 @@ class _Entry:
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
     runtime_notice: bool = False
-    # Runner id that claimed this input; only its heartbeats renew a confirmed paste.
-    runner_claim_owner: str | None = None
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
 
@@ -384,22 +377,13 @@ _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] 
 )
 _lock = threading.Lock()
 
-# Optional check the server wires to its cached session status; called under
-# :data:`_lock`, so it must be cheap and non-blocking.
-_session_busy_check: Callable[[str], bool] | None = None
 
-
-def set_session_busy_check(check: Callable[[str], bool] | None) -> None:
-    """
-    Register (or clear) the check that reports a session mid-turn.
-
-    :param check: Callback invoked as ``check(conversation_id)``; ``True``
-        means the session still has a turn in flight, so a pasted message the
-        runner confirmed may still be absorbed at the turn's next step. Pass
-        ``None`` to clear.
-    """
-    global _session_busy_check
-    _session_busy_check = check
+def _is_late_claimed_entry(entry: _Entry, now: float) -> bool:
+    """Whether a claimed entry is retained only for attempt-linked proof."""
+    return entry.runner_claim_id is not None and (
+        entry.last_runner_renewal is None
+        or now - entry.last_runner_renewal >= _CLAIMED_TEXT_MATCH_TIMEOUT_S
+    )
 
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
@@ -482,10 +466,9 @@ def record(
         its input id must equal ``stable_id``.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
-    Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
-    unheld one is evicted (never this new one), so the queue (and everything
-    sized by it) stays bounded without touching entries a persist in progress
-    must be able to put back.
+    Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries without a
+    runner lease, evict the oldest of those entries. Held entries and entries
+    with a runner lease settle through their respective owners.
     """
     if auto_retry is not None and auto_retry.input_id != stable_id:
         raise ValueError("Automatic input metadata requires its stable input id")
@@ -546,11 +529,11 @@ def claim_runner_input(
     claim_id: str,
     *,
     expected_attempt_id: str | None = None,
-    runner_id: str | None = None,
 ) -> bool:
     """Grant one runner attempt the right to paste while its lease is live."""
     with _lock:
-        entry = _pending.get(conversation_id, {}).get(pending_id)
+        entries = _pending.get(conversation_id, {})
+        entry = entries.get(pending_id)
         if entry is None or entry.held or entry.interrupted:
             return False
         if expected_attempt_id is not None and entry.delivery_attempt_id != expected_attempt_id:
@@ -565,8 +548,12 @@ def claim_runner_input(
             )
         if now - last_renewal >= _TTL_S:
             return False
+        # Refuse before pasting rather than evict a claim that may still have
+        # a delayed transcript receipt. Duplicate claims use their existing slot.
+        outstanding_claims = sum(other.runner_claim_id is not None for other in entries.values())
+        if outstanding_claims >= _MAX_ENTRIES_PER_CONVERSATION:
+            return False
         entry.runner_claim_id = claim_id
-        entry.runner_claim_owner = runner_id
         entry.last_runner_renewal = now
         entry.sending_since_ms = entry.input_enqueued_at_ms
         return True
@@ -602,8 +589,23 @@ def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
         )
 
 
+def peer_message_id_for(conversation_id: str, pending_id: str) -> str | None:
+    """Return the peer record a queued entry carries, if any."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return entry.peer_message_id if entry is not None else None
+
+
+def unclaim_runner_input(conversation_id: str, pending_id: str, claim_id: str) -> None:
+    """Withdraw a paste grant that was never answered to the runner."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None and entry.runner_claim_id == claim_id:
+            entry.runner_claim_id = None
+
+
 def renew_runner_inputs(
-    conversation_id: str, held_ids: set[str], active_ids: set[str], runner_id: str | None = None
+    conversation_id: str, held_ids: set[str], active_ids: set[str]
 ) -> dict[str, int | None]:
     """Renew the runner's live inputs and return their current sending timestamps."""
     now = _now()
@@ -629,23 +631,6 @@ def renew_runner_inputs(
                 entry.input_enqueued_at_ms if pending_id in active_ids else None
             )
             sending[pending_id] = entry.sending_since_ms
-        busy_check = _session_busy_check
-        if busy_check is not None and busy_check(conversation_id):
-            # A running turn absorbs a confirmed paste at its next step, which
-            # can outlast the claim lease; its mirror settles it. A replacement
-            # runner never had the paste, so only the claiming runner renews it.
-            for entry in entries.values():
-                if (
-                    entry.runner_claim_id is not None
-                    and runner_id is not None
-                    and entry.runner_claim_owner == runner_id
-                    and entry.last_delivery_stage == "native_turn_completed"
-                    and not entry.held
-                    and not entry.interrupted
-                    and entry.last_runner_renewal is not None
-                    and now - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
-                ):
-                    entry.last_runner_renewal = now
     return sending
 
 
@@ -722,16 +707,35 @@ def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None
 
 
 def oldest_admission_id(conversation_id: str) -> str | None:
-    """The admission carried by the oldest outstanding native web input."""
+    """The admission carried by the oldest current native web input."""
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         return next(
             (
                 entry.admission_id
                 for entry in _pending.get(conversation_id, {}).values()
-                if not entry.interrupted and not entry.held
+                if not entry.interrupted
+                and not entry.held
+                and not _is_late_claimed_entry(entry, now)
             ),
             None,
+        )
+
+
+def has_request_phase_pending(conversation_id: str) -> bool:
+    """Whether a current web input should deduplicate a native request hook.
+
+    A claimed entry beyond the text-only matching window remains in the index
+    for its original attempt evidence, but it no longer represents the native
+    request currently being evaluated.
+    """
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        return any(
+            not entry.interrupted and not _is_late_claimed_entry(entry, now)
+            for entry in _pending.get(conversation_id, {}).values()
         )
 
 
@@ -1164,7 +1168,6 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
-        runner_claim_owner=drained.runner_claim_owner,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1252,6 +1255,7 @@ def resolve_matching_text(
     hold: bool = False,
     shell_command: bool = False,
     claude_commands: bool = False,
+    echo_spellings: tuple[str, ...] = (),
 ) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
@@ -1276,6 +1280,8 @@ def resolve_matching_text(
     :param claude_commands: The session runs Claude Code, so its own commands
         (``!`` shell commands and bare exit words) are not known lost either
         when a later match jumps over them; see :func:`_is_command_entry`.
+    :param echo_spellings: Equivalent command lines to check for late-claim
+        ambiguity before settling a match for ``text``.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -1295,7 +1301,8 @@ def resolve_matching_text(
         attachment_delivery_identity(text) if claude_commands and not shell_command else None
     )
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
@@ -1327,6 +1334,29 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
+        bare_needle = exact_needle if shell_command else _bare_text(text)
+        late_claim_needles = [(exact_needle, bare_needle)]
+        late_claim_needles.extend(
+            (_collapse_whitespace(spelling), _bare_text(spelling))
+            for spelling in echo_spellings
+            if spelling != text
+        )
+        # A late claim can explain the echo. Only a current claim can settle
+        # from that text because it has already been admitted to paste.
+        late_claim_echo = (
+            not shell_command
+            and attachment_delivery is None
+            and any(
+                not entry.held
+                and entry.auto_retry is None
+                and _is_late_claimed_entry(entry, now)
+                and any(
+                    _matches_late_claim_text(entry, exact, bare)
+                    for exact, bare in late_claim_needles
+                )
+                for entry in entries.values()
+            )
+        )
         # Claude is the sender that claims pending prompts before pasting.
         # Its tagged uploads require evidence even for a shell or slash echo.
         ordered = [
@@ -1334,6 +1364,8 @@ def resolve_matching_text(
             for pid, entry in entries.items()
             if not entry.held
             and entry.auto_retry is None
+            and not _is_late_claimed_entry(entry, now)
+            and (not late_claim_echo or entry.runner_claim_id is not None)
             and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
             and not (
                 entry.runner_claim_id is not None
@@ -1379,10 +1411,13 @@ def resolve_matching_text(
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
-            return MatchedDrain(matched=None, skipped=[])
+            return MatchedDrain(
+                matched=None,
+                skipped=[],
+                match_method="unattributed_claim" if late_claim_echo else None,
+            )
         # Look across match tiers. A literal attachment marker or a command's
         # injected prefix can also explain an otherwise exact mirror.
-        bare_needle = _bare_text(text) if not shell_command else exact_needle
         shared_matches = [
             index
             for index, (_pid, entry) in enumerate(ordered)
@@ -1454,7 +1489,7 @@ def resolve_matching_text(
         )
 
 
-def has_pending(conversation_id: str) -> bool:
+def has_pending(conversation_id: str, *, include_claimed: bool = True) -> bool:
     """
     Report whether a session still holds an un-consumed message.
 
@@ -1462,12 +1497,17 @@ def has_pending(conversation_id: str) -> bool:
     to boot, the session is working even though no turn has started yet.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param include_claimed: Include inputs whose paste was already claimed.
+        A retained claim waiting for its mirror does not mean the session is starting.
     :returns: ``True`` iff at least one non-stale pending entry exists that the
         person has not cancelled by interrupting (see :func:`mark_interrupted`).
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
-        return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
+        return any(
+            not entry.interrupted and (include_claimed or entry.runner_claim_id is None)
+            for entry in _pending.get(conversation_id, {}).values()
+        )
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -1551,7 +1591,6 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
-        runner_claim_owner=entry.runner_claim_owner,
     )
 
 
@@ -1567,6 +1606,17 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _matches_late_claim_text(entry: _Entry, exact_needle: str, bare_needle: str) -> bool:
+    """Check the raw text when an echo consists entirely of attachment markers."""
+    queued_text = _content_text(entry.content)
+    matches_text = (
+        _bare_text(queued_text) == bare_needle
+        if bare_needle
+        else _collapse_whitespace(queued_text) == exact_needle
+    )
+    return matches_text or _matches_injected_prefix(entry, exact_needle)
 
 
 def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:

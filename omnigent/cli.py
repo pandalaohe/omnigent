@@ -62,6 +62,8 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    CODEX_NATIVE_UNLISTED_MODEL_KEY,
+    CODEX_NATIVE_UNLISTED_MODEL_MODES,
     NATIVE_HISTORY_CLEANUP_KEY,
     _ignored_project_harness_keys,
     _merge_effective_config,
@@ -683,9 +685,12 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "session_title_instructions",
         NATIVE_HISTORY_CLEANUP_KEY,
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
+        CODEX_NATIVE_UNLISTED_MODEL_KEY,
     }
 )
-_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"server", "session_title_instructions"})
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"server", "session_title_instructions", CODEX_NATIVE_UNLISTED_MODEL_KEY}
+)
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset(
     {_AUTO_OPEN_CONVERSATION_CONFIG_KEY, NATIVE_HISTORY_CLEANUP_KEY}
 )
@@ -12413,6 +12418,13 @@ def _parse_config_settings(
             value = str(Path(value).resolve())
         if key in _BOOLEAN_CONFIG_KEYS:
             parsed[key] = _parse_config_bool(key, value)
+        elif (
+            key == CODEX_NATIVE_UNLISTED_MODEL_KEY
+            and value not in CODEX_NATIVE_UNLISTED_MODEL_MODES
+        ):
+            raise click.ClickException(
+                f"{key} must be {' or '.join(CODEX_NATIVE_UNLISTED_MODEL_MODES)}."
+            )
         else:
             parsed[key] = value
     return parsed
@@ -12906,10 +12918,10 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project defaults take precedence except for harness
     executables and arguments, which are user-owned.
 
-    Supported keys: auto_open_conversation, default_agent, harness,
-    model, server, session_title_instructions. Server selection and session
-    title instructions require ``--global``. A project-local ``server`` is
-    ignored; use ``--server`` for a per-invocation destination.
+    Supported keys: auto_open_conversation, codex_native_unlisted_model,
+    default_agent, harness, model, server, session_title_instructions.
+    Server selection, session title instructions and the Codex unlisted-model
+    setting require ``--global``. Use ``--server`` for a per-invocation destination.
 
     Set ``--global host.native_history_cleanup=true`` to let this host expire
     old native bridge and attachment files. Restart the host to apply it.

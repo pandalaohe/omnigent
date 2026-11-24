@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { analysisDimensions, toQuery, type PageFilter } from "./usageAnalysisFilters";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { authenticatedFetch } from "@/lib/identity";
 import { usageJson } from "./usagePriceSourceData";
 import { usageRangeQuery, type UsageRange } from "./UsageRangeControl";
 import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
@@ -75,6 +76,7 @@ export interface UsageAnalysisV2 {
     | "aggregation_over_limit"
     | null;
   approx: boolean;
+  requests_configured?: boolean;
   totals: AnalysisAmounts;
   series: (AnalysisAmounts & { at: number | string })[];
   groups: (Partial<AnalysisAmounts> & {
@@ -231,6 +233,124 @@ export function useUsageAnalysisV2(
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
+}
+
+export interface UsageAnalysisHoursResponse {
+  filter: AnalysisFilter;
+  span: UsageAnalysis["span"];
+  complete: boolean;
+  incomplete_reason: UsageAnalysisV2["incomplete_reason"];
+  approx: boolean;
+  requests_configured?: boolean;
+  hours: AnalysisHour[];
+}
+
+export function useUsageAnalysisHours(filter: PageFilter, day: string | null, enabled = true) {
+  const isVisible = useAnalysisVisible();
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const params = toQuery({ ...filter, day }, undefined, true);
+  params.set("tz", tz);
+  return useQuery({
+    queryKey: ["usageBoard", "analysisHours", params.toString()],
+    queryFn: ({ signal }) =>
+      usageJson<UsageAnalysisHoursResponse>(`analysis/hours?${params}`, { signal }),
+    enabled: isVisible && enabled && day !== null,
+    staleTime: ANALYSIS_POLL_MS,
+    gcTime: 2 * ANALYSIS_POLL_MS,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+export interface UsageRequestTokens {
+  input: number | null;
+  cache_read: number | null;
+  cache_write: number | null;
+  output: number | null;
+  reasoning: number | null;
+}
+
+export interface UsageRequestRow {
+  id: string;
+  source: string | null;
+  at: string;
+  host: string | null;
+  agent: string | null;
+  account: string | null;
+  group: string | null;
+  model: string | null;
+  model_requested: string | null;
+  tokens: UsageRequestTokens;
+  cost_usd: string | null;
+  cost_basis: string | null;
+  ttft_ms: number | null;
+  duration_ms: number | null;
+  tps: number | null;
+  status: string;
+  http_status: number | null;
+  error_class: string | null;
+  fallback: boolean | null;
+}
+
+export interface UsageRequestSection {
+  state: string;
+  reason: string | null;
+}
+
+export interface UsageRequestsPage {
+  hour: number;
+  tz: string;
+  state: "ok" | "expired" | "partial";
+  rows: UsageRequestRow[];
+  next_cursor: string | null;
+  retained_from: number | null;
+  sections: Record<string, UsageRequestSection> | null;
+}
+
+export class UsageRequestsHttpError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+export async function fetchUsageRequests({
+  hour,
+  tz,
+  filter,
+  cursor,
+  limit = 8,
+  signal,
+}: {
+  hour: number;
+  tz: string;
+  filter: PageFilter;
+  cursor: string | null;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<UsageRequestsPage> {
+  const params = new URLSearchParams();
+  params.set("hour", String(hour));
+  params.set("tz", tz);
+  params.set("limit", String(limit));
+  for (const key of analysisDimensions) {
+    for (const value of filter[key]) params.append(key, value);
+  }
+  if (cursor !== null) params.set("cursor", cursor);
+  const response = await authenticatedFetch(`/v1/me/usage/requests?${params}`, { signal });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    const detail =
+      typeof body?.detail === "string"
+        ? body.detail
+        : `Usage requests read failed (${response.status})`;
+    throw new UsageRequestsHttpError(response.status, detail);
+  }
+  return response.json() as Promise<UsageRequestsPage>;
 }
 
 export const poolKey = (parent: string, pool: string) => JSON.stringify([parent, pool]);

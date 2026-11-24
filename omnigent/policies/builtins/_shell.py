@@ -20,12 +20,10 @@ from __future__ import annotations
 import re
 import shlex
 
-# Every harness's shell / terminal tool, all of which surface the command as a
-# string ``command`` argument. This is the default gated surface for every
+# Every harness's shell / terminal tool. This is the default gated surface for every
 # shell-surface policy — a policy that defaults to a narrower set is silently
 # inert on the harnesses it omits, which is the least-safe default for a
-# security gate. Keep in sync with the per-harness tool-name families in
-# ``safety.py`` (which maps the same seven for ``ask_on_os_tools``).
+# security gate. The approval policy also uses this set.
 SHELL_TOOLS: frozenset[str] = frozenset(
     {
         "sys_os_shell",  # Omnigent built-in (SDK harnesses)
@@ -35,6 +33,7 @@ SHELL_TOOLS: frozenset[str] = frozenset(
         "terminal",  # Hermes
         "developer__shell",  # Goose
         "shell",  # codex in-process harness (commandExecution observed tool)
+        "run_command",  # Antigravity ACP's bound shell command
     }
 )
 
@@ -158,6 +157,14 @@ PROCESS_SPAWNING_UTILITIES: frozenset[str] = frozenset(
         "make",
     }
 )
+
+
+def shell_command(tool_name: str, arguments: object) -> str | None:
+    """Read the command from the field defined by this tool's contract."""
+    if not isinstance(arguments, dict):
+        return None
+    command = arguments.get("CommandLine" if tool_name == "run_command" else "command")
+    return command if isinstance(command, str) else None
 
 
 def spawns_gated_command_as_child(tokens: list[str]) -> bool:
