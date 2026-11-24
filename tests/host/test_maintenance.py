@@ -123,6 +123,7 @@ def test_host_janitor_uses_startup_config(
     [
         (b"\xff", "UnicodeDecodeError"),
         (b"host: {native_history_cleanup: true}\nmetadata: 2026-02-31\n", "ValueError"),
+        (b"host: {native_history_cleanup: !!bool maybe}\n", "KeyError"),
     ],
 )
 def test_unreadable_config_keeps_host_maintenance_available(
@@ -143,7 +144,11 @@ def test_unreadable_config_keeps_host_maintenance_available(
         "runner_log_retention",
     } <= stages.keys()
     assert "codex_session_retention" not in stages
-    assert error in caplog.text
+    records = [record for record in caplog.records if record.name == "omnigent.config"]
+    assert [record.getMessage() for record in records] == [
+        f"Unable to read host config for native history cleanup ({error})"
+    ]
+    assert all(record.exc_info is None for record in records)
 
 
 @pytest.mark.parametrize(

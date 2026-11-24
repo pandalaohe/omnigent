@@ -56,7 +56,7 @@ def native_history_cleanup_enabled(path: Path | None = None) -> bool:
     """Read the host's opt-in to expiring resumable native session files."""
     try:
         config = load_global_config(path)
-    except (OSError, ValueError, OverflowError, RecursionError, yaml.YAMLError) as exc:
+    except Exception as exc:  # noqa: BLE001 — An optional setting must not abort maintenance.
         # Parser details can include private config values.
         _log.warning(
             "Unable to read host config for native history cleanup (%s)", type(exc).__name__
