@@ -2171,6 +2171,7 @@ class _CodexTurnStatusEdge:
     terminal_outcome: str | None = None
     bridge_revision: int | None = None
     bridge_thread_id: str | None = None
+    cold_retry_state: CodexNativeBridgeState | None = None
 
 
 @dataclass(frozen=True)
@@ -4521,6 +4522,7 @@ def _resume_turn_status_edge_for_latest_turn(
         error = _terminal_error_from_turn({"turn": turn})
         outcome = None
         revision = None
+        cold_retry_revision = None
         if status == "running":
             update_active_turn_id(bridge_dir, turn_id)
         else:
@@ -4537,10 +4539,21 @@ def _resume_turn_status_edge_for_latest_turn(
                 for item in turns
                 if isinstance(item, dict) and (value := _turn_id_from_payload(item)) is not None
             ]
-            current = record_resumed_terminal(bridge_dir, state, turn_ids, outcome)
+
+            def capture_cold_retry(revision: int) -> None:
+                nonlocal cold_retry_revision
+                cold_retry_revision = revision
+
+            current = record_resumed_terminal(
+                bridge_dir, state, turn_ids, outcome, on_cold_retry=capture_cold_retry
+            )
             if current is None:
                 return None
-            revision = current.active_turn_revision
+            revision = (
+                current.active_turn_revision
+                if cold_retry_revision is None
+                else cold_retry_revision
+            )
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -4549,6 +4562,7 @@ def _resume_turn_status_edge_for_latest_turn(
             terminal_outcome=outcome,
             bridge_revision=revision,
             bridge_thread_id=thread_id if revision is not None else None,
+            cold_retry_state=state if cold_retry_revision is not None else None,
         )
     return None
 
@@ -10943,10 +10957,18 @@ async def _post_turn_status_edge(
         if bridge_dir is None or edge.bridge_revision is None:
             return True
         current = read_bridge_state(bridge_dir)
+        if current is None or current.thread_id != edge.bridge_thread_id:
+            return False
+        if (cold := edge.cold_retry_state) is not None:
+            return (
+                current.session_id == cold.session_id
+                and current.socket_path == cold.socket_path
+                and current.active_turn_revision == cold.active_turn_revision
+                and current.active_turn_id is None
+                and current.last_terminal_turn_id is None
+            )
         return (
-            current is not None
-            and current.thread_id == edge.bridge_thread_id
-            and current.active_turn_revision == edge.bridge_revision
+            current.active_turn_revision == edge.bridge_revision
             and current.last_terminal_turn_id == edge.turn_id
             and current.last_terminal_outcome == edge.terminal_outcome
         )
