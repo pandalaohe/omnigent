@@ -9,6 +9,27 @@ describe("saved model identity", () => {
     });
     expect(splitModelId("plain")).toEqual({ provider: null, model: "plain" });
   });
+  it("deduplicates resolution notes that differ only by setting", () => {
+    const notes = [
+      {
+        setting: "session_choice",
+        saved: "gemini-4-neon",
+        model: "gemini-4-neon",
+        outcome: "missing",
+        host: "host-a",
+      },
+      {
+        setting: "session",
+        saved: "gemini-4-neon",
+        model: "gemini-4-neon",
+        outcome: "missing",
+        host: "host-a",
+      },
+    ];
+    expect(modelResolutionNotes({ "omnigent.model_resolution": JSON.stringify(notes) })).toEqual([
+      notes[0],
+    ]);
+  });
   it("reads a resolution note spanning bounded labels and rejects missing chunks", () => {
     const notes = [
       { setting: "explicit", saved: "old/x", model: "new/x", outcome: "renamed", host: "host-a" },
