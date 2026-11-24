@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Info, Unplug, CircleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { interfaceText } from "@/lib/interfaceText";
 import { usageJson } from "./usagePriceSourceData";
 import { USAGE_BOARD_POLL_MS, type UsageAccountView } from "./usageBoardData";
 import type { UsageActivity } from "./usageActivityData";
@@ -21,11 +22,11 @@ interface EventPage {
   next_before: string | null;
 }
 const kinds = [
-  ["", "全部"],
-  ["error", "异常"],
-  ["warn", "报警"],
-  ["disconnect", "断开"],
-  ["update", "更新"],
+  ["", "allEvents"],
+  ["error", "eventError"],
+  ["warn", "eventWarning"],
+  ["disconnect", "eventDisconnect"],
+  ["update", "eventUpdate"],
 ] as const;
 const clock = (at: number | null) =>
   at === null
@@ -78,10 +79,13 @@ export function UsageEvents({
     (source) => source.fresh_until !== null && source.fresh_until <= Date.now() / 1000,
   );
   return (
-    <section className="rounded-[11px] border border-border bg-card p-4" aria-label="事件记录">
+    <section
+      className="rounded-[11px] border border-border bg-card p-4"
+      aria-label={interfaceText("eventHistory")}
+    >
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">事件记录</h2>
-        <div className="flex flex-wrap gap-1" role="group" aria-label="事件类型">
+        <h2 className="text-sm font-semibold">{interfaceText("eventHistory")}</h2>
+        <div className="flex flex-wrap gap-1" role="group" aria-label={interfaceText("eventType")}>
           {kinds.map(([value, label]) => (
             <Button
               key={value}
@@ -93,26 +97,28 @@ export function UsageEvents({
                 setCursors([null]);
               }}
             >
-              {label}
+              {interfaceText(label)}
             </Button>
           ))}
         </div>
       </div>
       <div className="my-3 flex gap-4 text-xs text-muted-foreground">
         <span className={selected.some((item) => item.freshness === "old") ? "text-amber-600" : ""}>
-          额度刷新 {clock(quotaAt)}
+          {interfaceText("quotaRefreshed", { time: clock(quotaAt) })}
         </span>
-        <span className={stale ? "text-amber-600" : ""}>费用获取 {clock(costAt)}</span>
+        <span className={stale ? "text-amber-600" : ""}>
+          {interfaceText("costFetched", { time: clock(costAt) })}
+        </span>
       </div>
       {events.isError ? (
         <p role="alert" className="text-sm text-destructive">
-          事件获取失败{" "}
+          {interfaceText("eventsFailed")}{" "}
           <Button variant="ghost" size="sm" onClick={() => void events.refetch()}>
-            重试
+            {interfaceText("retryEvents")}
           </Button>
         </p>
       ) : events.isPending ? (
-        <p className="text-xs text-muted-foreground">加载中…</p>
+        <p className="text-xs text-muted-foreground">{interfaceText("eventsLoading")}</p>
       ) : (
         <>
           <ol className="divide-y divide-border">
@@ -121,7 +127,7 @@ export function UsageEvents({
             ))}
           </ol>
           {!events.data.events.length && (
-            <p className="py-3 text-xs text-muted-foreground">本页暂无变化记录</p>
+            <p className="py-3 text-xs text-muted-foreground">{interfaceText("noEventsOnPage")}</p>
           )}
           <div className="mt-3 flex items-center justify-end gap-2 text-xs">
             <Button
@@ -130,16 +136,16 @@ export function UsageEvents({
               disabled={cursors.length === 1}
               onClick={() => setCursors(cursors.slice(0, -1))}
             >
-              上一页
+              {interfaceText("previousEventsPage")}
             </Button>
-            <span>第 {cursors.length} 页</span>
+            <span>{interfaceText("eventsPageNumber", { page: cursors.length })}</span>
             <Button
               size="sm"
               variant="ghost"
               disabled={!events.data.next_before}
               onClick={() => setCursors([...cursors, events.data.next_before])}
             >
-              下一页
+              {interfaceText("nextEventsPage")}
             </Button>
           </div>
         </>
@@ -157,13 +163,15 @@ function EventRow({ event }: { event: UsageEvent }) {
       : event.severity === "warn"
         ? AlertTriangle
         : Info;
-  const label = disconnected
-    ? "断开连接"
-    : event.severity === "error"
-      ? "异常"
-      : event.severity === "warn"
-        ? "报警"
-        : "更新";
+  const label = interfaceText(
+    disconnected
+      ? "eventDisconnected"
+      : event.severity === "error"
+        ? "eventError"
+        : event.severity === "warn"
+          ? "eventWarning"
+          : "eventUpdate",
+  );
   const duration = event.episode ? Math.max(0, event.episode.recovered_at - event.time) : null;
   return (
     <li className="grid grid-cols-[auto_auto_1fr] items-start gap-3 py-3 text-xs">
@@ -181,15 +189,18 @@ function EventRow({ event }: { event: UsageEvent }) {
       <div className="min-w-0">
         <p>
           {String(event.data?.host ?? event.account ?? event.source)} · {label}
-          {event.episode ? (
+          {duration !== null ? (
             <span className="ml-2 text-muted-foreground">
-              已恢复 · {Math.floor(duration! / 60)}分{duration! % 60}秒
+              {interfaceText("eventRecovered", {
+                minutes: Math.floor(duration / 60),
+                seconds: duration % 60,
+              })}
             </span>
           ) : null}
         </p>
         {event.data && (
           <details className="mt-1 text-muted-foreground">
-            <summary className="cursor-pointer">原文</summary>
+            <summary className="cursor-pointer">{interfaceText("eventRawDetails")}</summary>
             <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words">
               {JSON.stringify(event.data, null, 2)}
             </pre>

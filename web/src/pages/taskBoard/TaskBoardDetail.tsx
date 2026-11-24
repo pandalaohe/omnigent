@@ -29,6 +29,7 @@ import { taskLocalTime, taskRelations } from "./taskBoardRouteData";
 import { displayCost, sessionObservation, type TaskDisplay } from "./taskBoardDisplay";
 import { boardSessionRows, boardGroupColors } from "./taskBoardSessionData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
+import { interfaceText } from "@/lib/interfaceText";
 import {
   activityAgentName,
   activityName,
@@ -598,10 +599,10 @@ export function TaskBoardDetail({
             <section>
               <h5>{t("detail.words")}</h5>
               <blockquote>
-                {"「"}
+                {interfaceText("quoteOpen")}
                 {quote[0].text.slice(0, 96)}
                 {quote[0].text.length > 96 ? "…" : ""}
-                {"」"}
+                {interfaceText("quoteClose")}
                 {(quote[0].date || quote.length > 1) && (
                   <cite>
                     {quote[0].date}

@@ -49,11 +49,20 @@ def current_model_prices(models: set[str]) -> dict:
 
 def recorded_source(ref: str | None, native: bool) -> PriceSource:
     if ref and ref.startswith("import:"):
-        return PriceSource(layer="import", name="记录时导入价", version=ref[7:])
-    names = {"provider": "来源估价", "builtin": "内置价", "mixed": "记录时估价，混合来源"}
+        return PriceSource(layer="import", name="Recorded imported price", version=ref[7:])
+    names = {
+        "provider": "Provider estimate",
+        "builtin": "Built-in price",
+        "mixed": "Recorded estimate, mixed sources",
+    }
     return PriceSource(
         layer=ref or "recorded",
-        name=names.get(ref or "", "记录时估价，来源未记录" if native else "来源估价，版本未报告"),
+        name=names.get(
+            ref or "",
+            "Recorded estimate, source not recorded"
+            if native
+            else "Provider estimate, version not reported",
+        ),
     )
 
 
@@ -133,7 +142,7 @@ def row_value(
                 price_sources=[
                     PriceSource(
                         layer="gateway",
-                        name=estimate.price_source or "来源估价，版本未报告",
+                        name=estimate.price_source or "Provider estimate, version not reported",
                         version=estimate.price_version,
                         fetched_at=estimate.fetched_at,
                     )
@@ -175,7 +184,7 @@ def row_value(
         if rate is None:
             for price, fallback_source in (
                 (imported, PriceSource(**import_source)),
-                (builtin, PriceSource(layer="builtin", name="内置价")),
+                (builtin, PriceSource(layer="builtin", name="Built-in price")),
             ):
                 if price is not None and getattr(price, price_field) is not None:
                     source = fallback_source

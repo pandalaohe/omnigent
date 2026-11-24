@@ -313,8 +313,12 @@ it.each(["host=east", "agent=claude", "model=Sonnet", "slot=2-14"])(
   async (query) => {
     mount(`?${query}`);
     const totals = await screen.findByRole("region", { name: "Totals" });
-    expect(within(totals).getAllByText("未知")).toHaveLength(2);
-    expect(within(totals).getAllByText("实付不分 Host / Agent / 模型 / 时段")).toHaveLength(2);
+    expect(within(totals).getAllByText("Unknown")).toHaveLength(2);
+    expect(
+      within(totals).getAllByText(
+        "Payments are not broken down by host, agent, model, or time slot",
+      ),
+    ).toHaveLength(2);
   },
 );
 
@@ -339,7 +343,9 @@ it.each([false, true])(
       const table = await screen.findByRole("table", { name: "Each item" });
       fireEvent.click(within(table).getByRole("button", { name: "east" }));
     }
-    expect(await screen.findByRole("alert")).toHaveTextContent("服务器版本不支持这个筛选");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This server version does not support this filter",
+    );
     expect(screen.queryByRole("region", { name: "Totals" })).toBeNull();
     expect(screen.queryByRole("table", { name: "Each item" })).toBeNull();
   },

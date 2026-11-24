@@ -34,6 +34,7 @@ import { BrowserSection } from "./settings/browser/BrowserSection";
 import { AgentBadgeDisplaySetting } from "@/components/AgentsSettings";
 import { ChatReserveWidthSetting } from "@/components/ChatReserveWidthSetting";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
+import { interfaceText } from "@/lib/interfaceText";
 import { toast } from "sonner";
 import {
   type ComponentType,
@@ -2344,7 +2345,7 @@ function GeneralSection() {
         <SettingsGroup title="Links" testId="settings-group-links">
           <ArtifactSharingSettings />
         </SettingsGroup>
-        <SettingsGroup title="语音输入" testId="settings-group-voice-input">
+        <SettingsGroup title={interfaceText("voiceInput")} testId="settings-group-voice-input">
           <VoiceInputSettings />
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">

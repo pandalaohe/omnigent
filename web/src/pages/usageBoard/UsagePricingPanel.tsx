@@ -11,6 +11,7 @@ import { usageJson } from "./usagePriceSourceData";
 import { UsageName } from "./UsageName";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatMoney } from "./usageBoardFormat";
+import { interfaceText } from "@/lib/interfaceText";
 import type { UsageAccountActivity } from "./usageActivityData";
 import { t } from "./usageText";
 import {
@@ -1103,8 +1104,13 @@ export function UsagePricingSummary({
             {card.repeats ? (
               <span className="usage-caption">
                 {query.data?.renewals?.[card.id]
-                  ? `自动续 · 下次 ${new Date(query.data.renewals[card.id]! * 1000).toLocaleDateString(undefined, { timeZone: card.timezone })}`
-                  : "自动续已结束"}
+                  ? interfaceText("automaticRenewalNext", {
+                      date: new Date(query.data.renewals[card.id]! * 1000).toLocaleDateString(
+                        undefined,
+                        { timeZone: card.timezone },
+                      ),
+                    })
+                  : interfaceText("automaticRenewalEnded")}
               </span>
             ) : null}
             <span>
