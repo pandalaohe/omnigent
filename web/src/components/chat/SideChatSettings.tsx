@@ -34,6 +34,7 @@ import {
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
 import { isEditorLevel } from "@/lib/permissionsApi";
+import { isSdkHarnessSession } from "@/lib/sessionCapabilities";
 import { refreshSessionModelOptions, updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
@@ -173,7 +174,12 @@ export function SideChatSettings({
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort
       : (session.reasoningEffort ?? null);
-  const supportsEffort = shouldShowEffortPicker(capabilities, family);
+  const supportsEffort = shouldShowEffortPicker(
+    isSdkHarnessSession(capabilities)
+      ? { ...capabilities, parentSessionId: sourceId }
+      : capabilities,
+    family,
+  );
   const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
   const showModels = kind !== null;
   const inheritedEffort = selectedModel?.defaultReasoningEffort ?? null;

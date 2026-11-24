@@ -5,16 +5,16 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/useSession";
 import * as runnerHealth from "@/hooks/RunnerHealthProvider";
+import * as agentLabels from "@/lib/agentLabels";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import type { Session, NativeModelOption } from "@/lib/types";
-import type * as AgentLabels from "@/lib/agentLabels";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { SideChatSettings } from "./SideChatSettings";
 
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof AgentLabels>()),
+  ...(await importOriginal<typeof agentLabels>()),
   useHarnessEffortFamilies: () => ({
     "claude-sdk": "anthropic",
     codex: "openai",
@@ -724,6 +724,22 @@ it("refreshes native settings support when the parent runner reconnects", async 
   expect(await screen.findByRole("button", { name: "Side chat model and effort" })).toBeVisible();
   expect(snapshot).toHaveBeenCalledTimes(2);
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
+});
+
+it("keeps per-model effort controls out of a Codex SDK side chat fork", async () => {
+  vi.spyOn(agentLabels, "useHarnessEffortFamilies").mockReturnValue({ codex: "codex-native" });
+  mount({
+    ...child,
+    harness: "codex",
+    labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": "parent" },
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  expect(screen.queryByTestId("side-chat-effort-high")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+  expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", { modelOverride: "model-b" });
 });
 
 it("keeps an empty SDK child catalog reachable and retries a failed load", async () => {
