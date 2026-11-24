@@ -679,8 +679,9 @@ async def test_requests_timeout_504_redirects_and_unknown_account(service, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("file_ending", ["", "\n", "\r\n"], ids=["no-newline", "lf", "crlf"])
 async def test_requests_credential_refs_and_fail_closed(
-    service, monkeypatch, tmp_path, caplog
+    service, monkeypatch, tmp_path, caplog, file_ending
 ) -> None:
     monkeypatch.setattr("omnigent.server.routes.agent_quota.time.time", lambda: NOW)
     service.report_account(
@@ -711,7 +712,7 @@ async def test_requests_credential_refs_and_fail_closed(
 
         # File credential ref.
         cred_file = tmp_path / "request-cred"
-        cred_file.write_text("fake-file-bearer-value", encoding="utf-8")
+        cred_file.write_bytes(f"fake-file-bearer-value{file_ending}".encode())
         app_file = _make_app(
             service,
             request_source=_bound_source(gateway.base_url, credential_file=str(cred_file)),
@@ -740,8 +741,11 @@ def test_usage_requests_error_holds_status_and_detail() -> None:
         ("env", "fake-malformed token"),
         ("env", " fake-malformed"),
         ("env", "fake-malformed\x01token"),
+        ("env", "fake-malformed\n"),
         ("file", "fake-malformed\ttoken"),
-        ("file", "fake-malformed\n"),
+        ("file", "fake-malformed token"),
+        ("file", "fake-malformed\n\n"),
+        ("file", "fake-malformed\r"),
         ("file", "fake-malformed\x81token"),
     ],
 )
@@ -760,7 +764,7 @@ async def test_requests_refuses_malformed_credential(
             source = _bound_source(gateway.base_url, credential_env=env_name)
         else:
             cred_file = tmp_path / "request-cred"
-            cred_file.write_text(value, encoding="utf-8")
+            cred_file.write_bytes(value.encode())
             source = _bound_source(gateway.base_url, credential_file=str(cred_file))
         app = _make_app(service, source)
         async with httpx.AsyncClient(

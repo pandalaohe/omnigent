@@ -214,10 +214,11 @@ def _resolve_auth_header(source: UsageRequestSource) -> dict[str, str]:
         token = os.environ.get(source.credential_env, "")
     elif source.credential_file is not None:
         try:
-            token = Path(source.credential_file).read_text(encoding="utf-8")
+            token = Path(source.credential_file).read_bytes().decode("utf-8")
         except OSError:
             _logger.warning("usage.request_source credential_file could not be read")
             raise UsageRequestsError(503, "Usage request credential is unavailable") from None
+        token = re.sub(r"\r?\n\Z", "", token)
     else:
         return {}
     if not token or re.search(r"[\s\x00-\x1f\x7f-\x9f]", token):
