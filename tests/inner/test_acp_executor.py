@@ -1022,6 +1022,37 @@ async def test_native_call_before_a_bridge_call_keeps_each_call_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tier_managed", [False, True])
+async def test_host_tier_does_not_delegate_filesystem_requests(tier_managed: bool) -> None:
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", host_permission_tier=tier_managed), os_env=OSEnvSpec()
+    )
+    ex._rpc = AsyncMock(return_value={"result": {"protocolVersion": 1}})
+    ex._send = AsyncMock()
+    environment = AsyncMock()
+    environment.read.return_value = {"content": "content", "encoding": "utf-8"}
+    environment.write.return_value = {}
+    ex._ensure_os_environment = AsyncMock(return_value=environment)
+
+    await ex._ensure_initialized()
+    capabilities = ex._rpc.await_args.args[1]["clientCapabilities"]["fs"]
+    assert capabilities == {"readTextFile": not tier_managed, "writeTextFile": not tier_managed}
+
+    for method in ("read_text_file", "write_text_file"):
+        await ex._respond_to_agent_request(
+            {"id": method, "method": f"fs/{method}", "params": {"path": "file", "content": "new"}}
+        )
+        reply = ex._send.await_args.args[0]
+        if tier_managed:
+            assert reply["error"]["code"] == -32601
+        else:
+            assert "result" in reply
+
+    assert environment.read.await_count == (0 if tier_managed else 1)
+    assert environment.write.await_count == (0 if tier_managed else 1)
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)

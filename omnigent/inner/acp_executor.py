@@ -501,10 +501,12 @@ class AcpExecutor(Executor):
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
-        # which enforces the spec's sandbox read/write roots). Enabled only when
-        # an os_env is configured and it isn't a ``fork`` env — a forked env
-        # operates on a *copied* tree whose path diverges from the agent's cwd.
-        self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
+        # which enforces the spec's sandbox read/write roots). Managed tiers
+        # require the agent's permission flow, so they cannot delegate FS RPCs.
+        # A forked env operates on a copied tree outside the agent's cwd.
+        self._fs_delegation = (
+            not config.host_permission_tier and os_env is not None and not os_env.fork
+        )
         self._os_environment: OSEnvironment | None = None
 
         # Session config options the agent advertises (``mode``, ``model``, …)
