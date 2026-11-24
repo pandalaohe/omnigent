@@ -416,8 +416,9 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
     assert not egress_tmpdir.exists()
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 def test_brokered_gateway_rewrites_only_parent_secret(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, short_tmp_parent: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, short_tmp_parent: Path, wrapper: bool
 ) -> None:
     codex = tmp_path / "codex"
     codex.touch()
@@ -459,9 +460,8 @@ def test_brokered_gateway_rewrites_only_parent_secret(
     backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", lambda *_: policy)
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", lambda *_: backend)
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.create_exec_launcher", lambda *_: str(launcher)
-    )
+    create_launcher = Mock(return_value=str(launcher))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
     monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_dir)
     start_proxy = Mock(return_value=proxy)
     monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
@@ -476,6 +476,13 @@ def test_brokered_gateway_rewrites_only_parent_secret(
         "GH_CONFIG_DIR": "/host/gh",
         "HOME": "/host/home",
     }
+    runtime_root = tmp_path / "runtime"
+    runtime_bin = runtime_root / "bin" / "codex"
+    if wrapper:
+        runtime_bin.parent.mkdir(parents=True)
+        runtime_bin.touch()
+        (runtime_root / ".omnigent-snapshot.json").write_text("{}")
+        worker_env["OMNIGENT_CODEX_RUNTIME_BIN"] = str(runtime_bin)
     worker = prepare_codex_worker(
         codex_path=str(codex),
         cwd=tmp_path,
@@ -513,6 +520,12 @@ def test_brokered_gateway_rewrites_only_parent_secret(
         assert "GH_CONFIG_DIR" not in worker_env
         assert worker_env["HOME"] == str(codex_home)
         assert worker_env["TMPDIR"] == str(codex_home)
+        worker_policy = create_launcher.call_args.args[1]
+        assert worker_env.get("OMNIGENT_CODEX_RUNTIME_BIN") == (
+            str(runtime_bin) if wrapper else None
+        )
+        assert ("OMNIGENT_CODEX_RUNTIME_BIN" in worker_policy.spawn_env_allowlist) is wrapper
+        assert (runtime_root.resolve() in worker_policy.read_roots) is wrapper
     finally:
         worker.close()
 

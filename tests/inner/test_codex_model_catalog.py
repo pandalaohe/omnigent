@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -551,6 +553,48 @@ def test_required_brokered_catalog_is_bundled_private_and_credential_free(
     config = tomllib.loads((tmp_path / "config.toml").read_text())
     assert config["model_catalog_json"] == str(catalog_path)
     assert (tmp_path / "config.toml").stat().st_mode & 0o777 == 0o600
+
+
+def test_locked_gateway_catalog_and_tool_preflight_use_same_wrapper_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    runtime = "/opt/work/omnigent/runtime/bin/codex"
+    launcher = "/opt/work/omnigent/sandboxed-wrapper"
+    prepare = Mock(return_value=CodexWorkerLaunch(launcher, sandboxed=True))
+    monkeypatch.setattr(codex_executor, "prepare_codex_catalog_probe", prepare)
+    tool_features = "".join(
+        f"{name} stable false\n" for name in codex_executor._BROKERED_DISABLED_FEATURES
+    ).encode()
+    run = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=0, stdout=json.dumps(_catalog()).encode()),
+            SimpleNamespace(returncode=0, stdout=tool_features),
+        ]
+    )
+    monkeypatch.setattr(codex_executor.subprocess, "run", run)
+
+    codex_executor._populate_codex_home_config(
+        tmp_path,
+        tmp_path / "missing-source",
+        minimal_config=True,
+        include_credentials=False,
+        required_brokered_probe=(
+            "/opt/work/omnigent/bin/wrapper",
+            tmp_path,
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        ),
+        require_native_tools_disabled=True,
+        runtime_bin=runtime,
+    )
+
+    catalog, preflight = run.call_args_list
+    assert catalog.args[0] == [launcher, "debug", "models", "--bundled"]
+    assert preflight.args[0][0] == launcher and preflight.args[0][-2:] == ["features", "list"]
+    assert catalog.kwargs["env"]["OMNIGENT_CODEX_RUNTIME_BIN"] == runtime
+    assert preflight.kwargs["env"].get("OMNIGENT_CODEX_RUNTIME_BIN") == runtime
 
 
 @pytest.mark.parametrize(

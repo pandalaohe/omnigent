@@ -1599,7 +1599,9 @@ def _populate_codex_home_config(
                 strip_native_tools=require_native_tools_disabled,
             )
             if require_native_tools_disabled:
-                verify_brokered_codex_native_tools_disabled(probe.launch_path, target_dir)
+                verify_brokered_codex_native_tools_disabled(
+                    probe.launch_path, target_dir, runtime_bin=runtime_bin
+                )
         finally:
             probe.close()
     if minimal_config is None:
@@ -2846,7 +2848,9 @@ def write_required_brokered_model_catalog(
     return catalog_path
 
 
-def verify_brokered_codex_native_tools_disabled(codex_path: str, codex_home: Path) -> None:
+def verify_brokered_codex_native_tools_disabled(
+    codex_path: str, codex_home: Path, *, runtime_bin: str | None = None
+) -> None:
     """Require the installed CLI to honor locked sessions' native-tool switches."""
     env = {
         name: value
@@ -2856,6 +2860,8 @@ def verify_brokered_codex_native_tools_disabled(codex_path: str, codex_home: Pat
     env.setdefault("PATH", os.defpath)
     env["HOME"] = str(codex_home)
     env["CODEX_HOME"] = str(codex_home)
+    if runtime_bin is not None:
+        env[CODEX_RUNTIME_BIN_ENV] = runtime_bin
     try:
         completed = subprocess.run(
             [

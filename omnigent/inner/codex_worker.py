@@ -202,7 +202,8 @@ def prepare_codex_worker(
     staged_env = dict(worker_env) if worker_env is not None else None
     if brokered_gateway and staged_env is not None:
         for key in tuple(staged_env):
-            if key not in BROKERED_CODEX_ALLOWED_ENV:
+            # The framework selects this snapshot after filtering the host environment.
+            if key != CODEX_RUNTIME_BIN_ENV and key not in BROKERED_CODEX_ALLOWED_ENV:
                 staged_env.pop(key, None)
         staged_env["HOME"] = str(codex_home)
         staged_env["CODEX_HOME"] = str(codex_home)
