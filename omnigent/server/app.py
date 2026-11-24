@@ -401,6 +401,9 @@ class ServerInfoResponse(BaseModel):
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
     session_settings_source_checks: bool = False
+    # An agent's create that names a project other than its source's project makes a
+    # standalone session; older servers refuse it while sibling sessions are on.
+    sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     # Attachment size limits the web client enforces before uploading (bytes;
     # ``None`` = unlimited). Deployment settings plus the fixed inline caps;
@@ -4510,6 +4513,7 @@ def create_app(
                 "scheduled_task_inbox": automations_enabled,
                 "session_move_source_checks": True,
                 "session_settings_source_checks": True,
+                "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "usage_board_enabled": agent_quota_service.usage_enabled,
                 "task_board_enabled": task_board_enabled(resolved_server_config),

@@ -771,7 +771,7 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, parent
-    linkage, workspace / git branch, persisted last-activity time,
+    linkage, workspace / git branch, project, persisted last-activity time,
     outstanding approval prompts, cost, context usage, last error, archive
     state / reason, keep-warm state, and a last-message excerpt.
 
@@ -793,7 +793,7 @@ class SysSessionGetInfoTool(Tool):
     inaccessible id.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus best-effort runner status and host readiness lookups) and projects
+    (plus best-effort runner status, host readiness and project name lookups) and projects
     the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
@@ -811,7 +811,7 @@ class SysSessionGetInfoTool(Tool):
             "Return one or more sessions' metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, persisted last-activity time, "
+            "parent session, workspace, project_id, project_name, persisted last-activity time, "
             "outstanding approval prompts, cost, context usage "
             "(compact_used_fraction is occupancy against the harness's "
             "auto-compaction window when it reports one), last error, "
@@ -1096,10 +1096,10 @@ class SysSessionCreateTool(Tool):
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
-    Returns a handle ``{conversation_id, agent_id, title, status, project_id}``. The
-    session runs asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
-    further child work and ``sys_session_message`` for independent sessions.
+    Returns a handle ``{conversation_id, agent_id, title, status, project_id}``. Independent
+    sessions also include ``project_name``. The session runs asynchronously — use
+    ``sys_session_get_history`` or ``sys_session_get_info`` to monitor it.
+    Use ``sys_session_send`` for child work or ``sys_session_message`` for independent sessions.
     """
 
     @classmethod
@@ -1142,6 +1142,10 @@ class SysSessionCreateTool(Tool):
             "These placements require orchestration enabled "
             "and a sending session that is private or shared read-only, including its "
             "side-chat source chain. "
+            "project_name files an independent session in your project with that name, "
+            "or in a new one; the project's agent, workspace and git defaults don't apply. "
+            "A project_name other than this session's project makes a standalone "
+            "session there, not a nested agent. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -1159,7 +1163,8 @@ class SysSessionCreateTool(Tool):
             "different host requires a workspace or worktree there. A child's "
             "worktree is never removed automatically. "
             "Returns {conversation_id, agent_id, title, status, project_id, "
-            "host_id, host_name, workspace, worktree, git_branch, harness}; "
+            "host_id, host_name, workspace, worktree, git_branch, harness} for children. "
+            "Independent results include project_id and project_name. "
             "First-message delivery waits up to 90 seconds after creation; "
             "initial_message reports sent, failed, or pending separately. "
             "For pending, check sys_session_get_info with conversation_id; "
@@ -1201,7 +1206,8 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Default child; same_host or managed launches a private "
                                 "independent session (agent_id only), grouped in this family "
-                                "when nested agents are enabled."
+                                "when nested agents are enabled, unless project_name names "
+                                "another project."
                             ),
                         },
                         "sandbox_provider": {
@@ -1257,6 +1263,17 @@ class SysSessionCreateTool(Tool):
                                 "'agent:instance', or 'ui:agent:instance'; "
                                 "avoid colons for an unsplit display label. "
                                 "The stored session title remains verbatim."
+                            ),
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project, by the name shown in the UI (not "
+                                "the project id), to file an independent session "
+                                "(same_host or managed) in: your existing project "
+                                "with this name, or a new one if you have none. "
+                                "A project other than this session's project gives a "
+                                "standalone session, not a nested agent."
                             ),
                         },
                         "message": {

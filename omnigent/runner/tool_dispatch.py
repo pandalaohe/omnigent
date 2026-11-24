@@ -5991,6 +5991,75 @@ async def _record_initial_message_outcome(
     )
 
 
+def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
+    """
+    Check the project a ``sys_session_create`` call names, before any request.
+
+    :param args: Parsed tool arguments; a null ``project_name`` or ``project_id`` is absent.
+    :param placement: The requested placement, e.g. ``"same_host"``.
+    :returns: A JSON error, or ``None`` when the arguments are usable.
+    """
+    if placement != "child" and args.get("project_id") is not None:
+        return json.dumps(
+            {
+                "error": "sys_session_create takes project_name, the project's name as "
+                "shown in the UI, not project_id"
+            }
+        )
+    project_name = args.get("project_name")
+    if project_name is None:
+        return None
+    if placement == "child":
+        return json.dumps({"error": "project_name requires placement='same_host' or 'managed'"})
+    if not isinstance(project_name, str) or not project_name.strip():
+        return json.dumps({"error": "project_name must be a nonempty string"})
+    return None
+
+
+async def _add_named_project(
+    body: _JsonObject,
+    args: _JsonObject,
+    server_client: httpx.AsyncClient,
+    server_info: _JsonObject,
+    headers: dict[str, str],
+) -> str | None:
+    """
+    Add the project a checked ``sys_session_create`` call names to its create body.
+
+    Explicit ``workspace`` and ``git`` nulls keep the project's defaults off the
+    session, so only the filing applies.
+
+    :param body: The orchestrated create body to update.
+    :param args: Arguments that passed :func:`_project_argument_error`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param server_info: The server's ``GET /v1/info`` payload.
+    :param headers: The create's headers, sent on a project create so the server checks the caller.
+    :returns: A JSON error when the project name can't be used, else ``None``.
+    """
+    project_name = args.get("project_name")
+    if project_name is None:
+        return None
+    # An older nested server refuses another project; refuse before a project is created.
+    if (
+        server_info.get("sibling_sessions") is True
+        and server_info.get("sibling_other_project_standalone") is not True
+    ):
+        return json.dumps(
+            {
+                "error": "This server keeps nested agents in this session's project, so it "
+                "does not accept project_name; omit it. No session was created."
+            }
+        )
+    try:
+        project_id = await _project_id_for_name(server_client, str(project_name), headers=headers)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps(
+            {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
+        )
+    body.update({"project_id": project_id, "workspace": None, "git": None})
+    return None
+
+
 async def _finalize_created_session(
     data: _JsonObject,
     *,
@@ -6579,6 +6648,9 @@ async def _execute_session_create_impl(
         return json.dumps({"error": "placement must be child, same_host or managed"})
     if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    project_error = _project_argument_error(args, placement_mode)
+    if project_error is not None:
+        return project_error
     message = args.get("message")
     profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
     selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
@@ -6692,12 +6764,13 @@ async def _execute_session_create_impl(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement_mode == "child" else "/v1/sessions/orchestrated"
-        if placement_mode == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
-            info = await server_client.get("/v1/info")
+        host_id = None
+        info_data: _JsonObject = {}
+        if placement_mode == "managed" or args.get("project_name") is not None:
+            info = await server_client.get("/v1/info", timeout=_SESSION_CREATE_TIMEOUT)
             info.raise_for_status()
             info_data = info.json()
+        if placement_mode == "managed":
             if (
                 info_data.get("sibling_sessions") is True
                 and info_data.get("sibling_session_destinations") == "current_host"
@@ -6723,7 +6796,13 @@ async def _execute_session_create_impl(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-            create_requested = True
+        project_error = await _add_named_project(body, args, server_client, info_data, headers)
+        if project_error is not None:
+            return project_error
+        create_requested = True
+        if placement_mode == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
             resp = await post_on_host(
                 server_client,
                 endpoint,
@@ -6733,7 +6812,6 @@ async def _execute_session_create_impl(
                 timeout=_SESSION_CREATE_TIMEOUT,
             )
         else:
-            create_requested = True
 
             async def post() -> httpx.Response:
                 return await server_client.post(
@@ -6832,6 +6910,10 @@ async def _execute_session_create_impl(
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
             **({"notes": data["notes"]} if data.get("notes") else {}),
+            "project_id": data.get("project_id"),
+            "project_name": await _project_name_or_none(
+                _optional_string(data.get("project_id")), server_client
+            ),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):
@@ -8586,18 +8668,21 @@ def _scheduled_task_url(task_id: object) -> str | None:
     return f"/v1/scheduled-tasks/{task_id.lower()}"
 
 
-async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+async def _project_id_for_name(
+    server_client: httpx.AsyncClient, name: str, *, headers: dict[str, str] | None = None
+) -> str:
     """
     Return the id of the caller's project named *name*, creating it if missing.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param name: The project name, e.g. ``"nightly triage"``.
+    :param headers: Extra headers for the create request, e.g. the orchestration source.
     :returns: The project id.
     :raises ValueError: If the name is blank or the project can't be resolved.
     """
     from omnigent.runner.session_projects import resolve_project_id
 
-    project_id, _created = await resolve_project_id(server_client, name)
+    project_id, _created = await resolve_project_id(server_client, name, headers=headers)
     return project_id
 
 
@@ -9233,6 +9318,26 @@ _SESSION_INFO_MAX_IDS = 20
 _SESSION_INFO_LOOKUP_FAILED_PREFIX = "lookup_failed: "
 
 
+async def _project_name_or_none(
+    project_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """Return the name of the caller's project ``project_id``, best-effort."""
+    if not project_id:
+        return None
+    try:
+        resp = await server_client.get(
+            f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
+        )
+        if resp.status_code != 200:
+            _logger.debug("Project %s name read returned HTTP %s", project_id, resp.status_code)
+            return None
+        return _optional_string(resp.json().get("name"))
+    except Exception:
+        _logger.debug("Project %s name read failed", project_id, exc_info=True)
+        return None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -9251,7 +9356,7 @@ async def _session_get_info_via_rest(
 
     Per item, projects the snapshot fields — status, title, agent binding,
     runner binding, host and its reported harness readiness, reasoning
-    effort, effective model, parent linkage, workspace / git branch,
+    effort, effective model, parent linkage, workspace / git branch, project,
     persisted last-activity time, the outstanding approval prompts, and the
     snapshot's durations and runtime facts (session age, idle time, current
     running period, cost, context usage, last error, archive state / reason,
@@ -9274,8 +9379,8 @@ async def _session_get_info_via_rest(
     the host is online and can launch the session's harness, or when it is a
     dormant resumable managed host; ``offline`` when the host is offline and
     not resumable, cannot launch the harness, or the session is closed. The
-    full transcript is intentionally omitted — that is what
-    ``sys_session_get_history`` returns.
+    project name is read best-effort. Use ``sys_session_get_history`` for the
+    full transcript.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target is
@@ -9468,15 +9573,17 @@ async def _session_info_item(
     # as ``effective_host_id``. The raw null must not hide the host that
     # decides whether the session can take its next turn.
     resolved_host_id = snap_host_id or _optional_string(snap.get("effective_host_id"))
-    host: _JsonObject | None = None
     host_diagnostics: dict[str, str] = {}
-    if include_host_readiness:
-        runner_online, host = await asyncio.gather(
-            _runner_online_or_none(snap_runner_id, server_client),
-            _host_detail_or_none(resolved_host_id, server_client, diagnostics=host_diagnostics),
-        )
-    else:
-        runner_online = await _runner_online_or_none(snap_runner_id, server_client)
+    project_id = _optional_string(snap.get("project_id"))
+    runner_online, host, project_name = await asyncio.gather(
+        _runner_online_or_none(snap_runner_id, server_client),
+        _host_detail_or_none(
+            resolved_host_id if include_host_readiness else None,
+            server_client,
+            diagnostics=host_diagnostics,
+        ),
+        _project_name_or_none(project_id, server_client),
+    )
     # A host session with no runner bound starts one on its next message too.
     runner_running = runner_online if snap_runner_id else False
     if runner_running is False and not include_host_readiness:
@@ -9547,6 +9654,8 @@ async def _session_info_item(
         "workspace": snap.get("workspace"),
         "worktree": snap.get("worktree"),
         "git_branch": snap.get("git_branch"),
+        "project_id": project_id,
+        "project_name": project_name,
         # The outstanding approval prompts themselves (original
         # elicitation-request event dicts), plus a count for quick
         # status checks. Surfacing the prompts — not just a tally —

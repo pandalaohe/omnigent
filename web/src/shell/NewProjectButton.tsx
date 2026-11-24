@@ -21,6 +21,7 @@ import { listProjects } from "@/lib/projectsApi";
 import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
 import { ProjectIconGlyph } from "@/lib/tablerIcon";
 import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -121,6 +122,9 @@ export function NewProjectButton({
   const [createWorkspaceFolder, setCreateWorkspaceFolder] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const submissionGeneration = useRef(0);
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const createProject = useCreateProject();
   const queryClient = useQueryClient();
   const archivedName =
@@ -300,7 +304,14 @@ export function NewProjectButton({
             placeholder="Project name…"
             value={name}
             onChange={(e) => setName(e.target.value)}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
             onKeyDown={(e) => {
+              if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
               if (e.key === "Enter") {
                 e.preventDefault();
                 void submit();

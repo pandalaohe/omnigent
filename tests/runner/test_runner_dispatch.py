@@ -10574,8 +10574,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status`` and host harness readiness from ``GET
-    /v1/hosts/{id}``.
+    /v1/runners/{id}/status``, host harness readiness from ``GET
+    /v1/hosts/{id}`` and the project name from ``GET /v1/projects/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (native agy readback wins over its request),
@@ -10613,6 +10613,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
                     "workspace": "/repo",
                     "worktree": "/repo/.omnigent/worktrees/conv_target",
                     "git_branch": "feature/x",
+                    "project_id": "proj_1",
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
@@ -10623,6 +10624,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
                 200,
                 json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
             )
+        if request.method == "GET" and request.url.path == "/v1/projects/proj_1":
+            return httpx.Response(200, json={"id": "proj_1", "name": "Auth work"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -10654,6 +10657,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
     }
     assert info["parent_session_id"] == "conv_parent"
     assert info["worktree"] == "/repo/.omnigent/worktrees/conv_target"
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] == "Auth work"
     assert info["model"] == expected_model
     # Two outstanding approval prompts surfaced from the snapshot — both
     # the prompts themselves and a count. If the projection dropped the
@@ -10666,17 +10671,19 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
-async def test_sys_session_get_info_tolerates_host_readiness_failure(
-    host_response: httpx.Response,
+@pytest.mark.parametrize("read_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_and_project_read_failures(
+    read_response: httpx.Response,
 ) -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
-        if request.url.path == "/v1/hosts/host_1":
-            return host_response
+            return httpx.Response(
+                200, json={"id": "conv_target", "host_id": "host_1", "project_id": "proj_1"}
+            )
+        if request.url.path in ("/v1/hosts/host_1", "/v1/projects/proj_1"):
+            return read_response
         return httpx.Response(404)
 
     async with httpx.AsyncClient(
@@ -10690,7 +10697,10 @@ async def test_sys_session_get_info_tolerates_host_readiness_failure(
             conversation_id="conv_caller",
         )
 
-    assert json.loads(output)["configured_harnesses"] is None
+    info = json.loads(output)
+    assert info["configured_harnesses"] is None
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] is None
 
 
 @pytest.mark.asyncio

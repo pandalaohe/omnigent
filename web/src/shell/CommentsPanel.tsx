@@ -5,6 +5,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
 import { commentAuthorLabel, isVisitorAuthor } from "@/lib/comments";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -119,6 +120,9 @@ export function CommentsPanel({
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
@@ -415,7 +419,14 @@ export function CommentsPanel({
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
                   persistDraft(e.target.value);
                 }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
                 onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
                     submitComment();
