@@ -3319,3 +3319,81 @@ def test_stranded_wake_rescue_has_nothing_for_a_codex_only_parent() -> None:
     ]
 
     assert subagent_work.latest_wake_eligible_subagent_work(entries) is None
+
+
+def test_subagent_failure_wake_notice_strips_ansi_and_c0_control_bytes() -> None:
+    """Failure wake notices strip CSI/OSC escapes and C0 controls so paste echoes match."""
+    from omnigent.harnesses.claude_native.bridge import _paste_payload_bytes
+    from omnigent.runtime import pending_inputs
+
+    raw_output = (
+        "\x1b[31mERROR\x1b[0m\x07"
+        "\x1b]0;window-title\x07"
+        "\x1b]8;;https://example.com\x1b\\ details\x1b]8;;\x1b\\"
+        "\r\nline2\tcol\x0c"
+    )
+    notice = subagent_work._format_subagent_wake_notice(
+        agent="researcher",
+        title="auth",
+        status="failed",
+        pending=1,
+        output=raw_output,
+    )
+
+    assert "\nFailure: ERROR details\nline2\tcol" in notice
+    assert all(ord(ch) >= 0x20 or ch in "\n\t" for ch in notice)
+    pasted = _paste_payload_bytes(notice).decode("utf-8").replace("\r", "\n")
+    assert pasted == notice
+
+    pending_inputs.reset_for_tests()
+    try:
+        pending_id = pending_inputs.record(
+            "conv_ansi_notice", [{"type": "input_text", "text": notice}], runner_managed=True
+        )
+        assert pending_inputs.claim_runner_input("conv_ansi_notice", pending_id, "claim-ansi")
+        matched = pending_inputs.resolve_matching_text(
+            "conv_ansi_notice", pasted, claude_commands=True
+        )
+        assert matched.matched is not None and matched.matched.pending_id == pending_id
+        assert matched.match_method == "normalized_text"
+    finally:
+        pending_inputs.reset_for_tests()
+
+    only_escapes = subagent_work._format_subagent_wake_notice(
+        agent="researcher",
+        title="auth",
+        status="failed",
+        pending=1,
+        output="\x1b[31m\x1b[0m\x07",
+    )
+    assert "\nFailure:" not in only_escapes
+
+
+@pytest.mark.asyncio
+async def test_failed_native_subagent_wake_post_matches_claude_paste_echo(
+    _clean_subagent_registry: None,
+) -> None:
+    """A failed native sub-agent's posted wake notice strips ANSI/BEL so Claude's echo settles."""
+    from omnigent.harnesses.claude_native.bridge import _paste_payload_bytes
+
+    http, items, server_client = await _post_native_status(
+        status="failed",
+        output="\x1b[31mERROR\x1b[0m\x07\nsecond line",
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=True,
+        register_work=True,
+    )
+    await asyncio.sleep(0)
+
+    assert http == 204
+    assert items and items[0]["status"] == "failed"
+    wake_posts = [
+        kwargs["json"]
+        for url, kwargs in server_client.posts
+        if url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
+    ]
+    assert len(wake_posts) == 1
+    notice_text = wake_posts[0]["data"]["content"][0]["text"]
+    assert "\nFailure: ERROR\nsecond line" in notice_text
+    assert all(ord(ch) >= 0x20 or ch in "\n\t" for ch in notice_text)
+    assert _paste_payload_bytes(notice_text).decode("utf-8").replace("\r", "\n") == notice_text
