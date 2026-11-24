@@ -811,6 +811,7 @@ class AcpExecutor(Executor):
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
                     if msg_id == self._active_prompt_request_id:
+                        self._active_prompt_request_id = None
                         # run_turn may already be cancelled when the response arrives.
                         error = msg.get("error")
                         if isinstance(error, dict):
@@ -838,6 +839,12 @@ class AcpExecutor(Executor):
                     if msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(
                         update, dict
                     ):
+                        if (
+                            self._config.host_permission_tier
+                            and self._active_prompt_request_id is not None
+                            and isinstance(params, dict)
+                        ):
+                            self._note_permission_update(params.get("sessionId"), update)
                         if update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION:
                             self._note_config_options(update.get("configOptions"))
                             continue
@@ -1341,18 +1348,50 @@ class AcpExecutor(Executor):
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
         return [o for o in (params.get("options") or []) if isinstance(o, dict)]
 
+    def _note_permission_update(self, session_id: object, update: _AcpJsonObject) -> None:
+        """Track the latest pending operation even while a policy decision is in flight."""
+        if self._session_id is None or session_id != self._session_id:
+            return
+        kind, call_id = update.get("sessionUpdate"), update.get("toolCallId")
+        if kind not in (_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE) or not (
+            isinstance(call_id, str) and call_id
+        ):
+            return
+        if update.get("status") not in (None, "pending"):
+            self._permission_calls.pop(call_id, None)
+            return
+        if kind == _UPDATE_TOOL_CALL:
+            self._permission_calls[call_id] = copy.deepcopy(update)
+            return
+        pending = self._permission_calls.get(call_id)
+        if pending is None:
+            return
+        changes = {
+            key: update[key]
+            for key in ("kind", "name", "title", "rawInput")
+            if update.get(key) is not None and update[key] != pending.get(key)
+        }
+        if changes:
+            self._permission_calls[call_id] = {**pending, **copy.deepcopy(changes)}
+
     def _bound_permission_call(self, params: _AcpJsonObject) -> _AcpJsonObject | None:
         """Bind a permission request to the pending tool event, never its display title."""
+        if (
+            self._active_prompt_request_id is None
+            or self._session_id is None
+            or params.get("sessionId") != self._session_id
+        ):
+            return None
         call = params.get("toolCall")
         if not isinstance(call, dict) or not isinstance(call.get("toolCallId"), str):
             return None
         call_id = call["toolCallId"]
-        observed = self._permission_calls.pop(call_id, None)
+        observed = self._permission_calls.get(call_id)
         if observed is None or call_id in self._answered_permission_calls:
             return None
         self._answered_permission_calls.add(call_id)
-        for key in ("kind", "title", "rawInput"):
-            if key in call and call[key] != observed.get(key):
+        for key in ("kind", "name", "title", "rawInput"):
+            if call.get(key) is not None and call[key] != observed.get(key):
                 return None
         arguments = observed.get("rawInput")
         if not isinstance(arguments, dict):
@@ -1454,6 +1493,25 @@ class AcpExecutor(Executor):
         ) if allowed and self._config.host_permission_tier else None
 
     async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
+        if not self._config.host_permission_tier:
+            return await self._evaluate_permission(params)
+        bound_call = self._bound_permission_call(params)
+        if bound_call is None:
+            return False, None
+        call_id = bound_call["call_id"]
+        pending = self._permission_calls[call_id]
+        result = await self._evaluate_permission(params, bound_call)
+        if (
+            self._active_prompt_request_id is None
+            or self._permission_calls.get(call_id) is not pending
+        ):
+            return False, None
+        self._permission_calls.pop(call_id)
+        return result
+
+    async def _evaluate_permission(
+        self, params: _AcpJsonObject, bound_call: _AcpJsonObject | None = None
+    ) -> tuple[bool, str | None]:
         """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
@@ -1475,11 +1533,7 @@ class AcpExecutor(Executor):
             picked from the agent's options, or ``None`` to let
             :meth:`_permission_outcome` choose the narrowest grant.
         """
-        bound_call = None
-        if self._config.host_permission_tier:
-            bound_call = self._bound_permission_call(params)
-            if bound_call is None:
-                return False, None
+        if bound_call is not None:
             tool_name, tool_input = bound_call["name"], bound_call["arguments"]
         else:
             tool_name, tool_input = self._extract_tool_call(params)
@@ -1887,8 +1941,6 @@ class AcpExecutor(Executor):
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
-                if self._config.host_permission_tier and update.get("status") in (None, "pending"):
-                    self._permission_calls[call_id] = copy.deepcopy(update)
                 metadata: _AcpJsonObject = {"call_id": call_id}
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
@@ -1905,7 +1957,6 @@ class AcpExecutor(Executor):
             ):
                 name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
-                self._permission_calls.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -2652,6 +2703,8 @@ class AcpExecutor(Executor):
 
         # Drain stale items from a prior turn, plus anything the switch above queued.
         await self._drain_stale_queue()
+        self._permission_calls.clear()
+        self._answered_permission_calls.clear()
 
         self._rpc_id += 1
         req_id = self._rpc_id

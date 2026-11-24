@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -1057,16 +1058,18 @@ async def test_host_tier_does_not_delegate_filesystem_requests(tier_managed: boo
 async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
     ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
     ex._elicitation_handler = AsyncMock(return_value=False)
     arguments = {"CommandLine": "git status"}
-    ex._handle_session_update(
+    ex._note_permission_update(
+        "s1",
         {
             "sessionUpdate": "tool_call",
             "toolCallId": "shell-1",
             "kind": "execute",
             "title": "Agent display text",
             "rawInput": arguments,
-        }
+        },
     )
 
     async def policy(phase, data):
@@ -1086,6 +1089,69 @@ async def test_host_tier_policy_uses_the_bound_tool_identity(action: str) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario", ["updated-input", "foreign-update", "foreign-request", "update-during-policy"]
+)
+async def test_host_tier_binds_latest_pending_tool_in_its_session(scenario: str) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    arguments = {"CommandLine": "git status"}
+    updated_arguments = {"CommandLine": "git diff"}
+    initial = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "shell-1",
+        "kind": "execute",
+        "title": "Run command",
+        "status": "pending",
+        "rawInput": arguments,
+    }
+    updated = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "shell-1",
+        "rawInput": updated_arguments,
+    }
+    ex._active_prompt_request_id = 1
+
+    async def observe(session_id: str, update: dict) -> None:
+        stdout = asyncio.StreamReader()
+        ex._proc = Mock(returncode=None, stdout=stdout)
+        frame = {"method": "session/update", "params": {"sessionId": session_id, "update": update}}
+        stdout.feed_data((json.dumps(frame) + "\n").encode())
+        stdout.feed_eof()
+        await ex._read_stdout_unobserved()
+        ex._handle_session_update(ex._queue.get_nowait()["params"]["update"])
+
+    await observe("s1", initial)
+    if scenario != "update-during-policy":
+        await observe("s2" if scenario == "foreign-update" else "s1", updated)
+
+    async def allow(_phase, _data):
+        if scenario == "update-during-policy":
+            await observe("s1", updated)
+        return Mock(action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"})
+
+    ex._policy_evaluator = AsyncMock(side_effect=allow)
+    params = {
+        "sessionId": "s2" if scenario == "foreign-request" else "s1",
+        "toolCall": {"toolCallId": "shell-1"},
+        "options": [{"kind": "allow_once", "optionId": "once"}],
+    }
+    result = await ex._decide_permission(params)
+    if scenario == "foreign-request":
+        assert result == (False, None)
+        ex._policy_evaluator.assert_not_awaited()
+    elif scenario == "update-during-policy":
+        assert result == (False, None)
+        ex._policy_evaluator.assert_awaited_once()
+    else:
+        assert result == (True, "once")
+        bound = ex._policy_evaluator.await_args.args[1]["_omnigent_acp_call"]
+        assert bound["arguments"] == (
+            arguments if scenario == "foreign-update" else updated_arguments
+        )
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
@@ -1096,6 +1162,8 @@ async def test_host_tier_allows_only_the_bound_call_once() -> None:
     from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
     ex = AcpExecutor(AcpAgentConfig(command="x", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
     ex._elicitation_handler = AsyncMock(return_value=True)
     ex._policy_evaluator = AsyncMock(
         return_value=PolicyVerdictPayload(
@@ -1110,25 +1178,25 @@ async def test_host_tier_allows_only_the_bound_call_once() -> None:
         "title": "Run command",
         "rawInput": {"CommandLine": "git status"},
     }
-    ex._handle_session_update(observed)
+    ex._note_permission_update("s1", observed)
     options = [
         {"kind": "allow_always", "optionId": "persistent"},
         {"kind": "allow_once", "optionId": "once"},
     ]
-    request = {"toolCall": {"toolCallId": "shell-1"}, "options": options}
+    request = {"sessionId": "s1", "toolCall": {"toolCallId": "shell-1"}, "options": options}
     assert await ex._decide_permission(request) == (True, "once")
     assert await ex._decide_permission(request) == (False, None)
-    ex._handle_session_update({**observed, "toolCallId": "shell-2"})
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-2"})
     assert await ex._decide_permission(
         {**request, "toolCall": {"toolCallId": "shell-2", "rawInput": {"CommandLine": "git diff"}}}
     ) == (False, None)
     ex._elicitation_handler.assert_not_awaited()
-    ex._handle_session_update({**observed, "toolCallId": "shell-3"})
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-3"})
     assert await ex._decide_permission(
-        {"toolCall": {"toolCallId": "shell-3"}, "options": options[:1]}
+        {**request, "toolCall": {"toolCallId": "shell-3"}, "options": options[:1]}
     ) == (False, None)
     ex._elicitation_handler.assert_not_awaited()
-    ex._handle_session_update({**observed, "toolCallId": "shell-4"})
+    ex._note_permission_update("s1", {**observed, "toolCallId": "shell-4"})
     ex._policy_evaluator.return_value = PolicyVerdictPayload(action="POLICY_ACTION_ASK")
     assert await ex._decide_permission({**request, "toolCall": {"toolCallId": "shell-4"}}) == (
         True,
