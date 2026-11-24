@@ -2174,6 +2174,7 @@ def create_app(
         usage_evidence_body_limit,
         usage_evidence_retention_days,
         usage_import_body_limit,
+        usage_request_source,
     )
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
     from omnigent.server.usage_evidence import UsageEvidenceService
@@ -3055,6 +3056,7 @@ def create_app(
             import_max_body_bytes=usage_import_body_limit(resolved_server_config),
             evidence_service=usage_evidence_service,
             evidence_max_body_bytes=usage_evidence_body_limit(resolved_server_config),
+            request_source=usage_request_source(resolved_server_config),
         ),
         prefix="/v1",
     )

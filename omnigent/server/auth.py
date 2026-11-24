@@ -97,6 +97,7 @@ def scope_allows(scope: str, method: str, path: str) -> bool:
             "/v1/me/usage/prices",
             "/v1/me/usage/analysis",
             "/v1/me/usage/analysis/hours",
+            "/v1/me/usage/requests",
             "/v1/me/usage/issues",
             "/v1/me/usage/models",
             "/v1/me/usage/events",

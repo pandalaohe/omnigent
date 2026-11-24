@@ -31,6 +31,7 @@ import {
   V2QuotaClosings,
 } from "./UsageAnalysisDetails";
 import { AnalysisSection, AnalysisSectionState, AnalysisUnknown } from "./UsageAnalysisPanel";
+import { V2Records } from "./UsageAnalysisRecords";
 import { analysisSections, UsageAnalysisRail } from "./UsageAnalysisRail";
 import {
   analysisDimensions,
@@ -191,6 +192,12 @@ export function UsageCostPage() {
             <V2Cumulative data={data} />
             <AnalysisComparison data={data} restricted={paymentRestricted(filter)} />
             <AnalysisV2Items data={data} filter={groupFilter} label={name} toggle={toggle} />
+            <V2Records
+              data={data}
+              filter={effectiveFilter}
+              label={name}
+              onSelectDay={(day) => change({ ...filter, day })}
+            />
             <V2Hosts
               data={data}
               filter={effectiveFilter}

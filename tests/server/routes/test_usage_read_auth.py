@@ -105,13 +105,13 @@ def test_usage_scope_requires_live_owner_grant() -> None:
 def test_hour_read_scope_is_exact():
     from omnigent.server.auth import api_key_scope_allows
 
-    path = "/v1/me/usage/analysis/hours"
-    assert api_key_scope_allows(("usage",), "GET", path)
-    assert api_key_scope_allows(("*",), "GET", path)
-    for scope in ("tasks", "usage:read", "sessions"):
-        assert not api_key_scope_allows((scope,), "GET", path)
-    assert not api_key_scope_allows(("usage",), "POST", path)
-    assert not api_key_scope_allows(("usage",), "GET", path + "/other")
+    for path in ("/v1/me/usage/analysis/hours", "/v1/me/usage/requests"):
+        assert api_key_scope_allows(("usage",), "GET", path)
+        assert api_key_scope_allows(("*",), "GET", path)
+        for scope in ("tasks", "usage:read", "sessions"):
+            assert not api_key_scope_allows((scope,), "GET", path)
+        assert not api_key_scope_allows(("usage",), "POST", path)
+        assert not api_key_scope_allows(("usage",), "GET", path + "/other")
 
 
 @pytest.fixture
@@ -249,6 +249,8 @@ def test_usage_key_reads_and_writes_only_usage(
         ("GET", "/v1/me/usage"),
         ("GET", "/v1/me/usage/activity"),
         ("GET", "/v1/me/usage/analysis"),
+        ("GET", "/v1/me/usage/analysis/hours"),
+        ("GET", "/v1/me/usage/requests"),
         ("GET", "/v1/me/usage/issues"),
         ("GET", "/v1/me/usage/models"),
         ("GET", "/v1/me/usage/events"),
