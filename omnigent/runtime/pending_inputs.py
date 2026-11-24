@@ -589,6 +589,21 @@ def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
         )
 
 
+def peer_message_id_for(conversation_id: str, pending_id: str) -> str | None:
+    """Return the peer record a queued entry carries, if any."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return entry.peer_message_id if entry is not None else None
+
+
+def unclaim_runner_input(conversation_id: str, pending_id: str, claim_id: str) -> None:
+    """Withdraw a paste grant that was never answered to the runner."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None and entry.runner_claim_id == claim_id:
+            entry.runner_claim_id = None
+
+
 def renew_runner_inputs(
     conversation_id: str, held_ids: set[str], active_ids: set[str]
 ) -> dict[str, int | None]:
