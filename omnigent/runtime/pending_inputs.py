@@ -1651,9 +1651,14 @@ def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
     return first
 
 
+def _strip_paste_control_chars(text: str) -> str:
+    """Drop C0 control bytes omitted by terminal paste encoders, keeping line breaks and tabs."""
+    return "".join(ch for ch in text if ord(ch) >= 0x20 or ch in "\n\r\t")
+
+
 def _collapse_whitespace(text: str) -> str:
-    """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
-    return " ".join(text.split())
+    """Collapse whitespace runs and drop control bytes stripped by terminal paste."""
+    return " ".join(_strip_paste_control_chars(text).split())
 
 
 def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
@@ -1687,6 +1692,7 @@ def _attachment_count(content: list[dict[str, Any]]) -> int:
 
 
 def _bare_text(text: str) -> str:
+    text = _strip_paste_control_chars(text)
     while True:
         stripped, removed = _ONE_LEADING_ATTACHMENT_MARKER_RE.subn("", text, count=1)
         if not removed:
