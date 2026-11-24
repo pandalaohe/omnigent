@@ -532,6 +532,10 @@ The setting lives in the host user's `~/.omnigent/config.yaml`. Set
 launch reads the setting without a host restart. Databricks profile launches
 and sessions with an inference binding use their existing selection rules.
 
+If the setting value is invalid or its reader cannot read or parse the user
+config during terminal launch, Codex uses `fallback` and logs the reason.
+Omnigent stops at runner startup if it cannot read the user config.
+
 </details>
 
 ### 3. Choose & switch models

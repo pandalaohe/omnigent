@@ -459,7 +459,7 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
         (None, "cannot read user config"),
     ],
 )
-async def test_user_config_failures_keep_the_fallback_launch_available(
+async def test_codex_terminal_unlisted_setting_uses_fallback(
     config_text: str | None,
     reason: str | None,
     codex_launch_harness: _LaunchHarness,
@@ -467,6 +467,7 @@ async def test_user_config_failures_keep_the_fallback_launch_available(
     caplog: pytest.LogCaptureFixture,
     _no_configured_codex_app_server_command: Callable[[], tuple[str, ...]],
 ) -> None:
+    """Invalid values and errors reading the setting at terminal launch log the fallback."""
     harness = codex_launch_harness
     path = global_config_path()
     path.parent.mkdir()
