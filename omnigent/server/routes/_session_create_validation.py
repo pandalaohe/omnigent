@@ -397,6 +397,7 @@ async def resolve_project_session_create(
     fill_host: bool = False,
     request: Request | None = None,
     apply_calling_defaults: bool = False,
+    apply_project_calling_defaults: bool = True,
     parent_project: Project | None = None,
     parent_host_id: str | None = None,
     calling_path_label: str = "POST /v1/sessions",
@@ -413,6 +414,7 @@ async def resolve_project_session_create(
     :func:`resolve_create_calling`; only omitted fields are filled. A child
     with no ``project_id`` uses *parent_project* for the chain and
     *parent_host_id* as its host when the request names none.
+    Independent worker filing can skip the project layers of this chain.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -485,6 +487,7 @@ async def resolve_project_session_create(
 
     speed = permission = None
     if apply_calling_defaults:
+        calling_project = project if project is not None else parent_project
         calling_host_id = updates.get("host_id", getattr(body, "host_id", None)) or parent_host_id
         explicit = body.model_dump()
         labels = getattr(body, "labels", None)
@@ -494,7 +497,7 @@ async def resolve_project_session_create(
         resolution = await resolve_create_calling(
             request=request,
             user_id=user_id,
-            project=project if project is not None else parent_project,
+            project=calling_project if apply_project_calling_defaults else None,
             host_id=calling_host_id,
             explicit=explicit,
             explicit_fields=explicit_fields,

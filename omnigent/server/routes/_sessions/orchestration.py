@@ -15816,6 +15816,7 @@ async def _create_session_from_existing_agent_impl(
         # model / effort from the runner's own member resolution; filling them
         # here would pin a model the worker's spec deliberately left unset.
         apply_calling_defaults=body.sub_agent_name is None,
+        apply_project_calling_defaults=created_by_session_id is None,
         parent_project=parent_project,
         parent_host_id=parent_host_id,
         calling_path_label=calling_path_label,

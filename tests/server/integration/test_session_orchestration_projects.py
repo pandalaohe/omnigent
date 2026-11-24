@@ -14,6 +14,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.routes import _session_create_validation
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import common as sessions_common
 from omnigent.server.routes._sessions import orchestration
@@ -299,6 +300,17 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         "Elsewhere",
         {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
     )
+    resolve_calling = _session_create_validation.resolve_create_calling
+    calling_project_ids: list[str | None] = []
+
+    async def record_calling_project(**kwargs):
+        project = kwargs["project"]
+        calling_project_ids.append(project.id if project is not None else None)
+        return await resolve_calling(**kwargs)
+
+    monkeypatch.setattr(
+        _session_create_validation, "resolve_create_calling", record_calling_project
+    )
 
     worker_id = await _start_worker(
         auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Elsewhere"}
@@ -310,6 +322,7 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
     assert worker.agent_id == source["agent_id"]
     assert worker.workspace != "/project-default"
     assert worker.git_branch is None
+    assert calling_project_ids == [None]
     info = json.loads(
         await execute_tool(
             tool_name="sys_session_get_info",
