@@ -127,7 +127,10 @@ def pane(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_Pane]:
     """Start the stand-in composer in tmux with the parametrized copy-mode key table."""
-    mode_keys, panel = request.param if isinstance(request.param, tuple) else (request.param, "")
+    mode_keys, panel, *columns = (
+        request.param if isinstance(request.param, tuple) else (request.param, "")
+    )
+    width = columns[0] if columns else 46 if panel == "question" else 48 if panel else 120
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
     terminal = tmp_path / "terminal.py"
@@ -150,7 +153,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "46" if panel == "question" else "48" if panel else "120",
+                    str(width),
                     "-y",
                     "24",
                     command,
@@ -250,6 +253,17 @@ def test_question_with_a_footer_word_split_by_tmux_keeps_waiting(
     poll_until(lambda: bridge.claude_pane_ready(pane.bridge_dir), timeout_s=5.0, interval_s=0.05)
     bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=5.0)
     assert json.loads(pane.delivered.read_text()) == ["AFTER_QUESTION"]
+
+
+@pytest.mark.parametrize("pane", [("emacs", "question", 16)], indirect=True)
+def test_question_footer_wrapped_over_four_lines_receives_no_keys(pane: _Pane) -> None:
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    footer = captured.split("─" * 16)[-1]
+    assert len([line for line in footer.splitlines() if line.strip()]) > 3
+
+    with pytest.raises(bridge.ClaudeUserPromptPending):
+        bridge.inject_user_message(pane.bridge_dir, content="Follow-up", timeout_s=1.0)
+    assert not pane.received.exists()
 
 
 @pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])

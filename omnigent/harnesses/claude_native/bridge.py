@@ -8747,12 +8747,19 @@ def _user_prompt_visible(pane: str) -> bool:
     if clipped:
         # The composer's last frame rule is the closing edge. Everything above
         # it may be draft text, including sentences that look like permissions.
-        region = "\n".join(lines[_composer_frame_rule_indices(lines)[-1] + 1 :])
+        region_start = _composer_frame_rule_indices(lines)[-1] + 1
     else:
-        region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes can wrap inside the decision footer's words.
-    footer = "".join(" ".join(region.splitlines()[-3:]).split())
+        region_start = rules[-2] + 1 if len(rules) >= 2 else 0
+    region = "\n".join(lines[region_start:])
     selector = re.search(r"(?m)^[ \t│]*❯[ \t]+\d+[.)][ \t]+", region)
+    # A narrow pane can wrap the footer across several rows and split words.
+    if rules and rules[-1] >= region_start:
+        footer_region = "\n".join(lines[rules[-1] + 1 :])
+    elif selector is not None:
+        footer_region = region[selector.end() :].partition("\n")[2]
+    else:
+        footer_region = region
+    footer = "".join(footer_region.split())
     decision_region = "\n".join(line.strip(" \t│") for line in region.splitlines())
     # Bind the title, options and selection to one list, even without a frame.
     permission_card = re.search(
