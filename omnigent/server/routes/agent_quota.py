@@ -33,9 +33,14 @@ from omnigent.server.agent_quota import (
 )
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
-from omnigent.server.server_config import load_server_config
+from omnigent.server.server_config import UsageRequestSource, load_server_config
 from omnigent.server.usage_evidence import UsageEvidenceService
 from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource
+from omnigent.server.usage_requests import (
+    UsageRequestsError,
+    UsageRequestsView,
+    fetch_usage_requests,
+)
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import (
@@ -221,6 +226,7 @@ def create_agent_quota_router(
     import_max_body_bytes: int = 5 * 1024 * 1024,
     evidence_service: UsageEvidenceService | None = None,
     evidence_max_body_bytes: int = 1024 * 1024,
+    request_source: UsageRequestSource | None = None,
 ) -> APIRouter:
     router = APIRouter()
     from omnigent.server.routes.usage_pricing import create_usage_pricing_router
@@ -659,12 +665,42 @@ def create_agent_quota_router(
                     name: payload[name]
                     for name in ("filter", "span", "complete", "incomplete_reason", "approx")
                 } | {"hours": payload["hours"]}
+            payload["requests_configured"] = request_source is not None
             return JSONResponse(
                 jsonable_encoder(display_values(payload)),
                 headers={"Cache-Control": "private, no-store"},
             )
         except (ValueError, ZoneInfoNotFoundError) as exc:
             raise HTTPException(422, str(exc)) from None
+
+    @router.get("/me/usage/requests", response_model=UsageRequestsView)
+    async def read_usage_requests(
+        request: Request,
+        _hour: Annotated[int, Query(alias="hour")],
+        _tz: Annotated[str, Query(alias="tz")] = "UTC",
+        _account: AnalysisAccounts = None,
+        _model: AnalysisModels = None,
+        _host: AnalysisHosts = None,
+        _agent: AnalysisAgents = None,
+        _cursor: Annotated[str | None, Query(alias="cursor", max_length=512)] = None,
+        _limit: Annotated[int, Query(alias="limit", ge=1, le=50)] = 8,
+    ) -> Response:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        try:
+            view = await fetch_usage_requests(
+                service,
+                owner,
+                request.query_params,
+                request_source=request_source,
+                now=time.time(),
+            )
+        except UsageRequestsError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from None
+        return JSONResponse(
+            view.model_dump(mode="json"),
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.get("/me/usage/analysis/hours", response_model=UsageAnalysisHoursView)
     async def read_analysis_hours(

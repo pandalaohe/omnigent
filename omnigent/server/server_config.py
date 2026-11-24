@@ -244,6 +244,85 @@ def usage_import_body_limit(config: Mapping[str, Any]) -> int:
 
 
 @dataclass(frozen=True)
+class UsageRequestSource:
+    """Server-configured upstream for per-request usage reads."""
+
+    base_url: str
+    credential_env: str | None = None
+    credential_file: str | None = None
+
+
+def usage_request_source(config: Mapping[str, Any]) -> UsageRequestSource | None:
+    """Validate the server-owned per-request upstream configuration."""
+    from urllib.parse import urlsplit
+
+    usage = config.get("usage")
+    if usage is None:
+        return None
+    if not isinstance(usage, Mapping):
+        raise ValueError("usage must be a mapping")
+    raw = usage.get("request_source")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("usage.request_source must be a mapping")
+    allowed = {"base_url", "credential_env", "credential_file"}
+    if set(raw) - allowed:
+        raise ValueError(
+            "usage.request_source accepts only base_url and an optional "
+            "credential_env or credential_file"
+        )
+    base_url = raw.get("base_url")
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in base_url)
+    ):
+        raise ValueError("usage.request_source.base_url must be a valid HTTP(S) URL")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("usage.request_source.base_url must be a valid HTTP(S) URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise ValueError(
+            "usage.request_source.base_url must be an HTTP(S) URL without "
+            "credentials, query or fragment"
+        )
+    credential_env = raw.get("credential_env")
+    credential_file = raw.get("credential_file")
+    if credential_env is not None and credential_file is not None:
+        raise ValueError("usage.request_source accepts at most one credential reference")
+    if credential_env is not None and (
+        not isinstance(credential_env, str)
+        or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", credential_env) is None
+    ):
+        raise ValueError(
+            "usage.request_source.credential_env must be an environment variable name"
+        )
+    if credential_file is not None and (
+        not isinstance(credential_file, str)
+        or not credential_file
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in credential_file)
+        or not PurePath(credential_file).is_absolute()
+    ):
+        raise ValueError("usage.request_source.credential_file must be an absolute path")
+    return UsageRequestSource(
+        base_url=base_url.rstrip("/"),
+        credential_env=credential_env,
+        credential_file=credential_file,
+    )
+
+
+@dataclass(frozen=True)
 class StartupAdmissionPolicy:
     host_resident_limit: int | None
     deployment_resident_limit: int | None
