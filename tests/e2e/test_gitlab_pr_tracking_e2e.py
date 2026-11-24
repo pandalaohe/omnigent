@@ -19,6 +19,7 @@ from omnigent.runner.session_prs import SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
 
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
+_SESSION_ID = "gitlab-owned"
 
 
 @pytest.fixture(autouse=True)
@@ -65,13 +66,13 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    bridge_dir = bridge.prepare_bridge_dir("gitlab-tracking", workspace=workspace)
+    bridge_dir = bridge.prepare_bridge_dir(_SESSION_ID, workspace=workspace)
     relay = bridge.start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
         tool_executor=None,
         loop=asyncio.get_running_loop(),
-        session_id="gitlab-owned",
+        session_id=_SESSION_ID,
     )
     command = [
         "/bin/sh",
@@ -133,7 +134,7 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
             )
             assert completed.returncode == 0, completed.stderr
             assert completed.stdout == ""
-        [entry] = SessionPrRegistry("gitlab-owned").list()
+        [entry] = SessionPrRegistry(_SESSION_ID).list()
         assert entry.url == URL and entry.relationship == "created" and entry.number == 7
         assert (calls.read_text() if calls.exists() else "") == before, (
             "the observer invoked the GitLab CLI"
@@ -141,7 +142,7 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
         assert SessionPrRegistry("untrusted-provider-session").list() == []
     finally:
         relay.close()
-    info = WorkspaceReader(workspace).github_info(session_id="gitlab-owned", pr_url=URL)
+    info = WorkspaceReader(workspace).github_info(session_id=_SESSION_ID, pr_url=URL)
     assert info["pr"]["title"] == "Native GitLab MR"
     assert info["provider_display"]["number_prefix"] == "!"
     assert info["prs"][0]["provider"] == "gitlab"

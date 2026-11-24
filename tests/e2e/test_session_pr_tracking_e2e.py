@@ -23,6 +23,8 @@ from omnigent.runner.session_prs import SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
 from tests._helpers.polling import poll_until_async
 
+_SESSION_ID = "conv_owned"
+
 
 @pytest.mark.parametrize("harness", ["claude_native", "codex_native"])
 async def test_native_session_tracks_prs_across_repositories(
@@ -83,13 +85,13 @@ async def test_native_session_tracks_prs_across_repositories(
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    bridge_dir = bridge.prepare_bridge_dir("tracking", workspace=workspace)
+    bridge_dir = bridge.prepare_bridge_dir(_SESSION_ID, workspace=workspace)
     relay = bridge.start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
         tool_executor=None,
         loop=asyncio.get_running_loop(),
-        session_id="conv_owned",
+        session_id=_SESSION_ID,
     )
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
     command = ["/bin/sh", "-c", str(hook["command"])]
@@ -280,7 +282,7 @@ async def test_native_session_tracks_prs_across_repositories(
                 )
                 assert completed.returncode == 0, completed.stderr
                 assert completed.stdout == ""
-        registry = SessionPrRegistry("conv_owned")
+        registry = SessionPrRegistry(_SESSION_ID)
         await poll_until_async(lambda: len(registry.list()) == 8, timeout_s=10)
         entries = registry.list()
         assert len(entries) == 8
@@ -314,7 +316,7 @@ async def test_native_session_tracks_prs_across_repositories(
     finally:
         relay.close()
     # Closing the relay and using a fresh reader models the parked-runner host path.
-    entries = SessionPrRegistry("conv_owned").list()
+    entries = SessionPrRegistry(_SESSION_ID).list()
     assert len(entries) == 7
     assert {entry.repository for entry in entries if entry.relationship == "worked_on"} == {
         "example/pushed-one",
@@ -323,10 +325,10 @@ async def test_native_session_tracks_prs_across_repositories(
     assert SessionPrRegistry("provider-session").list() == []
     reader = WorkspaceReader(workspace)
     for entry in entries:
-        result = reader.github_info(session_id="conv_owned", pr_url=entry.url)
+        result = reader.github_info(session_id=_SESSION_ID, pr_url=entry.url)
         assert result["pr"]["title"] == entry.repository
         assert len(result["prs"]) == 7
         assert (
-            reader.github_pr_diff(session_id="conv_owned", pr_url=entry.url)["patch"].strip()
+            reader.github_pr_diff(session_id=_SESSION_ID, pr_url=entry.url)["patch"].strip()
             == f"patch for {entry.repository}"
         )

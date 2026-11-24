@@ -42,7 +42,7 @@ async def test_native_write_reaches_changes_registry(
                 registry.seed_snapshot(change.path, change.baseline, session_id=_SESSION_ID)
             registry.record_change(change.path, change.operation, _SESSION_ID)
 
-    bridge_dir = bridge.prepare_bridge_dir("changes-tracking", workspace=workspace)
+    bridge_dir = bridge.prepare_bridge_dir(_SESSION_ID, workspace=workspace)
     relay = bridge.start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
