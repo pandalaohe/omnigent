@@ -844,6 +844,51 @@ async def test_acp_mode_label_survives_fork_and_continue(client, stores):
         assert response.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "review"
 
 
+@pytest.mark.parametrize("operation", ["fork", "continue", "switch"])
+async def test_managed_acp_derivation_builds_fresh_permission_state(client, stores, operation):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    harness = "acp:neutral"
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 7, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    labels[PERMISSION_RUNTIME_ID_LABEL_KEY] = "source-runtime"
+    source = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+    body = {}
+    if operation == "switch":
+        _seed_agent(stores, HOST_B, "codex")
+        body = {"agent_id": HOST_B}
+    if operation == "continue":
+        archived = await client.patch(
+            f"/v1/sessions/{source.id}", json={"archived": True}, headers=PERMISSION_TIERS_HEADERS
+        )
+        assert archived.status_code == 200, archived.text
+    response = await client.post(
+        f"/v1/sessions/{source.id}/{'continue' if operation == 'continue' else 'fork'}",
+        json=body,
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert response.status_code == 201, response.text
+    derived = conversations.get_conversation(response.json()["id"])
+    assert PERMISSION_RUNTIME_ID_LABEL_KEY not in derived.labels
+    assert PERMISSION_CAPABILITY_LABEL_KEY not in derived.labels
+    if operation == "switch":
+        assert PERMISSION_STATE_LABEL_KEY not in derived.labels
+        assert response.json()["permission_tier"] is None
+    else:
+        assert read_permission_state(derived.labels, harness=harness) == ConfirmedPermissionState(
+            "plan", 1, "blocked"
+        )
+
+
 async def test_acp_mode_unreported_by_an_older_host_is_refused(client, stores):
     _seed_agent(stores, AGENT_ID, "acp:neutral")
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")

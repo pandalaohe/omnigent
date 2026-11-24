@@ -8095,13 +8095,6 @@ def register_core_routes(
                 "Source session has no agent binding — cannot fork.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.server.permission_tiers import require_permission_protocol
-
-        source_harness = await asyncio.to_thread(
-            _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
-        )
-        require_permission_protocol(request, harness=source_harness)
-
         sandbox_profile = await prepare_profile(
             request, body, user_id=user_id, inherited_session_id=source_id
         )
@@ -8377,18 +8370,29 @@ def register_core_routes(
             TIER_HARNESSES,
             ConfirmedPermissionState,
             creation_permission_tier,
-            legacy_permission_tier,
+            is_acp_permission_harness,
+            permission_tier_active,
             require_permission_protocol,
+            source_permission_tier,
         )
 
         source_harness = await asyncio.to_thread(
             _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
         )
-        require_permission_protocol(request, harness=source_harness)
-        require_permission_protocol(request, harness=target_harness)
-        if body.permission_tier is not None and target_harness not in TIER_HARNESSES:
+        source_managed = permission_tier_active(source_harness, source.labels)
+        target_acp = is_acp_permission_harness(target_harness)
+        target_managed = target_harness in TIER_HARNESSES or (
+            target_acp
+            and (
+                body.permission_tier is not None
+                or (is_acp_permission_harness(source_harness) and source_managed)
+            )
+        )
+        require_permission_protocol(request, harness=source_harness, required=source_managed)
+        require_permission_protocol(request, harness=target_harness, required=target_managed)
+        if body.permission_tier is not None and not target_managed:
             raise OmnigentError(
-                "permission_tier is only supported by Pi and Antigravity forks",
+                "The target harness does not support permission tiers",
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.permission_mode is not None:
@@ -8442,29 +8446,16 @@ def register_core_routes(
                         _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
                     }
                 )
-        if source_harness in TIER_HARNESSES or target_harness in TIER_HARNESSES:
-            dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
+        dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
         tier = None
-        if target_harness in TIER_HARNESSES:
+        if target_managed:
             assert target_harness is not None
-            inherited_tier = None
-            if source_harness in TIER_HARNESSES:
-                assert source_harness is not None
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=source_harness,
-                        labels=source.labels or {},
-                        launch_args=source.terminal_launch_args or [],
-                    )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Source permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
             tier = creation_permission_tier(
                 harness=target_harness,
                 explicit=body.permission_tier,
-                inherited=inherited_tier,
+                inherited=source_permission_tier(
+                    source_harness, source.labels, source.terminal_launch_args or []
+                ),
             )
             extra_labels.update(
                 ConfirmedPermissionState(tier, 1, "blocked").labels(target_harness)
@@ -9028,7 +9019,26 @@ def register_core_routes(
             )
             or key.startswith(MEMBER_LABEL_PREFIX)
         }
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            is_acp_permission_harness,
+            require_permission_protocol,
+            source_permission_tier,
+        )
         from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
+
+        continued_harness = await asyncio.to_thread(
+            _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if continued_harness is not None and is_acp_permission_harness(continued_harness):
+            tier = source_permission_tier(
+                continued_harness, source.labels, source.terminal_launch_args or []
+            )
+            if tier is not None:
+                require_permission_protocol(request, harness=continued_harness, required=True)
+                continued_labels.update(
+                    ConfirmedPermissionState(tier, 1, "blocked").labels(continued_harness)
+                )
 
         continued_labels.update(
             resolve_session_mcp_selection(None, None, user_id, source_labels=source.labels).labels
