@@ -1499,7 +1499,7 @@ def test_read_keep_warm_settings_defaults_on_missing_store_owner_or_namespace(
     """Every gap resolves to the fail-safe keep-warm defaults with present=False."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
     default = KeepWarmSettings(
-        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=False
+        agents={}, host_offline_archive_s=0, migrated_from_legacy_at=None, present=False
     )
     assert read_keep_warm_settings(None, "alice@example.com") == default
     assert read_keep_warm_settings(store, None) == default
@@ -1579,7 +1579,7 @@ def test_read_keep_warm_settings_parses_cold_after_seconds(db_uri: str) -> None:
 def test_read_keep_warm_settings_tolerates_bad_rows_and_shapes() -> None:
     """A corrupt row or malformed namespace value never fails a caller."""
     default = KeepWarmSettings(
-        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=False
+        agents={}, host_offline_archive_s=0, migrated_from_legacy_at=None, present=False
     )
 
     class _RaisingStore:
@@ -1606,7 +1606,7 @@ def test_read_keep_warm_settings_tolerates_bad_rows_and_shapes() -> None:
         _ShapeStore({"settings": {"keep_warm": "compact"}}), "alice@example.com"
     )
     assert garbage == KeepWarmSettings(
-        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=True
+        agents={}, host_offline_archive_s=0, migrated_from_legacy_at=None, present=True
     )
 
     # An invalid host-offline value takes the default while the rows survive.
@@ -1623,7 +1623,7 @@ def test_read_keep_warm_settings_tolerates_bad_rows_and_shapes() -> None:
         ),
         "alice@example.com",
     )
-    assert partial.host_offline_archive_s == 14400
+    assert partial.host_offline_archive_s == 0
     assert partial.agents == {
         "agent-a": AgentKeepWarm(main=True, child=True, interval_s=None, max_s=14400)
     }
@@ -1758,7 +1758,7 @@ def test_migrate_legacy_keep_warm_writes_rows_for_the_given_agents(db_uri: str) 
                 "maxSeconds": 14400,
             },
         },
-        "hostOfflineArchiveSeconds": 14400,
+        "hostOfflineArchiveSeconds": 0,
         "migratedFromLegacyAt": 111,
     }
     # The legacy keys are never changed or deleted.

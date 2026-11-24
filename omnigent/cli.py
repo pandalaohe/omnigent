@@ -64,6 +64,7 @@ from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
     CODEX_NATIVE_UNLISTED_MODEL_KEY,
     CODEX_NATIVE_UNLISTED_MODEL_MODES,
+    NATIVE_HISTORY_CLEANUP_KEY,
     _ignored_project_harness_keys,
     _merge_effective_config,
     global_config_path,
@@ -682,6 +683,7 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "opencode_model",
         "server",
         "session_title_instructions",
+        NATIVE_HISTORY_CLEANUP_KEY,
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
         CODEX_NATIVE_UNLISTED_MODEL_KEY,
     }
@@ -689,7 +691,9 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
 _USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset(
     {"server", "session_title_instructions", CODEX_NATIVE_UNLISTED_MODEL_KEY}
 )
-_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
+_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset(
+    {_AUTO_OPEN_CONVERSATION_CONFIG_KEY, NATIVE_HISTORY_CLEANUP_KEY}
+)
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
 _ConfigValue: TypeAlias = (
@@ -1235,7 +1239,12 @@ def _save_global_config(  # type: ignore[explicit-any]
         else:
             cfg[key] = value
     for key in unset_keys:
-        cfg.pop(key, None)
+        if key == NATIVE_HISTORY_CLEANUP_KEY:
+            host_config = cfg.get("host")
+            if isinstance(host_config, dict):
+                host_config.pop("native_history_cleanup", None)
+        else:
+            cfg.pop(key, None)
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
     from omnigent.private_file import write_private_text
@@ -12450,6 +12459,8 @@ def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: boo
     """Reject project-local writes for user-owned server settings."""
     if is_global:
         return
+    if NATIVE_HISTORY_CLEANUP_KEY in settings:
+        raise click.ClickException(f"Config key {NATIVE_HISTORY_CLEANUP_KEY!r} requires --global.")
     user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
     if user_only:
         names = ", ".join(repr(key) for key in user_only)
@@ -12557,7 +12568,11 @@ def _print_config_defaults() -> None:
     # Only user-facing defaults (the keys ``config set`` accepts).
     # Internal blocks (``providers``, ``host``, ``tui``) are omitted — the
     # ``providers`` block is shown in the credentials-by-harness section.
-    global_cfg = {k: v for k, v in _load_global_config().items() if k in _GLOBAL_CONFIG_KEYS}
+    raw_global_cfg = _load_global_config()
+    global_cfg = {k: v for k, v in raw_global_cfg.items() if k in _GLOBAL_CONFIG_KEYS}
+    host_config = raw_global_cfg.get("host")
+    if isinstance(host_config, Mapping) and "native_history_cleanup" in host_config:
+        global_cfg[NATIVE_HISTORY_CLEANUP_KEY] = host_config["native_history_cleanup"] is True
     raw_local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
     global_path = _effective_global_config_path()
     local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
@@ -12908,6 +12923,9 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     Server selection, session title instructions and the Codex unlisted-model
     setting require ``--global``. Use ``--server`` for a per-invocation destination.
 
+    Set ``--global host.native_history_cleanup=true`` to let this host expire
+    old native bridge and attachment files. Restart the host to apply it.
+
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
     :param settings: ``KEY=VALUE`` pairs to set, e.g.
@@ -12922,6 +12940,9 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     _validate_config_set_scope(parsed, is_global=is_global)
     deep_keys = _harness_deep_merge_keys(parsed)
     if is_global:
+        if NATIVE_HISTORY_CLEANUP_KEY in parsed:
+            parsed["host"] = {"native_history_cleanup": parsed.pop(NATIVE_HISTORY_CLEANUP_KEY)}
+            deep_keys += ("host",)
         _save_global_config(parsed, (), deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
@@ -12947,6 +12968,8 @@ def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
     :param keys: Keys to remove, e.g. ``("server", "model")``.
     """
     validated = _validate_unset_keys(keys)
+    if not is_global and NATIVE_HISTORY_CLEANUP_KEY in validated:
+        raise click.ClickException(f"Config key {NATIVE_HISTORY_CLEANUP_KEY!r} requires --global.")
     if is_global:
         _save_global_config({}, tuple(validated))
         config_path: Path = _effective_global_config_path()

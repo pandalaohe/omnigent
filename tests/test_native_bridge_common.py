@@ -82,6 +82,32 @@ def _write_file(directory: Path, *, expired: bool) -> Path:
     return path
 
 
+def test_orphan_sweep_leaves_linked_directory_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridges"
+    root.mkdir()
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / native_bridge_common.OWNER_PID_FILENAME).write_text("999999", encoding="utf-8")
+    runtime_file = target / "server.json"
+    runtime_file.write_text("{}", encoding="utf-8")
+    link = root / "linked"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    assert (
+        native_bridge_common.prune_orphaned_dirs(
+            root,
+            should_prune=lambda _: False,
+            on_keep=lambda bridge: (bridge / runtime_file.name).unlink(),
+        )
+        == 0
+    )
+    assert runtime_file.exists()
+    assert link.is_symlink()
+
+
 def test_prune_expired_attachment_caches_removes_only_expired_attachment_dirs(
     tmp_path: Path,
 ) -> None:
@@ -152,17 +178,21 @@ def test_prune_expired_attachment_caches_missing_dir_returns_zero(tmp_path: Path
     assert native_bridge_common.prune_expired_attachment_caches(tmp_path / "never-created") == 0
 
 
+@pytest.mark.parametrize("enabled", [False, True])
 def test_reap_sweeps_expired_attachment_caches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    """The host-wide sweep also retires expired attachment caches under the data dir."""
+    """The automatic sweep expires attachments only with the host's opt-in."""
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.harness_plugins.native_agents", list)
+    if enabled:
+        (tmp_path / "config.yaml").write_text("host:\n  native_history_cleanup: true\n")
     cache = tmp_path / "data" / "attachments" / ("e" * 32)
     _write_file(cache, expired=True)
 
-    assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 1
-    assert not cache.exists()
+    assert native_bridge_common.reap_orphaned_native_bridge_dirs() == int(enabled)
+    assert cache.exists() is not enabled
 
 
 def test_prune_ignores_non_dir_entries_and_bad_markers(tmp_path: Path) -> None:
@@ -332,7 +362,7 @@ def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPat
         _recorder("opencode", 4),
     )
 
-    total = native_bridge_common.reap_orphaned_native_bridge_dirs()
+    total = native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True)
 
     assert set(called) == {"claude", "codex", "antigravity", "opencode"}
     assert total == 1 + 2 + 3 + 4
@@ -359,7 +389,7 @@ def test_reap_skips_agents_without_a_prune_and_bad_modules(
         "omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", _claude_prune
     )
 
-    total = native_bridge_common.reap_orphaned_native_bridge_dirs()
+    total = native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True)
 
     assert called == ["claude"]
     assert total == 5
@@ -380,7 +410,7 @@ def test_reap_isolates_a_failing_pruner(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", _ok)
 
     # codex raises but is swallowed; claude still runs and its count is returned.
-    assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 7
+    assert native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True) == 7
 
 
 def test_reap_isolates_a_module_that_raises_on_import(
@@ -411,7 +441,7 @@ def test_reap_isolates_a_module_that_raises_on_import(
     )
 
     # The broken module's import RuntimeError is swallowed; claude still runs.
-    assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 3
+    assert native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True) == 3
     assert called == ["claude"]
 
 
@@ -441,7 +471,7 @@ def test_reap_logs_an_unavailable_harness_below_error(
     )
 
     with caplog.at_level(logging.DEBUG, logger=native_bridge_common.__name__):
-        assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 3
+        assert native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True) == 3
 
     records = [r for r in caplog.records if "unavailable_native" in r.getMessage()]
     assert records, "the skipped harness must still be reported"
@@ -465,7 +495,7 @@ def test_reap_still_errors_on_a_module_that_raises_on_import(
     monkeypatch.setattr(native_bridge_common.importlib, "import_module", _fake_import)
 
     with caplog.at_level(logging.DEBUG, logger=native_bridge_common.__name__):
-        assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 0
+        assert native_bridge_common.reap_orphaned_native_bridge_dirs(expire_history=True) == 0
 
     records = [r for r in caplog.records if "broken_native" in r.getMessage()]
     assert [r.levelno for r in records] == [logging.ERROR]

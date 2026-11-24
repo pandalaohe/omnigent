@@ -310,7 +310,7 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     return bridge_dir
 
 
-def prune_orphaned_bridge_dirs() -> int:
+def prune_orphaned_bridge_dirs(*, expire_history: bool = True) -> int:
     """
     Remove inactive codex-native bridge dirs whose owner is dead or absent.
 
@@ -325,8 +325,14 @@ def prune_orphaned_bridge_dirs() -> int:
     """
     return native_bridge_common.prune_orphaned_dirs(
         bridge_root(),
-        should_prune=_codex_orphan_retention_expired,
+        should_prune=lambda bridge_dir: _codex_orphan_retention_expired(
+            bridge_dir, expire_history=expire_history
+        ),
     )
+
+
+def prune_orphaned_bridge_runtime_files() -> int:
+    return prune_orphaned_bridge_dirs(expire_history=False)
 
 
 def _codex_newest_activity_time(bridge_dir: Path) -> float | None:
@@ -565,7 +571,7 @@ def _trim_codex_orphan_plugin_bundle(codex_home: Path) -> None:
         return
 
 
-def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
+def _codex_orphan_retention_expired(bridge_dir: Path, *, expire_history: bool = True) -> bool:
     """Return whether a dead-owner Codex bridge is past whole-dir retention.
 
     Retiring a bridge is two-stage: caches are trimmed in place once it has
@@ -577,7 +583,7 @@ def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
     if newest is None:
         return False
     now = time.time()
-    if newest <= now - _ORPHAN_RETENTION_SECONDS:
+    if expire_history and newest <= now - _ORPHAN_RETENTION_SECONDS:
         return True
     if newest <= now - _ORPHAN_CACHE_TRIM_SECONDS:
         _trim_codex_orphan_caches(bridge_dir)

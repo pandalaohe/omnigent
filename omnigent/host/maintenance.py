@@ -951,6 +951,7 @@ class HostMaintenanceJanitor:
     def for_host(
         cls,
         *,
+        config_path: Path | None = None,
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: Callable[[], Collection[Path]] | None = None,
         on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
@@ -960,6 +961,7 @@ class HostMaintenanceJanitor:
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon.
 
+        :param config_path: The host daemon's startup config file.
         :param harness_tmp_parent: Override for the harness temp parent.
         :param live_runner_log_paths: Returns the log paths of this host's
             live runners, so the runner-log sweep never deletes a file a
@@ -973,6 +975,7 @@ class HostMaintenanceJanitor:
             included. Called off-loop once per retention pass.
         :param host_id: This host's id; the retention lists only its sessions.
         """
+        from omnigent.config import native_history_cleanup_enabled
         from omnigent.process_logging import data_dir, process_log_dir
         from omnigent.runtime.harnesses.paths import (
             absolute_harness_tmp_parent,
@@ -985,6 +988,7 @@ class HostMaintenanceJanitor:
             else resolve_harness_tmp_parent()
         )
         runner_log_dir = process_log_dir("runner")
+        expire_native_history = native_history_cleanup_enabled(config_path)
 
         async def _reap_harness_processes() -> None:
             from omnigent.runtime.harnesses.process_manager import (
@@ -1011,7 +1015,9 @@ class HostMaintenanceJanitor:
         async def _reap_native_bridge_dirs() -> object:
             from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
 
-            return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
+            return await _run_sync_stage(
+                lambda: reap_orphaned_native_bridge_dirs(expire_history=expire_native_history)
+            )
 
         async def _reap_codex_homes() -> object:
             from omnigent.inner.codex_staging import reap_orphaned_codex_homes
@@ -1037,7 +1043,7 @@ class HostMaintenanceJanitor:
             ("runner_log_retention", _retain_runner_logs),
         ]
         stage_skip_reasons = {"native_bridge_orphans": {"runner_superseded"}}
-        if server_url is not None and server_headers is not None:
+        if expire_native_history and server_url is not None and server_headers is not None:
             stages.append(
                 (
                     "codex_session_retention",

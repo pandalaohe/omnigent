@@ -20778,7 +20778,10 @@ def test_prune_orphaned_bridge_dirs_respects_forwarder_cursor_activity_and_7_day
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A recent transcript_forwarder.json holds a dead-owner dir until both age past 7 days."""
-    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
+    from omnigent.harnesses.claude_native.bridge import (
+        prune_orphaned_bridge_dirs,
+        prune_orphaned_bridge_runtime_files,
+    )
 
     root = tmp_path / "claude-native"
     root.mkdir(parents=True)
@@ -20799,6 +20802,11 @@ def test_prune_orphaned_bridge_dirs_respects_forwarder_cursor_activity_and_7_day
     assert bridge_dir.exists()
 
     os.utime(cursor_file, (eight_days_ago, eight_days_ago))
+    runtime_file = bridge_dir / "server.json"
+    runtime_file.write_text("{}", encoding="utf-8")
+    assert prune_orphaned_bridge_runtime_files() == 0
+    assert cursor_file.exists()
+    assert not runtime_file.exists()
     assert prune_orphaned_bridge_dirs() == 1
     assert not bridge_dir.exists()
 

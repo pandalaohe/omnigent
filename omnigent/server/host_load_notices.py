@@ -79,7 +79,7 @@ def _notice(hub: SystemStatusHub, workspace: int, host: str, load: dict[str, Any
         action = (
             "New child sessions created on this host are queued and start automatically "
             "when it drops below the line; heavy test runs wait."
-            if hub.get_settings(workspace)["load_lines"]["queue_enabled"]
+            if hub.queue_enabled(workspace)
             else "New child-session queuing is disabled. Do not dispatch new child sessions "
             "or heavy test runs to this host until it is clear."
         )
@@ -154,12 +154,17 @@ class HostLoadNotices:
             # Spare/normal changes alone are visible in queries and check-ins.
             if change.old not in _HOLDS and change.new not in _HOLDS:
                 continue
+            if not hub.notices_enabled(change.workspace_id):
+                continue
             with workspace_scope(change.workspace_id):
                 recipients = await asyncio.to_thread(self._recipients, change.host_id)
             for parent in recipients:
                 key = (change.workspace_id, parent, change.host_id)
                 self._deliveries.setdefault(key, _Delivery()).pending = True
         for key, delivery in list(self._deliveries.items()):
+            if not hub.notices_enabled(key[0]):
+                self._deliveries.pop(key)
+                continue
             if not delivery.pending or key in self._tasks:
                 continue
             self._tasks[key] = asyncio.create_task(
@@ -189,6 +194,8 @@ class HostLoadNotices:
         self, hub: SystemStatusHub, app: Any, key: tuple[int, str, str], delivery: _Delivery
     ) -> None:
         workspace, parent_id, host = key
+        if not hub.notices_enabled(workspace) or self._deliveries.get(key) is not delivery:
+            return
         parent = await asyncio.to_thread(self._store.get_conversation, parent_id)
         if parent is None or parent.archived or is_session_closed(parent.labels, parent.title):
             self._deliveries.pop(key, None)
@@ -212,6 +219,8 @@ class HostLoadNotices:
         ):
             return
         owner = await asyncio.to_thread(self._owner_for, fresh)
+        if not hub.notices_enabled(workspace) or self._deliveries.get(key) is not delivery:
+            return
         now = self._clock()
         load = hub.host_load(workspace, host, now=now, include_decision=True)
         level = load["level"]

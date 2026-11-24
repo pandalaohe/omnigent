@@ -34,6 +34,7 @@ _GLOBAL_CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 _LOCAL_CONFIG_RELPATH = Path(".omnigent") / "config.yaml"
 CODEX_NATIVE_UNLISTED_MODEL_KEY = "codex_native_unlisted_model"
 CODEX_NATIVE_UNLISTED_MODEL_MODES = ("as_requested", "fallback")
+NATIVE_HISTORY_CLEANUP_KEY = "host.native_history_cleanup"
 
 
 def global_config_path(default_path: Path | None = None) -> Path:
@@ -86,6 +87,20 @@ def codex_native_allows_unlisted_model() -> bool:
         " or ".join(CODEX_NATIVE_UNLISTED_MODEL_MODES),
     )
     return False
+
+
+def native_history_cleanup_enabled(path: Path | None = None) -> bool:
+    """Read the host's opt-in to expiring resumable native session files."""
+    try:
+        config = load_global_config(path)
+    except Exception as exc:  # noqa: BLE001 — An optional setting must not abort maintenance.
+        # Parser details can include private config values.
+        _log.warning(
+            "Unable to read host config for native history cleanup (%s)", type(exc).__name__
+        )
+        return False
+    host = config.get("host") if isinstance(config, Mapping) else None
+    return isinstance(host, Mapping) and host.get("native_history_cleanup") is True
 
 
 def load_local_config(path: Path | None = None) -> _Config:

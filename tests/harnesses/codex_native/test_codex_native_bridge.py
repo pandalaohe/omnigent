@@ -1733,17 +1733,19 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
 
 
 @pytest.mark.parametrize(
-    ("activity_age_days", "expect_pruned", "expect_trimmed"),
+    ("activity_age_days", "expire_history", "expect_pruned", "expect_trimmed"),
     [
-        (8, 0, True),
-        (6, 0, False),
-        (71, 1, True),
+        (8, True, 0, True),
+        (6, True, 0, False),
+        (71, True, 1, True),
+        (71, False, 0, True),
     ],
 )
 def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     activity_age_days: int,
+    expire_history: bool,
     expect_pruned: int,
     expect_trimmed: bool,
 ) -> None:
@@ -1807,7 +1809,12 @@ def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
     os.utime(owner_marker, (aged_at, aged_at))
     os.utime(rollout, (aged_at, aged_at))
 
-    assert codex_native_bridge.prune_orphaned_bridge_dirs() == expect_pruned
+    prune = (
+        codex_native_bridge.prune_orphaned_bridge_dirs
+        if expire_history
+        else codex_native_bridge.prune_orphaned_bridge_runtime_files
+    )
+    assert prune() == expect_pruned
 
     if expect_pruned:
         assert not dead_dir.exists()
@@ -1827,7 +1834,7 @@ def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
         assert cache_dir.exists() != expect_trimmed
         assert (skills_dir / "s.md").exists() != expect_trimmed
         assert plugins_dir.exists() != expect_trimmed
-        assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+        assert prune() == 0
         assert dead_dir.exists()
 
     assert (plugin_target / "plugin.txt").read_text(encoding="utf-8") == "plugin"

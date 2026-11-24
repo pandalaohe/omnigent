@@ -215,13 +215,13 @@ it("keeps empty cells, display columns, timestamps and explicit OFF masks", () =
     cells: preferences.cells,
     columns: ["direct", "harness:pi"],
     migratedToCellsAt: 123,
-    hostOfflineArchiveSeconds: 14400,
+    hostOfflineArchiveSeconds: 0,
   });
   writeKeepWarmPreferences({ ...KEEP_WARM_DEFAULTS, cells: {} });
   expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY)!)).toMatchObject({ cells: {} });
   expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", {
     cells: {},
-    hostOfflineArchiveSeconds: 14400,
+    hostOfflineArchiveSeconds: 0,
   });
 });
 
