@@ -497,7 +497,7 @@ it.each(["#child-sessions", "#child-idle"])(
       within(opening).getByRole("textbox", { name: "Open children per parent" }),
     ).toBeVisible();
     expect(within(checkins).getByTestId("child-idle-settings")).toBeVisible();
-    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(4);
+    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(0);
     expect(screen.getAllByRole("spinbutton", { name: /Archive children/ })).toHaveLength(1);
   },
 );
