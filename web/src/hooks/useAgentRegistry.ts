@@ -403,6 +403,7 @@ export function useAgentRegistry() {
   );
   return {
     items,
+    installedServerAgents: catalog.data?.agents.filter((agent) => agent.builtin === false) ?? [],
     legacyProducts,
     legacyLabels,
     isLoading:

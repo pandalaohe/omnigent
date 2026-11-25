@@ -53,6 +53,8 @@ export interface LayeredTableProps {
   /** Entries the page adds after the shared dot legend. */
   legend?: ReactNode;
   rows: readonly LayeredTableRow[];
+  /** Rows with their own settings link and no layered values. */
+  detailRows?: readonly { id: string; content: ReactNode }[];
   columns: readonly LayeredTableColumn[];
   renderCell: (row: string, col: string) => LayeredCell;
   renderEditor: (at: LayeredLevel, trigger: ReactElement) => ReactNode;
@@ -193,6 +195,7 @@ export function LayeredTable({
   tools,
   legend,
   rows,
+  detailRows,
   columns,
   renderCell,
   renderEditor,
@@ -439,6 +442,16 @@ export function LayeredTable({
                     </td>
                   );
                 })}
+              </tr>
+            ))}
+            {detailRows?.map((row) => (
+              <tr key={row.id} className="[&:last-child>*]:border-b-0">
+                <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
+                  {row.content}
+                </th>
+                {columns.map((col) => (
+                  <td key={col.id} className={cn(LEVEL_CELL, BODY_COLUMN)} />
+                ))}
               </tr>
             ))}
           </tbody>

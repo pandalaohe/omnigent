@@ -8,7 +8,7 @@ import {
 } from "@/lib/callingDefaultsApi";
 import { ArrowRightIcon } from "lucide-react";
 import { AgentNameTag } from "@/components/AgentNameTag";
-import { LayeredTable } from "@/components/LayeredTable";
+import { LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
 import {
   useInstructionLayers,
@@ -16,10 +16,16 @@ import {
   type InstructionLayers,
 } from "@/hooks/useInstructionLayers";
 import type { Host } from "@/hooks/useHosts";
-import { agentPresentOnHost, agentProductHarness, agentSettingsPath } from "@/lib/agentSettings";
+import {
+  agentPresentOnHost,
+  agentProductHarness,
+  agentSettingsHost,
+  agentSettingsPath,
+} from "@/lib/agentSettings";
 import { missingCellText } from "@/lib/layeredValues";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { Link } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
 
 function instructionAgent(
@@ -64,36 +70,21 @@ function ProviderValue({
 
 export function AgentContextTable({
   field,
-  hosts,
-  harnesses,
-  names,
-  agentIds,
-  capabilities,
+  ...props
 }: {
   field: "prompt" | "provider";
   hosts: readonly Host[];
   harnesses: readonly string[];
   names: Readonly<Record<string, string>>;
-  agentIds: Readonly<Record<string, string>>;
+  agentIds: Readonly<Record<string, string | undefined>>;
   capabilities: HarnessCapabilityMap;
+  detailRows?: LayeredTableProps["detailRows"];
+  visibleHostId?: string;
 }) {
   return field === "prompt" ? (
-    <PromptTable
-      hosts={hosts}
-      harnesses={harnesses}
-      names={names}
-      agentIds={agentIds}
-      capabilities={capabilities}
-    />
+    <PromptTable {...props} />
   ) : (
-    <ContextTable
-      field={field}
-      hosts={hosts}
-      harnesses={harnesses}
-      names={names}
-      agentIds={agentIds}
-      capabilities={capabilities}
-    />
+    <ContextTable {...props} field={field} />
   );
 }
 
@@ -128,10 +119,12 @@ function PromptTable(props: Omit<ContextProps, "field">) {
 function ContextTable({
   field,
   hosts,
+  visibleHostId,
   harnesses,
   names,
   agentIds,
   capabilities,
+  detailRows,
   layers,
   loading,
   catalogs,
@@ -152,19 +145,25 @@ function ContextTable({
         id: harness,
         label: names[harness] ?? harness,
         content: (
-          <span className={dependent(harness) ? "pl-4" : undefined}>
+          <span className={cn("block whitespace-normal", dependent(harness) && "pl-4")}>
             <AgentNameTag
               agentId={agentIds[harness] ?? null}
               name={names[harness] ?? harness}
               harness={harness}
-              markOnly={dependent(harness)}
+              className="max-w-full"
             />
-            {dependent(harness) && <span className="sr-only">{names[harness] ?? harness}</span>}
           </span>
         ),
         action: (
           <Link
-            to={agentSettingsPath(harness, hosts.length === 1 ? hosts[0].host_id : undefined)}
+            to={agentSettingsPath(
+              harness,
+              agentSettingsHost(
+                harness,
+                hosts,
+                visibleHostId ?? (hosts.length === 1 ? hosts[0].host_id : undefined),
+              ),
+            )}
             aria-label={`${names[harness] ?? harness} details`}
             componentId="settings.agents.detail"
             className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
@@ -173,7 +172,10 @@ function ContextTable({
           </Link>
         ),
       }))}
-      columns={hosts.map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
+      detailRows={detailRows}
+      columns={hosts
+        .filter((host) => !visibleHostId || host.host_id === visibleHostId)
+        .map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
       renderEditor={(_at, trigger: ReactElement) => (
         <div className="flex min-h-11 min-w-0 flex-col justify-center px-2.5 py-1.75">
           {(trigger.props as { children: ReactNode }).children}

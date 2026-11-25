@@ -1,5 +1,5 @@
 import type { ReactElement } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Outlet } from "react-router-dom";
 import {
   cleanup,
   fireEvent,
@@ -12,6 +12,8 @@ import type { CustomAgent } from "@/lib/customAgentsApi";
 import type { HarnessCapability } from "@/lib/agentLabels";
 import type * as AgentLabels from "@/lib/agentLabels";
 import type * as CustomAgentsApi from "@/lib/customAgentsApi";
+import { Link, useLocation } from "@/lib/routing";
+import App from "@/App";
 
 const mocks = vi.hoisted(() => ({
   hosts: [] as Record<string, unknown>[],
@@ -21,6 +23,8 @@ const mocks = vi.hoisted(() => ({
   sync: vi.fn(),
   queuePatch: vi.fn(),
   customAgents: [] as CustomAgent[],
+  installed: [] as { id: string; name: string; harness: string }[],
+  installedNext: [] as { id: string; name: string; harness: string }[],
   agents: [
     {
       id: "agent-claude",
@@ -57,12 +61,57 @@ vi.mock("@/lib/agentLabels", async (original) => ({
 }));
 vi.mock("@/hooks/useAgentRegistry", async (original) => ({
   ...(await original<Record<string, unknown>>()),
-  useAgentRegistry: () => ({ items: [], legacyProducts: {}, isError: false }),
+  useAgentRegistry: () => ({ items: [], installedServerAgents: [], legacyProducts: {} }),
+}));
+vi.mock("@/hooks/useCustomAgents", async () => {
+  const { useState } = await import("react");
+  return {
+    useCustomAgents: () => {
+      const [page, setPage] = useState(0);
+      return {
+        query: { data: { data: page === 0 ? mocks.installed : mocks.installedNext } },
+        pager: {
+          page,
+          hasNext: page === 0 && mocks.installedNext.length > 0,
+          onPrevious: () => setPage(0),
+          onNext: () => setPage(1),
+        },
+      };
+    },
+  };
+});
+vi.mock("@/pages/settings/SettingsHarnessesSection", () => ({
+  SettingsHarnessesSection: () => null,
+}));
+vi.mock("@/shell/AppShell", () => ({
+  AppShell: () => <Outlet />,
+}));
+vi.mock("@/pages/SettingsPage", async () => {
+  const { SettingsAgentsSection } = await import("@/pages/settings/SettingsAgentsSection");
+  return { SettingsPage: SettingsAgentsSection };
+});
+vi.mock("@/pages/NotFoundPage", () => ({
+  NotFoundPage: () => <p>Page not found</p>,
+}));
+vi.mock("@/pages/settings/SettingsCustomAgentsSection", () => ({
+  SettingsCustomAgentsSection: () => {
+    const location = useLocation();
+    return location.state?.fromAgentsTable === true ? (
+      <Link to="/settings/agents#agent-settings-table">Return to table</Link>
+    ) : null;
+  },
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    agent_install: true,
+    agent_detail: true,
+    features: { custom_agents_settings_ui: true },
+  }),
 }));
 import { CallingDefaultsSection } from "./CallingDefaultsSection";
 
-function render(ui: ReactElement) {
-  const result = renderComponent(<MemoryRouter>{ui}</MemoryRouter>);
+function render(ui: ReactElement, path = "/") {
+  const result = renderComponent(<MemoryRouter initialEntries={[path]}>{ui}</MemoryRouter>);
   const options = screen.queryByText("New session options")?.closest("details");
   if (options) options.open = true;
   return result;
@@ -123,6 +172,8 @@ beforeEach(() => {
   mocks.sync.mockReset().mockResolvedValue(mocks.catalogRows);
   mocks.queuePatch.mockReset();
   mocks.customAgents = [];
+  mocks.installed = [];
+  mocks.installedNext = [];
   mocks.capabilities = {};
 });
 
@@ -132,6 +183,55 @@ afterEach(() => {
 });
 
 describe("CallingDefaultsSection", () => {
+  it("links separately installed agents to their own settings without adding harness defaults", async () => {
+    mocks.installed = [
+      {
+        id: "agent-custom",
+        name: "Release assistant",
+        harness: "codex-native",
+      },
+    ];
+    render(<CallingDefaultsSection />);
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    expect(screen.getByRole("link", { name: "Release assistant details" })).toHaveAttribute(
+      "href",
+      "/settings/agents/custom/agent-custom",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
+    expect(screen.queryByRole("button", { name: /Select Release assistant/ })).toBeNull();
+  });
+
+  it("keeps the selected setting and page when returning from an installed agent", async () => {
+    mocks.installedNext = [
+      { id: "agent-next", name: "Release assistant", harness: "codex-native" },
+    ];
+    render(<App />, "/settings/agents");
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: "Thinking" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("link", { name: "Release assistant details" }));
+    expect(screen.queryByRole("radio", { name: "Thinking" })).toBeNull();
+    fireEvent.click(await screen.findByRole("link", { name: "Return to table" }));
+    expect(screen.getByRole("radio", { name: "Thinking" })).toBeChecked();
+    expect(screen.getByRole("link", { name: "Release assistant details" })).toBeVisible();
+    expect(screen.getByText("Page 2")).toBeVisible();
+  });
+
+  it("keeps host aliases out and directs an ACP row to the host that reported it", async () => {
+    mocks.hosts = [
+      { ...HOST, configured_harnesses: { "claude-sdk": true, claude: true } },
+      { ...HOST, host_id: "host-b", configured_harnesses: { "acp:example": true } },
+    ];
+    render(<CallingDefaultsSection />);
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    expect(screen.getAllByRole("link", { name: /Claude.*details/ })).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: /^claude details$/i })).toBeNull();
+    expect(screen.getByRole("link", { name: "ACP · example details" })).toHaveAttribute(
+      "href",
+      "/settings/agents/acp%3Aexample?host=host-b",
+    );
+  });
+
   it("shows every configured ACP row and saves advertised thinking choices", async () => {
     mocks.hosts = [{ ...HOST, configured_harnesses: { "acp:neutral": true } }];
     mocks.listCatalogs.mockResolvedValue([

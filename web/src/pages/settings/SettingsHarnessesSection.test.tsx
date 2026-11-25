@@ -237,14 +237,12 @@ vi.mock("./HarnessFixDialog", () => ({
   },
 }));
 
-function renderHarnesses(harness?: string, search = "") {
+function renderHarnesses(harness?: string, search = "", base = "/settings/harnesses") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter
-          initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}${search}`]}
-        >
+        <MemoryRouter initialEntries={[`${base}${harness ? `/${harness}` : ""}${search}`]}>
           <SettingsHarnessesSection />
         </MemoryRouter>
       </TooltipProvider>
@@ -383,6 +381,13 @@ describe("Agent setup list", () => {
 });
 
 describe("Harness details", () => {
+  it("opens a host-reported harness before a matching catalog record exists", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "acp:example": true } }];
+    renderHarnesses("acp%3Aexample", "", "/settings/agents");
+    expect(screen.getByRole("heading", { name: "ACP · example" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Edit badge for ACP · example" })).toBeNull();
+  });
+
   it("opens the SDK identity from its dependent row and saves its badge independently", async () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": true, codex: true } }];
     const product = (harness: string, label: string): RegistryItem => ({

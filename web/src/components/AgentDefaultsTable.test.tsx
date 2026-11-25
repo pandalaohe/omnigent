@@ -13,6 +13,7 @@ import {
   type CallingDefaultsTable,
 } from "@/lib/callingDefaults";
 import { AgentDefaultsTable, type AgentField } from "./AgentDefaultsTable";
+import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 import validityCases from "@/lib/__fixtures__/callingDefaultValidity.json";
 
 const { queuePatch } = vi.hoisted(() => ({ queuePatch: vi.fn() }));
@@ -104,7 +105,12 @@ describe("agent layered defaults", () => {
     );
   });
 
-  it("keeps a details entry for the SDK identity beside its Native product", () => {
+  it.each([true, false])("shows the SDK name and details with badges enabled=%s", (enabled) => {
+    writeAgentBadgePreferences({
+      version: 1,
+      enabled,
+      entries: { ag_sdk: { label: "XS", borderColor: "#ffaa00", textColor: "theme" } },
+    });
     render(
       <MemoryRouter>
         <AgentDefaultsTable
@@ -123,6 +129,11 @@ describe("agent layered defaults", () => {
     expect(screen.getByRole("link", { name: "Codex SDK details" })).toHaveAttribute(
       "href",
       "/settings/agents/codex?host=desktop",
+    );
+    const name = screen.getByText("Codex SDK");
+    expect(name.closest(".sr-only")).toBeNull();
+    expect(screen.queryByTestId("agent-name-badge")?.textContent ?? null).toBe(
+      enabled ? "XS" : null,
     );
   });
 

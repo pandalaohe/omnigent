@@ -5,8 +5,9 @@ import { AgentNameTag } from "@/components/AgentNameTag";
 import { ClaudeFastModeHelp } from "@/components/SessionDefaultModeSelect";
 import { ArrowRightIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
-import { LayeredOwn, LayeredTable } from "@/components/LayeredTable";
+import { LayeredOwn, LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
@@ -41,6 +42,7 @@ import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel
 import {
   agentPresentOnHost,
   agentProductHarness,
+  agentSettingsHost,
   agentSettingsPath,
   groupAgentHarnesses,
 } from "@/lib/agentSettings";
@@ -112,7 +114,8 @@ export interface AgentDefaultsTableProps {
   field?: AgentField;
   harnesses?: readonly string[];
   names?: Readonly<Record<string, string>>;
-  agentIds?: Readonly<Record<string, string>>;
+  detailRows?: LayeredTableProps["detailRows"];
+  agentIds?: Readonly<Record<string, string | undefined>>;
   linkToDetails?: boolean;
   visibleHostId?: string;
   onChange: (table: CallingDefaultsTable) => void;
@@ -343,6 +346,7 @@ export function AgentDefaultsTable({
   field: fixedField,
   harnesses: suppliedHarnesses,
   names,
+  detailRows,
   agentIds,
   linkToDetails = false,
   visibleHostId,
@@ -665,19 +669,18 @@ export function AgentDefaultsTable({
           id: row,
           label: label(row),
           content: (
-            <span className={dependent(row) ? "pl-4" : undefined}>
+            <span className={cn("block whitespace-normal", dependent(row) && "pl-4")}>
               <AgentNameTag
                 agentId={agentIds?.[row] ?? null}
                 name={label(row)}
                 harness={row}
-                markOnly={dependent(row)}
+                className="max-w-full"
               />
-              {dependent(row) && <span className="sr-only">{label(row)}</span>}
             </span>
           ),
           action: linkToDetails ? (
             <Link
-              to={agentSettingsPath(row, visibleHostId)}
+              to={agentSettingsPath(row, agentSettingsHost(row, hostList, visibleHostId))}
               aria-label={`${label(row)} details`}
               className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               componentId="settings.agents.detail"
@@ -694,6 +697,7 @@ export function AgentDefaultsTable({
             layerOptions().normalize(row, field, master["*"][row][field]) !==
               inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
         }))}
+        detailRows={detailRows}
         columns={hostList
           .filter((host) => !visibleHostId || host.host_id === visibleHostId)
           .map((host) => ({
