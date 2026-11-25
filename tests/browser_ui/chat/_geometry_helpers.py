@@ -8,15 +8,15 @@ from contextlib import contextmanager
 from itertools import pairwise
 
 import pytest
-from playwright.sync_api import CDPSession, FloatRect, Locator, Page, expect
+from playwright.sync_api import CDPSession, FloatRect, Locator, Page, ViewportSize, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 TOLERANCE = 1.0
-PHONE = {"width": 390, "height": 664}
-TABLET = {"width": 768, "height": 1024}
-DESKTOP = {"width": 1280, "height": 852}
-WIDE = {"width": 1800, "height": 900}
+PHONE: ViewportSize = {"width": 390, "height": 664}
+TABLET: ViewportSize = {"width": 768, "height": 1024}
+DESKTOP: ViewportSize = {"width": 1280, "height": 852}
+WIDE: ViewportSize = {"width": 1800, "height": 900}
 
 
 def box(locator: Locator) -> FloatRect:
@@ -42,13 +42,18 @@ def assert_same_vertical_center(left: FloatRect, right: FloatRect) -> None:
 
 
 def assert_no_overlap(left: FloatRect, right: FloatRect) -> None:
+    overlap_x, overlap_y = intersection_size(left, right)
+    assert not (overlap_x > TOLERANCE and overlap_y > TOLERANCE), (overlap_x, overlap_y)
+
+
+def intersection_size(left: FloatRect, right: FloatRect) -> tuple[float, float]:
     overlap_x = min(left["x"] + left["width"], right["x"] + right["width"]) - max(
         left["x"], right["x"]
     )
     overlap_y = min(left["y"] + left["height"], right["y"] + right["height"]) - max(
         left["y"], right["y"]
     )
-    assert not (overlap_x > TOLERANCE and overlap_y > TOLERANCE), (overlap_x, overlap_y)
+    return overlap_x, overlap_y
 
 
 def assert_within_viewport(value: FloatRect, width: int) -> None:
@@ -78,7 +83,7 @@ def assert_primitive_inset(measured: float, border_px: float = 0) -> None:
 def open_live(
     page: Page,
     chat: ChatSessionContract,
-    viewport: dict[str, int] = DESKTOP,
+    viewport: ViewportSize = DESKTOP,
 ) -> None:
     page.set_viewport_size(viewport)
     page.goto(chat.url)
@@ -90,7 +95,7 @@ def open_live(
 def open_landing(
     page: Page,
     chat: ChatSessionContract,
-    viewport: dict[str, int] = DESKTOP,
+    viewport: ViewportSize = DESKTOP,
 ) -> None:
     chat.contract.json(
         f"/v1/hosts/{chat.host_id}/filesystem",

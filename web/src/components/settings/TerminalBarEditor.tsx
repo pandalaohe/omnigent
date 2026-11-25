@@ -630,7 +630,10 @@ function SurfaceEditor({
                 <p className="mb-1 text-sm text-muted-foreground">
                   page {pageIndex + 1} · {ROW_CELLS - gaps} cells
                 </p>
-                <div data-key-grid className="relative grid grid-cols-12 gap-[2px]">
+                <div
+                  data-key-grid
+                  className={`relative grid grid-cols-12 gap-[2px]${pageIndex === 0 ? " pt-5" : ""}`}
+                >
                   {pageIndex === 0
                     ? pack.pinned.map((key, index) => (
                         <SortableKeyTile
@@ -658,9 +661,9 @@ function SurfaceEditor({
                       onPointerCancel={finishPinDrag}
                       onLostPointerCapture={finishPinDrag}
                       style={{
-                        left: `${(pack.pinned.reduce((sum, key) => sum + key.width, 0) / ROW_CELLS) * 100}%`,
+                        left: `clamp(0.625rem, ${(pack.pinned.reduce((sum, key) => sum + key.width, 0) / ROW_CELLS) * 100}%, calc(100% - 0.625rem))`,
                       }}
-                      className="absolute -top-3 z-10 flex h-3 w-5 -translate-x-1/2 items-center justify-center rounded border border-border bg-card text-muted-foreground touch-none"
+                      className="absolute top-0 z-10 flex h-4 w-5 -translate-x-1/2 items-center justify-center rounded border border-border bg-card text-muted-foreground touch-none"
                     >
                       <MenuIcon className="size-4" aria-hidden />
                     </button>
