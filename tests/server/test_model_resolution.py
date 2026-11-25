@@ -458,8 +458,17 @@ async def test_record_launched_model_patches_label_and_arg_value_extracts_model(
         timeout=10.0,
     )
 
+    # Unchanged or empty-to-empty launches skip the HTTP PATCH altogether.
     client.patch.reset_mock()
     await _record_launched_model("conv_1", client, None)
+    await _record_launched_model("conv_1", client, "fallback-b", current_launched="fallback-b")
+    client.patch.assert_not_awaited()
+
+    # Read-only snapshot clients without .patch are a safe no-op.
+    await _record_launched_model("conv_1", object(), "fallback-b")  # type: ignore[arg-type]
+
+    # Launching without a model clears a stale prior launched_model label.
+    await _record_launched_model("conv_1", client, None, current_launched="fallback-b")
     client.patch.assert_awaited_once_with(
         "/v1/sessions/conv_1",
         json={"labels": {LAUNCHED_MODEL_LABEL: ""}},

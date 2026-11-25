@@ -1493,6 +1493,7 @@ class _CodexNativeLaunchConfig:
     parent_session_id: str | None = None
     bridge_id: str | None = None
     terminal_generation: NativeTerminalGeneration | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1542,6 +1543,7 @@ class _PiNativeLaunchConfig:
     model_override: str | None = None
     reasoning_effort: str | None = None
     native_usage_baseline: dict[str, int | float] | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2149,6 +2151,13 @@ async def _pi_native_launch_config(
             and cost >= 0
         ):
             native_usage_baseline["cumulative_cost_usd"] = cost
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
     return _PiNativeLaunchConfig(
         parent_session_id=snapshot.get("parent_session_id")
         if isinstance(snapshot.get("parent_session_id"), str)
@@ -2165,6 +2174,7 @@ async def _pi_native_launch_config(
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
         native_usage_baseline=native_usage_baseline,
+        launched_model=launched_model,
     )
 
 
@@ -2333,6 +2343,13 @@ async def _codex_native_launch_config(
         harness_override=_harness_override if isinstance(_harness_override, str) else None,
         labels=labels if isinstance(labels, dict) else None,
     )
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
     runner_id = snapshot.get("runner_id")
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
@@ -2356,6 +2373,7 @@ async def _codex_native_launch_config(
             labels if isinstance(labels, dict) else {},
             runner_id if isinstance(runner_id, str) else None,
         ),
+        launched_model=launched_model,
     )
 
 
@@ -4092,7 +4110,12 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
-    await _record_launched_model(session_id, server_client, _arg_value(pi_args, "--model"))
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _arg_value(pi_args, "--model"),
+        current_launched=launch_config.launched_model,
+    )
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -7372,7 +7395,12 @@ async def _auto_create_codex_terminal(
             server_client,
             expected_model_override=pick_to_reset,
         )
-    await _record_launched_model(session_id, server_client, _codex_launch.model)
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _codex_launch.model,
+        current_launched=launch_config.launched_model,
+    )
     if model_reset_notice is not None:
         await _post_native_launch_notice(
             session_id=session_id,
@@ -10505,13 +10533,22 @@ async def _record_launched_model(
     session_id: str,
     server_client: httpx.AsyncClient | None,
     model: str | None,
+    *,
+    current_launched: str | None = None,
 ) -> None:
     """Record the concrete model a native terminal actually launched with."""
-    if server_client is None:
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
         return
     from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
 
     value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return
     try:
         resp = await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
@@ -11568,7 +11605,14 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
-    await _record_launched_model(session_id, server_client, launch_model)
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    await _record_launched_model(
+        session_id,
+        server_client,
+        launch_model,
+        current_launched=(launch_metadata.labels or {}).get(LAUNCHED_MODEL_LABEL),
+    )
     if unserved_pick is not None:
         await _post_native_launch_notice(
             session_id=session_id,

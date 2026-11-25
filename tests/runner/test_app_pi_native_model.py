@@ -321,6 +321,8 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
                     "external_session_id": None,
                 },
             )
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{session_id}":
+            return httpx.Response(200, json={})
         registry_requests.append(request)
         return httpx.Response(
             200,
