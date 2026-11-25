@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -94,6 +95,12 @@ _WINDOW_NAME_END_RE: Final = re.compile(rb"[\x18\x1a\x1b]")
 # preceded by CR so the CRLF rewrite is idempotent (a future tmux emitting
 # CRLF is left untouched).
 _CAPTURE_ROW_SEP_RE: Final = re.compile(rb"(?<!\r)\n")
+_CAPTURE_METADATA_FORMAT: Final = (
+    "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on},"
+    "#{mouse_standard_flag},#{mouse_button_flag},#{mouse_all_flag},"
+    "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag},"
+    "#{bracket_paste_flag}"
+)
 
 # tmux's client→server protocol rejects a single command larger than its 16KB
 # imsg cap. ``send-keys -H`` expands each input byte to 3 chars ("xx "), so cap
@@ -427,19 +434,28 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     tmux = shutil.which("tmux")
     if tmux is None:
         return None
-    meta = await _capture_pane_metadata(tmux, socket_path, tmux_target)
-    # Only extend the capture into history when on the primary screen; on the
-    # alternate screen ``-S -`` leaks stale primary history (see docstring).
-    # ``-J`` joins soft-wrapped rows into logical lines (see docstring).
-    capture_args = ["capture-pane", "-e", "-p", "-J", "-t", tmux_target]
-    if meta is not None and not meta.alternate_on:
-        capture_args += ["-S", "-"]
+    capture = shlex.join(["capture-pane", "-e", "-p", "-J", "-t", tmux_target])
+    # Format-only if-shell runs in the same tmux command queue as the metadata
+    # query. Pane output between separate commands would pair new cells with
+    # an old cursor or screen mode. Only the primary screen includes history.
     try:
         proc = await asyncio.create_subprocess_exec(
             tmux,
             "-S",
             socket_path,
-            *capture_args,
+            "display-message",
+            "-p",
+            "-t",
+            tmux_target,
+            _CAPTURE_METADATA_FORMAT,
+            ";",
+            "if-shell",
+            "-F",
+            "-t",
+            tmux_target,
+            "#{==:#{alternate_on},0}",
+            capture + " -S -",
+            capture,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -448,6 +464,8 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
         return None
     if proc.returncode != 0:
         return None
+    metadata, _, stdout = stdout.partition(b"\n")
+    meta = _parse_pane_metadata(metadata)
     # ``capture-pane -p`` emits one LF per row — INCLUDING a trailing LF after
     # the final row. Writing that trailing separator paints the last row and
     # then advances the cursor past it, which on a full-height pane scrolls the
@@ -556,43 +574,10 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
     return prelude, postlude
 
 
-async def _capture_pane_metadata(
-    tmux: str, socket_path: str, tmux_target: str
-) -> _PaneMetadata | None:
-    """Query cursor position, cursor visibility, and alt-screen state.
-
-    One ``display-message`` fetches every field the seed needs. Returns
-    ``None`` on any failure — the caller degrades gracefully (skips the
-    history extension and the cursor restore) rather than aborting the attach.
-
-    :param tmux: Absolute path to the tmux binary.
-    :param socket_path: tmux server socket path.
-    :param tmux_target: The ``-t`` target, e.g. ``"main"``.
-    :returns: The parsed :class:`_PaneMetadata`, or ``None`` if unavailable.
-    """
+def _parse_pane_metadata(metadata: bytes) -> _PaneMetadata | None:
+    """Read the display-message header, if tmux supplied the cursor and screen state."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            tmux,
-            "-S",
-            socket_path,
-            "display-message",
-            "-p",
-            "-t",
-            tmux_target,
-            "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on},"
-            "#{mouse_standard_flag},#{mouse_button_flag},#{mouse_all_flag},"
-            "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag},"
-            "#{bracket_paste_flag}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await proc.communicate()
-    except (OSError, ValueError):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        fields = [f.strip() for f in stdout.decode().strip().split(",")]
+        fields = [field.strip() for field in metadata.decode().split(",")]
         if len(fields) < 4:
             return None
         # A tmux without some mouse/DECCKM formats expands them to "" (the
@@ -621,7 +606,7 @@ async def _capture_pane_metadata(
 def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
     """Build the escape that restores the pane cursor after a seed.
 
-    :param meta: Pane metadata from :func:`_capture_pane_metadata`, or ``None``.
+    :param meta: Pane metadata from :func:`_parse_pane_metadata`, or ``None``.
     :returns: A CUP escape (``\\x1b[{row};{col}H``, 1-based) plus a show/hide
         escape matching the pane's cursor visibility, or ``b""`` when *meta* is
         ``None`` (a missing cursor restore is cosmetic, never fatal).

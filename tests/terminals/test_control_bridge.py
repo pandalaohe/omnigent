@@ -725,16 +725,16 @@ async def test_seed_resets_background_before_restoring_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     background = b"\x1b[48;2;166;227;161m"
-    metadata = Mock(returncode=0, communicate=AsyncMock(return_value=(b"7,8,1,0\n", b"")))
     capture = Mock(
-        returncode=0, communicate=AsyncMock(return_value=(background + b"prompt\n", b""))
+        returncode=0,
+        communicate=AsyncMock(return_value=(b"7,8,1,0\n" + background + b"prompt\n", b"")),
     )
     monkeypatch.setattr(
         "omnigent.terminals.control_bridge.shutil", Mock(which=Mock(return_value="/bin/tmux"))
     )
     monkeypatch.setattr(
         "omnigent.terminals.control_bridge.asyncio",
-        Mock(wraps=asyncio, create_subprocess_exec=AsyncMock(side_effect=[metadata, capture])),
+        Mock(wraps=asyncio, create_subprocess_exec=AsyncMock(return_value=capture)),
     )
 
     seed = await _run_tmux_capture("/tmp/example.sock", "main")
@@ -766,6 +766,48 @@ async def test_seed_restores_cursor_position() -> None:
         assert b"\x1b[9;8H" in seed, f"cursor CUP escape missing from seed: {seed[-24:]!r}"
         # Visible cursor → show-cursor tail.
         assert seed.endswith(b"\x1b[?25h"), f"seed did not end with show-cursor: {seed[-12:]!r}"
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_seed_captures_cells_and_cursor_from_the_same_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock, target = await _new_private_tmux(
+        "stty -echo; printf '\\033[4;10H'; read -r line; "
+        "printf '\\033[6;22Hnew\\033[6;22H'; sleep 30"
+    )
+    spawn = asyncio.create_subprocess_exec
+
+    async def tmux(*args: str) -> bytes:
+        proc = await spawn("tmux", "-S", str(sock), *args, stdout=asyncio.subprocess.PIPE)
+        output, _ = await proc.communicate()
+        assert proc.returncode == 0
+        return output
+
+    async def advance_before_capture(*args, **kwargs):
+        if any("capture-pane" in arg for arg in args):
+            await tmux("send-keys", "-t", target, "Enter")
+            async with asyncio.timeout(5):
+                while (
+                    await tmux("display-message", "-p", "-t", target, "#{cursor_x},#{cursor_y}")
+                    != b"21,5\n"
+                ):
+                    await asyncio.sleep(0.01)
+        return await spawn(*args, **kwargs)
+
+    try:
+        await _capture_when(sock, target, lambda seed: b"\x1b[4;10H" in seed)
+        monkeypatch.setattr(
+            "omnigent.terminals.control_bridge.asyncio",
+            Mock(subprocess=asyncio.subprocess, create_subprocess_exec=advance_before_capture),
+        )
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        assert b"new" in seed
+        assert seed.endswith(b"\x1b[6;22H\x1b[?25h")
     finally:
         await _kill_tmux(sock)
 
