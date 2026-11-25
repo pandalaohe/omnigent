@@ -498,7 +498,7 @@ _DARWIN_TEMP_ROOT = re.compile(r"^(/(?:private/)?var/folders/[^/]+/[^/]+/T)(?:/|
 # Redirections bind a write target; the rest only feed the command.
 _REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<-", "<<<", "<&", "<>")
 _POSIX_OPERATORS = re.compile(
-    r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|<\(|>\(|&&|\|\||\|&|;;|[;&|<>()\n]"
+    r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|<\(|>\(|&&|\|\||\|&|;;&|;&|;;|[;&|<>()\n]"
 )
 _WRITE_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", "<>")
 _UNBOUND_DELETE = "A delete needs a bindable target: an unresolved name could delete a tree"
@@ -1160,7 +1160,12 @@ def _heredoc_runs_shell(text: str, start: int) -> bool:
 
 
 def _shell_scan(
-    text: str, index: int = 0, closer: str = "", *, binding_paths: bool = False
+    text: str,
+    index: int = 0,
+    closer: str = "",
+    *,
+    binding_paths: bool = False,
+    keep_comments: bool = False,
 ) -> tuple[int, str, list[str]]:
     """Return the end, executable shell text and direct substitution bodies.
 
@@ -1219,7 +1224,10 @@ def _shell_scan(
             return index, "".join(kept), bodies
         if not quote and char == "#" and (index == start or text[index - 1] in " \t\n;&|()<>"):
             newline = text.find("\n", index)
-            index = len(text) if newline < 0 else newline
+            comment_end = len(text) if newline < 0 else newline
+            if keep_comments:
+                kept.append(text[index:comment_end])
+            index = comment_end
             continue
         if closer == ")" and not quote:
             if _word_at(text, index, "case", start) and _command_position(text, index, start):
@@ -1959,6 +1967,7 @@ def _write_tokens(
         raise ValueError("Shell token positions unavailable")
     tokens: list[str] = []
     raw_tokens: list[str] = []
+    prev_token_end = -1
     while True:
         # Exclude shlex's lookahead to retain each operator's original quoting.
         start = stream.tell() - len(lookahead)
@@ -1966,16 +1975,43 @@ def _write_tokens(
         if token is None:
             break
         end = stream.tell() - len(lookahead)
-        raw_span = command[start:end]
-        raw = raw_span.strip(" \t\r")
-        if raw == token and raw and all(char in ";|&<>()\n" for char in raw):
-            parts = _POSIX_OPERATORS.findall(raw)
+        pos = start
+        saw_comment_newline = False
+        while pos < end:
+            while pos < end and command[pos] in " \t\r":
+                pos += 1
+            if pos < end and command[pos] == "#":
+                newline = command.find("\n", pos, end)
+                if newline >= 0:
+                    saw_comment_newline = True
+                    pos = newline + 1
+                    continue
+            break
+        if saw_comment_newline:
+            if not (tokens and _redirect_parts(raw_tokens[-1]) is not None):
+                tokens.append("\n")
+                raw_tokens.append("\n")
+            prev_token_end = -1
+        token_start = pos
+        token_end = end
+        while token_end > token_start and command[token_end - 1] in " \t\r":
+            token_end -= 1
+        raw = command[token_start:token_end]
+        adjacent = prev_token_end == token_start
+        if (
+            token
+            and all(char in ";|&<>()\n" for char in token)
+            and raw.startswith(token)
+            and (len(raw) == len(token) or raw[len(token)] == "#")
+        ):
+            parts = _POSIX_OPERATORS.findall(token)
             for part_index, part in enumerate(parts):
                 if (
                     part_index == 0
+                    and adjacent
                     and tokens
                     and part in _REDIRECTIONS
-                    and raw_span.startswith(raw)
+                    and raw_tokens[-1].isascii()
                     and raw_tokens[-1].isdigit()
                 ):
                     tokens[-1] = raw_tokens[-1] + part
@@ -1983,20 +2019,23 @@ def _write_tokens(
                     continue
                 tokens.append(part)
                 raw_tokens.append(part)
+            prev_token_end = token_start + len(token)
             continue
         if (
-            tokens
+            adjacent
+            and tokens
             and raw == "-"
-            and raw_span.startswith("-")
             and tokens[-1].endswith("<<")
             and raw_tokens[-1] == tokens[-1]
-            and (len(tokens[-1]) == 2 or tokens[-1][:-2].isdigit())
+            and (len(tokens[-1]) == 2 or (tokens[-1][:-2].isascii() and tokens[-1][:-2].isdigit()))
         ):
             tokens[-1] += "-"
             raw_tokens[-1] += "-"
+            prev_token_end = token_end
             continue
         tokens.append(token)
         raw_tokens.append(raw)
+        prev_token_end = token_end
     return tokens, raw_tokens
 
 
@@ -2162,6 +2201,13 @@ def _redirect_parts(raw: str) -> tuple[str | None, str] | None:
     return None
 
 
+def _is_stdin_fd(fd: str | None) -> bool:
+    if fd is None:
+        return True
+    # POSIX/Bash treat any all-zero ASCII decimal descriptor (0, 00, ...) as fd 0.
+    return bool(fd) and fd.isascii() and fd.isdigit() and all(char == "0" for char in fd)
+
+
 def _shell_segments(
     tokens: list[str],
     raw_tokens: list[str],
@@ -2184,8 +2230,9 @@ def _shell_segments(
         raw = raw_tokens[index]
         if raw.startswith("#") and "\n" in raw:
             segments.append((segment, raws, redirects, operator, stdin_connected))
+            if segment or redirects:
+                stdin_connected = group_inputs[-1][0]
             segment, raws, redirects, operator = [], [], [], "\n"
-            stdin_connected = group_inputs[-1][0]
             raw = raw.rsplit("\n", 1)[-1]
         if (
             raw.startswith(tokens[index])
@@ -2203,7 +2250,7 @@ def _shell_segments(
                     group_inputs.append((stdin_connected, len(segments), _COMPOUND_CLOSERS[raw]))
                 elif raw in (")", "}") and len(group_inputs) > 1 and group_inputs[-1][2] == raw:
                     _, closed_group, _ = group_inputs.pop()
-                if raw != "\n" or segment:
+                if raw != "\n" or segment or redirects:
                     stdin_connected = group_inputs[-1][0] or raw in ("|", "|&")
             segment, raws, redirects = [], [], []
             operator = raw
@@ -2213,7 +2260,7 @@ def _shell_segments(
                 raise ValueError("Missing shell redirection target")
             index += 1
             destination = tokens[index]
-            if posix_stdin and op in _STDIN_REDIRECTIONS and fd in (None, "0"):
+            if posix_stdin and op in _STDIN_REDIRECTIONS and _is_stdin_fd(fd):
                 stdin_connected = True
                 if closed_group is not None:
                     for group_index in range(closed_group, len(segments)):
@@ -2223,36 +2270,62 @@ def _shell_segments(
                     # Parse process-substitution bodies separately so they do not mask
                     # the outer command as a script-file operand.
                     depth = 1
-                    cases = 0
+                    case_states: list[tuple[int, str]] = []
                     inner_start = index + 1
                     while index + 1 < len(tokens) and depth > 0:
                         index += 1
-                        if raw_tokens[index] == "case" and (
-                            index == inner_start
-                            or raw_tokens[index - 1]
-                            in (
-                                ";",
-                                "&&",
-                                "||",
-                                "|",
-                                "|&",
-                                "(",
-                                "<(",
-                                ">(",
-                                "{",
-                                "\n",
-                                "then",
-                                "do",
-                                "else",
-                                "elif",
+                        current = raw_tokens[index]
+                        if (
+                            current == "case"
+                            and (not case_states or case_states[-1] != (depth, "pattern"))
+                            and (
+                                index == inner_start
+                                or raw_tokens[index - 1]
+                                in (
+                                    ";",
+                                    ";;",
+                                    ";&",
+                                    ";;&",
+                                    "&&",
+                                    "||",
+                                    "|",
+                                    "|&",
+                                    "(",
+                                    "<(",
+                                    ">(",
+                                    "{",
+                                    "\n",
+                                    "then",
+                                    "do",
+                                    "else",
+                                    "elif",
+                                    ")",
+                                )
                             )
                         ):
-                            cases += 1
-                        elif cases and raw_tokens[index] == "esac":
-                            cases -= 1
-                        elif raw_tokens[index] in ("(", "<(", ">("):
+                            case_states.append((depth, "header"))
+                            continue
+                        if case_states and case_states[-1][0] == depth:
+                            case_depth, state = case_states[-1]
+                            if state == "header":
+                                if current == "in":
+                                    case_states[-1] = (case_depth, "pattern")
+                                continue
+                            if state == "pattern":
+                                if current == "esac":
+                                    case_states.pop()
+                                elif current == ")":
+                                    case_states[-1] = (case_depth, "body")
+                                continue
+                            if current == "esac":
+                                case_states.pop()
+                                continue
+                            if current in (";;", ";&", ";;&"):
+                                case_states[-1] = (case_depth, "pattern")
+                                continue
+                        if current in ("(", "<(", ">("):
                             depth += 1
-                        elif raw_tokens[index] == ")" and not cases:
+                        elif current == ")":
                             depth -= 1
                     if depth != 0:
                         raise ValueError("Unterminated process substitution")
@@ -2508,12 +2581,17 @@ def _shell_writes(
     windows_posix = windows_posix_executor and _windows_posix(context)
     posix_stdin = (not windows and not powershell) or windows_posix
     command = command.replace("\\\n", "")
+    scan_end, scanned_command, scan_bodies = _shell_scan(command, keep_comments=True)
     tokens, raw_tokens = _write_tokens(
-        command, windows=windows or powershell, windows_posix=windows_posix
+        scanned_command
+        if (not windows and not powershell) and scan_end == len(command)
+        else command,
+        windows=windows or powershell,
+        windows_posix=windows_posix,
     )
     assigned = untrusted | _shell_assignments(command, context)
     nested = _ShellWrites()
-    for body in _shell_scan(command)[2]:
+    for body in scan_bodies:
         try:
             nested = nested.merged(
                 _shell_writes(
