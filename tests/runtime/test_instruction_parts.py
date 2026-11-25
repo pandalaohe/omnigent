@@ -44,6 +44,7 @@ def test_native_parts_follow_received_order_without_stripping_user_text():
         ]
     )
     assert "\n\n".join(part.text for part in parts) == expected
+    assert "collect its result with sys_read_inbox" in expected
     assert (
         native_startup_instructions(
             spec, global_instructions="\n\n".join(part.text for part in session)
