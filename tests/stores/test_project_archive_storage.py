@@ -80,6 +80,26 @@ def test_per_batch_provenance_survives_later_archive(
     assert conversation_store.get_conversation(session.id).archived
 
 
+def test_session_revision_guard_preserves_archive_and_restore_cascade(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(parent_conversation_id=parent.id)
+    archived = conversation_store.update_conversation_with_changes(
+        parent.id, archived=True, expect_archived=False, expect_revision=parent.archive_revision
+    )
+    assert archived is not None and archived.archive_outcome == "applied"
+    assert conversation_store.get_conversation(child.id).archived
+    restored = conversation_store.update_conversation_with_changes(
+        parent.id,
+        archived=False,
+        expect_archived=True,
+        expect_revision=archived.conversation.archive_revision,
+    )
+    assert restored is not None and restored.archive_outcome == "applied"
+    assert not conversation_store.get_conversation(child.id).archived
+
+
 def test_stale_archive_operation_cannot_write_members_or_clear_labels(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

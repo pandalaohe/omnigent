@@ -935,14 +935,21 @@ def _assert_codex_refusal(
 
 
 def _assert_codex_unconfirmed(
-    session: _NativeSession, response: httpx.Response, *, effort: str = "high"
+    session: _NativeSession,
+    response: httpx.Response,
+    *,
+    effort: str = "high",
+    archive: bool = False,
 ) -> None:
     """The selection stays persisted for the next turn; nothing reached Codex yet."""
-    assert response.status_code == 200, response.text
+    assert response.status_code == (503 if archive else 200), response.text
     assert session.runner_replies[0].status_code == 504
     assert session.runner_replies[0].json()["error"] == "codex_native_settings_update_timeout"
     assert not any(event.get("type") == "response.error" for event in session.events)
     saved = session.store.get_conversation(session.session_id)
+    if archive:
+        assert not saved.archived and saved.archive_close_requested_revision is None
+        assert "Try archiving after it applies" in response.text
     assert saved.model_override == _REQUESTED_MODEL
     assert saved.reasoning_effort == effort
     assert session.codex.applied_updates == []
@@ -1172,11 +1179,13 @@ async def test_codex_settings_forward_uses_startup_budget(
 
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 @pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
+@pytest.mark.parametrize("archive", [False, True], ids=["settings-only", "archive"])
 async def test_codex_startup_timeout_keeps_settings_for_the_next_turn(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     combined: bool,
+    archive: bool,
 ) -> None:
     session = native_session
     assert session.codex.ready_gate is not None
@@ -1185,10 +1194,13 @@ async def test_codex_startup_timeout_keeps_settings_for_the_next_turn(
     selection = {"model_override": _REQUESTED_MODEL}
     if combined:
         selection["reasoning_effort"] = "low"
+    request = {**selection, "archived": True} if archive else selection
     response = await asyncio.wait_for(
-        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(2)
+        client.patch(f"/v1/sessions/{session.session_id}", json=request), timeout=budget(2)
     )
-    _assert_codex_unconfirmed(session, response, effort="low" if combined else "high")
+    _assert_codex_unconfirmed(
+        session, response, effort="low" if combined else "high", archive=archive
+    )
     assert session.codex.requests == []
     assert session.codex.launches == 1
 

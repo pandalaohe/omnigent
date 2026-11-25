@@ -37,6 +37,7 @@ from omnigent.runtime import session_stream
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -350,10 +351,13 @@ async def native_session(
             await codex.close()
 
 
-async def _pick_model(client: httpx.AsyncClient, session: _NativeSession) -> httpx.Response:
+async def _pick_model(
+    client: httpx.AsyncClient, session: _NativeSession, **changes: Any
+) -> httpx.Response:
     return await asyncio.wait_for(
         client.patch(
-            f"/v1/sessions/{session.session_id}", json={"model_override": session.requested_model}
+            f"/v1/sessions/{session.session_id}",
+            json={"model_override": session.requested_model, **changes},
         ),
         timeout=5,
     )
@@ -361,7 +365,7 @@ async def _pick_model(client: httpx.AsyncClient, session: _NativeSession) -> htt
 
 @asynccontextmanager
 async def _held_model_reply(
-    client: httpx.AsyncClient, session: _NativeSession
+    client: httpx.AsyncClient, session: _NativeSession, **changes: Any
 ) -> AsyncIterator[tuple[asyncio.Task[httpx.Response], asyncio.Event]]:
     """Hold the runner's model reply while another settings write completes."""
     reply_ready = asyncio.Event()
@@ -373,7 +377,7 @@ async def _held_model_reply(
             await release_reply.wait()
 
     session.runner.event_hooks["response"].append(hold_reply)
-    pending = asyncio.create_task(_pick_model(client, session))
+    pending = asyncio.create_task(_pick_model(client, session, **changes))
     try:
         await asyncio.wait_for(reply_ready.wait(), timeout=5)
         yield pending, release_reply
@@ -425,6 +429,34 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     if archive:
         snapshot = await client.get(f"/v1/sessions/{session.session_id}")
         assert snapshot.json()["archived"] is confirmed
+
+
+async def test_archive_revision_conflict_leaves_project_filing_unchanged(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = True
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    project = SqlAlchemyProjectStore(db_uri).create("b" * 32, "Existing work", None)
+    assert session.store.set_conversation_project(session.session_id, project.id)
+
+    async with _held_model_reply(client, session, archived=True, project_id="") as (
+        pending,
+        release,
+    ):
+        session.store.update_conversation(session.session_id, archived=True)
+        session.store.update_conversation(session.session_id, archived=False)
+        release.set()
+        response = await asyncio.wait_for(pending, timeout=5)
+
+    assert response.status_code == 409, response.text
+    assert "archive state changed" in response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert not saved.archived and saved.project_id == project.id
 
 
 @pytest.mark.parametrize(

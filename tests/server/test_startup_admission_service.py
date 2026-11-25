@@ -8,6 +8,8 @@ from uuid import uuid4
 import pytest
 from starlette.datastructures import Headers
 
+from omnigent.db.db_models import current_workspace_id
+from omnigent.db.session_startup import SqlSessionStartup
 from omnigent.entities.session_startup import StartupReceipt
 from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry
@@ -52,6 +54,38 @@ async def test_queue_eligibility_uses_enforcement_capability_without_inventory(d
     queued = await admission.queue_session(conn, conv.id)
     assert await admission._eligible(queued) is capability
     admission.inventory_ready.assert_not_awaited()
+    await admission.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queue_session_on_new_host_does_not_reuse_old_running_startup(db_uri):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    registry = HostRegistry()
+    old_host, new_host = uuid4().hex, uuid4().hex
+    old_conn, new_conn = (
+        registry.register(
+            host,
+            FakeWebSocket(),
+            HostHelloFrame(version="test", frame_protocol_version=1, name="sample-host"),
+            owner=None,
+        )
+        for host in (old_host, new_host)
+    )
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, old_host, "/opt/work/project")
+    admission = StartupAdmission(
+        startups, conversations, registry, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    old_start = await admission.queue_session(old_conn, conv.id)
+    with startups._session("seed_running_startup") as db:
+        db.get(SqlSessionStartup, (current_workspace_id(), old_start.id)).state = "working"
+    conversations.set_host_id(conv.id, new_host, "/opt/work/new-project")
+
+    new_start = await admission.queue_session(new_conn, conv.id)
+    assert new_start.id != old_start.id and new_start.state == "queued"
+    assert new_start.host_id == new_host
+    assert new_start.runtime_generation == old_start.runtime_generation + 1
+    assert (await admission.queue_session(new_conn, conv.id)).id == new_start.id
     await admission.shutdown()
 
 

@@ -27,6 +27,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from weakref import WeakValueDictionary
 
 from omnigent.pi_timeouts import (
     BOOTSTRAP_RESPONSE_TIMEOUT_S,
@@ -2567,6 +2568,7 @@ def create_runner_app(
     # not covered by the shared hold above. Always taken last, so it orders
     # against nothing else.
     _session_init_locks: dict[str, asyncio.Lock] = {}
+    _usage_admission_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     app.state.cli_runtime_lifecycle = _cli_runtime_lifecycle
 
@@ -11283,9 +11285,11 @@ def create_runner_app(
             }:
                 from omnigent.usage_export.runtime import begin_admitted_turn
 
-                await asyncio.to_thread(
-                    begin_admitted_turn, conv_id, harness_name, usage_admission
-                )
+                async with _usage_admission_locks.setdefault(conv_id, asyncio.Lock()):
+                    if _owns_live_turn():
+                        await asyncio.to_thread(
+                            begin_admitted_turn, conv_id, harness_name, usage_admission
+                        )
             if startup_admission.required(conv_id):
                 event_body["startup_required"] = True
             else:

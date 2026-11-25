@@ -61,6 +61,7 @@ STARTUP_WITHDRAWN = "withdrawn"
 # tells that message the startup is settled, while a later move's claim, held
 # before that move marks its own startup pending, isn't taken for it.
 STARTUP_SETTLED_BY_LABEL = "omnigent.startup.settled_by"
+STARTUP_WITHDRAWN_MOVE_PREFIX = "omnigent.startup.withdrawn_move."
 _WITHDRAWN_INPUT_NOTE = (
     "The message wasn't sent: the sandbox launch it was waiting for was withdrawn. Send it again."
 )
@@ -97,6 +98,12 @@ def _managed_move_attempt(runner_id: str | None) -> str | None:
     if runner_id is None or not is_move_claim(runner_id):
         return None
     return hashlib.sha256(runner_id.encode()).hexdigest()
+
+
+def withdrawn_move_input(conv: Conversation, item: ConversationItem) -> bool:
+    options = getattr(item.data, "startup_options", None)
+    attempt = options.managed_move_attempt if options is not None else None
+    return attempt is not None and STARTUP_WITHDRAWN_MOVE_PREFIX + attempt in conv.labels
 
 
 def input_content(item: ConversationItem) -> list[dict[str, Any]]:
@@ -481,7 +488,13 @@ class ManagedStartupInputs:
             )
         else:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-            settled = _settled_startup(conv) if conv is not None else None
+            settled = None
+            if conv is not None:
+                settled = (
+                    STARTUP_WITHDRAWN
+                    if withdrawn_move_input(conv, saved[0])
+                    else _settled_startup(conv)
+                )
             if settled is not None:
                 # Settled after this was admitted, possibly after the settlement
                 # failed what it saw: settle this input the same way.
@@ -595,10 +608,12 @@ class ManagedStartupInputs:
             recorded under the losing move's claim.
         """
         attempt = _managed_move_attempt(move_claim)
+        labels = {STARTUP_WITHDRAWN_MOVE_PREFIX + attempt: "true"} if attempt is not None else {}
         if not superseded:
-            labels = {STARTUP_LABEL: STARTUP_WITHDRAWN}
+            labels[STARTUP_LABEL] = STARTUP_WITHDRAWN
             if move_claim is not None:
                 labels[STARTUP_SETTLED_BY_LABEL] = move_claim
+        if labels:
             with contextlib.suppress(ConversationNotFoundError):
                 await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
         undelivered = False
@@ -1022,6 +1037,15 @@ class ManagedStartupInputs:
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
                 or current.status != "in_progress"
             ):
+                return "not_dispatched"
+            if withdrawn_move_input(conv, current):
+                await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    current.id,
+                    expected="in_progress",
+                    status="failed",
+                )
                 return "not_dispatched"
             if not await _startup_allows_delivery(app, self.conversations, session_id, item.id):
                 return "not_dispatched"

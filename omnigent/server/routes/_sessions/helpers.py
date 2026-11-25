@@ -13512,7 +13512,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     )
     from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+    from omnigent.server.startup_inputs import STARTUP_WITHDRAWN_MOVE_PREFIX
     from omnigent.stores.conversation_store import _may_collate_to
+
+    if any(_may_collate_to(key, STARTUP_WITHDRAWN_MOVE_PREFIX, prefix=True) for key in labels):
+        raise OmnigentError(
+            "Sandbox startup withdrawal markers are server-internal", code=ErrorCode.INVALID_INPUT
+        )
 
     if any(_may_collate_to(key, LAUNCHED_MODEL_LABEL, prefix=False) for key in labels):
         raise OmnigentError(

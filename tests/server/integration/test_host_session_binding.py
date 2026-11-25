@@ -2338,6 +2338,32 @@ async def test_message_admitted_while_a_launch_is_withdrawn_is_settled(
     assert conv is not None and conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
 
 
+async def test_input_saved_after_a_superseded_move_does_not_follow_the_winner(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    from starlette.datastructures import Headers
+
+    from omnigent.server.managed_hosts import new_move_claim
+    from omnigent.server.schemas import SessionEventInput
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="late-move-input")
+    startup = env.app.state.startup_inputs
+    retired = new_move_claim()
+    env.conv_store.set_labels(session_id, {STARTUP_LABEL: "ready"})
+    await startup.release_held_inputs(
+        session_id, "The sandbox did not start.", move_claim=retired, superseded=True
+    )
+    event = SessionEventInput(
+        type="message", data={"role": "user", "content": [{"type": "input_text", "text": "old"}]}
+    )
+    saved = await startup.enqueue(
+        session_id, event, user_id=None, headers=Headers(), first=False, held_runner_id=retired
+    )
+    assert env.conv_store.get_item(session_id, saved.id).status == "failed"
+    assert env.conv_store.get_conversation(session_id).labels.get(STARTUP_LABEL) == "ready"
+
+
 async def test_shutdown_after_the_sandbox_runner_starts_keeps_held_messages(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,

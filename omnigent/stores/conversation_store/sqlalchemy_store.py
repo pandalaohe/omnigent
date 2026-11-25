@@ -7684,6 +7684,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 or project_archive_batch is not None
                 or archive_project_id is not None
             )
+            cascade_archive = project_archive_batch is None and archive_project_id is None
             if conditional_archive:
                 if archived is None:
                     raise ValueError("conditional archive requires archived state")
@@ -7757,7 +7758,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 cascade_members = archive_cascade_members(
                     _to_conversation(row, None, _fetch_labels(ap_sess, row.id))
                 )
-                if archived and not row.archived and not conditional_archive:
+                if archived and not row.archived and cascade_archive:
                     frontier = [row.id]
                     seen = {row.id}
                     while frontier:
@@ -7778,7 +7779,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 archive_targets.append(child)
                                 cascade_members[child.id] = child.archive_revision + 1
                     defer_tree_close = defer_tree_close or len(seen) > 1
-                elif not conditional_archive:
+                elif cascade_archive:
                     for child_id, child_revision in cascade_members.items():
                         self._lock_conversation(ap_sess, child_id)
                         child = ap_sess.get(SqlConversation, (current_workspace_id(), child_id))

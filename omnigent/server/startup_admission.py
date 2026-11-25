@@ -12,6 +12,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.server_config import StartupAdmissionPolicy
 from omnigent.server.session_startup import StartupCoordinator
+from omnigent.server.startup_inputs import withdrawn_move_input
 from omnigent.server.startup_registration import (
     STARTUP_CREATE_PREPARATION_LABEL_KEY,
     STARTUP_CREATE_PREPARATION_PENDING,
@@ -203,7 +204,24 @@ class StartupAdmission:
         )
         current = await asyncio.to_thread(self.startups.for_session, session_id)
         pending = await self._generic_pending(session_id)
-        head = next((item for item in pending if item.status != "failed"), None)
+        head = next(
+            (
+                item
+                for item in pending
+                if item.status != "failed" and not withdrawn_move_input(conv, item)
+            ),
+            None,
+        )
+        if current is not None and current.host_id != conn.host_id:
+            if head is not None and head.status != "in_progress":
+                raise StartupQueued(None)
+            return await self.coordinator.enqueue(
+                session_id,
+                input_id=head.id if head is not None else None,
+                owner_user_id=conn.owner or "__local__",
+                operation_key=f"host-transfer:{current.id}:{conn.host_id}",
+                runtime_generation=current.runtime_generation + 1,
+            )
         if current is not None:
             if (
                 current.state == "queued"

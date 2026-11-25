@@ -7825,6 +7825,7 @@ def register_core_routes(
         )
         combined_model_forward = False
         _model_forward = None
+        effort_forward = None
         if (
             live_forward
             and (effort is not None or clear_effort)
@@ -8297,17 +8298,16 @@ def register_core_routes(
                 )
             labels_to_set[SPEED_TIER_LABEL_KEY] = requested_speed
             labels_to_set[SPEED_TIER_REQUESTED_LABEL_KEY] = requested_speed
-        if family_pin_value is not None:
-            await asyncio.to_thread(
-                conversation_store.set_family_pin, session_id, family_pin_value, user_id=user_id
-            )
-        if set_project:
-            filed = await asyncio.to_thread(
-                conversation_store.set_conversation_project, session_id, body.project_id or None
-            )
-            if not filed:
-                raise _session_not_found()
         if defer_archive:
+            if any(
+                result is not None and _codex_update_unconfirmed(result)
+                for result in (_model_forward, effort_forward)
+            ):
+                raise OmnigentError(
+                    "The terminal has not confirmed the settings yet. The selection is saved "
+                    "for the next turn. Try archiving after it applies.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             archive_result = await apply_session_archive_transition(
                 request,
                 updated,
@@ -8323,6 +8323,16 @@ def register_core_routes(
                     "The archive state changed while applying settings. Reload and try again.",
                     code=ErrorCode.CONFLICT,
                 )
+        if family_pin_value is not None:
+            await asyncio.to_thread(
+                conversation_store.set_family_pin, session_id, family_pin_value, user_id=user_id
+            )
+        if set_project:
+            filed = await asyncio.to_thread(
+                conversation_store.set_conversation_project, session_id, body.project_id or None
+            )
+            if not filed:
+                raise _session_not_found()
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
