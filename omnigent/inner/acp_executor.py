@@ -314,6 +314,12 @@ class _AcpRequestError(Exception):
         self.message = message
 
 
+@dataclass
+class _AcpPermissionTrace:
+    tier_verdict: str = "unreported"
+    once_offer: str = "unchecked"
+
+
 def _looks_like_missing_file(message: str) -> bool:
     """Heuristic: does an os_env error message indicate a missing path?
 
@@ -1350,6 +1356,10 @@ class AcpExecutor(Executor):
         """
         return self._config.permission_mode == "bypassPermissions"
 
+    @property
+    def _managed_agy(self) -> bool:
+        return self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
+
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
@@ -1515,21 +1525,51 @@ class AcpExecutor(Executor):
         if not self._config.host_permission_tier:
             return await self._evaluate_permission(params)
         bound_call = self._bound_permission_call(params)
-        if bound_call is None:
-            return False, None
-        call_id = bound_call["call_id"]
-        pending = self._permission_calls[call_id]
-        result = await self._evaluate_permission(params, bound_call)
-        if (
-            self._active_prompt_request_id is None
-            or self._permission_calls.get(call_id) is not pending
-        ):
-            return False, None
-        self._permission_calls.pop(call_id)
+        trace = _AcpPermissionTrace() if self._managed_agy else None
+        binding = "unbound"
+        result: tuple[bool | None, str | None] = False, None
+        if bound_call is not None:
+            call_id = bound_call["call_id"]
+            pending = self._permission_calls[call_id]
+            decision = await self._evaluate_permission(params, bound_call, trace)
+            if (
+                self._active_prompt_request_id is None
+                or self._permission_calls.get(call_id) is not pending
+            ):
+                binding = "changed"
+            else:
+                binding = "current"
+                self._permission_calls.pop(call_id)
+                result = decision
+        if trace is not None:
+            tool_name = bound_call["name"] if bound_call is not None else "unbound"
+            intent_kind = {
+                "unbound": "unbound",
+                "run_command": "execute",
+                "view_file": "read",
+                "write_to_file": "edit",
+            }.get(tool_name, "unknown")
+            allowed, option_id = result
+            option_kind = "none"
+            if option_id is not None:
+                option_kind = "allow_once" if allowed else "reject_once"
+            logger.info(
+                "acp agy permission decision: tool=%s intent=%s binding=%s tier=%s "
+                "once_offer=%s option=%s",
+                tool_name,
+                intent_kind,
+                binding,
+                trace.tier_verdict,
+                trace.once_offer,
+                option_kind,
+            )
         return result
 
     async def _evaluate_permission(
-        self, params: _AcpJsonObject, bound_call: _AcpJsonObject | None = None
+        self,
+        params: _AcpJsonObject,
+        bound_call: _AcpJsonObject | None = None,
+        trace: _AcpPermissionTrace | None = None,
     ) -> tuple[bool | None, str | None]:
         """Decide a permission request — policy then elicitation.
 
@@ -1558,7 +1598,7 @@ class AcpExecutor(Executor):
             tool_name, tool_input = self._extract_tool_call(params)
         policy_eval = getattr(self, "_policy_evaluator", None)
         action: str | None = None
-        verdict_data: object = None
+        tier: str | None = None
         # Either bridge can carry the question to the user.
         can_ask = (
             self._elicitation_handler is not None or self._elicitation_choice_handler is not None
@@ -1572,9 +1612,13 @@ class AcpExecutor(Executor):
                 verdict = await policy_eval("PHASE_TOOL_CALL", data)
                 action = getattr(verdict, "action", None)
                 verdict_data = getattr(verdict, "data", None)
+                if bound_call is not None and isinstance(verdict_data, dict):
+                    tier = verdict_data.get("_omnigent_acp_tier")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("acp TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
                 action = None
+            if trace is not None and tier in ("allow", "ask", "deny"):
+                trace.tier_verdict = tier
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
                 return False, None
@@ -1589,16 +1633,17 @@ class AcpExecutor(Executor):
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if bound_call is not None:
-            tier = (
-                verdict_data.get("_omnigent_acp_tier") if isinstance(verdict_data, dict) else None
-            )
             if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") or tier not in (
                 "allow",
                 "ask",
             ):
                 return False, None
-            if tier == "allow" and (option_id := self._allow_once_id(params)):
-                return True, option_id
+            if tier == "allow":
+                option_id = self._allow_once_id(params)
+                if trace is not None:
+                    trace.once_offer = "valid" if option_id is not None else "missing"
+                if option_id is not None:
+                    return True, option_id
             return (
                 await self._ask_user(tool_name, tool_input, params) if can_ask else (False, None)
             )
@@ -2586,9 +2631,7 @@ class AcpExecutor(Executor):
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         await self._drain_stale_queue()
-        managed_agy = (
-            self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
-        )
+        managed_agy = self._managed_agy
         if managed_agy:
             # In agy Auto, tools can run without a client permission request.
             # Keep the CLI in its request-producing mode for a host-tier session.

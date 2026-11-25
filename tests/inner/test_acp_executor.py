@@ -1322,6 +1322,93 @@ async def test_managed_policy_denial_does_not_select_a_user_reject_option() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["unbound", "no-once", "once", "opencode"])
+async def test_managed_agy_permission_logs_windows_auto_decision(
+    scenario: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.permission_tiers import Verdict, adapt_tool_call, decide_tier, load_rules
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import windows_host
+
+    command = "omni --version"
+    agent = "opencode" if scenario == "opencode" else "agy.exe"
+    ex = AcpExecutor(AcpAgentConfig(command=f"{agent} acp --stdio", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock()
+    ex._send = AsyncMock()
+
+    async def evaluate(_phase, data):
+        intent = adapt_tool_call(data["name"], data["arguments"], windows_host())
+        decision = decide_tier("auto", intent, load_rules())
+        assert decision.action == Verdict.ALLOW
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED", data={"_omnigent_acp_tier": "allow"}
+        )
+
+    ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+    if scenario != "unbound":
+        ex._note_permission_update(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "shell-1",
+                "kind": "execute",
+                "title": "Agent display text",
+                "rawInput": {"CommandLine": command},
+            },
+        )
+    options = [{"kind": "allow_always", "optionId": "persistent"}]
+    if scenario != "no-once":
+        options.append({"kind": "allow_once", "optionId": "once"})
+    with caplog.at_level(logging.INFO, logger=acp_executor_module.__name__):
+        await ex._respond_to_agent_request(
+            {
+                "id": 2,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "shell-1"},
+                    "options": options,
+                },
+            }
+        )
+
+    sent = ex._send.await_args
+    assert sent is not None
+    reply = sent.args[0]
+    if scenario in ("unbound", "no-once"):
+        assert reply["error"]["code"] == -32000
+    else:
+        assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
+    assert ex._policy_evaluator.await_count == (0 if scenario == "unbound" else 1)
+    ex._elicitation_handler.assert_not_awaited()
+    logs = [
+        message
+        for message in caplog.messages
+        if message.startswith("acp agy permission decision:")
+    ]
+    if scenario == "opencode":
+        assert logs == []
+    else:
+        fields = {
+            "unbound": (
+                "tool=unbound intent=unbound binding=unbound tier=unreported "
+                "once_offer=unchecked option=none"
+            ),
+            "no-once": (
+                "tool=run_command intent=execute binding=current tier=allow "
+                "once_offer=missing option=none"
+            ),
+            "once": (
+                "tool=run_command intent=execute binding=current tier=allow "
+                "once_offer=valid option=allow_once"
+            ),
+        }
+        assert logs == [f"acp agy permission decision: {fields[scenario]}"]
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_ask_defers_to_elicitation() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 
