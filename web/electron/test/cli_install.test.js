@@ -25,10 +25,22 @@ function spawnStub(codes, calls) {
 }
 
 describe("installCli", () => {
-  it("refuses on non-darwin", async () => {
+  it("refuses on non-darwin and honors a distribution installDocsUrl when supplied", async () => {
     const res = await installCli({ platform: "linux" });
     assert.equal(res.ok, false);
     assert.match(res.error, /macOS-only/);
+    assert.match(res.error, /https:\/\/omnigent\.ai\//);
+
+    const distRes = await installCli({
+      platform: "win32",
+      installDocsUrl: "https://github.com/example-org/omnigent-dist/blob/main/docs/install.md",
+    });
+    assert.equal(distRes.ok, false);
+    assert.match(
+      distRes.error,
+      /https:\/\/github\.com\/example-org\/omnigent-dist\/blob\/main\/docs\/install\.md/,
+    );
+    assert.doesNotMatch(distRes.error, /omnigent\.ai/);
   });
 
   it("errors when the bundled script is missing", async () => {

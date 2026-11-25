@@ -39,11 +39,13 @@ import contextlib
 import importlib.metadata
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import xml.etree.ElementTree as ET
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +100,15 @@ _UPGRADE_INDEX_TIMEOUT_SECONDS = 10.0
 # ``direct_url.json`` in place of a URL's userinfo. See
 # ``_unredact_ssh_userinfo`` for why we have to repair it.
 _REDACTED_USERINFO = "****"
+# Strict format for stamped distribution releases (e.g. ``0.21.0-wukong.12``).
+# SemVer prerelease identifiers are not valid PEP 440, so distribution checks
+# parse and compare them with this pattern rather than ``packaging.version``.
+_DISTRIBUTION_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_MAX_VERSION_FIELD_DIGITS = 64
+_DISTRIBUTION_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)-wukong\.(\d+)$")
+_ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+_WHEEL_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.whl$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass
@@ -284,6 +295,10 @@ def _run_installed_wheel_check() -> None:
         # would have caught this if .git/ were reachable; there's no
         # PyPI release to compare an editable install against, so bail.
         return
+    dist_cfg = _distribution_release_config()
+    if dist_cfg is not None:
+        _run_distribution_release_check(info, dist_cfg[0], dist_cfg[1])
+        return
     if info.vcs_url:
         # A git/VCS install tracks a moving ref, not a PyPI release. Its
         # version string (e.g. a frozen ``0.1.0`` on an unbumped ``main``)
@@ -318,6 +333,471 @@ def _run_installed_wheel_check() -> None:
     # Refresh the cached "latest version" out of band when it is missing,
     # stale, or was written by the (other-shape) clone path.
     if cache is None or cache.kind != "wheel" or _is_stale(cache):
+        _spawn_background_refresh()
+
+
+def _normalize_distribution_repo(repo: str) -> str | None:
+    """Validate an ``owner/repo`` string, rejecting dot segments and malformed characters."""
+    if not isinstance(repo, str):
+        return None
+    trimmed = repo.strip()
+    parts = trimmed.split("/")
+    if len(parts) != 2:
+        return None
+    owner, name = parts
+    if (
+        not _DISTRIBUTION_REPO_SEGMENT_RE.match(owner)
+        or not _DISTRIBUTION_REPO_SEGMENT_RE.match(name)
+        or owner in (".", "..")
+        or name in (".", "..")
+    ):
+        return None
+    return f"{owner}/{name}"
+
+
+def _distribution_release_config() -> tuple[str, str] | None:
+    """Return ``(release_repo, version)`` for a stamped distribution build, else ``None``."""
+    from omnigent.distribution import DISTRIBUTION_RELEASE_REPO, DISTRIBUTION_VERSION
+
+    if DISTRIBUTION_RELEASE_REPO and DISTRIBUTION_VERSION:
+        normalized_repo = _normalize_distribution_repo(DISTRIBUTION_RELEASE_REPO)
+        if normalized_repo is not None:
+            return normalized_repo, DISTRIBUTION_VERSION
+    return None
+
+
+def _parse_distribution_version(value: str) -> tuple[int, int, int, int] | None:
+    """Parse a ``[v]X.Y.Z-wukong.N`` version into a numeric sort key, or ``None``."""
+    match = _DISTRIBUTION_VERSION_RE.match(value.strip())
+    if match is None:
+        return None
+    groups = (match.group(1), match.group(2), match.group(3), match.group(4))
+    if any(len(part) > _MAX_VERSION_FIELD_DIGITS for part in groups):
+        return None
+    try:
+        return (
+            int(groups[0]),
+            int(groups[1]),
+            int(groups[2]),
+            int(groups[3]),
+        )
+    except ValueError:
+        return None
+
+
+def _is_newer_distribution_version(latest: str, current: str) -> bool:
+    """Strict numeric comparison for stamped distribution versions.
+
+    Non-matching tags return ``False`` rather than falling back to string
+    inequality, so upstream or malformed tags never trigger a false notice.
+    """
+    latest_key = _parse_distribution_version(latest)
+    current_key = _parse_distribution_version(current)
+    if latest_key is None or current_key is None:
+        return False
+    return latest_key > current_key
+
+
+def _validate_distribution_feed_url(raw_url: str, repo: str) -> str | None:
+    """Verify *raw_url* is the exact canonical GitHub ``releases.atom`` URL for *repo*."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    canonical = f"https://github.com/{normalized_repo}/releases.atom"
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "github.com"
+        or parts.query != ""
+        or parts.fragment != ""
+        or parts.path != f"/{normalized_repo}/releases.atom"
+        or raw_url != canonical
+    ):
+        return None
+    return canonical
+
+
+def _parse_expected_release_tag_url(raw_url: str, repo: str) -> str | None:
+    """Validate an Atom alternate link URL against *repo* and return its version string."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "github.com"
+        or parts.query != ""
+        or parts.fragment != ""
+    ):
+        return None
+    expected_owner, expected_name = normalized_repo.split("/")
+    segments = parts.path.split("/")
+    if (
+        len(segments) != 6
+        or segments[0] != ""
+        or segments[1] != expected_owner
+        or segments[2] != expected_name
+        or segments[3] != "releases"
+        or segments[4] != "tag"
+    ):
+        return None
+    raw_tag = segments[5]
+    if _parse_distribution_version(raw_tag) is None:
+        return None
+    canonical = f"https://github.com/{expected_owner}/{expected_name}/releases/tag/{raw_tag}"
+    if raw_url != canonical:
+        return None
+    return raw_tag.removeprefix("v")
+
+
+def _parse_releases_atom_versions(xml_text: str, repo: str) -> list[str]:
+    """Extract valid distribution versions from a GitHub ``releases.atom`` feed bound to *repo*."""
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None:
+        raise ValueError(f"Invalid distribution repository: {repo!r}")
+    root = ET.fromstring(xml_text)
+    if root.tag not in ("feed", f"{{{_ATOM_NAMESPACE}}}feed"):
+        raise ValueError("Atom feed root element must be <feed>")
+    versions: list[str] = []
+    for entry in root:
+        if entry.tag not in ("entry", f"{{{_ATOM_NAMESPACE}}}entry"):
+            continue
+        for child in entry:
+            if child.tag not in ("link", f"{{{_ATOM_NAMESPACE}}}link"):
+                continue
+            rel = child.attrib.get("rel")
+            if rel is not None and rel != "alternate":
+                continue
+            href = child.attrib.get("href", "")
+            version = _parse_expected_release_tag_url(href, normalized_repo)
+            if version is not None:
+                versions.append(version)
+                break
+    return versions
+
+
+def fetch_latest_distribution_release(
+    repo: str,
+    *,
+    timeout: float = _INDEX_TIMEOUT_SECONDS,
+    attempts: int = 1,
+) -> tuple[str, str | None]:
+    """Fetch the newest distribution release from GitHub's ``releases.atom`` feed.
+
+    Uses the public Atom feed rather than ``api.github.com`` so anonymous users
+    avoid the 60 req/hr REST API rate limit and see only completed GitHub
+    Releases.
+
+    :returns: ``("ok", version)`` when a matching release exists,
+        ``("empty", None)`` when the feed is 404 or holds no matching releases
+        (e.g. before the first public release), or ``("error", None)`` on a
+        network / HTTP / redirect / XML parse failure.
+    """
+    import httpx
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None:
+        return "error", None
+    url = f"https://github.com/{normalized_repo}/releases.atom"
+    resp = None
+    for _ in range(max(1, attempts)):
+        try:
+            resp = httpx.get(
+                url,
+                headers={"Accept": "application/atom+xml, application/xml, text/xml"},
+                timeout=timeout,
+                follow_redirects=False,
+            )
+            break
+        except httpx.HTTPError:
+            resp = None
+    if resp is None:
+        return "error", None
+    if 300 <= resp.status_code < 400:
+        return "error", None
+    resp_url = getattr(resp, "url", None)
+    if resp_url is not None:
+        resp_url_str = str(resp_url)
+        if resp_url_str and _validate_distribution_feed_url(resp_url_str, normalized_repo) is None:
+            return "error", None
+    if resp.status_code == 404:
+        return "empty", None
+    if resp.status_code != 200:
+        return "error", None
+    try:
+        versions = _parse_releases_atom_versions(resp.text, normalized_repo)
+    except (ET.ParseError, ValueError):
+        return "error", None
+    if not versions:
+        return "empty", None
+    best = max(versions, key=lambda v: _parse_distribution_version(v) or (0, 0, 0, 0))
+    return "ok", best
+
+
+_ALLOWED_RELEASE_ASSET_CDN_HOSTS = frozenset(
+    {"objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+)
+_REQUIRED_WHEEL_PACKAGES = frozenset({"omnigent", "omnigent-client", "omnigent-ui-sdk"})
+_MAX_RELEASE_ASSET_REDIRECTS = 5
+
+
+class DistributionWheelError(ValueError):
+    """Raised when downloading, validating, or verifying distribution wheels fails."""
+
+
+def _distribution_recovery_command(repo: str, extras: Collection[str] = ()) -> str:
+    """Return the platform-appropriate Wukong wheel installer command for *repo*."""
+    if IS_WINDOWS:
+        sorted_extras = sorted(extras)
+        if sorted_extras:
+            joined = ",".join(sorted_extras)
+            return (
+                "& ([scriptblock]::Create("
+                f"(irm https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.ps1)"
+                f")) -Extra '{joined}'"
+            )
+        return f"irm https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.ps1 | iex"
+    extra_flags = "".join(f" --extra {extra}" for extra in sorted(extras))
+    extra_args = f" -s --{extra_flags}" if extra_flags else ""
+    return (
+        f"curl -fsSL https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.sh "
+        f"| sh{extra_args}"
+    )
+
+
+def _validate_release_asset_url(
+    raw_url: str,
+    repo: str,
+    expected_tag: str,
+    expected_asset: str,
+) -> str | None:
+    """Verify *raw_url* is an allowed HTTPS GitHub release or release-CDN asset URL."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment != ""
+        or not parts.hostname
+        or parts.netloc != parts.hostname
+    ):
+        return None
+    if any(segment in (".", "..") for segment in parts.path.split("/")):
+        return None
+    if parts.hostname == "github.com":
+        canonical = f"https://github.com/{normalized_repo}/releases/download/{expected_tag}/{expected_asset}"
+        if parts.query != "" or raw_url != canonical:
+            return None
+        return canonical
+    if parts.hostname in _ALLOWED_RELEASE_ASSET_CDN_HOSTS:
+        if not parts.path.startswith("/"):
+            return None
+        return raw_url
+    return None
+
+
+def _download_release_asset_bytes(
+    repo: str,
+    tag: str,
+    asset_name: str,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> bytes:
+    """Download one release asset with strict HTTPS GitHub/CDN redirect validation."""
+    from urllib.parse import urljoin
+
+    import httpx
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(tag) is None:
+        raise DistributionWheelError(f"Invalid distribution release target: {repo!r} / {tag!r}.")
+    if "/" in asset_name or "\\" in asset_name or ".." in asset_name or not asset_name:
+        raise DistributionWheelError(f"Invalid release asset name: {asset_name!r}.")
+
+    current_url = f"https://github.com/{normalized_repo}/releases/download/{tag}/{asset_name}"
+    for _ in range(_MAX_RELEASE_ASSET_REDIRECTS + 1):
+        try:
+            resp = httpx.get(current_url, timeout=timeout, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            raise DistributionWheelError(
+                f"Could not download {asset_name} from "
+                f"https://github.com/{normalized_repo}/releases: {exc}"
+            ) from exc
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("location")
+            if not location:
+                raise DistributionWheelError(
+                    f"Redirect without Location header while downloading {asset_name}."
+                )
+            next_url = urljoin(current_url, location)
+            validated = _validate_release_asset_url(next_url, normalized_repo, tag, asset_name)
+            if validated is None:
+                raise DistributionWheelError(
+                    f"Refused redirect to disallowed URL while downloading {asset_name}: "
+                    f"{next_url}"
+                )
+            current_url = validated
+            continue
+        resp_url = getattr(resp, "url", None)
+        if resp_url is not None:
+            resp_url_str = str(resp_url)
+            if (
+                resp_url_str
+                and _validate_release_asset_url(resp_url_str, normalized_repo, tag, asset_name)
+                is None
+            ):
+                raise DistributionWheelError(
+                    f"Refused response from disallowed URL while downloading {asset_name}: "
+                    f"{resp_url_str}"
+                )
+        if resp.status_code != 200:
+            raise DistributionWheelError(
+                f"Could not download {asset_name} from "
+                f"https://github.com/{normalized_repo}/releases (HTTP {resp.status_code})."
+            )
+        return bytes(resp.content)
+    raise DistributionWheelError(f"Too many redirects while downloading {asset_name}.")
+
+
+def _parse_distribution_wheel_manifest(text: str, expected_tag: str) -> dict[str, tuple[str, str]]:
+    """Parse and validate ``wukong-wheels.txt``, rejecting duplicates and bad entries."""
+    manifest_tag: str | None = None
+    wheels: dict[str, tuple[str, str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("# tag "):
+            if manifest_tag is not None:
+                raise DistributionWheelError("Duplicate tag header in wheel manifest.")
+            manifest_tag = line.removeprefix("# tag ").strip()
+            continue
+        if line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            raise DistributionWheelError("Malformed entry in wheel manifest.")
+        pkg, filename, sha256 = parts
+        if pkg not in _REQUIRED_WHEEL_PACKAGES:
+            raise DistributionWheelError(f"Unexpected package in wheel manifest: {pkg!r}.")
+        if pkg in wheels:
+            raise DistributionWheelError(f"Duplicate package entry in wheel manifest: {pkg!r}.")
+        if not _WHEEL_FILENAME_RE.match(filename) or ".." in filename:
+            raise DistributionWheelError(
+                f"Invalid wheel filename in wheel manifest: {filename!r}."
+            )
+        if not _SHA256_HEX_RE.match(sha256):
+            raise DistributionWheelError(
+                f"Invalid SHA-256 checksum in wheel manifest for {pkg!r}."
+            )
+        wheels[pkg] = (filename, sha256)
+    if manifest_tag != expected_tag:
+        raise DistributionWheelError(
+            f"Wheel manifest tag {manifest_tag!r} does not match expected tag {expected_tag!r}."
+        )
+    if set(wheels) != _REQUIRED_WHEEL_PACKAGES:
+        raise DistributionWheelError("Incomplete wheel manifest: missing required packages.")
+    return wheels
+
+
+def fetch_distribution_wheel_manifest(
+    repo: str,
+    version: str,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> dict[str, tuple[str, str]]:
+    """Download and validate ``wukong-wheels.txt`` for *version* in *repo*."""
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(version) is None:
+        raise DistributionWheelError(
+            f"Invalid distribution release target: {repo!r} / {version!r}."
+        )
+    tag = f"v{version.removeprefix('v')}"
+    raw_bytes = _download_release_asset_bytes(
+        normalized_repo, tag, "wukong-wheels.txt", timeout=timeout
+    )
+    try:
+        manifest_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DistributionWheelError("Wheel manifest is not valid UTF-8.") from exc
+    return _parse_distribution_wheel_manifest(manifest_text, tag)
+
+
+def download_verified_distribution_wheels(
+    repo: str,
+    version: str,
+    dest_dir: Path,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> dict[str, Path]:
+    """Download every wheel listed in ``wukong-wheels.txt``, verify SHA-256, and save locally."""
+    import hashlib
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(version) is None:
+        raise DistributionWheelError(
+            f"Invalid distribution release target: {repo!r} / {version!r}."
+        )
+    tag = f"v{version.removeprefix('v')}"
+    manifest = fetch_distribution_wheel_manifest(normalized_repo, version, timeout=timeout)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    local_paths: dict[str, Path] = {}
+    for pkg in ("omnigent", "omnigent-client", "omnigent-ui-sdk"):
+        filename, expected_sha = manifest[pkg]
+        data = _download_release_asset_bytes(normalized_repo, tag, filename, timeout=timeout)
+        actual_sha = hashlib.sha256(data).hexdigest()
+        if actual_sha != expected_sha:
+            raise DistributionWheelError(
+                f"SHA-256 checksum mismatch for {filename} "
+                f"(expected {expected_sha}, got {actual_sha})."
+            )
+        target_path = dest_dir / filename
+        target_path.write_bytes(data)
+        local_paths[pkg] = target_path
+    return local_paths
+
+
+def _run_distribution_release_check(
+    info: _InstalledWheelInfo,
+    repo: str,
+    current: str,
+) -> None:
+    """Run the passive update check for a stamped distribution install."""
+    cache = _read_cache()
+    if (
+        cache is not None
+        and cache.kind == "distribution"
+        and cache.latest_version
+        and _is_newer_distribution_version(cache.latest_version, current)
+        and cache.latest_version != cache.last_notified_version
+    ):
+        _print_distribution_notice(current, cache.latest_version, repo, info.vcs_url)
+        _write_cache(
+            _CacheEntry(
+                last_check_epoch=cache.last_check_epoch,
+                commits_behind=0,
+                kind="distribution",
+                latest_version=cache.latest_version,
+                last_notified_version=cache.latest_version,
+            )
+        )
+
+    if cache is None or cache.kind != "distribution" or _is_stale(cache):
         _spawn_background_refresh()
 
 
@@ -644,6 +1124,32 @@ def refresh_update_cache() -> None:
         info = _read_installed_wheel_info()
         if info is None or info.is_editable:
             return
+        dist_cfg = _distribution_release_config()
+        if dist_cfg is not None:
+            repo, _ = dist_cfg
+            try:
+                status, latest = fetch_latest_distribution_release(repo)
+            except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
+                status, latest = "error", None
+            prev = _read_cache()
+            prev_dist = prev if prev is not None and prev.kind == "distribution" else None
+            last_notified = prev_dist.last_notified_version if prev_dist is not None else ""
+            if status == "ok" and latest:
+                cached_latest = latest
+            elif status == "empty":
+                cached_latest = ""
+            else:
+                cached_latest = prev_dist.latest_version if prev_dist is not None else ""
+            _write_cache(
+                _CacheEntry(
+                    last_check_epoch=time.time(),
+                    commits_behind=0,
+                    kind="distribution",
+                    latest_version=cached_latest,
+                    last_notified_version=last_notified,
+                )
+            )
+            return
         latest = fetch_latest_version()
         if latest is None:
             return
@@ -923,6 +1429,47 @@ def _print_notice(commits_behind: int) -> None:
         ("git pull", "bold"),
         " to update.",
     )
+    console.print(Panel(body, border_style="yellow", expand=False))
+
+
+def _print_distribution_notice(
+    current: str,
+    latest: str,
+    repo: str,
+    vcs_url: str | None,
+) -> None:
+    """Print the passive update notice for a stamped distribution build."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from omnigent.distribution import DISTRIBUTION_NAME
+
+    pinned_tag = False
+    if vcs_url:
+        _, rev = _split_vcs_url(vcs_url)
+        if rev and _parse_distribution_version(rev) is not None:
+            pinned_tag = True
+
+    console = Console(stderr=True)
+    if pinned_tag:
+        body = Text.assemble(
+            ("Update available", "bold yellow"),
+            f" — {DISTRIBUTION_NAME} ",
+            (latest, "bold"),
+            f" is out (pinned at {current}).\nReinstall from ",
+            (f"git+https://github.com/{repo}.git@v{latest}", "bold"),
+            " to update.",
+        )
+    else:
+        body = Text.assemble(
+            ("Update available", "bold yellow"),
+            f" — {DISTRIBUTION_NAME} ",
+            (latest, "bold"),
+            f" is out (you have {current}).\nRun ",
+            ("omni up", "bold"),
+            " to update.",
+        )
     console.print(Panel(body, border_style="yellow", expand=False))
 
 
@@ -1897,6 +2444,37 @@ def _probe_installed_distribution(
     return version, commit
 
 
+def _probe_distribution_version(
+    python_executable: str | None = None, *, env: dict[str, str] | None = None
+) -> str | None:
+    """Read ``DISTRIBUTION_VERSION`` from disk in a fresh subprocess."""
+    if not sys.executable:
+        return None
+    probe = (
+        "try:\n"
+        "    from omnigent.distribution import DISTRIBUTION_VERSION\n"
+        "    print(DISTRIBUTION_VERSION or '')\n"
+        "except Exception:\n"
+        "    print('')\n"
+    )
+    try:
+        result = subprocess.run(
+            [python_executable or sys.executable, "-I", "-c", probe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def _upgrade_failure_message(
     code: int, extras: Collection[str] = (), *, recovery_command: str | None = None
 ) -> str:
@@ -1927,12 +2505,18 @@ def _upgrade_failure_message(
     if version is not None:
         return f"Upgrade command exited with status {code}; your previous install is intact."
     extra_flags = "".join(f" --extra {extra}" for extra in sorted(extras))
+    dist_cfg = _distribution_release_config()
+    if dist_cfg is not None:
+        repo, _ = dist_cfg
+        reinstall_line = f"    {_distribution_recovery_command(repo, extras)}\n"
+    else:
+        reinstall_line = f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"
     return (
         f"Upgrade command exited with status {code}, and omnigent is no longer "
         "installed: the installer replaced the old environment before the new "
         "build failed. Your agents, history and credentials are untouched; "
         "reinstall the CLI to get back:\n\n"
-        f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"
+        f"{reinstall_line}"
         "    omnigent login <SERVER-URL>\n\n"
         "If the web UI build was what failed, install Node 22 LTS and pnpm "
         "first, or set OMNIGENT_SKIP_WEB_UI=true to install without it."

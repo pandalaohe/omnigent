@@ -88,7 +88,7 @@ class FakeWindow extends EventEmitter {
   }
 }
 
-function makeOverlay({ platform = process.platform } = {}) {
+function makeOverlay({ platform = process.platform, status = {} } = {}) {
   const onHandlers = new Map();
   const handleHandlers = new Map();
   const windows = [];
@@ -107,7 +107,7 @@ function makeOverlay({ platform = process.platform } = {}) {
   const calls = [];
   const updater = {
     getConfig: () => ({}),
-    getStatus: () => ({}),
+    getStatus: () => status,
     setConfig: () => ({}),
     checkForUpdates: async () => {},
     downloadUpdate: async () => {
@@ -290,5 +290,24 @@ describe("update overlay", () => {
       channel: "omnigent:update-overlay-height",
       payload: 180,
     });
+  });
+
+  it("opens an external release download directly without opening About", async () => {
+    const { calls, controller, handleHandlers } = makeOverlay({
+      status: {
+        state: "available",
+        info: {
+          version: "0.21.0-wukong.13",
+          downloadUrl:
+            "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+        },
+      },
+    });
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+
+    await handleHandlers.get("omnigent:overlay-update-download")({ sender: overlay.webContents });
+
+    assert.deepEqual(calls, ["download"]);
   });
 });

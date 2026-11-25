@@ -2,11 +2,15 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { OnboardingBackButton, OnboardingHeading } from "./primitives";
 
+const DEFAULT_INSTALL_DOCS_URL = "https://omnigent.ai/quickstart/install#install-omnigent";
+
 export function CliInstallStep({
+  installDocsUrl,
   onBack,
   onRecheck,
   onConnectAnyway,
 }: {
+  installDocsUrl?: string;
   onBack: () => void;
   onRecheck?: () => Promise<boolean>;
   onConnectAnyway?: () => void;
@@ -35,11 +39,7 @@ export function CliInstallStep({
         for your operating system, then return here and check again.
       </p>
       <Button asChild variant="outline">
-        <a
-          href="https://omnigent.ai/quickstart/install#install-omnigent"
-          target="_blank"
-          rel="noreferrer"
-        >
+        <a href={installDocsUrl || DEFAULT_INSTALL_DOCS_URL} target="_blank" rel="noreferrer">
           Installation instructions
         </a>
       </Button>

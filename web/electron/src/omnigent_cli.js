@@ -594,7 +594,11 @@ function parseJsonLoose(stdout) {
  *   installCommand: string,
  * }>}
  */
-async function getCliStatus(configuredPath) {
+async function getCliStatus(configuredPath, opts = {}) {
+  const installCommand =
+    typeof opts?.installCommand === "string" && opts.installCommand.trim()
+      ? opts.installCommand.trim()
+      : INSTALL_COMMAND;
   const resolved = resolveCliPath(configuredPath);
   if (!resolved) {
     return {
@@ -602,7 +606,7 @@ async function getCliStatus(configuredPath) {
       path: null,
       version: null,
       source: null,
-      installCommand: INSTALL_COMMAND,
+      installCommand,
     };
   }
   const res = await runCli(resolved.path, ["--version"], { timeoutMs: 5000 });
@@ -617,7 +621,7 @@ async function getCliStatus(configuredPath) {
     path: ok ? resolved.path : null,
     version: ok ? version || null : null,
     source: ok ? resolved.source : null,
-    installCommand: INSTALL_COMMAND,
+    installCommand,
   };
 }
 

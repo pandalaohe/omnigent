@@ -3246,6 +3246,7 @@ function UpdatesSection() {
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [lastCheckError, setLastCheckError] = useState<string | null>(null);
+  const [lastCheckNote, setLastCheckNote] = useState<string | null>(null);
 
   useEffect(() => {
     if (!bridge) {
@@ -3264,15 +3265,21 @@ function UpdatesSection() {
       });
     const unsubscribe = bridge.onStatus((status) => {
       if (status.state === "error-security") {
+        setLastCheckNote(null);
         setLastCheckError(status.lastError ?? "Security verification failed.");
       } else if (status.state === "idle" && status.lastError) {
+        setLastCheckNote(null);
         setLastCheckError(status.lastError);
+      } else if (status.state === "none" && status.manualOnly) {
+        setLastCheckError(null);
+        setLastCheckNote("You're up to date.");
       } else if (
         status.state === "checking" ||
         status.state === "available" ||
         status.state === "none"
       ) {
         setLastCheckError(null);
+        setLastCheckNote(null);
       }
     });
     return () => {
@@ -3299,6 +3306,7 @@ function UpdatesSection() {
     if (!bridge) return;
     setChecking(true);
     setLastCheckError(null);
+    setLastCheckNote(null);
     try {
       await bridge.check();
     } catch (err) {
@@ -3336,6 +3344,11 @@ function UpdatesSection() {
                 Check for updates now
               </Button>
               {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
+              {lastCheckNote && (
+                <span role="status" className="text-sm text-muted-foreground">
+                  {lastCheckNote}
+                </span>
+              )}
             </div>
           </SettingsGroup>
 
@@ -3362,20 +3375,22 @@ function UpdatesSection() {
               </Select>
             </label>
 
-            <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-              <SettingsLabel
-                label="Install downloaded updates on next quit"
-                note={null}
-                description="Applies only after you choose to download an update."
-              />
-              <Switch
-                checked={config.autoInstall}
-                onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
-                disabled={saving}
-                aria-label="Install downloaded updates on next quit"
-                componentId="settings.updates.auto_install"
-              />
-            </div>
+            {config.deliveryMode !== "manual-download" && (
+              <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+                <SettingsLabel
+                  label="Install downloaded updates on next quit"
+                  note={null}
+                  description="Applies only after you choose to download an update."
+                />
+                <Switch
+                  checked={config.autoInstall}
+                  onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+                  disabled={saving}
+                  aria-label="Install downloaded updates on next quit"
+                  componentId="settings.updates.auto_install"
+                />
+              </div>
+            )}
           </SettingsGroup>
 
           {lastCheckError && (

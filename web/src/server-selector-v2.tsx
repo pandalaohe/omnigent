@@ -45,6 +45,7 @@ interface OmnigentSetup {
   getCliStatus: () => Promise<{
     installed?: boolean;
     installSupported?: boolean;
+    installDocsUrl?: string;
     localServerRunning?: boolean;
   }>;
   startLocalServer: () => Promise<Partial<SetupResult> & { url?: string }>;
@@ -95,6 +96,8 @@ export function BridgeSetupApp() {
   // Whether in-app install is available on this platform (macOS only). Off →
   // connect/local must never route through an install step.
   const [installSupported, setInstallSupported] = useState(false);
+  // Distribution-specific install guide URL when supplied by the shell.
+  const [installDocsUrl, setInstallDocsUrl] = useState<string | undefined>(undefined);
   // Whether the env var pins the selector on → "Switch to legacy" can't take
   // effect, so the menu item is disabled.
   const [v2Forced, setV2Forced] = useState(false);
@@ -111,6 +114,11 @@ export function BridgeSetupApp() {
     const status = await setupBridge()?.getCliStatus();
     setInstalled(status?.installed === true);
     setInstallSupported(status?.installSupported === true);
+    setInstallDocsUrl(
+      typeof status?.installDocsUrl === "string" && status.installDocsUrl.trim()
+        ? status.installDocsUrl.trim()
+        : undefined,
+    );
     setLocalServerRunning(status?.localServerRunning === true);
     return status?.installed === true;
   }, []);
@@ -186,6 +194,7 @@ export function BridgeSetupApp() {
     serverNames,
     installed,
     installSupported,
+    installDocsUrl,
     onRecheckCli: refreshCliStatus,
     connectedBefore,
     localServerRunning,
@@ -272,8 +281,8 @@ export function BridgeSetupApp() {
               if (result?.ok && result.installed !== true) {
                 const errorMessage =
                   "The installer finished but the omnigent CLI still isn't detected.";
-                const errorAction =
-                  "Try opening a new terminal, or install it from https://omnigent.ai/.";
+                const recoveryUrl = installDocsUrl ?? "https://omnigent.ai/";
+                const errorAction = `Try opening a new terminal, or install it from ${recoveryUrl}.`;
                 return {
                   ok: false,
                   error: `${errorMessage} ${errorAction}`,

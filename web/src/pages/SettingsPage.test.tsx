@@ -1928,6 +1928,20 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
     });
+    expect(
+      screen.getByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the install-on-quit toggle in manual-download delivery mode", async () => {
+    installUpdateBridge({ ...DEFAULT_UPDATE_CONFIG, deliveryMode: "manual-download" });
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Update mode" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeNull();
   });
 
   it("surfaces manual update-check failures in Settings", async () => {

@@ -64,18 +64,28 @@ function renderDesktopUpdate(status) {
     desktopCheck.hidden = false;
     showResult(desktopResult, {
       state: "up-to-date",
-      message: "Omnigent Desktop is up to date.",
+      message: currentDesktopStatus.manualOnly
+        ? "You're up to date."
+        : "Omnigent Desktop is up to date.",
     });
     return;
   }
   if (state === "available") {
     desktopUpdateNow.hidden = false;
     const version = currentDesktopStatus.info?.version;
+    const isExternalDownload = Boolean(currentDesktopStatus.info?.downloadUrl);
+    if (isExternalDownload) {
+      desktopUpdateNow.textContent = "Download";
+    }
     showResult(desktopResult, {
       state: "available",
-      message: version
-        ? `Desktop update ${version} is available.`
-        : "A desktop update is available.",
+      message: isExternalDownload
+        ? version
+          ? `New version ${version} available`
+          : "A new version is available."
+        : version
+          ? `Desktop update ${version} is available.`
+          : "A desktop update is available.",
     });
     return;
   }
@@ -104,7 +114,9 @@ function renderDesktopUpdate(status) {
   if (state === "error-security" || currentDesktopStatus.lastError) {
     showResult(desktopResult, {
       state: "error",
-      message: "Unable to check for desktop updates.",
+      message: currentDesktopStatus.manualOnly
+        ? currentDesktopStatus.lastError || "Couldn't check for updates."
+        : "Unable to check for desktop updates.",
     });
   }
 }
@@ -158,10 +170,14 @@ desktopCheck.addEventListener("click", async () => {
 });
 
 desktopUpdateNow.addEventListener("click", async () => {
+  const isExternalDownload = Boolean(currentDesktopStatus.info?.downloadUrl);
   desktopUpdateNow.disabled = true;
-  desktopUpdateNow.textContent = "Starting…";
+  desktopUpdateNow.textContent = isExternalDownload ? "Opening…" : "Starting…";
   try {
     await api.downloadDesktopUpdate();
+    if (isExternalDownload) {
+      renderDesktopUpdate(currentDesktopStatus);
+    }
   } catch {
     renderDesktopUpdate({ state: "idle", lastError: "Update download failed" });
     showResult(desktopResult, { state: "error", message: "Unable to download the update." });

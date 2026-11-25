@@ -115,6 +115,9 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
   if (!bridge || !visibleStatus) return null;
 
   const releaseNotes = visibleStatus.info?.releaseNotes;
+  const isExternalDownload = Boolean(
+    visibleStatus.state === "available" && visibleStatus.info?.downloadUrl,
+  );
   const progress =
     visibleStatus.state === "downloading" ? formatPercent(visibleStatus.progress?.percent) : 0;
   const isError = visibleStatus.state === "error-security";
@@ -153,16 +156,22 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
           {visibleStatus.state === "available" && (
             <>
               <p className="font-medium text-foreground">
-                Omnigent Desktop {visibleStatus.info?.version ?? "update"} is available
+                {isExternalDownload ? (
+                  <>New version {visibleStatus.info?.version ?? ""} available</>
+                ) : (
+                  <>Omnigent Desktop {visibleStatus.info?.version ?? "update"} is available</>
+                )}
               </p>
               {visibleStatus.currentVersion && (
                 <p className="mt-0.5 text-sm text-muted-foreground">
                   Current version: {visibleStatus.currentVersion}.
                 </p>
               )}
-              <p className="mt-0.5 text-sm text-muted-foreground">
-                Updating won’t interrupt existing sessions.
-              </p>
+              {!isExternalDownload && (
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  Updating won’t interrupt existing sessions.
+                </p>
+              )}
             </>
           )}
           {visibleStatus.state === "downloading" && (
@@ -224,7 +233,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
                 onClick={() => void onDownload()}
                 loading={busyAction === "download"}
               >
-                Update now
+                {isExternalDownload ? "Download" : "Update now"}
               </Button>
               <Button
                 variant="outline"
