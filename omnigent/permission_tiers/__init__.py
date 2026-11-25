@@ -1120,7 +1120,7 @@ def _heredoc_substitutions(body: str) -> list[str]:
             continue
         if char == "`" or body.startswith("$(", index):
             backtick = char == "`"
-            end, inner, _ = _shell_scan(
+            end, inner, _, _ = _shell_scan(
                 body, index + (1 if backtick else 2), "`" if backtick else ")"
             )
             if end >= len(body):
@@ -1166,8 +1166,8 @@ def _shell_scan(
     *,
     binding_paths: bool = False,
     keep_comments: bool = False,
-) -> tuple[int, str, list[str]]:
-    """Return the end, executable shell text and direct substitution bodies.
+) -> tuple[int, str, list[str], bool]:
+    """Return end, executable text, substitution bodies and whether all heredocs closed.
 
     Quoted heredoc data is omitted unless a shell interpreter reads it. Quotes in
     unquoted heredoc bodies are literal; case patterns do not close substitutions.
@@ -1181,6 +1181,7 @@ def _shell_scan(
     start = index
     command_start = index
     heredocs: list[tuple[str, bool, bool, bool]] = []
+    heredocs_closed = True
     while index < len(text):
         char = text[index]
         if quote == "'":
@@ -1203,14 +1204,20 @@ def _shell_scan(
             index += 1
             for terminator, tabs, quoted, interpreter in heredocs:
                 body_start = body_end = index
+                found = False
                 while index < len(text):
-                    line_end = text.find("\n", index)
-                    line_end = len(text) if line_end < 0 else line_end
+                    newline = text.find("\n", index)
+                    line_end = len(text) if newline < 0 else newline
                     line = text[index:line_end]
-                    body_end, index = index, line_end + 1
+                    next_index = len(text) if newline < 0 else newline + 1
                     if (line.lstrip("\t") if tabs else line) == terminator:
+                        body_end = index
+                        index = next_index
+                        found = True
                         break
+                    index = next_index
                     body_end = index
+                heredocs_closed = heredocs_closed and found
                 body = text[body_start:body_end]
                 if not quoted:
                     bodies.extend(_heredoc_substitutions(body))
@@ -1221,7 +1228,7 @@ def _shell_scan(
             command_start = index
             continue
         if closer == "`" and char == "`":
-            return index, "".join(kept), bodies
+            return index, "".join(kept), bodies, heredocs_closed and not heredocs
         if not quote and char == "#" and (index == start or text[index - 1] in " \t\n;&|()<>"):
             newline = text.find("\n", index)
             comment_end = len(text) if newline < 0 else newline
@@ -1236,7 +1243,7 @@ def _shell_scan(
                 cases -= 1
             elif char in "()":
                 if char == ")" and not depth and not cases:
-                    return index, "".join(kept), bodies
+                    return index, "".join(kept), bodies, heredocs_closed and not heredocs
                 if not (char == ")" and not depth):
                     depth += 1 if char == "(" else -1
         if not quote and char in ";&|()\n":
@@ -1250,7 +1257,11 @@ def _shell_scan(
             quote = "'"
         elif char == '"':
             quote = "" if quote else '"'
-        elif not quote and text.startswith("<<", index) and not text.startswith("<<<", index):
+        elif not quote and text.startswith("<<<", index):
+            kept.append("<<<")
+            index += 3
+            continue
+        elif not quote and text.startswith("<<", index):
             match = _HEREDOC.match(text, index)
             if match:
                 heredocs.append(
@@ -1264,9 +1275,10 @@ def _shell_scan(
                 kept.append(match[0])
                 index = match.end()
                 continue
+            heredocs_closed = False
         elif (char == "`" and closer != "`") or text.startswith("$(", index):
             backtick = char == "`"
-            end, body, _ = _shell_scan(
+            end, body, _, _ = _shell_scan(
                 text, index + (1 if backtick else 2), "`" if backtick else ")"
             )
             if end >= len(text):
@@ -1280,7 +1292,7 @@ def _shell_scan(
             continue
         kept.append(char)
         index += 1
-    return index, "".join(kept), bodies
+    return index, "".join(kept), bodies, heredocs_closed and not heredocs
 
 
 def _expansion_end(raw: str, index: int) -> int:
@@ -1833,7 +1845,7 @@ def _windows_command_paths(
     windows_posix = posix_executor and _windows_posix(context)
     if windows_posix:
         assigned |= _shell_assignments(command, context)
-        end, outer, bodies = _shell_scan(command, binding_paths=True)
+        end, outer, bodies, _ = _shell_scan(command, binding_paths=True)
         if end != len(command):
             raise ValueError("Uncheckable POSIX shell expansion")
         command = outer
@@ -2271,37 +2283,40 @@ def _shell_segments(
                     # the outer command as a script-file operand.
                     depth = 1
                     case_states: list[tuple[int, str]] = []
+                    after_case_pattern = False
                     inner_start = index + 1
                     while index + 1 < len(tokens) and depth > 0:
                         index += 1
                         current = raw_tokens[index]
+                        can_start_command = (
+                            after_case_pattern
+                            or index == inner_start
+                            or raw_tokens[index - 1]
+                            in (
+                                ";",
+                                ";;",
+                                ";&",
+                                ";;&",
+                                "&&",
+                                "||",
+                                "|",
+                                "|&",
+                                "(",
+                                "<(",
+                                ">(",
+                                "{",
+                                "\n",
+                                "then",
+                                "do",
+                                "else",
+                                "elif",
+                            )
+                        )
+                        after_case_pattern = False
                         if (
                             current == "case"
                             and (not case_states or case_states[-1] != (depth, "pattern"))
-                            and (
-                                index == inner_start
-                                or raw_tokens[index - 1]
-                                in (
-                                    ";",
-                                    ";;",
-                                    ";&",
-                                    ";;&",
-                                    "&&",
-                                    "||",
-                                    "|",
-                                    "|&",
-                                    "(",
-                                    "<(",
-                                    ">(",
-                                    "{",
-                                    "\n",
-                                    "then",
-                                    "do",
-                                    "else",
-                                    "elif",
-                                    ")",
-                                )
-                            )
+                            and can_start_command
                         ):
                             case_states.append((depth, "header"))
                             continue
@@ -2316,6 +2331,7 @@ def _shell_segments(
                                     case_states.pop()
                                 elif current == ")":
                                     case_states[-1] = (case_depth, "body")
+                                    after_case_pattern = True
                                 continue
                             if current == "esac":
                                 case_states.pop()
@@ -2581,10 +2597,12 @@ def _shell_writes(
     windows_posix = windows_posix_executor and _windows_posix(context)
     posix_stdin = (not windows and not powershell) or windows_posix
     command = command.replace("\\\n", "")
-    scan_end, scanned_command, scan_bodies = _shell_scan(command, keep_comments=True)
+    scan_end, scanned_command, scan_bodies, heredocs_closed = _shell_scan(
+        command, keep_comments=True
+    )
     tokens, raw_tokens = _write_tokens(
         scanned_command
-        if (not windows and not powershell) and scan_end == len(command)
+        if (not windows and not powershell) and scan_end == len(command) and heredocs_closed
         else command,
         windows=windows or powershell,
         windows_posix=windows_posix,

@@ -1881,7 +1881,9 @@ def test_posix_non_shell_heredoc_body_is_data_not_script(platform):
     allow_expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
     for command in (
         "cat <<'EOF'\nbash -s\nEOF\n",
+        "cat <<'EOF'\nbash -s\nEOF",
         "cat <<EOF\nbash -s\nEOF\n",
+        "cat <<EOF\nbash -s\nEOF",
         "cat <<'EOF' > notes.txt\ncat install.sh | sh\nEOF\n",
         "python3 - <<'EOF'\nbash -s\nEOF\n",
     ):
@@ -1893,6 +1895,7 @@ def test_posix_non_shell_heredoc_body_is_data_not_script(platform):
     for command in (
         "cat <<EOF\n$(cat install.sh | bash)\nEOF\n",
         "cat <<'EOF' | bash\necho ok\nEOF\n",
+        "cat <<'EOF'\nbash -s",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
         assert auto_result.action == Verdict.DENY, command
@@ -1906,6 +1909,39 @@ def test_posix_non_shell_heredoc_body_is_data_not_script(platform):
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_posix_here_string_preserves_following_write_and_stdin_bindings(platform):
+    host = posix_host(platform=platform)
+    base_write_intent = adapt_tool_call("bash", {"command": "echo x > /etc/hosts"}, host)
+    for command in (
+        "cat <<< ok\necho x > /etc/hosts\n",
+        "cat <<< EOF\necho x > /etc/hosts\n",
+    ):
+        intent = adapt_tool_call("bash", {"command": command}, host)
+        assert intent.command_write_paths == base_write_intent.command_write_paths, command
+        result = decide_tier("auto", intent, RULES)
+        assert result.action == Verdict.DENY, command
+        assert result.rule_id == "protected-path", command
+        assert "/etc/hosts" in result.reason, command
+
+    expected_reason = "Shell script from standard input cannot be bound"
+    base_stdin_intent = adapt_tool_call("bash", {"command": "cat install.sh | sh"}, host)
+    for command in (
+        "cat <<< ok\ncat install.sh | sh\n",
+        "cat <<< EOF\ncat install.sh | sh\n",
+    ):
+        intent = adapt_tool_call("bash", {"command": command}, host)
+        assert intent.status == base_stdin_intent.status == "unknown", command
+        assert intent.detail == base_stdin_intent.detail == expected_reason, command
+        auto_result = decide_tier("auto", intent, RULES)
+        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.rule_id is None, command
+        assert auto_result.reason == expected_reason, command
+        accept_result = decide_tier("accept-edits", intent, RULES)
+        assert accept_result.action == Verdict.ASK, command
+        assert accept_result.reason == expected_reason, command
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_posix_case_arm_subshell_in_process_substitution(platform):
     host = posix_host(platform=platform)
     allow_expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
@@ -1913,6 +1949,10 @@ def test_posix_case_arm_subshell_in_process_substitution(platform):
         "cat < <(case x in x) (echo hi);; esac)",
         "cat < <(case x in (a|b) (echo hi);; esac)",
         "cat < <(case x in x) (echo hi) esac)",
+        "cat < <(case x in x) (echo hi);& y) (echo bye);; esac)",
+        "cat < <(case x in x) (echo hi);;& y) (echo bye);; esac)",
+        "cat < <(case x in x) case y in y) (echo ok);; esac;; esac)",
+        "cat < <(printf '%s\\n' <(echo hi) case)",
     ):
         actual = tuple(
             decision(tier, "bash", {"command": command}, host).action for tier in PERMISSION_TIERS
@@ -1922,6 +1962,8 @@ def test_posix_case_arm_subshell_in_process_substitution(platform):
     for command in (
         "bash < <(case x in x) (echo hi);; esac)",
         "bash < <(case x in (a|b) (echo hi);; esac)",
+        "bash < <(case x in x) (echo hi);& y) (echo bye);;& esac)",
+        "bash < <(printf '%s\\n' <(echo hi) case)",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
         assert auto_result.action == Verdict.DENY, command
