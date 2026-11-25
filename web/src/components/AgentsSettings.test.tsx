@@ -12,7 +12,7 @@ import {
 import type { CustomAgent, CustomAgentDetail, CustomAgentMember } from "@/lib/customAgentsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { expectSettingsPages } from "@/test/settingsPaging";
-import { AgentBadgeDisplaySetting, AgentsSettings } from "./AgentsSettings";
+import { AgentsSettings } from "./AgentsSettings";
 
 const mocks = vi.hoisted(() => ({
   available: undefined as AvailableAgent[] | undefined,
@@ -221,7 +221,7 @@ const installedAcp: AvailableAgent = {
   acpHarness: true,
 };
 
-function renderSettings(withBadgeDisplay = false) {
+function renderSettings() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
@@ -230,7 +230,6 @@ function renderSettings(withBadgeDisplay = false) {
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <AgentsSettings />
-        {withBadgeDisplay && <AgentBadgeDisplaySetting />}
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -390,7 +389,7 @@ describe("AgentsSettings", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
-  it("hides every badge globally without discarding saved entries", async () => {
+  it("hides every badge from the Agents list without discarding saved entries", async () => {
     mocks.available = [builtinPolly];
     const entries = {
       [builtinPolly.id]: { label: "P", borderColor: "#112233", textColor: "#ddeeff" },
@@ -401,10 +400,15 @@ describe("AgentsSettings", () => {
       enabled: true,
       entries,
     });
-    renderSettings(true);
+    renderSettings();
     expect(screen.getAllByTestId("agent-name-badge")).toHaveLength(2);
 
-    fireEvent.click(screen.getByRole("switch", { name: "Show Agent badges" }));
+    const switchControl = screen.getByRole("switch", { name: "Show Agent badges" });
+    const list = screen.getByRole("region", { name: "Agent configurations" });
+    expect(list).toContainElement(switchControl);
+    expect(within(list).getByRole("button", { name: "Edit badge for Polly" })).toBeVisible();
+    expect(switchControl).toBeChecked();
+    fireEvent.click(switchControl);
 
     await waitFor(() => expect(screen.queryByTestId("agent-name-badge")).not.toBeInTheDocument());
     const saved = JSON.parse(localStorage.getItem(AGENT_BADGE_STORAGE_KEY) ?? "null") as {
