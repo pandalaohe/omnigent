@@ -10986,6 +10986,10 @@
             "title": "Browser Annotations Available",
             "type": "boolean"
           },
+          "browser_approval_available": {
+            "title": "Browser Approval Available",
+            "type": "boolean"
+          },
           "connected_apps_available": {
             "default": false,
             "title": "Connected Apps Available",
@@ -11080,6 +11084,10 @@
             ],
             "title": "Public Sharing Max Level",
             "type": "string"
+          },
+          "push_credentials_required": {
+            "title": "Push Credentials Required",
+            "type": "boolean"
           },
           "request_managed_sandbox_host_id": {
             "default": true,
@@ -11263,6 +11271,9 @@
             "title": "Task Board Enabled",
             "type": "boolean"
           },
+          "telemetry": {
+            "$ref": "#/components/schemas/TelemetryStatus"
+          },
           "usage_board_enabled": {
             "default": false,
             "title": "Usage Board Enabled",
@@ -11276,6 +11287,9 @@
         },
         "required": [
           "accounts_enabled",
+          "browser_approval_available",
+          "push_credentials_required",
+          "telemetry",
           "single_user",
           "login_url",
           "needs_setup",
@@ -18423,6 +18437,42 @@
           "kind"
         ],
         "title": "StoreHarnessCredentialRequest",
+        "type": "object"
+      },
+      "TelemetrySettingsUpdate": {
+        "properties": {
+          "telemetry_enabled": {
+            "title": "Telemetry Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "telemetry_enabled"
+        ],
+        "title": "TelemetrySettingsUpdate",
+        "type": "object"
+      },
+      "TelemetryStatus": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "locked": {
+            "title": "Locked",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "locked",
+          "source"
+        ],
+        "title": "TelemetryStatus",
         "type": "object"
       },
       "TerminalCommandData": {
@@ -43490,6 +43540,44 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/v1/system/telemetry": {
+      "put": {
+        "operationId": "update_telemetry_v1_system_telemetry_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TelemetrySettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Telemetry"
       }
     },
     "/v1/usage": {
