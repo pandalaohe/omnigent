@@ -178,11 +178,15 @@ async def codex_launch_harness(
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{_SESSION_ID}"
             return httpx.Response(200, json=snapshot)
-        if request.method == "PATCH" and set(json.loads(request.content)) == {
-            "external_session_id"
-        }:
-            # A fork records the Codex thread it minted.
-            return httpx.Response(200, json={})
+        if request.method == "PATCH":
+            body = json.loads(request.content)
+            if set(body) == {"external_session_id"}:
+                # A fork records the Codex thread it minted.
+                return httpx.Response(200, json={})
+            if set(body) == {"labels"} and set(body["labels"]) == {"omnigent.launched_model"}:
+                # Recording the concrete launched model never mutates model_override.
+                snapshot.setdefault("labels", {}).update(body["labels"])
+                return httpx.Response(200, json={})
         assert request.method == "POST", "fallback must never unconditionally PATCH the pick"
         if request.url.path == f"/v1/sessions/{_SESSION_ID}/events":
             events.append("notice")
@@ -485,6 +489,7 @@ async def test_codex_terminal_unlisted_setting_uses_fallback(
 
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.snapshot["labels"]["omnigent.launched_model"] == _PROVIDER_DEFAULT
     assert harness.unlisted_bindings == [None]
     assert harness.notices == [_unavailable_notice(_RETIRED_PICK, _PROVIDER_DEFAULT)]
     warnings = [

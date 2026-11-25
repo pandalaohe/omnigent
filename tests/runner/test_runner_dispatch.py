@@ -11579,6 +11579,70 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
 
 
 @pytest.mark.asyncio
+async def test_sys_session_get_info_projects_requested_launched_running() -> None:
+    """``sys_session_get_info`` exposes requested, launched, and running from the snapshot."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_renamed":
+            return httpx.Response(
+                200,
+                headers={"date": _SESSION_INFO_DATE},
+                json={
+                    **_session_info_snapshot("conv_renamed"),
+                    "harness": "codex-native",
+                    "model_override": "krill/gpt-6.2-sol",
+                    "llm_model": "gpt-6.2-sol",
+                    "requested": "ccs-krill/gpt-6.2-sol",
+                    "launched": "krill/gpt-6.2-sol",
+                    "running": "gpt-6.2-sol",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_agy":
+            return httpx.Response(
+                200,
+                headers={"date": _SESSION_INFO_DATE},
+                json={
+                    **_session_info_snapshot("conv_agy"),
+                    "harness": "antigravity-native",
+                    "model_override": "gemini-4-neon",
+                    "llm_model": "Gemini 4 Neon (High)",
+                    "requested": "gemini-4-neon",
+                    "launched": None,
+                    "running": "Gemini 4 Neon (High)",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        renamed_out = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_renamed"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+        agy_out = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_agy"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    renamed = json.loads(renamed_out)
+    assert renamed["requested"] == "ccs-krill/gpt-6.2-sol"
+    assert renamed["launched"] == "krill/gpt-6.2-sol"
+    assert renamed["running"] == "gpt-6.2-sol"
+
+    agy = json.loads(agy_out)
+    assert agy["requested"] == "gemini-4-neon"
+    assert agy["launched"] is None
+    assert agy["running"] == "Gemini 4 Neon (High)"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "last_total_tokens,context_window,auto_compact_token_limit,"
     "expected_fraction,expected_compact_fraction",

@@ -8708,7 +8708,88 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .values(session_overrides=encoded, updated_at=now_epoch())
                 ),
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return False
+            # Atomically drop session-level model-resolution notes tied to the
+            # cleared override while preserving member:* notes in the same tx.
+            res_prefix = "omnigent.model_resolution"
+            res_conditions = (
+                SqlConversationLabel.workspace_id == workspace_id,
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key.startswith(res_prefix, autoescape=True),
+            )
+            current_res = dict(
+                session.execute(
+                    select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                        *res_conditions
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            if current_res:
+                try:
+                    raw_res = json.loads(current_res.get(res_prefix, "null"))
+                    if isinstance(raw_res, dict) and "chunks" in raw_res:
+                        chunk_count = raw_res["chunks"]
+                        if type(chunk_count) is int and 1 <= chunk_count <= len(current_res):
+                            raw_res = json.loads(
+                                "".join(
+                                    current_res[f"{res_prefix}.{idx}"]
+                                    for idx in range(chunk_count)
+                                )
+                            )
+                        else:
+                            raw_res = None
+                except (ValueError, KeyError, TypeError):
+                    raw_res = None
+                existing_notes = (
+                    [note for note in raw_res if isinstance(note, dict)]
+                    if isinstance(raw_res, list)
+                    else []
+                )
+                remaining_notes = [
+                    note
+                    for note in existing_notes
+                    if isinstance(note.get("setting"), str)
+                    and note["setting"].startswith("member:")
+                ]
+                if not existing_notes or len(remaining_notes) != len(existing_notes):
+                    replacement: dict[str, str] = {}
+                    if remaining_notes:
+                        encoded_notes = json.dumps(
+                            remaining_notes, ensure_ascii=False, separators=(",", ":")
+                        )
+                        if len(encoded_notes) <= LABEL_VALUE_MAX_LEN:
+                            replacement = {res_prefix: encoded_notes}
+                        else:
+                            chunks = [
+                                encoded_notes[idx : idx + LABEL_VALUE_MAX_LEN]
+                                for idx in range(0, len(encoded_notes), LABEL_VALUE_MAX_LEN)
+                            ]
+                            replacement = {
+                                res_prefix: json.dumps({"chunks": len(chunks)}),
+                                **{
+                                    f"{res_prefix}.{idx}": chunk
+                                    for idx, chunk in enumerate(chunks)
+                                },
+                            }
+                    stale_keys = {
+                        key
+                        for key in current_res
+                        if (key == res_prefix or key.startswith(f"{res_prefix}."))
+                        and key not in replacement
+                    }
+                    if stale_keys:
+                        session.execute(
+                            delete(SqlConversationLabel).where(
+                                *res_conditions,
+                                SqlConversationLabel.key.in_(stale_keys),
+                            )
+                        )
+                    if replacement:
+                        _upsert_prepared_labels(session, conversation_id, replacement, now_epoch())
+            return True
 
     def rename_conversation_if_title_matches(
         self,

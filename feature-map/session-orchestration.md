@@ -20,6 +20,8 @@ MCP independent creation.
   sender reads "From another session". The prefix is a label, not proof of origin.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+  `sys_session_get_info` exposes `requested`, `launched`, and `running` beside
+  `model` when each source is reliable for the target session's harness.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by

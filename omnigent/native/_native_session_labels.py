@@ -24,6 +24,7 @@ def replacement_session_labels(labels: Mapping[str, str]) -> dict[str, str]:
         "omnigent.startup.create_preparation",
         "omnigent.git.worktree_root_sha256",
         "omnigent.turn_actor",
+        "omnigent.launched_model",
         "omnigent.codex_native.subagent_thread_id",
     } | conversation_store.SUCCESSION_OPERATION_LABEL_KEYS
     prefixes = (

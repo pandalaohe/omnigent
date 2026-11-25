@@ -12246,6 +12246,287 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().pendingModelChange).toBe("haiku");
     });
+
+    it("updates session.running only for confirmed harness reports, not speculative router picks", () => {
+      client.setQueryData(["session", "conv_speculative"], {
+        id: "conv_speculative",
+        harness: "codex-native",
+        requested: "gpt-6.2-sol",
+        launched: null,
+        running: null,
+        labels: {},
+      } as unknown as Session);
+      useChatStore.setState({
+        conversationId: "conv_speculative",
+        llmModel: null,
+      });
+
+      // Speculative router pick keeps legacy llmModel picker sync but does not set running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-sol",
+      });
+      expect(useChatStore.getState().llmModel).toBe("gpt-6.2-sol");
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBeNull();
+
+      // Confirmed harness report updates running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-astra",
+        reported: true,
+      } as Parameters<typeof handleSessionEvent>[0]);
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBe(
+        "gpt-6.2-astra",
+      );
+    });
+
+    it("preserves a newer confirmed running report when an older reconnect snapshot finishes", async () => {
+      const id = "conv_reconnect_running";
+      const otherId = "conv_reconnect_other";
+      seedSession(id, []);
+      seedSession(otherId, []);
+      await useChatStore.getState().switchTo(id);
+      await useChatStore.getState().switchTo(otherId);
+
+      let releaseItems!: (r: Response) => void;
+      let metadataReturned = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          metadataReturned = true;
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              requested: "model-a",
+              launched: "model-a",
+              running: "model-a",
+              status: "idle",
+              labels: {},
+            }),
+          );
+        }
+        if (path === `/v1/sessions/${id}/items`) {
+          return new Promise<Response>((resolve) => {
+            releaseItems = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Revisiting the retained live session runs reconcileSessionAfterReconnect (parallel metadata + items).
+      const revisit = useChatStore.getState().switchTo(id);
+      await tick();
+      expect(metadataReturned).toBe(true);
+
+      // While history fetch is still in flight, a confirmed live model report arrives.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older snapshot completes after the live report; running must remain model-b.
+      releaseItems(mockResponse({ items: [], has_more: false }));
+      await revisit;
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
+
+    it("updates the header session query cache on successful model PATCH and session.launched_model", async () => {
+      const id = "conv_patch_header_cache";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      client.setQueryData(["session", id], {
+        id,
+        harness: "codex-native",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      } as unknown as Session);
+
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              model_override: "model-b",
+              requested: "model-b",
+              launched: "model-b",
+              running: "model-a",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().setModel("model-b");
+      expect(client.getQueryData<Session>(["session", id])).toMatchObject({
+        requested: "model-b",
+        launched: "model-b",
+      });
+
+      // SDK/native launch SSE updates launched in the open header cache.
+      handleSessionEvent(
+        {
+          type: "session_launched_model",
+          conversationId: id,
+          launched: "model-c",
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.launched).toBe("model-c");
+    });
+
+    it("preserves a newer confirmed running report across startup-input refresh", async () => {
+      const id = "conv_startup_refresh_running";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+
+      let releaseStartupRead!: (r: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseStartupRead = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Trigger refreshFailedInputs via a failed sandbox startup status edge.
+      handleSessionEvent(
+        {
+          type: "session_sandbox_status",
+          conversationId: id,
+          stage: "failed",
+          error: "sandbox failed",
+        },
+        id,
+      );
+      await tick();
+
+      // While startup-input refresh is in flight, a confirmed model report lands.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older startup-input snapshot returns with running: "model-a"; must not revert model-b.
+      releaseStartupRead(
+        mockResponse({
+          id,
+          harness: "codex-native",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          status: "failed",
+          labels: {},
+        }),
+      );
+      await tick();
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
+
+    it("guards fetchSessionHostId and preserves PATCH requested over an older in-flight GET", async () => {
+      const { fetchSessionHostId } = await import("@/lib/fetchSessionHostId");
+      const id = "conv_host_and_requested_freshness";
+      client.setQueryData(["session", id], {
+        id,
+        title: "Freshness",
+        agentId: "agent_1",
+        status: "idle",
+        createdAt: 100,
+        updatedAt: 200,
+        modelOverride: "model-a",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      });
+      useChatStore.setState({ conversationId: id, sessionModelOverride: "model-a" });
+
+      let releaseHostGet!: (response: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseHostGet = resolve;
+          });
+        }
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              title: "Freshness",
+              agent_id: "agent_1",
+              status: "idle",
+              created_at: 100,
+              updated_at: 205,
+              model_override: "model-c",
+              requested: "model-c",
+              launched: "model-a",
+              running: "model-b",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const hostFetch = fetchSessionHostId(id, { queryClient: client });
+      await tick();
+
+      // A confirmed live Running report AND an authoritative model PATCH arrive
+      // while the host-chain GET is still in flight.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: id,
+        model: "model-b",
+        reported: true,
+      });
+      await useChatStore.getState().setModel("model-c");
+
+      // Now the older host GET resolves with stale model-a fields.
+      releaseHostGet(
+        mockResponse({
+          id,
+          title: "Freshness",
+          agent_id: "agent_1",
+          status: "idle",
+          created_at: 100,
+          updated_at: 200,
+          host_id: "host_1",
+          model_override: "model-a",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          labels: {},
+        }),
+      );
+      await hostFetch;
+
+      const cached = client.getQueryData<Session>(["session", id]);
+      expect(cached?.running).toBe("model-b");
+      expect(cached?.requested).toBe("model-c");
+    });
   });
 
   describe("rotation failure notice", () => {

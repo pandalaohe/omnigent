@@ -2730,6 +2730,18 @@
             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
             "title": "Last Task Error"
           },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Post-resolution model passed to the child's harness (`model_override`), or `None` when unset or not confirmed by the harness (e.g. `antigravity-native`).",
+            "title": "Launched"
+          },
           "native_activity_unverified": {
             "default": false,
             "title": "Native Activity Unverified",
@@ -2752,6 +2764,18 @@
             "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
+          },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model originally requested for the child \u2014 `saved` from `omnigent.model_resolution` when resolution rewrote it, else `model_override`. `None` when unset.",
+            "title": "Requested"
           },
           "routed_model": {
             "anyOf": [
@@ -2776,6 +2800,18 @@
             ],
             "description": "Identifier of the routing decision that produced `routed_model`, mirroring `RoutingDecisionData.decision_id`. Read from the child's `omnigent.routing.decision_id` label, stamped when routing pins the model. `None` when the child was not routed.",
             "title": "Routing Decision Id"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model last reported as actually running by the child's harness (`reported_model`), or `None` when not yet reported.",
+            "title": "Running"
           },
           "session_name": {
             "anyOf": [
@@ -11305,6 +11341,7 @@
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.input.sending": "#/components/schemas/SessionInputSendingEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.launched_model": "#/components/schemas/SessionLaunchedModelEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -11341,6 +11378,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionLaunchedModelEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTitleEvent"
@@ -13253,6 +13293,51 @@
         "title": "SessionLabelsResponse",
         "type": "object"
       },
+      "SessionLaunchedModelEvent": {
+        "description": "Confirmed launched-model update for an active session header.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launched"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.launched_model",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionLaunchedModelEvent",
+        "type": "object"
+      },
       "SessionList": {
         "description": "Paginated list of sessions; `data` is a page of `SessionListItem`.",
         "properties": {
@@ -14070,6 +14155,18 @@
             "description": "The model the harness reports the session is on, VERBATIM in the harness's own spelling, e.g. `\"claude-opus-4-8[1m]\"` or `\"gpt-5.6-luna\"` \u2014 never collapsed to a picker alias. Category: **transient** (SSE-only). The server also writes `reported_model` on the conversation (served on the snapshot's `llm_model`), so on reconnect clients restore the display from the snapshot rather than from a replayed event.",
             "title": "Model",
             "type": "string"
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reported"
           },
           "sequence_number": {
             "anyOf": [
@@ -15566,6 +15663,18 @@
             "description": "Total token count (input + output) from the most recently completed task's `usage`, e.g. `45231`. `None` when no task has completed yet. Lets clients seed their context-ring on conversation resume without waiting for the next `response.completed` SSE event.",
             "title": "Last Total Tokens"
           },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Post-resolution model passed to the harness (`model_override`), or `None` when unset or not confirmed by the harness (e.g. `antigravity-native`).",
+            "title": "Launched"
+          },
           "llm_model": {
             "anyOf": [
               {
@@ -15762,6 +15871,18 @@
             "description": "Per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, and `\"max\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
             "title": "Reasoning Effort"
           },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model originally requested for the session \u2014 `saved` from `omnigent.model_resolution` when resolution rewrote it, else `model_override`. `None` when unset.",
+            "title": "Requested"
+          },
           "root_conversation_id": {
             "anyOf": [
               {
@@ -15797,6 +15918,18 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model last reported as actually running by the harness (`reported_model`), or `None` when not yet reported.",
+            "title": "Running"
           },
           "running_since": {
             "anyOf": [

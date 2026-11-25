@@ -810,7 +810,8 @@ class SysSessionGetInfoTool(Tool):
         return (
             "Return one or more sessions' metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
-            "host + configured harness readiness, reasoning effort, model, "
+            "host + configured harness readiness, reasoning effort, model "
+            "(plus requested, launched, and running when reliable for the harness), "
             "parent session, workspace, persisted last-activity time, "
             "outstanding approval prompts, cost, context usage "
             "(compact_used_fraction is occupancy against the harness's "

@@ -3154,8 +3154,16 @@ def _build_session_response(
             permission_tiers_capability = (
                 conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
             )
+    from omnigent.server.model_resolution import session_model_display
     from omnigent.server.routes._session_create_validation import session_acp_harness
     from omnigent.server.session_choice_runtime import choice_record
+
+    model_display = session_model_display(
+        conv.labels,
+        conv.model_override,
+        conv.reported_model,
+        harness=harness,
+    )
 
     return SessionResponse(
         id=conv.id,
@@ -3209,6 +3217,9 @@ def _build_session_response(
         permission_tier_state=permission_tier_state,
         permission_tiers_capability=permission_tiers_capability,
         model_override=conv.model_override,
+        requested=model_display.requested,
+        launched=model_display.launched,
+        running=model_display.running,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,
@@ -3530,6 +3541,7 @@ async def _persist_relay_reported_model(
             type="session.model",
             conversation_id=session_id,
             model=model,
+            reported=True,
         ).model_dump(exclude_none=True),
     )
 
@@ -10194,7 +10206,7 @@ def _publish_routed_model(session_id: str, model: str) -> None:
         conversation_id=session_id,
         model=model,
     )
-    session_stream.publish(session_id, event.model_dump())
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
 def _runner_reject_detail(response: httpx.Response) -> str:
@@ -10931,6 +10943,7 @@ async def _forward_event_to_runner(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         shell_forwarded = True
+        launched_model_seq = _next_launched_model_seq(session_id)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if annotation_pending:
@@ -11070,7 +11083,115 @@ async def _forward_event_to_runner(
         elif taken_notes is not None:
             shell_notes.release(session_id, taken_notes)
 
+    if shell_forwarded:
+        _schedule_sdk_launched_model_record(
+            session_id,
+            conv,
+            effective_runner_override,
+            conversation_store,
+            seq=launched_model_seq,
+        )
+
     return persisted_items[0].id
+
+
+_LAUNCHED_MODEL_DISPATCH_SEQ: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_LAUNCHED_MODEL_LOCKS: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache()
+_LAUNCHED_MODEL_TASKS: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
+
+
+def _next_launched_model_seq(session_id: str) -> int:
+    """Reserve the next monotonic dispatch sequence for *session_id*."""
+    seq = _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id, 0) + 1
+    _LAUNCHED_MODEL_DISPATCH_SEQ[session_id] = seq
+    return seq
+
+
+def _schedule_sdk_launched_model_record(
+    session_id: str,
+    conv: Conversation,
+    model_override: str | None,
+    conversation_store: ConversationStore,
+    *,
+    seq: int | None = None,
+) -> asyncio.Task[None] | None:
+    """Record the dispatched SDK/ACP launched model off the delivery ack path.
+
+    Runs in a retained background task fenced by per-session monotonic dispatch
+    order and lock so a slow or failing label write never delays or fails
+    ``input.consumed``, and an older delayed write cannot overwrite a newer
+    dispatch's record.
+    """
+    effective_seq = _next_launched_model_seq(session_id) if seq is None else seq
+    dispatched_model = (
+        model_override.strip()
+        if isinstance(model_override, str) and model_override.strip()
+        else None
+    )
+
+    async def _write() -> None:
+        lock = _LAUNCHED_MODEL_LOCKS.setdefault(session_id, asyncio.Lock())
+        try:
+            async with lock:
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                if await asyncio.to_thread(_is_native_terminal_session, conv):
+                    return
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+                from omnigent.server.schemas import SessionLaunchedModelEvent
+
+                live_conv = (
+                    await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    if callable(getattr(conversation_store, "get_conversation", None))
+                    else None
+                )
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                live_labels = live_conv.labels if live_conv is not None else conv.labels
+                current_launched = live_labels.get(LAUNCHED_MODEL_LABEL)
+                changed = False
+                if dispatched_model is not None and current_launched != dispatched_model:
+                    set_labels = getattr(conversation_store, "set_labels", None)
+                    if callable(set_labels):
+                        await asyncio.to_thread(
+                            set_labels, session_id, {LAUNCHED_MODEL_LABEL: dispatched_model}
+                        )
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                            conv.labels[LAUNCHED_MODEL_LABEL] = dispatched_model
+                        changed = True
+                elif dispatched_model is None and LAUNCHED_MODEL_LABEL in live_labels:
+                    delete_label = getattr(conversation_store, "delete_label", None)
+                    if callable(delete_label):
+                        await asyncio.to_thread(delete_label, session_id, LAUNCHED_MODEL_LABEL)
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                            conv.labels.pop(LAUNCHED_MODEL_LABEL, None)
+                        changed = True
+                if changed and _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                    session_stream.publish(
+                        session_id,
+                        SessionLaunchedModelEvent(
+                            type="session.launched_model",
+                            conversation_id=session_id,
+                            launched=dispatched_model,
+                        ).model_dump(),
+                    )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "launched_model: failed to persist launched model for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        finally:
+            if not lock.locked() and _LAUNCHED_MODEL_LOCKS.get(session_id) is lock:
+                _LAUNCHED_MODEL_LOCKS.pop(session_id, None)
+
+    task = asyncio.create_task(_write(), name=f"launched-model-{session_id}-{effective_seq}")
+    _LAUNCHED_MODEL_TASKS.add(task)
+    task.add_done_callback(_LAUNCHED_MODEL_TASKS.discard)
+    return task
 
 
 async def _stamp_routing_decision_label(

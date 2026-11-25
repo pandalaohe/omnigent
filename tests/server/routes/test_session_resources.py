@@ -9018,6 +9018,7 @@ async def test_relay_persists_harness_reported_model(
                 "type": "session.model",
                 "conversation_id": session_id,
                 "model": "claude-opus-4-8",
+                "reported": True,
             }
         ]
     )

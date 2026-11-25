@@ -1493,6 +1493,7 @@ class _CodexNativeLaunchConfig:
     parent_session_id: str | None = None
     bridge_id: str | None = None
     terminal_generation: NativeTerminalGeneration | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1542,6 +1543,7 @@ class _PiNativeLaunchConfig:
     model_override: str | None = None
     reasoning_effort: str | None = None
     native_usage_baseline: dict[str, int | float] | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2149,6 +2151,13 @@ async def _pi_native_launch_config(
             and cost >= 0
         ):
             native_usage_baseline["cumulative_cost_usd"] = cost
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
     return _PiNativeLaunchConfig(
         parent_session_id=snapshot.get("parent_session_id")
         if isinstance(snapshot.get("parent_session_id"), str)
@@ -2165,6 +2174,7 @@ async def _pi_native_launch_config(
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
         native_usage_baseline=native_usage_baseline,
+        launched_model=launched_model,
     )
 
 
@@ -2333,6 +2343,13 @@ async def _codex_native_launch_config(
         harness_override=_harness_override if isinstance(_harness_override, str) else None,
         labels=labels if isinstance(labels, dict) else None,
     )
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
     runner_id = snapshot.get("runner_id")
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
@@ -2356,6 +2373,7 @@ async def _codex_native_launch_config(
             labels if isinstance(labels, dict) else {},
             runner_id if isinstance(runner_id, str) else None,
         ),
+        launched_model=launched_model,
     )
 
 
@@ -4091,6 +4109,12 @@ async def _auto_create_pi_terminal(
         "Auto-created pi terminal for session %s with extension %s",
         session_id,
         pi_extension,
+    )
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _arg_value(pi_args, "--model"),
+        current_launched=launch_config.launched_model,
     )
 
     if server_client is not None and ensure_comment_relay is not None:
@@ -7371,6 +7395,12 @@ async def _auto_create_codex_terminal(
             server_client,
             expected_model_override=pick_to_reset,
         )
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _codex_launch.model,
+        current_launched=launch_config.launched_model,
+    )
     if model_reset_notice is not None:
         await _post_native_launch_notice(
             session_id=session_id,
@@ -10499,6 +10529,96 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+_BACKGROUND_LAUNCHED_MODEL_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _record_launched_model(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+    *,
+    current_launched: str | None = None,
+) -> None:
+    """Record the concrete model a native terminal actually launched with."""
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
+        return
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"labels": {LAUNCHED_MODEL_LABEL: value}},
+            params={"include_usage": "false"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except (httpx.HTTPError, RuntimeError):
+        _logger.debug(
+            "native terminal: could not record launched model for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _schedule_launched_model_record(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+    *,
+    current_launched: str | None = None,
+) -> asyncio.Task[None] | None:
+    """Schedule ``_record_launched_model`` off envelope terminal startup."""
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
+        return None
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return None
+    task = asyncio.create_task(
+        _record_launched_model(
+            session_id,
+            server_client,
+            model,
+            current_launched=current_launched,
+        ),
+        name=f"native-launched-model-{session_id}",
+    )
+    _BACKGROUND_LAUNCHED_MODEL_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_LAUNCHED_MODEL_TASKS.discard)
+    return task
+
+
+def _arg_value(args: Sequence[str], flag: str) -> str | None:
+    """Return the last value passed for *flag* (``--flag val`` or ``--flag=val``)."""
+    prefix = f"{flag}="
+    found: str | None = None
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
+        if token == flag and idx + 1 < len(args):
+            found = args[idx + 1]
+            idx += 2
+            continue
+        if token.startswith(prefix):
+            val = token[len(prefix) :]
+            if val:
+                found = val
+        idx += 1
+    return found
+
+
 async def _clear_session_model_override(
     session_id: str,
     server_client: httpx.AsyncClient,
@@ -11520,6 +11640,24 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    effective_claude_model = _arg_value(launch_args, "--model") or launch_model
+    current_claude_launched = (launch_metadata.labels or {}).get(LAUNCHED_MODEL_LABEL)
+    if session_init is not None:
+        _schedule_launched_model_record(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
+    else:
+        await _record_launched_model(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
     if unserved_pick is not None:
         await _post_native_launch_notice(
             session_id=session_id,

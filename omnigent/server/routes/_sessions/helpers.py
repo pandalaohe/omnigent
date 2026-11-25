@@ -3491,8 +3491,9 @@ async def _persist_external_model_change(
         type="session.model",
         conversation_id=session_id,
         model=model,
+        reported=True,
     )
-    session_stream.publish(session_id, event.model_dump())
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
     if body.data.get("confirmed") is True:
         await _persist_agy_model_notice(session_id, conv, conversation_store, model)
 
@@ -6140,10 +6141,13 @@ class _RunnerForwardResult:
     :param status_code: Runner response status, e.g. ``204``.
     :param body: Runner response body text. Empty string when the runner
         returns no body.
+    :param model_applied: ``True`` only when the runner explicitly confirmed
+        that a live ``model_change`` took effect on the harness.
     """
 
     status_code: int
     body: str
+    model_applied: bool = False
 
 
 def _require_external_status_forward(
@@ -9358,7 +9362,11 @@ async def _forward_session_change_to_runner_impl(
             resp.text,
             extra={"session_id": session_id},
         )
-    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+    return _RunnerForwardResult(
+        status_code=resp.status_code,
+        body=resp.text,
+        model_applied=resp.headers.get("X-Omnigent-Model-Applied", "").lower() == "true",
+    )
 
 
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
@@ -13290,7 +13298,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         ACP_SESSION_MODE_LABEL_KEY,
         ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     )
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
     from omnigent.stores.conversation_store import _may_collate_to
+
+    if any(_may_collate_to(key, LAUNCHED_MODEL_LABEL, prefix=False) for key in labels):
+        raise OmnigentError(
+            f"label {LAUNCHED_MODEL_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     if any(
         _may_collate_to(key, reserved, prefix=False)
@@ -14842,8 +14857,15 @@ def _child_session_summary_from_conversation(
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     from omnigent.server.child_keep_warm import warm_state_reason_for_harness
+    from omnigent.server.model_resolution import session_model_display
     from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
 
+    model_display = session_model_display(
+        conv.labels,
+        conv.model_override,
+        conv.reported_model,
+        harness=harness,
+    )
     placement = _effective_placement(conv, inherited or Placement(None, None, None))
     return ChildSessionSummary(
         id=conv.id,
@@ -14887,6 +14909,9 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        requested=model_display.requested,
+        launched=model_display.launched,
+        running=model_display.running,
         routing_decision_id=routing_decision_id,
         warm_state=_warm_state_for_child(
             conv, harness=harness, busy=busy, cold_after_s=cold_after_s

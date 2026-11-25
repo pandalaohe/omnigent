@@ -78,6 +78,15 @@ import {
 } from "@/lib/localElicitationResolutions";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
+  clearStreamModelDisplay,
+  preserveStreamModelDisplay,
+  recordStreamLaunchedModel,
+  recordStreamReportedModel,
+  recordStreamRequestedModel,
+  streamModelDisplayRevisions,
+  type StreamModelDisplayRevisions,
+} from "@/lib/modelReference";
+import {
   ApiError,
   approve as approveElicitation,
   bindOnlyOnlineRunner,
@@ -1637,6 +1646,7 @@ const streamTurnEdgeRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => {
   streamEventRevisions.delete(id);
   streamTurnEdgeRevisions.delete(id);
+  clearStreamModelDisplay(id);
 });
 conversationRegistry.subscribeDisposed(clearArtifactOpenRequest);
 
@@ -4166,6 +4176,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
       const permissionBeforeFetch = get().codexPermissionReadbacks[conversationId];
+      const modelDisplayBeforeFetch = streamModelDisplayRevisions(conversationId);
       let updated;
       try {
         const session = await queryClient.fetchQuery({
@@ -4174,7 +4185,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           staleTime: Infinity,
           retry: false,
         });
-        cacheSessionSnapshot(session, permissionBeforeFetch);
+        cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
         // Harness has no effort control: undo the optimistic session-scoped write
         // so this conversation doesn't claim an effort the server will never hold.
         // SDK harnesses carry no wrapper label, so resolve their declared effort
@@ -4232,6 +4243,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }, 30_000);
       }
       const pick = trackLiveSettingPick(conversationId, "modelOverride", previous);
+      const permissionBeforeFetch = get().codexPermissionReadbacks[conversationId];
+      const modelDisplayBeforeFetch = streamModelDisplayRevisions(conversationId);
       let session;
       try {
         session = await updateSession(conversationId, { modelOverride: model });
@@ -4256,6 +4269,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The override belongs to the session that was PATCHed, so apply it there
       // even if the user has since switched away.
       setterFor(conversationId)({ sessionModelOverride: canonical });
+      recordStreamRequestedModel(conversationId, session.requested ?? null);
+      if (
+        streamModelDisplayRevisions(conversationId).launched === modelDisplayBeforeFetch.launched &&
+        session.launched !== undefined
+      ) {
+        recordStreamLaunchedModel(conversationId, session.launched ?? null);
+      }
+      cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
       // Carry-over memory (K3): an accepted model change records the
       // session's canonical triple; a failed PATCH never reaches here.
       recordSessionCallingLast(session);
@@ -4286,6 +4307,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       costControlModeOverride: mode,
       ...(clearModel ? { sessionModelOverride: null } : {}),
     });
+    const permissionBeforeFetch = get().codexPermissionReadbacks[conversationId];
+    const modelDisplayBeforeFetch = streamModelDisplayRevisions(conversationId);
     try {
       const session = await updateSession(conversationId, {
         costControlModeOverride: mode,
@@ -4295,6 +4318,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         costControlModeOverride: session.costControlModeOverride ?? null,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
+      if (clearModel) {
+        recordStreamRequestedModel(conversationId, session.requested ?? null);
+      }
+      cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
     } catch (err) {
       // Roll back so neither control claims a state the server never persisted.
       // A disposed entry makes this a no-op, which is the only case worth
@@ -4969,6 +4996,7 @@ function cacheCodexPermissionReport(id: string, encoded: string, stale = false):
 function cacheSessionSnapshot(
   session: Session,
   before: CodexPermissionCachedReport | undefined,
+  modelDisplayBeforeFetch?: StreamModelDisplayRevisions,
 ): void {
   const report = useChatStore.getState().codexPermissionReadbacks[session.id];
   let snapshot = session;
@@ -4983,6 +5011,7 @@ function cacheSessionSnapshot(
       cacheCodexPermissionReport(session.id, encoded, report?.encoded === encoded && report.stale);
     }
   }
+  snapshot = preserveStreamModelDisplay(snapshot, modelDisplayBeforeFetch);
   queryClient?.setQueryData(["session", session.id], snapshot);
   followSupersededSession(session.id, snapshot.labels?.["omnigent.succeeded_by"]);
 }
@@ -5387,6 +5416,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
       .map((block) => [block.elicitationId, block]),
   );
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(id);
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -5403,7 +5433,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
   // showing a card that was already answered elsewhere. Gating on the visible
   // conversation made a background reconcile fetch the snapshot and discard it.
   if (isConversationDisposed(id)) return;
-  cacheSessionSnapshot(session, permissionBeforeFetch);
+  cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
   const stillPending = new Set(
     (session.pendingElicitations ?? [])
       .map((e) => (typeof e.elicitation_id === "string" ? e.elicitation_id : null))
@@ -5714,13 +5744,14 @@ async function refreshSessionBinding(id: string): Promise<void> {
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch?.startup;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(id);
   let session: Session;
   try {
     session = await getIndependentSessionMetadata(id);
   } catch {
     return;
   }
-  cacheSessionSnapshot(session, permissionBeforeFetch);
+  cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
   void queryClient?.invalidateQueries({ queryKey: ["skills", id] });
   // Apply to the conversation this refresh was for, not whichever is on screen:
   // an agent switch in a backgrounded conversation must still re-derive its
@@ -5758,6 +5789,8 @@ async function refreshFailedInputs(id: string): Promise<void> {
   startupReadCount += 1;
   const read = startupReadCount;
   startupReads.set(id, read);
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(id);
   let session: Session | null = null;
   try {
     session = await getSessionSlim(id);
@@ -5768,7 +5801,7 @@ async function refreshFailedInputs(id: string): Promise<void> {
   startupReads.delete(id);
   if (session === null) return;
   const fresh = session;
-  queryClient?.setQueryData(["session", id], fresh);
+  cacheSessionSnapshot(fresh, permissionBeforeFetch, modelDisplayBeforeFetch);
   setterFor(id)((s) => {
     const startup = startupInputsPatch(fresh);
     // Only the startup fields: live events stay newer than this read for the
@@ -5966,6 +5999,7 @@ async function bindStream(
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch.startup;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(id);
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -5988,7 +6022,7 @@ async function bindStream(
       ),
     ]);
     if (isConversationDisposed(id)) return;
-    cacheSessionSnapshot(session, permissionBeforeFetch);
+    cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -7256,6 +7290,7 @@ async function reconcileOnReconnect(
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks, id);
   const todosAtReconnectStart = get().todos;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(id);
   const pendingAtReconnectStart = new Set(get().pendingUserMessages.map((p) => p.tempId));
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
@@ -7271,7 +7306,7 @@ async function reconcileOnReconnect(
     return "failed";
   }
   if (stale()) return "skipped";
-  cacheSessionSnapshot(session, permissionBeforeFetch);
+  cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
   // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
@@ -9563,6 +9598,7 @@ async function refetchRunnerBackedSessionState(
   const launchBeforeFetch = mcpStartupBeforeSnapshot(conversationId, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch?.startup;
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[conversationId];
+  const modelDisplayBeforeFetch = streamModelDisplayRevisions(conversationId);
   let session: Session;
   try {
     if (options.applyBindingPatch === true) {
@@ -9580,7 +9616,7 @@ async function refetchRunnerBackedSessionState(
       session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
     }
     const reportBeforeMerge = useChatStore.getState().codexPermissionReadbacks[conversationId];
-    cacheSessionSnapshot(session, permissionBeforeFetch);
+    cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
     if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length === 0) {
       // The event can race the bind snapshot's in-flight query. Once that
       // request settles, issue a second read instead of accepting its stale [].
@@ -9589,8 +9625,9 @@ async function refetchRunnerBackedSessionState(
         reportBeforeMerge === permissionBeforeFetch
           ? useChatStore.getState().codexPermissionReadbacks[conversationId]
           : permissionBeforeFetch;
+      const modelDisplayBeforeRetry = streamModelDisplayRevisions(conversationId);
       session = await getSessionSlim(conversationId);
-      cacheSessionSnapshot(session, permissionBeforeRetry);
+      cacheSessionSnapshot(session, permissionBeforeRetry, modelDisplayBeforeRetry);
     }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
@@ -10016,9 +10053,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // opened before provisioning, without depending on a browser send.
         const permissionBeforeFetch =
           useChatStore.getState().codexPermissionReadbacks[event.conversationId];
+        const modelDisplayBeforeFetch = streamModelDisplayRevisions(event.conversationId);
         void getSessionSlim(event.conversationId)
           .then((session) => {
-            cacheSessionSnapshot(session, permissionBeforeFetch);
+            cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
             applyToConversation({ sessionHostId: session.hostId ?? null });
           })
           .catch(() => {});
@@ -10115,6 +10153,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         sessionModelSeeded: false,
         pendingModelChange: null,
       });
+      if (event.reported === true) {
+        recordStreamReportedModel(event.conversationId, event.model);
+        queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+          session ? { ...session, running: event.model } : session,
+        );
+      }
+      return;
+    case "session_launched_model":
+      recordStreamLaunchedModel(event.conversationId, event.launched);
+      queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+        session ? { ...session, launched: event.launched } : session,
+      );
       return;
     case "error":
       if (event.error.code === "pi_compact_unavailable") settleLegacyPiCompact();

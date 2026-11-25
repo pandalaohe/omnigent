@@ -13438,7 +13438,10 @@ def create_runner_app(
                         allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
-                        return JSONResponse({"codex_settings_applied": True})
+                        return JSONResponse(
+                            {"codex_settings_applied": True, "model_applied": True},
+                            headers={"X-Omnigent-Model-Applied": "true"},
+                        )
                     return response
                 if harness == "antigravity-native":
                     effort = body.get("effort")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -17,6 +17,7 @@ from omnigent.member_snapshot import (
     encode_member_entry,
     parse_member_entry,
 )
+from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_reference import (
     ALIASES_NAMESPACE,
     ModelResolution,
@@ -28,11 +29,75 @@ from omnigent.models.model_reference import (
 from omnigent.server.json_labels import decode_json_labels, encode_json_labels
 
 RESOLUTION_LABEL = "omnigent.model_resolution"
+LAUNCHED_MODEL_LABEL = "omnigent.launched_model"
 _logger = logging.getLogger(__name__)
 
 
 def resolution_labels(notes: Sequence[dict[str, str]]) -> dict[str, str]:
     return encode_json_labels(RESOLUTION_LABEL, list(notes)) if notes else {}
+
+
+def _is_member_setting(note: Mapping[str, Any]) -> bool:
+    setting = note.get("setting")
+    return isinstance(setting, str) and setting.startswith("member:")
+
+
+def _resolution_label_keys(labels: Mapping[str, str]) -> list[str]:
+    return [
+        key for key in labels if key == RESOLUTION_LABEL or key.startswith(f"{RESOLUTION_LABEL}.")
+    ]
+
+
+def clear_session_resolution_labels(
+    labels: Mapping[str, str] | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Drop session-level resolution notes while preserving member:* notes.
+
+    :returns: ``(labels_to_set, keys_to_delete)`` to persist the cleaned notes.
+    """
+    if not labels:
+        return {}, []
+    existing_keys = _resolution_label_keys(labels)
+    if not existing_keys:
+        return {}, []
+    existing_notes = notes_from_labels(labels)
+    remaining = [note for note in existing_notes if _is_member_setting(note)]
+    if len(remaining) == len(existing_notes) and existing_notes:
+        return {}, []
+    encoded = resolution_labels(remaining)
+    to_delete = [key for key in existing_keys if key not in encoded]
+    return encoded, to_delete
+
+
+def mutate_session_resolution_notes(
+    conversations: Any,
+    session_id: str,
+    transform: Callable[[list[dict[str, str]]], list[dict[str, str]]],
+) -> dict[str, str]:
+    """Atomically rewrite the ``omnigent.model_resolution*`` label group.
+
+    Uses ``conversations.mutate_label_group`` so chunk deletes and upserts land
+    in one serialized transaction against live member:* notes, preventing half-
+    deleted chunk manifests or clobbered concurrent member updates.
+    """
+    from omnigent.stores.conversation_store import LabelGroupChange
+
+    mutate_group = getattr(conversations, "mutate_label_group", None)
+    if callable(mutate_group):
+
+        def _change(current: dict[str, str]) -> LabelGroupChange:
+            existing_keys = _resolution_label_keys(current)
+            existing_notes = notes_from_labels(current)
+            next_notes = transform(list(existing_notes))
+            if next_notes == existing_notes and (bool(existing_notes) or not existing_keys):
+                return LabelGroupChange(upserts={}, deletes=set())
+            encoded = resolution_labels(next_notes)
+            deletes = {key for key in existing_keys if key not in encoded}
+            return LabelGroupChange(upserts=encoded, deletes=deletes)
+
+        result = mutate_group(session_id, RESOLUTION_LABEL, _change)
+        return dict(result) if isinstance(result, Mapping) else {}
+    return {}
 
 
 def usable_catalog(record: Mapping[str, Any] | None) -> frozenset[str] | None:
@@ -172,8 +237,10 @@ async def resolve_session_model(
     saved = conversation.model_override or await asyncio.to_thread(
         _resolve_llm_model, conversation, agent_store=agents, agent_cache=agent_cache
     )
+    session_resolved_model: str | None = None
     if saved and conversation.host_id:
         result = context.resolve(harness, saved, "session")
+        session_resolved_model = result.model
         if result.model != saved:
             await asyncio.to_thread(
                 conversations.update_conversation, conversation.id, model_override=result.model
@@ -215,16 +282,86 @@ async def resolve_session_model(
                     code=ErrorCode.INVALID_INPUT,
                 )
             labels[key] = encoded
-    notes = notes_from_labels(conversation.labels)
-    for current in contexts.values():
-        for note in current.notes:
-            if note.payload() not in notes:
-                notes.append(note.payload())
-    if any(current.notes for current in contexts.values()):
-        labels.update(resolution_labels(notes))
+    new_session_notes = [
+        note.payload() for note in context.notes if not note.setting.startswith("member:")
+    ]
+    new_member_notes = [
+        note.payload()
+        for current in contexts.values()
+        for note in current.notes
+        if note.setting.startswith("member:")
+    ]
+    has_session_rewrite = any(
+        note.get("saved", "").strip() != note.get("model", "").strip()
+        for note in new_session_notes
+    )
+
+    def _merge_notes(existing_notes: list[dict[str, str]]) -> list[dict[str, str]]:
+        member_notes = [note for note in existing_notes if _is_member_setting(note)]
+        for note_payload in new_member_notes:
+            if note_payload not in member_notes:
+                member_notes.append(note_payload)
+        existing_session = [note for note in existing_notes if not _is_member_setting(note)]
+        if has_session_rewrite:
+            session_notes = list(new_session_notes)
+        elif session_resolved_model is not None:
+            # Keep active rename provenance (A -> B) through same-selection
+            # resumes and catalog misses (B -> B); drop notes from older picks.
+            session_notes = [
+                note
+                for note in existing_session
+                if isinstance(note.get("model"), str)
+                and note["model"].strip() == session_resolved_model
+                and (
+                    not new_session_notes
+                    or (
+                        isinstance(note.get("saved"), str)
+                        and note["saved"].strip() != session_resolved_model
+                    )
+                )
+            ]
+            for note_payload in new_session_notes:
+                if note_payload not in session_notes:
+                    session_notes.append(note_payload)
+        else:
+            session_notes = list(existing_session)
+            for note_payload in new_session_notes:
+                if note_payload not in session_notes:
+                    session_notes.append(note_payload)
+        return [*session_notes, *member_notes]
+
     if labels:
         await asyncio.to_thread(conversations.set_labels, conversation.id, labels)
         conversation.labels.update(labels)
+    if callable(getattr(conversations, "mutate_label_group", None)):
+        updated_group = await asyncio.to_thread(
+            mutate_session_resolution_notes, conversations, conversation.id, _merge_notes
+        )
+        for stale_key in _resolution_label_keys(conversation.labels):
+            if stale_key not in updated_group:
+                conversation.labels.pop(stale_key, None)
+        conversation.labels.update(updated_group)
+    else:
+        existing_notes = notes_from_labels(conversation.labels)
+        merged = _merge_notes(existing_notes)
+        if merged != existing_notes or any(current.notes for current in contexts.values()):
+            encoded_notes = resolution_labels(merged)
+            fallback_labels: dict[str, str] = dict(encoded_notes)
+            stale_keys = [
+                key
+                for key in _resolution_label_keys(conversation.labels)
+                if key not in encoded_notes
+            ]
+            delete_label = getattr(conversations, "delete_label", None)
+            for stale_key in stale_keys:
+                if callable(delete_label):
+                    await asyncio.to_thread(delete_label, conversation.id, stale_key)
+                    conversation.labels.pop(stale_key, None)
+                else:
+                    fallback_labels[stale_key] = ""
+            if fallback_labels:
+                await asyncio.to_thread(conversations.set_labels, conversation.id, fallback_labels)
+                conversation.labels.update(fallback_labels)
     return conversation
 
 
@@ -244,3 +381,62 @@ async def resolve_app_session_model(app: Any, conversation: Any) -> Any:
 def notes_from_labels(labels: Mapping[str, str]) -> list[dict[str, str]]:
     notes = decode_json_labels(labels, RESOLUTION_LABEL)
     return [note for note in notes if isinstance(note, dict)] if isinstance(notes, list) else []
+
+
+@dataclass(frozen=True)
+class SessionModelDisplay:
+    """Requested, launched, and running model ids for session and child info."""
+
+    requested: str | None = None
+    launched: str | None = None
+    running: str | None = None
+
+
+def session_model_display(
+    labels: Mapping[str, str] | None,
+    model_override: str | None,
+    reported_model: str | None,
+    *,
+    harness: str | None = None,
+) -> SessionModelDisplay:
+    """Derive requested, launched, and running models for one session.
+
+    Omits any field whose source is absent or unreliable for *harness*:
+    ``launched`` is read only from ``omnigent.launched_model`` (stamped when
+    a harness launch or confirmed live apply actually uses that model) and
+    remains omitted for ``antigravity-native``; old sessions without
+    ``reported_model`` or ``omnigent.launched_model`` omit those fields.
+    """
+    override = (
+        model_override.strip()
+        if isinstance(model_override, str) and model_override.strip()
+        else None
+    )
+    running = concrete_reported_model(reported_model)
+    requested = override
+    if override is not None and labels:
+        for note in reversed(notes_from_labels(labels)):
+            if _is_member_setting(note):
+                continue
+            raw_saved = note.get("saved")
+            raw_model = note.get("model")
+            if (
+                isinstance(raw_saved, str)
+                and isinstance(raw_model, str)
+                and raw_model.strip() == override
+                and raw_saved.strip()
+                and raw_saved.strip() != override
+            ):
+                requested = raw_saved.strip()
+                break
+    raw_launched = labels.get(LAUNCHED_MODEL_LABEL) if labels else None
+    launched = (
+        None
+        if harness == "antigravity-native"
+        else (
+            raw_launched.strip()
+            if isinstance(raw_launched, str) and raw_launched.strip()
+            else None
+        )
+    )
+    return SessionModelDisplay(requested=requested, launched=launched, running=running)
