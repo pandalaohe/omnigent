@@ -2054,9 +2054,7 @@ def test_windows_native_shell_keeps_conservative_nested_bash_paths(shell, tier):
     )
 
 
-@pytest.mark.parametrize(
-    "path", ["/c/Windows/x", "/c/Users/example/x", "/tmp/x", "~/x", "$HOME/x"]
-)
+@pytest.mark.parametrize("path", ["/c/Windows/x", "/c/Users/sample/x", "/tmp/x", "~/x", "$HOME/x"])
 def test_windows_git_bash_does_not_guess_msys_write_paths(path):
     host = windows_host(
         shell="bash", environment={"SystemRoot": r"C:\Windows", "HOME": r"C:\work\sample"}
