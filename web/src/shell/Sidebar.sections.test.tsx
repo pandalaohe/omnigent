@@ -668,6 +668,26 @@ describe("Sidebar sections", () => {
     );
   }, 15_000);
 
+  it("keeps a pinned family together when the pin response promotes its representative first", () => {
+    const previous = { id: "family", representative_id: "a", pinned: true };
+    const promoted = { ...previous, representative_id: "b" };
+    mockConversations([
+      conversation("a", { family: previous, archived: true }),
+      conversation("b", { family: previous }),
+      conversation("c", { family: previous }),
+    ]);
+    pinnedRef.current = [
+      conversation("b", { family: promoted }),
+      conversation("c", { family: promoted }),
+    ];
+    renderSidebar();
+
+    const pinned = within(sectionOf("Pinned"));
+    expect(isBefore(pinned.getByText("b"), pinned.getByText("c"))).toBe(true);
+    expect(pinned.queryByText("a")).toBeNull();
+    expect(pinned.getByRole("button", { name: "Collapse session family" })).toBeVisible();
+  });
+
   it("returns filed and unfiled pins to their home rows when Favorites is removed", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));

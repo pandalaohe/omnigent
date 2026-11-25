@@ -80,6 +80,7 @@ const {
   fetchProjectSessionIdsMock,
   conversationsRef,
   pinnedIdsRef,
+  pinFilterHonoredRef,
   projectSessionsMock,
   projectSessionsLoadingRef,
   projectSessionsNextPage,
@@ -109,6 +110,7 @@ const {
   // key, which the one-time migration clears on mount) so a seeded pin survives
   // the first render. `seedPins` sets it; the toggle mock mutates it.
   pinnedIdsRef: { current: [] as string[] },
+  pinFilterHonoredRef: { current: true },
   // Per-project override: when a test sets projectSessionsMock[name], the folder
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
@@ -159,7 +161,7 @@ vi.mock("@/hooks/useConversations", async () => {
       return {
         data: {
           conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
-          filterHonored: true,
+          filterHonored: pinFilterHonoredRef.current,
         },
         isSuccess: true,
       };
@@ -394,6 +396,7 @@ beforeEach(() => {
   projectSessionsLoadingRef.current = false;
   projectSessionsNextPage.current = {};
   pinnedIdsRef.current = [];
+  pinFilterHonoredRef.current = true;
   systemStatusSummaryRef.current = undefined;
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -502,26 +505,31 @@ describe("Sidebar scroll divider", () => {
 });
 
 describe("Sidebar session list", () => {
-  it("keeps a labeled shared pin in its home when shared pins are excluded", () => {
-    mockConversations([
-      conv("owned_pin", "Claude Code", { labels: { [PINNED_LABEL_KEY]: "1" } }),
-      conv("shared_pin", "Claude Code", {
-        owner: "other@example.com",
-        labels: { [PINNED_LABEL_KEY]: "2" },
-      }),
-    ]);
-    seedPins(["owned_pin"]);
-    renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
-      ...sidebarConfig,
-      pinsIncludeShared: false,
-    });
-    selectSessionFilter("all");
+  it.each([true, false])(
+    "keeps an excluded shared pin in its home (authoritative=%s)",
+    (authoritative) => {
+      pinFilterHonoredRef.current = authoritative;
+      mockConversations([
+        conv("owned_pin", "Claude Code", { labels: { [PINNED_LABEL_KEY]: "1" } }),
+        conv("shared_pin", "Claude Code", {
+          owner: "other@example.com",
+          labels: { [PINNED_LABEL_KEY]: "2" },
+        }),
+      ]);
+      seedPins(["owned_pin"]);
+      renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+        ...sidebarConfig,
+        pinsIncludeShared: false,
+      });
+      selectSessionFilter("all");
 
-    const pinned = screen.getByText("Pinned").closest("section")!;
-    expect(within(pinned).getByText("owned_pin")).toBeInTheDocument();
-    expect(within(pinned).queryByText("shared_pin")).toBeNull();
-    expect(screen.getByText("shared_pin")).toBeInTheDocument();
-  });
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByText("owned_pin")).toBeInTheDocument();
+      expect(within(pinned).queryByText("shared_pin")).toBeNull();
+      const shared = screen.getByText("shared_pin").closest("li")!;
+      expect(within(shared).queryByLabelText("Unpin conversation")).toBeNull();
+    },
+  );
 
   it("does not mark sessions shared with the viewer, in the list or under Pinned", () => {
     mockConversations([

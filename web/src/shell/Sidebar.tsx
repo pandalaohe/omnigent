@@ -2896,20 +2896,36 @@ function ConversationList({
     [draftBackfills],
   );
   const authoritativeRows = useMemo(() => {
+    const pinRows = pinnedQuery.data?.filterHonored ? pinnedConversations : EMPTY_CONVERSATIONS;
+    const pinnedSessions = new Map(pinRows.map((row) => [row.id, row]));
+    const pinnedFamilies = new Map(
+      pinRows.flatMap(({ family }) => (family ? [[family.id, family] as const] : [])),
+    );
     const listRows = dedupeConversationsById([
       ...pagedConversations,
       ...pinnedConversations,
       ...(openSessionRow ? [openSessionRow] : []),
     ]);
     return dedupeConversationsById([
-      ...listRows.map((row) =>
-        row.family
-          ? row
-          : (draftRows.find((detail) => detail.id === row.id && detail.family) ?? row),
-      ),
+      ...listRows.map((row) => {
+        // The pin response can already know the next representative after
+        // archive while the normal list still carries the old family shape.
+        const family =
+          pinnedSessions.get(row.id)?.family ??
+          (row.family ? pinnedFamilies.get(row.family.id) : undefined);
+        if (family) return { ...row, family };
+        if (row.family) return row;
+        return draftRows.find((detail) => detail.id === row.id && detail.family) ?? row;
+      }),
       ...draftRows,
     ]);
-  }, [pagedConversations, pinnedConversations, openSessionRow, draftRows]);
+  }, [
+    pagedConversations,
+    pinnedConversations,
+    pinnedQuery.data?.filterHonored,
+    openSessionRow,
+    draftRows,
+  ]);
   const unavailableDraftRows = useMemo(
     () =>
       new Set([
@@ -6786,7 +6802,9 @@ function ConversationSection({
 }) {
   const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   const pinnedSet = new Set(pinnedConversationIds);
-  const pinsAuthoritative = useSidebarData().pinned.data?.filterHonored === true;
+  const { pinned, pinsIncludeShared } = useSidebarData();
+  const pinsAuthoritative = pinned.data?.filterHonored === true;
+  const viewerId = useViewerId();
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
@@ -6948,7 +6966,10 @@ function ConversationSection({
                     inActiveGrid={gridMembers.has(conv.id)}
                     gridSelected={conv.id === grids?.selectedSessionId}
                     gridsEnabled={grids?.enabled ?? false}
-                    isPinned={isSessionPinned(conv, pinnedSet, pinsAuthoritative)}
+                    isPinned={
+                      (pinsIncludeShared || isOwnedByViewer(conv, viewerId)) &&
+                      isSessionPinned(conv, pinnedSet, pinsAuthoritative)
+                    }
                     shortcutSlot={meta.canonical ? sessionShortcutSlots?.get(conv.id) : undefined}
                     onClick={onRowClick}
                     onTogglePinned={onTogglePinned}
