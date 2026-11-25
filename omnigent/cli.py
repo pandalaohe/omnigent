@@ -6593,6 +6593,123 @@ def _upgrade_to_nightly(
         )
 
 
+def _upgrade_distribution_install(
+    info: _InstalledWheelInfo,
+    *,
+    repo: str,
+    current: str,
+    check_only: bool,
+    force: bool,
+    extra_overrides: tuple[str, ...],
+    target_version: str | None,
+    dry_run: bool,
+) -> None:
+    """Upgrade a non-VCS stamped distribution install from its GitHub releases."""
+    from omnigent.distribution import DISTRIBUTION_NAME
+    from omnigent.update_check import (
+        _UPGRADE_INDEX_TIMEOUT_SECONDS,
+        _build_upgrade_suggestion,
+        _is_newer_distribution_version,
+        _probe_distribution_version,
+        _run_upgrade_command,
+        _upgrade_failure_message,
+        _uv_tool_receipt_path,
+        fetch_latest_distribution_release,
+    )
+
+    if target_version:
+        target = target_version.removeprefix("v")
+        click.echo(f"Targeting {DISTRIBUTION_NAME} {target}.")
+    else:
+        status, latest = fetch_latest_distribution_release(
+            repo, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
+        )
+        if status == "error":
+            raise click.ClickException(
+                f"Couldn't reach https://github.com/{repo}/releases.atom to check for a "
+                f"newer {DISTRIBUTION_NAME} release. Check your connection and try again."
+            )
+        if status == "empty" or latest is None:
+            click.echo(f"No published {DISTRIBUTION_NAME} releases found yet.")
+            return
+        if not _is_newer_distribution_version(latest, current):
+            click.echo(f"{DISTRIBUTION_NAME} is up to date ({current}).")
+            return
+        target = latest
+        click.echo(f"A new {DISTRIBUTION_NAME} release is available: {current} → {target}.")
+
+    if check_only:
+        raise SystemExit(1)
+
+    target_vcs_url = f"git+https://github.com/{repo}.git@v{target}"
+    if info.detected_installer == "pip":
+        click.echo(
+            "omnigent was installed with pip, and pip does not record which extras "
+            f"were requested. `{cli_invocation(name='omni')} upgrade` cannot preserve them "
+            "safely, so you should upgrade manually:\n\n"
+            f"    pip install --force-reinstall '{target_vcs_url}'\n"
+            "    # or, if you need extras:\n"
+            f"    pip install --force-reinstall '{target_vcs_url}#egg=omnigent[your,extras,here]'"
+        )
+        raise SystemExit(0)
+    if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
+        manual_extras = f"{target_vcs_url}#egg=omnigent[your,extras,here]"
+        click.echo(
+            "omnigent was installed with `uv pip`, not `uv tool install`. "
+            "`uv pip` does not record which extras were requested, so "
+            f"`{cli_invocation(name='omni')} upgrade` cannot preserve them safely. "
+            "Upgrade manually:\n\n"
+            f"    uv pip install --force-reinstall '{target_vcs_url}'\n"
+            "    # or, if you need extras:\n"
+            f"    uv pip install --force-reinstall '{manual_extras}'"
+        )
+        raise SystemExit(0)
+
+    suggestion = _build_upgrade_suggestion(
+        info,
+        extra_overrides=extra_overrides,
+        target_vcs_url=target_vcs_url,
+    )
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    if dry_run:
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
+        return
+
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
+            )
+
+        new_dist = _probe_distribution_version()
+        if new_dist is None:
+            click.echo(
+                "Ran the upgrade command, but couldn't confirm the installed version. "
+                f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
+            )
+            return
+        if new_dist == target or _is_newer_distribution_version(new_dist, current):
+            click.echo(
+                f"✓ Upgraded to {DISTRIBUTION_NAME} {new_dist}. Re-run your command — the "
+                "local server will start on the new version."
+            )
+            return
+        raise click.ClickException(
+            f"The upgrade command ran but {DISTRIBUTION_NAME} is still {new_dist} "
+            f"(expected {target}). Try the command directly: {suggestion.command}"
+        )
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -6686,6 +6803,7 @@ def upgrade(
     from omnigent.update_check import (
         _UPGRADE_INDEX_TIMEOUT_SECONDS,
         _build_upgrade_suggestion,
+        _distribution_release_config,
         _find_repo_root,
         _is_newer,
         _probe_installed_distribution,
@@ -6721,11 +6839,20 @@ def upgrade(
             "This is an editable install — update it with `git pull`, "
             f"not `{cli_invocation(name='omni')} upgrade`."
         )
+    dist_cfg = _distribution_release_config()
     # Nightly channel: resolved from git tags, not the index, and applies to
     # every install shape, so it dispatches before the VCS-vs-registry split
     # (a VCS install pinned to an older nightly tag must move tags, not
     # re-pull its pinned ref).
     if nightly:
+        if dist_cfg is not None:
+            from omnigent.distribution import DISTRIBUTION_NAME
+
+            raise click.ClickException(
+                f"{DISTRIBUTION_NAME} does not publish upstream nightly builds; "
+                f"run `{cli_invocation(name='omni')} up` for the latest "
+                f"{DISTRIBUTION_NAME} release."
+            )
         _upgrade_to_nightly(
             info,
             check_only=check_only,
@@ -6757,6 +6884,19 @@ def upgrade(
 
             setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
             raise
+        return
+
+    if dist_cfg is not None:
+        _upgrade_distribution_install(
+            info,
+            repo=dist_cfg[0],
+            current=dist_cfg[1],
+            check_only=check_only,
+            force=force,
+            extra_overrides=extra_overrides,
+            target_version=target_version,
+            dry_run=dry_run,
+        )
         return
 
     # pip / ``uv pip`` do not record which extras were requested for a plain

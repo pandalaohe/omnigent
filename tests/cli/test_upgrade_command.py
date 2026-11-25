@@ -1431,3 +1431,106 @@ def test_upgrade_nightly_failure_surfaces_recovery_when_install_is_gone(
     assert "your previous install is intact" not in result.output
     assert "no longer installed" in result.output
     assert "install.sh" in result.output
+
+
+def test_upgrade_nightly_refused_for_stamped_distribution(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """Stamped distribution builds refuse ``--nightly`` without touching upstream."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query upstream nightly")),
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
+
+    assert result.exit_code != 0
+    assert "nightly" in result.output.lower()
+    assert "omni up" in result.output
+
+
+def test_upgrade_stamped_non_vcs_queries_distribution_atom_never_pypi(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """Non-VCS stamped installs check distribution releases and upgrade via its git URL."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_distribution_release",
+        lambda repo, **_k: ("ok", "0.21.0-wukong.13"),
+    )
+
+    check_res = CliRunner().invoke(cli, ["upgrade", "--check"])
+    assert check_res.exit_code == 1, check_res.output
+    assert "0.21.0-wukong.13" in check_res.output
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command", lambda cmd, _c: ran.append(cmd) or 0
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_distribution_version",
+        lambda: "0.21.0-wukong.13",
+    )
+
+    up_res = CliRunner().invoke(cli, ["upgrade"])
+    assert up_res.exit_code == 0, up_res.output
+    assert ran == [
+        f"uv tool install --reinstall-package omnigent{_UV_PY} "
+        "git+https://github.com/example-org/omnigent-dist.git@v0.21.0-wukong.13"
+    ]
+    assert "0.21.0-wukong.13" in up_res.output
+
+
+def test_upgrade_stamped_non_vcs_before_first_release_is_silent_and_never_hits_pypi(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """Empty/404 distribution feed exits 0 on ``--check`` and never falls back to PyPI."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_distribution_release",
+        lambda repo, **_k: ("empty", None),
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade", "--check"])
+    assert result.exit_code == 0, result.output
+    assert "No published" in result.output
+
+
+def test_upgrade_failure_message_stamped_points_at_distribution_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed upgrade recovery on a stamped build points at the distribution repo."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    message = _upgrade_failure_message(1, {"databricks"})
+
+    assert "omnigent.ai" not in message
+    assert (
+        "https://raw.githubusercontent.com/example-org/omnigent-dist/main/scripts/install_oss.sh"
+        in message
+    )
+    assert "--repo https://github.com/example-org/omnigent-dist.git" in message

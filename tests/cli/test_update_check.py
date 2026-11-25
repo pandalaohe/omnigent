@@ -2596,3 +2596,242 @@ def test_read_installed_wheel_info_reads_pipx_metadata(
     assert info.installer == "pip"
     assert info.detected_installer == "pipx"
     assert info.extras == ("all",)
+
+
+# ------------------------------------------------------------------
+# Distribution release checks (stamped builds, e.g. omnigent-wukong)
+# ------------------------------------------------------------------
+
+
+def _releases_atom(*tags: str, repo: str = "example-org/omnigent-dist") -> str:
+    entries = "".join(
+        f"<entry><id>tag:github.com,2008:Repository/1/{tag}</id>"
+        f'<link rel="alternate" type="text/html" href="https://github.com/{repo}/releases/tag/{tag}"/>'
+        f"<title>omnigent-dist {tag}</title></entry>"
+        for tag in tags
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'
+
+
+def test_distribution_version_comparison_strict_numeric_and_ignores_non_matching() -> None:
+    """Distribution comparator orders ``X.Y.Z-wukong.N`` numerically and ignores foreign tags."""
+    from omnigent.update_check import _is_newer_distribution_version
+
+    assert _is_newer_distribution_version("0.21.0-wukong.10", "0.21.0-wukong.9") is True
+    assert _is_newer_distribution_version("0.22.0-wukong.13", "0.21.0-wukong.12") is True
+    assert _is_newer_distribution_version("0.21.0-wukong.12", "0.21.0-wukong.12") is False
+    assert _is_newer_distribution_version("0.21.0-wukong.11", "0.21.0-wukong.12") is False
+    # Non-matching tags must never fall back to string inequality.
+    assert _is_newer_distribution_version("0.99.0", "0.21.0-wukong.12") is False
+    assert _is_newer_distribution_version("0.21.0-wukong.12", "0.99.0") is False
+
+
+def test_fetch_latest_distribution_release_parses_atom_and_picks_highest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atom parser picks the numerically highest ``-wukong.N`` tag and ignores others."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    seen: list[str] = []
+    xml = _releases_atom("v0.21.0-wukong.9", "v0.99.0", "v0.21.0-wukong.10", "v0.22.0-wukong.13")
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        seen.append(url)
+        return _FakeResp(status_code=200, content_type="application/atom+xml", text=xml)
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    status, latest = fetch_latest_distribution_release("example-org/omnigent-dist")
+
+    assert seen == ["https://github.com/example-org/omnigent-dist/releases.atom"]
+    assert status == "ok"
+    assert latest == "0.22.0-wukong.13"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (404, "Not Found"),
+        (200, _releases_atom()),
+        (200, _releases_atom("v0.21.0")),
+    ],
+)
+def test_fetch_latest_distribution_release_empty_or_404(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    body: str,
+) -> None:
+    """Before the first public release (404 or empty Atom), return ``('empty', None)``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(
+            status_code=status_code, content_type="application/atom+xml", text=body
+        ),
+    )
+
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("empty", None)
+
+
+def test_stamped_vcs_install_notifies_from_distribution_cache_without_pypi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stamped VCS install (tracking default branch) gets a once-per-release notice."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="distribution",
+            latest_version="0.21.0-wukong.13",
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.21.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-dist.git",
+            "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+
+    _run_installed_wheel_check()
+    err = _strip_rich_panel(capsys.readouterr().err)
+    assert "0.21.0-wukong.13" in err
+    assert "0.21.0-wukong.12" in err
+    assert "omni up" in err
+
+    # Second run stays quiet for the same release.
+    _run_installed_wheel_check()
+    assert capsys.readouterr().err == ""
+
+
+def test_stamped_pinned_vcs_install_notice_mentions_reinstall_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A tag-pinned VCS install tells the user how to move pins instead of bare ``omni up``."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="distribution",
+            latest_version="0.21.0-wukong.13",
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.21.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-dist.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "a" * 40,
+                "requested_revision": "v0.21.0-wukong.12",
+            },
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+    err = _strip_rich_panel(capsys.readouterr().err)
+    assert "0.21.0-wukong.13" in err
+    assert "@v0.21.0-wukong.13" in err
+
+
+def test_refresh_update_cache_stamped_caches_empty_on_404_and_never_hits_pypi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the first public release, background refresh caches empty result silently."""
+    import httpx
+
+    import omnigent.distribution as distribution
+    from omnigent.update_check import refresh_update_cache
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.21.0.dev0")
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+    monkeypatch.setattr(
+        httpx, "get", lambda *_a, **_k: _FakeResp(status_code=404, text="Not Found")
+    )
+
+    refresh_update_cache()
+
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.kind == "distribution"
+    assert cached.latest_version == ""
+    assert not _is_stale(cached)
+
+
+def test_unstamped_vcs_install_still_skips_passive_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Our own hosts (unstamped VCS installs) stay untouched and spawn no refresh."""
+    import omnigent.distribution as distribution
+
+    assert distribution.DISTRIBUTION_VERSION is None
+    assert distribution.DISTRIBUTION_RELEASE_REPO is None
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.22.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-custom.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b" * 40,
+                "requested_revision": "local/host-custom",
+            },
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+    assert spawned == []

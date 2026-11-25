@@ -39,11 +39,13 @@ import contextlib
 import importlib.metadata
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import xml.etree.ElementTree as ET
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +100,11 @@ _UPGRADE_INDEX_TIMEOUT_SECONDS = 10.0
 # ``direct_url.json`` in place of a URL's userinfo. See
 # ``_unredact_ssh_userinfo`` for why we have to repair it.
 _REDACTED_USERINFO = "****"
+# Strict format for stamped distribution releases (e.g. ``0.21.0-wukong.12``).
+# SemVer prerelease identifiers are not valid PEP 440, so distribution checks
+# parse and compare them with this pattern rather than ``packaging.version``.
+_DISTRIBUTION_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)-wukong\.(\d+)$")
+_ATOM_TAG_HREF_RE = re.compile(r"/releases/tag/([^/?#]+)$")
 
 
 @dataclass
@@ -284,6 +291,10 @@ def _run_installed_wheel_check() -> None:
         # would have caught this if .git/ were reachable; there's no
         # PyPI release to compare an editable install against, so bail.
         return
+    dist_cfg = _distribution_release_config()
+    if dist_cfg is not None:
+        _run_distribution_release_check(info, dist_cfg[0], dist_cfg[1])
+        return
     if info.vcs_url:
         # A git/VCS install tracks a moving ref, not a PyPI release. Its
         # version string (e.g. a frozen ``0.1.0`` on an unbumped ``main``)
@@ -318,6 +329,143 @@ def _run_installed_wheel_check() -> None:
     # Refresh the cached "latest version" out of band when it is missing,
     # stale, or was written by the (other-shape) clone path.
     if cache is None or cache.kind != "wheel" or _is_stale(cache):
+        _spawn_background_refresh()
+
+
+def _distribution_release_config() -> tuple[str, str] | None:
+    """Return ``(release_repo, version)`` for a stamped distribution build, else ``None``."""
+    from omnigent.distribution import DISTRIBUTION_RELEASE_REPO, DISTRIBUTION_VERSION
+
+    if DISTRIBUTION_RELEASE_REPO and DISTRIBUTION_VERSION:
+        return DISTRIBUTION_RELEASE_REPO, DISTRIBUTION_VERSION
+    return None
+
+
+def _parse_distribution_version(value: str) -> tuple[int, int, int, int] | None:
+    """Parse a ``[v]X.Y.Z-wukong.N`` version into a numeric sort key, or ``None``."""
+    match = _DISTRIBUTION_VERSION_RE.match(value.strip())
+    if match is None:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+        int(match.group(4)),
+    )
+
+
+def _is_newer_distribution_version(latest: str, current: str) -> bool:
+    """Strict numeric comparison for stamped distribution versions.
+
+    Non-matching tags return ``False`` rather than falling back to string
+    inequality, so upstream or malformed tags never trigger a false notice.
+    """
+    latest_key = _parse_distribution_version(latest)
+    current_key = _parse_distribution_version(current)
+    if latest_key is None or current_key is None:
+        return False
+    return latest_key > current_key
+
+
+def _parse_releases_atom_versions(xml_text: str) -> list[str]:
+    """Extract valid distribution versions from a GitHub ``releases.atom`` feed."""
+    root = ET.fromstring(xml_text)
+    versions: list[str] = []
+    for entry in root.iter():
+        if not entry.tag.endswith("entry"):
+            continue
+        candidate: str | None = None
+        for child in entry:
+            if child.tag.endswith("link"):
+                href = child.attrib.get("href", "")
+                match = _ATOM_TAG_HREF_RE.search(href)
+                if match is not None:
+                    candidate = match.group(1)
+                    break
+        if candidate is None:
+            for child in entry:
+                if child.tag.endswith("id") and child.text:
+                    candidate = child.text.strip().rsplit("/", 1)[-1]
+                    break
+        if candidate and _parse_distribution_version(candidate) is not None:
+            versions.append(candidate.removeprefix("v"))
+    return versions
+
+
+def fetch_latest_distribution_release(
+    repo: str,
+    *,
+    timeout: float = _INDEX_TIMEOUT_SECONDS,
+    attempts: int = 1,
+) -> tuple[str, str | None]:
+    """Fetch the newest distribution release from GitHub's ``releases.atom`` feed.
+
+    Uses the public Atom feed rather than ``api.github.com`` so anonymous users
+    avoid the 60 req/hr REST API rate limit and see only completed GitHub
+    Releases.
+
+    :returns: ``("ok", version)`` when a matching release exists,
+        ``("empty", None)`` when the feed is 404 or holds no matching releases
+        (e.g. before the first public release), or ``("error", None)`` on a
+        network / HTTP / XML parse failure.
+    """
+    import httpx
+
+    url = f"https://github.com/{repo}/releases.atom"
+    resp = None
+    for _ in range(max(1, attempts)):
+        try:
+            resp = httpx.get(
+                url,
+                headers={"Accept": "application/atom+xml, application/xml, text/xml"},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            break
+        except httpx.HTTPError:
+            resp = None
+    if resp is None:
+        return "error", None
+    if resp.status_code == 404:
+        return "empty", None
+    if resp.status_code != 200:
+        return "error", None
+    try:
+        versions = _parse_releases_atom_versions(resp.text)
+    except ET.ParseError:
+        return "error", None
+    if not versions:
+        return "empty", None
+    best = max(versions, key=lambda v: _parse_distribution_version(v) or (0, 0, 0, 0))
+    return "ok", best
+
+
+def _run_distribution_release_check(
+    info: _InstalledWheelInfo,
+    repo: str,
+    current: str,
+) -> None:
+    """Run the passive update check for a stamped distribution install."""
+    cache = _read_cache()
+    if (
+        cache is not None
+        and cache.kind == "distribution"
+        and cache.latest_version
+        and _is_newer_distribution_version(cache.latest_version, current)
+        and cache.latest_version != cache.last_notified_version
+    ):
+        _print_distribution_notice(current, cache.latest_version, repo, info.vcs_url)
+        _write_cache(
+            _CacheEntry(
+                last_check_epoch=cache.last_check_epoch,
+                commits_behind=0,
+                kind="distribution",
+                latest_version=cache.latest_version,
+                last_notified_version=cache.latest_version,
+            )
+        )
+
+    if cache is None or cache.kind != "distribution" or _is_stale(cache):
         _spawn_background_refresh()
 
 
@@ -644,6 +792,29 @@ def refresh_update_cache() -> None:
         info = _read_installed_wheel_info()
         if info is None or info.is_editable:
             return
+        dist_cfg = _distribution_release_config()
+        if dist_cfg is not None:
+            repo, _ = dist_cfg
+            status, latest = fetch_latest_distribution_release(repo)
+            prev = _read_cache()
+            prev_dist = prev if prev is not None and prev.kind == "distribution" else None
+            last_notified = prev_dist.last_notified_version if prev_dist is not None else ""
+            if status == "ok" and latest:
+                cached_latest = latest
+            elif status == "empty":
+                cached_latest = ""
+            else:
+                cached_latest = prev_dist.latest_version if prev_dist is not None else ""
+            _write_cache(
+                _CacheEntry(
+                    last_check_epoch=time.time(),
+                    commits_behind=0,
+                    kind="distribution",
+                    latest_version=cached_latest,
+                    last_notified_version=last_notified,
+                )
+            )
+            return
         latest = fetch_latest_version()
         if latest is None:
             return
@@ -923,6 +1094,47 @@ def _print_notice(commits_behind: int) -> None:
         ("git pull", "bold"),
         " to update.",
     )
+    console.print(Panel(body, border_style="yellow", expand=False))
+
+
+def _print_distribution_notice(
+    current: str,
+    latest: str,
+    repo: str,
+    vcs_url: str | None,
+) -> None:
+    """Print the passive update notice for a stamped distribution build."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from omnigent.distribution import DISTRIBUTION_NAME
+
+    pinned_tag = False
+    if vcs_url:
+        _, rev = _split_vcs_url(vcs_url)
+        if rev and _parse_distribution_version(rev) is not None:
+            pinned_tag = True
+
+    console = Console(stderr=True)
+    if pinned_tag:
+        body = Text.assemble(
+            ("Update available", "bold yellow"),
+            f" — {DISTRIBUTION_NAME} ",
+            (latest, "bold"),
+            f" is out (pinned at {current}).\nReinstall from ",
+            (f"git+https://github.com/{repo}.git@v{latest}", "bold"),
+            " to update.",
+        )
+    else:
+        body = Text.assemble(
+            ("Update available", "bold yellow"),
+            f" — {DISTRIBUTION_NAME} ",
+            (latest, "bold"),
+            f" is out (you have {current}).\nRun ",
+            ("omni up", "bold"),
+            " to update.",
+        )
     console.print(Panel(body, border_style="yellow", expand=False))
 
 
@@ -1897,6 +2109,37 @@ def _probe_installed_distribution(
     return version, commit
 
 
+def _probe_distribution_version(
+    python_executable: str | None = None, *, env: dict[str, str] | None = None
+) -> str | None:
+    """Read ``DISTRIBUTION_VERSION`` from disk in a fresh subprocess."""
+    if not sys.executable:
+        return None
+    probe = (
+        "try:\n"
+        "    from omnigent.distribution import DISTRIBUTION_VERSION\n"
+        "    print(DISTRIBUTION_VERSION or '')\n"
+        "except Exception:\n"
+        "    print('')\n"
+    )
+    try:
+        result = subprocess.run(
+            [python_executable or sys.executable, "-I", "-c", probe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def _upgrade_failure_message(
     code: int, extras: Collection[str] = (), *, recovery_command: str | None = None
 ) -> str:
@@ -1927,12 +2170,21 @@ def _upgrade_failure_message(
     if version is not None:
         return f"Upgrade command exited with status {code}; your previous install is intact."
     extra_flags = "".join(f" --extra {extra}" for extra in sorted(extras))
+    dist_cfg = _distribution_release_config()
+    if dist_cfg is not None:
+        repo, _ = dist_cfg
+        reinstall_line = (
+            f"    curl -fsSL https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.sh "
+            f"| sh -s -- --repo https://github.com/{repo}.git{extra_flags}\n"
+        )
+    else:
+        reinstall_line = f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"
     return (
         f"Upgrade command exited with status {code}, and omnigent is no longer "
         "installed: the installer replaced the old environment before the new "
         "build failed. Your agents, history and credentials are untouched; "
         "reinstall the CLI to get back:\n\n"
-        f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"
+        f"{reinstall_line}"
         "    omnigent login <SERVER-URL>\n\n"
         "If the web UI build was what failed, install Node 22 LTS and pnpm "
         "first, or set OMNIGENT_SKIP_WEB_UI=true to install without it."
