@@ -437,6 +437,12 @@ async def test_record_launched_model_patches_label_and_arg_value_extracts_model(
     assert _arg_value(["--provider", "omnigent", "--model", "omnigent/k2.5"], "--model") == (
         "omnigent/k2.5"
     )
+    assert _arg_value(["--model=custom/pi-model", "--thinking", "high"], "--model") == (
+        "custom/pi-model"
+    )
+    assert _arg_value(["--model", "first-model", "--model=second-model"], "--model") == (
+        "second-model"
+    )
     assert _arg_value(["--thinking", "high"], "--model") is None
 
     client = MagicMock()
@@ -460,3 +466,319 @@ async def test_record_launched_model_patches_label_and_arg_value_extracts_model(
         params={"include_usage": "false"},
         timeout=10.0,
     )
+
+
+@pytest.mark.asyncio
+async def test_sdk_turn_delivery_acknowledges_even_when_launched_model_write_fails_or_stalls(
+    monkeypatch,
+):
+    """P1: delivery returns and publishes input.consumed if launched_model write fails/stalls."""
+    import asyncio
+    import threading
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from omnigent.entities import Conversation, ConversationItem
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _sid, payload: published.append(dict(payload))
+    )
+    monkeypatch.setattr(orchestration, "_is_native_terminal_session", lambda _c: False)
+
+    async def _noop_async(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(orchestration, "claim_retry_forward", _noop_async)
+
+    def _make_store(set_labels_fn):
+        store = MagicMock()
+
+        def _append(_cid, items):
+            new_item = items[0]
+            return [
+                ConversationItem(
+                    id="item_ack_1",
+                    type=new_item.type,
+                    response_id=new_item.response_id,
+                    data=new_item.data,
+                    status="completed",
+                    created_at=100,
+                    created_by=new_item.created_by,
+                )
+            ]
+
+        store.append.side_effect = _append
+        store.set_labels.side_effect = set_labels_fn
+        store.get_conversation.return_value = None
+        return store
+
+    runner_client = MagicMock()
+    runner_client.post = MagicMock(
+        side_effect=lambda *_a, **_kw: asyncio.sleep(0, result=httpx.Response(202, json={}))
+    )
+
+    # Case 1: set_labels raises ConnectionError — must NOT enter runner-unreachable branch.
+    conv_err = Conversation(
+        id="conv_p1_err",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_p1_err",
+        agent_id="ag_test",
+        model_override="model-a",
+        labels={},
+    )
+    store_err = _make_store(lambda *_a, **_kw: (_ for _ in ()).throw(ConnectionError("db down")))
+    msg_event = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    )
+    item_id = await orchestration._forward_event_to_runner(
+        conv_err.id,
+        conv_err,
+        msg_event,
+        store_err,
+        runner_client,
+    )
+    assert item_id == "item_ack_1"
+    assert any(evt.get("type") == "session.input.consumed" for evt in published)
+    if orchestration._LAUNCHED_MODEL_TASKS:
+        await asyncio.gather(*list(orchestration._LAUNCHED_MODEL_TASKS), return_exceptions=True)
+
+    # Case 2: set_labels stalls on an event — delivery returns immediately before unblock.
+    unblock = threading.Event()
+    started = threading.Event()
+
+    def _blocking_set_labels(*_a, **_kw):
+        started.set()
+        unblock.wait(timeout=5.0)
+
+    conv_stall = Conversation(
+        id="conv_p1_stall",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_p1_stall",
+        agent_id="ag_test",
+        model_override="model-b",
+        labels={},
+    )
+    store_stall = _make_store(_blocking_set_labels)
+    try:
+        item_id_2 = await asyncio.wait_for(
+            orchestration._forward_event_to_runner(
+                conv_stall.id,
+                conv_stall,
+                msg_event,
+                store_stall,
+                runner_client,
+            ),
+            timeout=1.0,
+        )
+        assert item_id_2 == "item_ack_1"
+    finally:
+        unblock.set()
+        if orchestration._LAUNCHED_MODEL_TASKS:
+            await asyncio.gather(
+                *list(orchestration._LAUNCHED_MODEL_TASKS), return_exceptions=True
+            )
+
+
+@pytest.mark.asyncio
+async def test_fenced_sdk_launched_model_write_prevents_stale_dispatch_from_overwriting_newer(
+    monkeypatch,
+):
+    """P1: a delayed older launched_model write cannot overwrite a newer dispatch."""
+    import asyncio
+    import threading
+    from unittest.mock import MagicMock
+
+    from omnigent.entities import Conversation
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_is_native_terminal_session", lambda _c: False)
+
+    written: list[str] = []
+    release_first = threading.Event()
+    first_entered = threading.Event()
+
+    def _set_labels(_sid, labels):
+        val = labels[LAUNCHED_MODEL_LABEL]
+        if val == "model-a":
+            first_entered.set()
+            release_first.wait(timeout=5.0)
+        written.append(val)
+
+    store = MagicMock()
+    store.set_labels.side_effect = _set_labels
+
+    conv_a = Conversation(
+        id="conv_fence",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_fence",
+        agent_id="ag_test",
+        model_override="model-a",
+        labels={},
+    )
+    conv_b = Conversation(
+        id="conv_fence",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_fence",
+        agent_id="ag_test",
+        model_override="model-b",
+        labels={},
+    )
+
+    t1 = orchestration._schedule_sdk_launched_model_record(conv_a.id, conv_a, "model-a", store)
+    assert t1 is not None
+    await asyncio.to_thread(first_entered.wait, 2.0)
+    t2 = orchestration._schedule_sdk_launched_model_record(conv_b.id, conv_b, "model-b", store)
+    assert t2 is not None
+    release_first.set()
+    await asyncio.gather(t1, t2)
+    assert written[-1] == "model-b"
+
+
+def test_native_patch_confirmation_rejects_queued_pi_and_noop_clear():
+    """P2: only harness-confirmed live model switches promote launched_model."""
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.server.routes.sessions.routes_core import _native_model_change_confirmed
+
+    # Pi queued bridge 204 is NOT confirmation.
+    assert (
+        _native_model_change_confirmed(
+            _RunnerForwardResult(status_code=204, body=""),
+            model_override="omnigent/k2.5",
+            clear_model=False,
+            codex_native=False,
+            agy_native=False,
+            unconfirmed=False,
+            unsupported=None,
+            forward_failed=False,
+        )
+        is False
+    )
+    # No-op clear 204 keeps the last launch record.
+    assert (
+        _native_model_change_confirmed(
+            _RunnerForwardResult(status_code=204, body="", model_applied=True),
+            model_override=None,
+            clear_model=True,
+            codex_native=True,
+            agy_native=False,
+            unconfirmed=False,
+            unsupported=None,
+            forward_failed=False,
+        )
+        is False
+    )
+    # Confirmed Claude switch (204 + model_applied=True) promotes launched.
+    assert (
+        _native_model_change_confirmed(
+            _RunnerForwardResult(status_code=204, body="", model_applied=True),
+            model_override="opus",
+            clear_model=False,
+            codex_native=False,
+            agy_native=False,
+            unconfirmed=False,
+            unsupported=None,
+            forward_failed=False,
+        )
+        is True
+    )
+    # Confirmed Codex switch (200/204 non-deferred) promotes launched; 202 deferred does not.
+    assert (
+        _native_model_change_confirmed(
+            _RunnerForwardResult(status_code=204, body="", model_applied=True),
+            model_override="gpt-6.2-sol",
+            clear_model=False,
+            codex_native=True,
+            agy_native=False,
+            unconfirmed=False,
+            unsupported=None,
+            forward_failed=False,
+        )
+        is True
+    )
+    assert (
+        _native_model_change_confirmed(
+            _RunnerForwardResult(status_code=202, body='{"deferred": true}'),
+            model_override="gpt-6.2-sol",
+            clear_model=False,
+            codex_native=True,
+            agy_native=False,
+            unconfirmed=False,
+            unsupported=None,
+            forward_failed=False,
+        )
+        is False
+    )
+
+
+def test_launched_model_label_rejected_for_generic_clients():
+    """P2: generic client label seeding rejects omnigent.launched_model and collation variants."""
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes._sessions.helpers import _reject_server_reserved_label_seed
+
+    for key in ("omnigent.launched_model", "OMNIGENT.LAUNCHED_MODEL", "omnigent.launched_model "):
+        with pytest.raises(OmnigentError):
+            _reject_server_reserved_label_seed({key: "fake-model"})
+
+
+def test_mutate_session_resolution_notes_is_atomic_on_group():
+    """P2: note cleanup runs through mutate_label_group, preserving concurrent member notes."""
+    import json
+
+    from omnigent.server.model_resolution import (
+        RESOLUTION_LABEL,
+        mutate_session_resolution_notes,
+        notes_from_labels,
+        resolution_labels,
+    )
+    from omnigent.stores.conversation_store import LabelGroupChange
+
+    # Multi-chunk record containing one session note and one concurrent member note.
+    member_note = {
+        "setting": "member:worker",
+        "saved": "old/" + ("y" * 120),
+        "model": "new/" + ("y" * 120),
+        "outcome": "renamed",
+        "host": "host-a",
+    }
+    session_note = {
+        "setting": "session",
+        "saved": "old/" + ("x" * 120),
+        "model": "new/" + ("x" * 120),
+        "outcome": "renamed",
+        "host": "host-a",
+    }
+    live_group = resolution_labels([session_note, member_note])
+    assert len(live_group) > 1  # spans multiple chunks
+
+    applied_changes: list[LabelGroupChange] = []
+
+    class FakeStore:
+        def mutate_label_group(self, _cid, prefix, change_fn):
+            assert prefix == RESOLUTION_LABEL
+            change = change_fn(dict(live_group))
+            applied_changes.append(change)
+            for k in change.deletes:
+                live_group.pop(k, None)
+            live_group.update(change.upserts)
+            return dict(live_group)
+
+    result = mutate_session_resolution_notes(
+        FakeStore(),
+        "conv_atomic",
+        lambda notes: [n for n in notes if str(n.get("setting", "")).startswith("member:")],
+    )
+    assert len(applied_changes) == 1
+    assert applied_changes[0].deletes  # excess chunk deleted atomically alongside upsert
+    assert notes_from_labels(result) == [member_note]
+    assert json.loads(result[RESOLUTION_LABEL])  # still decodable after atomic mutation

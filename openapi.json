@@ -11341,6 +11341,7 @@
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.input.sending": "#/components/schemas/SessionInputSendingEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.launched_model": "#/components/schemas/SessionLaunchedModelEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -11377,6 +11378,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionLaunchedModelEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTitleEvent"
@@ -13287,6 +13291,51 @@
           "id"
         ],
         "title": "SessionLabelsResponse",
+        "type": "object"
+      },
+      "SessionLaunchedModelEvent": {
+        "description": "Confirmed launched-model update for an active session header.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launched"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.launched_model",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionLaunchedModelEvent",
         "type": "object"
       },
       "SessionList": {

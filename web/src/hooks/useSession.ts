@@ -21,6 +21,7 @@ import {
   setSessionParent,
 } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { preserveStreamModelDisplay, streamModelDisplayRevisions } from "@/lib/modelReference";
 import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
 
@@ -63,7 +64,12 @@ export function isCachedAncestor(
 export function sessionQueryOptions(sessionId: string | null) {
   return {
     queryKey: ["session", sessionId] as const,
-    queryFn: () => getSessionSlim(sessionId as string, { refreshState: true }),
+    queryFn: async () => {
+      const id = sessionId as string;
+      const before = streamModelDisplayRevisions(id);
+      const session = await getSessionSlim(id, { refreshState: true });
+      return preserveStreamModelDisplay(session, before);
+    },
     enabled: sessionId !== null,
     staleTime: Infinity,
     retry: false,

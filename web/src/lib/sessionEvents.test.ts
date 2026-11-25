@@ -1606,6 +1606,26 @@ describe("session.model (FLAT envelope)", () => {
   });
 });
 
+describe("session.launched_model (FLAT envelope)", () => {
+  it("lifts conversation_id and launched model (including null clear)", () => {
+    const setEvents = parse("session.launched_model", {
+      conversation_id: "conv_abc",
+      launched: "gpt-6.2-sol",
+    });
+    expect(setEvents).toEqual([
+      { type: "session_launched_model", conversationId: "conv_abc", launched: "gpt-6.2-sol" },
+    ]);
+
+    const clearEvents = parse("session.launched_model", {
+      conversation_id: "conv_abc",
+      launched: null,
+    });
+    expect(clearEvents).toEqual([
+      { type: "session_launched_model", conversationId: "conv_abc", launched: null },
+    ]);
+  });
+});
+
 describe("session.title (FLAT envelope)", () => {
   it("lifts conversation_id and title", () => {
     const events = parse("session.title", {

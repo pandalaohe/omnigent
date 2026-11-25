@@ -374,3 +374,64 @@ async def test_switching_away_from_alias_does_not_revive_historical_requested_mo
         harness="codex-native",
     )
     assert explicit_display.requested == "new/x"
+
+
+async def test_resume_catalog_miss_for_same_selection_keeps_active_alias_provenance(
+    references_env, db_uri
+):
+    """P2: a same-selection catalog miss (B->B) on resume keeps active A->B provenance."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.model_resolution import (
+        LAUNCHED_MODEL_LABEL,
+        notes_from_labels,
+        resolve_session_model,
+        session_model_display,
+    )
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    env = references_env
+    env.catalogs.upsert(HOST, "codex", [{"id": "new/x"}], 1)
+    env.prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
+    conversations = env.app.state.conversation_store
+    conv = conversations.create_conversation(
+        agent_id=env.agent, host_id=HOST, workspace="/opt/work/example", model_override="old/x"
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(OWNER)
+    permissions.grant(OWNER, conv.id, LEVEL_OWNER)
+
+    # First resolution renames old/x -> new/x.
+    await resolve_session_model(
+        conv,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    # Later, the host's usable catalog loses new/x before resume.
+    env.catalogs.upsert(HOST, "codex", [{"id": "other/y"}], 2)
+    resuming = conversations.get_conversation(conv.id)
+    assert resuming is not None
+    await resolve_session_model(
+        resuming,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    after = conversations.get_conversation(conv.id)
+    assert after is not None
+    display = session_model_display(
+        {**after.labels, LAUNCHED_MODEL_LABEL: "new/x"},
+        after.model_override,
+        "new/x",
+        harness="codex-native",
+    )
+    assert display.requested == "old/x"
+    outcomes = {(n["saved"], n["model"], n["outcome"]) for n in notes_from_labels(after.labels)}
+    assert ("old/x", "new/x", "renamed") in outcomes
+    assert ("new/x", "new/x", "missing") in outcomes

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -67,6 +67,37 @@ def clear_session_resolution_labels(
     encoded = resolution_labels(remaining)
     to_delete = [key for key in existing_keys if key not in encoded]
     return encoded, to_delete
+
+
+def mutate_session_resolution_notes(
+    conversations: Any,
+    session_id: str,
+    transform: Callable[[list[dict[str, str]]], list[dict[str, str]]],
+) -> dict[str, str]:
+    """Atomically rewrite the ``omnigent.model_resolution*`` label group.
+
+    Uses ``conversations.mutate_label_group`` so chunk deletes and upserts land
+    in one serialized transaction against live member:* notes, preventing half-
+    deleted chunk manifests or clobbered concurrent member updates.
+    """
+    from omnigent.stores.conversation_store import LabelGroupChange
+
+    mutate_group = getattr(conversations, "mutate_label_group", None)
+    if callable(mutate_group):
+
+        def _change(current: dict[str, str]) -> LabelGroupChange:
+            existing_keys = _resolution_label_keys(current)
+            existing_notes = notes_from_labels(current)
+            next_notes = transform(list(existing_notes))
+            if next_notes == existing_notes and (bool(existing_notes) or not existing_keys):
+                return LabelGroupChange(upserts={}, deletes=set())
+            encoded = resolution_labels(next_notes)
+            deletes = {key for key in existing_keys if key not in encoded}
+            return LabelGroupChange(upserts=encoded, deletes=deletes)
+
+        result = mutate_group(session_id, RESOLUTION_LABEL, _change)
+        return dict(result) if isinstance(result, Mapping) else {}
+    return {}
 
 
 def usable_catalog(record: Mapping[str, Any] | None) -> frozenset[str] | None:
@@ -251,7 +282,6 @@ async def resolve_session_model(
                     code=ErrorCode.INVALID_INPUT,
                 )
             labels[key] = encoded
-    existing_notes = notes_from_labels(conversation.labels)
     new_session_notes = [
         note.payload() for note in context.notes if not note.setting.startswith("member:")
     ]
@@ -261,43 +291,77 @@ async def resolve_session_model(
         for note in current.notes
         if note.setting.startswith("member:")
     ]
-    member_notes = [note for note in existing_notes if _is_member_setting(note)]
-    for note_payload in new_member_notes:
-        if note_payload not in member_notes:
-            member_notes.append(note_payload)
-    if new_session_notes:
-        session_notes = list(new_session_notes)
-    elif session_resolved_model is not None:
-        # Keep an existing session note only when this resume is still on that
-        # same resolved model; drop notes belonging to an earlier model choice.
-        session_notes = [
-            note
-            for note in existing_notes
-            if not _is_member_setting(note)
-            and isinstance(note.get("model"), str)
-            and note["model"].strip() == session_resolved_model
-        ]
-    else:
-        session_notes = [note for note in existing_notes if not _is_member_setting(note)]
-    notes = [*session_notes, *member_notes]
-    stale_keys: list[str] = []
-    if notes != existing_notes or any(current.notes for current in contexts.values()):
-        encoded_notes = resolution_labels(notes)
-        labels.update(encoded_notes)
-        stale_keys = [
-            key for key in _resolution_label_keys(conversation.labels) if key not in encoded_notes
-        ]
-    if stale_keys:
-        delete_label = getattr(conversations, "delete_label", None)
-        for stale_key in stale_keys:
-            if callable(delete_label):
-                await asyncio.to_thread(delete_label, conversation.id, stale_key)
-                conversation.labels.pop(stale_key, None)
-            else:
-                labels[stale_key] = ""
+    has_session_rewrite = any(
+        note.get("saved", "").strip() != note.get("model", "").strip()
+        for note in new_session_notes
+    )
+
+    def _merge_notes(existing_notes: list[dict[str, str]]) -> list[dict[str, str]]:
+        member_notes = [note for note in existing_notes if _is_member_setting(note)]
+        for note_payload in new_member_notes:
+            if note_payload not in member_notes:
+                member_notes.append(note_payload)
+        existing_session = [note for note in existing_notes if not _is_member_setting(note)]
+        if has_session_rewrite:
+            session_notes = list(new_session_notes)
+        elif session_resolved_model is not None:
+            # Keep active rename provenance (A -> B) through same-selection
+            # resumes and catalog misses (B -> B); drop notes from older picks.
+            session_notes = [
+                note
+                for note in existing_session
+                if isinstance(note.get("model"), str)
+                and note["model"].strip() == session_resolved_model
+                and (
+                    not new_session_notes
+                    or (
+                        isinstance(note.get("saved"), str)
+                        and note["saved"].strip() != session_resolved_model
+                    )
+                )
+            ]
+            for note_payload in new_session_notes:
+                if note_payload not in session_notes:
+                    session_notes.append(note_payload)
+        else:
+            session_notes = list(existing_session)
+            for note_payload in new_session_notes:
+                if note_payload not in session_notes:
+                    session_notes.append(note_payload)
+        return [*session_notes, *member_notes]
+
     if labels:
         await asyncio.to_thread(conversations.set_labels, conversation.id, labels)
         conversation.labels.update(labels)
+    if callable(getattr(conversations, "mutate_label_group", None)):
+        updated_group = await asyncio.to_thread(
+            mutate_session_resolution_notes, conversations, conversation.id, _merge_notes
+        )
+        for stale_key in _resolution_label_keys(conversation.labels):
+            if stale_key not in updated_group:
+                conversation.labels.pop(stale_key, None)
+        conversation.labels.update(updated_group)
+    else:
+        existing_notes = notes_from_labels(conversation.labels)
+        merged = _merge_notes(existing_notes)
+        if merged != existing_notes or any(current.notes for current in contexts.values()):
+            encoded_notes = resolution_labels(merged)
+            fallback_labels: dict[str, str] = dict(encoded_notes)
+            stale_keys = [
+                key
+                for key in _resolution_label_keys(conversation.labels)
+                if key not in encoded_notes
+            ]
+            delete_label = getattr(conversations, "delete_label", None)
+            for stale_key in stale_keys:
+                if callable(delete_label):
+                    await asyncio.to_thread(delete_label, conversation.id, stale_key)
+                    conversation.labels.pop(stale_key, None)
+                else:
+                    fallback_labels[stale_key] = ""
+            if fallback_labels:
+                await asyncio.to_thread(conversations.set_labels, conversation.id, fallback_labels)
+                conversation.labels.update(fallback_labels)
     return conversation
 
 

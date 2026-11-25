@@ -4625,6 +4625,14 @@ class SessionModelEvent(_SSEEventBase):
     reported: bool | None = None
 
 
+class SessionLaunchedModelEvent(_SSEEventBase):
+    """Confirmed launched-model update for an active session header."""
+
+    type: Literal["session.launched_model"]
+    conversation_id: str
+    launched: str | None = None
+
+
 class SessionTitleEvent(_SSEEventBase):
     """
     Session-title update from a terminal-backed integration.
@@ -6291,6 +6299,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionLaunchedModelEvent
     | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionSpeedTierEvent

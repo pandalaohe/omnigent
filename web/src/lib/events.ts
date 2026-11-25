@@ -652,6 +652,12 @@ export interface SessionModelEvent {
   reported?: boolean;
 }
 
+export interface SessionLaunchedModelEvent {
+  type: "session_launched_model";
+  conversationId: string;
+  launched: string | null;
+}
+
 /**
  * `session.title` — session rename from a claude-native session.
  *
@@ -1154,6 +1160,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionLaunchedModelEvent
   | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent

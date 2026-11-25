@@ -36,15 +36,19 @@ the header menu), and each place is a separate entry point.
   above them; a drop on another project's row still files the session there.
 - `model-display`: session snapshots, child summaries (beside `routed_model`),
   and `sys_session_get_info` expose `requested` (`saved` from the active
-  session note in `omnigent.model_resolution` when rewritten, else
-  `model_override`), `launched` (`omnigent.launched_model`, recorded only when
-  a harness launch or confirmed live apply actually uses that model and
-  omitted for `antigravity-native`), and `running` (`reported_model`, updated
-  live only from confirmed harness `session.model` reports and omitted until
-  the harness reports a concrete model). The session header shows the launched
-  model name when present and reuses the Model reference chip only when
-  `requested` or `running` differ (ignoring verified equivalent Codex catalog
-  and runtime spellings, or when resolution notes exist).
+  session note in `omnigent.model_resolution` when rewritten, preserved across
+  same-selection catalog misses and cleared atomically on model change/reset,
+  else `model_override`), `launched` (instance-scoped server-owned
+  `omnigent.launched_model`, dropped on fork, recorded only when a harness
+  launch, confirmed live apply, or accepted SDK/ACP turn actually uses that
+  model and omitted for `antigravity-native`, pushed live via
+  `session.launched_model`), and `running` (`reported_model`, updated live only
+  from confirmed harness `session.model` reports under a freshness guard across
+  snapshot refreshes and omitted until the harness reports a concrete model).
+  The session header shows the launched model name when present and reuses the
+  Model reference chip only when `requested` or `running` differ (ignoring
+  verified equivalent Codex catalog and runtime spellings, or when resolution
+  notes exist).
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `title-instructions`: Settings → General → Sessions → **Title instructions**

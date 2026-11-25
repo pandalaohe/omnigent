@@ -4092,7 +4092,7 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
-    await _record_launched_model(session_id, server_client, _arg_value(provider_args, "--model"))
+    await _record_launched_model(session_id, server_client, _arg_value(pi_args, "--model"))
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -10529,11 +10529,22 @@ async def _record_launched_model(
 
 
 def _arg_value(args: Sequence[str], flag: str) -> str | None:
-    """Return the value passed immediately after *flag* in *args*, if any."""
-    for idx, token in enumerate(args):
+    """Return the last value passed for *flag* (``--flag val`` or ``--flag=val``)."""
+    prefix = f"{flag}="
+    found: str | None = None
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
         if token == flag and idx + 1 < len(args):
-            return args[idx + 1]
-    return None
+            found = args[idx + 1]
+            idx += 2
+            continue
+        if token.startswith(prefix):
+            val = token[len(prefix) :]
+            if val:
+                found = val
+        idx += 1
+    return found
 
 
 async def _clear_session_model_override(

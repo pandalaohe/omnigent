@@ -57,6 +57,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionLaunchedModelEvent,
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
@@ -737,6 +738,21 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       model,
       ...(data.reported === true ? { reported: true } : {}),
     } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.launched_model") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const rawLaunched = data.launched;
+    if (rawLaunched !== null && rawLaunched !== undefined && typeof rawLaunched !== "string") {
+      return null;
+    }
+    const launched =
+      typeof rawLaunched === "string" && rawLaunched.trim() ? rawLaunched.trim() : null;
+    return {
+      type: "session_launched_model",
+      conversationId,
+      launched,
+    } satisfies SessionLaunchedModelEvent;
   }
   if (eventType === "session.title") {
     const conversationId = data.conversation_id;

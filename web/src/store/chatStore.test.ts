@@ -12339,6 +12339,111 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       await revisit;
       expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
     });
+
+    it("updates the header session query cache on successful model PATCH and session.launched_model", async () => {
+      const id = "conv_patch_header_cache";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      client.setQueryData(["session", id], {
+        id,
+        harness: "codex-native",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      } as unknown as Session);
+
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              model_override: "model-b",
+              requested: "model-b",
+              launched: "model-b",
+              running: "model-a",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().setModel("model-b");
+      expect(client.getQueryData<Session>(["session", id])).toMatchObject({
+        requested: "model-b",
+        launched: "model-b",
+      });
+
+      // SDK/native launch SSE updates launched in the open header cache.
+      handleSessionEvent(
+        {
+          type: "session_launched_model",
+          conversationId: id,
+          launched: "model-c",
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.launched).toBe("model-c");
+    });
+
+    it("preserves a newer confirmed running report across startup-input refresh", async () => {
+      const id = "conv_startup_refresh_running";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+
+      let releaseStartupRead!: (r: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseStartupRead = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Trigger refreshFailedInputs via a failed sandbox startup status edge.
+      handleSessionEvent(
+        {
+          type: "session_sandbox_status",
+          conversationId: id,
+          stage: "failed",
+          error: "sandbox failed",
+        },
+        id,
+      );
+      await tick();
+
+      // While startup-input refresh is in flight, a confirmed model report lands.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older startup-input snapshot returns with running: "model-a"; must not revert model-b.
+      releaseStartupRead(
+        mockResponse({
+          id,
+          harness: "codex-native",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          status: "failed",
+          labels: {},
+        }),
+      );
+      await tick();
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
   });
 
   describe("rotation failure notice", () => {

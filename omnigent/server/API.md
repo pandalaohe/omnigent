@@ -495,17 +495,20 @@ Fields:
     Model originally requested for the active selection: `saved` from
     the active session note in `omnigent.model_resolution` when catalog
     resolution rewrote the current override, else `model_override`.
-    Cleared when the user selects another model so historical aliases
-    are not revived. `null` when unset. Also exposed on
-    `ChildSessionSummary` beside `routed_model`.
+    Preserved across same-selection resume catalog misses; cleared
+    atomically when the user selects another model or a fallback reset
+    wins so historical aliases are not revived. `null` when unset.
+    Also exposed on `ChildSessionSummary` beside `routed_model`.
 
   launched (string or null)
-    Model recorded in `omnigent.launched_model` once a harness launch
-    or confirmed live model switch actually used it, or `null` when
-    unlaunched, pending the next turn, or not confirmed at launch by
-    the harness (e.g. `antigravity-native`, where overrides are launch
-    requests only). Also exposed on `ChildSessionSummary` beside
-    `routed_model`.
+    Model recorded in server-owned `omnigent.launched_model` once a
+    harness launch (claude, codex, pi including explicit `--model`),
+    harness-confirmed live model switch, or accepted SDK/ACP turn
+    actually used it, or `null` when unlaunched, forked, pending the
+    next turn, or not confirmed at launch by the harness (e.g.
+    `antigravity-native`, where overrides are launch requests only).
+    Live updates publish `session.launched_model`. Also exposed on
+    `ChildSessionSummary` beside `routed_model`.
 
   running (string or null)
     Model last reported as actually running by the harness

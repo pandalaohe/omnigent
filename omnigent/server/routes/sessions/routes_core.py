@@ -468,6 +468,46 @@ def _runner_reply_field(body: str, key: str) -> object:
     return result.get(key) if isinstance(result, dict) else None
 
 
+def _native_model_change_confirmed(
+    forward_result: _RunnerForwardResult | None,
+    *,
+    model_override: str | None,
+    clear_model: bool,
+    codex_native: bool,
+    agy_native: bool,
+    unconfirmed: bool,
+    unsupported: str | None,
+    forward_failed: bool,
+) -> bool:
+    """Whether a native live ``model_change`` forward genuinely confirmed applying a model.
+
+    Excludes Antigravity (launch requests only), no-op clears, deferred/queued
+    202/204 responses (such as Pi bridge enqueue or Claude busy-turn deferral),
+    and unconfirmed/failed forwards.
+    """
+    if (
+        agy_native
+        or clear_model
+        or not isinstance(model_override, str)
+        or not model_override.strip()
+        or unconfirmed
+        or unsupported is not None
+        or forward_failed
+        or forward_result is None
+        or not (200 <= forward_result.status_code < 300)
+    ):
+        return False
+    if _runner_reply_field(forward_result.body, "deferred") is True:
+        return False
+    if (
+        forward_result.model_applied
+        or _runner_reply_field(forward_result.body, "model_applied") is True
+    ):
+        return True
+    del codex_native
+    return False
+
+
 async def _restore_refused_settings(
     conversation_store: ConversationStore,
     session_id: str,
@@ -5918,19 +5958,13 @@ def register_core_routes(
             ) from exc
         # The terminal already launched its fallback. This only retires metadata;
         # forwarding another model change could undo a concurrent live selection.
+        # Winning compare-and-clear also clears session-level model-resolution
+        # notes atomically inside the same store transaction.
         reset = await asyncio.to_thread(
             conversation_store.clear_model_override_if_matches,
             session_id,
             body.expected_model_override,
         )
-        if reset:
-            from omnigent.server.model_resolution import clear_session_resolution_labels
-
-            res_set, res_del = clear_session_resolution_labels(conv.labels)
-            for key in res_del:
-                await asyncio.to_thread(conversation_store.delete_label, session_id, key)
-            if res_set:
-                await asyncio.to_thread(conversation_store.set_labels, session_id, res_set)
         return ResetSessionModelOverrideResponse(reset=reset)
 
     @router.patch(
@@ -6104,6 +6138,20 @@ def register_core_routes(
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = labels_to_set.pop(
                 scalar_keys[0]
             )
+        from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+        launched_keys = [
+            key
+            for key in labels_to_set
+            if _may_collate_to(key, LAUNCHED_MODEL_LABEL, prefix=False)
+        ]
+        if len(launched_keys) > 1:
+            raise OmnigentError(
+                "labels contains duplicate launched model keys",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if launched_keys:
+            labels_to_set[LAUNCHED_MODEL_LABEL] = labels_to_set.pop(launched_keys[0])
         from omnigent.server.session_collab import (
             AGENT_SESSION_HEADER,
             require_session_action_allowed,
@@ -6455,7 +6503,28 @@ def register_core_routes(
                 "Antigravity permission tier is server-owned", code=ErrorCode.INVALID_INPUT
             )
         if body.labels:
-            _reject_server_reserved_label_seed(body.labels)
+            if LAUNCHED_MODEL_LABEL in labels_to_set:
+                from omnigent.server.routes._sessions.helpers import _has_runner_tunnel_authority
+
+                _conv_for_launched = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if _conv_for_launched is None or not _has_runner_tunnel_authority(
+                    request, _conv_for_launched, runner_tunnel_tokens
+                ):
+                    raise OmnigentError(
+                        f"label {LAUNCHED_MODEL_LABEL!r} is server-internal and cannot be set by clients",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                _reject_server_reserved_label_seed(
+                    {
+                        k: v
+                        for k, v in body.labels.items()
+                        if not _may_collate_to(k, LAUNCHED_MODEL_LABEL, prefix=False)
+                    }
+                )
+            else:
+                _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -7682,13 +7751,15 @@ def register_core_routes(
                         "Please check the current selection and try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
-                if (
-                    not agy_native
-                    and not unconfirmed
-                    and unsupported is None
-                    and not forward_failed
-                    and _model_forward is not None
-                    and 200 <= _model_forward.status_code < 300
+                if _native_model_change_confirmed(
+                    _model_forward,
+                    model_override=updated.model_override,
+                    clear_model=clear_model,
+                    codex_native=codex_native,
+                    agy_native=agy_native,
+                    unconfirmed=unconfirmed,
+                    unsupported=unsupported,
+                    forward_failed=forward_failed,
                 ):
                     native_model_applied = True
             else:
@@ -7911,17 +7982,16 @@ def register_core_routes(
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
         from omnigent.server.model_resolution import (
-            LAUNCHED_MODEL_LABEL,
-            clear_session_resolution_labels,
+            mutate_session_resolution_notes,
         )
 
-        if native_model_applied:
-            labels_to_set[LAUNCHED_MODEL_LABEL] = updated.model_override or ""
+        if native_model_applied and updated.model_override:
+            labels_to_set[LAUNCHED_MODEL_LABEL] = updated.model_override
+        launched_model_updated = LAUNCHED_MODEL_LABEL in labels_to_set
+        launched_model_value = (
+            labels_to_set[LAUNCHED_MODEL_LABEL].strip() or None if launched_model_updated else None
+        )
         _labels_to_clear: list[str] = []
-        if not body.silent and (model_override is not None or clear_model):
-            _res_set, _res_del = clear_session_resolution_labels(updated.labels)
-            labels_to_set.update(_res_set)
-            _labels_to_clear.extend(_res_del)
         for _clear_key in (
             PROJECT_LABEL_KEY,
             pinned_label_key(user_id),
@@ -7934,6 +8004,40 @@ def register_core_routes(
             await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if not body.silent and (model_override is not None or clear_model):
+            # Tie session-note cleanup to the winning override update and run
+            # atomically against the live resolution label group.
+            async with write_guard:
+                latest_for_notes = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if (
+                    latest_for_notes is not None
+                    and latest_for_notes.model_override == updated.model_override
+                ):
+                    await asyncio.to_thread(
+                        mutate_session_resolution_notes,
+                        conversation_store,
+                        session_id,
+                        lambda notes: [
+                            note
+                            for note in notes
+                            if isinstance(note.get("setting"), str)
+                            and note["setting"].startswith("member:")
+                        ],
+                    )
+        if launched_model_updated:
+            from omnigent.runtime import session_stream
+            from omnigent.server.schemas import SessionLaunchedModelEvent
+
+            session_stream.publish(
+                session_id,
+                SessionLaunchedModelEvent(
+                    type="session.launched_model",
+                    conversation_id=session_id,
+                    launched=launched_model_value,
+                ).model_dump(),
+            )
         if SPEED_TIER_LABEL_KEY in labels_to_set:
             _publish_speed_tier(session_id, labels_to_set[SPEED_TIER_LABEL_KEY])
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
@@ -8366,7 +8470,9 @@ def register_core_routes(
         # labels from the fork; otherwise the copied label would shadow the
         # freshly chosen mode. Only on an explicit pick: an untouched picker
         # sends no launch args and the label carries over as before.
-        dropped_label_keys_set: set[str] = set()
+        from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+        dropped_label_keys_set: set[str] = {LAUNCHED_MODEL_LABEL}
         if launch_args_set:
             dropped_label_keys_set |= {
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,

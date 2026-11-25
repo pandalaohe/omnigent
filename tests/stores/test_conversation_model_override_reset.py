@@ -121,6 +121,62 @@ def test_clear_matching_model_preserves_other_settings(
     assert _snapshot(store, conversation.id) == (after, metadata_after)
 
 
+def test_clear_matching_model_atomically_clears_session_resolution_notes(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Winning override reset removes session resolution notes while keeping member:* notes."""
+    from omnigent.server.model_resolution import (
+        RESOLUTION_LABEL,
+        notes_from_labels,
+        resolution_labels,
+    )
+
+    session_note = {
+        "setting": "session",
+        "saved": "old/" + ("a" * 120),
+        "model": "unavailable-model",
+        "outcome": "renamed",
+        "host": "host-a",
+    }
+    member_note = {
+        "setting": "member:worker",
+        "saved": "old/" + ("b" * 120),
+        "model": "new/" + ("b" * 120),
+        "outcome": "renamed",
+        "host": "host-a",
+    }
+    multi_chunk = resolution_labels([session_note, member_note])
+    assert len(multi_chunk) > 1
+
+    conversation = store.create_conversation(
+        title="Reset with notes",
+        model_override="unavailable-model",
+        labels={**multi_chunk, "keep": "label"},
+    )
+    assert store.clear_model_override_if_matches(conversation.id, "unavailable-model") is True
+    after = store.get_conversation(conversation.id)
+    assert after is not None
+    assert after.model_override is None
+    assert after.labels.get("keep") == "label"
+    assert notes_from_labels(after.labels) == [member_note]
+    # Stale chunk keys beyond the replacement encoding are deleted atomically.
+    remaining_chunk_keys = [
+        k for k in after.labels if k == RESOLUTION_LABEL or k.startswith(f"{RESOLUTION_LABEL}.")
+    ]
+    assert remaining_chunk_keys == list(resolution_labels([member_note]))
+
+    # Non-matching reset leaves resolution notes completely untouched.
+    other = store.create_conversation(
+        title="Reset miss keeps notes",
+        model_override="newer-model",
+        labels=resolution_labels([session_note]),
+    )
+    assert store.clear_model_override_if_matches(other.id, "unavailable-model") is False
+    untouched = store.get_conversation(other.id)
+    assert untouched is not None
+    assert notes_from_labels(untouched.labels) == [session_note]
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -283,9 +339,11 @@ def test_clear_model_override_compiles_portable_exact_blob_comparison(
         def scalar(self, _statement: object) -> str:
             return original
 
-        def execute(self, statement: Update) -> SimpleNamespace:
-            statements.append(statement)
-            return SimpleNamespace(rowcount=1)
+        def execute(self, statement: object) -> SimpleNamespace:
+            if isinstance(statement, Update):
+                statements.append(statement)
+                return SimpleNamespace(rowcount=1)
+            return SimpleNamespace(tuples=lambda: SimpleNamespace(all=list))
 
     @contextmanager
     def _session(query_name: str) -> Iterator[_Session]:

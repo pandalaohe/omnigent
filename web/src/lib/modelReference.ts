@@ -101,6 +101,57 @@ function codexModelsEquivalent(
   return false;
 }
 
+export interface StreamModelDisplayRevisions {
+  reported: number;
+  launched: number;
+}
+
+const streamReportedModels = new Map<string, { revision: number; model: string }>();
+const streamLaunchedModels = new Map<string, { revision: number; launched: string | null }>();
+
+export function streamModelDisplayRevisions(conversationId: string): StreamModelDisplayRevisions {
+  return {
+    reported: streamReportedModels.get(conversationId)?.revision ?? 0,
+    launched: streamLaunchedModels.get(conversationId)?.revision ?? 0,
+  };
+}
+
+export function recordStreamReportedModel(conversationId: string, model: string): void {
+  streamReportedModels.set(conversationId, {
+    revision: (streamReportedModels.get(conversationId)?.revision ?? 0) + 1,
+    model,
+  });
+}
+
+export function recordStreamLaunchedModel(conversationId: string, launched: string | null): void {
+  streamLaunchedModels.set(conversationId, {
+    revision: (streamLaunchedModels.get(conversationId)?.revision ?? 0) + 1,
+    launched,
+  });
+}
+
+export function clearStreamModelDisplay(conversationId: string): void {
+  streamReportedModels.delete(conversationId);
+  streamLaunchedModels.delete(conversationId);
+}
+
+/** Preserve newer confirmed live running/launched reports over an older in-flight snapshot. */
+export function preserveStreamModelDisplay<
+  T extends { id: string; running?: string | null; launched?: string | null },
+>(session: T, before: StreamModelDisplayRevisions | undefined): T {
+  if (before === undefined) return session;
+  let next = session;
+  const latestReported = streamReportedModels.get(session.id);
+  if (latestReported !== undefined && latestReported.revision !== before.reported) {
+    next = { ...next, running: latestReported.model };
+  }
+  const latestLaunched = streamLaunchedModels.get(session.id);
+  if (latestLaunched !== undefined && latestLaunched.revision !== before.launched) {
+    next = { ...next, launched: latestLaunched.launched };
+  }
+  return next;
+}
+
 export function sessionHeaderModelState(
   session:
     | {

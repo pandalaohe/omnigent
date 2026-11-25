@@ -6141,10 +6141,13 @@ class _RunnerForwardResult:
     :param status_code: Runner response status, e.g. ``204``.
     :param body: Runner response body text. Empty string when the runner
         returns no body.
+    :param model_applied: ``True`` only when the runner explicitly confirmed
+        that a live ``model_change`` took effect on the harness.
     """
 
     status_code: int
     body: str
+    model_applied: bool = False
 
 
 def _require_external_status_forward(
@@ -9359,7 +9362,11 @@ async def _forward_session_change_to_runner_impl(
             resp.text,
             extra={"session_id": session_id},
         )
-    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+    return _RunnerForwardResult(
+        status_code=resp.status_code,
+        body=resp.text,
+        model_applied=resp.headers.get("X-Omnigent-Model-Applied", "").lower() == "true",
+    )
 
 
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
@@ -13291,7 +13298,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         ACP_SESSION_MODE_LABEL_KEY,
         ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     )
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
     from omnigent.stores.conversation_store import _may_collate_to
+
+    if any(_may_collate_to(key, LAUNCHED_MODEL_LABEL, prefix=False) for key in labels):
+        raise OmnigentError(
+            f"label {LAUNCHED_MODEL_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     if any(
         _may_collate_to(key, reserved, prefix=False)
