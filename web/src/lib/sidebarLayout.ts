@@ -1,10 +1,10 @@
 // Sidebar layout model: the ordered sections a user arranges in the sidebar.
 // Pure functions only; localStorage is the synchronous read path and
-// userPreferencesSync mirrors the whole value to the account. Nothing is ever
-// pruned automatically: refs that no longer resolve are kept and skipped at
-// render until an explicit user action removes them.
+// userPreferencesSync mirrors the whole value to the account. Well-formed
+// refs that no longer resolve are kept and skipped at render until removed.
 
 import { nanoid } from "nanoid";
+import { isTempConvId } from "./tempConversationId";
 
 export type SectionKind = "projects" | "favorites" | "recent" | "other_projects" | "other_sessions";
 
@@ -110,6 +110,7 @@ function favoriteRef(raw: unknown): FavoriteRef | null {
   if (!isRecord(raw)) return null;
   if (raw.type !== "session" && raw.type !== "project") return null;
   if (typeof raw.id !== "string" || raw.id === "") return null;
+  if (raw.type === "session" && isTempConvId(raw.id)) return null;
   return { type: raw.type, id: raw.id };
 }
 

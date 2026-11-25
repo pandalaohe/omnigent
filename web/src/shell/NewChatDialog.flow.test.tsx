@@ -24,7 +24,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
   NewChatChoiceNotice: () => null,
@@ -360,7 +360,7 @@ function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
   seed?: { project: string; prompt: string },
-): ReturnType<typeof render> {
+): { client: QueryClient; view: ReturnType<typeof render> } {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -409,7 +409,8 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  return render(<NewChatLandingScreen seed={seed} />, { wrapper: Wrapper });
+  const view = render(<NewChatLandingScreen seed={seed} />, { wrapper: Wrapper });
+  return { client, view };
 }
 
 /**
@@ -890,6 +891,7 @@ describe("NewChatLandingScreen create flow", () => {
       removeLocalConversationMock.mockReturnValue(true);
       let resolveCreate!: (response: Response) => void;
       let sourceUnavailable = false;
+      let sourceTitle = "Source";
       vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
         if (String(url).startsWith("/v1/sessions/source?")) {
           if (sourceUnavailable) {
@@ -898,7 +900,7 @@ describe("NewChatLandingScreen create flow", () => {
           return new Response(
             JSON.stringify({
               id: "source",
-              title: "Source",
+              title: sourceTitle,
               host_id: "host_1",
               workspace: SEEDED_WORKSPACE,
               agent_id: "ag_hello",
@@ -914,7 +916,7 @@ describe("NewChatLandingScreen create flow", () => {
       });
       const info = { features: { canvas: true }, sibling_sessions: true };
       try {
-        renderLanding([], info);
+        const { client } = renderLanding([], info);
         await waitForWorkspaceSeed();
         typeMessage("Keep this scoped draft");
         fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
@@ -922,6 +924,15 @@ describe("NewChatLandingScreen create flow", () => {
         });
         fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
         await waitFor(() => expect(resolveCreate).toBeDefined());
+        if (query.startsWith("sibling=")) {
+          sourceTitle = "Renamed source";
+          await act(async () => {
+            await client.invalidateQueries({ queryKey: ["sibling-source", "source"] });
+          });
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: true, created: false }),
+          ]);
+        }
         cleanup();
         sourceUnavailable = sourceDeleted;
         await act(async () => {
@@ -929,11 +940,14 @@ describe("NewChatLandingScreen create flow", () => {
             new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
           );
         });
+        if (query.startsWith("sibling=")) {
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
         await waitFor(() =>
           expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
         );
         searchParams = new URLSearchParams(window.location.search);
-        renderLanding([], info);
+        const { client: reopenedClient } = renderLanding([], info);
         if (sourceDeleted) {
           expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
           fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
@@ -948,11 +962,64 @@ describe("NewChatLandingScreen create flow", () => {
         );
         expect(screen.getByText("notes.txt")).toBeVisible();
         expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+        if (query.startsWith("sibling=") && !sourceDeleted) {
+          cleanup();
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
       } finally {
         window.history.replaceState({}, "", previousUrl);
       }
     },
   );
+
+  it("keeps a created nested session and its prompt when local hydration fails", async () => {
+    const previousUrl = window.location.href;
+    onTestFinished(() => window.history.replaceState({}, "", previousUrl));
+    navigateMock.mockImplementation((to: string) => window.history.replaceState({}, "", to));
+    searchParams = new URLSearchParams("sibling=source");
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).startsWith("/v1/sessions/source?")
+              ? {
+                  id: "source",
+                  host_id: "host_1",
+                  workspace: SEEDED_WORKSPACE,
+                  agent_id: "ag_hello",
+                  permission_level: 4,
+                  labels: {},
+                  items: [],
+                }
+              : { id: "created" },
+          ),
+        ),
+    );
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pending",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    hydrateLocalConversationMock.mockImplementationOnce(() => {
+      throw new Error("local setup failed");
+    });
+    const { client } = renderLanding([], { sibling_sessions: true });
+    await waitForWorkspaceSeed();
+    typeMessage("Keep this task");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith("created", {
+      text: "Keep this task",
+      skill: null,
+      files: [],
+      composerParts: [{ type: "text", text: "Keep this task" }],
+    });
+    expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+      expect.objectContaining({ id: "created", created: true }),
+    ]);
+    expect(navigateMock).toHaveBeenLastCalledWith("/c/created");
+  });
 
   it("includes selected registry services in the sandbox creation request", async () => {
     vi.mocked(registryRequest).mockResolvedValue({
@@ -2864,7 +2931,7 @@ describe("NewChatLandingScreen create flow", () => {
       ok: true,
       json: async () => ({ id: "conv_full" }),
     } as unknown as Response);
-    const view = renderLanding();
+    const { view } = renderLanding();
     await waitForWorkspaceSeed();
     pickPermissionOption("full");
     vi.mocked(useHostModelOptions).mockReturnValue({

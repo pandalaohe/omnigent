@@ -23,12 +23,18 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
     _NATIVE_RELAY_BUILTIN_TOOLS,
+    _SCHEDULED_TASK_CREATE_FIELDS,
     _SCHEDULED_TASK_TOOLS,
+    _SCHEDULED_TASK_UPDATE_FIELDS,
     _execute_scheduled_task_tool,
     execute_tool,
 )
 from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
-from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
+from omnigent.tools.base import Tool
+from omnigent.tools.builtins.scheduled_tasks import (
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskUpdateTool,
+)
 
 _ALL_NAMES = {
     "sys_scheduled_task_create",
@@ -114,6 +120,7 @@ async def test_create_posts_payload() -> None:
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
                 "project_id": "proj_1",
+                "max_cost_usd": 2.5,
                 "workspace": "/repo",
                 "host_id": "host_1",
                 "session_mode": "continue",
@@ -136,6 +143,7 @@ async def test_create_posts_payload() -> None:
         "project_id": "proj_1",
         # The calling session rides along so the server can inherit its project.
         "source_session_id": "conv_source",
+        "max_cost_usd": 2.5,
         "workspace": "/repo",
         "host_id": "host_1",
         "session_mode": "continue",
@@ -505,6 +513,27 @@ def test_update_schema_accepts_a_project_id_or_null(project_id: str | None) -> N
         },
         parameters,
     )
+
+
+@pytest.mark.parametrize(
+    ("tool", "forwarded", "handled_separately"),
+    [
+        (SysScheduledTaskCreateTool(), _SCHEDULED_TASK_CREATE_FIELDS, {"project_name"}),
+        (
+            SysScheduledTaskUpdateTool(),
+            _SCHEDULED_TASK_UPDATE_FIELDS,
+            {"project_name", "scheduled_task_id"},
+        ),
+    ],
+    ids=["create", "update"],
+)
+def test_every_advertised_field_is_forwarded(
+    tool: Tool, forwarded: tuple[str, ...], handled_separately: set[str]
+) -> None:
+    """A field the schema advertises but the allowlist omits is dropped silently
+    while the call still reports success."""
+    advertised = set(tool.get_schema()["function"]["parameters"]["properties"])
+    assert advertised - handled_separately - set(forwarded) == set()
 
 
 @pytest.mark.asyncio

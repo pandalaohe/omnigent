@@ -928,11 +928,13 @@ describe("Sidebar sections", () => {
     await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_beta"));
     expect(scrolledElements).toEqual([]);
 
-    // Clicking a session row in Recent whose project folder (Gamma) is collapsed
-    // neither auto-expands Gamma nor scrolls the sidebar.
+    // Gamma holds its active row while collapsed. The click neither expands
+    // the folder nor scrolls the sidebar.
     fireEvent.click(within(sectionOf("Recent")).getByRole("link", { name: /s_gamma/ }));
     await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_gamma"));
-    expect(within(sectionOf("Work")).queryByText("s_gamma")).toBeNull();
+    const work = within(sectionOf("Work"));
+    expect(work.getByRole("button", { name: /^Gamma/ })).toHaveAttribute("aria-expanded", "false");
+    expect(work.getByText("s_gamma")).toBeVisible();
     expect(scrolledElements).toEqual([]);
 
     // Clicking a pinned session row in Pinned opens the session without scrolling.
@@ -2199,11 +2201,18 @@ describe("sidebar project favorites", () => {
     });
   });
 
-  it("reorders a project ref below a session and writes no pin timestamps", async () => {
+  it("reorders a project below a pinned family without splitting it or saving a draft ref", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_REORDER_LAYOUT));
     projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
-    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
-    mockConversations([conversation("s1")]);
+    const family = { id: "s1", representative_id: "s1", pinned: true };
+    const representative = conversation("s1", { family, labels: { "omnigent.pinned": "1000" } });
+    const draft = conversation("temp:draft", {
+      family,
+      provisional: true,
+      nested_draft_source_id: "s1",
+    });
+    pinnedRef.current = [representative];
+    mockConversations([representative, draft]);
     stubFavoriteItemRects();
     renderSidebar();
 
@@ -2228,6 +2237,8 @@ describe("sidebar project favorites", () => {
         { type: "project", id: "p_beta" },
       ]);
     });
+    expect(isBefore(within(fav).getByText("s1"), within(fav).getByText("temp:draft"))).toBe(true);
+    expect(isBefore(within(fav).getByText("temp:draft"), within(fav).getByText("Beta"))).toBe(true);
     expect(reorderPinsFn).not.toHaveBeenCalled();
   });
 

@@ -66,7 +66,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isIndentedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript, retrySession } from "@/lib/sessionsApi";
 import { copyText } from "@/lib/clipboard";
@@ -78,7 +78,6 @@ import { useComments } from "@/hooks/useComments";
 import { effectiveWorktree } from "@/lib/types";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
-  PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
@@ -250,9 +249,10 @@ export function HeaderConversationMenu({
   const automationSourceOf = automationDeletedWith(info, conversation);
   const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
-  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isPinned = isSessionPinned(conversation);
   const isArchived = conversation.archived === true;
   const isChild = conversation.parent_session_id != null;
+  const canPin = !isChild && !isIndentedSibling(conversation);
   const runnerOnline = useSessionRunnerOnline(conversation.id);
   const canStop =
     !isArchived &&
@@ -481,7 +481,9 @@ export function HeaderConversationMenu({
       : togglePinned.mutate({ id: conversation.id, pinned: true });
   // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
   // Like the menu item, Pin waits out a pending pin write (from any row).
-  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("toggle-pin-session", pinSaving || !canPin ? null : togglePin, {
+    active: isPinned,
+  });
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
@@ -512,7 +514,7 @@ export function HeaderConversationMenu({
           ),
         ]
       : []),
-    ...(!isChild
+    ...(canPin
       ? [
           menuRow("session-pin", "session", () => (
             <DropdownMenuItem

@@ -60,6 +60,18 @@ describe("newSectionId", () => {
 });
 
 describe("normalizeLayout", () => {
+  it("drops old provisional session references from stored favorites", () => {
+    const section = makeSection("fav", "favorites", {
+      items: [
+        { type: "session", id: "temp:draft" },
+        { type: "session", id: "saved" },
+      ],
+    });
+    expect(normalizeLayout(layoutOf(section)).sections[0].items).toEqual([
+      { type: "session", id: "saved" },
+    ]);
+  });
+
   it("falls back to the default layout for absent or unusable values", () => {
     expect(normalizeLayout(null)).toEqual(defaultLayout());
     expect(normalizeLayout(undefined)).toEqual(defaultLayout());

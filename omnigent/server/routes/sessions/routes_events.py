@@ -58,7 +58,7 @@ from omnigent.entities.subagent_terminal import (
     TERMINAL_IDENTITY_LABEL_PREFIX,
     TurnIdentity,
 )
-from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
+from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError, WrongReplicaError
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -940,8 +940,8 @@ async def _raise_if_runner_on_another_replica(
     :param app_state: ``request.app.state`` — supplies the host registry and
         the host store.
     :param conversation_store: Store used to resolve a sub-agent's ancestors.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the routing host is live on
-        another replica.
+    :raises WrongReplicaError: When the routing host is live on another
+        replica.
     """
     host_registry = getattr(app_state, "host_registry", None)
     host_store = getattr(app_state, "host_store", None)
@@ -952,10 +952,7 @@ async def _raise_if_runner_on_another_replica(
         return
     host = await asyncio.to_thread(host_store.get_host, host_id)
     if host is not None and host_is_live(host):
-        raise OmnigentError(
-            "session runner is on another replica; retry",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("session runner is on another replica", host_id=host_id)
 
 
 async def _raise_if_runner_re_tunnelled_to_another_replica(
@@ -982,8 +979,10 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id being classified (captured before the wait).
     :param conversation_store: Store used to re-read the fresh runner stamp.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's liveness
-        stamp is fresh evidence written by another replica.
+    :raises WrongReplicaError: When the bound runner's liveness stamp is fresh
+        evidence written by another replica, naming the session's routing host.
+    :raises OmnigentError: ``WRONG_REPLICA`` for the same miss when no host is
+        bound anywhere in the session's chain.
     """
     if runner_id is None:
         return
@@ -997,6 +996,11 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     if _runner_live_on_another_replica_from_conversations(
         [fresh], runner_id, last_liveness_stamp(runner_id)
     ):
+        host_id = await asyncio.to_thread(routing_host_id, fresh, conversation_store)
+        if host_id is not None:
+            raise WrongReplicaError(
+                "session runner re-tunnelled to another replica", host_id=host_id
+            )
         raise OmnigentError(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
@@ -3191,8 +3195,8 @@ def register_events_routes(
                 # the runner tunnel registers on the same replica as its host,
                 # so an absent tunnel here while the host is live elsewhere
                 # means the key routed to the wrong replica. Signal it (same as
-                # the message path) so the client re-addresses without the key,
-                # rather than getting a false "reconnect" 503 for a session that
+                # the message path) so the client re-addresses with the key it
+                # names, rather than getting a false "reconnect" 503 for a session that
                 # is actually wakeable on another replica.
                 _host_store = getattr(_app_state, "host_store", None)
                 if (
@@ -3202,9 +3206,8 @@ def register_events_routes(
                 ):
                     _elsewhere = await asyncio.to_thread(_host_store.get_host, wake_conv.host_id)
                     if _elsewhere is not None and host_is_live(_elsewhere):
-                        raise OmnigentError(
-                            "session runner is on another replica; retry",
-                            code=ErrorCode.WRONG_REPLICA,
+                        raise WrongReplicaError(
+                            "session runner is on another replica", host_id=wake_conv.host_id
                         )
                 _relaunched_runner_id: str | None = None
                 _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None

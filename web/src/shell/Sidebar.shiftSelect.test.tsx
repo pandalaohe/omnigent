@@ -150,6 +150,33 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Sidebar shift-click selection", () => {
+  it("skips an unsubmitted nested draft in session shortcuts and bulk selection", async () => {
+    const family = { id: "parent", representative_id: "parent", pinned: false };
+    mockConversations([
+      conv("parent", { family, updated_at: 100 }),
+      conv("temp:nested", { family, provisional: true, nested_draft_source_id: "parent" }),
+      conv("next", { updated_at: 1 }),
+    ]);
+    renderSidebar();
+
+    const draft = await screen.findByRole("link", { name: "temp:nested" });
+    expect(draft).toHaveAttribute("href", "/?sibling=parent");
+    expect(vi.mocked(useSessionSwitchHotkey).mock.lastCall?.[0]).toEqual(["parent", "next"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: "parent" }));
+    fireEvent.click(draft);
+    expect(screen.getByText("1 selected")).toBeVisible();
+    fireEvent.click(screen.getByRole("link", { name: "next" }), { shiftKey: true });
+    expect(screen.getByText("2 selected")).toBeVisible();
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+    await waitFor(() =>
+      expect(bulkArchiveMock.mutate).toHaveBeenCalledWith(
+        expect.objectContaining({ ids: ["parent", "next"], archived: true }),
+      ),
+    );
+  });
+
   it.each([false, true])(
     "excludes collapsed siblings from shortcuts and bulk ranges (project=%s)",
     async (project) => {
