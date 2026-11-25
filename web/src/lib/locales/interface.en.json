@@ -29,5 +29,7 @@
   "quotaLastValidReading": "Last valid reading {{time}}",
   "quotaNoValidReading": "No valid reading",
   "quoteOpen": "“",
-  "quoteClose": "”"
+  "quoteClose": "”",
+  "browserApprovalUnavailable": "Needs a signed-in browser — available with accounts sign-in.",
+  "artifactSharingSingleMachineHint": "On a single-machine install, shared links and visitor comments are reachable only from this machine unless the server is exposed."
 }

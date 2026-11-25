@@ -26,6 +26,7 @@ import binascii
 import hashlib
 import http
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -86,7 +87,7 @@ from omnigent.server.artifact_sharing import (
     remember_cookie_valid,
     verify_share_code,
 )
-from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -869,6 +870,36 @@ def register_artifact_routes(
         """Whether *user_id* is a real identity, not a reserved sentinel."""
         return user_id is not None and user_id != RESERVED_USER_LOCAL
 
+    def _host_is_loopback(host: str | None) -> bool:
+        """Whether *host* is a loopback hostname or IP (including IPv4-mapped IPv6)."""
+        if not host:
+            return False
+        if host == "localhost":
+            return True
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return addr.is_loopback or (mapped is not None and mapped.is_loopback)
+
+    def _is_single_user_loopback_owner(
+        request: Request, user_id: str | None, owner: str | None
+    ) -> bool:
+        """Whether a direct loopback request belongs to the single-user local owner."""
+        if not (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "header"
+            and auth_provider._local_single_user
+        ):
+            return False
+        if user_id != RESERVED_USER_LOCAL or owner != RESERVED_USER_LOCAL:
+            return False
+        if request.headers.get("x-forwarded-for") or request.headers.get("forwarded"):
+            return False
+        peer = request.client.host if request.client is not None else None
+        return _host_is_loopback(peer) and _host_is_loopback(request.url.hostname)
+
     async def _identity_allowed(request: Request, claims: ArtifactTokenClaims) -> bool:
         """Whether the request's identity passes the mint's read rule.
 
@@ -974,7 +1005,9 @@ def register_artifact_routes(
         # external off. A URL whose grant is bad is evaluated here as a bare one.
         if record is not None and record.external and record.code_hash is None:
             return None, record
-        if _is_login(user_id) and await _identity_allowed(request, claims):
+        if (
+            _is_login(user_id) or _is_single_user_loopback_owner(request, user_id, owner)
+        ) and await _identity_allowed(request, claims):
             return (
                 _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
                 record,

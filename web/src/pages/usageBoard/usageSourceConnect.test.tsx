@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { UsageSourceConnect } from "./UsageSourceConnect";
 import { UsageTile } from "./UsageTile";
 import { usageBoardData } from "./usageBoardFixtures";
@@ -28,6 +30,36 @@ describe("source connection", () => {
         expect(connectCommandPayload(command, 1794000000)).toBeTruthy();
       }
     }
+  });
+
+  it("omits API key guidance in single-user mode and preserves it in multi-user mode", () => {
+    const view = render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, single_user: true }}>
+        <UsageSourceConnect initialSource="report" />
+      </CapabilitiesProvider>,
+    );
+    const command = document.querySelector("pre")?.textContent ?? "";
+    expect(command).not.toContain("Authorization: Bearer");
+    expect(connectCommandPayload(command, 1794000000)).toBeTruthy();
+    expect(screen.getByText(/no api key is needed on this machine/i)).toBeVisible();
+    expect(screen.queryByText(/Settings → API keys/)).toBeNull();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: t("otel") } });
+    fireEvent.click(screen.getByRole("option", { name: t("otel") }));
+    expect(document.querySelector("pre")?.textContent ?? "").not.toContain("Authorization: Bearer");
+    expect(screen.queryByText(/Authorization: Bearer \$USAGE_KEY/)).toBeNull();
+
+    view.rerender(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, single_user: false, accounts_enabled: true }}
+      >
+        <UsageSourceConnect initialSource="report" />
+      </CapabilitiesProvider>,
+    );
+    expect(document.querySelector("pre")?.textContent ?? "").toContain(
+      "Authorization: Bearer $USAGE_KEY",
+    );
+    expect(screen.getByText(/Settings → API keys/)).toBeVisible();
   });
 
   it("shows a zero balance and its own old reading with no pace, in both densities", () => {

@@ -29,5 +29,7 @@
   "quotaLastValidReading": "上次有效读数 {{time}}",
   "quotaNoValidReading": "无有效读数",
   "quoteOpen": "「",
-  "quoteClose": "」"
+  "quoteClose": "」",
+  "browserApprovalUnavailable": "需要已登录的浏览器会话——启用账号登录模式后可用。",
+  "artifactSharingSingleMachineHint": "单机安装下，分享链接与访客评论/批注仅本机可访问，除非将服务端对外暴露。"
 }

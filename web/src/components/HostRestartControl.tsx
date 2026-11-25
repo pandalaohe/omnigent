@@ -12,6 +12,9 @@ import {
 } from "@/components/ui/dialog";
 import { useHostRestart, type HostRestartPhase } from "@/hooks/useHostRestart";
 import type { Host } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
+import { interfaceText } from "@/lib/interfaceText";
 
 const PHASE_LABELS: Record<HostRestartPhase, string> = {
   draining: "Waiting for running turns to finish",
@@ -37,6 +40,8 @@ export function HostRestartControl({
   const [expiresAt, setExpiresAt] = useState(0);
   const [expired, setExpired] = useState(false);
   const starting = useRef(false);
+  const serverInfo = useServerInfo();
+  const singleUser = isSingleUserMode(serverInfo);
   const { preview, start, status } = useHostRestart(host.host_id, requestId);
   const canRestart =
     host.status === "online" &&
@@ -68,6 +73,22 @@ export function HostRestartControl({
   }
 
   if (!canRestart && requestId === null && !open) return null;
+
+  if (singleUser && requestId === null && !open) {
+    const reason = interfaceText("browserApprovalUnavailable");
+    const reasonId = `host-restart-unavailable-${host.host_id}`;
+    return (
+      <span className="ml-auto inline-flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" disabled aria-describedby={reasonId} title={reason}>
+          <RotateCwIcon className="size-3.5" aria-hidden="true" />
+          Restart
+        </Button>
+        <span id={reasonId} className="text-xs text-muted-foreground">
+          {reason}
+        </span>
+      </span>
+    );
+  }
 
   return (
     <Dialog open={open} onOpenChange={changeOpen}>

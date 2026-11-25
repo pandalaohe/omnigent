@@ -23,6 +23,10 @@ import {
 } from "./taskBoardActivityData";
 
 const fetcher = vi.hoisted(() => vi.fn());
+const serverInfoState = vi.hoisted(() => ({
+  usage_board_enabled: false,
+  single_user: false,
+}));
 
 it("shows Today decisions by source visibility regardless of language or prefix", () => {
   const task: BoardTask = {
@@ -121,10 +125,11 @@ it("deduplicates repeated repositories, withholds conflicting totals and incompa
   expect(repositoryCommitTotals({}, now)).toMatchObject({ total: null, partial: true });
 });
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ usage_board_enabled: false }),
+  useServerInfo: () => serverInfoState,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetcher }));
 afterEach(() => {
+  serverInfoState.single_user = false;
   cleanup();
   fetcher.mockReset();
 });
@@ -887,4 +892,26 @@ it("offers an available standards reference before a source is connected", () =>
   expect(screen.getByRole("link", { name: "JSCalendar reference" }).getAttribute("href")).toBe(
     "https://www.rfc-editor.org/rfc/rfc8984.html",
   );
+});
+
+it("explains loopback push without an API key in single-user mode and keeps bearer header in multi-user mode", () => {
+  const source = taskBoardFixture().sources[0];
+  const prefs = {
+    ...boardDefaults,
+    view: "settings" as const,
+    mode: "order" as const,
+    focus: [],
+    aliases: {},
+    hiddenSources: [],
+    pinnedQuota: [],
+  };
+  serverInfoState.single_user = true;
+  const view = wrap(<TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />);
+  expect(view.container.textContent).toMatch(/no api key is needed on this machine/i);
+  expect(view.container.textContent).not.toContain("Authorization: Bearer");
+
+  view.unmount();
+  serverInfoState.single_user = false;
+  const multi = wrap(<TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />);
+  expect(multi.container.textContent).toContain("Authorization: Bearer <your tasks-scoped key>");
 });

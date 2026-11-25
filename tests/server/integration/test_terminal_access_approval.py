@@ -630,3 +630,61 @@ async def test_real_card_timeout_releases_reservation_without_another_request(
     await poll_until_async(lambda: not _requests, timeout_s=2)
     assert not _requests
     assert pending_elicitations.lookup(eid, conversation_id=env.sid) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["mcp", "relay", "park"])
+async def test_single_user_terminal_access_returns_reason_without_posting_card(
+    terminal_access, monkeypatch, gate
+):
+    env = terminal_access
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setattr(env.provider, "_source", "header")
+    monkeypatch.setattr(env.provider, "_accounts_config", None)
+    monkeypatch.setattr(env.provider, "_local_single_user", True)
+    published = []
+    monkeypatch.setattr(session_stream, "publish", lambda *args: published.append(args))
+    if gate == "mcp":
+        response = await orchestration._handle_mcp_tools_call(
+            1,
+            env.sid,
+            {"name": "sys_terminal_request_access", "arguments": env.args},
+            env.store,
+            None,
+            None,
+        )
+        body = json.loads(bytes(response.body))
+        assert "error" in body, body
+        reason = body["error"]["message"]
+    elif gate == "relay":
+        verdict = await orchestration._evaluate_independent_tool_call_policy(
+            env.sid,
+            env.store.get_conversation(env.sid),
+            SessionEventInput(
+                type="function_call",
+                data={"name": "sys_terminal_request_access", "arguments": json.dumps(env.args)},
+            ),
+            env.store,
+            env.agents,
+            None,
+        )
+        assert verdict is not None and verdict["verdict"] == "deny", verdict
+        reason = verdict["reason"]
+    else:
+        ready = asyncio.Event()
+        result = await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=env.sid,
+            params=ElicitationRequestParams(mode="form", message="Access?"),
+            timeout_s=0.05,
+            conversation_store=env.store,
+            tool_name="mcp__omnigent__sys_terminal_request_access",
+            tool_input=env.args,
+            published=ready,
+        )
+        assert result is not None and result.action == "decline" and ready.is_set()
+        reason = (result.content or {}).get("reason", "")
+    assert "signed-in browser" in reason.lower(), reason
+    assert "accounts sign-in" in reason.lower(), reason
+    assert not published
+    assert not _requests

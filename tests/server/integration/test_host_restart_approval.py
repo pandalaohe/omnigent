@@ -99,6 +99,17 @@ async def test_restart_card_preview_and_owner_resolution(
         )
 
     monkeypatch.setattr(registry, "send_text", reply)
+    provider = auth_app.state.mcp_registry_auth
+    config = AccountsConfig(
+        cookie_secret=b"test-browser-approval-key-32-bytes",
+        session_ttl_hours=8,
+        base_url="http://test",
+        init_admin_password=None,
+        invite_ttl_seconds=3600,
+        magic_ttl_seconds=300,
+    )
+    monkeypatch.setattr(provider, "_source", "accounts")
+    monkeypatch.setattr(provider, "_accounts_config", config)
     parked = None
     args = {"host": " restart-test ", "dry_run": False}
     initial = None
@@ -159,20 +170,14 @@ async def test_restart_card_preview_and_owner_resolution(
     else:
         url = f"/v1/sessions/{session_id}/events"
         body = {"type": "approval", "data": {"elicitation_id": elicitation_id, "action": action}}
-    denied = await auth_client.post(url, json=body, headers={"X-Forwarded-Email": collaborator})
-    assert denied.status_code == 403, denied.text
+    with monkeypatch.context() as header_ctx:
+        header_ctx.setattr(provider, "_source", "header")
+        header_ctx.setattr(provider, "_local_single_user", False)
+        denied = await auth_client.post(
+            url, json=body, headers={"X-Forwarded-Email": collaborator}
+        )
+        assert denied.status_code == 403, denied.text
     assert not registry.restarts.previews[preview["preview_id"]].tool_approved
-    provider = auth_app.state.mcp_registry_auth
-    config = AccountsConfig(
-        cookie_secret=b"test-browser-approval-key-32-bytes",
-        session_ttl_hours=8,
-        base_url="http://test",
-        init_admin_password=None,
-        invite_ttl_seconds=3600,
-        magic_ttl_seconds=300,
-    )
-    monkeypatch.setattr(provider, "_source", "accounts")
-    monkeypatch.setattr(provider, "_accounts_config", config)
     auth_client.cookies.set(
         config.session_cookie_name,
         mint_session_cookie(
@@ -279,6 +284,20 @@ async def test_invalid_restart_target_never_publishes_card(
     )
     assert created.status_code == 201
     session_id = created.json()["id"]
+    provider = auth_app.state.mcp_registry_auth
+    monkeypatch.setattr(provider, "_source", "accounts")
+    monkeypatch.setattr(
+        provider,
+        "_accounts_config",
+        AccountsConfig(
+            cookie_secret=b"test-browser-approval-key-32-bytes",
+            session_ttl_hours=8,
+            base_url="http://test",
+            init_admin_password=None,
+            invite_ttl_seconds=3600,
+            magic_ttl_seconds=300,
+        ),
+    )
     store = SqlAlchemyConversationStore(db_uri)
     registry = auth_app.state.host_registry
     monkeypatch.setattr(
@@ -319,3 +338,119 @@ async def test_invalid_restart_target_never_publishes_card(
         assert result.action == "decline" and ready.is_set()
     assert not published
     assert not registry.restarts.previews
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["mcp", "relay", "park"])
+async def test_single_user_host_restart_returns_reason_without_posting_card(
+    auth_app, auth_client, db_uri, monkeypatch, gate
+):
+    owner = "local"
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    provider = auth_app.state.mcp_registry_auth
+    monkeypatch.setattr(provider, "_source", "header")
+    monkeypatch.setattr(provider, "_local_single_user", True)
+    agent = await create_test_agent(auth_client)
+    created = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    registry = auth_app.state.host_registry
+    hosts = HostStore(db_uri)
+    host_id = "fedcba9876543210fedcba9876543210"
+    hosts.upsert_on_connect(host_id, "local-host", owner)
+    auth_app.include_router(
+        create_hosts_router(
+            registry,
+            hosts,
+            store,
+            auth_provider=provider,
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+        ),
+        prefix="/v1",
+    )
+    registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            "test", 1, "local-host", capabilities=[CAP_HOST_RESTART], supervised="launchd"
+        ),
+        owner,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.common.get_server_host_registry", lambda: registry
+    )
+    monkeypatch.setattr(
+        orchestration, "_load_agent_spec_for_session", lambda *_: AgentSpec(spec_version=1)
+    )
+    monkeypatch.setattr(orchestration, "_resolve_harness", lambda *_, **__: None)
+
+    def reply(connection, raw):
+        frame = decode_host_frame(raw)
+        connection.pending_restarts[frame.request_id].set_result(
+            HostRestartResultFrame(
+                frame.request_id,
+                True,
+                supervisor="launchd",
+                running_sessions=[],
+                runner_count=1,
+            )
+        )
+
+    monkeypatch.setattr(registry, "send_text", reply)
+    published = []
+    monkeypatch.setattr(
+        orchestration.session_stream, "publish", lambda *args: published.append(args)
+    )
+    args = {"host": "local-host", "dry_run": False}
+    if gate == "mcp":
+        response = await _handle_mcp_tools_call(
+            1, session_id, {"name": "sys_host_restart", "arguments": args}, store, None, None
+        )
+        body = json.loads(bytes(response.body))
+        assert "error" in body, body
+        reason = body["error"]["message"]
+    elif gate == "relay":
+        from omnigent.server.schemas import SessionEventInput
+        from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+        verdict = await orchestration._evaluate_independent_tool_call_policy(
+            session_id,
+            store.get_conversation(session_id),
+            SessionEventInput(
+                type="function_call",
+                data={"name": "sys_host_restart", "arguments": json.dumps(args)},
+            ),
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            None,
+        )
+        assert verdict is not None and verdict["verdict"] == "deny", verdict
+        reason = verdict["reason"]
+    else:
+        ready = asyncio.Event()
+        result = await _publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=session_id,
+            params=ElicitationRequestParams(mode="form", message="Restart?"),
+            timeout_s=0.05,
+            conversation_store=store,
+            tool_name="sys_host_restart",
+            tool_input=args,
+            published=ready,
+        )
+        assert result is not None and result.action == "decline" and ready.is_set()
+        reason = (result.content or {}).get("reason", "")
+    assert "signed-in browser" in reason.lower(), reason
+    assert "accounts sign-in" in reason.lower(), reason
+    assert not published
+    assert not registry.restarts.previews
+    denied = await auth_client.post(
+        f"/v1/hosts/{host_id}/restart",
+        json={"dry_run": False, "preview_id": "missing"},
+        headers={"Origin": "http://127.0.0.1:6767"},
+    )
+    assert denied.status_code == 403, denied.text
+    assert "signed-in browser" in denied.text.lower()
+    assert "accounts sign-in" in denied.text.lower()
+    await registry.restarts.shutdown()

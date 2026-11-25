@@ -69,7 +69,13 @@ from omnigent.server.artifact_sharing import (
     grant_valid,
     remember_cookie_name,
 )
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, UnifiedAuthProvider
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    UnifiedAuthProvider,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes import artifacts as artifacts_module
 from omnigent.server.routes.comments import create_comments_router
@@ -2719,6 +2725,121 @@ async def test_gate_without_an_auth_provider_governs_the_local_record(
             resp = await client.get(minted["url"])
 
     assert resp.status_code == 403
+
+
+async def test_gate_single_user_loopback_owner_opens_own_links(
+    runner_globals_reset: None,
+    db_uri: str,
+    asset_dir: Path,
+) -> None:
+    """Single-user loopback mode treats local as the owner for visit and raw links."""
+    del runner_globals_reset
+    _write_visit_shell(asset_dir)
+    store = _ConversationStore({_SESSION_ID: _conversation()}, storage_location=db_uri)
+    permissions = _PermissionStore()
+    permissions.grant(RESERVED_USER_LOCAL, _SESSION_ID, LEVEL_OWNER)
+    provider = UnifiedAuthProvider(source="header", local_single_user=True)
+    app = _build_app(store, auth_provider=provider, permission_store=permissions)
+    ArtifactSharingStore(db_uri).write_sharing(RESERVED_USER_LOCAL, external=False)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51234))
+    runner = _stub_runner_app(
+        b"<html><body><h1>Report</h1></body></html>", content_type="text/html"
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:6767") as client:
+        visit_minted = await _mint(client, path=_ENTRY, view="visit")
+        raw_minted = await _mint(client, path="notes.txt", view="raw")
+        async with _use_runner(runner):
+            visit_redirect = await client.get(visit_minted["url"])
+            assert visit_redirect.status_code == 303, visit_redirect.text
+            assert "~" in visit_redirect.headers["location"]
+            visit_served = await client.get(visit_redirect.headers["location"])
+            assert visit_served.status_code == 200
+
+            raw_redirect = await client.get(raw_minted["url"])
+            assert raw_redirect.status_code == 303, raw_redirect.text
+            assert "~" in raw_redirect.headers["location"]
+            raw_served = await client.get(raw_redirect.headers["location"])
+            assert raw_served.status_code == 200
+
+
+async def test_gate_single_user_non_loopback_forwarded_non_owner_and_accounts_refused(
+    runner_globals_reset: None,
+    db_uri: str,
+    asset_dir: Path,
+) -> None:
+    """Non-loopback peers, proxies, non-owner identities, and accounts mode stay closed."""
+    del runner_globals_reset
+    store = _ConversationStore({_SESSION_ID: _conversation()}, storage_location=db_uri)
+    permissions = _PermissionStore()
+    permissions.grant(RESERVED_USER_LOCAL, _SESSION_ID, LEVEL_OWNER)
+    provider = UnifiedAuthProvider(source="header", local_single_user=True)
+    app = _build_app(store, auth_provider=provider, permission_store=permissions)
+    ArtifactSharingStore(db_uri).write_sharing(RESERVED_USER_LOCAL, external=False)
+    runner = _stub_runner_app(
+        b"<html><body><h1>Report</h1></body></html>", content_type="text/html"
+    )
+
+    loopback = httpx.ASGITransport(app=app, client=("127.0.0.1", 51234))
+    async with httpx.AsyncClient(transport=loopback, base_url="http://127.0.0.1:6767") as client:
+        visit_minted = await _mint(client, path=_ENTRY, view="visit")
+        raw_minted = await _mint(client, path="notes.txt", view="raw")
+        async with _use_runner(runner):
+            forwarded = await client.get(
+                visit_minted["url"], headers={"X-Forwarded-For": "192.0.2.20"}
+            )
+            assert forwarded.status_code == 403
+            non_owner = await client.get(
+                visit_minted["url"], headers={"X-Forwarded-Email": "other@example.test"}
+            )
+            assert non_owner.status_code == 403
+
+    async with httpx.AsyncClient(
+        transport=loopback, base_url="http://shared.example.test"
+    ) as host_client:
+        async with _use_runner(runner):
+            resp = await host_client.get(raw_minted["url"])
+            assert resp.status_code == 403
+
+    remote = httpx.ASGITransport(app=app, client=("192.0.2.20", 51234))
+    async with httpx.AsyncClient(transport=remote, base_url="http://127.0.0.1:6767") as remote_c:
+        async with _use_runner(runner):
+            resp = await remote_c.get(visit_minted["url"])
+            assert resp.status_code == 403
+
+    other_permissions = _PermissionStore()
+    other_permissions.grant(_OWNER, _SESSION_ID, LEVEL_OWNER)
+    other_app = _build_app(store, auth_provider=provider, permission_store=other_permissions)
+    ArtifactSharingStore(db_uri).write_sharing(_OWNER, external=False)
+    other_loopback = httpx.ASGITransport(app=other_app, client=("127.0.0.1", 51234))
+    async with httpx.AsyncClient(
+        transport=other_loopback, base_url="http://127.0.0.1:6767"
+    ) as other_client:
+        async with _use_runner(runner):
+            resp = await other_client.get(visit_minted["url"])
+            assert resp.status_code == 403
+
+    accounts_provider = UnifiedAuthProvider(
+        source="accounts",
+        accounts_config=AccountsConfig(
+            cookie_secret=b"artifact-accounts-guard-key-32by",
+            session_ttl_hours=8,
+            base_url="http://127.0.0.1:6767",
+            init_admin_password=None,
+            invite_ttl_seconds=3600,
+            magic_ttl_seconds=300,
+        ),
+    )
+    accounts_app = _build_app(
+        store, auth_provider=accounts_provider, permission_store=other_permissions
+    )
+    accounts_loopback = httpx.ASGITransport(app=accounts_app, client=("127.0.0.1", 51234))
+    async with httpx.AsyncClient(
+        transport=accounts_loopback, base_url="http://127.0.0.1:6767"
+    ) as accounts_client:
+        async with _use_runner(runner):
+            resp = await accounts_client.get(visit_minted["url"])
+            assert resp.status_code == 403
 
 
 # ── Gate: unlock throttle ───────────────────────────────────────────

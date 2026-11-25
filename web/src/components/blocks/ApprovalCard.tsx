@@ -37,7 +37,14 @@
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext, useMemo } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
-import { isTerminalAccessPolicyName, type TerminalAccessRequest } from "@/lib/terminalAccess";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
+import { interfaceText } from "@/lib/interfaceText";
+import {
+  isHostRestartPolicyName,
+  isTerminalAccessPolicyName,
+  type TerminalAccessRequest,
+} from "@/lib/terminalAccess";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -411,6 +418,12 @@ function TerminalAccessActions({
   sessionId?: string | null;
 }) {
   const viewerId = useViewerId();
+  const serverInfo = useServerInfo();
+  if (isSingleUserMode(serverInfo)) {
+    return (
+      <p className="text-sm text-muted-foreground">{interfaceText("browserApprovalUnavailable")}</p>
+    );
+  }
   if (!request) {
     return (
       <div className="text-sm">
@@ -478,9 +491,16 @@ export function ApprovalCard({
   keyboardActive,
   className,
 }: ApprovalCardProps) {
+  const serverInfo = useServerInfo();
+  const singleUser = isSingleUserMode(serverInfo);
   const isTerminalAccess = Boolean(terminalAccess) || isTerminalAccessPolicyName(policyName);
+  const isHostRestart = isHostRestartPolicyName(policyName);
+  const browserApprovalBlocked = singleUser && (isTerminalAccess || isHostRestart);
   // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
-  const hotkeyTarget = useApprovesOnHotkey(elicitationId, status === "pending");
+  const hotkeyTarget = useApprovesOnHotkey(
+    elicitationId,
+    status === "pending" && !browserApprovalBlocked,
+  );
   useApprovalPromptOnScreen(elicitationId, inChat && status === "pending");
   const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
   const declineKeys = hotkeyTarget && inChat ? DECLINE_KEYS : undefined;
@@ -1317,6 +1337,10 @@ export function ApprovalCard({
                 onApprove={() => submitBinary("accept")}
                 onReject={() => submitBinary("decline")}
               />
+            ) : browserApprovalBlocked ? (
+              <p className="text-sm text-muted-foreground">
+                {interfaceText("browserApprovalUnavailable")}
+              </p>
             ) : isExternalUrl ? (
               <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
                 <Button size="sm" className={MOBILE_CHOICE_CLASS} asChild>

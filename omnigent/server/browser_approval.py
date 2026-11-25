@@ -6,8 +6,32 @@ from fastapi import HTTPException, Request
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.auth import AuthProvider, UnifiedAuthProvider, local_single_user_enabled
 from omnigent.server.ws_origin import origin_allowed, parse_allowed_origins
+
+BROWSER_APPROVAL_UNAVAILABLE_REASON = (
+    "Needs a signed-in browser — available with accounts sign-in."
+)
+
+
+def browser_approval_supported(auth_provider: AuthProvider | None) -> bool:
+    """Whether *auth_provider* can verify signed browser-session cookies."""
+    if not isinstance(auth_provider, UnifiedAuthProvider):
+        return False
+    if auth_provider._source == "oidc":
+        return auth_provider._oidc_config is not None
+    if auth_provider._source == "accounts":
+        return auth_provider._accounts_config is not None
+    return False
+
+
+def is_single_user_without_browser_approval(auth_provider: AuthProvider | None) -> bool:
+    """Whether the server runs in single-user local mode without browser-session auth."""
+    if browser_approval_supported(auth_provider):
+        return False
+    if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._local_single_user:
+        return True
+    return local_single_user_enabled()
 
 
 def browser_action_user(
@@ -54,6 +78,8 @@ def require_owner_browser_approval(
     request: Request, auth_provider: AuthProvider | None, owner: str | None
 ) -> None:
     """Require the owner's browser cookie and a configured, trusted HTTP origin."""
+    if is_single_user_without_browser_approval(auth_provider):
+        raise OmnigentError(BROWSER_APPROVAL_UNAVAILABLE_REASON, code=ErrorCode.FORBIDDEN)
     try:
         user = browser_action_user(request, auth_provider, mutating=True)
         if owner is not None and user == owner:

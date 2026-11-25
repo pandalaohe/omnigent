@@ -6,7 +6,7 @@ import jwt
 import pytest
 from starlette.requests import Request
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.browser_approval import require_owner_browser_approval
@@ -107,3 +107,20 @@ def test_unproven_browser_identity_fails_closed(provider):
     )
     with pytest.raises(OmnigentError):
         require_owner_browser_approval(request, provider, "owner@example.test")
+
+
+def test_single_user_browser_approval_explains_accounts_requirement():
+    provider = UnifiedAuthProvider("header", local_single_user=True)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/resolve",
+            "headers": [(b"origin", b"http://127.0.0.1:6767")],
+        }
+    )
+    with pytest.raises(OmnigentError) as exc_info:
+        require_owner_browser_approval(request, provider, "local")
+    assert exc_info.value.code == ErrorCode.FORBIDDEN
+    assert "signed-in browser" in exc_info.value.message.lower()
+    assert "accounts sign-in" in exc_info.value.message.lower()

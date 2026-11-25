@@ -48,6 +48,7 @@ from omnigent.harness_plugins import (
 )
 from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from omnigent.runner.routing import RunnerRouter
+from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -1258,6 +1259,20 @@ def get_server_host_registry() -> HostRegistry | None:
     return _server_host_registry
 
 
+_server_auth_provider: AuthProvider | None = None
+
+
+def set_server_auth_provider(auth_provider: AuthProvider | None) -> None:
+    """Stash the live auth provider for card builders outside a request closure."""
+    global _server_auth_provider
+    _server_auth_provider = auth_provider
+
+
+def get_server_auth_provider() -> AuthProvider | None:
+    """Return the auth provider stashed by :func:`set_server_auth_provider`."""
+    return _server_auth_provider
+
+
 __all__ = [
     "CLIENT_SESSION_EVENT_TYPES",
     "COST_CONTROL_OVERRIDE_VALUES",
@@ -1483,9 +1498,11 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "_unbound_managed_launch_tasks",
+    "get_server_auth_provider",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
+    "set_server_auth_provider",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

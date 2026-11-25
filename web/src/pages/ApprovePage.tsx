@@ -28,7 +28,11 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
-import { isTerminalAccessPolicyName, parseTerminalAccess } from "@/lib/terminalAccess";
+import {
+  isHostRestartPolicyName,
+  isTerminalAccessPolicyName,
+  parseTerminalAccess,
+} from "@/lib/terminalAccess";
 import { formatPreview } from "@/lib/previewFormat";
 import { fileEditRequestFromWire } from "@/lib/toolEditDiff";
 
@@ -177,6 +181,7 @@ export function ApprovePage() {
     (Boolean(state.data.native_delivery) ||
       Boolean(state.data.permission_directories?.length) ||
       isTerminalAccessPolicyName(state.data.policy_name ?? "") ||
+      isHostRestartPolicyName(state.data.policy_name ?? "") ||
       Boolean(parseTerminalAccess(state.data)) ||
       fileEdit !== null);
 

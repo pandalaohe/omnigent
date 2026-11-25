@@ -3394,6 +3394,9 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    from omnigent.server.routes._sessions.common import set_server_auth_provider
+
+    set_server_auth_provider(auth_provider)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The
