@@ -3228,7 +3228,11 @@ def register_hooks_routes(
             # now, so the interrupt a regular declined request sends would
             # abort an unrelated turn. A timeout stop already interrupted on
             # its way here, so its replay must not interrupt a second time.
-            if not is_async_question and not (result.meta or {}).get("omnigent_timeout"):
+            if (
+                not is_async_question
+                and codex_request.interrupts_on_decline
+                and not (result.meta or {}).get("omnigent_timeout")
+            ):
                 # Explicit user decline. Codex's response has no deny-with-
                 # interrupt (unlike Claude's ``decision.interrupt``), so the
                 # stop is a runner interrupt awaited before the decline result

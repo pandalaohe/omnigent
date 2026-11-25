@@ -5114,7 +5114,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 20
+    assert len(python_commands) == 21
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -6064,6 +6064,27 @@ def test_augment_claude_args_pins_policy_hook_timeouts(tmp_path: Path) -> None:
     ]
     assert post_policy, "the PostToolUse policy hook must still be registered"
     assert "timeout" not in post_policy[0], "PostToolUse must keep the inherited default"
+
+
+def test_augment_claude_args_registers_policy_hook_for_failed_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """
+    Failed tool calls reach TOOL_RESULT policies through PostToolUseFailure.
+
+    Claude Code fires PostToolUseFailure instead of PostToolUse when a tool
+    fails, so result policies such as ``detect_thrashing`` need a catch-all
+    evaluate-policy hook there too. The hook stays gated on a server URL.
+    """
+    settings = _load_invocation_settings(
+        augment_claude_args((), bridge_dir=tmp_path, ap_server_url="http://127.0.0.1:8787")
+    )
+    entries = settings["hooks"].get("PostToolUseFailure", [])
+    assert ["matcher" in entry for entry in entries] == [False]
+    assert "evaluate-policy" in entries[0]["hooks"][0]["command"]
+
+    ungoverned = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "PostToolUseFailure" not in ungoverned["hooks"]
 
 
 def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(

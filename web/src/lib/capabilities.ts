@@ -88,6 +88,8 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   telemetry?: TelemetryStatus;
+  /** The server enforces the browser's Admin view cookie; absent on older servers. */
+  admin_view?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -755,6 +757,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
+          admin_view: data.admin_view === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

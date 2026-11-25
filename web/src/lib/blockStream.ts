@@ -937,6 +937,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         elicitationId: event.elicitationId,
         triage: event.triage,
         ...(event.nativeDelivery ? { nativeDelivery: event.nativeDelivery } : {}),
+        ...(event.isBlocking === false ? { isBlocking: false as const } : {}),
         targetSessionId: event.targetSessionId,
         message: event.message,
         phase: event.phase,

@@ -89,7 +89,8 @@ _GUARD_SCRIPT = r"""if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] && read -r allow_unt
   outer "${head%%'"hook_event_name":'*}" || event=
   outer "${head%%'"tool_name":'*}" || tool=
   case ${event# } in
-    '"PreToolUse"'*|'"PostToolUse"'*) case ${tool# } in '"'[!'"']*) exit 0 ;; esac ;;
+    '"PreToolUse"'*|'"PostToolUse"'*|'"PostToolUseFailure"'*)
+      case ${tool# } in '"'[!'"']*) exit 0 ;; esac ;;
   esac
   printf '%s' "$payload" | { @COMMAND@; }
   exit

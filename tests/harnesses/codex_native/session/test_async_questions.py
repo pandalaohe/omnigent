@@ -302,6 +302,7 @@ def _expected_async_question_envelope(
             "turnId": "turn_123",
             "itemId": call_id,
             "omnigentAsyncQuestion": True,
+            "isBlocking": False,
             "questions": [
                 {
                     "id": f"{call_id}:{index}",

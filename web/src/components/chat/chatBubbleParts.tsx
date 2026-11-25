@@ -78,13 +78,14 @@ import {
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
-import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   ATTACHMENT_UPLOAD_FAILED,
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
@@ -122,6 +123,7 @@ import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
@@ -145,7 +147,7 @@ export const SessionSharedContext = createContext(false);
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
   const text = stripAutomationContext(joinTextBlocks(content));
-  return splitSessionMessageOrigin(text)?.body ?? text;
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
 /** A user message's text for reading and copying: mention markers become ``@name``. */
@@ -611,6 +613,11 @@ function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
   return computeIsTurnActive(sessionStatus, localSending);
+}
+
+/** Whether any elicitation card still parks the turn on the user's answer. */
+function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
+  return blocks.some(isPendingBlockingElicitation);
 }
 
 /**
@@ -1477,9 +1484,7 @@ function AssistantBubble({
   const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationId = sessionId ?? scopedConversationId ?? activeConversationId;
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
-  const rootHasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending" && b.asyncKind == null),
-  );
+  const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   // Archive/library viewers (readOnly) never show a live status regardless of
   // scope — there's no session to be pending on.
   const sessionStatus = readOnly
@@ -1493,9 +1498,7 @@ function AssistantBubble({
   const hasPendingElicitation = readOnly
     ? false
     : scopedConversationId
-      ? scopedState.blocks.some(
-          (b) => b.type === "elicitation" && b.status === "pending" && b.asyncKind == null,
-        )
+      ? hasPendingElicitationBlock(scopedState.blocks)
       : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(
@@ -1534,7 +1537,7 @@ function AssistantBubble({
           current.sessionStatus === "running" ||
           current.sessionStatus === "waiting" ||
           current.pendingUserMessages.length > 0 ||
-          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+          current.blocks.some(isPendingBlockingElicitation)
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }

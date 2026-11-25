@@ -10998,6 +10998,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "admin_view": {
+            "default": false,
+            "title": "Admin View",
+            "type": "boolean"
+          },
           "agent_config_edit": {
             "default": false,
             "title": "Agent Config Edit",
@@ -11059,6 +11064,11 @@
           },
           "browser_approval_available": {
             "title": "Browser Approval Available",
+            "type": "boolean"
+          },
+          "codex_nonblocking_decline": {
+            "default": false,
+            "title": "Codex Nonblocking Decline",
             "type": "boolean"
           },
           "connected_apps_available": {
@@ -18284,6 +18294,17 @@
             "default": false,
             "title": "Background Titles Enabled",
             "type": "boolean"
+          },
+          "managed_move_attempt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Managed Move Attempt"
           },
           "model_override": {
             "anyOf": [

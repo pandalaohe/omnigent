@@ -7812,6 +7812,7 @@ def _async_question_envelope(question: _CodexAsyncQuestion) -> CodexMessage:
     params: _JsonObject = {
         "itemId": question.call_id,
         "omnigentAsyncQuestion": True,
+        "isBlocking": False,
         "questions": [
             {
                 "id": _async_question_id(question.call_id, question.index),

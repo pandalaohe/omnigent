@@ -57,6 +57,7 @@ from omnigent.native.native_bridge_common import (
     wrap_agent_instructions,
     write_agent_instructions_preamble,
 )
+from omnigent.native.native_policy_hook import TOOL_FAILED_PAYLOAD_KEY
 
 # A real pane capture from devin 3000.10.21 (200x50), trimmed. The composer sits
 # between two horizontal rules with the model/context status line below.
@@ -772,6 +773,19 @@ class TestNormalizeToolResult:
         )
         assert payload["tool_output"] == "boom"
 
+    def test_failure_is_flagged_for_result_policies(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": False, "output": "cat: x: No such file", "error": None}}
+        )
+        assert payload["tool_output"] == "cat: x: No such file"
+        assert payload[TOOL_FAILED_PAYLOAD_KEY] is True
+
+    def test_success_is_not_flagged(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": True, "output": "hi", "error": None}}
+        )
+        assert TOOL_FAILED_PAYLOAD_KEY not in payload
+
     def test_existing_tool_output_wins(self) -> None:
         payload = _normalize_tool_result({"tool_output": "kept", "tool_response": {"output": "x"}})
         assert payload["tool_output"] == "kept"
@@ -1396,6 +1410,7 @@ class TestStartupInstructionRouting:
         from omnigent.runtime.prompt import (
             EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
             SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+            WORKSPACE_IMAGE_INSTRUCTION,
         )
         from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -1442,15 +1457,18 @@ class TestStartupInstructionRouting:
                 global_instructions="G",
             )
 
-        framework_text = (
-            f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        framework_instructions = (
+            SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            WORKSPACE_IMAGE_INSTRUCTION,
         )
+        framework_text = "\n\n".join(framework_instructions)
         rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
         preamble = read_agent_instructions_preamble(bridge_dir)
         if rule_is_writable:
             rule_text = rule.read_text(encoding="utf-8")
             assert "Author brief." in rule_text
-            assert framework_text not in rule_text
+            assert all(instruction not in rule_text for instruction in framework_instructions)
             assert "G" not in rule_text
             assert preamble == f"{framework_text}\n\nG"
             # Recorded so SessionEnd removes the live rule.

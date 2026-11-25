@@ -67,6 +67,18 @@ class CodexElicitationRequest:
         """
         return self.response_builder(result, self.method, self.codex_params)
 
+    @property
+    def interrupts_on_decline(self) -> bool:
+        """
+        Return whether declining this request should interrupt Codex.
+
+        A non-blocking question, such as one from ``request_user_input_async``,
+        does not hold up its turn, so declining it only dismisses the card.
+
+        :returns: ``False`` when the request sets ``isBlocking: false``.
+        """
+        return self.codex_params.get("isBlocking") is not False
+
 
 def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitationRequest:
     """
@@ -628,6 +640,8 @@ def _codex_tool_request_user_input_params(
         # server scopes them to their own session and never treats them
         # as a block.
         extras["async_kind"] = "question"
+    if params.get("isBlocking") is False:
+        extras["is_blocking"] = False
     return ElicitationRequestParams(
         mode="form",
         message="Codex needs input",
