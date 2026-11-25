@@ -195,6 +195,7 @@ from omnigent.server.server_config import (
 )
 from omnigent.server.session_collab import session_peer_enabled
 from omnigent.server.session_retention import SessionRetention
+from omnigent.server.telemetry_settings import TelemetryStatus
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
@@ -302,6 +303,7 @@ class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     browser_approval_available: bool
     push_credentials_required: bool
+    telemetry: TelemetryStatus
     browser_annotations_available: bool = False
     api_keys_available: bool = False
     connected_apps_available: bool = False
@@ -1800,6 +1802,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    telemetry_enabled_at_start: bool | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -2013,6 +2016,27 @@ def create_app(
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
+    from omnigent.server.telemetry_settings import (
+        TelemetrySettings,
+        TelemetrySettingsUpdate,
+        UsageTelemetryMiddleware,
+    )
+    from omnigent.telemetry.client import ServerUsageTelemetry
+
+    telemetry_settings = TelemetrySettings(resolved_server_config)
+    from omnigent.runtime import telemetry
+
+    resolved_boot_telemetry = (
+        telemetry_settings.enabled()
+        if telemetry_enabled_at_start is None
+        else telemetry_enabled_at_start
+    )
+    telemetry.init(
+        os.environ.get("OTEL_SERVICE_NAME") or "omni-server",
+        server_opted_in=resolved_boot_telemetry,
+    )
+    usage_telemetry = ServerUsageTelemetry(telemetry_settings.enabled)
+    telemetry_write_lock = asyncio.Lock()
     from omnigent.server.auth import UnifiedAuthProvider
 
     if "api_keys" in resolved_server_config:
@@ -2365,7 +2389,7 @@ def create_app(
     server_metrics_otel = ServerMetricsOtelPublisher()
 
     @asynccontextmanager
-    async def _lifespan(
+    async def _run_lifespan(
         app_inst: FastAPI,
     ) -> AsyncIterator[None]:
         """FastAPI lifespan: start/stop the harness process manager
@@ -2393,11 +2417,6 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
-
-        # Initialise usage telemetry (fire-and-forget; no-op when disabled).
-        from omnigent.telemetry import init_client as _init_telemetry
-
-        _init_telemetry(config=server_config)
 
         # Apply OMNIGENT_LOG_LEVEL to the omnigent namespace after
         # uvicorn's dictConfig runs (dictConfig resets existing handlers,
@@ -2952,10 +2971,21 @@ def create_app(
         else None
     )
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
-    from omnigent.runtime import telemetry
+    @asynccontextmanager
+    async def _lifespan(app_inst: FastAPI) -> AsyncIterator[None]:
+        with usage_telemetry.scope():
+            try:
+                usage_telemetry.refresh()
+                async with _run_lifespan(app_inst):
+                    yield
+            finally:
+                usage_telemetry.close()
 
-    telemetry.instrument_fastapi_app(app)
+    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app.add_middleware(UsageTelemetryMiddleware, telemetry=usage_telemetry)
+    app.state.telemetry_enabled_at_start = resolved_boot_telemetry
+    if resolved_boot_telemetry:
+        telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
@@ -4307,6 +4337,26 @@ def create_app(
             "server_name": branding_snapshot.server_name,
         }
 
+    @app.put("/v1/system/telemetry", response_model=TelemetryStatus)
+    async def update_telemetry(request: Request, body: TelemetrySettingsUpdate) -> TelemetryStatus:
+        from omnigent.server.routes.default_policies import _require_admin
+        from omnigent.server.sharing_settings import write_telemetry_enabled_override
+
+        if auth_provider is not None and permission_store is None:
+            raise OmnigentError("Admin privileges required", code=ErrorCode.FORBIDDEN)
+        await _require_admin(request, auth_provider, permission_store)
+        async with telemetry_write_lock:
+            if (await asyncio.to_thread(telemetry_settings.status)).locked:
+                raise OmnigentError(
+                    "Telemetry is locked by the deployment", code=ErrorCode.CONFLICT
+                )
+            try:
+                await asyncio.to_thread(write_telemetry_enabled_override, body.telemetry_enabled)
+            except OSError as exc:
+                raise HTTPException(503, "Telemetry setting could not be saved") from exc
+            await asyncio.to_thread(usage_telemetry.refresh)
+            return await asyncio.to_thread(telemetry_settings.status)
+
     @app.get("/v1/info", response_model=ServerInfoResponse)
     async def info(request: Request, response: Response) -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
@@ -4335,6 +4385,7 @@ def create_app(
         """
         from omnigent.server.auth import local_single_user_enabled
 
+        response.headers["Cache-Control"] = "no-store"
         # Same helper as the manifest's auth.mode, so the two never disagree.
         accounts_enabled = auth_mode(auth_provider) == "accounts"
         login_url = getattr(auth_provider, "login_url", None)
@@ -4464,6 +4515,7 @@ def create_app(
                 "accounts_enabled": accounts_enabled,
                 "browser_approval_available": browser_approval_supported(auth_provider),
                 "push_credentials_required": authentication_requires_identity(auth_provider),
+                "telemetry": await asyncio.to_thread(telemetry_settings.status),
                 "browser_annotations_available": annotation_enabled
                 and annotation_storage_supported,
                 "api_keys_available": api_keys_enabled,

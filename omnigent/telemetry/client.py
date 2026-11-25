@@ -70,7 +70,9 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
@@ -150,6 +152,11 @@ def _config_url() -> str:
     return f"{_CONFIG_URL_PROD}/{VERSION}.json"
 
 
+_config_fetch_guard: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "telemetry_config_fetch_guard", default=None
+)
+
+
 def _fetch_remote_config() -> TelemetryConfig | None:
     """Fetch and validate the remote telemetry config.
 
@@ -162,6 +169,9 @@ def _fetch_remote_config() -> TelemetryConfig | None:
 
         url = _config_url()
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        may_send = _config_fetch_guard.get()
+        if may_send is not None and not may_send():
+            return None
         with urllib.request.urlopen(req, timeout=_CONFIG_FETCH_TIMEOUT_S) as resp:
             raw_config: object = json.loads(resp.read().decode("utf-8"))
 
@@ -215,32 +225,56 @@ def _fetch_remote_config() -> TelemetryConfig | None:
         return None
 
 
-def _config_telemetry_disabled() -> bool:
-    """Return ``True`` when ``telemetry: false`` is set in config.yaml.
+def config_disables_telemetry(config: Mapping[str, object]) -> bool:
+    """Return ``True`` when a parsed config mapping sets top-level ``telemetry`` to false."""
+    value = config.get("telemetry")
+    # Some config loaders preserve YAML scalars as strings.
+    return value is False or (isinstance(value, str) and value.strip().lower() == "false")
 
-    Reads ``~/.omnigent/config.yaml`` (honouring ``OMNIGENT_CONFIG_HOME``).
-    Returns ``False`` on any error so a missing/malformed config never
-    silently suppresses telemetry.
+
+def _config_file_disables_telemetry(config_path: Path) -> bool:
+    import yaml
+
+    if not config_path.is_file():
+        return False
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    try:
+        data: object = yaml.safe_load(text)
+    except yaml.YAMLError:
+        # Preserve opt-out detection if a malformed YAML file still has a
+        # `telemetry: false` directive.
+        for line in text.splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            key, sep, val = stripped.partition(":")
+            if sep and key.strip().strip("'\"").lower() == "telemetry":
+                return val.strip().lower() == "false"
+        return False
+    return isinstance(data, Mapping) and config_disables_telemetry(data)
+
+
+def _config_telemetry_disabled() -> bool:
+    """Return ``True`` when any active Omnigent config sets ``telemetry: false``.
+
+    Uses the same config-path rules as ``omnigent.server.server_config``
+    (``OMNIGENT_CONFIG`` or ``<server_data_dir>/config.yaml``) and
+    ``omnigent.config`` (``OMNIGENT_CONFIG_HOME/config.yaml`` or
+    ``~/.omnigent/config.yaml``), parsed with ``yaml.safe_load``.
     """
     try:
-        import re as _re
+        from omnigent.config import global_config_path
+        from omnigent.server.server_config import resolve_config_path
 
-        config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-        if config_home:
-            config_path = Path(config_home) / "config.yaml"
-        else:
-            config_path = Path.home() / ".omnigent" / "config.yaml"
-        if not config_path.exists():
-            return False
-        # Read raw text and match `telemetry: false` directly to avoid
-        # PyYAML SafeLoader bool-resolver corruption: spec/parser.py's
-        # _ConfigYamlLoader subclass modifies the shared
-        # SafeLoader.yaml_implicit_resolvers class dict at import time,
-        # causing `false` to parse as a string rather than a boolean.
-        text = config_path.read_text(encoding="utf-8")
-        return bool(
-            _re.search(r"^\s*telemetry\s*:\s*false\s*$", text, _re.IGNORECASE | _re.MULTILINE)
-        )
+        candidates: list[Path] = []
+        server_path = resolve_config_path()
+        if server_path is not None:
+            candidates.append(server_path)
+        user_path = global_config_path(default_path=Path.home() / ".omnigent" / "config.yaml")
+        if user_path not in candidates:
+            candidates.append(user_path)
+        return any(_config_file_disables_telemetry(path) for path in candidates)
     except Exception:
         return False
 
@@ -359,7 +393,10 @@ class TelemetryClient:
     All errors are suppressed — telemetry must never disrupt the application.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, enabled: Callable[[], bool] | None = None) -> None:
+        self._enabled = enabled
+        self._revoked = False
+        self.config_skipped = False
         self._config: TelemetryConfig | None = None
         self._config_ready = threading.Event()
         self._queue: queue.Queue[_TelemetryRecord | None] = queue.Queue(maxsize=_MAX_QUEUE_SIZE)
@@ -386,7 +423,7 @@ class TelemetryClient:
         # Defense-in-depth: re-check opt-out inside the client so
         # a late env-var change is respected even if the call site
         # skipped the module-level is_disabled() guard.
-        if is_disabled():
+        if not self._may_send():
             return
         try:
             event_name = type(event).__name__
@@ -424,6 +461,19 @@ class TelemetryClient:
 
     # ── Internal helpers ─────────────────────────────────
 
+    def revoke(self) -> None:
+        """Discard this opt-in's queued records without waiting for the worker."""
+        self._revoked = True
+        self._stopped = True
+        if self._atexit_registered:
+            atexit.unregister(self._atexit_callback)
+            self._atexit_registered = False
+
+    def _may_send(self) -> bool:
+        if self._revoked:
+            return False
+        return self._enabled() if self._enabled is not None else not is_disabled()
+
     def _ensure_started(self) -> None:
         if self._started:
             return
@@ -453,7 +503,17 @@ class TelemetryClient:
     def _load_config(self) -> None:
         """Daemon thread: fetch remote config then signal the consumer."""
         try:
-            cfg = _fetch_remote_config()
+            if self._enabled is not None and not self._may_send():
+                self.config_skipped = True
+                return
+            token = _config_fetch_guard.set(self._may_send if self._enabled is not None else None)
+            try:
+                cfg = _fetch_remote_config()
+            finally:
+                _config_fetch_guard.reset(token)
+            if cfg is None and self._enabled is not None and not self._may_send():
+                self.config_skipped = True
+                return
             if cfg is None:
                 # Kill-switch or fetch failure — stop the client.
                 self._stopped = True
@@ -552,6 +612,8 @@ class TelemetryClient:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            if self._enabled is not None and not self._may_send():
+                return
             with urllib.request.urlopen(req, timeout=3) as resp:
                 resp.read()
         except Exception:
@@ -564,9 +626,69 @@ _CLIENT: TelemetryClient | None = None
 _CLIENT_LOCK = threading.Lock()
 
 
+class ServerUsageTelemetry:
+    """One anonymous usage emitter per app, with a fresh queue on re-enabling."""
+
+    def __init__(self, enabled: Callable[[], bool]) -> None:
+        self._enabled = enabled
+        self._client: TelemetryClient | None = None
+        self._lock = threading.Lock()
+
+    def refresh(self) -> TelemetryClient | None:
+        with self._lock:
+            if not self._enabled():
+                self._revoke()
+                return None
+            if self._client is None or self._client.config_skipped:
+                self._revoke()
+                _prime_installation_id()
+                try:
+                    client = TelemetryClient(enabled=self._enabled)
+                    client._ensure_started()
+                    self._client = client
+                except Exception:
+                    _logger.debug("Server usage telemetry init failed", exc_info=True)
+            return self._client
+
+    def close(self) -> None:
+        with self._lock:
+            self._revoke()
+
+    def _revoke(self) -> None:
+        if self._client is not None:
+            self._client.revoke()
+            self._client = None
+
+    @contextmanager
+    def scope(self) -> Iterator[None]:
+        token = _server_usage_telemetry.set(self)
+        try:
+            yield
+        finally:
+            _server_usage_telemetry.reset(token)
+
+
+_server_usage_telemetry: ContextVar[ServerUsageTelemetry | None] = ContextVar(
+    "server_usage_telemetry", default=None
+)
+
+
 def get_client() -> TelemetryClient | None:
-    """Return the active singleton client, or ``None`` when disabled."""
+    """Return the active usage client, or ``None`` when disabled."""
+    server_telemetry = _server_usage_telemetry.get()
+    if server_telemetry is not None:
+        return server_telemetry.refresh()
     return _CLIENT
+
+
+def _prime_installation_id() -> None:
+    # Cache the installation ID before request handlers need it.
+    try:
+        from omnigent.telemetry.installation_id import get_installation_id
+
+        get_installation_id()
+    except Exception:
+        _logger.debug("Telemetry installation-id prime failed", exc_info=True)
 
 
 def init_client(*, config: Mapping[str, object] | None = None) -> None:
@@ -583,14 +705,7 @@ def init_client(*, config: Mapping[str, object] | None = None) -> None:
         return
     if config is not None and config.get("telemetry") is False:
         return
-    # Prime the installation-id cache on startup so later request
-    # handlers do not perform synchronous file I/O on the event loop.
-    try:
-        from omnigent.telemetry.installation_id import get_installation_id
-
-        get_installation_id()
-    except Exception:
-        _logger.debug("Telemetry installation-id prime failed", exc_info=True)
+    _prime_installation_id()
     with _CLIENT_LOCK:
         if _CLIENT is None:
             try:
@@ -611,9 +726,9 @@ def emit(event: object) -> None:
     :param event: A dataclass instance.
     """
     try:
-        if is_disabled():
+        if _server_usage_telemetry.get() is None and is_disabled():
             return
-        client = _CLIENT
+        client = get_client()
         if client is not None:
             client.emit(event)
     except Exception:

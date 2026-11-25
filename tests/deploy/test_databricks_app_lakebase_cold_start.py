@@ -170,7 +170,7 @@ def _stub_downstream_boot(monkeypatch: pytest.MonkeyPatch) -> None:
 
     import omnigent.runtime.telemetry as telemetry
 
-    monkeypatch.setattr(telemetry, "init", lambda: None)
+    monkeypatch.setattr(telemetry, "init", lambda *_a, **_kw: None)
 
     import omnigent.server.app as server_app
 

@@ -46,9 +46,6 @@ _REQUIRED_ARGS = [
     "main.omnigent.artifacts",
 ]
 
-# The app spec `main` hardcoded before app_command / app_env /
-# otel_export_destinations existed. `prod` must still resolve to exactly this.
-_PROD_COMMAND_BEFORE = ["opentelemetry-instrument", "python", "app.py"]
 _PROD_ENV_BEFORE = [
     {"name": "AP_LAKEBASE_ENDPOINT", "value_from": "postgres"},
     {"name": "AP_ARTIFACT_VOLUME_PATH", "value_from": "artifact_volume"},
@@ -135,10 +132,10 @@ def _resolved_app_spec(bundle: dict[str, Any], target: str) -> dict[str, Any]:
     [
         pytest.param(
             "prod",
-            _PROD_COMMAND_BEFORE,
+            ["python", "app.py"],
             _PROD_ENV_BEFORE,
             _PROD_TELEMETRY_BEFORE,
-            id="prod-unchanged-from-before-the-variables",
+            id="prod-lets-the-app-gate-its-configured-exporters",
         ),
         pytest.param(
             "prod-no-otel",

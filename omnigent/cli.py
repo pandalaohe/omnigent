@@ -4055,6 +4055,9 @@ def _build_host_daemon_env(
     pin = _host_databricks_org_pin(server_url)
     if pin is not None:
         env[PINNED_DATABRICKS_ORG_ENV_VAR] = pin
+    from omnigent.telemetry.environment import preserve_zerobus_opt_outs
+
+    preserve_zerobus_opt_outs(env, os.environ)
     return env
 
 
@@ -4944,7 +4947,7 @@ def server(
             else {}
         )
         key_config = global_cfg if resolve_config_path() is None else load_server_config()
-        for key in ("api_keys", "frame_ancestors"):
+        for key in ("api_keys", "frame_ancestors", "telemetry"):
             if key in key_config:
                 title_server_config[key] = key_config[key]
 
@@ -4967,6 +4970,12 @@ def server(
     # connects, else a fresh <data_dir> (first run, or a cleared dir) fails
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
+
+    # Resolve server OTel on/off before constructing the first SQLAlchemy engine
+    # so a stored opt-in instruments SQL queries and a lock-off blocks legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    telemetry_enabled_at_start = configure_server_boot_telemetry(title_server_config)
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
@@ -5052,13 +5061,6 @@ def server(
         global_instructions_store=global_instructions_store,
         caps=caps,
     )
-
-    # Initialize OpenTelemetry observability. No-op when
-    # OTEL_EXPORTER_OTLP_ENDPOINT is unset; see
-    # designs/OBSERVABILITY.md for the env var reference.
-    from omnigent.runtime import telemetry
-
-    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -5189,11 +5191,6 @@ def server(
 
     from omnigent.process_logging import configure_process_logging
 
-    server_log_path = configure_process_logging(
-        "server",
-        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
-    )
-
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -5229,6 +5226,12 @@ def server(
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
+    )
+    server_log_path = configure_process_logging(
+        "server",
+        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
+        debug_log_enabled=app.state.telemetry_enabled_at_start,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

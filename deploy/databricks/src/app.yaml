@@ -1,4 +1,4 @@
-command: ["opentelemetry-instrument", "python", "app.py"]
+command: ["python", "app.py"]
 env:
   - name: AP_LAKEBASE_ENDPOINT
     valueFrom: postgres

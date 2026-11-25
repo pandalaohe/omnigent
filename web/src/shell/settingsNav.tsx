@@ -16,6 +16,7 @@ import {
   GitBranchIcon,
   GlobeIcon,
   KeyboardIcon,
+  MonitorIcon,
   PaletteIcon,
   PlugIcon,
   SettingsIcon,
@@ -32,6 +33,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell, supportsBrowser } from "@/lib/nativeBridge";
+import { interfaceText } from "@/lib/interfaceText";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
@@ -39,6 +41,7 @@ export type SettingsSectionId =
   | "appearance"
   | "agents"
   | "general"
+  | "system"
   | "git"
   | "integrations"
   | "mcp"
@@ -61,6 +64,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "agents",
   "general",
+  "system",
   "git",
   "integrations",
   "mcp",
@@ -126,6 +130,7 @@ export function settingsNavGroups(
   };
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
+    { id: "system", label: interfaceText("settingsSystem"), icon: MonitorIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },

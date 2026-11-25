@@ -829,9 +829,8 @@ def _parse_args() -> argparse.Namespace:
         "--no-otel",
         action="store_true",
         help=(
-            "Deploy without OpenTelemetry: run 'python app.py' instead of "
-            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
-            "drop the platform telemetry_export_destinations. Use for "
+            "Deploy without the platform OpenTelemetry collector: drop "
+            "OTEL_TRACES_SAMPLER and telemetry_export_destinations. Use for "
             "workspaces with no OTel collector / UC OTel tables — otherwise "
             "span exports fail DEADLINE_EXCEEDED to localhost:4317."
         ),
@@ -930,7 +929,7 @@ def _parse_args() -> argparse.Namespace:
                 f"warning: --no-otel has no effect on --target {args.target!r}: it "
                 f"only swaps the default 'prod' target for 'prod-no-otel'. That "
                 f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
-                "stays ON for this deploy — copy the overrides from the "
+                "can still export when enabled — copy the overrides from the "
                 "prod-no-otel block in databricks.yml, or drop --target."
             )
     return args

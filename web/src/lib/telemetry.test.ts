@@ -59,7 +59,7 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    initBrowserTelemetry(true);
 
     // With no collector, nothing is registered — production builds without
     // a backend pay zero overhead and never patch fetch.
@@ -67,11 +67,21 @@ describe("initBrowserTelemetry", () => {
     expect(m.registerInstrumentations).not.toHaveBeenCalled();
   });
 
+  it.each([false, undefined])("stays off without explicit server consent (%s)", async (enabled) => {
+    vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.test");
+    const { initBrowserTelemetry } = await import("./telemetry");
+
+    initBrowserTelemetry(enabled);
+
+    expect(m.OTLPTraceExporter).not.toHaveBeenCalled();
+    expect(m.registerInstrumentations).not.toHaveBeenCalled();
+  });
+
   it("registers a provider + fetch/XHR instrumentation when an endpoint is set", async () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    initBrowserTelemetry(true);
 
     expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
     expect(m.register).toHaveBeenCalledTimes(1);
@@ -88,8 +98,8 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
-    initBrowserTelemetry();
+    initBrowserTelemetry(true);
+    initBrowserTelemetry(true);
 
     expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
   });
@@ -98,7 +108,7 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    initBrowserTelemetry(true);
 
     expect(m.OTLPTraceExporter).toHaveBeenCalledWith({
       url: "http://localhost:4318/v1/traces",

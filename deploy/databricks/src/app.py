@@ -165,7 +165,6 @@ try:
     import uvicorn
 
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
@@ -173,14 +172,6 @@ try:
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.server_config import load_server_config
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
-    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
-
-    # OTel: the Databricks Apps platform auto-injects
-    # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
-    # is set on the app — telemetry.init() picks that up and routes
-    # OTLP to the platform collector, which writes to the configured
-    # UC tables. No-op if neither OTEL nor MLflow env vars are set.
-    telemetry.init()
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.databricks_volumes import (
         DatabricksVolumesArtifactStore,
@@ -216,6 +207,7 @@ try:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
@@ -244,6 +236,17 @@ try:
         max_attempts=int(os.environ.get("AP_MIGRATE_MAX_ATTEMPTS", "8")),
         backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
     )
+
+    server_cfg = load_server_config()
+    # Resolve server boot telemetry before constructing the first DB engine so
+    # stored opt-ins instrument SQLAlchemy and locked-off values beat legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    telemetry_enabled_at_start = configure_server_boot_telemetry(server_cfg)
+    if telemetry_enabled_at_start:
+        from omnigent.debug_logging import attach_debug_log_sink
+
+        attach_debug_log_sink([logging.getLogger()], source="server", level=logging.INFO)
 
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)
@@ -295,7 +298,7 @@ try:
     # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
     # stops startup here instead of 502-ing the first managed session.
     try:
-        sandbox_config = parse_sandbox_config(load_server_config().get("sandbox"))
+        sandbox_config = parse_sandbox_config(server_cfg.get("sandbox"))
     except ValueError as exc:
         logger.error("Invalid 'sandbox' section in the server config: %s", exc)
         raise
@@ -343,8 +346,10 @@ try:
         user_preferences_store=user_preferences_store,
         auth_provider=auth_provider,
         sandbox_config=sandbox_config,
+        server_config=server_cfg,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
     )
 
     if __name__ == "__main__":
