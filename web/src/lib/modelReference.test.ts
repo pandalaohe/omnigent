@@ -142,4 +142,54 @@ describe("sessionHeaderModelState", () => {
       hasDifference: false,
     });
   });
+
+  it("treats verified equivalent Codex spellings as matching while surfacing real changes", () => {
+    expect(
+      sessionHeaderModelState({
+        harness: "codex-native",
+        requested: "databricks-gpt-5-6-luna",
+        launched: "databricks-gpt-5-6-luna",
+        running: "gpt-5.6-luna",
+      }),
+    ).toMatchObject({ requestedDiffers: false, runningDiffers: false, hasDifference: false });
+
+    expect(
+      sessionHeaderModelState({
+        harness: "codex-native",
+        requested: "system.ai.gpt-5-6-luna",
+        launched: "system.ai.gpt-5-6-luna",
+        running: "gpt-5.6-luna",
+      }),
+    ).toMatchObject({ requestedDiffers: false, runningDiffers: false, hasDifference: false });
+
+    // Real version change stays visible.
+    expect(
+      sessionHeaderModelState({
+        harness: "codex-native",
+        requested: "databricks-gpt-5-6-luna",
+        launched: "databricks-gpt-5-6-luna",
+        running: "gpt-5.5-luna",
+      }),
+    ).toMatchObject({ requestedDiffers: false, runningDiffers: true, hasDifference: true });
+
+    // Real provider substitution stays visible.
+    expect(
+      sessionHeaderModelState({
+        harness: "codex-native",
+        requested: "krill/gpt-6.2-sol",
+        launched: "krill/gpt-6.2-sol",
+        running: "gpt-6.2-sol",
+      }),
+    ).toMatchObject({ requestedDiffers: false, runningDiffers: true, hasDifference: true });
+
+    // Explicit provider rename still flags requestedDiffers even when running matches launched.
+    expect(
+      sessionHeaderModelState({
+        harness: "codex-native",
+        requested: "ccs-krill/gpt-6.2-sol",
+        launched: "krill/gpt-6.2-sol",
+        running: "krill/gpt-6.2-sol",
+      }),
+    ).toMatchObject({ requestedDiffers: true, runningDiffers: false, hasDifference: true });
+  });
 });

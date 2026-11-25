@@ -3491,8 +3491,9 @@ async def _persist_external_model_change(
         type="session.model",
         conversation_id=session_id,
         model=model,
+        reported=True,
     )
-    session_stream.publish(session_id, event.model_dump())
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
     if body.data.get("confirmed") is True:
         await _persist_agy_model_notice(session_id, conv, conversation_store, model)
 

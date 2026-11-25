@@ -3541,6 +3541,7 @@ async def _persist_relay_reported_model(
             type="session.model",
             conversation_id=session_id,
             model=model,
+            reported=True,
         ).model_dump(exclude_none=True),
     )
 
@@ -10205,7 +10206,7 @@ def _publish_routed_model(session_id: str, model: str) -> None:
         conversation_id=session_id,
         model=model,
     )
-    session_stream.publish(session_id, event.model_dump())
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
 def _runner_reject_detail(response: httpx.Response) -> str:
@@ -10942,6 +10943,27 @@ async def _forward_event_to_runner(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         shell_forwarded = True
+        if not await asyncio.to_thread(_is_native_terminal_session, conv):
+            from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+            dispatched_model = (
+                effective_runner_override.strip()
+                if isinstance(effective_runner_override, str) and effective_runner_override.strip()
+                else None
+            )
+            current_launched = conv.labels.get(LAUNCHED_MODEL_LABEL)
+            if dispatched_model is not None and current_launched != dispatched_model:
+                set_labels = getattr(conversation_store, "set_labels", None)
+                if callable(set_labels):
+                    await asyncio.to_thread(
+                        set_labels, session_id, {LAUNCHED_MODEL_LABEL: dispatched_model}
+                    )
+                    conv.labels[LAUNCHED_MODEL_LABEL] = dispatched_model
+            elif dispatched_model is None and LAUNCHED_MODEL_LABEL in conv.labels:
+                delete_label = getattr(conversation_store, "delete_label", None)
+                if callable(delete_label):
+                    await asyncio.to_thread(delete_label, session_id, LAUNCHED_MODEL_LABEL)
+                    conv.labels.pop(LAUNCHED_MODEL_LABEL, None)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if annotation_pending:

@@ -4622,6 +4622,7 @@ class SessionModelEvent(_SSEEventBase):
     type: Literal["session.model"]
     conversation_id: str
     model: str
+    reported: bool | None = None
 
 
 class SessionTitleEvent(_SSEEventBase):

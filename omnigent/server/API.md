@@ -492,16 +492,20 @@ Fields:
     command uses) so the web picker and the TUI stay in sync.
 
   requested (string or null)
-    Model originally requested for the session: `saved` from the
-    `omnigent.model_resolution` label when catalog resolution rewrote
-    the active override, else `model_override`. `null` when unset.
-    Also exposed on `ChildSessionSummary` beside `routed_model`.
+    Model originally requested for the active selection: `saved` from
+    the active session note in `omnigent.model_resolution` when catalog
+    resolution rewrote the current override, else `model_override`.
+    Cleared when the user selects another model so historical aliases
+    are not revived. `null` when unset. Also exposed on
+    `ChildSessionSummary` beside `routed_model`.
 
   launched (string or null)
-    Post-resolution model passed to the harness (`model_override`), or
-    `null` when unset or not confirmed at launch by the harness (e.g.
-    `antigravity-native`, where overrides are launch requests only).
-    Also exposed on `ChildSessionSummary` beside `routed_model`.
+    Model recorded in `omnigent.launched_model` once a harness launch
+    or confirmed live model switch actually used it, or `null` when
+    unlaunched, pending the next turn, or not confirmed at launch by
+    the harness (e.g. `antigravity-native`, where overrides are launch
+    requests only). Also exposed on `ChildSessionSummary` beside
+    `routed_model`.
 
   running (string or null)
     Model last reported as actually running by the harness

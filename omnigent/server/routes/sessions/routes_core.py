@@ -5923,6 +5923,14 @@ def register_core_routes(
             session_id,
             body.expected_model_override,
         )
+        if reset:
+            from omnigent.server.model_resolution import clear_session_resolution_labels
+
+            res_set, res_del = clear_session_resolution_labels(conv.labels)
+            for key in res_del:
+                await asyncio.to_thread(conversation_store.delete_label, session_id, key)
+            if res_set:
+                await asyncio.to_thread(conversation_store.set_labels, session_id, res_set)
         return ResetSessionModelOverrideResponse(reset=reset)
 
     @router.patch(
@@ -7529,6 +7537,7 @@ def register_core_routes(
                     else "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
+        native_model_applied = False
         if live_model_change:
             if not combined_model_forward:
                 _model_forward = await _forward_session_change_to_runner(
@@ -7673,6 +7682,15 @@ def register_core_routes(
                         "Please check the current selection and try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
+                if (
+                    not agy_native
+                    and not unconfirmed
+                    and unsupported is None
+                    and not forward_failed
+                    and _model_forward is not None
+                    and 200 <= _model_forward.status_code < 300
+                ):
+                    native_model_applied = True
             else:
                 await _persist_model_change_note(
                     session_id,
@@ -7892,10 +7910,22 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
+        from omnigent.server.model_resolution import (
+            LAUNCHED_MODEL_LABEL,
+            clear_session_resolution_labels,
+        )
+
+        if native_model_applied:
+            labels_to_set[LAUNCHED_MODEL_LABEL] = updated.model_override or ""
         _labels_to_clear: list[str] = []
+        if not body.silent and (model_override is not None or clear_model):
+            _res_set, _res_del = clear_session_resolution_labels(updated.labels)
+            labels_to_set.update(_res_set)
+            _labels_to_clear.extend(_res_del)
         for _clear_key in (
             PROJECT_LABEL_KEY,
             pinned_label_key(user_id),
+            LAUNCHED_MODEL_LABEL,
         ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}

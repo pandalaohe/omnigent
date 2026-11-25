@@ -12,7 +12,7 @@ const CATALOG_PREFIXES = ["databricks-", "system.ai."] as const;
  * spelling in both ``id`` and ``model``. Mirrors the server's
  * ``comparable_model_id``.
  */
-function comparableModelId(model: string | null | undefined): string {
+export function comparableModelId(model: string | null | undefined): string {
   // Null-safe: a picker row may carry a null ``model`` (cursor rows have
   // only ``id`` + ``displayName``), and folding it must not throw. An empty
   // fold never equals a real (non-empty) target, so it simply never matches.

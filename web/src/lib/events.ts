@@ -649,6 +649,7 @@ export interface SessionModelEvent {
   type: "session_model";
   conversationId: string;
   model: string;
+  reported?: boolean;
 }
 
 /**

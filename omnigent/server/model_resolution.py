@@ -29,11 +29,44 @@ from omnigent.models.model_reference import (
 from omnigent.server.json_labels import decode_json_labels, encode_json_labels
 
 RESOLUTION_LABEL = "omnigent.model_resolution"
+LAUNCHED_MODEL_LABEL = "omnigent.launched_model"
 _logger = logging.getLogger(__name__)
 
 
 def resolution_labels(notes: Sequence[dict[str, str]]) -> dict[str, str]:
     return encode_json_labels(RESOLUTION_LABEL, list(notes)) if notes else {}
+
+
+def _is_member_setting(note: Mapping[str, Any]) -> bool:
+    setting = note.get("setting")
+    return isinstance(setting, str) and setting.startswith("member:")
+
+
+def _resolution_label_keys(labels: Mapping[str, str]) -> list[str]:
+    return [
+        key for key in labels if key == RESOLUTION_LABEL or key.startswith(f"{RESOLUTION_LABEL}.")
+    ]
+
+
+def clear_session_resolution_labels(
+    labels: Mapping[str, str] | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Drop session-level resolution notes while preserving member:* notes.
+
+    :returns: ``(labels_to_set, keys_to_delete)`` to persist the cleaned notes.
+    """
+    if not labels:
+        return {}, []
+    existing_keys = _resolution_label_keys(labels)
+    if not existing_keys:
+        return {}, []
+    existing_notes = notes_from_labels(labels)
+    remaining = [note for note in existing_notes if _is_member_setting(note)]
+    if len(remaining) == len(existing_notes) and existing_notes:
+        return {}, []
+    encoded = resolution_labels(remaining)
+    to_delete = [key for key in existing_keys if key not in encoded]
+    return encoded, to_delete
 
 
 def usable_catalog(record: Mapping[str, Any] | None) -> frozenset[str] | None:
@@ -173,8 +206,10 @@ async def resolve_session_model(
     saved = conversation.model_override or await asyncio.to_thread(
         _resolve_llm_model, conversation, agent_store=agents, agent_cache=agent_cache
     )
+    session_resolved_model: str | None = None
     if saved and conversation.host_id:
         result = context.resolve(harness, saved, "session")
+        session_resolved_model = result.model
         if result.model != saved:
             await asyncio.to_thread(
                 conversations.update_conversation, conversation.id, model_override=result.model
@@ -216,13 +251,50 @@ async def resolve_session_model(
                     code=ErrorCode.INVALID_INPUT,
                 )
             labels[key] = encoded
-    notes = notes_from_labels(conversation.labels)
-    for current in contexts.values():
-        for note in current.notes:
-            if note.payload() not in notes:
-                notes.append(note.payload())
-    if any(current.notes for current in contexts.values()):
-        labels.update(resolution_labels(notes))
+    existing_notes = notes_from_labels(conversation.labels)
+    new_session_notes = [
+        note.payload() for note in context.notes if not note.setting.startswith("member:")
+    ]
+    new_member_notes = [
+        note.payload()
+        for current in contexts.values()
+        for note in current.notes
+        if note.setting.startswith("member:")
+    ]
+    member_notes = [note for note in existing_notes if _is_member_setting(note)]
+    for note_payload in new_member_notes:
+        if note_payload not in member_notes:
+            member_notes.append(note_payload)
+    if new_session_notes:
+        session_notes = list(new_session_notes)
+    elif session_resolved_model is not None:
+        # Keep an existing session note only when this resume is still on that
+        # same resolved model; drop notes belonging to an earlier model choice.
+        session_notes = [
+            note
+            for note in existing_notes
+            if not _is_member_setting(note)
+            and isinstance(note.get("model"), str)
+            and note["model"].strip() == session_resolved_model
+        ]
+    else:
+        session_notes = [note for note in existing_notes if not _is_member_setting(note)]
+    notes = [*session_notes, *member_notes]
+    stale_keys: list[str] = []
+    if notes != existing_notes or any(current.notes for current in contexts.values()):
+        encoded_notes = resolution_labels(notes)
+        labels.update(encoded_notes)
+        stale_keys = [
+            key for key in _resolution_label_keys(conversation.labels) if key not in encoded_notes
+        ]
+    if stale_keys:
+        delete_label = getattr(conversations, "delete_label", None)
+        for stale_key in stale_keys:
+            if callable(delete_label):
+                await asyncio.to_thread(delete_label, conversation.id, stale_key)
+                conversation.labels.pop(stale_key, None)
+            else:
+                labels[stale_key] = ""
     if labels:
         await asyncio.to_thread(conversations.set_labels, conversation.id, labels)
         conversation.labels.update(labels)
@@ -265,9 +337,11 @@ def session_model_display(
 ) -> SessionModelDisplay:
     """Derive requested, launched, and running models for one session.
 
-    Omits any field whose source is absent or unreliable for *harness*
-    (native Antigravity overrides are launch requests, not confirmed launches;
-    old sessions without ``reported_model`` omit ``running``).
+    Omits any field whose source is absent or unreliable for *harness*:
+    ``launched`` is read only from ``omnigent.launched_model`` (stamped when
+    a harness launch or confirmed live apply actually uses that model) and
+    remains omitted for ``antigravity-native``; old sessions without
+    ``reported_model`` or ``omnigent.launched_model`` omit those fields.
     """
     override = (
         model_override.strip()
@@ -278,8 +352,7 @@ def session_model_display(
     requested = override
     if override is not None and labels:
         for note in reversed(notes_from_labels(labels)):
-            setting = note.get("setting")
-            if isinstance(setting, str) and setting.startswith("member:"):
+            if _is_member_setting(note):
                 continue
             raw_saved = note.get("saved")
             raw_model = note.get("model")
@@ -292,5 +365,14 @@ def session_model_display(
             ):
                 requested = raw_saved.strip()
                 break
-    launched = None if harness == "antigravity-native" else override
+    raw_launched = labels.get(LAUNCHED_MODEL_LABEL) if labels else None
+    launched = (
+        None
+        if harness == "antigravity-native"
+        else (
+            raw_launched.strip()
+            if isinstance(raw_launched, str) and raw_launched.strip()
+            else None
+        )
+    )
     return SessionModelDisplay(requested=requested, launched=launched, running=running)

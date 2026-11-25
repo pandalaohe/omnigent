@@ -1,3 +1,6 @@
+import { comparableModelId, findNativeModelOption } from "./codexNativeModels";
+import type { NativeModelOption } from "./types";
+
 export interface ModelIdentity {
   provider: string | null;
   model: string;
@@ -79,6 +82,25 @@ function antigravityModelIdentity(value: string): string {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function codexModelsEquivalent(
+  launched: string,
+  running: string,
+  options?: readonly NativeModelOption[] | null,
+): boolean {
+  if (launched === running) return true;
+  // Keep provider substitutions visible even when the model suffix matches.
+  if (splitModelId(launched).provider !== splitModelId(running).provider) return false;
+  const left = comparableModelId(launched);
+  const right = comparableModelId(running);
+  if (left !== "" && left === right) return true;
+  if (options && options.length > 0) {
+    const launchedOption = findNativeModelOption(options, launched);
+    const runningOption = findNativeModelOption(options, running);
+    if (launchedOption !== null && launchedOption === runningOption) return true;
+  }
+  return false;
+}
+
 export function sessionHeaderModelState(
   session:
     | {
@@ -86,6 +108,7 @@ export function sessionHeaderModelState(
         requested?: string | null;
         launched?: string | null;
         running?: string | null;
+        codexModelOptions?: readonly NativeModelOption[] | null;
       }
     | null
     | undefined,
@@ -96,7 +119,10 @@ export function sessionHeaderModelState(
   const requestedDiffers = Boolean(requested && launched && requested !== launched);
   let runningDiffers = false;
   if (launched && running) {
-    runningDiffers = running !== launched;
+    runningDiffers =
+      session?.harness === "codex-native" || session?.harness === "codex"
+        ? !codexModelsEquivalent(launched, running, session.codexModelOptions)
+        : running !== launched;
   } else if (!launched && session?.harness === "antigravity-native" && requested && running) {
     runningDiffers = antigravityModelIdentity(requested) !== antigravityModelIdentity(running);
   }

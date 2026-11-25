@@ -14107,6 +14107,18 @@
             "title": "Model",
             "type": "string"
           },
+          "reported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reported"
+          },
           "sequence_number": {
             "anyOf": [
               {

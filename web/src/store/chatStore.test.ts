@@ -12246,6 +12246,99 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().pendingModelChange).toBe("haiku");
     });
+
+    it("updates session.running only for confirmed harness reports, not speculative router picks", () => {
+      client.setQueryData(["session", "conv_speculative"], {
+        id: "conv_speculative",
+        harness: "codex-native",
+        requested: "gpt-6.2-sol",
+        launched: null,
+        running: null,
+        labels: {},
+      } as unknown as Session);
+      useChatStore.setState({
+        conversationId: "conv_speculative",
+        llmModel: null,
+      });
+
+      // Speculative router pick keeps legacy llmModel picker sync but does not set running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-sol",
+      });
+      expect(useChatStore.getState().llmModel).toBe("gpt-6.2-sol");
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBeNull();
+
+      // Confirmed harness report updates running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-astra",
+        reported: true,
+      } as Parameters<typeof handleSessionEvent>[0]);
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBe(
+        "gpt-6.2-astra",
+      );
+    });
+
+    it("preserves a newer confirmed running report when an older reconnect snapshot finishes", async () => {
+      const id = "conv_reconnect_running";
+      const otherId = "conv_reconnect_other";
+      seedSession(id, []);
+      seedSession(otherId, []);
+      await useChatStore.getState().switchTo(id);
+      await useChatStore.getState().switchTo(otherId);
+
+      let releaseItems!: (r: Response) => void;
+      let metadataReturned = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          metadataReturned = true;
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              requested: "model-a",
+              launched: "model-a",
+              running: "model-a",
+              status: "idle",
+              labels: {},
+            }),
+          );
+        }
+        if (path === `/v1/sessions/${id}/items`) {
+          return new Promise<Response>((resolve) => {
+            releaseItems = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Revisiting the retained live session runs reconcileSessionAfterReconnect (parallel metadata + items).
+      const revisit = useChatStore.getState().switchTo(id);
+      await tick();
+      expect(metadataReturned).toBe(true);
+
+      // While history fetch is still in flight, a confirmed live model report arrives.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older snapshot completes after the live report; running must remain model-b.
+      releaseItems(mockResponse({ items: [], has_more: false }));
+      await revisit;
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
   });
 
   describe("rotation failure notice", () => {

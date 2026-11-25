@@ -4092,6 +4092,7 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+    await _record_launched_model(session_id, server_client, _arg_value(provider_args, "--model"))
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -7371,6 +7372,7 @@ async def _auto_create_codex_terminal(
             server_client,
             expected_model_override=pick_to_reset,
         )
+    await _record_launched_model(session_id, server_client, _codex_launch.model)
     if model_reset_notice is not None:
         await _post_native_launch_notice(
             session_id=session_id,
@@ -10499,6 +10501,41 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+async def _record_launched_model(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+) -> None:
+    """Record the concrete model a native terminal actually launched with."""
+    if server_client is None:
+        return
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"labels": {LAUNCHED_MODEL_LABEL: value}},
+            params={"include_usage": "false"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except (httpx.HTTPError, RuntimeError):
+        _logger.debug(
+            "native terminal: could not record launched model for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _arg_value(args: Sequence[str], flag: str) -> str | None:
+    """Return the value passed immediately after *flag* in *args*, if any."""
+    for idx, token in enumerate(args):
+        if token == flag and idx + 1 < len(args):
+            return args[idx + 1]
+    return None
+
+
 async def _clear_session_model_override(
     session_id: str,
     server_client: httpx.AsyncClient,
@@ -11520,6 +11557,7 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    await _record_launched_model(session_id, server_client, launch_model)
     if unserved_pick is not None:
         await _post_native_launch_notice(
             session_id=session_id,

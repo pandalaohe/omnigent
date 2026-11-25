@@ -261,7 +261,7 @@ def test_child_summary_durable_terminal_holds_for_a_harness_subagent_mirror() ->
 def test_child_summary_exposes_requested_launched_running_beside_routed_model() -> None:
     """Child info carries requested, launched, and running alongside routed_model."""
     from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
-    from omnigent.server.model_resolution import RESOLUTION_LABEL
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL, RESOLUTION_LABEL
 
     # T12: requested, launched, and running all match on codex-native.
     exact = Conversation(
@@ -273,7 +273,10 @@ def test_child_summary_exposes_requested_launched_running_beside_routed_model() 
         agent_id="ag_test",
         model_override="gpt-6.2-sol",
         reported_model="gpt-6.2-sol",
-        labels={ROUTING_DECISION_LABEL_KEY: "dec_1"},
+        labels={
+            ROUTING_DECISION_LABEL_KEY: "dec_1",
+            LAUNCHED_MODEL_LABEL: "gpt-6.2-sol",
+        },
     )
     exact_summary = _child_session_summary_from_conversation(
         exact, "conv_parent", None, harness="codex-native"
@@ -283,7 +286,7 @@ def test_child_summary_exposes_requested_launched_running_beside_routed_model() 
     assert exact_summary.launched == "gpt-6.2-sol"
     assert exact_summary.running == "gpt-6.2-sol"
 
-    # T13: rename label supplies requested while model_override supplies launched.
+    # T13: rename label supplies requested while omnigent.launched_model supplies launched.
     renamed = Conversation(
         id="conv_child_renamed",
         created_at=100,
@@ -294,6 +297,7 @@ def test_child_summary_exposes_requested_launched_running_beside_routed_model() 
         model_override="krill/gpt-6.2-sol",
         reported_model="krill/gpt-6.2-sol",
         labels={
+            LAUNCHED_MODEL_LABEL: "krill/gpt-6.2-sol",
             RESOLUTION_LABEL: json.dumps(
                 [
                     {
@@ -304,7 +308,7 @@ def test_child_summary_exposes_requested_launched_running_beside_routed_model() 
                         "host": "host-a",
                     }
                 ]
-            )
+            ),
         },
     )
     renamed_summary = _child_session_summary_from_conversation(

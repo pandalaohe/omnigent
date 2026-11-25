@@ -1547,4 +1547,27 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByText("Running")).toBeInTheDocument();
     expect(screen.getByText("Gemini 2.5 Flash")).toBeInTheDocument();
   });
+
+  it("hides the warning chip for equivalent Codex catalog and runtime spellings", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv-codex-equiv"], {
+      id: "conv-codex-equiv",
+      harness: "codex-native",
+      requested: "databricks-gpt-5-6-luna",
+      launched: "databricks-gpt-5-6-luna",
+      running: "gpt-5.6-luna",
+      labels: {},
+    } as unknown as Session);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-codex-equiv",
+      conversationTitle: "Codex equiv",
+      queryClient,
+    });
+
+    const badge = screen.getByTestId("session-header-model");
+    expect(badge).toHaveTextContent("databricks-gpt-5-6-luna");
+    expect(badge).not.toHaveClass("hidden");
+    expect(screen.queryByRole("button", { name: "Model resolution warning" })).toBeNull();
+  });
 });

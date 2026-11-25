@@ -731,7 +731,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof conversationId !== "string" || !conversationId) return null;
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
-    return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+    return {
+      type: "session_model",
+      conversationId,
+      model,
+      ...(data.reported === true ? { reported: true } : {}),
+    } satisfies SessionModelEvent;
   }
   if (eventType === "session.title") {
     const conversationId = data.conversation_id;

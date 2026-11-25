@@ -12,7 +12,7 @@ export function SessionHeaderModel({ sessionId }: { sessionId: string }) {
       data-testid="session-header-model"
       title={launched}
       aria-label={`Launched model: ${launched}`}
-      className="hidden max-w-44 shrink-0 truncate rounded-md border border-border/60 bg-background/60 px-2 py-0.5 font-mono text-xs text-muted-foreground md:inline-flex"
+      className="inline-flex max-w-28 shrink-0 truncate rounded-md border border-border/60 bg-background/60 px-2 py-0.5 font-mono text-xs text-muted-foreground sm:max-w-44"
     >
       {launched}
     </span>

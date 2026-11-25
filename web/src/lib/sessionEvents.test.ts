@@ -1583,6 +1583,18 @@ describe("session.model (FLAT envelope)", () => {
     expect(ev.type).toBe("session_model");
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.model).toBe("opus");
+    expect(ev.reported).toBeUndefined();
+  });
+
+  it("carries reported=true only when explicitly marked by the server", () => {
+    const events = parse("session.model", {
+      conversation_id: "conv_abc",
+      model: "claude-opus-4-8",
+      reported: true,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionModelEvent;
+    expect(ev.reported).toBe(true);
   });
 
   it("rejects missing model", () => {
