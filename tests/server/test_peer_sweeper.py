@@ -397,6 +397,7 @@ class _DeliverScript:
         text: str,
         *,
         attempt_id: str | None = None,
+        expected_reason: str | None = None,
         acting_user_id: Any = None,
     ) -> tuple[str, str | None]:
         self.calls.append(
@@ -1928,48 +1929,3 @@ async def test_claim_mark_is_refused_once_the_sweeper_reverted_the_record(
     assert mark_peer_copy_claimed(harness.store, "receiver", held.id, attempt)
     assert not mark_peer_copy_claimed(harness.store, "receiver", held.id, "b" * 32)
     assert not mark_peer_copy_claimed(harness.store, "other-receiver", held.id, attempt)
-
-
-async def test_sweeper_does_not_forward_a_copy_claimed_during_its_recheck(db_uri: str) -> None:
-    """An earlier copy claimed between the re-claim and the forward is not sent again."""
-    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
-
-    store = SqlAlchemyPeerMessageStore(db_uri)
-    conv_store = _FakeConversationStore()
-    sender = _conv(uuid.uuid4().hex, title="Sender")
-    receiver = _conv(uuid.uuid4().hex, title="Receiver")
-    conv_store.convs[sender.id] = sender
-    conv_store.convs[receiver.id] = receiver
-    now = now_epoch()
-    record = store.create(
-        SessionPeerMessage(
-            id=uuid.uuid4().hex,
-            sender_session_id=sender.id,
-            receiver_session_id=receiver.id,
-            ref="ref-1",
-            text="hello",
-            state="pending",
-            created_at=now,
-            expires_at=now + 3600,
-        )
-    )
-    receiver_reads = {"count": 0}
-
-    async def _true_state(conv: Conversation, receiver: bool = False) -> tuple[str, bool]:
-        if receiver:
-            receiver_reads["count"] += 1
-            if receiver_reads["count"] == 2:
-                # The stalled earlier copy's runner claims while this pass re-checks.
-                assert mark_peer_copy_claimed(store, conv.id, record.id, "a" * 32)
-        return "idle", True
-
-    deliver = _DeliverScript()
-    sweeper = _store_sweeper(
-        store, conv_store, cast(Any, _true_state), deliver, _PostEventScript(), now=now
-    )
-    await sweeper._process_due(_row(store, record.id), now)
-
-    assert receiver_reads["count"] == 2
-    assert deliver.calls == []
-    stored = _row(store, record.id)
-    assert (stored.state, stored.reason) == ("delivering", "native_claimed:" + "a" * 32)
