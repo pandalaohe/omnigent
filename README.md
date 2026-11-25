@@ -790,6 +790,12 @@ ZeroBus debug-log destination (`OMNIGENT_DEBUG_LOG_*`) keep using that
 destination unless one of the deployment opt-outs above is active.
 When the web UI is embedded in a host application, the host-provided analytics
 callback is an embedder boundary controlled by that host application.
+Automatic update checks (the CLI check against PyPI or `git origin`, and the
+desktop app update feed) are outside this switch: they fetch only a public
+version list and send no usage data. To turn them off, set
+`OMNIGENT_NO_UPDATE_CHECK=1` for the CLI, or set `update_mode` to `"manual"`
+(manual checks only) or `"none"` (off) in desktop `settings.json` (supported
+values: `"default"`, `"start"`, `"manual"`, `"none"`).
 Vendor CLI telemetry is managed by each CLI.
 
 ---
