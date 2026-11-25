@@ -7707,7 +7707,9 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        if body.archived is not None and set_project:
+        settings_write = bool({"reasoning_effort", "model_override"} & body.model_fields_set)
+        defer_archive = body.archived is not None and settings_write
+        if body.archived is not None and set_project and not defer_archive:
             target_project_id = body.project_id or None
             if target_project_id is not None:
                 owned = (
@@ -7723,7 +7725,18 @@ def register_core_routes(
                 raise _session_not_found()
             set_project = False
 
-        settings_write = bool({"reasoning_effort", "model_override"} & body.model_fields_set)
+        write_body = body
+        if defer_archive:
+            # A terminal can reject the settings after they are saved. Keep the
+            # archive and its durable teardown intent behind that confirmation.
+            write_body = body.model_copy(
+                update={
+                    "archived": None,
+                    "delete_worktree": False,
+                    "keep_worktree": False,
+                    "worktree_archive_mode": None,
+                }
+            )
         write_guard = (
             live_change.write_lock
             if live_change is not None and settings_write
@@ -7733,7 +7746,7 @@ def register_core_routes(
             update_result = await apply_session_archive_transition(
                 request,
                 conv,
-                body,
+                write_body,
                 conversation_store,
                 permission_store,
                 runner_router,
@@ -8291,6 +8304,22 @@ def register_core_routes(
             )
             if not filed:
                 raise _session_not_found()
+        if defer_archive:
+            archive_result = await apply_session_archive_transition(
+                request,
+                updated,
+                body,
+                conversation_store,
+                permission_store,
+                runner_router,
+                expect_archived=bool(conv.archived),
+                expect_revision=conv.archive_revision,
+            )
+            if archive_result.archive_outcome == "conflict":
+                raise OmnigentError(
+                    "The archive state changed while applying settings. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                )
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

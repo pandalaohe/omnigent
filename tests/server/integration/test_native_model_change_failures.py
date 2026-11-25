@@ -384,19 +384,30 @@ async def _held_model_reply(
         session.runner.event_hooks["response"].remove(hold_reply)
 
 
-@pytest.mark.parametrize("confirmed", [False, True], ids=["timeout", "confirmed"])
+@pytest.mark.parametrize(
+    ("confirmed", "archive"),
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["timeout", "confirmed", "timeout-with-archive", "confirmed-with-archive"],
+)
 async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     confirmed: bool,
+    archive: bool,
 ) -> None:
     session = native_session
     assert session.claude is not None
     session.claude.confirm = confirmed
     monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
 
-    response = await _pick_model(client, session)
+    if archive:
+        response = await client.patch(
+            f"/v1/sessions/{session.session_id}",
+            json={"model_override": session.requested_model, "archived": True},
+        )
+    else:
+        response = await _pick_model(client, session)
 
     assert session.claude.commands == [f"/model {session.requested_model}"]
     assert session.tunnel.dispatch_errors == []
@@ -411,6 +422,9 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
         assert refused["error"] == "claude_native_model_unconfirmed"
         assert "did not confirm" in refused["detail"]
         assert "did not confirm" in session.errors[0]["message"]
+    if archive:
+        snapshot = await client.get(f"/v1/sessions/{session.session_id}")
+        assert snapshot.json()["archived"] is confirmed
 
 
 @pytest.mark.parametrize(
