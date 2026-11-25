@@ -35,6 +35,19 @@ function cacheAncestorScrollTops(el: HTMLElement): () => void {
   };
 }
 
+function revealEndCaret(ta: HTMLTextAreaElement) {
+  const end = ta.value.length;
+  if (
+    end === 0 ||
+    ta.ownerDocument.activeElement !== ta ||
+    ta.selectionStart !== end ||
+    ta.selectionEnd !== end
+  )
+    return;
+  const bottom = ta.scrollHeight - ta.clientHeight;
+  if (bottom > 0 && ta.scrollTop < bottom) ta.scrollTop = bottom;
+}
+
 /**
  * Measure ``ta`` and set its height to fit its content, capped at
  * ``maxRows`` rows (after which it scrolls). When ``scrollHeight`` is 0 the
@@ -68,6 +81,8 @@ function measureTextarea(
   onGrowth?: (px: number) => void,
   testForHeightReduction = true,
 ): void {
+  // The temporary overflow and height can clamp the textarea's own offset.
+  const restoreScrollTop = ta.scrollTop;
   const wrapper = ta.parentElement;
   const wrapperHeight = wrapper?.getBoundingClientRect().height ?? 0;
   const restoreHeight = wrapper?.style.height ?? "";
@@ -79,9 +94,6 @@ function measureTextarea(
   }
   const restoreOverflowY = ta.style.overflowY;
   ta.style.overflowY = "hidden";
-  // Captured before the collapse: setting ``height:auto`` clamps the box's
-  // scroll offset to 0, and Gecko doesn't restore it when the height lands.
-  const restoreScrollTop = ta.scrollTop;
   let restoreAncestorScrollTops: (() => void) | undefined;
   let growth = 0;
   try {
@@ -149,12 +161,13 @@ export function useAutoGrowTextarea(
   maxRows = 10,
   onGrowth?: (px: number) => void,
 ) {
-  // Read through a ref so an inline callback doesn't re-subscribe the
-  // observer below on every render. Declared first: effects run in order, so
-  // this is current before either measuring effect uses it.
+  // Keep callback and maxRows in refs so updates never re-subscribe the
+  // observer/listener effect below after later hooks on the same textarea.
   const onGrowthRef = useRef(onGrowth);
+  const maxRowsRef = useRef(maxRows);
   useLayoutEffect(() => {
     onGrowthRef.current = onGrowth;
+    maxRowsRef.current = maxRows;
   });
 
   const prevValueRef = useRef(value);
@@ -172,6 +185,8 @@ export function useAutoGrowTextarea(
     const testForHeightReduction = !isAppend;
 
     measureTextarea(ta, maxRows, onGrowthRef.current, testForHeightReduction);
+    // A capped draft can gain a line while its saved scroll offset stays put.
+    if (prev !== value) revealEndCaret(ta);
   }, [ref, value, maxRows]);
 
   // Install one observer per element (not per keystroke — value isn't a dep)
@@ -181,9 +196,20 @@ export function useAutoGrowTextarea(
   // without ResizeObserver.
   useLayoutEffect(() => {
     const ta = ref.current;
-    if (!ta || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => measureTextarea(ta, maxRows, onGrowthRef.current, true));
-    ro.observe(ta);
-    return () => ro.disconnect();
-  }, [ref, maxRows]);
+    if (!ta) return;
+    // IME commits can leave the value unchanged, skipping the value effect.
+    const onCompositionEnd = () => revealEndCaret(ta);
+    ta.addEventListener("compositionend", onCompositionEnd);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(() =>
+            measureTextarea(ta, maxRowsRef.current, onGrowthRef.current, true),
+          );
+    observer?.observe(ta);
+    return () => {
+      ta.removeEventListener("compositionend", onCompositionEnd);
+      observer?.disconnect();
+    };
+  }, [ref]);
 }

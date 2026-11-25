@@ -1,5 +1,5 @@
-import { render } from "@testing-library/react";
-import { useLayoutEffect, useRef } from "react";
+import { fireEvent, render } from "@testing-library/react";
+import { type ChangeEventHandler, useLayoutEffect, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoGrowTextarea } from "./useAutoGrowTextarea";
 
@@ -27,7 +27,15 @@ function stubScrollHeight(el: HTMLElement, px: number): void {
   });
 }
 
-function Harness({ value, onGrowth }: { value: string; onGrowth?: (px: number) => void }) {
+function Harness({
+  value,
+  onGrowth,
+  onChange,
+}: {
+  value: string;
+  onGrowth?: (px: number) => void;
+  onChange?: ChangeEventHandler<HTMLTextAreaElement>;
+}) {
   const ref = useRef<HTMLTextAreaElement>(null);
   useAutoGrowTextarea(ref, value, 10, onGrowth);
   // Inline line-height/padding so getComputedStyle returns real numbers
@@ -39,11 +47,29 @@ function Harness({ value, onGrowth }: { value: string; onGrowth?: (px: number) =
       <textarea
         ref={ref}
         data-testid="ta"
-        defaultValue={value}
+        value={value}
+        onChange={onChange ?? (() => {})}
         style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
       />
     </div>
   );
+}
+
+const cappedDraft = "Draft line\n".repeat(39) + "x";
+
+function renderCappedDraft() {
+  function EditableDraft() {
+    const [value, setValue] = useState(cappedDraft);
+    return <Harness value={value} onChange={(event) => setValue(event.currentTarget.value)} />;
+  }
+  const { getByTestId } = render(<EditableDraft />);
+  const ta = getByTestId("ta") as HTMLTextAreaElement;
+  Object.defineProperty(ta, "clientHeight", { value: 200 });
+  stubScrollHeight(ta, 800);
+  roCallback?.([], {} as ResizeObserver);
+  ta.focus();
+  ta.setSelectionRange(cappedDraft.length, cappedDraft.length);
+  return ta;
 }
 
 beforeEach(() => {
@@ -93,6 +119,46 @@ describe("useAutoGrowTextarea", () => {
     // prompt scrolls instead of growing without bound. A larger value means
     // the maxRows clamp regressed.
     expect(ta.style.height).toBe("200px");
+  });
+
+  it.each([false, true])("keeps the end caret visible on input (IME: %s)", (isComposing) => {
+    const ta = renderCappedDraft();
+    if (isComposing) fireEvent.compositionStart(ta);
+    ta.scrollTop = 600;
+    stubScrollHeight(ta, 820);
+    // An IME update can replace the previous candidate, taking the shrink-measure path.
+    const value = isComposing ? `${cappedDraft.slice(0, -1)}文字` : `${cappedDraft}\nText`;
+    fireEvent.input(ta, {
+      inputType: isComposing ? "insertCompositionText" : "insertText",
+      isComposing,
+      target: { value, selectionStart: value.length, selectionEnd: value.length },
+    });
+
+    expect(ta.scrollTop + ta.clientHeight).toBe(ta.scrollHeight);
+  });
+
+  it("reveals the end caret when composition commits without another value change", () => {
+    const ta = renderCappedDraft();
+    fireEvent.compositionStart(ta);
+    ta.scrollTop = 0;
+
+    fireEvent.compositionEnd(ta, { data: "x" });
+
+    expect(ta.value).toBe(cappedDraft);
+    expect(ta.scrollTop + ta.clientHeight).toBe(ta.scrollHeight);
+  });
+
+  it("keeps the current scroll position when editing earlier in the draft", () => {
+    const ta = renderCappedDraft();
+    ta.scrollTop = 300;
+    const caret = "Draft line\n".length * 17;
+    const value = `${cappedDraft.slice(0, caret)}x${cappedDraft.slice(caret)}`;
+
+    fireEvent.input(ta, {
+      target: { value, selectionStart: caret + 1, selectionEnd: caret + 1 },
+    });
+
+    expect(ta.scrollTop).toBe(300);
   });
 
   it("holds the wrapper's height while the textarea collapses to measure", () => {
@@ -198,10 +264,7 @@ describe("useAutoGrowTextarea", () => {
     // loss: the backing offset resets while the box is collapsed. The hook
     // must put the pre-collapse offset back once the height lands, bounded
     // by the new box exactly as the browser would clamp it.
-    const { getByTestId } = render(<Harness value="long draft" />);
-    const ta = getByTestId("ta") as HTMLTextAreaElement;
-    const wrapper = getByTestId("wrapper") as HTMLDivElement;
-    wrapper.getBoundingClientRect = () => ({ height: 100 }) as DOMRect;
+    const ta = renderCappedDraft();
 
     // Back the element's scroll offset so the hook's save and restore go
     // through the property the browser would.
@@ -212,12 +275,6 @@ describe("useAutoGrowTextarea", () => {
       set: (v: number) => {
         scrollTop = v;
       },
-    });
-    stubScrollHeight(ta, 800);
-    // The capped box: 800px of draft in a 10-row (200px) tall viewport.
-    Object.defineProperty(ta, "clientHeight", {
-      configurable: true,
-      get: () => 200,
     });
     Object.defineProperty(ta, "scrollHeight", {
       configurable: true,

@@ -20,7 +20,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
   NewChatChoiceNotice: () => null,
@@ -482,6 +482,82 @@ describe("NewChatLandingScreen tokens", () => {
     expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("/review");
     expect(overlay.querySelector(".text-primary")?.textContent).toBe("[image 1]");
     expect(landingInput()).toHaveClass("text-transparent");
+  });
+
+  it("keeps the attachment-only backdrop aligned on scroll, resize, and IME commit", () => {
+    const notifyTextareaResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        private notify: () => void;
+        constructor(callback: ResizeObserverCallback) {
+          this.notify = () => callback([], this as unknown as ResizeObserver);
+        }
+        observe(element: Element) {
+          if (element instanceof HTMLTextAreaElement) notifyTextareaResize.add(this.notify);
+        }
+        unobserve() {}
+        disconnect() {
+          notifyTextareaResize.delete(this.notify);
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+
+    renderLanding();
+    const field = landingInput();
+    let top = 14;
+    let width = 360;
+    let contentHeight = 720;
+    const currentBoxHeight = () => {
+      const parsed = Number.parseFloat(field.style.height);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 180;
+    };
+    Object.defineProperties(field, {
+      offsetTop: { configurable: true, get: () => top },
+      offsetLeft: { configurable: true, value: 12 },
+      offsetWidth: { configurable: true, get: () => width },
+      offsetHeight: { configurable: true, get: currentBoxHeight },
+      clientHeight: { configurable: true, get: currentBoxHeight },
+      scrollHeight: { configurable: true, get: () => contentHeight },
+    });
+    field.style.lineHeight = "20px";
+    field.style.padding = "0";
+
+    // Attachment-only draft (no command or @mention) activates backdrop alignment.
+    attach([img()]);
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.style.top).toBe("14px");
+    expect(overlay.style.left).toBe("12px");
+    expect(overlay.style.width).toBe("360px");
+
+    const draft = `${field.value}\n${"Draft line\n".repeat(35)}end`;
+    typeMessage(draft);
+    field.scrollTop = 540;
+    fireEvent.scroll(field);
+    expect(overlay.scrollTop).toBe(540);
+
+    // Resize updates the overlay box and clamped scroll offset.
+    width = 420;
+    top = 18;
+    contentHeight = 500;
+    act(() => notifyTextareaResize.forEach((notify) => notify()));
+    expect(overlay.style.top).toBe("18px");
+    expect(overlay.style.width).toBe("420px");
+    expect(overlay.style.height).toBe("180px");
+    expect(field.scrollTop).toBe(320);
+    expect(overlay.scrollTop).toBe(320);
+
+    // Unchanged-value IME commit reveals the end caret and syncs the backdrop.
+    field.focus();
+    field.setSelectionRange(draft.length, draft.length);
+    fireEvent.compositionStart(field);
+    field.scrollTop = 0;
+    fireEvent.compositionEnd(field, { data: "文" });
+    expect(field.scrollTop).toBe(320);
+    expect(overlay.scrollTop).toBe(320);
   });
 
   it("T23 — the badge moves the caret; the image keeps opening the lightbox", () => {

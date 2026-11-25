@@ -29,30 +29,49 @@ export function renderMentionTokens(text: string, tokens: readonly string[]): Re
   return parts;
 }
 
-/**
- * Pin a mirror overlay to its textarea's box and scroll position while
- * ``active``. The input area also holds the textarea's line-box descent, which
- * would otherwise cut the mirror's scroll range short.
- */
+function alignMirror(overlay: HTMLDivElement, textarea: HTMLTextAreaElement) {
+  const { offsetTop, offsetLeft, offsetWidth, offsetHeight, scrollTop } = textarea;
+  overlay.style.top = `${offsetTop}px`;
+  overlay.style.left = `${offsetLeft}px`;
+  overlay.style.width = `${offsetWidth}px`;
+  overlay.style.height = `${offsetHeight}px`;
+  overlay.scrollTop = scrollTop;
+}
+
+/** Keep the mirror aligned after autosize, before the new draft paints. */
 export function useComposerMirrorAlignment(
   overlayRef: RefObject<HTMLDivElement | null>,
   textareaRef: RefObject<HTMLTextAreaElement | null>,
   active: boolean,
 ) {
+  // A draft update can move the textarea or change its inner scroll range
+  // without resizing its outer box or firing a scroll event yet.
   useLayoutEffect(() => {
     const overlay = overlayRef.current;
     const textarea = textareaRef.current;
     if (!active || !overlay || !textarea) return;
-    const align = () => {
-      overlay.style.top = `${textarea.offsetTop}px`;
-      overlay.style.height = `${textarea.offsetHeight}px`;
+    alignMirror(overlay, textarea);
+  });
+
+  useLayoutEffect(() => {
+    const overlay = overlayRef.current;
+    const textarea = textareaRef.current;
+    if (!active || !overlay || !textarea) return;
+    const syncScroll = () => {
       overlay.scrollTop = textarea.scrollTop;
     };
-    align();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(align);
-    observer.observe(textarea);
-    return () => observer.disconnect();
+    textarea.addEventListener("scroll", syncScroll);
+    textarea.addEventListener("compositionend", syncScroll);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(() => alignMirror(overlay, textarea));
+    observer?.observe(textarea);
+    return () => {
+      textarea.removeEventListener("scroll", syncScroll);
+      textarea.removeEventListener("compositionend", syncScroll);
+      observer?.disconnect();
+    };
   }, [overlayRef, textareaRef, active]);
 }
 

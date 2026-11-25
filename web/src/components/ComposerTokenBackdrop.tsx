@@ -1,14 +1,4 @@
-import {
-  forwardRef,
-  useEffect,
-  useImperativeHandle,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-  type RefObject,
-} from "react";
+import { forwardRef, useMemo, type ReactNode } from "react";
 
 import { labelOf, tokenText } from "@/lib/composerTokens";
 import { findMentionTokens } from "@/lib/composerMentions";
@@ -125,16 +115,12 @@ function renderSegments(value: string, spans: Span[]): ReactNode[] {
     cursor = end;
   });
   if (cursor < content.length) nodes.push(content.slice(cursor));
-  if (trailingNewline) nodes.push(<br key="trailing-newline" />);
+  // A final break needs content on its empty line to match the textarea's scroll range.
+  if (trailingNewline) nodes.push(<br key="trailing-newline" />, "\u00a0");
   return nodes;
 }
 
-/**
- * Fork replacement for upstream's slash-command highlight overlay: reuses
- * upstream's overlay classes and scroll behaviour but takes its box from the
- * tail textarea (`anchor`) instead of `inset-0`, so it stays over the tail
- * when reply quotes render above it. Renders into `slots.inputBackdrop`.
- */
+/** Renders the glyphs in the aligned composer backdrop. */
 export const ComposerTokenBackdrop = forwardRef<
   HTMLDivElement,
   {
@@ -142,103 +128,12 @@ export const ComposerTokenBackdrop = forwardRef<
     files: readonly File[];
     command: string | null;
     activeIndex: number | null;
-    anchor: RefObject<HTMLTextAreaElement | null>;
     mentionTokens?: readonly string[];
   }
 >(function ComposerTokenBackdrop(
-  { value, files, command, activeIndex, anchor, mentionTokens = NO_MENTION_TOKENS },
+  { value, files, command, activeIndex, mentionTokens = NO_MENTION_TOKENS },
   ref,
 ) {
-  const innerRef = useRef<HTMLDivElement>(null);
-  useImperativeHandle(ref, () => innerRef.current as HTMLDivElement);
-  const [box, setBox] = useState({ top: 0, left: 0, width: 0, height: 0 });
-  const layoutMeasureCount = useRef(0);
-  const measureResetFrame = useRef<number | null>(null);
-  const measureSkipped = useRef(false);
-
-  const measure = (el: HTMLTextAreaElement) => {
-    setBox((prev) => {
-      const next = {
-        top: el.offsetTop,
-        left: el.offsetLeft,
-        width: el.offsetWidth,
-        height: el.offsetHeight,
-      };
-      const unchanged =
-        prev.top === next.top &&
-        prev.left === next.left &&
-        prev.width === next.width &&
-        prev.height === next.height;
-      return unchanged ? prev : next;
-    });
-  };
-
-  // Re-measures every render: the anchor can MOVE without resizing (a reply
-  // quote inserted above pushes it down), which ResizeObserver never
-  // reports, so only a render-scoped effect (no deps) sees it.
-  useLayoutEffect(() => {
-    const el = anchor.current;
-    if (!el) return;
-    // Without rAF there is no frame to lift the cap, so keep measuring.
-    if (typeof requestAnimationFrame !== "function") {
-      measure(el);
-      return;
-    }
-    // An oscillating layout would re-measure forever when the anchor's box
-    // flips between two values each read; cap measures until the next frame,
-    // then retry one skipped measure so a position-only move isn't lost.
-    if (layoutMeasureCount.current > 3) {
-      measureSkipped.current = true;
-      return;
-    }
-    layoutMeasureCount.current += 1;
-    if (measureResetFrame.current === null) {
-      measureResetFrame.current = requestAnimationFrame(() => {
-        measureResetFrame.current = null;
-        layoutMeasureCount.current = 0;
-        const skipped = measureSkipped.current;
-        measureSkipped.current = false;
-        const current = anchor.current;
-        if (skipped && current) measure(current);
-      });
-    }
-    measure(el);
-  });
-
-  useEffect(
-    () => () => {
-      if (measureResetFrame.current !== null) cancelAnimationFrame(measureResetFrame.current);
-      // StrictMode replays effects on mount: null the ref and counters so the
-      // replay schedules a fresh frame instead of leaving measures capped.
-      measureResetFrame.current = null;
-      layoutMeasureCount.current = 0;
-      measureSkipped.current = false;
-    },
-    [],
-  );
-
-  useEffect(() => {
-    const el = anchor.current;
-    if (!el) return;
-    // Backdrop is an earlier sibling of `anchor`, so on mount the layout
-    // effect above fires before the textarea's ref attaches; this passive
-    // effect runs after the whole tree commits, so `el` is always ready.
-    measure(el);
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure(el));
-    observer.observe(el);
-    return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [anchor.current]);
-
-  useEffect(() => {
-    const el = anchor.current;
-    const node = innerRef.current;
-    if (!el || !node) return;
-    node.scrollTop = el.scrollTop;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [anchor.current]);
-
   const spans = useMemo(
     () => computeSpans(value, files, command, activeIndex, mentionTokens),
     [value, files, command, activeIndex, mentionTokens],
@@ -247,13 +142,12 @@ export const ComposerTokenBackdrop = forwardRef<
 
   return (
     <div
-      ref={innerRef}
+      ref={ref}
       aria-hidden
       // Upstream's testid: this overlay replaces the slash-command
       // highlighter, and upstream's composer tests query it by that name.
       data-testid="composer-highlight-overlay"
       className="composer-input-text pointer-events-none absolute overflow-hidden whitespace-pre-wrap break-words p-0 text-ui text-foreground"
-      style={{ top: box.top, left: box.left, width: box.width, height: box.height }}
     >
       {nodes}
     </div>
