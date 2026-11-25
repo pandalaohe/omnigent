@@ -6,6 +6,7 @@
 // terminal link provider delegates to — the piece that makes terminal URLs
 // open the right way — so we pin it here.
 
+import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import { render } from "@testing-library/react";
@@ -1967,13 +1968,14 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("clamps a fitted grid once the bridge identifies itself as tmux", () => {
+  it("keeps the cursor at the tmux grid floor during a narrower panel fit", async () => {
     // WHY: the bridge drops resizes under 20x5, so a visible container that fits
     // smaller would otherwise render a grid narrower than the pane it shows.
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;
-    const fit = (session as unknown as { fit: { fit: () => void } }).fit;
-    vi.spyOn(fit, "fit").mockImplementation(() => term.resize(10, 3));
+    const proposeDimensions = vi
+      .spyOn(FitAddon.prototype, "proposeDimensions")
+      .mockReturnValue({ cols: 16, rows: 5 });
 
     socket.open();
     socket.emit("message", { data: JSON.stringify({ type: "tmux-replies", queries: [] }) });
@@ -1983,6 +1985,22 @@ describe("TerminalSession", () => {
       .filter((m) => typeof m === "string" && m.includes('"type":"resize"'))
       .at(-1);
     expect(frame).toBe(JSON.stringify({ type: "resize", cols: 20, rows: 5 }));
+
+    const bytes = new TextEncoder().encode("\x1b[5;19H");
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    expect(term.buffer.active.cursorX).toBe(18);
+
+    proposeDimensions.mockReturnValue({ cols: 15, rows: 4 });
+    FakeResizeObserver.instances[0].cb();
+
+    expect([term.buffer.active.cursorX, term.buffer.active.cursorY]).toEqual([18, 4]);
+    expect([term.cols, term.rows]).toEqual([20, 5]);
+    expect(socket.sent.filter((message) => message === frame)).toHaveLength(1);
     session.dispose();
   });
 
