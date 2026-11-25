@@ -1362,6 +1362,9 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
     options = [{"kind": "allow_always", "optionId": "persistent"}]
     if scenario != "no-once":
         options.append({"kind": "allow_once", "optionId": "once"})
+    request_call: dict[str, object] = {"toolCallId": "shell-1"}
+    if scenario in ("no-once", "once"):
+        request_call["rawInput"] = {"CommandLine": command}
     with caplog.at_level(logging.INFO, logger=acp_executor_module.__name__):
         await ex._respond_to_agent_request(
             {
@@ -1369,7 +1372,7 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
                 "method": "session/request_permission",
                 "params": {
                     "sessionId": "s1",
-                    "toolCall": {"toolCallId": "shell-1"},
+                    "toolCall": request_call,
                     "options": options,
                 },
             }
@@ -1812,9 +1815,19 @@ async def _observe_acp_update(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tier", ["auto", "ask"])
+@pytest.mark.parametrize(
+    ("tier", "include_request_metadata"),
+    [
+        pytest.param("auto", True, id="auto"),
+        pytest.param("ask", True, id="ask"),
+        pytest.param("auto", False, id="without-request-kind-and-title"),
+    ],
+)
 async def test_managed_agy_permission_binds_pending_update_after_in_progress_start(
-    tier, windows_acp_permission_executor, caplog: pytest.LogCaptureFixture
+    tier,
+    include_request_metadata,
+    windows_acp_permission_executor,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     ex = windows_acp_permission_executor(tier)
     ex._session_id = "s1"
@@ -1854,6 +1867,10 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
     assert ex._permission_calls["call-1"]["rawInput"] == raw_input
 
     # Step 3: agy sends session/request_permission for the same toolCallId.
+    request_call: dict[str, object] = {"status": "pending", **base_call}
+    if not include_request_metadata:
+        del request_call["kind"]
+        del request_call["title"]
     with caplog.at_level(logging.INFO, logger=acp_executor_module.__name__):
         await ex._respond_to_agent_request(
             {
@@ -1861,7 +1878,7 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
                 "method": "session/request_permission",
                 "params": {
                     "sessionId": "s1",
-                    "toolCall": {"status": "pending", **base_call},
+                    "toolCall": request_call,
                     "options": options,
                 },
             }
@@ -1920,24 +1937,34 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "scenario",
+    ("scenario", "terminal_status"),
     [
-        "no-pending-update",
-        "statusless-update",
-        "mismatched-raw-input",
-        "terminal-pop-before-request",
-        "non-agy",
-        "second-request",
+        ("no-pending-update", None),
+        ("statusless-update", None),
+        ("mismatched-raw-input", None),
+        ("omitted-raw-input", None),
+        ("null-raw-input", None),
+        ("non-object-raw-input", None),
+        ("terminal-pop-before-request", "failed"),
+        ("late-pending", "completed"),
+        ("late-pending", "failed"),
+        ("late-pending", "cancelled"),
+        ("non-agy", None),
+        ("second-request", None),
     ],
 )
 async def test_managed_agy_pending_update_negatives_and_non_agy_control(
-    scenario: str, windows_acp_permission_executor, caplog: pytest.LogCaptureFixture
+    scenario: str,
+    terminal_status: str | None,
+    windows_acp_permission_executor,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     command = "opencode acp" if scenario == "non-agy" else "agy.exe acp --stdio"
     ex = windows_acp_permission_executor("auto", command)
     ex._session_id = "s1"
     ex._active_prompt_request_id = 1
     ex._send = AsyncMock()
+    ex._elicitation_choice_handler = AsyncMock()
 
     raw_input: dict[str, object] = {
         "CommandLine": "omni --version",
@@ -1983,13 +2010,28 @@ async def test_managed_agy_pending_update_negatives_and_non_agy_control(
             **request_call,
             "rawInput": {**raw_input, "CommandLine": "omni --help"},
         }
-    elif scenario == "terminal-pop-before-request":
+    elif scenario == "omitted-raw-input":
+        del request_call["rawInput"]
+    elif scenario == "null-raw-input":
+        request_call["rawInput"] = None
+    elif scenario == "non-object-raw-input":
+        request_call["rawInput"] = [raw_input]
+
+    if terminal_status is not None:
         await _observe_acp_update(
             ex,
             "s1",
-            {"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "status": "failed"},
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": terminal_status,
+            },
         )
         assert ex._permission_calls == {}
+        if scenario == "late-pending":
+            await _observe_acp_update(
+                ex, "s1", {"sessionUpdate": "tool_call_update", "status": "pending", **base_call}
+            )
 
     request = {
         "id": 2,
@@ -2016,6 +2058,7 @@ async def test_managed_agy_pending_update_negatives_and_non_agy_control(
     assert reply["error"]["code"] == -32000
     assert ex._policy_evaluator.await_count == (1 if scenario == "second-request" else 0)
     ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
     logs = [
         message
         for message in caplog.messages

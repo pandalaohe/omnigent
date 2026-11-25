@@ -622,6 +622,7 @@ class AcpExecutor(Executor):
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
         self._permission_calls: dict[str, _AcpJsonObject] = {}
         self._answered_permission_calls: set[str] = set()
+        self._terminal_permission_calls: set[str] = set()
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -1409,8 +1410,17 @@ class AcpExecutor(Executor):
             isinstance(call_id, str) and call_id
         ):
             return
-        if update.get("status") not in (None, "pending"):
+        status = update.get("status")
+        if status not in (None, "pending"):
             self._permission_calls.pop(call_id, None)
+            if (
+                status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED, "cancelled")
+                and self._config.host_permission_tier
+                and is_antigravity_acp_command(self._config.command)
+            ):
+                self._terminal_permission_calls.add(call_id)
+            return
+        if call_id in self._terminal_permission_calls:
             return
         if kind == _UPDATE_TOOL_CALL:
             self._permission_calls[call_id] = copy.deepcopy(update)
@@ -1421,7 +1431,7 @@ class AcpExecutor(Executor):
             if (
                 self._config.host_permission_tier
                 and is_agy
-                and update.get("status") == "pending"
+                and status == "pending"
                 and call_id not in self._answered_permission_calls
             ):
                 self._permission_calls[call_id] = {
@@ -1456,6 +1466,8 @@ class AcpExecutor(Executor):
             return None
         self._answered_permission_calls.add(call_id)
         is_agy = is_antigravity_acp_command(self._config.command)
+        if is_agy and not isinstance(call.get("rawInput"), dict):
+            return None
         same_value = _same_json_value if is_agy else operator.eq
         for key in ("kind", "name", "title", "rawInput"):
             if call.get(key) is not None and not same_value(call[key], observed.get(key)):
@@ -2045,6 +2057,7 @@ class AcpExecutor(Executor):
         self._tool_inputs.clear()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
+        self._terminal_permission_calls.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -2730,6 +2743,7 @@ class AcpExecutor(Executor):
         mode_selection = config.extra.get("session_mode_selection") if config else None
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
+        self._terminal_permission_calls.clear()
         await self._drain_stale_queue()
         managed_agy = self._managed_agy
         if managed_agy:
@@ -2862,6 +2876,7 @@ class AcpExecutor(Executor):
         await self._drain_stale_queue()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
+        self._terminal_permission_calls.clear()
         reported_mode = self._active_mode
         if reported_mode:
             yield SessionModeChanged(
