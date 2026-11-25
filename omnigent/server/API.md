@@ -491,6 +491,24 @@ Fields:
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
     command uses) so the web picker and the TUI stay in sync.
 
+  requested (string or null)
+    Model originally requested for the session: `saved` from the
+    `omnigent.model_resolution` label when catalog resolution rewrote
+    the active override, else `model_override`. `null` when unset.
+    Also exposed on `ChildSessionSummary` beside `routed_model`.
+
+  launched (string or null)
+    Post-resolution model passed to the harness (`model_override`), or
+    `null` when unset or not confirmed at launch by the harness (e.g.
+    `antigravity-native`, where overrides are launch requests only).
+    Also exposed on `ChildSessionSummary` beside `routed_model`.
+
+  running (string or null)
+    Model last reported as actually running by the harness
+    (`reported_model`), verbatim. `null` before the harness reports a
+    concrete model or on older sessions without one. Also exposed on
+    `ChildSessionSummary` beside `routed_model`.
+
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for

@@ -10115,6 +10115,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         sessionModelSeeded: false,
         pendingModelChange: null,
       });
+      queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+        session ? { ...session, running: event.model } : session,
+      );
       return;
     case "error":
       if (event.error.code === "pi_compact_unavailable") settleLegacyPiCompact();

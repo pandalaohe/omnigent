@@ -9575,6 +9575,9 @@ async def _session_info_item(
             if snap.get("harness") == "antigravity-native"
             else snap.get("model_override") or snap.get("llm_model")
         ),
+        "requested": snap.get("requested"),
+        "launched": snap.get("launched"),
+        "running": snap.get("running"),
         "workspace": snap.get("workspace"),
         "worktree": snap.get("worktree"),
         "git_branch": snap.get("git_branch"),

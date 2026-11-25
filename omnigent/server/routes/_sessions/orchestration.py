@@ -3154,8 +3154,16 @@ def _build_session_response(
             permission_tiers_capability = (
                 conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
             )
+    from omnigent.server.model_resolution import session_model_display
     from omnigent.server.routes._session_create_validation import session_acp_harness
     from omnigent.server.session_choice_runtime import choice_record
+
+    model_display = session_model_display(
+        conv.labels,
+        conv.model_override,
+        conv.reported_model,
+        harness=harness,
+    )
 
     return SessionResponse(
         id=conv.id,
@@ -3209,6 +3217,9 @@ def _build_session_response(
         permission_tier_state=permission_tier_state,
         permission_tiers_capability=permission_tiers_capability,
         model_override=conv.model_override,
+        requested=model_display.requested,
+        launched=model_display.launched,
+        running=model_display.running,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,

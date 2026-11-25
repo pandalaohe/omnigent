@@ -256,3 +256,88 @@ def test_child_summary_durable_terminal_holds_for_a_harness_subagent_mirror() ->
 
     assert summary.busy is False
     assert summary.current_task_status == "completed"
+
+
+def test_child_summary_exposes_requested_launched_running_beside_routed_model() -> None:
+    """Child info carries requested, launched, and running alongside routed_model."""
+    from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
+    from omnigent.server.model_resolution import RESOLUTION_LABEL
+
+    # T12: requested, launched, and running all match on codex-native.
+    exact = Conversation(
+        id="conv_child_exact",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_parent",
+        title="worker:exact",
+        agent_id="ag_test",
+        model_override="gpt-6.2-sol",
+        reported_model="gpt-6.2-sol",
+        labels={ROUTING_DECISION_LABEL_KEY: "dec_1"},
+    )
+    exact_summary = _child_session_summary_from_conversation(
+        exact, "conv_parent", None, harness="codex-native"
+    )
+    assert exact_summary.routed_model == "gpt-6.2-sol"
+    assert exact_summary.requested == "gpt-6.2-sol"
+    assert exact_summary.launched == "gpt-6.2-sol"
+    assert exact_summary.running == "gpt-6.2-sol"
+
+    # T13: rename label supplies requested while model_override supplies launched.
+    renamed = Conversation(
+        id="conv_child_renamed",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_parent",
+        title="worker:renamed",
+        agent_id="ag_test",
+        model_override="krill/gpt-6.2-sol",
+        reported_model="krill/gpt-6.2-sol",
+        labels={
+            RESOLUTION_LABEL: json.dumps(
+                [
+                    {
+                        "setting": "session",
+                        "saved": "ccs-krill/gpt-6.2-sol",
+                        "model": "krill/gpt-6.2-sol",
+                        "outcome": "renamed",
+                        "host": "host-a",
+                    }
+                ]
+            )
+        },
+    )
+    renamed_summary = _child_session_summary_from_conversation(
+        renamed, "conv_parent", None, harness="codex-native"
+    )
+    assert renamed_summary.routed_model is None
+    assert renamed_summary.requested == "ccs-krill/gpt-6.2-sol"
+    assert renamed_summary.launched == "krill/gpt-6.2-sol"
+    assert renamed_summary.running == "krill/gpt-6.2-sol"
+
+    # antigravity-native omits launched (override is only a request).
+    agy = Conversation(
+        id="conv_child_agy",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_parent",
+        title="worker:agy",
+        agent_id="ag_test",
+        model_override="gemini-4-neon",
+        reported_model="Gemini 4 Neon (High)",
+        labels={},
+    )
+    agy_summary = _child_session_summary_from_conversation(
+        agy, "conv_parent", None, harness="antigravity-native"
+    )
+    assert agy_summary.requested == "gemini-4-neon"
+    assert agy_summary.launched is None
+    assert agy_summary.running == "Gemini 4 Neon (High)"
+
+    # Old child without reported_model or override omits all three.
+    old_summary = _child_session_summary_from_conversation(
+        _child({}), "conv_parent", None, harness="claude-native"
+    )
+    assert old_summary.requested is None
+    assert old_summary.launched is None
+    assert old_summary.running is None

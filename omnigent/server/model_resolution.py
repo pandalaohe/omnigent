@@ -17,6 +17,7 @@ from omnigent.member_snapshot import (
     encode_member_entry,
     parse_member_entry,
 )
+from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_reference import (
     ALIASES_NAMESPACE,
     ModelResolution,
@@ -244,3 +245,52 @@ async def resolve_app_session_model(app: Any, conversation: Any) -> Any:
 def notes_from_labels(labels: Mapping[str, str]) -> list[dict[str, str]]:
     notes = decode_json_labels(labels, RESOLUTION_LABEL)
     return [note for note in notes if isinstance(note, dict)] if isinstance(notes, list) else []
+
+
+@dataclass(frozen=True)
+class SessionModelDisplay:
+    """Requested, launched, and running model ids for session and child info."""
+
+    requested: str | None = None
+    launched: str | None = None
+    running: str | None = None
+
+
+def session_model_display(
+    labels: Mapping[str, str] | None,
+    model_override: str | None,
+    reported_model: str | None,
+    *,
+    harness: str | None = None,
+) -> SessionModelDisplay:
+    """Derive requested, launched, and running models for one session.
+
+    Omits any field whose source is absent or unreliable for *harness*
+    (native Antigravity overrides are launch requests, not confirmed launches;
+    old sessions without ``reported_model`` omit ``running``).
+    """
+    override = (
+        model_override.strip()
+        if isinstance(model_override, str) and model_override.strip()
+        else None
+    )
+    running = concrete_reported_model(reported_model)
+    requested = override
+    if override is not None and labels:
+        for note in reversed(notes_from_labels(labels)):
+            setting = note.get("setting")
+            if isinstance(setting, str) and setting.startswith("member:"):
+                continue
+            raw_saved = note.get("saved")
+            raw_model = note.get("model")
+            if (
+                isinstance(raw_saved, str)
+                and isinstance(raw_model, str)
+                and raw_model.strip() == override
+                and raw_saved.strip()
+                and raw_saved.strip() != override
+            ):
+                requested = raw_saved.strip()
+                break
+    launched = None if harness == "antigravity-native" else override
+    return SessionModelDisplay(requested=requested, launched=launched, running=running)

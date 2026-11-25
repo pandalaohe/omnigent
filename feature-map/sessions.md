@@ -34,6 +34,14 @@ the header menu), and each place is a separate entry point.
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
   above them; a drop on another project's row still files the session there.
+- `model-display`: session snapshots, child summaries (beside `routed_model`),
+  and `sys_session_get_info` expose `requested` (`saved` from
+  `omnigent.model_resolution` when rewritten, else `model_override`),
+  `launched` (`model_override`, omitted for `antigravity-native` where it is
+  only a launch request), and `running` (`reported_model`, omitted until the
+  harness reports a concrete model). The desktop session header shows the
+  launched model name when present and reuses the Model reference chip only
+  when `requested` or `running` differ (or resolution notes exist).
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `title-instructions`: Settings → General → Sessions → **Title instructions**

@@ -1,12 +1,29 @@
 import { AlertTriangleIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useSession } from "@/hooks/useSession";
-import { modelResolutionNotes } from "@/lib/modelReference";
+import { modelResolutionNotes, sessionHeaderModelState } from "@/lib/modelReference";
+
+export function SessionHeaderModel({ sessionId }: { sessionId: string }) {
+  const { session } = useSession(sessionId);
+  const { launched } = sessionHeaderModelState(session);
+  if (!launched) return null;
+  return (
+    <span
+      data-testid="session-header-model"
+      title={launched}
+      aria-label={`Launched model: ${launched}`}
+      className="hidden max-w-44 shrink-0 truncate rounded-md border border-border/60 bg-background/60 px-2 py-0.5 font-mono text-xs text-muted-foreground md:inline-flex"
+    >
+      {launched}
+    </span>
+  );
+}
 
 export function ModelResolutionChip({ sessionId }: { sessionId: string }) {
   const { session } = useSession(sessionId);
   const notes = modelResolutionNotes(session?.labels);
-  if (notes.length === 0) return null;
+  const modelState = sessionHeaderModelState(session);
+  if (notes.length === 0 && !modelState.hasDifference) return null;
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -21,21 +38,45 @@ export function ModelResolutionChip({ sessionId }: { sessionId: string }) {
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] space-y-3 text-sm">
         <h2 className="font-medium">Model resolution</h2>
-        <ul className="space-y-2">
-          {notes.map((note) => (
-            <li key={JSON.stringify(note)} className="space-y-1">
-              <p className="break-all font-mono text-xs">
-                {note.saved}
-                {note.model !== note.saved && <> → {note.model}</>}
-              </p>
-              <p className="text-muted-foreground">
-                {note.outcome === "missing"
-                  ? "Not listed by this host; tried as unknown."
-                  : "Resolved automatically for this host."}
-              </p>
-            </li>
-          ))}
-        </ul>
+        {modelState.hasDifference && (
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+            {modelState.requested && (
+              <>
+                <dt className="text-muted-foreground">Requested</dt>
+                <dd className="break-all font-mono">{modelState.requested}</dd>
+              </>
+            )}
+            {modelState.launched && (
+              <>
+                <dt className="text-muted-foreground">Launched</dt>
+                <dd className="break-all font-mono">{modelState.launched}</dd>
+              </>
+            )}
+            {modelState.running && (
+              <>
+                <dt className="text-muted-foreground">Running</dt>
+                <dd className="break-all font-mono">{modelState.running}</dd>
+              </>
+            )}
+          </dl>
+        )}
+        {notes.length > 0 && (
+          <ul className="space-y-2">
+            {notes.map((note) => (
+              <li key={JSON.stringify(note)} className="space-y-1">
+                <p className="break-all font-mono text-xs">
+                  {note.saved}
+                  {note.model !== note.saved && <> → {note.model}</>}
+                </p>
+                <p className="text-muted-foreground">
+                  {note.outcome === "missing"
+                    ? "Not listed by this host; tried as unknown."
+                    : "Resolved automatically for this host."}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
       </PopoverContent>
     </Popover>
   );

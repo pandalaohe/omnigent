@@ -306,6 +306,9 @@ interface SessionResponseWire {
   harness?: string | null;
   harness_namespace?: string | null;
   model_override?: string | null;
+  requested?: string | null;
+  launched?: string | null;
+  running?: string | null;
   inference_configured?: boolean;
   inference_error?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
@@ -523,6 +526,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     harness: wire.harness ?? null,
     harnessNamespace: wire.harness_namespace ?? null,
     modelOverride: wire.model_override,
+    ...(wire.requested !== undefined ? { requested: wire.requested } : {}),
+    ...(wire.launched !== undefined ? { launched: wire.launched } : {}),
+    ...(wire.running !== undefined ? { running: wire.running } : {}),
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
     shareWorkspaceFiles: wire.share_workspace_files ?? false,

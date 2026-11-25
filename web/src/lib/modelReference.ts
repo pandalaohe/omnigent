@@ -55,3 +55,57 @@ export function modelResolutionNotes(labels: Record<string, string> = {}): Model
     return [];
   }
 }
+
+export interface SessionHeaderModelState {
+  requested: string | null;
+  launched: string | null;
+  running: string | null;
+  requestedDiffers: boolean;
+  runningDiffers: boolean;
+  hasDifference: boolean;
+}
+
+function trimOrNull(value: string | null | undefined): string | null {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed ? trimmed : null;
+}
+
+function antigravityModelIdentity(value: string): string {
+  return value
+    .trim()
+    .replace(/\s*\((?:low|medium|high|xhigh|max)\)$/i, "")
+    .replace(/[-_](?:low|medium|high|xhigh|max)$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+export function sessionHeaderModelState(
+  session:
+    | {
+        harness?: string | null;
+        requested?: string | null;
+        launched?: string | null;
+        running?: string | null;
+      }
+    | null
+    | undefined,
+): SessionHeaderModelState {
+  const requested = trimOrNull(session?.requested);
+  const launched = trimOrNull(session?.launched);
+  const running = trimOrNull(session?.running);
+  const requestedDiffers = Boolean(requested && launched && requested !== launched);
+  let runningDiffers = false;
+  if (launched && running) {
+    runningDiffers = running !== launched;
+  } else if (!launched && session?.harness === "antigravity-native" && requested && running) {
+    runningDiffers = antigravityModelIdentity(requested) !== antigravityModelIdentity(running);
+  }
+  return {
+    requested,
+    launched,
+    running,
+    requestedDiffers,
+    runningDiffers,
+    hasDifference: requestedDiffers || runningDiffers,
+  };
+}

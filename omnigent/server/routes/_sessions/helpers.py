@@ -14842,8 +14842,15 @@ def _child_session_summary_from_conversation(
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     from omnigent.server.child_keep_warm import warm_state_reason_for_harness
+    from omnigent.server.model_resolution import session_model_display
     from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
 
+    model_display = session_model_display(
+        conv.labels,
+        conv.model_override,
+        conv.reported_model,
+        harness=harness,
+    )
     placement = _effective_placement(conv, inherited or Placement(None, None, None))
     return ChildSessionSummary(
         id=conv.id,
@@ -14887,6 +14894,9 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        requested=model_display.requested,
+        launched=model_display.launched,
+        running=model_display.running,
         routing_decision_id=routing_decision_id,
         warm_state=_warm_state_for_child(
             conv, harness=harness, busy=busy, cold_after_s=cold_after_s

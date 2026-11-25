@@ -1163,6 +1163,14 @@ class ChildSessionSummary(BaseModel):
         child's ``model_override`` — the field intelligent routing writes
         when it picks a model for a spawned child. ``None`` when the child
         inherits the parent/spec model.
+    :param requested: Model originally requested for the child — ``saved``
+        from ``omnigent.model_resolution`` when resolution rewrote it, else
+        ``model_override``. ``None`` when unset.
+    :param launched: Post-resolution model passed to the child's harness
+        (``model_override``), or ``None`` when unset or not confirmed by the
+        harness (e.g. ``antigravity-native``).
+    :param running: Model last reported as actually running by the child's
+        harness (``reported_model``), or ``None`` when not yet reported.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -1222,6 +1230,9 @@ class ChildSessionSummary(BaseModel):
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
     routed_model: str | None = None
+    requested: str | None = None
+    launched: str | None = None
+    running: str | None = None
     routing_decision_id: str | None = None
     host_id: str | None = None
     cwd: str | None = None
@@ -2715,6 +2726,14 @@ class SessionResponse(BaseModel):
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
         command; both write the same column so the web UI and
         the TUI stay in sync.
+    :param requested: Model originally requested for the session — ``saved``
+        from ``omnigent.model_resolution`` when resolution rewrote it, else
+        ``model_override``. ``None`` when unset.
+    :param launched: Post-resolution model passed to the harness
+        (``model_override``), or ``None`` when unset or not confirmed by the
+        harness (e.g. ``antigravity-native``).
+    :param running: Model last reported as actually running by the harness
+        (``reported_model``), or ``None`` when not yet reported.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2961,6 +2980,9 @@ class SessionResponse(BaseModel):
     permission_tier_state: Literal["ready", "switching", "blocked"] | None = None
     permission_tiers_capability: bool = False
     model_override: str | None = None
+    requested: str | None = None
+    launched: str | None = None
+    running: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     share_workspace_files: bool = False

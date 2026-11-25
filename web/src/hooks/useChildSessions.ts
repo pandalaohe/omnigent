@@ -72,6 +72,12 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /** Originally requested model for the child, or null when unset. */
+  requested?: string | null;
+  /** Post-resolution model passed to the child's harness, or null when unset/unconfirmed. */
+  launched?: string | null;
+  /** Model last reported as actually running by the child's harness. */
+  running?: string | null;
   /**
    * Effective host: the child's own ``host_id``, else the nearest
    * host-bound ancestor's. ``null`` when no ancestor is host-bound.
@@ -128,6 +134,12 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  /** Originally requested model for the child, or null when unset. */
+  requested?: string | null;
+  /** Post-resolution model passed to the child's harness, or null when unset/unconfirmed. */
+  launched?: string | null;
+  /** Model last reported as actually running by the child's harness. */
+  running?: string | null;
   host_id?: string | null;
   cwd?: string | null;
   git_branch?: string | null;
@@ -172,6 +184,9 @@ function mapChildSession(row: ChildSessionWire): ChildSessionInfo {
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    ...(row.requested !== undefined ? { requested: row.requested } : {}),
+    ...(row.launched !== undefined ? { launched: row.launched } : {}),
+    ...(row.running !== undefined ? { running: row.running } : {}),
     host_id: row.host_id ?? null,
     cwd: row.cwd ?? null,
     git_branch: row.git_branch ?? null,
