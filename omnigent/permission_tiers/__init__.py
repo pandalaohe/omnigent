@@ -496,7 +496,10 @@ _TRUSTED_EXPANSION = re.compile(r"\$(?:\{(HOME|TMPDIR)\}|(HOME|TMPDIR))(?![A-Za-
 _WRAPPER_OPTION = re.compile(r"/c|-[a-z]*c[a-z]*|-command")
 _DARWIN_TEMP_ROOT = re.compile(r"^(/(?:private/)?var/folders/[^/]+/[^/]+/T)(?:/|$)")
 # Redirections bind a write target; the rest only feed the command.
-_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>")
+_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<-", "<<<", "<&", "<>")
+_POSIX_OPERATORS = re.compile(
+    r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|<\(|>\(|&&|\|\||\|&|;;|[;&|<>()\n]"
+)
 _WRITE_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", "<>")
 _UNBOUND_DELETE = "A delete needs a bindable target: an unresolved name could delete a tree"
 
@@ -1086,7 +1089,7 @@ class _UnboundSedWrite(_UnboundShellWrite):
 
 _HEREDOC = re.compile(r"<<(-?)[ \t]*([^\s;&|<>()]+)")
 # Same POSIX interpreter names the engine's existing `-c` recursion recognises.
-_HEREDOC_SHELLS = ("sh", "bash", "zsh")
+_HEREDOC_SHELLS = ("sh", "bash", "zsh", "dash")
 _COMMAND_LEADS = ("then", "do", "else", "elif", "{", "!", "time")
 
 
@@ -1660,7 +1663,7 @@ def _windows_path_operands(
     if dialect in _HEREDOC_SHELLS and tokens[0] == "echo":
         if all(not re.search(r"\$(?!\?)|[`{}\r\n]", raw) for raw in raw_tokens[1:]):
             return tokens[:1]
-    if dialect not in ("pwsh", "powershell", "cmd", "sh", "bash", "zsh") or any(
+    if dialect not in ("pwsh", "powershell", "cmd", *_HEREDOC_SHELLS) or any(
         any(char in raw for char in "$`^!{}\r\n")
         or (dialect == "cmd" and any(char in raw for char in "%'"))
         or (dialect in _HEREDOC_SHELLS and "\\" in raw)
@@ -1803,7 +1806,7 @@ def _windows_path_operands(
 
 
 _WINDOWS_SHELL_TOKENS = (
-    r"&>>|&>|>>|>\||>&|<<<|<<|<&|<>|&&|\|\||\|&|[;&|<>()\n]|"
+    r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|&&|\|\||\|&|[;&|<>()\n]|"
     r"""(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+"""
 )
 
@@ -1859,7 +1862,7 @@ def _windows_command_paths(
         if brace or (raw and all(char in ";&|()\n" for char in raw)):
             segments.append([])
             raw_segments.append([])
-        elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>"):
+        elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<-", "<<<", "<&", "<>"):
             index += 1
             if index == len(tokens) or re.fullmatch(r"[;&|<>()\n]+", raw_tokens[index]):
                 raise ValueError("Missing shell redirection target")
@@ -1963,8 +1966,37 @@ def _write_tokens(
         if token is None:
             break
         end = stream.tell() - len(lookahead)
+        raw_span = command[start:end]
+        raw = raw_span.strip(" \t\r")
+        if raw == token and raw and all(char in ";|&<>()\n" for char in raw):
+            parts = _POSIX_OPERATORS.findall(raw)
+            for part_index, part in enumerate(parts):
+                if (
+                    part_index == 0
+                    and tokens
+                    and part in _REDIRECTIONS
+                    and raw_span.startswith(raw)
+                    and raw_tokens[-1].isdigit()
+                ):
+                    tokens[-1] = raw_tokens[-1] + part
+                    raw_tokens[-1] = raw_tokens[-1] + part
+                    continue
+                tokens.append(part)
+                raw_tokens.append(part)
+            continue
+        if (
+            tokens
+            and raw == "-"
+            and raw_span.startswith("-")
+            and tokens[-1].endswith("<<")
+            and raw_tokens[-1] == tokens[-1]
+            and (len(tokens[-1]) == 2 or tokens[-1][:-2].isdigit())
+        ):
+            tokens[-1] += "-"
+            raw_tokens[-1] += "-"
+            continue
         tokens.append(token)
-        raw_tokens.append(command[start:end].strip(" \t\r"))
+        raw_tokens.append(raw)
     return tokens, raw_tokens
 
 
@@ -1992,24 +2024,46 @@ def _command_offset(tokens: list[str], offset: int = 0) -> int:
     return offset
 
 
+def _takes_shell_option_arg(option: str) -> bool:
+    return option in ("--rcfile", "--init-file") or (
+        len(option) >= 2
+        and option[0] in ("-", "+")
+        and option[-1] in ("o", "O")
+        and option[1:].isalpha()
+    )
+
+
 def _wrapped_command(
     tokens: list[str], raw_tokens: list[str], index: int, *, writes_only: bool
 ) -> tuple[str, str] | None:
     """The shell dialect and inner command when a token opens `-c` execution."""
     shell = _command_name(tokens[index])
-    if shell not in ("sh", "bash", "zsh", "cmd", "powershell", "pwsh"):
+    if shell not in (*_HEREDOC_SHELLS, "cmd", "powershell", "pwsh"):
         return None
-    for option_index in range(index + 1, len(tokens) - 1):
-        option = tokens[option_index].lower()
-        if not _WRAPPER_OPTION.fullmatch(option):
-            if not option.startswith(("-", "/")):
+    option_index = index + 1
+    while option_index < len(tokens) - 1:
+        option = tokens[option_index]
+        if shell in _HEREDOC_SHELLS:
+            if option in ("--", "-"):
                 return None
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", option):
+                return shell, tokens[option_index + 1]
+            if _takes_shell_option_arg(option):
+                option_index += 2
+                continue
+            if not option.startswith(("-", "+")):
+                return None
+            option_index += 1
+            continue
+        lowered = option.lower()
+        if not _WRAPPER_OPTION.fullmatch(lowered):
+            if not lowered.startswith(("-", "/")):
+                return None
+            option_index += 1
             continue
         rest = tokens[option_index + 1 :]
-        if shell in ("cmd", "powershell", "pwsh"):
-            keep = raw_tokens[option_index + 1 :] if writes_only and len(rest) > 1 else rest
-            return shell, " ".join(keep)
-        return shell, rest[0]
+        keep = raw_tokens[option_index + 1 :] if writes_only and len(rest) > 1 else rest
+        return shell, " ".join(keep)
     return None
 
 
@@ -2086,12 +2140,34 @@ class _ShellWrites:
         )
 
 
+_COMPOUND_CLOSERS = {
+    "(": ")",
+    "{": "}",
+    "if": "fi",
+    "for": "done",
+    "while": "done",
+    "until": "done",
+    "case": "esac",
+}
+_STDIN_REDIRECTIONS = ("<", "<<", "<<-", "<<<", "<&", "<>")
+_STDIN_SCRIPT_PATHS = ("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")
+
+
+def _redirect_parts(raw: str) -> tuple[str | None, str] | None:
+    if raw in _REDIRECTIONS:
+        return None, raw
+    digits = len(raw) - len(raw.lstrip("0123456789"))
+    if digits and raw[digits:] in _REDIRECTIONS:
+        return raw[:digits], raw[digits:]
+    return None
+
+
 def _shell_segments(
     tokens: list[str],
     raw_tokens: list[str],
     *,
     windows: bool,
-    windows_posix: bool = False,
+    posix_stdin: bool = False,
     inherited_stdin: bool = False,
 ) -> list[tuple[list[str], list[str], list[str], str, bool]]:
     """Split a token stream into commands with redirect targets and leading operator."""
@@ -2101,7 +2177,7 @@ def _shell_segments(
     redirects: list[str] = []
     operator = ""
     stdin_connected = inherited_stdin
-    group_inputs: list[tuple[bool, int]] = [(inherited_stdin, 0)]
+    group_inputs: list[tuple[bool, int, str]] = [(inherited_stdin, 0, "")]
     closed_group: int | None = None
     index = 0
     while index < len(tokens):
@@ -2117,36 +2193,92 @@ def _shell_segments(
             and all(char in ";|&<>()\n" for char in tokens[index])
         ):
             raw = tokens[index]
-        brace = windows_posix and raw in ("{", "}") and not segment
+        brace = posix_stdin and raw in ("{", "}") and not segment
+        redirect = _redirect_parts(raw)
         if brace or (raw and all(char in ";|&()\n" for char in raw)):
             segments.append((segment, raws, redirects, operator, stdin_connected))
             closed_group = None
-            if windows_posix:
+            if posix_stdin:
                 if raw in ("(", "{"):
-                    group_inputs.append((stdin_connected, len(segments)))
-                elif raw in (")", "}") and len(group_inputs) > 1:
-                    _, closed_group = group_inputs.pop()
+                    group_inputs.append((stdin_connected, len(segments), _COMPOUND_CLOSERS[raw]))
+                elif raw in (")", "}") and len(group_inputs) > 1 and group_inputs[-1][2] == raw:
+                    _, closed_group, _ = group_inputs.pop()
                 if raw != "\n" or segment:
                     stdin_connected = group_inputs[-1][0] or raw in ("|", "|&")
             segment, raws, redirects = [], [], []
             operator = raw
-        elif raw in _REDIRECTIONS:
+        elif redirect is not None:
+            fd, op = redirect
             if index + 1 >= len(tokens):
                 raise ValueError("Missing shell redirection target")
             index += 1
             destination = tokens[index]
-            if windows_posix and raw in ("<", "<<", "<<<", "<&", "<>"):
+            if posix_stdin and op in _STDIN_REDIRECTIONS and fd in (None, "0"):
                 stdin_connected = True
                 if closed_group is not None:
                     for group_index in range(closed_group, len(segments)):
                         group_segment = segments[group_index]
                         segments[group_index] = (*group_segment[:4], True)
-            if raw in _WRITE_REDIRECTIONS or (
-                raw == ">&" and not destination.isdigit() and destination != "-"
+                if raw_tokens[index] == "<(":
+                    # Parse process-substitution bodies separately so they do not mask
+                    # the outer command as a script-file operand.
+                    depth = 1
+                    cases = 0
+                    inner_start = index + 1
+                    while index + 1 < len(tokens) and depth > 0:
+                        index += 1
+                        if raw_tokens[index] == "case" and (
+                            index == inner_start
+                            or raw_tokens[index - 1]
+                            in (
+                                ";",
+                                "&&",
+                                "||",
+                                "|",
+                                "|&",
+                                "(",
+                                "<(",
+                                ">(",
+                                "{",
+                                "\n",
+                                "then",
+                                "do",
+                                "else",
+                                "elif",
+                            )
+                        ):
+                            cases += 1
+                        elif cases and raw_tokens[index] == "esac":
+                            cases -= 1
+                        elif raw_tokens[index] in ("(", "<(", ">("):
+                            depth += 1
+                        elif raw_tokens[index] == ")" and not cases:
+                            depth -= 1
+                    if depth != 0:
+                        raise ValueError("Unterminated process substitution")
+                    segments.extend(
+                        _shell_segments(
+                            tokens[inner_start:index],
+                            raw_tokens[inner_start:index],
+                            windows=windows,
+                            posix_stdin=posix_stdin,
+                            inherited_stdin=False,
+                        )
+                    )
+                    index += 1
+                    continue
+            if op in _WRITE_REDIRECTIONS or (
+                op == ">&" and not destination.isdigit() and destination != "-"
             ):
                 if destination != "/dev/null" or windows:
                     redirects.append(destination)
         else:
+            if posix_stdin and not segment:
+                if raw in ("if", "for", "while", "until", "case"):
+                    group_inputs.append((stdin_connected, len(segments), _COMPOUND_CLOSERS[raw]))
+                elif raw in ("fi", "done", "esac") and group_inputs[-1][2] == raw:
+                    _, closed_group, _ = group_inputs.pop()
+                    stdin_connected = group_inputs[-1][0]
             segment.append(tokens[index])
             raws.append(raw)
         index += 1
@@ -2156,12 +2288,56 @@ def _shell_segments(
 
 def _stdin_shell_offset(tokens: list[str]) -> int:
     offset = _command_offset(tokens)
-    while offset < len(tokens) and _command_name(tokens[offset]) in ("env", "exec"):
+    while offset < len(tokens):
         wrapper = _command_name(tokens[offset])
-        offset += 1
         if wrapper == "env":
-            while offset < len(tokens) and tokens[offset] in ("-i", "--ignore-environment", "--"):
+            offset += 1
+            while offset < len(tokens) and tokens[offset].startswith("-"):
+                option = tokens[offset]
                 offset += 1
+                if option == "--":
+                    break
+                if option in ("-u", "-C", "--unset", "--chdir"):
+                    offset += 1
+        elif wrapper == "exec":
+            offset += 1
+            while offset < len(tokens) and tokens[offset].startswith("-"):
+                option = tokens[offset]
+                offset += 1
+                if option == "--":
+                    break
+                if option == "-a":
+                    offset += 1
+        elif wrapper == "sudo":
+            offset += 1
+            while offset < len(tokens) and tokens[offset].startswith("-"):
+                option = tokens[offset]
+                offset += 1
+                if option == "--":
+                    break
+                if option in (
+                    "-u",
+                    "-g",
+                    "-C",
+                    "-D",
+                    "-h",
+                    "-p",
+                    "-r",
+                    "-t",
+                    "-U",
+                    "--user",
+                    "--group",
+                ):
+                    offset += 1
+        elif wrapper == "time":
+            offset += 1
+            while offset < len(tokens) and tokens[offset] in ("-p", "--"):
+                option = tokens[offset]
+                offset += 1
+                if option == "--":
+                    break
+        else:
+            break
         offset = _command_offset(tokens, offset)
     return offset
 
@@ -2169,19 +2345,37 @@ def _stdin_shell_offset(tokens: list[str]) -> int:
 def _reads_stdin_script(
     tokens: list[str], raw_tokens: list[str], offset: int, connected: bool
 ) -> bool:
-    if offset >= len(tokens) or _command_name(tokens[offset]) not in _HEREDOC_SHELLS:
+    if offset >= len(tokens):
+        return False
+    command = _command_name(tokens[offset])
+    if command in ("source", "."):
+        arguments = iter(zip(tokens[offset + 1 :], raw_tokens[offset + 1 :], strict=True))
+        first = next(arguments, None)
+        if first is not None and first[0] == "--":
+            first = next(arguments, None)
+        if first is None:
+            return False
+        operand, raw = first
+        return raw == "<(" or (connected and operand in _STDIN_SCRIPT_PATHS)
+    if command not in _HEREDOC_SHELLS:
         return False
     if _wrapped_command(tokens, raw_tokens, offset, writes_only=True) is not None:
         return False
-    arguments = iter(tokens[offset + 1 :])
-    for option in arguments:
+    arguments = iter(zip(tokens[offset + 1 :], raw_tokens[offset + 1 :], strict=True))
+    for option, raw in arguments:
         if option in ("--", "-"):
-            return connected and next(arguments, None) is None
+            following = next(arguments, None)
+            if following is None:
+                return connected
+            operand, operand_raw = following
+            return operand_raw == "<(" or (connected and operand in _STDIN_SCRIPT_PATHS)
+        if raw == "<(":
+            return True
         if not option.startswith(("-", "+")):
-            return False
-        if option in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            return connected and option in _STDIN_SCRIPT_PATHS
+        if _takes_shell_option_arg(option):
             next(arguments, None)
-        if re.fullmatch(r"-[a-z]*s[a-z]*", option):
+        if re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", option):
             return True
     return connected
 
@@ -2312,6 +2506,7 @@ def _shell_writes(
         raise ValueError("Shell wrapper nesting cannot be checked")
     windows = context.platform == "windows"
     windows_posix = windows_posix_executor and _windows_posix(context)
+    posix_stdin = (not windows and not powershell) or windows_posix
     command = command.replace("\\\n", "")
     tokens, raw_tokens = _write_tokens(
         command, windows=windows or powershell, windows_posix=windows_posix
@@ -2342,7 +2537,7 @@ def _shell_writes(
         tokens,
         raw_tokens,
         windows=windows,
-        windows_posix=windows_posix,
+        posix_stdin=posix_stdin,
         inherited_stdin=inherited_stdin,
     )
     paths: list[str] = []
@@ -2354,9 +2549,32 @@ def _shell_writes(
         if not segment and not redirects:
             continue
         read_only = read_only and not redirects and _reads_only(segment)
-        shell_offset = _stdin_shell_offset(segment) if windows_posix else len(segment)
+        shell_offset = _stdin_shell_offset(segment) if posix_stdin else len(segment)
         if _reads_stdin_script(segment, raws, shell_offset, stdin_connected):
             opaque_stdin = "Shell script from standard input cannot be bound"
+        if posix_stdin and stdin_connected:
+            for raw in raws:
+                if "$(" not in raw and "`" not in raw:
+                    continue
+                for body in _shell_scan(raw)[2]:
+                    try:
+                        nested = nested.merged(
+                            _shell_writes(
+                                body,
+                                context,
+                                depth + 1,
+                                powershell=powershell,
+                                untrusted=assigned,
+                                windows_posix_executor=windows_posix_executor,
+                                inherited_stdin=True,
+                            )
+                        )
+                    except _UnboundShellWrite:
+                        raise
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        if windows_posix:
+                            raise
+                        continue
         deleting = _delete_segment(segment)
         operands = (
             _write_operands(
