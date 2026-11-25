@@ -1557,8 +1557,10 @@ def windows_acp_permission_executor():
         ("read", {"AbsolutePath": "note.txt", "CommandLine": "omni --version"}),
         (None, {"AbsolutePath": "note.txt", "Path": "other.txt", "Content": "abc"}),
         ("edit", {"Path": "note.txt", "TargetFile": "other.txt", "Content": "abc"}),
+        ("edit", {"TargetFile": "note.txt", "Edits": [], "CommandLine": "omni --version"}),
+        ("edit", {"TargetFile": "note.txt", "Edits": [], "WaitMsBeforeAsync": 10000}),
     ],
-    ids=["execute", "edit", "read", "no-kind", "two-write-targets"],
+    ids=["execute", "edit", "read", "no-kind", "two-write-targets", "edit-command", "edit-wait"],
 )
 async def test_managed_agy_permission_rejects_mixed_shapes(
     kind, arguments, windows_acp_permission_executor
@@ -1643,6 +1645,40 @@ async def test_managed_agy_permission_applies_equal_tier_verdicts_to_write_path_
         assert policy_call.args[1]["name"] == "write_to_file"
         assert policy_call.args[1]["arguments"]["TargetFile"] == path
         ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["auto", "plan"])
+@pytest.mark.parametrize(
+    ("path", "protected"),
+    [(r"tmp\note.txt", False), (r"C:\Windows\System32\drivers\etc\hosts", True)],
+    ids=["workspace", "protected"],
+)
+async def test_managed_agy_permission_preserves_legacy_target_file_edit_verdict(
+    tier, path, protected, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor(tier)
+    arguments = {"TargetFile": path, "Edits": [{"Target": "before", "Replacement": "after"}]}
+    params = _pending_acp_permission(ex, arguments, "edit")
+    expected = (True, "once") if tier == "auto" and not protected else (False, None)
+    assert await ex._decide_permission(params) == expected
+    policy_call = ex._policy_evaluator.await_args
+    assert policy_call is not None
+    assert policy_call.args[1]["name"] == "write_to_file"
+    assert policy_call.args[1]["arguments"] == arguments
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["auto", "ask", "plan"])
+async def test_managed_agy_permission_rejects_empty_read_path_before_tier(
+    tier, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor(tier)
+    params = _pending_acp_permission(ex, {"AbsolutePath": ""}, "read")
+    assert await ex._decide_permission(params) == (False, None)
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

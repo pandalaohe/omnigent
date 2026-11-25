@@ -165,11 +165,12 @@ _AGY_ACP_COMMAND_FIELDS = {
 _AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
 _AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
 # toolSummary is display metadata shared by agy tools.
+_AGY_ACP_SHELL_FIELDS = (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"}) | {"Cwd"}
 _AGY_ACP_READ_CONFLICT_FIELDS = (
-    (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"})
+    _AGY_ACP_SHELL_FIELDS
     | _AGY_ACP_WRITE_TARGETS
     | _AGY_ACP_WRITE_FIELDS
-    | {"Cwd", "Edits", "Target", "Replacement"}
+    | {"Edits", "Target", "Replacement"}
 )
 
 # session/update.update.sessionUpdate discriminator values we map.
@@ -1492,11 +1493,7 @@ class AcpExecutor(Executor):
         write_targets = keys & _AGY_ACP_WRITE_TARGETS
         if len(write_targets) > 1:
             return None
-        if (
-            (kind == "edit" and "TargetFile" in keys)
-            or (write_targets and keys & _AGY_ACP_WRITE_FIELDS)
-            or keys >= _AGY_ACP_WRITE_FIELDS
-        ):
+        if write_targets and keys & _AGY_ACP_WRITE_FIELDS:
             target_field = "Path" if "Path" in keys else "TargetFile"
             target = arguments.get(target_field)
             if (
@@ -1508,8 +1505,13 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "write_to_file", {**arguments, "TargetFile": target}
-        if kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
-            return "view_file", arguments
+        if kind == "edit" and isinstance(arguments.get("TargetFile"), str):
+            if keys & _AGY_ACP_SHELL_FIELDS:
+                return None
+            return "write_to_file", arguments
+        path = arguments.get("AbsolutePath")
+        if kind == "read" and isinstance(path, str):
+            return ("view_file", arguments) if path else None
         return "unknown", arguments
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
