@@ -161,12 +161,13 @@ export function useAutoGrowTextarea(
   maxRows = 10,
   onGrowth?: (px: number) => void,
 ) {
-  // Read through a ref so an inline callback doesn't re-subscribe the
-  // observer below on every render. Declared first: effects run in order, so
-  // this is current before either measuring effect uses it.
+  // Keep callback and maxRows in refs so updates never re-subscribe the
+  // observer/listener effect below after later hooks on the same textarea.
   const onGrowthRef = useRef(onGrowth);
+  const maxRowsRef = useRef(maxRows);
   useLayoutEffect(() => {
     onGrowthRef.current = onGrowth;
+    maxRowsRef.current = maxRows;
   });
 
   const prevValueRef = useRef(value);
@@ -202,11 +203,13 @@ export function useAutoGrowTextarea(
     const observer =
       typeof ResizeObserver === "undefined"
         ? undefined
-        : new ResizeObserver(() => measureTextarea(ta, maxRows, onGrowthRef.current, true));
+        : new ResizeObserver(() =>
+            measureTextarea(ta, maxRowsRef.current, onGrowthRef.current, true),
+          );
     observer?.observe(ta);
     return () => {
       ta.removeEventListener("compositionend", onCompositionEnd);
       observer?.disconnect();
     };
-  }, [ref, maxRows]);
+  }, [ref]);
 }

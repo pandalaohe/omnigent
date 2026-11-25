@@ -1,6 +1,8 @@
-import { render } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { StrictMode, useRef } from "react";
+import { act, render } from "@testing-library/react";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { useComposerMirrorAlignment } from "@/components/composer/MentionTokenOverlay";
 import { assignLabels } from "@/lib/composerTokens";
 import { ComposerTokenBackdrop, hasTint } from "./ComposerTokenBackdrop";
 
@@ -116,5 +118,101 @@ describe("ComposerTokenBackdrop", () => {
     const node = renderBackdrop({ value: "hello" });
     expect(node.className).toContain("p-0");
     expect(node.className).not.toMatch(/\bpx-3\b|\bpt-3\b|\bpb-1\b/);
+  });
+
+  it("aligns on oscillating anchor reads without triggering a React update loop", () => {
+    const notifyResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        private notify: () => void;
+        constructor(callback: ResizeObserverCallback) {
+          this.notify = () => callback([], this as unknown as ResizeObserver);
+        }
+        observe() {
+          notifyResize.add(this.notify);
+        }
+        unobserve() {}
+        disconnect() {
+          notifyResize.delete(this.notify);
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const widths = [300, 340];
+    let reads = 0;
+    let top = 20;
+
+    function AlignedBackdrop({ value }: { value: string }) {
+      const overlayRef = useRef<HTMLDivElement>(null);
+      const textareaRef = useRef<HTMLTextAreaElement>(null);
+      useComposerMirrorAlignment(overlayRef, textareaRef, true);
+      const attachAnchor = (el: HTMLTextAreaElement | null) => {
+        textareaRef.current = el;
+        if (!el) return;
+        Object.defineProperties(el, {
+          offsetTop: { configurable: true, get: () => top },
+          offsetLeft: { configurable: true, value: 10 },
+          offsetHeight: { configurable: true, value: 60 },
+          offsetWidth: {
+            configurable: true,
+            get: () => widths[reads++ % widths.length],
+          },
+        });
+      };
+      // Mount backdrop before textarea, matching ChatComposer's DOM order.
+      return (
+        <>
+          <ComposerTokenBackdrop
+            ref={overlayRef}
+            value={value}
+            files={[]}
+            command={null}
+            activeIndex={null}
+          />
+          <textarea ref={attachAnchor} value={value} onChange={() => {}} />
+        </>
+      );
+    }
+
+    const { container, rerender } = render(
+      <StrictMode>
+        <AlignedBackdrop value="hello" />
+      </StrictMode>,
+    );
+    const node = container.querySelector(
+      '[data-testid="composer-highlight-overlay"]',
+    ) as HTMLElement;
+    expect(node.style.top).toBe("20px");
+    expect(node.style.left).toBe("10px");
+    expect(node.style.height).toBe("60px");
+    expect(["300px", "340px"]).toContain(node.style.width);
+
+    // Repeated rerenders and resize notifications with alternating widths must
+    // never loop or drop a synchronous position update.
+    expect(() => {
+      for (const value of ["a", "b", "c", "d", "e", "hello [file 1]"]) {
+        rerender(
+          <StrictMode>
+            <AlignedBackdrop value={value} />
+          </StrictMode>,
+        );
+      }
+    }).not.toThrow();
+    top = 48;
+    rerender(
+      <StrictMode>
+        <AlignedBackdrop value="moved [file 1]" />
+      </StrictMode>,
+    );
+    expect(node.style.top).toBe("48px");
+    expect(["300px", "340px"]).toContain(node.style.width);
+
+    const beforeResizeWidth = node.style.width;
+    act(() => notifyResize.forEach((notify) => notify()));
+    expect(node.style.width).toBe(beforeResizeWidth === "300px" ? "340px" : "300px");
   });
 });
