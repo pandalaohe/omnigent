@@ -82,6 +82,7 @@ import {
   preserveStreamModelDisplay,
   recordStreamLaunchedModel,
   recordStreamReportedModel,
+  recordStreamRequestedModel,
   streamModelDisplayRevisions,
   type StreamModelDisplayRevisions,
 } from "@/lib/modelReference";
@@ -4268,6 +4269,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The override belongs to the session that was PATCHed, so apply it there
       // even if the user has since switched away.
       setterFor(conversationId)({ sessionModelOverride: canonical });
+      recordStreamRequestedModel(conversationId, session.requested ?? null);
+      if (
+        streamModelDisplayRevisions(conversationId).launched === modelDisplayBeforeFetch.launched &&
+        session.launched !== undefined
+      ) {
+        recordStreamLaunchedModel(conversationId, session.launched ?? null);
+      }
       cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
       // Carry-over memory (K3): an accepted model change records the
       // session's canonical triple; a failed PATCH never reaches here.
@@ -4310,6 +4318,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         costControlModeOverride: session.costControlModeOverride ?? null,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
+      if (clearModel) {
+        recordStreamRequestedModel(conversationId, session.requested ?? null);
+      }
       cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
     } catch (err) {
       // Roll back so neither control claims a state the server never persisted.

@@ -102,18 +102,28 @@ function codexModelsEquivalent(
 }
 
 export interface StreamModelDisplayRevisions {
+  requested: number;
   reported: number;
   launched: number;
 }
 
+const streamRequestedModels = new Map<string, { revision: number; requested: string | null }>();
 const streamReportedModels = new Map<string, { revision: number; model: string }>();
 const streamLaunchedModels = new Map<string, { revision: number; launched: string | null }>();
 
 export function streamModelDisplayRevisions(conversationId: string): StreamModelDisplayRevisions {
   return {
+    requested: streamRequestedModels.get(conversationId)?.revision ?? 0,
     reported: streamReportedModels.get(conversationId)?.revision ?? 0,
     launched: streamLaunchedModels.get(conversationId)?.revision ?? 0,
   };
+}
+
+export function recordStreamRequestedModel(conversationId: string, requested: string | null): void {
+  streamRequestedModels.set(conversationId, {
+    revision: (streamRequestedModels.get(conversationId)?.revision ?? 0) + 1,
+    requested,
+  });
 }
 
 export function recordStreamReportedModel(conversationId: string, model: string): void {
@@ -131,16 +141,26 @@ export function recordStreamLaunchedModel(conversationId: string, launched: stri
 }
 
 export function clearStreamModelDisplay(conversationId: string): void {
+  streamRequestedModels.delete(conversationId);
   streamReportedModels.delete(conversationId);
   streamLaunchedModels.delete(conversationId);
 }
 
-/** Preserve newer confirmed live running/launched reports over an older in-flight snapshot. */
+/** Preserve newer confirmed live requested/running/launched updates over an older in-flight snapshot. */
 export function preserveStreamModelDisplay<
-  T extends { id: string; running?: string | null; launched?: string | null },
+  T extends {
+    id: string;
+    requested?: string | null;
+    running?: string | null;
+    launched?: string | null;
+  },
 >(session: T, before: StreamModelDisplayRevisions | undefined): T {
   if (before === undefined) return session;
   let next = session;
+  const latestRequested = streamRequestedModels.get(session.id);
+  if (latestRequested !== undefined && latestRequested.revision !== before.requested) {
+    next = { ...next, requested: latestRequested.requested };
+  }
   const latestReported = streamReportedModels.get(session.id);
   if (latestReported !== undefined && latestReported.revision !== before.reported) {
     next = { ...next, running: latestReported.model };

@@ -10529,6 +10529,9 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+_BACKGROUND_LAUNCHED_MODEL_TASKS: set[asyncio.Task[None]] = set()
+
+
 async def _record_launched_model(
     session_id: str,
     server_client: httpx.AsyncClient | None,
@@ -10563,6 +10566,38 @@ async def _record_launched_model(
             session_id,
             exc_info=True,
         )
+
+
+def _schedule_launched_model_record(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+    *,
+    current_launched: str | None = None,
+) -> asyncio.Task[None] | None:
+    """Schedule ``_record_launched_model`` off envelope terminal startup."""
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
+        return None
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return None
+    task = asyncio.create_task(
+        _record_launched_model(
+            session_id,
+            server_client,
+            model,
+            current_launched=current_launched,
+        ),
+        name=f"native-launched-model-{session_id}",
+    )
+    _BACKGROUND_LAUNCHED_MODEL_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_LAUNCHED_MODEL_TASKS.discard)
+    return task
 
 
 def _arg_value(args: Sequence[str], flag: str) -> str | None:
@@ -11607,12 +11642,22 @@ async def _auto_create_claude_terminal(
         await _clear_session_model_override(session_id, server_client)
     from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
 
-    await _record_launched_model(
-        session_id,
-        server_client,
-        launch_model,
-        current_launched=(launch_metadata.labels or {}).get(LAUNCHED_MODEL_LABEL),
-    )
+    effective_claude_model = _arg_value(launch_args, "--model") or launch_model
+    current_claude_launched = (launch_metadata.labels or {}).get(LAUNCHED_MODEL_LABEL)
+    if session_init is not None:
+        _schedule_launched_model_record(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
+    else:
+        await _record_launched_model(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
     if unserved_pick is not None:
         await _post_native_launch_notice(
             session_id=session_id,

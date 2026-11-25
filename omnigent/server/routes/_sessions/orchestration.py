@@ -10943,6 +10943,7 @@ async def _forward_event_to_runner(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         shell_forwarded = True
+        launched_model_seq = _next_launched_model_seq(session_id)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if annotation_pending:
@@ -11084,7 +11085,11 @@ async def _forward_event_to_runner(
 
     if shell_forwarded:
         _schedule_sdk_launched_model_record(
-            session_id, conv, effective_runner_override, conversation_store
+            session_id,
+            conv,
+            effective_runner_override,
+            conversation_store,
+            seq=launched_model_seq,
         )
 
     return persisted_items[0].id
@@ -11095,11 +11100,20 @@ _LAUNCHED_MODEL_LOCKS: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScoped
 _LAUNCHED_MODEL_TASKS: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
 
 
+def _next_launched_model_seq(session_id: str) -> int:
+    """Reserve the next monotonic dispatch sequence for *session_id*."""
+    seq = _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id, 0) + 1
+    _LAUNCHED_MODEL_DISPATCH_SEQ[session_id] = seq
+    return seq
+
+
 def _schedule_sdk_launched_model_record(
     session_id: str,
     conv: Conversation,
     model_override: str | None,
     conversation_store: ConversationStore,
+    *,
+    seq: int | None = None,
 ) -> asyncio.Task[None] | None:
     """Record the dispatched SDK/ACP launched model off the delivery ack path.
 
@@ -11108,8 +11122,7 @@ def _schedule_sdk_launched_model_record(
     ``input.consumed``, and an older delayed write cannot overwrite a newer
     dispatch's record.
     """
-    seq = _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id, 0) + 1
-    _LAUNCHED_MODEL_DISPATCH_SEQ[session_id] = seq
+    effective_seq = _next_launched_model_seq(session_id) if seq is None else seq
     dispatched_model = (
         model_override.strip()
         if isinstance(model_override, str) and model_override.strip()
@@ -11120,16 +11133,24 @@ def _schedule_sdk_launched_model_record(
         lock = _LAUNCHED_MODEL_LOCKS.setdefault(session_id, asyncio.Lock())
         try:
             async with lock:
-                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != seq:
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
                     return
                 if await asyncio.to_thread(_is_native_terminal_session, conv):
                     return
-                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != seq:
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
                     return
                 from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
                 from omnigent.server.schemas import SessionLaunchedModelEvent
 
-                current_launched = conv.labels.get(LAUNCHED_MODEL_LABEL)
+                live_conv = (
+                    await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    if callable(getattr(conversation_store, "get_conversation", None))
+                    else None
+                )
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                live_labels = live_conv.labels if live_conv is not None else conv.labels
+                current_launched = live_labels.get(LAUNCHED_MODEL_LABEL)
                 changed = False
                 if dispatched_model is not None and current_launched != dispatched_model:
                     set_labels = getattr(conversation_store, "set_labels", None)
@@ -11137,17 +11158,17 @@ def _schedule_sdk_launched_model_record(
                         await asyncio.to_thread(
                             set_labels, session_id, {LAUNCHED_MODEL_LABEL: dispatched_model}
                         )
-                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == seq:
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
                             conv.labels[LAUNCHED_MODEL_LABEL] = dispatched_model
                         changed = True
-                elif dispatched_model is None and LAUNCHED_MODEL_LABEL in conv.labels:
+                elif dispatched_model is None and LAUNCHED_MODEL_LABEL in live_labels:
                     delete_label = getattr(conversation_store, "delete_label", None)
                     if callable(delete_label):
                         await asyncio.to_thread(delete_label, session_id, LAUNCHED_MODEL_LABEL)
-                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == seq:
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
                             conv.labels.pop(LAUNCHED_MODEL_LABEL, None)
                         changed = True
-                if changed and _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == seq:
+                if changed and _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
                     session_stream.publish(
                         session_id,
                         SessionLaunchedModelEvent(
@@ -11167,7 +11188,7 @@ def _schedule_sdk_launched_model_record(
             if not lock.locked() and _LAUNCHED_MODEL_LOCKS.get(session_id) is lock:
                 _LAUNCHED_MODEL_LOCKS.pop(session_id, None)
 
-    task = asyncio.create_task(_write(), name=f"launched-model-{session_id}-{seq}")
+    task = asyncio.create_task(_write(), name=f"launched-model-{session_id}-{effective_seq}")
     _LAUNCHED_MODEL_TASKS.add(task)
     task.add_done_callback(_LAUNCHED_MODEL_TASKS.discard)
     return task

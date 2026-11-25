@@ -12444,6 +12444,89 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       await tick();
       expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
     });
+
+    it("guards fetchSessionHostId and preserves PATCH requested over an older in-flight GET", async () => {
+      const { fetchSessionHostId } = await import("@/lib/fetchSessionHostId");
+      const id = "conv_host_and_requested_freshness";
+      client.setQueryData(["session", id], {
+        id,
+        title: "Freshness",
+        agentId: "agent_1",
+        status: "idle",
+        createdAt: 100,
+        updatedAt: 200,
+        modelOverride: "model-a",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      });
+      useChatStore.setState({ conversationId: id, sessionModelOverride: "model-a" });
+
+      let releaseHostGet!: (response: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseHostGet = resolve;
+          });
+        }
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              title: "Freshness",
+              agent_id: "agent_1",
+              status: "idle",
+              created_at: 100,
+              updated_at: 205,
+              model_override: "model-c",
+              requested: "model-c",
+              launched: "model-a",
+              running: "model-b",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const hostFetch = fetchSessionHostId(id, { queryClient: client });
+      await tick();
+
+      // A confirmed live Running report AND an authoritative model PATCH arrive
+      // while the host-chain GET is still in flight.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: id,
+        model: "model-b",
+        reported: true,
+      });
+      await useChatStore.getState().setModel("model-c");
+
+      // Now the older host GET resolves with stale model-a fields.
+      releaseHostGet(
+        mockResponse({
+          id,
+          title: "Freshness",
+          agent_id: "agent_1",
+          status: "idle",
+          created_at: 100,
+          updated_at: 200,
+          host_id: "host_1",
+          model_override: "model-a",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          labels: {},
+        }),
+      );
+      await hostFetch;
+
+      const cached = client.getQueryData<Session>(["session", id]);
+      expect(cached?.running).toBe("model-b");
+      expect(cached?.requested).toBe("model-c");
+    });
   });
 
   describe("rotation failure notice", () => {

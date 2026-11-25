@@ -654,6 +654,79 @@ async def test_fenced_sdk_launched_model_write_prevents_stale_dispatch_from_over
     assert written[-1] == "model-b"
 
 
+@pytest.mark.asyncio
+async def test_sdk_launched_model_fence_reads_live_label_across_b_a_b_race(monkeypatch):
+    """P1 R3: B -> stalled A -> B (stale snapshot still says B) writes B and emits SSE."""
+    import asyncio
+    import threading
+    from unittest.mock import MagicMock
+
+    from omnigent.entities import Conversation
+    from omnigent.runtime import session_stream
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_is_native_terminal_session", lambda _c: False)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _sid, payload: published.append(dict(payload))
+    )
+
+    live_labels: dict[str, str] = {LAUNCHED_MODEL_LABEL: "model-b"}
+    release_a = threading.Event()
+    entered_a = threading.Event()
+
+    def _get_conv(sid: str) -> Conversation:
+        return Conversation(
+            id=sid,
+            created_at=100,
+            updated_at=200,
+            root_conversation_id=sid,
+            agent_id="ag_test",
+            labels=dict(live_labels),
+        )
+
+    def _set_labels(_sid: str, labels: dict[str, str]) -> None:
+        if labels.get(LAUNCHED_MODEL_LABEL) == "model-a":
+            entered_a.set()
+            release_a.wait(timeout=5.0)
+        live_labels.update(labels)
+
+    store = MagicMock()
+    store.get_conversation.side_effect = _get_conv
+    store.set_labels.side_effect = _set_labels
+
+    # Both snapshots start seeing B before A commits.
+    conv_a = _get_conv("conv_bab")
+    conv_b = _get_conv("conv_bab")
+
+    t1 = orchestration._schedule_sdk_launched_model_record("conv_bab", conv_a, "model-a", store)
+    assert t1 is not None
+    await asyncio.to_thread(entered_a.wait, 2.0)
+    t2 = orchestration._schedule_sdk_launched_model_record("conv_bab", conv_b, "model-b", store)
+    assert t2 is not None
+    release_a.set()
+    await asyncio.gather(t1, t2)
+
+    assert live_labels[LAUNCHED_MODEL_LABEL] == "model-b"
+    launched_events = [e for e in published if e.get("type") == "session.launched_model"]
+    assert len(launched_events) == 1
+    assert launched_events[0]["conversation_id"] == "conv_bab"
+    assert launched_events[0]["launched"] == "model-b"
+
+
+def test_replacement_session_labels_drops_launched_model():
+    """P2 R3: native session succession must not copy omnigent.launched_model."""
+    from omnigent.native._native_session_labels import replacement_session_labels
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    filtered = replacement_session_labels(
+        {LAUNCHED_MODEL_LABEL: "claude-opus-4-8", "user.tag": "keep"}
+    )
+    assert LAUNCHED_MODEL_LABEL not in filtered
+    assert filtered == {"user.tag": "keep"}
+
+
 def test_native_patch_confirmation_rejects_queued_pi_and_noop_clear():
     """P2: only harness-confirmed live model switches promote launched_model."""
     from omnigent.server.routes._sessions.helpers import _RunnerForwardResult

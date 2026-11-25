@@ -73,6 +73,7 @@ import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdow
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
+import { preserveStreamModelDisplay, streamModelDisplayRevisions } from "@/lib/modelReference";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import {
   serverSwitcherHiddenForSurface,
@@ -3437,9 +3438,13 @@ function ComposerImpl(
     configBusyRef.current = true;
     setConfigBusy(true);
     try {
+      const modelDisplayBeforeFetch = streamModelDisplayRevisions(composerSessionId);
       const updated = await updateSession(composerSessionId, { speedTier: speed });
       if (useChatStore.getState().conversationId === composerSessionId) {
-        chatQueryClient()?.setQueryData(["session", composerSessionId], updated);
+        chatQueryClient()?.setQueryData(
+          ["session", composerSessionId],
+          preserveStreamModelDisplay(updated, modelDisplayBeforeFetch),
+        );
       }
     } catch (error) {
       if (useChatStore.getState().conversationId === composerSessionId) {
@@ -3582,8 +3587,12 @@ function ComposerImpl(
     try {
       const store = useChatStore.getState();
       if (acpPermissionControl && sourceSessionId) {
+        const modelDisplayBeforeFetch = streamModelDisplayRevisions(sourceSessionId);
         const updated = await updateSession(sourceSessionId, { claudePermissionMode: mode });
-        chatQueryClient()?.setQueryData(["session", sourceSessionId], updated);
+        chatQueryClient()?.setQueryData(
+          ["session", sourceSessionId],
+          preserveStreamModelDisplay(updated, modelDisplayBeforeFetch),
+        );
         void chatQueryClient()?.invalidateQueries({ queryKey: ["session", sourceSessionId] });
         return updated.labels?.["omnigent.acp.session_mode"] === mode;
       } else if (
@@ -3591,11 +3600,15 @@ function ComposerImpl(
         sourceSessionId &&
         composerSession?.permissionTierRevision != null
       ) {
+        const modelDisplayBeforeFetch = streamModelDisplayRevisions(sourceSessionId);
         const updated = await updateSession(sourceSessionId, {
           permissionTier: mode,
           expectedPermissionTierRevision: composerSession.permissionTierRevision,
         });
-        chatQueryClient()?.setQueryData(["session", sourceSessionId], updated);
+        chatQueryClient()?.setQueryData(
+          ["session", sourceSessionId],
+          preserveStreamModelDisplay(updated, modelDisplayBeforeFetch),
+        );
       } else if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
       if (useChatStore.getState().conversationId !== sourceSessionId) return false;
