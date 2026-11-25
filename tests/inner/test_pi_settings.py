@@ -536,8 +536,21 @@ def test_inline_launch_refuses_unsupported_sdk(tmp_path):
         ordered_pi_launch("/opt/bin/standalone-pi", [], extension=tmp_path / "guard.js")
 
 
-@pytest.mark.parametrize("version", ["1.3.0", "1.5.0", "1.4.0", "1.5.1", "unknown"])
-def test_scoped_inline_launch_admits_only_reviewed_versions(tmp_path, monkeypatch, version):
+@pytest.mark.parametrize(
+    ("version", "allowed"),
+    [
+        ("1.3.0", True),
+        ("1.5.0", True),
+        ("1.6.0", True),
+        ("1.4.0", False),
+        ("1.5.1", False),
+        ("1.6.1", False),
+        ("unknown", False),
+    ],
+)
+def test_scoped_inline_launch_admits_only_reviewed_versions(
+    tmp_path, monkeypatch, version, allowed
+):
     from omnigent.inner import pi_settings
 
     dist = tmp_path / "sdk" / "dist"
@@ -555,7 +568,7 @@ def test_scoped_inline_launch_admits_only_reviewed_versions(tmp_path, monkeypatc
     (dist.parent / "package.json").write_text(json.dumps({"version": version}))
     monkeypatch.setattr(pi_settings, "pi_cli_argv", lambda _: [str(dist / "cli.js")])
     kwargs = {"extension": tmp_path / "guard.js", "scoped_handoff": tmp_path / "handoff"}
-    if version not in ("1.3.0", "1.5.0"):
+    if not allowed:
         with pytest.raises(pi_settings.PiSdkLoaderUnavailableError):
             pi_settings.ordered_pi_launch("pi", [], **kwargs)
     else:

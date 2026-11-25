@@ -660,8 +660,9 @@ async def test_real_rpc_launcher_rebinds_fresh_process_without_unlocking_startup
     if sdk is None or json.loads((sdk / "package.json").read_text()).get("version") not in (
         "1.3.0",
         "1.5.0",
+        "1.6.0",
     ):
-        pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
+        pytest.skip("a reviewed Pi SDK (1.3.0, 1.5.0, or 1.6.0) is required")
     runtime, broker, _relay, _source, _registry = attestor_relay
     permission = runtime.state("session-a")
     path = runtime.path("session-a")
@@ -1960,10 +1961,10 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         None,
     )
     version = json.loads((sdk / "package.json").read_text()).get("version") if sdk else None
-    if sdk is None or version not in ("1.3.0", "1.5.0"):
-        pytest.skip("a reviewed Pi SDK (1.3.0 or 1.5.0) is required")
-    if (mode.startswith("mcp-") or mode == "control-shape") and version != "1.5.0":
-        pytest.skip("Pi 1.5.0 built-in MCP is required")
+    if sdk is None or version not in ("1.3.0", "1.5.0", "1.6.0"):
+        pytest.skip("a reviewed Pi SDK (1.3.0, 1.5.0, or 1.6.0) is required")
+    if (mode.startswith("mcp-") or mode == "control-shape") and version == "1.3.0":
+        pytest.skip("Pi 1.5.0 or 1.6.0 built-in MCP is required")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(Path(__file__).with_name("pi_scoped_sdk_consumer.py")),
