@@ -27,11 +27,26 @@ CI_ENV_VARS = frozenset(
 
 def is_disabled_by_env(env: Mapping[str, str]) -> bool:
     """Check usage-telemetry opt-in and opt-outs without reading config or cached state."""
-    if env.get(ENABLE_TELEMETRY_ENV_VAR, "").strip().lower() not in ("1", "true", "yes"):
-        return True
+    return telemetry_override(env) != (True, ENABLE_TELEMETRY_ENV_VAR)
+
+
+def telemetry_override(
+    env: Mapping[str, str], *, disabled_by_config: bool = False
+) -> tuple[bool, str] | None:
+    """Return the deployment's locked value and source, if any."""
+    truthy = ("1", "true", "yes")
+    for name in (DISABLE_TELEMETRY_ENV_VAR, "DISABLE_TELEMETRY"):
+        if env.get(name, "").strip().lower() in truthy:
+            return False, name
+    if env.get("DO_NOT_TRACK", "").strip() == "1":
+        return False, "DO_NOT_TRACK"
     if env.get("OMNIGENT_ANALYTICS", "").strip() == "0":
-        return True
-    for name in ("DISABLE_TELEMETRY", DISABLE_TELEMETRY_ENV_VAR):
-        if env.get(name, "").strip().lower() in ("1", "true", "yes"):
-            return True
-    return env.get("DO_NOT_TRACK", "").strip() == "1" or any(name in env for name in CI_ENV_VARS)
+        return False, "OMNIGENT_ANALYTICS"
+    for name in sorted(CI_ENV_VARS):
+        if name in env:
+            return False, name
+    if disabled_by_config:
+        return False, "config.yaml"
+    if env.get(ENABLE_TELEMETRY_ENV_VAR, "").strip().lower() in truthy:
+        return True, ENABLE_TELEMETRY_ENV_VAR
+    return None

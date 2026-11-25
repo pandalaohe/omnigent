@@ -4944,7 +4944,7 @@ def server(
             else {}
         )
         key_config = global_cfg if resolve_config_path() is None else load_server_config()
-        for key in ("api_keys", "frame_ancestors"):
+        for key in ("api_keys", "frame_ancestors", "telemetry"):
             if key in key_config:
                 title_server_config[key] = key_config[key]
 
@@ -5052,13 +5052,6 @@ def server(
         global_instructions_store=global_instructions_store,
         caps=caps,
     )
-
-    # Initialize OpenTelemetry observability. No-op when
-    # OTEL_EXPORTER_OTLP_ENDPOINT is unset; see
-    # designs/OBSERVABILITY.md for the env var reference.
-    from omnigent.runtime import telemetry
-
-    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -5189,11 +5182,6 @@ def server(
 
     from omnigent.process_logging import configure_process_logging
 
-    server_log_path = configure_process_logging(
-        "server",
-        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
-    )
-
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -5229,6 +5217,11 @@ def server(
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
+    )
+    server_log_path = configure_process_logging(
+        "server",
+        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
+        debug_log_enabled=app.state.telemetry_enabled_at_start,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

@@ -26,6 +26,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as ContextUsageModule from "@/components/ContextUsageSettings";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
+import { interfaceText } from "@/lib/interfaceText";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import {
   useProjectFolderCollapse,
@@ -576,6 +577,13 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("opens Usage telemetry from the System settings route", () => {
+    renderPage("/settings/system");
+    expect(
+      screen.getByRole("heading", { name: interfaceText("settingsSystem") }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(interfaceText("usageTelemetry"), { exact: true })).toBeInTheDocument();
+  });
   it("mounts one custom-agent section even without the installed-agent flags", () => {
     renderPage("/settings/custom-agents");
     expect(screen.getAllByTestId("custom-agent-settings")).toHaveLength(1);

@@ -1247,6 +1247,25 @@ def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
             handler.close()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_server_logging_respects_telemetry_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    from unittest.mock import Mock
+
+    attach_debug = Mock()
+    attach_local_sse = Mock()
+    monkeypatch.setattr("omnigent.debug_logging.attach_debug_log_sink", attach_debug)
+    monkeypatch.setattr("omnigent.debug_logging.attach_sse_file_sink", attach_local_sse)
+    path = tmp_path / "server.log"
+    configure_process_logging(
+        "server", log_path=path, logger_names=(), root=False, debug_log_enabled=enabled
+    )
+    assert attach_debug.called is enabled
+    attach_local_sse.assert_called_once()
+    assert path.is_file()
+
+
 def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
     # cli_diagnostics sets our package loggers to propagate=False with their own
     # handlers, so records logged under them never reach root. The debug-log

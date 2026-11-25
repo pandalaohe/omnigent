@@ -362,7 +362,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # ── Stores ───────────────────────────────────────────────
 
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
@@ -397,8 +396,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
-
-    telemetry.init()
 
     agent_store = SqlAlchemyAgentStore(database_url)
     file_store = SqlAlchemyFileStore(database_url)

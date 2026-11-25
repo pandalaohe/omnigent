@@ -6,8 +6,8 @@
 // request, which the FastAPI-instrumented server extracts. The browser
 // exports spans over OTLP/HTTP to a collector.
 //
-// Opt-in by configuration, mirroring the server: tracing only activates when
-// `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is set (the base URL of an OTLP/HTTP
+// Tracing requires server consent and `VITE_OTEL_EXPORTER_OTLP_ENDPOINT`
+// (the base URL of an OTLP/HTTP
 // collector, e.g. `http://localhost:4318`). With no endpoint configured this
 // is a no-op — no provider, no patched fetch, zero overhead — so production
 // builds without a collector are unaffected.
@@ -24,14 +24,12 @@ import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 let initialized = false;
 
 /**
- * Initialize browser tracing if a collector endpoint is configured.
+ * Initialize browser tracing if a collector is configured and the server opted in.
  *
- * Idempotent and safe to call once at app startup (before any request is
- * made, so fetch/XHR are patched in time). No-op when
- * `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is unset.
+ * Idempotent. Call once the startup capability probe has resolved.
  */
-export function initBrowserTelemetry(): void {
-  if (initialized) return;
+export function initBrowserTelemetry(serverEnabled?: boolean): void {
+  if (serverEnabled !== true || initialized) return;
 
   const endpoint = import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
   if (!endpoint) return;

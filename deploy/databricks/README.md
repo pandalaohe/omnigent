@@ -295,12 +295,9 @@ uv run python deploy/databricks/deploy.py --skip-build --allow-dirty ...
 # API-only deploy (drops the SPA from the main wheel).
 uv run python deploy/databricks/deploy.py --skip-web-ui ...
 
-# No-OpenTelemetry deploy: runs `python app.py` instead of under
-# opentelemetry-instrument, drops OTEL_TRACES_SAMPLER, and drops the platform
-# telemetry_export_destinations. Use for workspaces with no OTel collector /
-# UC OTel tables -- otherwise every span export fails DEADLINE_EXCEEDED to
-# localhost:4317. Selects the `prod-no-otel` DAB target (same workspace/state
-# as `prod`).
+# Deploy without a platform OTel collector or UC OTel tables. This selects
+# the `prod-no-otel` target (same workspace and state as `prod`) and drops
+# OTEL_TRACES_SAMPLER and the platform telemetry_export_destinations.
 uv run python deploy/databricks/deploy.py --no-otel ...
 ```
 

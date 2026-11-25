@@ -86,6 +86,7 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  telemetry?: TelemetryStatus;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -350,6 +351,21 @@ export interface ServerInfo {
    * an older server, which means no restriction.
    */
   picker?: PickerCuration;
+}
+
+export interface TelemetryStatus {
+  enabled: boolean;
+  locked: boolean;
+  source: string;
+}
+
+export function parseTelemetryStatus(value: unknown): TelemetryStatus | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { enabled, locked, source } = value as Partial<TelemetryStatus>;
+  if (typeof enabled !== "boolean" || typeof locked !== "boolean" || typeof source !== "string") {
+    return undefined;
+  }
+  return { enabled, locked, source };
 }
 
 /** Keys of the ``attachment_limits`` payload the web understands. */
@@ -642,6 +658,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          telemetry: parseTelemetryStatus(data.telemetry),
           sibling_sessions: data.sibling_sessions === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,

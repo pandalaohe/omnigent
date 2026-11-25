@@ -176,6 +176,7 @@ import {
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
 import { authenticatedFetch, getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { UsageTelemetrySetting } from "./settings/UsageTelemetrySetting";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { usageBoardAvailable, taskBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
@@ -499,6 +500,11 @@ export function SettingsPage() {
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "system" && (
+        <Section title={interfaceText("settingsSystem")}>
+          <UsageTelemetrySetting />
+        </Section>
+      )}
       {section === "model-providers" && <ModelProvidersSection />}
       {section === "browser" && <BrowserSection />}
       {section === "agents" && <SettingsAgentsSection />}

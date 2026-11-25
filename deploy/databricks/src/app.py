@@ -165,7 +165,6 @@ try:
     import uvicorn
 
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
@@ -173,14 +172,6 @@ try:
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.server_config import load_server_config
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
-    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
-
-    # OTel: the Databricks Apps platform auto-injects
-    # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
-    # is set on the app — telemetry.init() picks that up and routes
-    # OTLP to the platform collector, which writes to the configured
-    # UC tables. No-op if neither OTEL nor MLflow env vars are set.
-    telemetry.init()
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.databricks_volumes import (
         DatabricksVolumesArtifactStore,
@@ -216,6 +207,7 @@ try:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"

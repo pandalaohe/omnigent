@@ -70,7 +70,9 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
@@ -359,7 +361,10 @@ class TelemetryClient:
     All errors are suppressed — telemetry must never disrupt the application.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, enabled: Callable[[], bool] | None = None) -> None:
+        self._enabled = enabled
+        self._revoked = False
+        self.config_skipped = False
         self._config: TelemetryConfig | None = None
         self._config_ready = threading.Event()
         self._queue: queue.Queue[_TelemetryRecord | None] = queue.Queue(maxsize=_MAX_QUEUE_SIZE)
@@ -386,7 +391,7 @@ class TelemetryClient:
         # Defense-in-depth: re-check opt-out inside the client so
         # a late env-var change is respected even if the call site
         # skipped the module-level is_disabled() guard.
-        if is_disabled():
+        if not self._may_send():
             return
         try:
             event_name = type(event).__name__
@@ -424,6 +429,19 @@ class TelemetryClient:
 
     # ── Internal helpers ─────────────────────────────────
 
+    def revoke(self) -> None:
+        """Discard this opt-in's queued records without waiting for the worker."""
+        self._revoked = True
+        self._stopped = True
+        if self._atexit_registered:
+            atexit.unregister(self._atexit_callback)
+            self._atexit_registered = False
+
+    def _may_send(self) -> bool:
+        if self._revoked:
+            return False
+        return self._enabled() if self._enabled is not None else not is_disabled()
+
     def _ensure_started(self) -> None:
         if self._started:
             return
@@ -453,6 +471,9 @@ class TelemetryClient:
     def _load_config(self) -> None:
         """Daemon thread: fetch remote config then signal the consumer."""
         try:
+            if self._enabled is not None and not self._may_send():
+                self.config_skipped = True
+                return
             cfg = _fetch_remote_config()
             if cfg is None:
                 # Kill-switch or fetch failure — stop the client.
@@ -552,6 +573,8 @@ class TelemetryClient:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            if self._enabled is not None and not self._may_send():
+                return
             with urllib.request.urlopen(req, timeout=3) as resp:
                 resp.read()
         except Exception:
@@ -564,9 +587,69 @@ _CLIENT: TelemetryClient | None = None
 _CLIENT_LOCK = threading.Lock()
 
 
+class ServerUsageTelemetry:
+    """One anonymous usage emitter per app, with a fresh queue on re-enabling."""
+
+    def __init__(self, enabled: Callable[[], bool]) -> None:
+        self._enabled = enabled
+        self._client: TelemetryClient | None = None
+        self._lock = threading.Lock()
+
+    def refresh(self) -> TelemetryClient | None:
+        with self._lock:
+            if not self._enabled():
+                self._revoke()
+                return None
+            if self._client is None or self._client.config_skipped:
+                self._revoke()
+                _prime_installation_id()
+                try:
+                    client = TelemetryClient(enabled=self._enabled)
+                    client._ensure_started()
+                    self._client = client
+                except Exception:
+                    _logger.debug("Server usage telemetry init failed", exc_info=True)
+            return self._client
+
+    def close(self) -> None:
+        with self._lock:
+            self._revoke()
+
+    def _revoke(self) -> None:
+        if self._client is not None:
+            self._client.revoke()
+            self._client = None
+
+    @contextmanager
+    def scope(self) -> Iterator[None]:
+        token = _server_usage_telemetry.set(self)
+        try:
+            yield
+        finally:
+            _server_usage_telemetry.reset(token)
+
+
+_server_usage_telemetry: ContextVar[ServerUsageTelemetry | None] = ContextVar(
+    "server_usage_telemetry", default=None
+)
+
+
 def get_client() -> TelemetryClient | None:
-    """Return the active singleton client, or ``None`` when disabled."""
+    """Return the active usage client, or ``None`` when disabled."""
+    server_telemetry = _server_usage_telemetry.get()
+    if server_telemetry is not None:
+        return server_telemetry.refresh()
     return _CLIENT
+
+
+def _prime_installation_id() -> None:
+    # Cache the installation ID before request handlers need it.
+    try:
+        from omnigent.telemetry.installation_id import get_installation_id
+
+        get_installation_id()
+    except Exception:
+        _logger.debug("Telemetry installation-id prime failed", exc_info=True)
 
 
 def init_client(*, config: Mapping[str, object] | None = None) -> None:
@@ -583,14 +666,7 @@ def init_client(*, config: Mapping[str, object] | None = None) -> None:
         return
     if config is not None and config.get("telemetry") is False:
         return
-    # Prime the installation-id cache on startup so later request
-    # handlers do not perform synchronous file I/O on the event loop.
-    try:
-        from omnigent.telemetry.installation_id import get_installation_id
-
-        get_installation_id()
-    except Exception:
-        _logger.debug("Telemetry installation-id prime failed", exc_info=True)
+    _prime_installation_id()
     with _CLIENT_LOCK:
         if _CLIENT is None:
             try:
@@ -611,9 +687,9 @@ def emit(event: object) -> None:
     :param event: A dataclass instance.
     """
     try:
-        if is_disabled():
+        if _server_usage_telemetry.get() is None and is_disabled():
             return
-        client = _CLIENT
+        client = get_client()
         if client is not None:
             client.emit(event)
     except Exception:

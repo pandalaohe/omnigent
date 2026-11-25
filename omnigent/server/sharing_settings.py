@@ -201,7 +201,8 @@ def _read_override_text(
         if raise_errors:
             raise
         return None
-    _cache[key] = (mtime, raw)
+    if use_cache:
+        _cache[key] = (mtime, raw)
     return raw
 
 
@@ -344,6 +345,21 @@ def read_default_public_sessions_override() -> DefaultPublicSessions | None:
 def write_default_public_sessions_override(policy: DefaultPublicSessions) -> None:
     """Persist the admin default-public-sessions override atomically."""
     _write_override_text(resolve_default_public_sessions_path(), policy.value)
+
+
+def read_telemetry_enabled_override() -> bool | None:
+    """Read the server setting fresh so a revoked opt-in cannot stay cached."""
+    try:
+        raw = _read_override_text(resolve_data_dir() / "telemetry_enabled", use_cache=False)
+    except UnicodeError:
+        return None
+    if raw in ("on", "off"):
+        return raw == "on"
+    return None
+
+
+def write_telemetry_enabled_override(enabled: bool) -> None:
+    _write_override_text(resolve_data_dir() / "telemetry_enabled", "on" if enabled else "off")
 
 
 def read_sibling_session_destinations_override() -> SiblingSessionDestinations | None:

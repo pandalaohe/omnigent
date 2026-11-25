@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
@@ -21,6 +21,102 @@ from fastapi import FastAPI
 from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_server_otel_exporters_use_the_boot_setting(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+) -> None:
+    from omnigent.runtime import telemetry
+    from omnigent.telemetry.environment import CI_ENV_VARS
+
+    for name in CI_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
+    (tmp_path / "telemetry_enabled").write_text("on\n" if enabled else "off\n")
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "1")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_capture_content", False)
+    monkeypatch.setattr(telemetry, "_server_opted_in", False)
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "test-server")
+    exporters = [Mock() for _ in range(3)]
+    for signal, exporter in zip(("traces", "metrics", "logs"), exporters, strict=True):
+        monkeypatch.setattr(telemetry, f"_init_otel_{signal}", exporter)
+    monkeypatch.setattr(telemetry, "_instrument_httpx", Mock())
+    monkeypatch.setattr(telemetry, "instrument_fastapi_app", Mock())
+
+    request.getfixturevalue("app")
+
+    assert [exporter.called for exporter in exporters] == [enabled] * 3
+    assert telemetry.instrument_fastapi_app.called is enabled
+
+
+async def test_usage_telemetry_switch_controls_live_fetch_and_events(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.telemetry import client as telemetry
+    from omnigent.telemetry.environment import CI_ENV_VARS
+    from omnigent.telemetry.events import SessionStoppedEvent
+
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
+    for name in CI_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    url = "https://collector.example.test/events"
+    config_fetched = threading.Event()
+    event_sent = threading.Event()
+    received = []
+
+    def fetch_config() -> telemetry.TelemetryConfig:
+        config_fetched.set()
+        return telemetry.TelemetryConfig(ingestion_url=url, disable_events=frozenset())
+
+    def send(request, *, timeout):
+        received.append(request.full_url)
+        event_sent.set()
+        return Mock(__enter__=Mock(return_value=Mock()), __exit__=Mock(return_value=False))
+
+    monkeypatch.setattr(telemetry, "_fetch_remote_config", fetch_config)
+    monkeypatch.setattr(telemetry, "_BATCH_SIZE", 1)
+    monkeypatch.setattr("urllib.request.urlopen", send)
+    event = SessionStoppedEvent("server-installation", "test-session", None)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+        assert (await client.get("/v1/info")).json()["telemetry"] == {
+            "enabled": False,
+            "locked": False,
+            "source": "default",
+        }
+        telemetry.emit(event)
+        assert not config_fetched.is_set()
+        changed = await client.put("/v1/system/telemetry", json={"telemetry_enabled": True})
+        assert changed.status_code == 200
+        assert changed.json() == {"enabled": True, "locked": False, "source": "setting"}
+        assert await asyncio.to_thread(config_fetched.wait, 2)
+        telemetry.emit(event)
+        assert await asyncio.to_thread(event_sent.wait, 2)
+        assert received == [url]
+
+        changed = await client.put("/v1/system/telemetry", json={"telemetry_enabled": False})
+        assert changed.json()["enabled"] is False
+        assert (await client.get("/v1/info")).json()["telemetry"]["enabled"] is False
+        with patch.dict("os.environ", {"OMNIGENT_ENABLE_TELEMETRY": "yes"}):
+            assert (await client.get("/v1/info")).json()["telemetry"] == {
+                "enabled": True,
+                "locked": True,
+                "source": "OMNIGENT_ENABLE_TELEMETRY",
+            }
+            denied = await client.put("/v1/system/telemetry", json={"telemetry_enabled": True})
+            assert denied.status_code == 409
+            with patch.dict("os.environ", {"DO_NOT_TRACK": "1"}):
+                assert (await client.get("/v1/info")).json()["telemetry"] == {
+                    "enabled": False,
+                    "locked": True,
+                    "source": "DO_NOT_TRACK",
+                }
 
 
 @pytest.mark.parametrize("usage_enabled", [True, False])
@@ -79,6 +175,7 @@ async def test_lifespan_usage_telemetry_uses_server_ci_environment(
     monkeypatch.setattr(telemetry, "_CLIENT", None)
     monkeypatch.setattr(telemetry, "_IS_DISABLED_CACHE", [None])
     client_factory = Mock()
+    client_factory.return_value.config_skipped = False
     monkeypatch.setattr(telemetry, "TelemetryClient", client_factory)
     installation_id = Mock(return_value="server-installation")
     monkeypatch.setattr("omnigent.telemetry.installation_id.get_installation_id", installation_id)
@@ -91,7 +188,7 @@ async def test_lifespan_usage_telemetry_uses_server_ci_environment(
             client_factory.assert_not_called()
             installation_id.assert_not_called()
         else:
-            client_factory.assert_called_once_with()
+            client_factory.assert_called_once()
             client_factory.return_value._ensure_started.assert_called_once_with()
             client_factory.return_value.emit.assert_called_once_with(event)
 

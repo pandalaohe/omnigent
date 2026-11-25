@@ -103,21 +103,25 @@ def should_capture_content() -> bool:
     return _capture_content
 
 
+_server_opted_in = False
+
+
 def telemetry_enabled() -> bool:
     """
     Return whether telemetry is enabled for this process.
 
-    Master opt-in controlled by ``OMNIGENT_TELEMETRY_ENABLED`` (off by
-    default). When it is unset/false, :func:`init` is a no-op and every
+    The server can opt in at startup. Other processes use
+    ``OMNIGENT_TELEMETRY_ENABLED`` (off by default). Without an opt-in,
+    :func:`init` is a no-op and every
     instrumentor and manual-span helper short-circuits — a default
     install installs no instrumentation, creates no spans, and emits no
     telemetry, so users who never opt in pay nothing. Read directly from
     the environment (not cached) so it is correct no matter the order in
     which instrumentation entry points run relative to :func:`init`.
 
-    :returns: ``True`` when ``OMNIGENT_TELEMETRY_ENABLED`` is truthy.
+    :returns: Whether this process has opted in.
     """
-    return _env_bool("OMNIGENT_TELEMETRY_ENABLED")
+    return _server_opted_in or _env_bool("OMNIGENT_TELEMETRY_ENABLED")
 
 
 def telemetry_guarded(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -1232,7 +1236,7 @@ def _init_otel_logs() -> None:
         _logs_initialized = True
 
 
-def init(service_name: str | None = None) -> None:
+def init(service_name: str | None = None, *, server_opted_in: bool = False) -> None:
     """
     Initialize OpenTelemetry tracing for the omnigent runtime.
 
@@ -1254,6 +1258,8 @@ def init(service_name: str | None = None) -> None:
         honored, otherwise it defaults to ``"omnigent"``. Deployment-
         level identity (environment, region) belongs in
         ``OTEL_RESOURCE_ATTRIBUTES``.
+    :param server_opted_in: Set only by server startup after resolving the
+        effective server setting.
 
     Two modes based on the environment:
 
@@ -1267,7 +1273,12 @@ def init(service_name: str | None = None) -> None:
       ``TracerProvider`` externally get spans automatically. The
       default OTel no-op provider discards spans silently.
     """
-    global _capture_content, _initialized
+    global _capture_content, _initialized, _server_opted_in
+
+    if server_opted_in:
+        # Keep the server setting in this process. Hosts and runners keep their
+        # own opt-in, even when the server launches them.
+        _server_opted_in = True
 
     if not telemetry_enabled():
         # Master opt-in off (the default): stay fully inert — no provider, no

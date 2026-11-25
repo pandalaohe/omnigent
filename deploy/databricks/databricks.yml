@@ -26,20 +26,18 @@ variables:
     default: ""
   # OTel plumbing is gated on these three complex variables so a workspace
   # without an OTel collector / UC OTel tables can deploy cleanly. deploy.py
-  # --no-otel selects the `prod-no-otel` target, which overrides them; the
-  # defaults below keep the tracer on exactly as before.
+  # --no-otel selects the `prod-no-otel` target, which overrides them.
   app_command:
     type: complex
     description: >
-      App entrypoint. Default runs under opentelemetry-instrument so the
-      Databricks Apps platform OTLP endpoint is auto-instrumented. --no-otel
-      overrides this with ["python", "app.py"] (no instrumentation).
-    default: ["opentelemetry-instrument", "python", "app.py"]
+      App entrypoint. The server checks the telemetry setting before
+      instrumenting the app and using the Databricks Apps platform endpoint.
+    default: ["python", "app.py"]
   app_env:
     type: complex
     description: >
-      The app's full env list. Default forces the OTel tracer on
-      (OTEL_TRACES_SAMPLER=always_on); --no-otel overrides with the same list
+      The app's full env list. The default sampler records all traces when
+      telemetry is enabled. --no-otel overrides with the same list
       minus the sampler, so no exporter is configured (otherwise spans export
       to localhost:4317 and fail DEADLINE_EXCEEDED when no collector present).
     default:
@@ -102,8 +100,8 @@ resources:
   root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
 
 targets:
-  # One target per workspace. deploy.py selects via --target. `prod` keeps the
-  # OTel tracer on; `prod-no-otel` (below) is the same workspace/state with the
+  # One target per workspace. deploy.py selects via --target. `prod` provides a
+  # collector; `prod-no-otel` (below) is the same workspace/state with the
   # OTel variables overridden off — deploy.py --no-otel selects it. To deploy
   # to a different workspace, edit the &prod_workspace anchor above.
   prod:
@@ -114,7 +112,7 @@ targets:
         omnigent:
           # Databricks Apps platform OTel export. The platform auto-injects
           # OTEL_EXPORTER_OTLP_ENDPOINT into the app container so any OTLP
-          # emitter (including telemetry.init() in src/app.py) routes to the
+          # emitter (including the server's OTel exporters) routes to the
           # configured UC tables. Gated on ${var.otel_export_destinations} so
           # --no-otel drops it (empty list). The export API rejects tables in
           # default storage, so this requires a workspace with a custom

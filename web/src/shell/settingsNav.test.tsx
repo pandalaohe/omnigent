@@ -94,7 +94,7 @@ describe("settingsNavGroups", () => {
       icon: SettingsIcon,
     });
     const ids = general?.items.map((item) => item.id) ?? [];
-    expect(ids).toEqual(["general", "appearance", "git", "shortcuts", "import"]);
+    expect(ids).toEqual(["general", "system", "appearance", "git", "shortcuts", "import"]);
     expect(
       settingsNavGroups(false, false, false, false, false, true)
         .find((group) => group.title === "Customize")

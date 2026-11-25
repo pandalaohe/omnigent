@@ -66,3 +66,27 @@ def test_config_opt_out_wins_over_the_opt_in(tmp_path: Path) -> None:
 
     with patch.dict("os.environ", env, clear=True):
         assert telemetry._compute_is_disabled() is True
+
+
+def test_server_config_override_locks_off_even_with_env_opt_in(tmp_path: Path) -> None:
+    from omnigent.server.telemetry_settings import TelemetrySettings
+
+    env = {ENABLE_TELEMETRY_ENV_VAR: "1", "OMNIGENT_CONFIG_HOME": str(tmp_path)}
+    with patch.dict("os.environ", env, clear=True):
+        assert TelemetrySettings({"telemetry": False}).status().model_dump() == {
+            "enabled": False,
+            "locked": True,
+            "source": "config.yaml",
+        }
+
+
+def test_revoked_server_consent_blocks_config_and_buffered_outbound_requests() -> None:
+    from omnigent.telemetry.events import SessionStoppedEvent
+
+    client = telemetry.TelemetryClient(enabled=lambda: False)
+    record = telemetry._build_record(SessionStoppedEvent("installation", "session", None))
+
+    with patch("urllib.request.urlopen") as urlopen:
+        client._load_config()
+        client._send([record], "https://collector.example.test/events")
+        urlopen.assert_not_called()

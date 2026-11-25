@@ -960,6 +960,7 @@ def configure_process_logging(
     root: bool = True,
     force: bool = False,
     debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
+    debug_log_enabled: bool = True,
 ) -> Path:
     """Configure Python logging for one process destination.
 
@@ -1026,13 +1027,13 @@ def configure_process_logging(
     # so it captures the same records this process writes to disk.
     from omnigent.debug_logging import attach_debug_log_sink, attach_sse_file_sink
 
-    sink_targets = _debug_sink_target_loggers(logger_names, root=root)
-    attach_debug_log_sink(
-        sink_targets,
-        source=destination,
-        level=resolved_level,
-        send=debug_log_send,
-    )
+    if debug_log_enabled:
+        attach_debug_log_sink(
+            _debug_sink_target_loggers(logger_names, root=root),
+            source=destination,
+            level=resolved_level,
+            send=debug_log_send,
+        )
     # Opt-in local SSE-event file sink (OMNIGENT_SSE_LOG_TO_FILE), independent of
     # the debug-log table above; a no-op when the env var is not truthy.
     attach_sse_file_sink(source=destination, level=resolved_level)
