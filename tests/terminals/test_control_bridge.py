@@ -906,7 +906,12 @@ async def test_seed_captures_cells_and_cursor_from_the_same_frame(
         await _capture_when(sock, target, lambda seed: b"\x1b[4;10H" in seed)
         monkeypatch.setattr(
             "omnigent.terminals.control_bridge.asyncio",
-            Mock(subprocess=asyncio.subprocess, create_subprocess_exec=advance_before_capture),
+            Mock(
+                subprocess=asyncio.subprocess,
+                wait_for=asyncio.wait_for,
+                CancelledError=asyncio.CancelledError,
+                create_subprocess_exec=advance_before_capture,
+            ),
         )
         seed = await _run_tmux_capture(str(sock), target)
         assert seed is not None
@@ -2333,5 +2338,461 @@ async def test_simultaneous_attaches_serialize_sizing_decision_through_registrat
         assert await _settled_window_width(sock, target) == 160
     finally:
         release_capture.set()
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_fail_open_browser_reclaims_window_size_after_native_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fail-open browser after a failed initial query still reclaims after native input."""
+    tmux = shutil.which("tmux")
+    assert tmux
+    sock, target = await _new_private_tmux("cat")
+    loop = asyncio.get_running_loop()
+    controller: int | None = None
+    local_terminal: subprocess.Popen[bytes] | None = None
+    browser = _LiveWebSocket(_resize_frame(160, 40))
+    tasks: list[asyncio.Task[None]] = []
+
+    real_spawn = asyncio.create_subprocess_exec
+    initial_query_failed = False
+
+    async def _fail_first_query(*args: Any, **kwargs: Any) -> object:
+        nonlocal initial_query_failed
+        if (
+            not initial_query_failed
+            and "list-clients" in args
+            and args[-2:] == ("-F", "#{client_flags}")
+        ):
+            initial_query_failed = True
+            return _FakeClientQuery(returncode=1)
+        return await real_spawn(*args, **kwargs)
+
+    def drain_terminal_output(fd: int) -> None:
+        try:
+            if os.read(fd, 65536):
+                return
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        loop.remove_reader(fd)
+
+    async def _browser_saw(needle: bytes) -> bool:
+        return needle in b"".join(browser.sent)
+
+    try:
+        controller, tty = pty.openpty()
+        try:
+            fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+            local_terminal = subprocess.Popen(
+                [tmux, "-S", str(sock), "attach", "-t", target],
+                stdin=tty,
+                stdout=tty,
+                stderr=tty,
+                start_new_session=True,
+                env={**os.environ, "TERM": "xterm-256color"},
+            )
+        finally:
+            os.close(tty)
+        os.set_blocking(controller, False)
+        loop.add_reader(controller, drain_terminal_output, controller)
+        await _wait_for(lambda: _window_width(sock, target), 70)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fail_first_query)
+        tasks.append(_start_bridge(browser, sock, target))
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        assert initial_query_failed
+
+        # Native input takes sizing back to 70 cols; genuine browser input must reclaim 160.
+        os.write(controller, b"native-takes\r")
+        await _wait_for(lambda: _browser_saw(b"native-takes"), True)
+        await _wait_for(lambda: _window_width(sock, target), 70)
+
+        browser.frames.put_nowait(_input_frame(b"browser-reclaims\r"))
+        await _wait_for(lambda: _browser_saw(b"browser-reclaims"), True)
+        assert await _settled_window_width(sock, target) == 160
+
+        # A second round confirms ongoing tracking after the first reclaim.
+        os.write(controller, b"native-again\r")
+        await _wait_for(lambda: _browser_saw(b"native-again"), True)
+        await _wait_for(lambda: _window_width(sock, target), 70)
+
+        browser.frames.put_nowait(_input_frame(b"browser-again\r"))
+        await _wait_for(lambda: _browser_saw(b"browser-again"), True)
+        assert await _settled_window_width(sock, target) == 160
+    finally:
+        if controller is not None:
+            loop.remove_reader(controller)
+            os.close(controller)
+        try:
+            if local_terminal is not None:
+                local_terminal.kill()
+                local_terminal.wait(timeout=5)
+        finally:
+            for task in tasks:
+                await _kill_and_join(sock, task)
+            await _kill_tmux(sock)
+
+
+class _HeldAttachProcess:
+    """Fake control-attach child that never emits ``%session-changed`` until stopped."""
+
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stdin = Mock()
+        self.stdin.is_closing = Mock(return_value=False)
+        self.stdin.write = Mock()
+        self.stdin.drain = AsyncMock()
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+        self.stdout.feed_eof()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.stdout.feed_eof()
+
+    async def wait(self) -> int:
+        self.waited = True
+        while self.returncode is None:
+            await asyncio.sleep(0)
+        return self.returncode
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_registration_timeout_cleans_up_unconfirmed_client_before_next_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attach whose registration times out is torn down before the lock is released."""
+    sock, target = await _new_private_tmux("cat")
+    first_ws = _LiveWebSocket(_resize_frame(160, 40))
+    second_ws = _LiveWebSocket(_resize_frame(45, 40))
+    tasks: list[asyncio.Task[None]] = []
+
+    real_spawn = asyncio.create_subprocess_exec
+    held_proc = _HeldAttachProcess()
+    first_spawned = asyncio.Event()
+    held_reaped_before_second_query: list[bool] = []
+    attach_calls = 0
+
+    async def _hold_first_attach(*args: Any, **kwargs: Any) -> object:
+        nonlocal attach_calls
+        if "-C" in args and "attach" in args:
+            attach_calls += 1
+            if attach_calls == 1:
+                first_spawned.set()
+                return held_proc
+        if (
+            "list-clients" in args
+            and args[-2:] == ("-F", "#{client_flags}")
+            and first_spawned.is_set()
+        ):
+            held_reaped_before_second_query.append(
+                (held_proc.terminated or held_proc.killed) and held_proc.waited
+            )
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _hold_first_attach)
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._ATTACH_REGISTRATION_TIMEOUT_S",
+        0.15,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.terminals.control_bridge._CLIENT_QUERY_TIMEOUT_S", 0.15)
+    try:
+        tasks.append(_start_bridge(first_ws, sock, target))
+        await asyncio.wait_for(first_spawned.wait(), timeout=5)
+        tasks.append(_start_bridge(second_ws, sock, target))
+
+        done, _ = await asyncio.wait({tasks[0]}, timeout=2)
+        assert tasks[0] in done, "unconfirmed attach stayed open past registration timeout"
+        await _wait_for(lambda: _window_width(sock, target), 45)
+        assert first_ws.close_code is not None
+        assert held_reaped_before_second_query == [True]
+        assert await _sizing_client_widths(sock, target) == [45]
+    finally:
+        if held_proc.returncode is None:
+            held_proc.kill()
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_handoff_during_attach_capture_keeps_new_client_passive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A takeover that happens while a third client captures keeps that third client passive."""
+    sock, target = await _new_private_tmux("cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    tablet = _LiveWebSocket(_resize_frame(80, 40))
+    tasks = [_start_bridge(desktop, sock, target)]
+
+    real_spawn = asyncio.create_subprocess_exec
+    phone_recheck_gated = asyncio.Event()
+    hold_phone_recheck = asyncio.Event()
+    tablet_in_capture = asyncio.Event()
+    release_tablet_capture = asyncio.Event()
+    tablet_attached_started = False
+
+    async def _gate_phone_recheck(*args: Any, **kwargs: Any) -> object:
+        if (
+            not tablet_attached_started
+            and "list-clients" in args
+            and args[-2:] == ("-F", "#{client_flags}")
+        ):
+            phone_recheck_gated.set()
+            await hold_phone_recheck.wait()
+        return await real_spawn(*args, **kwargs)
+
+    async def _gated_capture(socket_path: str, tmux_target: str) -> bytes | None:
+        tablet_in_capture.set()
+        await release_tablet_capture.wait()
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45, 160])
+
+        # Hold phone's departure recheck so tablet's initial query observes zero sizing clients.
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _gate_phone_recheck)
+        desktop.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(tasks[0], timeout=10)
+        await asyncio.wait_for(phone_recheck_gated.wait(), timeout=5)
+
+        tablet_attached_started = True
+        monkeypatch.setattr("omnigent.terminals.control_bridge._run_tmux_capture", _gated_capture)
+        tasks.append(_start_bridge(tablet, sock, target))
+        await asyncio.wait_for(tablet_in_capture.wait(), timeout=5)
+
+        # While tablet captures with a stale "no sizer" decision, phone types and takes over.
+        phone.frames.put_nowait(_input_frame(b"p"))
+        await _wait_for(lambda: _sizing_client_widths(sock, target), [45])
+        await _wait_for(lambda: _window_width(sock, target), 45)
+
+        release_tablet_capture.set()
+        hold_phone_recheck.set()
+        await _wait_for(lambda: _client_widths(sock), [45, 80])
+        assert await _sizing_client_widths(sock, target) == [45]
+        assert await _settled_window_width(sock, target) == 45
+    finally:
+        hold_phone_recheck.set()
+        release_tablet_capture.set()
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_stuck_capture_times_out_reaps_child_and_unblocks_next_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck capture times out and reaps its child without blocking other terminals."""
+    sock, target = await _new_private_tmux("cat")
+    await _tmux_output(sock, "new-session", "-d", "-s", "other", "cat")
+    first_main = _LiveWebSocket(_resize_frame(160, 40))
+    second_main = _LiveWebSocket(_resize_frame(45, 40))
+    other_ws = _LiveWebSocket(_resize_frame(100, 40))
+    tasks: list[asyncio.Task[None]] = []
+
+    real_spawn = asyncio.create_subprocess_exec
+
+    class _StuckCapture(_FakeClientQuery):
+        def __init__(self) -> None:
+            super().__init__(returncode=None)
+            self._stopped = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await self._stopped.wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            super().kill()
+            self._stopped.set()
+
+    stuck_capture = _StuckCapture()
+    capture_started = asyncio.Event()
+    stalled_once = False
+
+    async def _stall_first_main_capture(*args: Any, **kwargs: Any) -> object:
+        nonlocal stalled_once
+        if not stalled_once and "display-message" in args and target in args:
+            stalled_once = True
+            capture_started.set()
+            return stuck_capture
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _stall_first_main_capture)
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._CAPTURE_TIMEOUT_S",
+        0.15,
+        raising=False,
+    )
+    try:
+        tasks.append(_start_bridge(first_main, sock, target))
+        await asyncio.wait_for(capture_started.wait(), timeout=5)
+
+        # A distinct terminal on the same socket attaches without waiting on main's lock.
+        tasks.append(_start_bridge(other_ws, sock, "other"))
+        await _wait_for(lambda: _window_width(sock, "other"), 100)
+
+        # A second attach to main proceeds once the stuck capture times out and is reaped.
+        tasks.append(_start_bridge(second_main, sock, target))
+        async with asyncio.timeout(3):
+            while await _client_widths(sock) != [45, 100, 160]:
+                await asyncio.sleep(0.05)
+
+        assert (stuck_capture.killed, stuck_capture.waited) == (True, True)
+        assert await _sizing_client_widths(sock, target) == [160]
+        assert await _settled_window_width(sock, target) == 160
+    finally:
+        if stuck_capture.returncode is None:
+            stuck_capture.kill()
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_takeover_uses_registered_session_id_after_rename_with_prefix_collision() -> None:
+    """Takeover targets the registered session ID even after rename with prefix collision."""
+    tmux = shutil.which("tmux")
+    assert tmux
+    sock, target = await _new_private_tmux("cat")
+    await _tmux_output(sock, "new-session", "-d", "-s", f"{target}-work", "cat")
+    orig_sid = await _tmux_output(sock, "display-message", "-p", "-t", target, "#{session_id}")
+    orig_wid = await _tmux_output(sock, "display-message", "-p", "-t", target, "#{window_id}")
+
+    loop = asyncio.get_running_loop()
+    controller: int | None = None
+    local_terminal: subprocess.Popen[bytes] | None = None
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    tasks: list[asyncio.Task[None]] = []
+
+    def drain_terminal_output(fd: int) -> None:
+        try:
+            if os.read(fd, 65536):
+                return
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        loop.remove_reader(fd)
+
+    async def _browser_saw(ws: _LiveWebSocket, needle: bytes) -> bool:
+        return needle in b"".join(ws.sent)
+
+    try:
+        controller, tty = pty.openpty()
+        try:
+            fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+            local_terminal = subprocess.Popen(
+                [tmux, "-S", str(sock), "attach", "-t", target],
+                stdin=tty,
+                stdout=tty,
+                stderr=tty,
+                start_new_session=True,
+                env={**os.environ, "TERM": "xterm-256color"},
+            )
+        finally:
+            os.close(tty)
+        os.set_blocking(controller, False)
+        loop.add_reader(controller, drain_terminal_output, controller)
+        await _wait_for(lambda: _window_width(sock, orig_sid), 70)
+
+        native_client = await _tmux_output(
+            sock, "list-clients", "-t", orig_sid, "-F", "#{client_name}"
+        )
+        tasks.append(_start_bridge(desktop, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [70, 160])
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45, 70, 160])
+
+        # Rename the session so its original name now prefix-matches "<target>-work".
+        await _tmux_output(sock, "rename-session", "-t", orig_sid, "renamed")
+
+        os.write(controller, b"native-key\r")
+        await _wait_for(lambda: _browser_saw(desktop, b"native-key"), True)
+        assert await _settled_window_width(sock, orig_sid) == 70
+
+        desktop.frames.put_nowait(_input_frame(b"desktop-key\r"))
+        await _wait_for(lambda: _browser_saw(desktop, b"desktop-key"), True)
+        assert await _settled_window_width(sock, orig_sid) == 160
+
+        phone.frames.put_nowait(_input_frame(b"phone-key\r"))
+        await _wait_for(lambda: _browser_saw(phone, b"phone-key"), True)
+        assert await _settled_window_width(sock, orig_sid) == 45
+
+        # Every client stays on the original session and window; native keeps its flags.
+        all_clients = await _tmux_output(
+            sock,
+            "list-clients",
+            "-F",
+            "#{client_name} #{session_id} #{window_id} #{client_flags}",
+        )
+        rows = [line.split(" ", 3) for line in all_clients.splitlines()]
+        assert len(rows) == 3
+        assert all(sid == orig_sid and wid == orig_wid for _name, sid, wid, _flags in rows)
+        native_rows = [flags for name, _sid, _wid, flags in rows if name == native_client]
+        assert len(native_rows) == 1
+        assert "ignore-size" not in native_rows[0].split(",")
+        assert await _tmux_output(sock, "list-clients", "-t", f"{target}-work") == ""
+    finally:
+        if controller is not None:
+            loop.remove_reader(controller)
+            os.close(controller)
+        try:
+            if local_terminal is not None:
+                local_terminal.kill()
+                local_terminal.wait(timeout=5)
+        finally:
+            for task in tasks:
+                await _kill_and_join(sock, task)
+            await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_failed_takeover_preserves_prior_sizing_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed takeover command or switched client leaves the prior sizing owner intact."""
+    sock, target = await _new_private_tmux("cat")
+    await _tmux_output(sock, "new-session", "-d", "-s", "other", "cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    tasks = [_start_bridge(desktop, sock, target)]
+
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        # Force phone's recorded session ID to a nonexistent session so tmux replies %error.
+        monkeypatch.setattr(
+            "omnigent.terminals.control_bridge._session_changed_id",
+            lambda line: "$999" if line.startswith(b"%session-changed ") else None,
+            raising=False,
+        )
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45, 160])
+
+        phone.frames.put_nowait(_input_frame(b"x"))
+        assert await _settled_window_width(sock, target) == 160
+        assert await _sizing_client_widths(sock, target) == [160]
+    finally:
         for task in tasks:
             await _kill_and_join(sock, task)
