@@ -230,7 +230,7 @@ export function MembersPage() {
 
       {users !== null && users.length > 0 && (
         <div className="overflow-hidden rounded-md border border-border">
-          <table className="w-full text-ui">
+          <table className="w-full text-ui max-md:[&_td]:px-1.5 max-md:[&_th]:px-1.5">
             <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">Username</th>
@@ -243,7 +243,7 @@ export function MembersPage() {
               {users.map((u) => (
                 <tr key={u.id} className="border-t border-border">
                   <td className="px-3 py-2 align-middle">
-                    <span className="font-medium">{u.id}</span>
+                    <span className="font-medium wrap-anywhere">{u.id}</span>
                     {u.id === meId && (
                       <span className="ml-2 text-sm text-muted-foreground">(you)</span>
                     )}
@@ -256,7 +256,7 @@ export function MembersPage() {
                   <td className="px-3 py-2 align-middle">
                     {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
                   </td>
-                  <td className="px-3 py-2 align-middle text-muted-foreground">
+                  <td className="px-3 py-2 align-middle text-muted-foreground wrap-anywhere">
                     {formatEpoch(u.last_login_at)}
                   </td>
                   {manageable && (

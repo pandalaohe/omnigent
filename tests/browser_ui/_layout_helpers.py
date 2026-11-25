@@ -30,60 +30,86 @@ _PROBE = """async (scope, tolerance) => {
         || element.getAttribute('name') || element.localName;
     const items = [];
     const problems = [];
-    const remember = (element, description, {left, top, right, bottom}) => {
+    const contentOwner = element => element.closest(controls) || element.closest('label')?.control;
+    const remember = (element, {left, top, right, bottom}, {
+        description, owner, isControl = false, textRun = null,
+    }) => {
         if (right > left && bottom > top) {
             items.push({
                 description, anchor: indexes.get(element),
                 rect: {x: left, y: top, width: right - left, height: bottom - top},
-                overlay: Boolean(element.closest('[data-layout-overlay]')),
+                owner: indexes.get(owner) ?? null, is_control: isControl,
+                text_run: textRun,
+                hit_area: isControl && element.getAttribute('data-layout-overlay') === 'hit-area',
+                overlay: Boolean(
+                    element.closest('[data-layout-overlay]:not([data-layout-overlay="hit-area"])')
+                ),
             });
         }
     };
-    // A scroll container can reveal an entire line. A hidden/clip boundary
-    // cannot. Respect its client box, which excludes borders and scrollbars.
-    const textRect = (rect, element, description) => {
-        let {left, right, top, bottom} = rect;
-        for (let parent = element; scope.contains(parent); parent = parent.parentElement) {
-            const css = style(parent);
-            if (css.clipPath === 'inset(50%)' || /^rect\\(0px, 0px, 0px, 0px\\)$/.test(css.clip)) {
-                return;
-            }
-            if (css.display === 'inline' || css.display === 'contents') continue;
+    const clips = new Map();
+    const clipFor = element => {
+        if (clips.has(element)) return clips.get(element);
+        const css = style(element);
+        let clip = null;
+        if (css.clipPath === 'inset(50%)' || /^rect\\(0px, 0px, 0px, 0px\\)$/.test(css.clip)) {
+            clip = {hidden: true};
+        } else if (css.display !== 'inline' && css.display !== 'contents') {
             const clipX = /^(hidden|clip)$/.test(css.overflowX);
             const clipY = /^(hidden|clip)$/.test(css.overflowY);
             const scrollX = /^(auto|scroll)$/.test(css.overflowX)
-                && parent.scrollWidth > parent.clientWidth;
-            if (!clipX && !clipY && !scrollX) continue;
-            const bounds = parent.getBoundingClientRect();
-            const clientLeft = bounds.left + parent.clientLeft;
-            const clientTop = bounds.top + parent.clientTop;
-            const clientRight = clientLeft + parent.clientWidth;
-            const clientBottom = clientTop + parent.clientHeight;
-            const cutX = clipX
-                && (left < clientLeft - tolerance || right > clientRight + tolerance);
-            const cutY = clipY
-                && (top < clientTop - tolerance || bottom > clientBottom + tolerance);
-            if ((cutX || cutY) && !(cutX && !cutY && css.textOverflow.includes('ellipsis'))
-                && !(css.webkitLineClamp !== 'none' && +css.webkitLineClamp > 0)) {
+                && element.scrollWidth > element.clientWidth;
+            const scrollY = /^(auto|scroll)$/.test(css.overflowY)
+                && element.scrollHeight > element.clientHeight;
+            if (clipX || clipY || scrollX || scrollY) {
+                const bounds = element.getBoundingClientRect();
+                const left = bounds.left + element.clientLeft;
+                const top = bounds.top + element.clientTop;
+                clip = {
+                    clipX, clipY, scrollX, scrollY, left, top,
+                    right: left + element.clientWidth, bottom: top + element.clientHeight,
+                    ellipsis: css.textOverflow.includes('ellipsis'),
+                    lineClamp: +css.webkitLineClamp > 0,
+                };
+            }
+        }
+        clips.set(element, clip);
+        return clip;
+    };
+    // A scroll container can reveal an entire line. A hidden/clip boundary cannot.
+    const visibleRect = (rect, parent, description = null) => {
+        let {left, right, top, bottom} = rect;
+        for (; scope.contains(parent); parent = parent.parentElement) {
+            const clip = clipFor(parent);
+            if (!clip) continue;
+            if (clip.hidden) return;
+            const cutX = clip.clipX
+                && (left < clip.left - tolerance || right > clip.right + tolerance);
+            const cutY = clip.clipY
+                && (top < clip.top - tolerance || bottom > clip.bottom + tolerance);
+            if (description && (cutX || cutY) && !(cutX && !cutY && clip.ellipsis)
+                && !clip.lineClamp) {
                 problems.push({
-                    anchor: indexes.get(element),
+                    anchor: description.anchor,
                     description:
-                        `clipped: ${description} by ${parent.localName} "${name(parent)}"`,
+                        `clipped: ${description.text} by ${parent.localName} "${name(parent)}"`,
                 });
             }
-            if (clipX || scrollX) {
-                left = Math.max(left, clientLeft);
-                right = Math.min(right, clientRight);
+            if (clip.clipX || clip.scrollX) {
+                left = Math.max(left, clip.left);
+                right = Math.min(right, clip.right);
             }
-            if (clipY) {
-                top = Math.max(top, clientTop);
-                bottom = Math.min(bottom, clientBottom);
+            if (clip.clipY || clip.scrollY) {
+                top = Math.max(top, clip.top);
+                bottom = Math.min(bottom, clip.bottom);
             }
+            if (right <= left || bottom <= top) return;
         }
         return {left, right, top, bottom};
     };
     const range = document.createRange();
     const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+    let nextTextRun = 0;
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         const element = node.parentElement;
         const value = node.textContent.trim();
@@ -92,11 +118,15 @@ _PROBE = """async (scope, tolerance) => {
         }
         range.setStart(node, node.textContent.indexOf(value));
         range.setEnd(node, node.textContent.indexOf(value) + value.length);
-        const description = `text "${value.slice(0, 100)}"`;
+        const description = {anchor: indexes.get(element), text: `text "${value.slice(0, 100)}"`};
+        const owner = contentOwner(element);
+        const textRun = nextTextRun++;
         for (const rect of range.getClientRects()) {
             if (!rect.width || !rect.height) continue;
-            const painted = textRect(rect, element, description);
-            if (painted) remember(element, description, painted);
+            const painted = visibleRect(rect, element, description);
+            if (painted) {
+                remember(element, painted, {description: description.text, owner, textRun});
+            }
         }
     }
     for (const element of elements) {
@@ -107,7 +137,8 @@ _PROBE = """async (scope, tolerance) => {
         const description = isControl
             ? `${element.localName} "${name(element)}"`
             : `icon in "${name(owner)}"`;
-        remember(element, description, element.getBoundingClientRect());
+        const painted = visibleRect(element.getBoundingClientRect(), element.parentElement);
+        if (painted) remember(element, painted, {description, owner, isControl});
     }
     const overflow = scope.scrollWidth - scope.clientWidth;
     if (overflow > tolerance) {
@@ -128,8 +159,12 @@ _PROBE = """async (scope, tolerance) => {
 class _Item(TypedDict):
     anchor: int
     description: str
+    hit_area: bool
+    is_control: bool
+    owner: int | None
     overlay: bool
     rect: FloatRect
+    text_run: int | None
 
 
 class _Problem(TypedDict):
@@ -151,6 +186,16 @@ def _contains(outer: FloatRect, inner: FloatRect) -> bool:
     )
 
 
+def _contains_related_content(outer: _Item, inner: _Item) -> bool:
+    # Chromium can return both the original and ellipsized rect for one text
+    # node. A declared hit area likewise surrounds smaller, independent actions.
+    same_text = outer["text_run"] is not None and outer["text_run"] == inner["text_run"]
+    own_content = outer["is_control"] and inner["owner"] == outer["anchor"]
+    return (same_text or own_content or outer["hit_area"]) and _contains(
+        outer["rect"], inner["rect"]
+    )
+
+
 def assert_layout(scope: Locator, surface: str, output: Path) -> None:
     """Assert the contract and capture evidence at each distinct hit location."""
     expect(scope).to_be_visible()
@@ -168,8 +213,8 @@ def assert_layout(scope: Locator, surface: str, output: Path) -> None:
             if (
                 first["overlay"]
                 or second["overlay"]
-                or _contains(left, right)
-                or _contains(right, left)
+                or _contains_related_content(first, second)
+                or _contains_related_content(second, first)
             ):
                 continue
             overlap_x, overlap_y = intersection_size(left, right)

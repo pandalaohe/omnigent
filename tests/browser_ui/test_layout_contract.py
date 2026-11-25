@@ -14,27 +14,34 @@ from tests.browser_ui.test_sessions_appearance import appearance_features as app
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 _VIEWPORTS = [(1280, 800), (390, 844)]
+_LONG_MEMBER = "example-member-with-an-uncommonly-long-account-name-for-testing"
 _SETTINGS = {
-    "account": "Account",
-    "admin": "Admin settings",
-    "agents": "Agents",
-    "api-keys": "API keys",
-    "appearance": "Appearance",
-    "archived": "Archived sessions",
-    "browser": "Browser",
-    "cli": "Local CLI",
-    "general": "General",
-    "git": "Git",
-    "import": "Import sessions",
-    "instructions": "Startup prompts",
-    "integrations": "Sandbox Integrations",
-    "mcp": "MCP",
-    "members": "Members",
-    "model-providers": "Model providers",
-    "policies": "Global Policies",
-    "sharing": "Session sharing",
-    "shortcuts": "Keyboard shortcuts",
-    "updates": "Updates",
+    "account": ("Account", "Sign out"),
+    "admin": ("Admin settings", "Nested agent destinations"),
+    "agents": ("Agents", "No custom agents yet."),
+    "api-keys": ("API keys", "No API keys yet."),
+    "appearance": ("Appearance", "Interface typography"),
+    "archived": ("Archived sessions", "No archived sessions match."),
+    "browser": ("Browser", "Your recently visited pages will appear here."),
+    "cli": ("Local CLI", "CLI status is unavailable."),
+    "general": ("General", "Approvals & Questions"),
+    "git": ("Git", "Worktrees"),
+    "import": ("Import sessions", "Import from a machine"),
+    "instructions": ("Startup prompts", "Route total"),
+    "integrations": ("Sandbox Integrations", "Connect GitHub"),
+    "mcp": ("MCP", "No managed services are available for your account."),
+    "members": ("Members", "No members yet."),
+    "model-providers": (
+        "Model providers",
+        "No model providers yet. Add a provider to get started.",
+    ),
+    "policies": (
+        "Global Policies",
+        "No global policies configured. Add one to apply it to all sessions.",
+    ),
+    "sharing": ("Session sharing", "Sharing mode"),
+    "shortcuts": ("Keyboard shortcuts", "Show key bar on this page"),
+    "updates": ("Updates", "Update settings are unavailable."),
 }
 
 
@@ -79,6 +86,70 @@ def test_layout_probe_reports_geometry_and_respects_intentional_overlap(
     assert_layout(scope, "probe", Path(output_path))
 
 
+def test_layout_probe_detects_fully_overlapping_controls(page: Page, output_path: str) -> None:
+    page.set_content("""
+        <section id="fixture" style="display:grid;width:120px">
+          <button aria-label="First action" style="grid-area:1/1;height:40px">
+            <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="7"/></svg>
+          </button>
+          <button aria-label="Second action" style="grid-area:1/1;height:40px">
+            <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="7"/></svg>
+          </button>
+        </section>
+        """)
+    with pytest.raises(AssertionError) as outcome:
+        assert_layout(page.locator("#fixture"), "fully-overlapping-controls", Path(output_path))
+    assert 'button "First action" ↔ button "Second action"' in str(outcome.value)
+
+
+def test_layout_probe_uses_visible_control_area_in_horizontal_scroller(
+    page: Page, output_path: str
+) -> None:
+    page.set_content("""
+        <section id="fixture" style="display:flex;width:145px">
+          <div style="width:100px;flex:none;overflow-x:auto">
+            <button aria-label="Scrollable action"
+                    style="position:relative;width:130px;height:32px">
+              <svg width="16" height="16" aria-hidden="true"
+                   style="position:absolute;top:8px;right:3px">
+                <circle cx="8" cy="8" r="7"/>
+              </svg>
+            </button>
+          </div>
+          <button aria-label="Fixed action" style="width:45px;height:32px"></button>
+        </section>
+        """)
+    scope = page.locator("#fixture")
+    assert_layout(scope, "clipped-control", Path(output_path))
+
+    scope.get_by_role("button", name="Fixed action").evaluate(
+        "el => el.style.transform = 'translateX(-10px)'"
+    )
+    with pytest.raises(AssertionError) as outcome:
+        assert_layout(scope, "visible-control-overlap", Path(output_path))
+    assert 'button "Scrollable action" ↔ button "Fixed action"' in str(outcome.value)
+
+
+def test_layout_probe_checks_text_on_an_intentional_hit_area(page: Page, output_path: str) -> None:
+    page.set_content("""
+        <section id="fixture" style="position:relative;width:240px">
+          <button data-layout-overlay="hit-area"
+                  style="width:100%;height:38px;text-align:left;padding-left:10px">
+            Open a session
+          </button>
+          <button aria-label="More actions"
+                  style="position:absolute;top:4px;right:4px;width:32px;height:30px"></button>
+        </section>
+        """)
+    scope = page.locator("#fixture")
+    assert_layout(scope, "intentional-hit-area", Path(output_path))
+
+    scope.get_by_role("button", name="More actions").evaluate("el => el.style.left = '35px'")
+    with pytest.raises(AssertionError) as outcome:
+        assert_layout(scope, "covered-hit-area-label", Path(output_path))
+    assert 'button "More actions" ↔ text "Open a session"' in str(outcome.value)
+
+
 @pytest.mark.parametrize(("width", "height"), _VIEWPORTS)
 @pytest.mark.parametrize("section", _SETTINGS)
 def test_settings_layout(
@@ -105,7 +176,34 @@ def test_settings_layout(
     browser_contract.json(
         "/v1/me", {"user_id": "example", "is_admin": True, "email": "user@example.test"}
     )
-    browser_contract.json("/auth/users", {"users": []})
+    populated_members = section == "members" and width == 390
+    browser_contract.json(
+        "/auth/users",
+        {
+            "users": [
+                {
+                    "id": _LONG_MEMBER,
+                    "is_admin": False,
+                    "has_password": True,
+                    "created_at": 1_704_067_200,
+                    "last_login_at": 1_704_067_200,
+                }
+            ]
+            if populated_members
+            else []
+        },
+    )
+    if populated_members:
+        page.add_init_script("""
+            const fetchUsers = window.fetch.bind(window);
+            window.fetch = async (input, options) => {
+                const response = await fetchUsers(input, options);
+                if (new URL(response.url, location.href).pathname === '/auth/users') {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+                return response;
+            };
+            """)
     browser_contract.json(
         "/v1/me/api-keys", {"keys": [], "read_only": [], "available_scopes": ["usage"]}
     )
@@ -138,10 +236,17 @@ def test_settings_layout(
         )
     page.set_viewport_size({"width": width, "height": height})
     page.goto(f"{appearance_url}/settings/{section}")
-    heading = page.get_by_role("heading", name=_SETTINGS[section], exact=True).first
+    title, ready_text = _SETTINGS[section]
+    heading = page.get_by_role("heading", name=title, exact=True).first
     expect(heading).to_be_visible(timeout=5_000)
     main = page.get_by_role("main").filter(has=heading).last
+    marker = _LONG_MEMBER if populated_members else ready_text
+    expect(main.get_by_text(marker, exact=True)).to_be_visible(timeout=5_000)
     assert_layout(main, f"settings-{section}", Path(output_path))
+    if populated_members:
+        expect(main.get_by_role("button", name="Remove user")).to_be_in_viewport(
+            ratio=1, timeout=2_000
+        )
 
 
 @pytest.mark.parametrize(("width", "height"), _VIEWPORTS)
