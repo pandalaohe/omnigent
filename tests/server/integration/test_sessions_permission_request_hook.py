@@ -4370,9 +4370,11 @@ async def test_codex_failed_stop_falls_back_to_native(
     assert late.status_code == 202, late.text
 
 
+@pytest.mark.parametrize("legacy_marker", [True, False], ids=["legacy", "upstream"])
 async def test_codex_async_question_ignores_the_timeout_setting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_marker: bool,
 ) -> None:
     """
     S13: async questions keep the 86400 s budget and never stop.
@@ -4384,12 +4386,16 @@ async def test_codex_async_question_ignores_the_timeout_setting(
     agent = await create_test_agent(client, "test-codex-async-unchanged")
     session_id = await _create_session(client, agent["id"])
 
+    payload = _codex_async_question_payload()
+    if not legacy_marker:
+        del payload["params"]["omnigentAsyncQuestion"]
+        payload["params"]["isBlocking"] = False
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
     hook_task = asyncio.create_task(
         client.post(
             f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-            json=_codex_async_question_payload(),
+            json=payload,
         )
     )
     event = await drain_task

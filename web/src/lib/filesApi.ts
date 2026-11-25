@@ -5,7 +5,9 @@ import {
   authenticatedFetch,
   authenticatedRequestHeaders,
   handleUnauthorizedResponse,
+  isWrongReplicaResponse,
 } from "./identity";
+import { SLICE_KEY_HEADER } from "./routingKey";
 import { apiErrorFromResponse } from "./sessionsApi";
 
 export interface UploadedFile {
@@ -53,8 +55,9 @@ function uploadedFileFromResource(
  * {@link authenticatedRequestHeaders}. When an embed host owns transport
  * (`hasOmnigentHostFetcher`) or the server is a Databricks workspace, the
  * upload goes through {@link authenticatedFetch} instead: that path owns the
- * slice-key routing, the wrong-replica retry and the 401 redirect, and the
- * XHR path cannot reproduce them. Progress is only reportable on the XHR
+ * host routing and 401 redirects through the embedded transport. Standalone
+ * sharded uploads retry a wrong-replica response on the default replica.
+ * Progress is only reportable on the XHR
  * path, so `onProgress` reports zero known bytes and an unknown total on the
  * fetch path.
  *
@@ -89,8 +92,29 @@ export async function uploadFile(
   }
 
   const headers = await authenticatedRequestHeaders(path);
+  let response = await uploadWithProgress(path, form, headers, onProgress, signal);
+  if (headers.has(SLICE_KEY_HEADER) && (await isWrongReplicaResponse(response))) {
+    const keylessHeaders = new Headers(headers);
+    keylessHeaders.delete(SLICE_KEY_HEADER);
+    response = await uploadWithProgress(path, form, keylessHeaders, onProgress, signal);
+  }
+  if (!response.ok) {
+    handleUnauthorizedResponse(path, response);
+    throw await apiErrorFromResponse(response);
+  }
+  const resource = (await response.json()) as UploadResourcePayload;
+  return uploadedFileFromResource(resource, file, filename);
+}
+
+function uploadWithProgress(
+  path: string,
+  form: FormData,
+  headers: Headers,
+  onProgress?: (progress: FileUploadProgress) => void,
+  signal?: AbortSignal,
+): Promise<Response> {
   signal?.throwIfAborted();
-  return new Promise<UploadedFile>((resolve, reject) => {
+  return new Promise<Response>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const abortFromSignal = () => {
       reject(signal?.reason);
@@ -111,25 +135,16 @@ export async function uploadFile(
     };
     xhr.onload = () => {
       settle();
-      const response = new Response(xhr.responseText, {
-        status: xhr.status,
-        statusText: xhr.statusText,
-      });
-      if (xhr.status < 200 || xhr.status >= 300) {
-        // Reuse authenticatedFetch's 401 handling so a standalone session
-        // expiry redirects exactly as every other API call would.
-        handleUnauthorizedResponse(path, response);
-        void apiErrorFromResponse(response).then(reject, reject);
-        return;
-      }
-      let resource: UploadResourcePayload;
       try {
-        resource = JSON.parse(xhr.responseText) as UploadResourcePayload;
+        resolve(
+          new Response(xhr.responseText, {
+            status: xhr.status,
+            statusText: xhr.statusText,
+          }),
+        );
       } catch (error) {
         reject(error);
-        return;
       }
-      resolve(uploadedFileFromResource(resource, file, filename));
     };
     xhr.onerror = () => {
       settle();

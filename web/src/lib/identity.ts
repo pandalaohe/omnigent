@@ -712,7 +712,7 @@ export function getCurrentAuthorId(): string | null {
  * @param res The response to inspect.
  * @returns `true` when the JSON body carries `error.code === "wrong_replica"`.
  */
-async function _isWrongReplica(res: Response): Promise<boolean> {
+export async function isWrongReplicaResponse(res: Response): Promise<boolean> {
   if (res.status !== 400) return false;
   try {
     const body = (await res.clone().json()) as { error?: { code?: string } };
@@ -868,7 +868,7 @@ export async function authenticatedFetch(
   // the host registered under, so we can't know up front — try keyed, then fall
   // back). Only when WE stamped the key; a genuinely-offline runner returns
   // runner_unavailable and is not re-addressed here.
-  if (isDatabricksWorkspace() && stampedSliceKey && (await _isWrongReplica(res))) {
+  if (isDatabricksWorkspace() && stampedSliceKey && (await isWrongReplicaResponse(res))) {
     // A retry after a Server switch would reach the new Server with the old
     // request, so it is skipped.
     if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
@@ -896,7 +896,7 @@ export async function authenticatedFetch(
     derivedHostId === null &&
     !callerKeyed &&
     isDatabricksWorkspace() &&
-    (await _isWrongReplica(res))
+    (await isWrongReplicaResponse(res))
   ) {
     // A retry after a Server switch would reach the new Server with the old
     // request, so it is skipped.
@@ -922,7 +922,7 @@ export async function authenticatedFetch(
         res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
       }
     }
-    if (await _isWrongReplica(res)) {
+    if (await isWrongReplicaResponse(res)) {
       if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
@@ -934,7 +934,7 @@ export async function authenticatedFetch(
       if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
       if (hostId !== null && res.ok) {
         markHostKeyless(hostId);
-      } else if (hostId !== null && demoted && (await _isWrongReplica(res))) {
+      } else if (hostId !== null && demoted && (await isWrongReplicaResponse(res))) {
         if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
         // The default replica missed too, so the demotion is stale: try the host's key.
         clearHostKeyless(hostId);
@@ -948,7 +948,7 @@ export async function authenticatedFetch(
     derivedHostId &&
     unkeyed &&
     isHostKeyless(derivedHostId) &&
-    (await _isWrongReplica(res))
+    (await isWrongReplicaResponse(res))
   ) {
     if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
     // We sent this keyless BECAUSE the host was demoted, yet it still came back

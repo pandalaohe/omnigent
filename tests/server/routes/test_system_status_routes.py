@@ -23,6 +23,7 @@ from omnigent.host.frames import (
     ResourceMachine,
     ResourceProcessRow,
 )
+from omnigent.server.auth import AdminViewMiddleware
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.system_status import create_system_status_router
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
@@ -78,6 +79,7 @@ def _build(
 ) -> tuple[TestClient, SystemStatusHub]:
     hub = SystemStatusHub(tmp_path, None)
     app = FastAPI()
+    app.add_middleware(AdminViewMiddleware)
 
     @app.middleware("http")
     async def _workspace(request: Request, call_next):
@@ -285,6 +287,16 @@ def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
         json={"cpu_pct": 70},
     )
     assert forbidden_put.status_code == 403
+
+    admin_off = {
+        "X-Test-User": "admin@example.com",
+        "Cookie": "omnigent_admin_view=off",
+    }
+    assert client.get("/v1/system/settings", headers=admin_off).status_code == 403
+    assert (
+        client.put("/v1/system/settings", headers=admin_off, json={"cpu_pct": 70}).status_code
+        == 403
+    )
 
     admin = client.get("/v1/system/settings", headers={"X-Test-User": "admin@example.com"})
     assert admin.status_code == 200

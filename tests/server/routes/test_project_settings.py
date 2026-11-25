@@ -56,7 +56,13 @@ def settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
 @pytest.fixture()
 def shared_settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     app = _build_app(
-        db_uri, tmp_path, auth=True, preferences=True, catalogs=True, permissions=True
+        db_uri,
+        tmp_path,
+        auth=True,
+        local_single_user=False,
+        preferences=True,
+        catalogs=True,
+        permissions=True,
     )
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_A, "Owner host", ALICE)
@@ -651,6 +657,15 @@ async def test_owner_admin_and_foreign_user_are_scoped_to_project_owner(
         assert (await client.get(url, headers=_as_user(BOB))).status_code == 404
         owner = await client.get(url, headers=_as_user(ALICE))
         assert owner.status_code == 200, owner.text
+        admin_off = {**_as_user("admin@example.com"), "Cookie": "omnigent_admin_view=off"}
+        assert (await client.get(url, headers=admin_off)).status_code == 404
+        assert (
+            await client.put(
+                url, headers=admin_off, json={"expected_revision": owner.json()["revision"]}
+            )
+        ).status_code == 404
+        owner_off = {**_as_user(ALICE), "Cookie": "omnigent_admin_view=off"}
+        assert (await client.get(url, headers=owner_off)).status_code == 200
         admin = await client.get(url, headers=_as_user("admin@example.com"))
         assert admin.status_code == 200, admin.text
         assert admin.json()["owner_user_id"] == ALICE

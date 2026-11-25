@@ -34,7 +34,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_NEEDS_AUTH, reported_harness_availability
 from omnigent.harness_capabilities import IntegrationMode
 from omnigent.harness_plugins import capability_for_harness
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, effective_admin
 from omnigent.server.model_resolution import ResolutionContext, read_provider_groups
 from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.project_placement import default_host, host_roots
@@ -286,7 +286,7 @@ def create_project_settings_router(
 
     async def snapshot(request: Request, project_id: str) -> tuple[Any, list[Any], str]:
         caller = require_user(request, auth_provider)
-        admin = bool(
+        admin = effective_admin(
             caller is not None
             and permission_store is not None
             and await asyncio.to_thread(permission_store.is_admin, caller)
@@ -777,7 +777,7 @@ def create_project_settings_router(
             binding_store.update_settings,
             project_id,
             caller_id=require_user(request, auth_provider),
-            is_admin=bool(
+            is_admin=effective_admin(
                 project.user_id != require_user(request, auth_provider)
                 and permission_store is not None
                 and await asyncio.to_thread(

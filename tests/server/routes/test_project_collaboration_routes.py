@@ -104,6 +104,7 @@ def _build_app(
     *,
     enabled: bool = True,
     auth: bool = False,
+    local_single_user: bool | None = None,
     preferences: bool = False,
     catalogs: bool = False,
     permissions: bool = False,
@@ -127,7 +128,11 @@ def _build_app(
         project_store=SqlAlchemyProjectStore(db_uri),
         project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
         project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header") if auth else None,
+        auth_provider=(
+            UnifiedAuthProvider(source="header", local_single_user=local_single_user)
+            if auth
+            else None
+        ),
         permission_store=SqlAlchemyPermissionStore(db_uri) if permissions else None,
         feature_flags=flags,
         user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri) if preferences else None,

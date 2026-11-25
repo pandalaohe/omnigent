@@ -75,8 +75,15 @@ class _AsyncQuestionOmnigentClient:
         self.hold_message_once = hold_message_once
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.hook_bodies: list[dict[str, Any]] = []
+        self.server_info = httpx.Response(
+            200, json={"codex_nonblocking_decline": True}, request=httpx.Request("GET", "/v1/info")
+        )
         self._hooks_released = asyncio.Event()
         self._messages_released = asyncio.Event()
+
+    async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        assert url == "/v1/info"
+        return self.server_info
 
     async def post(
         self,
@@ -379,6 +386,25 @@ async def _settle_async_question_wait(
     assert question.wait_task is not None, "async question has no active wait"
     await asyncio.wait_for(question.wait_task, timeout=2.0)
     await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("status_code", [200, 503], ids=["older-server", "unavailable"])
+def test_async_question_stays_in_terminal_if_card_support_is_unknown(
+    tmp_path: Path, status_code: int
+) -> None:
+    async def run() -> None:
+        client = _AsyncQuestionOmnigentClient()
+        client.server_info = httpx.Response(
+            status_code, json={}, request=httpx.Request("GET", "/v1/info")
+        )
+        state = _async_question_state()
+        await _drive_async_question(client, state, tmp_path, _async_question_item())
+        assert client.conversation_items("message")
+        assert client.conversation_items("function_call") == []
+        assert client.hook_bodies == []
+        await state.async_question_tracker.close()
+
+    asyncio.run(run())
 
 
 def test_async_question_posts_one_card_per_question(tmp_path: Path) -> None:

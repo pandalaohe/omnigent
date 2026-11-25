@@ -20,7 +20,7 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server._runner_ws_tunnel import _TunneledWSConn
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, effective_admin
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.host_terminals import HostTerminalService
 from omnigent.server.routes._auth_helpers import require_user
@@ -113,8 +113,8 @@ def create_host_terminals_router(
     async def create(request: Request, body: HostTerminalCreate) -> HostTerminalResource:
         host, conn = await authorize(request)
         if body.elevated:
-            if permission_store is not None and not await asyncio.to_thread(
-                permission_store.is_admin, host.user_id
+            if permission_store is not None and not effective_admin(
+                await asyncio.to_thread(permission_store.is_admin, host.user_id)
             ):
                 raise TerminalAccessDenied("admin_not_allowed", "admin access required")
             if "terminal_elevated_v1" not in conn.hello.capabilities:

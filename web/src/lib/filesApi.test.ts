@@ -5,7 +5,8 @@ vi.mock("./host", () => ({
   isDatabricksWorkspace: vi.fn(() => false),
 }));
 
-vi.mock("./identity", () => ({
+vi.mock(import("./identity"), async (importOriginal) => ({
+  ...(await importOriginal()),
   authenticatedFetch: vi.fn(),
   authenticatedRequestHeaders: vi.fn(),
   handleUnauthorizedResponse: vi.fn(),
@@ -18,6 +19,7 @@ import {
   handleUnauthorizedResponse,
 } from "./identity";
 import { uploadFile } from "./filesApi";
+import { SLICE_KEY_HEADER } from "./routingKey";
 
 /** Minimal XHR the upload path drives, so tests can script status + progress. */
 class FakeXHR {
@@ -132,6 +134,25 @@ describe("uploadFile", () => {
     );
     const uploaded = await promise;
     expect(uploaded.filename).toBe("stored.png");
+  });
+
+  it("reuses the upload on the default replica once when host routing misses", async () => {
+    vi.mocked(authenticatedRequestHeaders).mockResolvedValue(
+      new Headers({ [SLICE_KEY_HEADER]: "host-key", "X-Forwarded-Email": "user@example.com" }),
+    );
+    const promise = uploadFile("s1", new File(["bytes"], "document.txt"));
+    const first = await nextXhr();
+    expect(first.requestHeaders[SLICE_KEY_HEADER.toLowerCase()]).toBe("host-key");
+    first.respond(400, JSON.stringify({ error: { code: "wrong_replica" } }));
+
+    await vi.waitFor(() => expect(FakeXHR.instances).toHaveLength(2));
+    const retry = FakeXHR.instances[1];
+    expect(retry.requestHeaders).toEqual({ "x-forwarded-email": "user@example.com" });
+    expect(retry.sentBody).toBe(first.sentBody);
+    retry.respond(201, JSON.stringify({ id: "file_1" }));
+
+    await expect(promise).resolves.toMatchObject({ id: "file_1" });
+    expect(FakeXHR.instances).toHaveLength(2);
   });
 
   it("reports the upload fraction as it progresses", async () => {

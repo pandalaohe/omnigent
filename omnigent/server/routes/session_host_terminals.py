@@ -12,6 +12,7 @@ from pydantic import Field
 
 from omnigent.entities.host_terminal import HostTerminalCreate
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.server.auth import effective_admin
 from omnigent.server.linked_host_terminals import LinkedHostTerminals
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._terminal_access import require_terminal_browser_session
@@ -63,8 +64,8 @@ def create_session_host_terminals_router(service: LinkedHostTerminals) -> APIRou
             raise HTTPException(409, "Unarchive the session before opening a terminal")
         _, conn = await service.target(body.host_id, user)
         if body.elevated:
-            if service.permissions is not None and (
-                user is None or not await asyncio.to_thread(service.permissions.is_admin, user)
+            if service.permissions is not None and not effective_admin(
+                user is not None and await asyncio.to_thread(service.permissions.is_admin, user)
             ):
                 raise TerminalAccessDenied(
                     "admin_not_allowed", "Admin terminals require an administrator"

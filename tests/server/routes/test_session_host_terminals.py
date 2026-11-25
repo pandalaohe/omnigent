@@ -14,7 +14,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runner.host_terminals import create_host_terminal_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.accounts_config import AccountsConfig
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import AdminViewMiddleware, UnifiedAuthProvider
 from omnigent.server.linked_host_terminals import LinkedHostTerminals
 from omnigent.server.oidc import mint_session_token
 from omnigent.server.routes.session_host_terminals import create_session_host_terminals_router
@@ -60,6 +60,7 @@ def linked_app(monkeypatch):
         return_value={"terminals": [{"terminal_id": "a" * 32}], "complete": True}
     )
     app = FastAPI()
+    app.add_middleware(AdminViewMiddleware)
 
     @app.exception_handler(OmnigentError)
     async def handle_error(request, exc):
@@ -187,11 +188,14 @@ async def test_collaborator_cannot_open_or_discover_linked_terminals(linked_app)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["owner", "links", "elevated"])
+@pytest.mark.parametrize("failure", ["owner", "links", "elevated", "admin-view"])
 async def test_linked_open_checks_host_ownership_and_capabilities(linked_app, failure):
     env = linked_app
+    headers = env.headers()
     if failure == "owner":
         env.host.user_id = "another-owner"
+    elif failure == "admin-view":
+        headers["Cookie"] += "; omnigent_admin_view=off"
     else:
         env.conn.hello.capabilities.remove(
             "host_terminal_links_v1" if failure == "links" else "terminal_elevated_v1"
@@ -202,9 +206,9 @@ async def test_linked_open_checks_host_ownership_and_capabilities(linked_app, fa
         response = await client.post(
             "/v1/sessions/session/host-terminals",
             json={"host_id": "host", "elevated": True},
-            headers=env.headers(),
+            headers=headers,
         )
-    assert response.status_code == (403 if failure == "owner" else 409)
+    assert response.status_code == (403 if failure in {"owner", "admin-view"} else 409)
     env.service.call.assert_not_awaited()
 
 

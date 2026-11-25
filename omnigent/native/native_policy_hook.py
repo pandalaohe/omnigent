@@ -598,13 +598,13 @@ def _retry_budget_for_request(
     :param outage_wait_s: Optional wait limit for a native enforcement gate.
     :returns: ``(retry_budget_s, max_backoff_s)`` for its event phase.
     """
-    if outage_wait_s is not None:
-        return outage_wait_s, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
     event = eval_request.get("event")
-    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
-        return TOOL_CALL_POLICY_RETRY_BUDGET_S, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
     if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_RESULT:
         return _EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+    if outage_wait_s is not None:
+        return outage_wait_s, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
+    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
+        return TOOL_CALL_POLICY_RETRY_BUDGET_S, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
     return _EVALUATE_POLICY_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
 
 

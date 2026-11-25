@@ -2049,10 +2049,12 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     assert hooks[0]["error_details"] == result["reason"]
 
 
+@pytest.mark.parametrize("event", ["PostToolUse", "PostToolUseFailure"])
 def test_evaluate_policy_post_tool_use_fails_open_on_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    event: str,
 ) -> None:
     """
     PostToolUse fails OPEN on a transport error — the tool already ran.
@@ -2062,15 +2064,19 @@ def test_evaluate_policy_post_tool_use_fails_open_on_error(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(
+        native_policy_hook.time, "sleep", lambda _: pytest.fail("tool result tried to wait")
+    )
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
     payload = {
-        "hook_event_name": "PostToolUse",
+        "hook_event_name": event,
         "tool_name": "Bash",
         "tool_input": {"command": "ls"},
         "tool_output": "ok",
+        "error": "tool failed",
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 

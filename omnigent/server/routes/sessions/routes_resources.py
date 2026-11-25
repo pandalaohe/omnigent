@@ -63,6 +63,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    effective_admin,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
@@ -1886,8 +1887,8 @@ def register_resources_routes(
                 request, conv, auth_provider, conversation_store
             )
             user_id = _get_user_id(request, auth_provider)
-            if permission_store is not None and (
-                not user_id or not await asyncio.to_thread(permission_store.is_admin, user_id)
+            if permission_store is not None and not effective_admin(
+                bool(user_id and await asyncio.to_thread(permission_store.is_admin, user_id))
             ):
                 raise HTTPException(
                     status_code=403, detail="admin terminal creation requires an administrator"

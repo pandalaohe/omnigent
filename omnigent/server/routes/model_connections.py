@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import ValidationError
 
 from omnigent.server import model_connections as connections
+from omnigent.server.auth import effective_admin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.default_policies import _require_admin
 
@@ -51,7 +52,7 @@ def create_model_connections_router(
     @router.get("/model-connections")
     async def listing(request: Request):
         owner = require_user(request, auth_provider)
-        is_admin = auth_provider is None or (
+        is_admin = auth_provider is None or effective_admin(
             permission_store is not None
             and owner is not None
             and await asyncio.to_thread(permission_store.is_admin, owner)

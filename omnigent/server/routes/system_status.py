@@ -24,7 +24,7 @@ from fastapi import APIRouter, Body, Request
 from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.attachment_archive_cleanup import SUMMARY_FILENAME
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, effective_admin
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
@@ -75,7 +75,7 @@ def create_system_status_router(
             return True
         if user_id is None:
             return False
-        return await asyncio.to_thread(permission_store.is_admin, user_id)
+        return effective_admin(await asyncio.to_thread(permission_store.is_admin, user_id))
 
     def _hub(request: Request) -> SystemStatusHub:
         hub = getattr(request.app.state, "system_status", None)

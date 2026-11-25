@@ -31,7 +31,7 @@ from omnigent.server.agent_quota import (
     UsageStorageUnavailableError,
     UsageWriterConflictError,
 )
-from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider, effective_admin
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.server_config import UsageRequestSource, load_server_config
 from omnigent.server.usage_evidence import UsageEvidenceService
@@ -896,7 +896,7 @@ def create_agent_quota_router(
         can_edit = (
             auth_provider is None
             or service.permissions is None
-            or await asyncio.to_thread(service.permissions.is_admin, owner)
+            or effective_admin(await asyncio.to_thread(service.permissions.is_admin, owner))
         )
         return {**price_source.status(), "can_edit": can_edit}
 

@@ -648,7 +648,23 @@ class _CodexAsyncQuestionTracker:
     def __init__(self) -> None:
         """Initialize an empty per-run tracker."""
         self._questions: dict[str, _CodexAsyncQuestion] = {}
+        self._server_supports_cards: bool | None = None
         self._closed = False
+
+    async def server_supports_cards(self, client: httpx.AsyncClient) -> bool:
+        """Require the server to support closing a card without stopping Codex."""
+        if self._server_supports_cards is None:
+            try:
+                response = await client.get("/v1/info", timeout=5.0)
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                _logger.debug("Could not verify Codex async card support", exc_info=True)
+                return False
+            self._server_supports_cards = (
+                isinstance(payload, dict) and payload.get("codex_nonblocking_decline") is True
+            )
+        return self._server_supports_cards
 
     def register(
         self,
@@ -8637,6 +8653,7 @@ async def _handle_completed_item_inner(
             and forwarder_state is not None
             and isinstance(call_id, str)
             and call_id
+            and await forwarder_state.async_question_tracker.server_supports_cards(client)
         ):
             await _post_async_questions(
                 client,
