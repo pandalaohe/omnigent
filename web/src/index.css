@@ -1084,7 +1084,8 @@ select optgroup {
   min-width: 0;
   overflow: hidden;
   opacity: 0;
-  transform: translateX(12px);
+  /* The closed, zero-width rail must not extend the shell's scroll area. */
+  transform: translateX(min(12px, 100%));
   pointer-events: none;
 }
 
