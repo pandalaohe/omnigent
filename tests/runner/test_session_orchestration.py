@@ -341,6 +341,9 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
     def respond(request):
         if request.url.path == "/v1/info":
             return httpx.Response(200, json={"sibling_sessions": True})
+        if request.url.path == f"/v1/projects/{_PROJECT_ID}":
+            requests.append(request)
+            return httpx.Response(200, json={"name": "Triage"})
         if request.method == "GET":
             return httpx.Response(200, json={"parent_session_id": None})
         requests.append(request)
@@ -351,7 +354,7 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
                     202, json={"queued": False, "denied": True, "reason": "Task needs approval"}
                 )
             return httpx.Response(status, text="First task unavailable")
-        return httpx.Response(201, json={"id": session_id})
+        return httpx.Response(201, json={"id": session_id, "project_id": _PROJECT_ID})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://server"
@@ -367,6 +370,7 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
             )
         )
     assert result["conversation_id"] == session_id
+    assert result["project_name"] == "Triage"
     assert result["status"] == "created_initial_message_failed"
     assert "Session created" in result["error"]
     assert "do not automatically resend" in result["error"]
@@ -376,7 +380,8 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
         assert result["initial_message"]["denied"] is True
     if status == "runner_disabled":
         assert "disabled on this runner" in result["initial_message"]["error"]
-    assert len(requests) == (1 if status == "runner_disabled" else 2)
+    assert len(requests) == (2 if status == "runner_disabled" else 3)
+    assert requests[-1].url.path == f"/v1/projects/{_PROJECT_ID}"
 
 
 @pytest.mark.asyncio

@@ -6952,9 +6952,6 @@ async def _execute_session_create_impl(
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
             **({"notes": data["notes"]} if data.get("notes") else {}),
             "project_id": data.get("project_id"),
-            "project_name": await _project_name_or_none(
-                _optional_string(data.get("project_id")), server_client
-            ),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):
@@ -6975,6 +6972,9 @@ async def _execute_session_create_impl(
                     f"Session created, but its first task was refused or not confirmed "
                     f"({initial_message['error']}); {_UNCONFIRMED_FIRST_TASK_GUIDANCE}"
                 )
+        handle["project_name"] = await _project_name_or_none(
+            _optional_string(data.get("project_id")), server_client
+        )
         return json.dumps(handle)
     return await _finalize_created_session(
         data,
