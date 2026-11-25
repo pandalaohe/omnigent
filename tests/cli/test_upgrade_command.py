@@ -1456,7 +1456,7 @@ def test_upgrade_nightly_refused_for_stamped_distribution(
 def test_upgrade_stamped_non_vcs_queries_distribution_atom_never_pypi(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
-    """Non-VCS stamped installs check distribution releases and upgrade via its git URL."""
+    """Non-VCS stamped installs check distribution releases and prefer prebuilt release wheels."""
     import omnigent.distribution as distribution
 
     monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
@@ -1468,6 +1468,15 @@ def test_upgrade_stamped_non_vcs_queries_distribution_atom_never_pypi(
     monkeypatch.setattr(
         "omnigent.update_check.fetch_latest_distribution_release",
         lambda repo, **_k: ("ok", "0.21.0-wukong.13"),
+    )
+    wheel_base = "https://github.com/example-org/omnigent-dist/releases/download/v0.21.0-wukong.13"
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_distribution_wheel_urls",
+        lambda repo, ver, **_k: {
+            "omnigent": f"{wheel_base}/omnigent-0.21.0.dev0-py3-none-any.whl",
+            "omnigent-client": f"{wheel_base}/omnigent_client-0.21.0.dev0-py3-none-any.whl",
+            "omnigent-ui-sdk": f"{wheel_base}/omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl",
+        },
     )
 
     check_res = CliRunner().invoke(cli, ["upgrade", "--check"])
@@ -1487,7 +1496,9 @@ def test_upgrade_stamped_non_vcs_queries_distribution_atom_never_pypi(
     assert up_res.exit_code == 0, up_res.output
     assert ran == [
         f"uv tool install --reinstall-package omnigent{_UV_PY} "
-        "git+https://github.com/example-org/omnigent-dist.git@v0.21.0-wukong.13"
+        f"--with 'omnigent-client @ {wheel_base}/omnigent_client-0.21.0.dev0-py3-none-any.whl' "
+        f"--with 'omnigent-ui-sdk @ {wheel_base}/omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl' "
+        f"'omnigent @ {wheel_base}/omnigent-0.21.0.dev0-py3-none-any.whl'"
     ]
     assert "0.21.0-wukong.13" in up_res.output
 
@@ -1517,7 +1528,7 @@ def test_upgrade_stamped_non_vcs_before_first_release_is_silent_and_never_hits_p
 def test_upgrade_failure_message_stamped_points_at_distribution_installer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Failed upgrade recovery on a stamped build points at the distribution repo."""
+    """Failed upgrade recovery on a stamped build points at the distribution wheel installer."""
     import omnigent.distribution as distribution
 
     monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
@@ -1533,4 +1544,5 @@ def test_upgrade_failure_message_stamped_points_at_distribution_installer(
         "https://raw.githubusercontent.com/example-org/omnigent-dist/main/scripts/install_oss.sh"
         in message
     )
-    assert "--repo https://github.com/example-org/omnigent-dist.git" in message
+    assert "--repo" not in message
+    assert "--extra databricks" in message

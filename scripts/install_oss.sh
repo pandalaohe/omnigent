@@ -38,6 +38,9 @@ DATABRICKS_CLI_SHA256_DARWIN_ARM64=5c899a18bb280a33cb1814418fd1352a6a6e5487a2d9e
 # Set by --repo to install from a git checkout instead (development; builds
 # the web UI from source). Empty => install the published wheel from PyPI.
 REPO_URL=
+# Optional GitHub repository ("owner/repo") serving prebuilt release wheels
+# (wukong-wheels.txt + .whl assets). Empty => install from PyPI (upstream).
+WHEEL_RELEASE_REPO=
 PYTHON_VERSION="3.12"
 INSTALL_URL=
 NON_INTERACTIVE=false
@@ -502,6 +505,118 @@ check_bubblewrap() {
   fi
 }
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    uv run --no-project --python "$PYTHON_VERSION" python -c '
+import hashlib
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    print(hashlib.file_digest(handle, "sha256").hexdigest())
+' "$1"
+  fi
+}
+
+install_from_wheel_release() (
+  extras_suffix="$1"
+  case "$WHEEL_RELEASE_REPO" in
+    "" | */*/* | ./* | ../* | */. | */..)
+      fail "Invalid WHEEL_RELEASE_REPO: $WHEEL_RELEASE_REPO"
+      ;;
+  esac
+  printf '%s\n' "$WHEEL_RELEASE_REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' \
+    || fail "Invalid WHEEL_RELEASE_REPO: $WHEEL_RELEASE_REPO"
+
+  requested_ver=
+  if [ -n "$VERSION" ]; then
+    requested_ver="${VERSION#v}"
+    printf '%s\n' "$requested_ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-wukong\.[0-9]+$' \
+      || fail "Unsupported distribution version: $VERSION (expected X.Y.Z-wukong.N)."
+    manifest_url="https://github.com/${WHEEL_RELEASE_REPO}/releases/download/v${requested_ver}/wukong-wheels.txt"
+  else
+    manifest_url="https://github.com/${WHEEL_RELEASE_REPO}/releases/latest/download/wukong-wheels.txt"
+  fi
+
+  wheel_tmp="$(mktemp -d "${TMPDIR:-/tmp}/omnigent-wheels.XXXXXX")" || exit 1
+  trap 'rm -rf "$wheel_tmp"' 0
+  trap 'exit 1' 1 2 15
+
+  if ! curl -fsSL "$manifest_url" -o "$wheel_tmp/wukong-wheels.txt"; then
+    fail "Could not download the prebuilt wheel manifest from https://github.com/${WHEEL_RELEASE_REPO}/releases. Check your connection, or pass --repo https://github.com/${WHEEL_RELEASE_REPO}.git to build from source."
+  fi
+
+  release_tag=
+  core_whl=
+  core_sha=
+  client_whl=
+  client_sha=
+  ui_sdk_whl=
+  ui_sdk_sha=
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r col1 col2 col3 col4; do
+    col1="${col1%$(printf '\r')}"
+    col2="${col2%$(printf '\r')}"
+    col3="${col3%$(printf '\r')}"
+    case "$col1" in
+      "") continue ;;
+      "# tag "*)
+        release_tag="${col1#\# tag }"
+        continue
+        ;;
+      "#"*) continue ;;
+    esac
+    [ -z "$col4" ] || fail "Malformed wheel manifest entry."
+    case "$col2" in
+      */* | *..*) fail "Invalid wheel filename in manifest: $col2" ;;
+    esac
+    printf '%s\n' "$col2" | grep -Eq '^[A-Za-z0-9._-]+\.whl$' \
+      || fail "Invalid wheel filename in manifest: $col2"
+    printf '%s\n' "$col3" | grep -Eq '^[0-9a-f]{64}$' \
+      || fail "Invalid wheel checksum in manifest for $col1"
+    case "$col1" in
+      omnigent) core_whl="$col2"; core_sha="$col3" ;;
+      omnigent-client) client_whl="$col2"; client_sha="$col3" ;;
+      omnigent-ui-sdk) ui_sdk_whl="$col2"; ui_sdk_sha="$col3" ;;
+      *) fail "Unexpected package in wheel manifest: $col1" ;;
+    esac
+  done <"$wheel_tmp/wukong-wheels.txt"
+
+  printf '%s\n' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-wukong\.[0-9]+$' \
+    || fail "Invalid release tag in wheel manifest."
+  if [ -n "$requested_ver" ] && [ "$release_tag" != "v$requested_ver" ]; then
+    fail "Wheel manifest tag $release_tag does not match requested version v$requested_ver."
+  fi
+  if [ -z "$core_whl" ] || [ -z "$client_whl" ] || [ -z "$ui_sdk_whl" ]; then
+    fail "Incomplete wheel manifest from https://github.com/${WHEEL_RELEASE_REPO}/releases."
+  fi
+
+  release_base="https://github.com/${WHEEL_RELEASE_REPO}/releases/download/${release_tag}"
+  for spec in \
+    "${core_whl}:${core_sha}" \
+    "${client_whl}:${client_sha}" \
+    "${ui_sdk_whl}:${ui_sdk_sha}"; do
+    whl_name="${spec%%:*}"
+    expected_sha="${spec#*:}"
+    if ! curl -fsSL "${release_base}/${whl_name}" -o "$wheel_tmp/$whl_name"; then
+      fail "Failed to download ${whl_name} from ${release_base}."
+    fi
+    actual_sha="$(sha256_file "$wheel_tmp/$whl_name")"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+      fail "SHA-256 checksum mismatch for ${whl_name}."
+    fi
+  done
+
+  step "Installing Omnigent ${release_tag#v}${extras_suffix:+ $extras_suffix} from prebuilt wheels (Python $PYTHON_VERSION)"
+  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" \
+    --with "omnigent-client @ file://$wheel_tmp/$client_whl" \
+    --with "omnigent-ui-sdk @ file://$wheel_tmp/$ui_sdk_whl" \
+    "${PACKAGE_NAME}${extras_suffix} @ file://$wheel_tmp/$core_whl"
+)
+
 install_omnigent() {
   # PyPI wheels bundle the web UI; --repo builds it from source with npm.
   # Extras apply to every install mode, including Databricks by default.
@@ -519,6 +634,9 @@ install_omnigent() {
       target="$INSTALL_URL"
     fi
     step "Installing Omnigent from source${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
+  elif [ -n "$WHEEL_RELEASE_REPO" ]; then
+    install_from_wheel_release "$extras_suffix"
+    return
   elif [ -n "$VERSION" ]; then
     target="${PACKAGE_NAME}${extras_suffix}==${VERSION}"
     step "Installing Omnigent $VERSION${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"

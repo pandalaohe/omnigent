@@ -36,6 +36,8 @@ function loadMainHarness({
     appExit: 0,
     checkForUpdates: 0,
     downloadUpdate: 0,
+    electronUpdaterRequired: 0,
+    autoUpdaterAccessed: 0,
     quitAndInstall: [],
     sent: [],
     showMessageBox: [],
@@ -238,7 +240,11 @@ function loadMainHarness({
       isExecutableFile: () => false,
       resolveCliPath: () => null,
       localHostId: () => "host_test",
-      getCliStatus: () => ({ installed: false }),
+      localServerHealthy: async () => null,
+      getCliStatus: (_path, opts) => ({
+        installed: false,
+        installCommand: opts?.installCommand ?? "upstream-default",
+      }),
     },
     "./server_manager": {
       shutdown: () => serverShutdown(),
@@ -289,7 +295,15 @@ function loadMainHarness({
     },
     require: (specifier) => {
       if (specifier === "electron") return electron;
-      if (specifier === "electron-updater") return { autoUpdater };
+      if (specifier === "electron-updater") {
+        calls.electronUpdaterRequired += 1;
+        return {
+          get autoUpdater() {
+            calls.autoUpdaterAccessed += 1;
+            return autoUpdater;
+          },
+        };
+      }
       if (specifier === "../package.json" && packageMeta) {
         return { ...mainRequire("../package.json"), ...packageMeta };
       }
@@ -1731,16 +1745,17 @@ describe("auto-update main-process wiring", () => {
     ]);
   });
 
-  it("wires external release feed only for packaged macOS builds with omnigentExternalReleaseRepo", async (t) => {
+  it("wires external release feed only for packaged macOS builds with omnigentExternalReleaseRepo and never touches autoUpdater", async (t) => {
     const originalFetch = globalThis.fetch;
     const fetchedUrls = [];
     globalThis.fetch = async (url) => {
       fetchedUrls.push(String(url));
       return {
         status: 200,
+        url: String(url),
         text: async () =>
           `<feed xmlns="http://www.w3.org/2005/Atom">` +
-          `<entry><link href="https://github.com/pandalaohe/omnigent-wukong/releases/tag/v0.3.0-wukong.2"/></entry>` +
+          `<entry><link rel="alternate" href="https://github.com/example-org/omnigent-dist/releases/tag/v0.3.0-wukong.2"/></entry>` +
           `</feed>`,
       };
     };
@@ -1748,43 +1763,107 @@ describe("auto-update main-process wiring", () => {
       globalThis.fetch = originalFetch;
     });
 
-    // Packaged macOS with omnigentExternalReleaseRepo -> external feed, never autoUpdater.
+    // Packaged macOS with omnigentExternalReleaseRepo -> external feed, NEVER requires/accesses autoUpdater.
     const macWukong = loadMainHarness({
       isPackaged: true,
       platform: "darwin",
       settings: { update_mode: "manual" },
-      packageMeta: { omnigentExternalReleaseRepo: "pandalaohe/omnigent-wukong" },
+      packageMeta: { omnigentExternalReleaseRepo: "example-org/omnigent-dist" },
     });
     t.after(macWukong.cleanup);
+    assert.equal(macWukong.calls.electronUpdaterRequired, 0);
+    assert.equal(macWukong.calls.autoUpdaterAccessed, 0);
     macWukong.api.updater.init();
     await macWukong.api.updater.checkForUpdates({ manual: true });
+    assert.equal(macWukong.calls.electronUpdaterRequired, 0);
+    assert.equal(macWukong.calls.autoUpdaterAccessed, 0);
     assert.equal(macWukong.calls.checkForUpdates, 0);
-    assert.deepEqual(fetchedUrls, ["https://github.com/pandalaohe/omnigent-wukong/releases.atom"]);
+    assert.equal(macWukong.api.updater.getConfig().deliveryMode, "manual-download");
+    assert.deepEqual(fetchedUrls, ["https://github.com/example-org/omnigent-dist/releases.atom"]);
 
-    // Packaged Windows with the same metadata -> keeps autoUpdater, never hits external feed.
+    // Packaged Windows with the same metadata -> accesses autoUpdater, never hits external feed.
     fetchedUrls.length = 0;
     const winBuild = loadMainHarness({
       isPackaged: true,
       platform: "win32",
       settings: { update_mode: "manual" },
-      packageMeta: { omnigentExternalReleaseRepo: "pandalaohe/omnigent-wukong" },
+      packageMeta: { omnigentExternalReleaseRepo: "example-org/omnigent-dist" },
     });
     t.after(winBuild.cleanup);
+    assert.equal(winBuild.calls.autoUpdaterAccessed, 1);
     winBuild.api.updater.init();
     await winBuild.api.updater.checkForUpdates({ manual: true });
     assert.equal(winBuild.calls.checkForUpdates, 1);
+    assert.equal(winBuild.api.updater.getConfig().deliveryMode, undefined);
     assert.deepEqual(fetchedUrls, []);
 
-    // Packaged untagged macOS (no omnigentExternalReleaseRepo) -> keeps autoUpdater.
+    // Packaged untagged macOS (no omnigentExternalReleaseRepo) -> accesses autoUpdater.
     const macUntagged = loadMainHarness({
       isPackaged: true,
       platform: "darwin",
       settings: { update_mode: "manual" },
     });
     t.after(macUntagged.cleanup);
+    assert.equal(macUntagged.calls.autoUpdaterAccessed, 1);
     macUntagged.api.updater.init();
     await macUntagged.api.updater.checkForUpdates({ manual: true });
     assert.equal(macUntagged.calls.checkForUpdates, 1);
     assert.deepEqual(fetchedUrls, []);
+
+    // Unpackaged dev macOS build even with omnigentExternalReleaseRepo -> keeps legacy dev path.
+    const macDev = loadMainHarness({
+      isPackaged: false,
+      platform: "darwin",
+      settings: { update_mode: "manual" },
+      packageMeta: { omnigentExternalReleaseRepo: "example-org/omnigent-dist" },
+    });
+    t.after(macDev.cleanup);
+    assert.equal(macDev.calls.autoUpdaterAccessed, 1);
+    assert.equal(macDev.api.updater.getConfig().deliveryMode, undefined);
+  });
+
+  it("wires distribution CLI install command and docs URL when omnigentDistributionRepo is set", async (t) => {
+    const { pathToFileURL } = require("node:url");
+    const setupUrl = pathToFileURL(path.join(__dirname, "../setup/index.html")).href;
+
+    const winDist = loadMainHarness({
+      isPackaged: true,
+      platform: "win32",
+      packageMeta: { omnigentDistributionRepo: "example-org/omnigent-dist" },
+    });
+    t.after(winDist.cleanup);
+    winDist.api.registerIpc();
+    const setupEvent = {
+      sender: winDist.events.pinned.sender,
+      senderFrame: { url: setupUrl },
+    };
+    const status = await winDist.ipcHandlers.get("omnigent:get-cli-status")(setupEvent);
+    assert.equal(
+      status.installDocsUrl,
+      "https://github.com/example-org/omnigent-dist/blob/main/docs/install.md",
+    );
+    assert.match(
+      status.installCommand,
+      /example-org\/omnigent-dist\/main\/scripts\/install_oss\.ps1/,
+    );
+    assert.equal(status.installSupported, false);
+
+    const macDist = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      packageMeta: { omnigentDistributionRepo: "example-org/omnigent-dist" },
+    });
+    t.after(macDist.cleanup);
+    macDist.api.registerIpc();
+    const macStatus = await macDist.ipcHandlers.get("omnigent:get-cli-status")({
+      sender: macDist.events.pinned.sender,
+      senderFrame: { url: setupUrl },
+    });
+    assert.match(
+      macStatus.installCommand,
+      /example-org\/omnigent-dist\/main\/scripts\/install_oss\.sh/,
+    );
+    assert.doesNotMatch(macStatus.installCommand, /--repo/);
+    assert.equal(macStatus.installSupported, true);
   });
 });

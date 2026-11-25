@@ -3369,20 +3369,22 @@ function UpdatesSection() {
               </Select>
             </label>
 
-            <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-              <SettingsLabel
-                label="Install downloaded updates on next quit"
-                note={null}
-                description="Applies only after you choose to download an update."
-              />
-              <Switch
-                checked={config.autoInstall}
-                onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
-                disabled={saving}
-                aria-label="Install downloaded updates on next quit"
-                componentId="settings.updates.auto_install"
-              />
-            </div>
+            {config.deliveryMode !== "manual-download" && (
+              <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+                <SettingsLabel
+                  label="Install downloaded updates on next quit"
+                  note={null}
+                  description="Applies only after you choose to download an update."
+                />
+                <Switch
+                  checked={config.autoInstall}
+                  onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+                  disabled={saving}
+                  aria-label="Install downloaded updates on next quit"
+                  componentId="settings.updates.auto_install"
+                />
+              </div>
+            )}
           </SettingsGroup>
 
           {lastCheckError && (

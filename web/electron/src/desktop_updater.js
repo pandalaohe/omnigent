@@ -31,29 +31,55 @@ const EXTERNAL_CHECK_FAILED = "Couldn't check for updates.";
 /** Background re-check cadence for the "default" mode (every 6 hours). */
 const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const EXTERNAL_FEED_TIMEOUT_MS = 10_000;
-const EXTERNAL_REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const EXTERNAL_REPO_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+const MAX_VERSION_FIELD_DIGITS = 64;
 const DISTRIBUTION_VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)-wukong\.(\d+)$/;
-const ATOM_ENTRY_RE = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
-const ATOM_LINK_TAG_RE = /<link\b[^>]*\bhref=["'][^"']*\/releases\/tag\/([^/"'?#]+)["'][^>]*>/i;
-const ATOM_ID_RE = /<id\b[^>]*>([\s\S]*?)<\/id>/i;
+const ATOM_NAMESPACE = "http://www.w3.org/2005/Atom";
+const XML_NAME_RE = /^[A-Za-z_:][A-Za-z0-9._:-]*$/;
+const MAX_FEED_REDIRECTS = 3;
 
 /**
- * Parse a stamped distribution version (`[v]X.Y.Z-wukong.N`) into a numeric
- * tuple, or null when the string does not match.
+ * Validate and normalize an `owner/repo` string, rejecting dot segments and
+ * malformed characters so URL construction cannot be traversed or spoofed.
  *
  * @param {unknown} value
- * @returns {[number, number, number, number] | null}
+ * @returns {string | null}
+ */
+function normalizeExternalReleaseRepo(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const parts = trimmed.split("/");
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  if (
+    !EXTERNAL_REPO_SEGMENT_RE.test(owner) ||
+    !EXTERNAL_REPO_SEGMENT_RE.test(repo) ||
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".."
+  ) {
+    return null;
+  }
+  return `${owner}/${repo}`;
+}
+
+/**
+ * Parse a stamped distribution version (`[v]X.Y.Z-wukong.N`) into an exact
+ * BigInt tuple, or null when the string does not match or exceeds the field
+ * digit bound.
+ *
+ * @param {unknown} value
+ * @returns {[bigint, bigint, bigint, bigint] | null}
  */
 function parseDistributionVersion(value) {
   if (typeof value !== "string") return null;
   const match = DISTRIBUTION_VERSION_RE.exec(value.trim());
   if (!match) return null;
-  return [
-    Number.parseInt(match[1], 10),
-    Number.parseInt(match[2], 10),
-    Number.parseInt(match[3], 10),
-    Number.parseInt(match[4], 10),
-  ];
+  for (let i = 1; i <= 4; i += 1) {
+    if (match[i].length > MAX_VERSION_FIELD_DIGITS) return null;
+  }
+  return [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), BigInt(match[4])];
 }
 
 /**
@@ -75,54 +101,422 @@ function isNewerDistributionVersion(latest, current) {
 }
 
 /**
+ * Validate that a URL exactly matches `https://github.com/<owner>/<repo>/releases.atom`
+ * with no credentials, explicit port, query, fragment, dot segments, or encoded
+ * path separators.
+ *
+ * @param {unknown} rawUrl
+ * @param {string} repo
+ * @returns {string | null}
+ */
+function validateExternalFeedUrl(rawUrl, repo) {
+  const normalizedRepo = normalizeExternalReleaseRepo(repo);
+  if (!normalizedRepo || typeof rawUrl !== "string") return null;
+  if (rawUrl.includes("\\") || /%(?:2f|5c)/i.test(rawUrl)) return null;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const canonical = `https://github.com/${normalizedRepo}/releases.atom`;
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "github.com" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    parsed.href !== canonical ||
+    rawUrl !== canonical
+  ) {
+    return null;
+  }
+  return canonical;
+}
+
+/**
+ * Validate a release tag URL against the expected GitHub repository and strict
+ * Wukong tag format. Returns the parsed version, tag, and canonical URL, or
+ * null if anything (origin, repo, credentials, port, query, fragment, dot
+ * segments, encoded separators, or tag format) does not match.
+ *
+ * @param {unknown} rawUrl
+ * @param {string} repo
+ * @returns {{ version: string, tag: string, releaseUrl: string } | null}
+ */
+function parseExpectedReleaseTagUrl(rawUrl, repo) {
+  const normalizedRepo = normalizeExternalReleaseRepo(repo);
+  if (!normalizedRepo || typeof rawUrl !== "string") return null;
+  if (rawUrl.includes("\\") || /%(?:2f|5c)/i.test(rawUrl)) return null;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "github.com" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    return null;
+  }
+  const [expectedOwner, expectedRepo] = normalizedRepo.split("/");
+  const segments = parsed.pathname.split("/");
+  if (
+    segments.length !== 6 ||
+    segments[0] !== "" ||
+    segments[1] !== expectedOwner ||
+    segments[2] !== expectedRepo ||
+    segments[3] !== "releases" ||
+    segments[4] !== "tag"
+  ) {
+    return null;
+  }
+  const rawTag = segments[5];
+  if (!parseDistributionVersion(rawTag)) return null;
+  const canonical = `https://github.com/${expectedOwner}/${expectedRepo}/releases/tag/${rawTag}`;
+  if (parsed.href !== canonical || rawUrl !== canonical) return null;
+  const version = rawTag.startsWith("v") ? rawTag.slice(1) : rawTag;
+  return { version, tag: rawTag, releaseUrl: canonical };
+}
+
+function decodeXmlEntities(text) {
+  return text.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z]+);/g, (_match, entity) => {
+    if (entity === "amp") return "&";
+    if (entity === "lt") return "<";
+    if (entity === "gt") return ">";
+    if (entity === "quot") return '"';
+    if (entity === "apos") return "'";
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      const code = Number.parseInt(entity.slice(2), 16);
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+        throw new Error("Invalid XML character reference");
+      }
+      return String.fromCodePoint(code);
+    }
+    if (entity.startsWith("#")) {
+      const code = Number.parseInt(entity.slice(1), 10);
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+        throw new Error("Invalid XML character reference");
+      }
+      return String.fromCodePoint(code);
+    }
+    throw new Error(`Unsupported XML entity &${entity};`);
+  });
+}
+
+function assertValidXmlEntities(text) {
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "&") {
+      const semi = text.indexOf(";", i + 1);
+      if (semi === -1) throw new Error("Unterminated XML entity");
+      decodeXmlEntities(text.slice(i, semi + 1));
+      i = semi;
+    }
+  }
+}
+
+/**
+ * Minimal strict XML 1.0 well-formedness parser for Atom documents. Rejects
+ * truncated documents, mismatched tags, unclosed attributes/comments/CDATA,
+ * DOCTYPE declarations, duplicate attributes, and trailing garbage.
+ *
+ * @param {string} xmlText
+ * @returns {{ name: string, attrs: Record<string, string>, children: Array<any> }}
+ */
+function parseStrictXmlDocument(xmlText) {
+  if (typeof xmlText !== "string") throw new Error("XML document must be a string");
+  const src = xmlText.startsWith("\uFEFF") ? xmlText.slice(1) : xmlText;
+  const len = src.length;
+  let pos = 0;
+
+  function skipWs() {
+    while (
+      pos < len &&
+      (src[pos] === " " || src[pos] === "\t" || src[pos] === "\r" || src[pos] === "\n")
+    ) {
+      pos += 1;
+    }
+  }
+
+  function skipMisc() {
+    while (pos < len) {
+      skipWs();
+      if (src.startsWith("<!--", pos)) {
+        const end = src.indexOf("-->", pos + 4);
+        if (end === -1 || src.slice(pos + 4, end).includes("--")) {
+          throw new Error("Malformed XML comment");
+        }
+        pos = end + 3;
+      } else if (src.startsWith("<?", pos)) {
+        const end = src.indexOf("?>", pos + 2);
+        if (end === -1) throw new Error("Unterminated XML processing instruction");
+        pos = end + 2;
+      } else {
+        break;
+      }
+    }
+  }
+
+  function readName() {
+    const start = pos;
+    while (
+      pos < len &&
+      src[pos] !== " " &&
+      src[pos] !== "\t" &&
+      src[pos] !== "\r" &&
+      src[pos] !== "\n" &&
+      src[pos] !== ">" &&
+      src[pos] !== "/" &&
+      src[pos] !== "="
+    ) {
+      pos += 1;
+    }
+    const name = src.slice(start, pos);
+    if (!XML_NAME_RE.test(name)) throw new Error(`Invalid XML name: ${name}`);
+    return name;
+  }
+
+  skipWs();
+  if (src.startsWith("<?xml", pos)) {
+    const end = src.indexOf("?>", pos + 5);
+    if (end === -1) throw new Error("Unterminated XML declaration");
+    pos = end + 2;
+  }
+  skipMisc();
+  if (pos >= len || src[pos] !== "<") throw new Error("Missing XML root element");
+  if (src.startsWith("<!DOCTYPE", pos) || src.startsWith("<!doctype", pos)) {
+    throw new Error("DOCTYPE declarations are not allowed");
+  }
+
+  let root = null;
+  const stack = [];
+
+  while (pos < len) {
+    if (src[pos] === "<") {
+      if (src.startsWith("<!--", pos)) {
+        const end = src.indexOf("-->", pos + 4);
+        if (end === -1 || src.slice(pos + 4, end).includes("--")) {
+          throw new Error("Malformed XML comment");
+        }
+        pos = end + 3;
+        continue;
+      }
+      if (src.startsWith("<![CDATA[", pos)) {
+        if (stack.length === 0) throw new Error("CDATA outside root element");
+        const end = src.indexOf("]]>", pos + 9);
+        if (end === -1) throw new Error("Unterminated CDATA section");
+        pos = end + 3;
+        continue;
+      }
+      if (src.startsWith("<?", pos)) {
+        const end = src.indexOf("?>", pos + 2);
+        if (end === -1) throw new Error("Unterminated XML processing instruction");
+        pos = end + 2;
+        continue;
+      }
+      if (src.startsWith("<!", pos)) {
+        throw new Error("Unsupported XML markup declaration");
+      }
+      if (src.startsWith("</", pos)) {
+        pos += 2;
+        const closeName = readName();
+        skipWs();
+        if (src[pos] !== ">") throw new Error("Malformed XML closing tag");
+        pos += 1;
+        const open = stack.pop();
+        if (!open || open.name !== closeName) {
+          throw new Error(`Mismatched XML closing tag </${closeName}>`);
+        }
+        if (stack.length === 0) {
+          skipMisc();
+          if (pos !== len) throw new Error("Trailing content after XML root element");
+          break;
+        }
+        continue;
+      }
+      if (root && stack.length === 0) {
+        throw new Error("Multiple XML root elements");
+      }
+      pos += 1;
+      const name = readName();
+      const attrs = Object.create(null);
+      let selfClosing = false;
+      while (pos < len) {
+        const beforeWs = pos;
+        skipWs();
+        if (src[pos] === ">") {
+          pos += 1;
+          break;
+        }
+        if (src.startsWith("/>", pos)) {
+          selfClosing = true;
+          pos += 2;
+          break;
+        }
+        if (pos === beforeWs) throw new Error("Missing whitespace before XML attribute");
+        const attrName = readName();
+        skipWs();
+        if (src[pos] !== "=") throw new Error("Missing '=' in XML attribute");
+        pos += 1;
+        skipWs();
+        const quote = src[pos];
+        if (quote !== '"' && quote !== "'") throw new Error("Unquoted XML attribute value");
+        pos += 1;
+        const valStart = pos;
+        const valEnd = src.indexOf(quote, valStart);
+        if (valEnd === -1) throw new Error("Unterminated XML attribute value");
+        const rawVal = src.slice(valStart, valEnd);
+        if (rawVal.includes("<")) throw new Error("Unescaped '<' in XML attribute value");
+        if (Object.hasOwn(attrs, attrName)) {
+          throw new Error(`Duplicate XML attribute: ${attrName}`);
+        }
+        attrs[attrName] = decodeXmlEntities(rawVal);
+        pos = valEnd + 1;
+      }
+      if (pos > len || (!selfClosing && src[pos - 1] !== ">")) {
+        throw new Error("Unterminated XML start tag");
+      }
+      const node = { name, attrs, children: [] };
+      if (stack.length > 0) {
+        stack[stack.length - 1].children.push(node);
+      } else {
+        root = node;
+      }
+      if (!selfClosing) {
+        stack.push(node);
+      } else if (stack.length === 0) {
+        skipMisc();
+        if (pos !== len) throw new Error("Trailing content after XML root element");
+        break;
+      }
+    } else {
+      const nextTag = src.indexOf("<", pos);
+      const textEnd = nextTag === -1 ? len : nextTag;
+      const chunk = src.slice(pos, textEnd);
+      if (stack.length === 0) {
+        if (chunk.trim() !== "") throw new Error("Unexpected text outside XML root element");
+      } else {
+        if (chunk.includes("]]>")) throw new Error("Illegal ']]>' in XML text");
+        assertValidXmlEntities(chunk);
+      }
+      pos = textEnd;
+    }
+  }
+
+  if (!root || stack.length > 0) {
+    throw new Error("Truncated XML document");
+  }
+  return root;
+}
+
+function xmlLocalName(name) {
+  const colon = name.indexOf(":");
+  return colon === -1 ? name : name.slice(colon + 1);
+}
+
+function resolveElementNamespace(node, inheritedNamespaces) {
+  const namespaces = { ...inheritedNamespaces };
+  for (const [key, value] of Object.entries(node.attrs)) {
+    if (key === "xmlns") namespaces[""] = value;
+    else if (key.startsWith("xmlns:")) namespaces[key.slice(6)] = value;
+  }
+  const colon = node.name.indexOf(":");
+  const prefix = colon === -1 ? "" : node.name.slice(0, colon);
+  return { ns: namespaces[prefix] ?? "", local: xmlLocalName(node.name), namespaces };
+}
+
+/**
  * Extract the numerically highest `-wukong.N` release from a GitHub
- * `releases.atom` XML document.
+ * `releases.atom` XML document, strictly bound to `repo`. Throws on malformed
+ * XML or non-Atom documents; skips individual entries whose alternate link or
+ * tag does not match.
  *
  * @param {string} xmlText
  * @param {string} repo `owner/repo`
  * @returns {{ version: string, tag: string, releaseUrl: string } | null}
  */
 function parseReleasesAtom(xmlText, repo) {
-  if (typeof xmlText !== "string" || !EXTERNAL_REPO_RE.test(repo)) return null;
+  const normalizedRepo = normalizeExternalReleaseRepo(repo);
+  if (!normalizedRepo) {
+    throw new Error("Invalid external release repository");
+  }
+  const root = parseStrictXmlDocument(xmlText);
+  const rootInfo = resolveElementNamespace(root, Object.create(null));
+  if (rootInfo.local !== "feed" || (rootInfo.ns !== "" && rootInfo.ns !== ATOM_NAMESPACE)) {
+    throw new Error("Atom feed root element must be <feed>");
+  }
+
   let best = null;
-  ATOM_ENTRY_RE.lastIndex = 0;
-  let match = ATOM_ENTRY_RE.exec(xmlText);
-  while (match !== null) {
-    const entry = match[1];
-    let rawTag = ATOM_LINK_TAG_RE.exec(entry)?.[1] ?? null;
-    if (!rawTag) {
-      const idText = ATOM_ID_RE.exec(entry)?.[1]?.trim() ?? "";
-      rawTag = idText.split("/").pop() ?? null;
+  for (const entry of root.children) {
+    const entryInfo = resolveElementNamespace(entry, rootInfo.namespaces);
+    if (entryInfo.local !== "entry" || (entryInfo.ns !== "" && entryInfo.ns !== ATOM_NAMESPACE)) {
+      continue;
     }
-    if (rawTag && parseDistributionVersion(rawTag)) {
-      const version = rawTag.startsWith("v") ? rawTag.slice(1) : rawTag;
-      const tag = rawTag.startsWith("v") ? rawTag : `v${rawTag}`;
-      if (!best || isNewerDistributionVersion(version, best.version)) {
-        best = {
-          version,
-          tag,
-          releaseUrl: `https://github.com/${repo}/releases/tag/${tag}`,
-        };
+    let matched = null;
+    for (const child of entry.children) {
+      const childInfo = resolveElementNamespace(child, entryInfo.namespaces);
+      if (childInfo.local !== "link" || (childInfo.ns !== "" && childInfo.ns !== ATOM_NAMESPACE)) {
+        continue;
+      }
+      const rel = child.attrs.rel;
+      if (rel !== undefined && rel !== "alternate") continue;
+      const candidate = parseExpectedReleaseTagUrl(child.attrs.href, normalizedRepo);
+      if (candidate) {
+        matched = candidate;
+        break;
       }
     }
-    match = ATOM_ENTRY_RE.exec(xmlText);
+    if (matched && (!best || isNewerDistributionVersion(matched.version, best.version))) {
+      best = matched;
+    }
   }
   return best;
 }
 
 /**
  * Default HTTP getter for `releases.atom` using Node/Electron's built-in fetch.
+ * Refuses redirects to any other origin or repository.
  *
  * @param {string} url
- * @returns {Promise<{ status: number, text: string }>}
+ * @param {string} [expectedRepo]
+ * @param {number} [hop]
+ * @returns {Promise<{ status: number, text: string, url?: string }>}
  */
-async function defaultFetchFeed(url) {
+async function defaultFetchFeed(url, expectedRepo, hop = 0) {
   const resp = await fetch(url, {
     headers: { Accept: "application/atom+xml, application/xml, text/xml" },
-    redirect: "follow",
+    redirect: "manual",
     signal: AbortSignal.timeout(EXTERNAL_FEED_TIMEOUT_MS),
   });
-  return { status: resp.status, text: await resp.text() };
+  if (resp.status >= 300 && resp.status < 400) {
+    const location = resp.headers?.get?.("location");
+    if (!location || hop >= MAX_FEED_REDIRECTS) {
+      throw new Error(`Unexpected redirect (${resp.status}) while checking release feed`);
+    }
+    let nextUrl;
+    try {
+      nextUrl = new URL(location, url).href;
+    } catch {
+      throw new Error("Malformed redirect URL while checking release feed");
+    }
+    if (!expectedRepo || !validateExternalFeedUrl(nextUrl, expectedRepo)) {
+      throw new Error("Refused redirect to unexpected origin or repository");
+    }
+    return defaultFetchFeed(nextUrl, expectedRepo, hop + 1);
+  }
+  return {
+    status: resp.status,
+    text: await resp.text(),
+    url: typeof resp.url === "string" && resp.url ? resp.url : url,
+  };
 }
 
 /**
@@ -214,10 +608,7 @@ function createDesktopUpdater({
   fetchFeed = defaultFetchFeed,
   openExternal = null,
 }) {
-  const validExternalRepo =
-    typeof externalReleaseRepo === "string" && EXTERNAL_REPO_RE.test(externalReleaseRepo.trim())
-      ? externalReleaseRepo.trim()
-      : null;
+  const validExternalRepo = normalizeExternalReleaseRepo(externalReleaseRepo);
   const isExternalMode = validExternalRepo !== null;
   let updateCheckTimer = null;
   let currentUpdateStatus = { state: "idle" };
@@ -226,9 +617,12 @@ function createDesktopUpdater({
   // handler surface a failure to the user only when they explicitly asked.
   let manualCheckInFlight = false;
   let statusBeforeCheck = null;
+  // Single in-flight external-feed check shared by startup/periodic and manual callers.
+  let externalCheckInFlight = null;
 
   function getConfig() {
-    return normalizeUpdateConfig(loadSettings());
+    const cfg = normalizeUpdateConfig(loadSettings());
+    return isExternalMode ? { ...cfg, deliveryMode: "manual-download" } : cfg;
   }
 
   function setConfig(patch = {}) {
@@ -363,45 +757,68 @@ function createDesktopUpdater({
     applyConfig(cfg);
   }
 
-  async function checkExternalRelease({ manual = false } = {}) {
-    statusBeforeCheck = currentUpdateStatus;
-    if (manual) broadcast({ state: "checking" });
-    const feedUrl = `https://github.com/${validExternalRepo}/releases.atom`;
-    try {
-      const resp = await fetchFeed(feedUrl);
-      if (resp && resp.status === 404) {
-        broadcast(manual ? { state: "none", manualOnly: true } : { state: "idle" });
-        statusBeforeCheck = null;
-        return;
+  function checkExternalRelease({ manual = false } = {}) {
+    if (externalCheckInFlight) {
+      if (manual && !externalCheckInFlight.manual) {
+        externalCheckInFlight.manual = true;
+        broadcast({ state: "checking" });
       }
-      if (!resp || resp.status !== 200) {
-        throw new Error(`Unexpected status ${resp?.status ?? "unknown"}`);
-      }
-      const latest = parseReleasesAtom(resp.text, validExternalRepo);
-      const current = getCurrentVersion();
-      if (latest && isNewerDistributionVersion(latest.version, current)) {
-        broadcast({
-          state: "available",
-          currentVersion: current,
-          info: {
-            version: latest.version,
-            downloadUrl: latest.releaseUrl,
-          },
-        });
-      } else {
-        broadcast(manual ? { state: "none", manualOnly: true } : { state: "idle" });
-      }
-      statusBeforeCheck = null;
-    } catch (err) {
-      const msg = String(err?.message ?? err);
-      console.warn("[omnigent] update error:", msg);
-      if (manual) {
-        broadcast({ state: "idle", manualOnly: true, lastError: EXTERNAL_CHECK_FAILED });
-      } else {
-        broadcast(statusBeforeCheck ?? { state: "idle" });
-      }
-      statusBeforeCheck = null;
+      return externalCheckInFlight.promise;
     }
+    const run = { manual: Boolean(manual), promise: null };
+    if (run.manual) broadcast({ state: "checking" });
+    const feedUrl = `https://github.com/${validExternalRepo}/releases.atom`;
+    run.promise = (async () => {
+      try {
+        const resp = await fetchFeed(feedUrl, validExternalRepo);
+        if (resp && resp.status >= 300 && resp.status < 400) {
+          throw new Error(`Unexpected redirect (${resp.status}) while checking release feed`);
+        }
+        if (
+          resp &&
+          typeof resp.url === "string" &&
+          resp.url !== "" &&
+          !validateExternalFeedUrl(resp.url, validExternalRepo)
+        ) {
+          throw new Error("Feed response resolved to an unexpected origin or repository");
+        }
+        if (resp && resp.status === 404) {
+          if (run.manual) {
+            broadcast({ state: "none", manualOnly: true });
+          }
+          return;
+        }
+        if (!resp || resp.status !== 200) {
+          throw new Error(`Unexpected status ${resp?.status ?? "unknown"}`);
+        }
+        const latest = parseReleasesAtom(resp.text, validExternalRepo);
+        const current = getCurrentVersion();
+        if (latest && isNewerDistributionVersion(latest.version, current)) {
+          broadcast({
+            state: "available",
+            currentVersion: current,
+            info: {
+              version: latest.version,
+              downloadUrl: latest.releaseUrl,
+            },
+          });
+        } else if (run.manual) {
+          broadcast({ state: "none", manualOnly: true });
+        }
+      } catch (err) {
+        const msg = String(err?.message ?? err);
+        console.warn("[omnigent] update error:", msg);
+        if (run.manual) {
+          broadcast({ state: "idle", manualOnly: true, lastError: EXTERNAL_CHECK_FAILED });
+        }
+      } finally {
+        if (externalCheckInFlight === run) {
+          externalCheckInFlight = null;
+        }
+      }
+    })();
+    externalCheckInFlight = run;
+    return run.promise;
   }
 
   function checkForUpdates({ manual = false } = {}) {
@@ -466,16 +883,15 @@ function createDesktopUpdater({
     }
     if (isExternalMode) {
       const releaseUrl = currentUpdateStatus.info?.downloadUrl;
-      const expectedPrefix = `https://github.com/${validExternalRepo}/releases/tag/`;
+      const checked = parseExpectedReleaseTagUrl(releaseUrl, validExternalRepo);
       if (
         currentUpdateStatus.state !== "available" ||
-        typeof releaseUrl !== "string" ||
-        !releaseUrl.startsWith(expectedPrefix) ||
+        !checked ||
         typeof openExternal !== "function"
       ) {
         return Promise.reject(new Error("No release download link is available."));
       }
-      return Promise.resolve(openExternal(releaseUrl)).then(() => undefined);
+      return Promise.resolve(openExternal(checked.releaseUrl)).then(() => undefined);
     }
     // Enter the progress state immediately instead of waiting for the first
     // provider event. Fast downloads and slow-loading About windows then still
@@ -653,8 +1069,11 @@ module.exports = {
   createDesktopUpdater,
   normalizeUpdateConfig,
   isUpdateSecurityError,
+  normalizeExternalReleaseRepo,
   parseDistributionVersion,
   isNewerDistributionVersion,
+  parseExpectedReleaseTagUrl,
+  validateExternalFeedUrl,
   parseReleasesAtom,
   UPDATE_MODES,
   UPDATES_UNAVAILABLE_IN_DEV,

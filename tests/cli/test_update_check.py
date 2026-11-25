@@ -2615,39 +2615,160 @@ def _releases_atom(*tags: str, repo: str = "example-org/omnigent-dist") -> str:
 
 def test_distribution_version_comparison_strict_numeric_and_ignores_non_matching() -> None:
     """Distribution comparator orders ``X.Y.Z-wukong.N`` numerically and ignores foreign tags."""
-    from omnigent.update_check import _is_newer_distribution_version
+    from omnigent.update_check import _is_newer_distribution_version, _parse_distribution_version
 
     assert _is_newer_distribution_version("0.21.0-wukong.10", "0.21.0-wukong.9") is True
     assert _is_newer_distribution_version("0.22.0-wukong.13", "0.21.0-wukong.12") is True
     assert _is_newer_distribution_version("0.21.0-wukong.12", "0.21.0-wukong.12") is False
     assert _is_newer_distribution_version("0.21.0-wukong.11", "0.21.0-wukong.12") is False
-    # Non-matching tags must never fall back to string inequality.
-    assert _is_newer_distribution_version("0.99.0", "0.21.0-wukong.12") is False
-    assert _is_newer_distribution_version("0.21.0-wukong.12", "0.99.0") is False
+    # Exact comparison for large neighbour fields (> 2^53).
+    assert (
+        _is_newer_distribution_version(
+            "0.21.0-wukong.9007199254740993", "0.21.0-wukong.9007199254740992"
+        )
+        is True
+    )
+    assert (
+        _is_newer_distribution_version(
+            "0.21.0-wukong.9007199254740992", "0.21.0-wukong.9007199254740993"
+        )
+        is False
+    )
+    # Oversized fields (>64 digits, including >4300 Python int_max_str_digits) return None safely.
+    assert _parse_distribution_version(f"0.21.0-wukong.{'9' * 65}") is None
+    assert _parse_distribution_version(f"0.21.0-wukong.{'9' * 5000}") is None
+    # Non-matching tags and other pre-release suffixes must never fall back to string inequality.
+    for bad in (
+        "0.99.0",
+        "0.21.0-rc.1",
+        "0.21.0-beta.2",
+        "0.21.0-alpha.1",
+        "0.21.0-wukong.12-rc.1",
+        "0.21.0-wukong.12+build.1",
+        "0.21.0.dev0",
+    ):
+        assert _is_newer_distribution_version(bad, "0.21.0-wukong.12") is False
+        assert _is_newer_distribution_version("0.21.0-wukong.12", bad) is False
 
 
 def test_fetch_latest_distribution_release_parses_atom_and_picks_highest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Atom parser picks the numerically highest ``-wukong.N`` tag and ignores others."""
+    """Atom parser picks the numerically highest ``-wukong.N`` tag bound to the expected repo."""
     import httpx
 
     from omnigent.update_check import fetch_latest_distribution_release
 
-    seen: list[str] = []
-    xml = _releases_atom("v0.21.0-wukong.9", "v0.99.0", "v0.21.0-wukong.10", "v0.22.0-wukong.13")
+    seen: list[tuple[str, object]] = []
+    base = "https://github.com/example-org/omnigent-dist/releases/tag"
+    huge_n = "9" * 5000
+    # Mix foreign-repo same-format entry, ID-only entry, non-alternate link, oversized field,
+    # dot-segment/query/port URLs, and valid entries — only valid bound entries participate.
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry><id>tag:github.com,2008:Repository/1/v9.9.9-wukong.99</id>"
+        '<link rel="alternate" '
+        'href="https://github.com/foreign-org/foreign-repo/releases/tag/v9.9.9-wukong.99"/></entry>'
+        "<entry><id>tag:github.com,2008:Repository/1/v8.8.8-wukong.88</id></entry>"
+        f'<entry><link rel="related" href="{base}/v7.7.7-wukong.77"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v6.6.6-wukong.66?x=1"/></entry>'
+        '<entry><link rel="alternate" '
+        'href="https://github.com:443/example-org/omnigent-dist/releases/tag/v5.5.5-wukong.55"/></entry>'
+        '<entry><link rel="alternate" '
+        'href="https://github.com/other/repo/../../example-org/omnigent-dist/releases/tag/v4.4.4-wukong.44"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.22.0-wukong.{huge_n}"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.21.0-wukong.9"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.99.0"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.21.0-wukong.10"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.22.0-wukong.13"/></entry>'
+        "</feed>"
+    )
 
-    def _get(url: str, **_kw: object) -> _FakeResp:
-        seen.append(url)
+    def _get(url: str, **kw: object) -> _FakeResp:
+        seen.append((url, kw.get("follow_redirects")))
         return _FakeResp(status_code=200, content_type="application/atom+xml", text=xml)
 
     monkeypatch.setattr(httpx, "get", _get)
 
     status, latest = fetch_latest_distribution_release("example-org/omnigent-dist")
 
-    assert seen == ["https://github.com/example-org/omnigent-dist/releases.atom"]
+    assert seen == [("https://github.com/example-org/omnigent-dist/releases.atom", False)]
     assert status == "ok"
     assert latest == "0.22.0-wukong.13"
+
+
+def test_fetch_latest_distribution_release_rejects_bad_repo_redirects_and_corrupt_xml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed repo metadata, redirects, and corrupt XML return ``('error', None)``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    # Malformed repo metadata (including dot segments) fails without making a request.
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not fetch invalid repo")),
+    )
+    for bad_repo in ("../evil", "./repo", "owner/..", "owner/.", "a/b/c", "noslash", ""):
+        assert fetch_latest_distribution_release(bad_repo) == ("error", None)
+
+    # HTTP 302 redirect refused.
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_k: _FakeResp(status_code=302, text=""))
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+    # Foreign resolved response URL refused.
+    class _RedirectedResp(_FakeResp):
+        url = "https://github.com/foreign-org/foreign-repo/releases.atom"
+
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _RedirectedResp(
+            status_code=200,
+            text=_releases_atom("v0.22.0-wukong.99", repo="example-org/omnigent-dist"),
+        ),
+    )
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+    # Corrupt XML and non-<feed> XML return error (not empty).
+    for bad_xml in ("<html><body>oops</body></html>", "<feed><entry>", "not xml at all"):
+        monkeypatch.setattr(
+            httpx, "get", lambda *_a, _b=bad_xml, **_k: _FakeResp(status_code=200, text=_b)
+        )
+        assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+
+def test_refresh_update_cache_writes_throttle_entry_on_corrupt_or_oversized_feed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Background refresh still writes throttle cache when XML is corrupt or fields overflow."""
+    import httpx
+
+    import omnigent.distribution as distribution
+    from omnigent.update_check import refresh_update_cache
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.21.0.dev0")
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(status_code=200, text="<feed><entry>corrupt"),
+    )
+
+    refresh_update_cache()
+
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.kind == "distribution"
+    assert not _is_stale(cached)
 
 
 @pytest.mark.parametrize(

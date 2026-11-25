@@ -103,8 +103,12 @@ _REDACTED_USERINFO = "****"
 # Strict format for stamped distribution releases (e.g. ``0.21.0-wukong.12``).
 # SemVer prerelease identifiers are not valid PEP 440, so distribution checks
 # parse and compare them with this pattern rather than ``packaging.version``.
+_DISTRIBUTION_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_MAX_VERSION_FIELD_DIGITS = 64
 _DISTRIBUTION_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)-wukong\.(\d+)$")
-_ATOM_TAG_HREF_RE = re.compile(r"/releases/tag/([^/?#]+)$")
+_ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+_WHEEL_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.whl$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass
@@ -332,12 +336,33 @@ def _run_installed_wheel_check() -> None:
         _spawn_background_refresh()
 
 
+def _normalize_distribution_repo(repo: str) -> str | None:
+    """Validate an ``owner/repo`` string, rejecting dot segments and malformed characters."""
+    if not isinstance(repo, str):
+        return None
+    trimmed = repo.strip()
+    parts = trimmed.split("/")
+    if len(parts) != 2:
+        return None
+    owner, name = parts
+    if (
+        not _DISTRIBUTION_REPO_SEGMENT_RE.match(owner)
+        or not _DISTRIBUTION_REPO_SEGMENT_RE.match(name)
+        or owner in (".", "..")
+        or name in (".", "..")
+    ):
+        return None
+    return f"{owner}/{name}"
+
+
 def _distribution_release_config() -> tuple[str, str] | None:
     """Return ``(release_repo, version)`` for a stamped distribution build, else ``None``."""
     from omnigent.distribution import DISTRIBUTION_RELEASE_REPO, DISTRIBUTION_VERSION
 
     if DISTRIBUTION_RELEASE_REPO and DISTRIBUTION_VERSION:
-        return DISTRIBUTION_RELEASE_REPO, DISTRIBUTION_VERSION
+        normalized_repo = _normalize_distribution_repo(DISTRIBUTION_RELEASE_REPO)
+        if normalized_repo is not None:
+            return normalized_repo, DISTRIBUTION_VERSION
     return None
 
 
@@ -346,12 +371,18 @@ def _parse_distribution_version(value: str) -> tuple[int, int, int, int] | None:
     match = _DISTRIBUTION_VERSION_RE.match(value.strip())
     if match is None:
         return None
-    return (
-        int(match.group(1)),
-        int(match.group(2)),
-        int(match.group(3)),
-        int(match.group(4)),
-    )
+    groups = (match.group(1), match.group(2), match.group(3), match.group(4))
+    if any(len(part) > _MAX_VERSION_FIELD_DIGITS for part in groups):
+        return None
+    try:
+        return (
+            int(groups[0]),
+            int(groups[1]),
+            int(groups[2]),
+            int(groups[3]),
+        )
+    except ValueError:
+        return None
 
 
 def _is_newer_distribution_version(latest: str, current: str) -> bool:
@@ -367,28 +398,89 @@ def _is_newer_distribution_version(latest: str, current: str) -> bool:
     return latest_key > current_key
 
 
-def _parse_releases_atom_versions(xml_text: str) -> list[str]:
-    """Extract valid distribution versions from a GitHub ``releases.atom`` feed."""
+def _validate_distribution_feed_url(raw_url: str, repo: str) -> str | None:
+    """Verify *raw_url* is the exact canonical GitHub ``releases.atom`` URL for *repo*."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    canonical = f"https://github.com/{normalized_repo}/releases.atom"
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "github.com"
+        or parts.query != ""
+        or parts.fragment != ""
+        or parts.path != f"/{normalized_repo}/releases.atom"
+        or raw_url != canonical
+    ):
+        return None
+    return canonical
+
+
+def _parse_expected_release_tag_url(raw_url: str, repo: str) -> str | None:
+    """Validate an Atom alternate link URL against *repo* and return its version string."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "github.com"
+        or parts.query != ""
+        or parts.fragment != ""
+    ):
+        return None
+    expected_owner, expected_name = normalized_repo.split("/")
+    segments = parts.path.split("/")
+    if (
+        len(segments) != 6
+        or segments[0] != ""
+        or segments[1] != expected_owner
+        or segments[2] != expected_name
+        or segments[3] != "releases"
+        or segments[4] != "tag"
+    ):
+        return None
+    raw_tag = segments[5]
+    if _parse_distribution_version(raw_tag) is None:
+        return None
+    canonical = f"https://github.com/{expected_owner}/{expected_name}/releases/tag/{raw_tag}"
+    if raw_url != canonical:
+        return None
+    return raw_tag.removeprefix("v")
+
+
+def _parse_releases_atom_versions(xml_text: str, repo: str) -> list[str]:
+    """Extract valid distribution versions from a GitHub ``releases.atom`` feed bound to *repo*."""
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None:
+        raise ValueError(f"Invalid distribution repository: {repo!r}")
     root = ET.fromstring(xml_text)
+    if root.tag not in ("feed", f"{{{_ATOM_NAMESPACE}}}feed"):
+        raise ValueError("Atom feed root element must be <feed>")
     versions: list[str] = []
-    for entry in root.iter():
-        if not entry.tag.endswith("entry"):
+    for entry in root:
+        if entry.tag not in ("entry", f"{{{_ATOM_NAMESPACE}}}entry"):
             continue
-        candidate: str | None = None
         for child in entry:
-            if child.tag.endswith("link"):
-                href = child.attrib.get("href", "")
-                match = _ATOM_TAG_HREF_RE.search(href)
-                if match is not None:
-                    candidate = match.group(1)
-                    break
-        if candidate is None:
-            for child in entry:
-                if child.tag.endswith("id") and child.text:
-                    candidate = child.text.strip().rsplit("/", 1)[-1]
-                    break
-        if candidate and _parse_distribution_version(candidate) is not None:
-            versions.append(candidate.removeprefix("v"))
+            if child.tag not in ("link", f"{{{_ATOM_NAMESPACE}}}link"):
+                continue
+            rel = child.attrib.get("rel")
+            if rel is not None and rel != "alternate":
+                continue
+            href = child.attrib.get("href", "")
+            version = _parse_expected_release_tag_url(href, normalized_repo)
+            if version is not None:
+                versions.append(version)
+                break
     return versions
 
 
@@ -407,11 +499,14 @@ def fetch_latest_distribution_release(
     :returns: ``("ok", version)`` when a matching release exists,
         ``("empty", None)`` when the feed is 404 or holds no matching releases
         (e.g. before the first public release), or ``("error", None)`` on a
-        network / HTTP / XML parse failure.
+        network / HTTP / redirect / XML parse failure.
     """
     import httpx
 
-    url = f"https://github.com/{repo}/releases.atom"
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None:
+        return "error", None
+    url = f"https://github.com/{normalized_repo}/releases.atom"
     resp = None
     for _ in range(max(1, attempts)):
         try:
@@ -419,25 +514,104 @@ def fetch_latest_distribution_release(
                 url,
                 headers={"Accept": "application/atom+xml, application/xml, text/xml"},
                 timeout=timeout,
-                follow_redirects=True,
+                follow_redirects=False,
             )
             break
         except httpx.HTTPError:
             resp = None
     if resp is None:
         return "error", None
+    if 300 <= resp.status_code < 400:
+        return "error", None
+    resp_url = getattr(resp, "url", None)
+    if resp_url is not None:
+        resp_url_str = str(resp_url)
+        if resp_url_str and _validate_distribution_feed_url(resp_url_str, normalized_repo) is None:
+            return "error", None
     if resp.status_code == 404:
         return "empty", None
     if resp.status_code != 200:
         return "error", None
     try:
-        versions = _parse_releases_atom_versions(resp.text)
-    except ET.ParseError:
+        versions = _parse_releases_atom_versions(resp.text, normalized_repo)
+    except (ET.ParseError, ValueError):
         return "error", None
     if not versions:
         return "empty", None
     best = max(versions, key=lambda v: _parse_distribution_version(v) or (0, 0, 0, 0))
     return "ok", best
+
+
+_ALLOWED_RELEASE_ASSET_HOSTS = frozenset(
+    {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+)
+
+
+def fetch_distribution_wheel_urls(
+    repo: str,
+    version: str,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> dict[str, str] | None:
+    """Fetch and validate prebuilt wheel URLs from a release's ``wukong-wheels.txt`` manifest."""
+    from urllib.parse import urljoin, urlsplit
+
+    import httpx
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(version) is None:
+        return None
+    tag = f"v{version.removeprefix('v')}"
+    current_url = f"https://github.com/{normalized_repo}/releases/download/{tag}/wukong-wheels.txt"
+    resp = None
+    for _ in range(4):
+        try:
+            resp = httpx.get(current_url, timeout=timeout, follow_redirects=False)
+        except httpx.HTTPError:
+            return None
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("location")
+            if not location:
+                return None
+            next_url = urljoin(current_url, location)
+            parts = urlsplit(next_url)
+            if parts.scheme != "https" or parts.hostname not in _ALLOWED_RELEASE_ASSET_HOSTS:
+                return None
+            if parts.hostname == "github.com" and not parts.path.startswith(
+                f"/{normalized_repo}/releases/"
+            ):
+                return None
+            current_url = next_url
+            continue
+        break
+    if resp is None or resp.status_code != 200:
+        return None
+    expected_tag: str | None = None
+    wheels: dict[str, str] = {}
+    for raw_line in resp.text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("# tag "):
+            expected_tag = line.removeprefix("# tag ").strip()
+            continue
+        if line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            return None
+        pkg, filename, sha256 = parts
+        if (
+            pkg not in ("omnigent", "omnigent-client", "omnigent-ui-sdk")
+            or not _WHEEL_FILENAME_RE.match(filename)
+            or ".." in filename
+            or not _SHA256_HEX_RE.match(sha256)
+        ):
+            return None
+        wheels[pkg] = f"https://github.com/{normalized_repo}/releases/download/{tag}/{filename}"
+    if expected_tag != tag or set(wheels) != {"omnigent", "omnigent-client", "omnigent-ui-sdk"}:
+        return None
+    return wheels
 
 
 def _run_distribution_release_check(
@@ -795,7 +969,10 @@ def refresh_update_cache() -> None:
         dist_cfg = _distribution_release_config()
         if dist_cfg is not None:
             repo, _ = dist_cfg
-            status, latest = fetch_latest_distribution_release(repo)
+            try:
+                status, latest = fetch_latest_distribution_release(repo)
+            except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
+                status, latest = "error", None
             prev = _read_cache()
             prev_dist = prev if prev is not None and prev.kind == "distribution" else None
             last_notified = prev_dist.last_notified_version if prev_dist is not None else ""
@@ -2173,9 +2350,10 @@ def _upgrade_failure_message(
     dist_cfg = _distribution_release_config()
     if dist_cfg is not None:
         repo, _ = dist_cfg
+        extra_args = f" -s --{extra_flags}" if extra_flags else ""
         reinstall_line = (
             f"    curl -fsSL https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.sh "
-            f"| sh -s -- --repo https://github.com/{repo}.git{extra_flags}\n"
+            f"| sh{extra_args}\n"
         )
     else:
         reinstall_line = f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"

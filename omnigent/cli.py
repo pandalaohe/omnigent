@@ -6608,12 +6608,17 @@ def _upgrade_distribution_install(
     from omnigent.distribution import DISTRIBUTION_NAME
     from omnigent.update_check import (
         _UPGRADE_INDEX_TIMEOUT_SECONDS,
+        _UV_REINSTALL_PACKAGE,
         _build_upgrade_suggestion,
+        _extras_str,
         _is_newer_distribution_version,
         _probe_distribution_version,
         _run_upgrade_command,
         _upgrade_failure_message,
+        _UpgradeSuggestion,
+        _uv_python_pin,
         _uv_tool_receipt_path,
+        fetch_distribution_wheel_urls,
         fetch_latest_distribution_release,
     )
 
@@ -6641,6 +6646,9 @@ def _upgrade_distribution_install(
     if check_only:
         raise SystemExit(1)
 
+    wheel_urls = fetch_distribution_wheel_urls(
+        repo, target, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
+    )
     target_vcs_url = f"git+https://github.com/{repo}.git@v{target}"
     if info.detected_installer == "pip":
         click.echo(
@@ -6665,11 +6673,24 @@ def _upgrade_distribution_install(
         )
         raise SystemExit(0)
 
-    suggestion = _build_upgrade_suggestion(
-        info,
-        extra_overrides=extra_overrides,
-        target_vcs_url=target_vcs_url,
-    )
+    if wheel_urls is not None and (info.detected_installer or info.installer) == "uv":
+        extras = sorted(set(info.extras) | set(extra_overrides))
+        extras_suffix = _extras_str(extras)
+        suggestion = _UpgradeSuggestion(
+            command=(
+                f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                f"--with 'omnigent-client @ {wheel_urls['omnigent-client']}' "
+                f"--with 'omnigent-ui-sdk @ {wheel_urls['omnigent-ui-sdk']}' "
+                f"'omnigent{extras_suffix} @ {wheel_urls['omnigent']}'"
+            ),
+            runnable=True,
+        )
+    else:
+        suggestion = _build_upgrade_suggestion(
+            info,
+            extra_overrides=extra_overrides,
+            target_vcs_url=target_vcs_url,
+        )
     if not suggestion.runnable:
         raise click.ClickException(
             f"No automatic upgrade command is known for this install. {suggestion.command}."

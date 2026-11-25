@@ -635,11 +635,14 @@ export interface GlobalShortcutStatus extends GlobalShortcutSetting {
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
+export type UpdateDeliveryMode = "auto" | "manual-download";
 
 export interface UpdateConfig {
   mode: UpdateMode;
   autoInstall: boolean;
   skippedVersion: string | null;
+  /** How updates are delivered; `"manual-download"` opens a release page instead of self-installing. */
+  deliveryMode?: UpdateDeliveryMode;
 }
 
 export type UpdateStatus = {
