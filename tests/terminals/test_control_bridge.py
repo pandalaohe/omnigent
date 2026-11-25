@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -27,10 +28,11 @@ import tempfile
 import termios
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import create_terminal_instance
@@ -1700,11 +1702,20 @@ def _input_frame(data: bytes) -> dict[str, object]:
 
 
 def _start_bridge(
-    ws: _FakeWebSocket, sock: Path, target: str, *, read_only: bool = False
+    ws: _FakeWebSocket,
+    sock: Path,
+    target: str,
+    *,
+    read_only: bool = False,
+    browser_resize: bool = False,
 ) -> asyncio.Task[None]:
     return asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=read_only
+            cast("WebSocket", ws),
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=read_only,
+            browser_resize=browser_resize,
         )
     )
 
@@ -1786,6 +1797,36 @@ async def test_waiting_owner_takes_window_size_when_it_types(
         phone.frames.put_nowait({"type": "websocket.disconnect"})
         await asyncio.wait_for(tasks[1], timeout=10)
         assert await _settled_window_width(sock, target) == 160
+    finally:
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_browser_handover_uses_last_valid_resize() -> None:
+    sock, target = await _new_private_tmux("cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    tasks = [_start_bridge(desktop, sock, target, browser_resize=True)]
+
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        desktop.frames.put_nowait(_resize_frame(140, 40))
+        await _wait_for(lambda: _window_width(sock, target), 140)
+
+        tasks.append(_start_bridge(phone, sock, target, browser_resize=True))
+        await _wait_for(lambda: _client_widths(sock), [45, 140])
+        assert await _settled_window_width(sock, target) == 140
+
+        phone.frames.put_nowait(_input_frame(b""))
+        phone.frames.put_nowait(_resize_frame(50, 40))
+        await _wait_for(lambda: _client_widths(sock), [50, 140])
+        assert await _settled_window_width(sock, target) == 140
+
+        phone.frames.put_nowait(_resize_frame(MIN_FORWARDED_COLS - 1, MIN_FORWARDED_ROWS - 1))
+        phone.frames.put_nowait(_input_frame(b"x"))
+        assert await _settled_window_width(sock, target) == 50
     finally:
         for task in tasks:
             await _kill_and_join(sock, task)
@@ -1890,22 +1931,41 @@ async def test_browser_owner_keeps_local_terminal_size_until_handover(handover: 
     tmux = shutil.which("tmux")
     assert tmux
     sock, target = await _new_private_tmux("cat")
-    pty_fds: list[int] = []
+    loop = asyncio.get_running_loop()
+    controller: int | None = None
     local_terminal: subprocess.Popen[bytes] | None = None
     browser = _LiveWebSocket(_resize_frame(160, 40))
     tasks: list[asyncio.Task[None]] = []
+
+    def drain_terminal_output(fd: int) -> None:
+        try:
+            if os.read(fd, 65536):
+                return
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        loop.remove_reader(fd)
+
     try:
-        pty_fds.extend(pty.openpty())
-        tty = pty_fds[1]
-        fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
-        local_terminal = subprocess.Popen(
-            [tmux, "-S", str(sock), "attach", "-t", target],
-            stdin=tty,
-            stdout=tty,
-            stderr=tty,
-            start_new_session=True,
-            env={**os.environ, "TERM": "xterm-256color"},
-        )
+        controller, tty = pty.openpty()
+        try:
+            tty_name = os.ttyname(tty)
+            fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+            local_terminal = subprocess.Popen(
+                [tmux, "-S", str(sock), "attach", "-t", target],
+                stdin=tty,
+                stdout=tty,
+                stderr=tty,
+                start_new_session=True,
+                env={**os.environ, "TERM": "xterm-256color"},
+            )
+        finally:
+            os.close(tty)
+        # Consume tmux's native screen writes so the PTY can drain on exit.
+        os.set_blocking(controller, False)
+        loop.add_reader(controller, drain_terminal_output, controller)
         await _wait_for(lambda: _window_width(sock, target), 70)
         tasks.append(_start_bridge(browser, sock, target))
         await _wait_for(lambda: _client_widths(sock), [70, 160])
@@ -1915,17 +1975,20 @@ async def test_browser_owner_keeps_local_terminal_size_until_handover(handover: 
             browser.frames.put_nowait(_input_frame(b"x"))
         else:
             await _tmux_output(sock, "new-session", "-d", "-s", "other", "cat")
-            await _tmux_output(sock, "switch-client", "-c", os.ttyname(tty), "-t", "other")
+            await _tmux_output(sock, "switch-client", "-c", tty_name, "-t", "other")
         await _wait_for(lambda: _window_width(sock, target), 160)
     finally:
-        for task in tasks:
-            await _kill_and_join(sock, task)
-        await _kill_tmux(sock)
-        if local_terminal is not None:
-            local_terminal.kill()
-            local_terminal.wait()
-        for fd in pty_fds:
-            os.close(fd)
+        if controller is not None:
+            loop.remove_reader(controller)
+            os.close(controller)
+        try:
+            if local_terminal is not None:
+                local_terminal.kill()
+                local_terminal.wait(timeout=5)
+        finally:
+            for task in tasks:
+                await _kill_and_join(sock, task)
+            await _kill_tmux(sock)
 
 
 class _FakeClientQuery:

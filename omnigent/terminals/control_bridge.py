@@ -911,7 +911,8 @@ async def bridge_tmux_control_to_websocket(
             if len(parts) == 3:
                 output = window_name_filter.feed(unescape_control_output(parts[2]))
                 if output:
-                    cursor_requests.feed(output)
+                    if waiting_to_size:
+                        cursor_requests.feed(output)
                     output_chunks.put_nowait(output)
             return True
         buffer_name = _clipboard_buffer_name(line)
@@ -1061,8 +1062,12 @@ async def bridge_tmux_control_to_websocket(
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
-                    if not _is_terminal_report(
-                        data, cursor_reply_expected=cursor_requests.reply_expected()
+                    if (
+                        data
+                        and waiting_to_size
+                        and not _is_terminal_report(
+                            data, cursor_reply_expected=cursor_requests.reply_expected()
+                        )
                     ):
                         await _take_window_size()
                     for cmd in _hex_send_keys_commands(tmux_target, data):
