@@ -1275,7 +1275,6 @@ def _shell_scan(
                 kept.append(match[0])
                 index = match.end()
                 continue
-            heredocs_closed = False
         elif (char == "`" and closer != "`") or text.startswith("$(", index):
             backtick = char == "`"
             end, body, _, _ = _shell_scan(
@@ -1845,8 +1844,8 @@ def _windows_command_paths(
     windows_posix = posix_executor and _windows_posix(context)
     if windows_posix:
         assigned |= _shell_assignments(command, context)
-        end, outer, bodies, _ = _shell_scan(command, binding_paths=True)
-        if end != len(command):
+        end, outer, bodies, heredocs_closed = _shell_scan(command, binding_paths=True)
+        if end != len(command) or not heredocs_closed:
             raise ValueError("Uncheckable POSIX shell expansion")
         command = outer
         for body in bodies:

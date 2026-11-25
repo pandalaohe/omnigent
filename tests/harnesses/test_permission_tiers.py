@@ -1626,6 +1626,24 @@ def test_windows_git_bash_reassigned_host_variable_cannot_bind_a_path():
 @pytest.mark.parametrize(
     "command",
     [
+        "(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt",
+        "(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt\n",
+        "(( x = 1 << 2 ))\ncat ../control/tier",
+        "(( x = 1 << 2 ))\ncat ../control/tier\n",
+        "(( x = 1 << 2 ))\ncat report.txt:stream",
+        "(( x = 1 << 2 ))\ncat report.txt:stream\n",
+    ],
+)
+def test_windows_git_bash_unclosed_heredoc_scan_refuses_following_commands(command):
+    host = windows_host(shell="bash")
+    result = decision("auto", "sys_os_shell", {"command": command}, host)
+    assert result.action == Verdict.DENY
+    assert "Uncheckable POSIX shell expansion" in result.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "printf '%b' 'echo ok\\n' | bash",
         "printf '%s' 'echo ok' | sh",
         "printf '%s' 'echo ok' | (echo ready; sh)",
