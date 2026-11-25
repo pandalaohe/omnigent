@@ -85,8 +85,14 @@
             "title": "Anchor Content"
           },
           "anchor_metadata": {
-            "title": "Anchor Metadata",
-            "type": "null"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "body": {
             "description": "The comment text.",
@@ -3844,6 +3850,36 @@
           }
         },
         "title": "CodexPermissionObservation",
+        "type": "object"
+      },
+      "CommentPage": {
+        "description": "A bounded comment page; filtered pages can be empty and still have a cursor.",
+        "properties": {
+          "comments": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Comments",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "comments",
+          "next_cursor"
+        ],
+        "title": "CommentPage",
         "type": "object"
       },
       "CompactionCompletedEvent": {
@@ -9471,6 +9507,54 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "PullRequestCommentAnchor": {
+        "description": "Immutable PR coordinates for a session-only review comment.",
+        "properties": {
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "line": {
+            "format": "int64",
+            "title": "Line",
+            "type": "integer"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          },
+          "side": {
+            "title": "Side",
+            "type": "string"
+          },
+          "start_line": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Line"
+          }
+        },
+        "required": [
+          "pr_url",
+          "side",
+          "line",
+          "start_line",
+          "head_sha",
+          "base_sha"
+        ],
+        "title": "PullRequestCommentAnchor",
+        "type": "object"
+      },
       "PurchasedCard": {
         "additionalProperties": false,
         "properties": {
@@ -11069,6 +11153,11 @@
           "codex_nonblocking_decline": {
             "default": false,
             "title": "Codex Nonblocking Decline",
+            "type": "boolean"
+          },
+          "comment_anchor_metadata": {
+            "default": true,
+            "title": "Comment Anchor Metadata",
             "type": "boolean"
           },
           "connected_apps_available": {
@@ -38122,7 +38211,7 @@
     },
     "/v1/sessions/{session_id}/comments": {
       "get": {
-        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\nVisitor comments still in `draft` are omitted (the owner has not\nsent them to the agent); the owner's read path passes\n`include_visitor_drafts=true` to see them. Every returned visitor\nrow carries `source: \"visitor\"` and an untrusted-data note.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
+        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\nVisitor comments still in `draft` are omitted (the owner has not\nsent them to the agent); the owner's read path passes\n`include_visitor_drafts=true` to see them. Every returned visitor\nrow carries `source: \"visitor\"` and an untrusted-data note.\n\n**Returns:** A Files-only array, or a page in ID order when opted in. Path filtering happens after paging; follow next_cursor even when comments is empty. Pagination parameters apply only to this mode.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
         "operationId": "list_comments_v1_sessions__session_id__comments_get",
         "parameters": [
           {
@@ -38162,6 +38251,48 @@
               "title": "Include Visitor Drafts",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Opt in to bounded pages including PR anchors. Legacy callers receive the Files-only array.",
+            "in": "query",
+            "name": "include_pr_comments",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Pr Comments",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Maximum rows examined per page, plus one continuation row.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive comment ID from the previous page's next_cursor.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
           }
         ],
         "responses": {
@@ -38169,12 +38300,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get",
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommentPage"
+                    }
+                  ],
+                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get"
                 }
               }
             },

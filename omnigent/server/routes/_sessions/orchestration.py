@@ -6636,7 +6636,10 @@ async def _enrich_terminal_status_with_subagent_output(
         for key, value in provider_error_context_from_text(wire_detail).items():
             context.setdefault(key, value)
         data = {**data, "failure_context": context}
-    current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
+    superseded_response = data.get("superseded_response") is True
+    current_turn_only = (
+        status == "failed" or data.get("turn_outcome") == "cancelled" or superseded_response
+    )
     failure_detail = data.get("failure_detail") if status == "failed" else None
     if isinstance(failure_detail, str) and failure_detail.strip():
         context.setdefault("detail_source", "external_status_failure_detail")
@@ -6648,14 +6651,10 @@ async def _enrich_terminal_status_with_subagent_output(
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
         return data
-    if status == "idle" and data.get("turn_completed") is True and isinstance(existing, str):
-        return data
-    if current_turn_only and isinstance(existing, str) and existing.strip():
-        if status == "failed":
-            context.setdefault("detail_source", "external_status_output")
-        return data
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
+    if superseded_response and response_id is None:
+        return data
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,

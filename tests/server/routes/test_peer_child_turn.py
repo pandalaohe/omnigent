@@ -170,6 +170,26 @@ def stores(
     return conv, peer, mother, child, sender
 
 
+def test_classify_matches_the_terminal_response_when_two_turns_give_the_same_answer(
+    stores: Any,
+) -> None:
+    conv, peer, _, child, sender = stores
+    record = _record(peer, sender=sender.id, receiver=child.id)
+    parent_answer, peer_answer = "resp_parent", "resp_peer"
+    conv.append(
+        child.id,
+        [
+            _user("Please do my work."),
+            _assistant("Done").model_copy(update={"response_id": parent_answer}),
+            _user(_envelope(record)),
+            _assistant("Done").model_copy(update={"response_id": peer_answer}),
+        ],
+    )
+    assert classify_child_turn(conv, peer, child, "Done", response_id=parent_answer) is None
+    peer_turn = classify_child_turn(conv, peer, child, "Done", response_id=peer_answer)
+    assert peer_turn is not None and peer_turn.peer_id == record.id
+
+
 def test_classify_hit_returns_peer_turn(stores: Any) -> None:
     conv, peer, mother, child, sender = stores
     record = _record(peer, sender=sender.id, receiver=child.id, ref="ref-1")

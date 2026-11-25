@@ -1246,11 +1246,15 @@ class TranscriptRecordItems:
     e.g. ``"2026-09-10T13:23:13.274Z"``), or ``None`` when the record carries
     none. The sub-agent forwarder uses it to order a SendMessage resume
     record against the parent notification that set the terminal state.
+    A parsed record's start offset and resulting response identify the turn
+    even when a Stop saw an incomplete write.
     """
 
     next_byte_offset: int
     items: tuple[ClaudeTranscriptItem, ...]
     timestamp: str | None = None
+    active_response_id: str | None = None
+    byte_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1457,6 +1461,8 @@ class ClaudeHookRecord:
         payload's ``error_details`` field, e.g.
         ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -1488,6 +1494,8 @@ class ClaudeHookRecord:
     prompt_id: str | None = None
     retry_session_id: str | None = None
     retry_input_id: str | None = None
+    completion_output: str | None = None
+    stop_transcript_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -3934,6 +3942,10 @@ def record_hook_event(
             "recorded_at": time.time(),
             "payload": payload,
         }
+        transcript_path = payload.get("transcript_path")
+        if is_parent and event_name == "Stop" and isinstance(transcript_path, str):
+            with contextlib.suppress(OSError, ValueError):
+                envelope["stop_transcript_offset"] = Path(transcript_path).stat().st_size
         with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
 
@@ -4480,19 +4492,25 @@ def read_transcript_items_since_with_position(
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         if not isinstance(entry, dict):
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         task_notifications.extend(_task_notifications_from_entry(entry))
@@ -4531,15 +4549,16 @@ def read_transcript_items_since_with_position(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
                 timestamp=_record_timestamp(entry),
+                active_response_id=active_response_id,
+                byte_offset=record.byte_offset,
             )
         )
     items = _dedupe_compact_noop_echo(items)
     retained_source_ids = {item.source_id for item in items}
     record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
+        replace(
+            record,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
-            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -4703,19 +4722,25 @@ def read_transcript_items_from_offset(
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         if not isinstance(entry, dict):
             record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+                TranscriptRecordItems(
+                    record.next_byte_offset, (), active_response_id=active_response_id
+                )
             )
             continue
         task_notifications.extend(_task_notifications_from_entry(entry))
@@ -4759,15 +4784,16 @@ def read_transcript_items_from_offset(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
                 timestamp=_record_timestamp(entry),
+                active_response_id=active_response_id,
+                byte_offset=record.byte_offset,
             )
         )
     items = _dedupe_compact_noop_echo(items)
     retained_source_ids = {item.source_id for item in items}
     record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
+        replace(
+            record,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
-            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -5389,6 +5415,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         event_name = raw_event_name
     raw_source = payload.get("source") if isinstance(payload, dict) else None
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
+    stop_offset = envelope.get("stop_transcript_offset") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
     raw_agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
@@ -5475,6 +5502,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
@@ -5564,6 +5596,10 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
+        completion_output=completion_output,
+        stop_transcript_offset=stop_offset
+        if type(stop_offset) is int and stop_offset >= 0
+        else None,
     )
 
 

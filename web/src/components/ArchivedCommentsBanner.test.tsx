@@ -57,6 +57,17 @@ const COMMENTS = [
   makeComment("c1", "draft", "visitor:Alice"),
   makeComment("c2", "draft", null),
   makeComment("c3", "addressed"),
+  {
+    ...makeComment("c4", "draft"),
+    anchor_metadata: {
+      pr_url: "https://example.com/repo/pull/1",
+      side: "RIGHT" as const,
+      line: 7,
+      start_line: null,
+      head_sha: "a".repeat(40),
+      base_sha: "b".repeat(40),
+    },
+  },
 ];
 
 function renderBanner(comments: Comment[] = COMMENTS) {
@@ -115,6 +126,7 @@ describe("ArchivedCommentsBanner", () => {
   it("copies the formatted prompt without marking anything", async () => {
     mockSendAndPatch();
     renderBanner();
+    expect(screen.getByText("2 unhandled comments (1 from visitors)")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Copy as prompt" }));
 
@@ -147,6 +159,10 @@ describe("ArchivedCommentsBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
 
     await waitFor(() => expect(mocks.send).toHaveBeenCalled());
+    expect(JSON.parse(mocks.fetch.mock.calls[0][1].body)).toEqual({
+      comment_ids: ["c1", "c2"],
+      mark_addressed: false,
+    });
     expect(mocks.continueSession).toHaveBeenCalledWith("conv_arch");
     expect(mocks.navigate).toHaveBeenCalledWith("/c/conv_new");
     // The prompt is delivered into (and pinned to) the new session.

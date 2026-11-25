@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { copyText } from "@/lib/clipboard";
 import { unhandledCommentCounts } from "@/lib/comments";
 import { authenticatedFetch } from "@/lib/identity";
+import { isFileComment } from "@/lib/localReviewComments";
 import { useNavigate } from "@/lib/routing";
 import { continueArchivedSession } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -56,10 +57,12 @@ export function ArchivedCommentsBanner({
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
-  const { total, visitors } = unhandledCommentCounts(comments);
+  const { total, visitors } = unhandledCommentCounts(comments.filter(isFileComment));
 
   const formatPrompt = useCallback(async () => {
-    const draftIds = comments.filter((comment) => comment.status === "draft").map((c) => c.id);
+    const draftIds = comments
+      .filter((comment) => comment.status === "draft" && isFileComment(comment))
+      .map((comment) => comment.id);
     const res = await authenticatedFetch(
       `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
       {

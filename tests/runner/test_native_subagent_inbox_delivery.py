@@ -2213,6 +2213,78 @@ async def _post_terminal(
 
 
 @pytest.mark.asyncio
+async def test_explicit_empty_completion_survives_undrained_restart(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = _assistant_item("item_progress", "Still working")
+    app, server = _delivery_app([progress])
+    server._child_body["status"] = "idle"
+    inbox = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        registered_by="sys_session_send",
+    )
+    labels = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: entry.work_id}
+    stamping = asyncio.Event()
+    release_stamp = asyncio.Event()
+    post = server.post
+
+    async def persist(url: str, **kwargs: Any) -> Any:
+        assert kwargs.get("json", {}).get("type") != "external_conversation_item"
+        return await post(url, **kwargs)
+
+    async def patch(url: str, **kwargs: Any) -> Any:
+        updates = kwargs["json"]["labels"]
+        if subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY in updates:
+            stamping.set()
+            await release_stamp.wait()
+        labels.update(updates)
+        return server._Resp({})
+
+    monkeypatch.setattr(server, "post", persist)
+    monkeypatch.setattr(server, "patch", patch)
+    async with _runner_client(app) as client:
+        pending_ack = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "turn_completed": True, "output": ""},
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(stamping.wait(), timeout=5)
+            assert not pending_ack.done()
+            assert subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY not in labels
+        finally:
+            release_stamp.set()
+        result = await asyncio.wait_for(pending_ack, timeout=5)
+        assert result.status_code == 204, result.text
+
+    assert (
+        labels[subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY] == f"{entry.work_id}:completed:@empty"
+    )
+    assert inbox.qsize() == 1
+    subagent_work.unregister_subagent_work(CHILD_SESSION_ID)
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    recovery_server = _RecoveryServerClient(
+        [_child_summary(labels=labels)], child_items=server.items
+    )
+    restarted = create_runner_app(server_client=recovery_server)
+    await restarted.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    recovered = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert recovered["output"] == ""
+    assert recovered["work_id"] == entry.work_id
+    assert all("/items" not in url for url, _ in recovery_server.requests)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("addressing", ["session_id", "named"])
 @pytest.mark.parametrize("stale_after_start", [False, True])
 async def test_user_turn_result_cannot_complete_the_next_parent_dispatch(

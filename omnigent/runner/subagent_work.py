@@ -26,9 +26,16 @@ from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.subagent_retry import InboxOwnerFence, RetryFinal
 from omnigent.entities.subagent_terminal import (
+    EMPTY_SUBAGENT_RESULT_ITEM,
     RESULT_IDENTITY_LABEL_PREFIX,
     TERMINAL_IDENTITY_LABEL_PREFIX,
     TerminalEnvelope,
+)
+from omnigent.entities.subagent_terminal import (
+    SUBAGENT_DISPATCH_ID_LABEL_KEY as SUBAGENT_DISPATCH_ID_LABEL_KEY,
+)
+from omnigent.entities.subagent_terminal import (
+    SUBAGENT_RESULT_ITEM_LABEL_KEY as SUBAGENT_RESULT_ITEM_LABEL_KEY,
 )
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
@@ -107,13 +114,9 @@ _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH = "superseded_dispatch"
 # durable across a runner restart. The dispatch id is stamped when a turn is
 # sent to the child; the delivered id is the receipt the parent's
 # ``sys_read_inbox`` drain writes once it has consumed that turn's result.
-SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
 SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY = "omnigent.subagent.activity_unverified"
-# Pins an undrained parent result across peer turns: "<work_id>:<status>:<item_id>".
-# Restart recovery uses its outcome and item instead of the newer peer result.
-SUBAGENT_RESULT_ITEM_LABEL_KEY = "omnigent.subagent.result_item"
 SUBAGENT_LAST_TASK_ERROR_LABEL_KEYS: tuple[str, ...] = (
     "omnigent.last_task_error_code",
     "omnigent.last_task_error_message",
@@ -228,6 +231,7 @@ class _SubagentWorkEntry:
     delivered_result_key: str | None = None
     prior_result_key: str | None = None
     recovery_result: tuple[str, str | None, str | None] | None = None
+    empty_result_stamp: asyncio.Task[bool] | None = None
     recovery_turn_started: bool = False
     registered_by: str | None = None
     native_origin: str = CODEX_NATIVE_ORIGIN_UNKNOWN
@@ -985,6 +989,7 @@ def _stamped_result_item_id(
         or status not in _SUBAGENT_TERMINAL_STATUSES
         or not item_id
         or ":" in item_id
+        or (item_id == EMPTY_SUBAGENT_RESULT_ITEM and status != "completed")
     ):
         return None
     return status, item_id
@@ -1190,17 +1195,20 @@ async def _recover_subagent_results_from_server(
         stamped_result = _stamped_result_item_id(label_map, dispatch_id)
         if stamped_result is not None:
             recover_status, stamped_id = stamped_result
-            output = await _fetch_item_text_by_id(server_client, child_id, stamped_id)
-            if output is None:
-                _logger.warning(
-                    "Recovery result-item label names a missing item for child=%s "
-                    "dispatch=%s item=%s; skipping.",
-                    child_id,
-                    dispatch_id,
-                    stamped_id,
-                )
-                continue
-            result_key = stamped_id
+            if stamped_id == EMPTY_SUBAGENT_RESULT_ITEM:
+                output = ""
+            else:
+                output = await _fetch_item_text_by_id(server_client, child_id, stamped_id)
+                if output is None:
+                    _logger.warning(
+                        "Recovery result-item label names a missing item for child=%s "
+                        "dispatch=%s item=%s; skipping.",
+                        child_id,
+                        dispatch_id,
+                        stamped_id,
+                    )
+                    continue
+                result_key = stamped_id
             interrupted = False
         elif status == "failed":
             error = child.get("last_task_error")

@@ -40,6 +40,8 @@ import {
   type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
+import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
@@ -1287,8 +1289,11 @@ function UserBubble({
                     ? block.text
                     : userMarkdownText([block], taggedSessions);
                   if (!full.trim() || budget <= 0) return null;
-                  const visible = budget < full.length ? sliceByCodePoint(full, budget) : full;
-                  budget -= visible.length;
+                  const clipped = budget < full.length;
+                  const prefix = clipped ? sliceByCodePoint(full, budget) : full;
+                  budget -= prefix.length;
+                  const visible =
+                    clipped && !isShellCommand ? omitIncompleteLocalReviewComment(prefix) : prefix;
                   if (isShellCommand)
                     return (
                       <pre key={key} className="whitespace-pre-wrap break-words font-mono text-sm">
@@ -1302,6 +1307,7 @@ function UserBubble({
                       breaks
                       mode="static"
                       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                      renderLocalReviewComment={renderLocalReviewComment}
                     >
                       {visible}
                     </FilePathAwareMessageResponse>

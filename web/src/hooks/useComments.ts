@@ -1,3 +1,9 @@
+import {
+  isLocalReviewComment,
+  sameLocalReviewAnchor,
+  type LocalReviewAnchor,
+} from "@/lib/localReviewComments";
+import { removeLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 // TanStack Query hooks for the comments API:
 // POST/GET/PATCH/DELETE /v1/sessions/{id}/comments
 // POST /v1/sessions/{id}/comments/send
@@ -35,6 +41,7 @@ export interface Comment {
   anchor_content: string | null;
   created_by: string | null;
   screenshot_expires_at?: number;
+  anchor_metadata?: LocalReviewAnchor | null;
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────
@@ -46,16 +53,37 @@ export function commentsQueryKey(sessionId: string, path?: string) {
   return path ? ["comments", sessionId, path] : ["comments", sessionId];
 }
 
-export async function fetchComments(sessionId: string, path?: string): Promise<Comment[]> {
+export async function fetchComments(
+  sessionId: string,
+  path?: string,
+  signal?: AbortSignal,
+): Promise<Comment[]> {
   // Visitor drafts are hidden from the agent-facing read path unless the
   // owner's client asks for them; the owner's panels and inbox need to see
   // them before they are sent.
   const url = path
     ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?include_visitor_drafts=1&path=${encodeURIComponent(path)}`
     : `/v1/sessions/${encodeURIComponent(sessionId)}/comments?include_visitor_drafts=1`;
-  const res = await authenticatedFetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as Comment[];
+  const pageUrl = `${url}&include_pr_comments=true&limit=100`;
+  const comments: Comment[] = [];
+  let cursor: string | null = null;
+  do {
+    // eslint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
+    const res = await authenticatedFetch(
+      `${pageUrl}${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`,
+      { signal },
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop -- Decode this page before following its cursor.
+    const page: Comment[] | { comments: Comment[]; next_cursor: string | null } = await res.json();
+    // Older servers ignore the opt-in and return their Files-only array.
+    if (Array.isArray(page)) return page;
+    comments.push(...page.comments);
+    cursor = page.next_cursor;
+  } while (cursor);
+  return comments.sort(
+    (left, right) => left.created_at - right.created_at || left.id.localeCompare(right.id),
+  );
 }
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
@@ -68,34 +96,68 @@ export async function fetchComments(sessionId: string, path?: string): Promise<C
 export function useComments(sessionId: string | undefined, path?: string) {
   return useQuery({
     queryKey: commentsQueryKey(sessionId ?? "", path),
-    queryFn: () => fetchComments(sessionId!, path),
+    queryFn: ({ signal }) => fetchComments(sessionId!, path, signal),
     enabled: !!sessionId,
     staleTime: 2_000,
   });
+}
+
+export interface AddCommentPayload {
+  path: string;
+  start_index: number;
+  end_index: number;
+  body: string;
+  anchor_content?: string | null;
+  anchor_metadata?: LocalReviewAnchor;
+}
+
+export async function createComment(
+  sessionId: string,
+  payload: AddCommentPayload,
+): Promise<Comment> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/comments`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const comment: Comment = await response.json();
+  if (
+    payload.anchor_metadata &&
+    (!isLocalReviewComment(comment) ||
+      comment.conversation_id !== sessionId ||
+      comment.path !== payload.path ||
+      !sameLocalReviewAnchor(payload.anchor_metadata, comment.anchor_metadata!))
+  ) {
+    const message = "This server did not preserve the review location. Your draft is saved.";
+    // A mixed-version deployment may accept the request as an ordinary Files comment.
+    try {
+      if (!comment?.id) throw new Error("Missing comment ID");
+      await deleteComment(sessionId, comment.id);
+    } catch {
+      throw new Error(`${message} A comment may remain in Files; remove it before retrying.`);
+    }
+    throw new Error(`${message} Update the server before retrying.`);
+  }
+  return comment;
+}
+
+async function deleteComment(sessionId: string, commentId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${res.statusText}`);
 }
 
 /** POST /v1/sessions/{id}/comments */
 export function useAddComment(sessionId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (payload: {
-      path: string;
-      start_index: number;
-      end_index: number;
-      body: string;
-      anchor_content?: string | null;
-    }) => {
-      const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-      );
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Comment;
-    },
+    mutationFn: (payload: AddCommentPayload) => createComment(sessionId, payload),
     onSuccess: (comment) => {
       // Invalidate both the full-session list and the per-file list
       // so the sidebar and any per-file views refresh.
@@ -113,14 +175,9 @@ export function useAddComment(sessionId: string) {
 export function useDeleteComment(sessionId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (commentId: string) => {
-      const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
-        { method: "DELETE" },
-      );
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    },
-    onSuccess: () => {
+    mutationFn: (commentId: string) => deleteComment(sessionId, commentId),
+    onSuccess: (_, commentId) => {
+      removeLocalReviewContext(sessionId, commentId);
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
@@ -143,9 +200,16 @@ export function useUpdateComment(sessionId: string) {
         },
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Comment;
+      const comment: Comment = await res.json();
+      if (comment.id !== commentId || comment.conversation_id !== sessionId) {
+        throw new Error(
+          "This server returned a different comment. Your attached context is unchanged.",
+        );
+      }
+      return comment;
     },
-    onSuccess: () => {
+    onSuccess: (comment) => {
+      updateLocalReviewContext(comment);
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });

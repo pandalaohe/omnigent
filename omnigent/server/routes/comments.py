@@ -12,12 +12,13 @@ import logging
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Request
-from pydantic import BaseModel, model_validator
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, field_validator, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Comment
+from omnigent.entities.comment import PullRequestCommentAnchor
 from omnigent.entities.comment_location import (
     TEXT_ANCHOR_PREFIX,
     comment_location,
@@ -41,7 +42,11 @@ from omnigent.server.routes._errors import session_not_found
 from omnigent.server.visitor_screenshots import VisitorScreenshotFiles
 from omnigent.stores import ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store import (
+    MAX_COMMENT_PAGE_SIZE,
+    CommentStore,
+    serialize_comment_anchor,
+)
 from omnigent.stores.comment_store.visitor_comments import (
     VISITOR_FEEDBACK_HEADER,
     comment_rows,
@@ -330,6 +335,13 @@ def _annotation_attachments(
 # ── Request models ─────────────────────────────────────────────────────────────
 
 
+class CommentPage(BaseModel):
+    """A bounded comment page; filtered pages can be empty and still have a cursor."""
+
+    comments: list[dict[str, Any]]
+    next_cursor: str | None
+
+
 class AddCommentRequest(BaseModel):
     """Request body for ``POST /sessions/{id}/comments``.
 
@@ -349,7 +361,16 @@ class AddCommentRequest(BaseModel):
     start_index: int
     end_index: int
     anchor_content: str | None = None
-    anchor_metadata: None = None
+    anchor_metadata: PullRequestCommentAnchor | None = None
+
+    @field_validator("anchor_metadata")
+    @classmethod
+    def _validate_anchor_storage_size(
+        cls, anchor: PullRequestCommentAnchor | None
+    ) -> PullRequestCommentAnchor | None:
+        """Reject anchors that cannot fit the persisted column with a validation error."""
+        serialize_comment_anchor(anchor)
+        return anchor
 
     @model_validator(mode="after")
     def _validate_range(self) -> AddCommentRequest:
@@ -567,6 +588,7 @@ def create_comments_router(
             start_index=body.start_index,
             end_index=body.end_index,
             anchor_content=body.anchor_content,
+            anchor_metadata=body.anchor_metadata,
             # Map the single-user "local" sentinel to None (matching the
             # sessions/messages write paths) so single-user comments record
             # no author and stay editable/deletable by any editor — both the
@@ -582,7 +604,10 @@ def create_comments_router(
         session_id: str,
         path: str | None = None,
         include_visitor_drafts: bool = False,
-    ) -> list[dict[str, Any]]:
+        include_pr_comments: bool = False,
+        limit: int = Query(MAX_COMMENT_PAGE_SIZE, ge=1, le=MAX_COMMENT_PAGE_SIZE),
+        after: str | None = Query(None, pattern=r"^[0-9a-f]{32}$"),
+    ) -> list[dict[str, Any]] | CommentPage:
         """List comments for a session, optionally filtered by file.
 
         Requires ``LEVEL_READ`` on the session in multi-user mode.
@@ -598,18 +623,38 @@ def create_comments_router(
             e.g. ``"src/App.tsx"``.
         :param include_visitor_drafts: When ``True``, include visitor
             comments that are still drafts.
-        :returns: List of serialized comment dicts.
+        :param include_pr_comments: Opt in to bounded pages including PR anchors.
+            Legacy callers receive the Files-only array.
+        :param limit: Maximum rows examined per page, plus one continuation row.
+        :param after: Exclusive comment ID from the previous page's next_cursor.
+        :returns: A Files-only array, or a page in ID order when opted in.
+            Path filtering happens after paging; follow next_cursor even when
+            comments is empty. Pagination parameters apply only to this mode.
         :raises OmnigentError: 401/403/404 if the user lacks read permission.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_READ)
-        if screenshot_files is not None:
+        if screenshot_files is not None and (not include_pr_comments or after is None):
             try:
                 await asyncio.to_thread(screenshot_files.clean_expired_and_count, session_id)
             except Exception:
                 logger.warning(
                     "Visitor screenshot cleanup failed for session %s", session_id, exc_info=True
                 )
+        if include_pr_comments:
+            comments, next_cursor = await asyncio.to_thread(
+                store.list_page, session_id, limit=limit, after_id=after
+            )
+            return CommentPage(
+                comments=comment_rows(
+                    [comment for comment in comments if path is None or comment.path == path],
+                    include_visitor_drafts=include_visitor_drafts,
+                    visitor_screenshot_allowed=screenshot_files.is_bound
+                    if screenshot_files
+                    else None,
+                ),
+                next_cursor=next_cursor,
+            )
         comments = store.list_for_conversation(session_id, path=path)
         return comment_rows(
             [comment for comment in comments if comment.anchor_metadata is None],

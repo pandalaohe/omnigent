@@ -240,6 +240,7 @@ def _scan_foreign_turn(
     *,
     output: str | None,
     require_x: bool,
+    response_id: str | None = None,
 ) -> _ForeignTurn | None:
     """Walk the child's transcript and verify a foreign-started turn.
 
@@ -262,7 +263,12 @@ def _scan_foreign_turn(
             # Items newer than X are outside the window; only X itself matters.
             # X is the newest assistant text that equals the edge output
             # exactly — surrounding whitespace is a different message.
-            if isinstance(data, MessageData) and not data.is_meta and data.role == "assistant":
+            if (
+                (response_id is None or item.response_id == response_id)
+                and isinstance(data, MessageData)
+                and not data.is_meta
+                and data.role == "assistant"
+            ):
                 text = _message_text(data.content)
                 if text is not None and text == output:
                     x_found = True
@@ -319,7 +325,12 @@ def classify_child_turn(
             return None
         if sdk_delivery is None:
             turn = _scan_foreign_turn(
-                conversation_store, peer_store, child, output=output, require_x=True
+                conversation_store,
+                peer_store,
+                child,
+                output=output,
+                require_x=True,
+                response_id=response_id,
             )
         else:
             # SDK receipt and output writers can persist in either order.

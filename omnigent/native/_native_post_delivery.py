@@ -189,6 +189,7 @@ async def post_external_session_status(
     turn_completed: bool | None = None,
     terminal: TerminalEnvelope | None = None,
     native_generation: int | None = None,
+    superseded_response: bool = False,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -202,7 +203,8 @@ async def post_external_session_status(
         ``"failed"``, ``"stopped"``, or ``"killed"``.
     :param output: Optional text attached to ``data``. For structured terminal
         edges this is the correlated child result; on failure the server also
-        surfaces it as ``last_task_error``. Ignored when falsy.
+        surfaces it as ``last_task_error``. ``None`` omits it; an empty string
+        reports an explicitly empty reply.
     :param background_task_count: Background tasks (shells) still running at the
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
@@ -232,6 +234,8 @@ async def post_external_session_status(
         edge that cannot distinguish "finished" from "stopped early".
     :param failure_context: Optional bounded native error evidence, independent
         of display text. Older servers ignore this additive field.
+    :param superseded_response: A newer response has started. Deliver this
+        result without publishing its idle as the current session state.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -250,7 +254,7 @@ async def post_external_session_status(
         data.update(identity)
         if terminal.error is not None:
             data["terminal_error"] = terminal.error
-    if output:
+    if output is not None:
         data["output"] = output
     if failure_detail:
         data["failure_detail"] = failure_detail
@@ -266,6 +270,8 @@ async def post_external_session_status(
         data["replayed"] = True
     if turn_completed is not None:
         data["turn_completed"] = turn_completed
+    if superseded_response:
+        data["superseded_response"] = True
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

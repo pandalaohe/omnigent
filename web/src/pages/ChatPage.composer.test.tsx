@@ -1,10 +1,13 @@
 import * as voiceApi from "@/lib/voiceInputApi";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { create } from "zustand";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseCommentsModule from "@/hooks/useComments";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
@@ -123,7 +126,10 @@ vi.mock("@/hooks/usePullRequests", () => ({
 
 // The archived-comments banner reads session comments via a TanStack query
 // hook; stub it so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useComments", () => ({ useComments: () => ({ data: [] }) }));
+vi.mock("@/hooks/useComments", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseCommentsModule>()),
+  useComments: () => ({ data: [] }),
+}));
 // The session chips read react-query; their own suites cover them.
 vi.mock("@/components/StandingApprovalChip", () => ({
   StandingApprovalChip: () => <span data-testid="standing-approval-chip-stub" />,
@@ -7480,6 +7486,166 @@ describe("Composer reply quotes", () => {
       if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
     },
   );
+
+  it("preserves review context through legacy edits and a failed deletion, then sends or removes it", async () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <Composer {...props} ref={ref} />
+      </QueryClientProvider>,
+    );
+    act(() => ref.current?.appendReplyQuote("Existing quote"));
+    fireEvent.change(textarea(), { target: { value: "My instructions" } });
+    const comment = {
+      id: "123",
+      conversation_id: "conv_test",
+      path: "src/example.ts",
+      start_index: 0,
+      end_index: 0,
+      body: "Preserve the public API.",
+      status: "draft" as const,
+      created_at: 1,
+      updated_at: 1,
+      anchor_content: null,
+      created_by: null,
+      anchor_metadata: {
+        pr_url: "https://github.com/acme/repo/pull/1",
+        side: "RIGHT" as const,
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    expect(textarea()).toHaveValue("My instructions");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Existing quote");
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() =>
+      updateLocalReviewContext({ ...comment, body: "Updated review", anchor_metadata: undefined }),
+    );
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain('"id": "123"');
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("Updated review");
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Attached: src/example.ts]");
+    const [sentText, , sentReply] = vi.mocked(props.onSend).mock.calls[0]!;
+    expect(serializeReplyDraft(sentReply!)).toBe(sentText);
+    expect(sentText.indexOf("My instructions")).toBeLessThan(
+      sentText.indexOf("```local-review-comment"),
+    );
+    expect(sentText).not.toContain("Please address these local review comments:");
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    act(() => ref.current?.appendReplyQuote("Keep this quote"));
+    fireEvent.change(textarea(), { target: { value: "Keep these instructions" } });
+    const attachment = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const secondAttachment = new File(["more"], "more.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [attachment, secondAttachment] },
+    });
+    fireEvent.change(textarea(), {
+      target: { value: "Keep these instructions [file 1] between files [file 2] after both" },
+    });
+    const draft = getSessionDraft("conv_test");
+    const textWithAttachment = textarea().value;
+    expect(textWithAttachment).toContain("Keep these instructions [file 1]");
+    expect(draft?.files).toEqual([attachment, secondAttachment]);
+    const request = vi.spyOn(identity, "authenticatedFetch");
+    request.mockRejectedValueOnce(new TypeError("Network error"));
+    request.mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const error = vi.spyOn(toast, "error");
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith("Couldn't delete comment: Network error"),
+    );
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    expect(getSessionDraft("conv_test")).toEqual(draft);
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument(),
+    );
+    expect(request).toHaveBeenLastCalledWith("/v1/sessions/conv_test/comments/123", {
+      method: "DELETE",
+    });
+    expect(getSessionDraft("conv_test")).toEqual({ ...draft, reviewComments: [] });
+    expect(textarea()).toHaveValue(textWithAttachment);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Keep this quote");
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    act(() => requestLocalReviewContext({ ...comment, id: "456" }));
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain('"id": "456"');
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain('"id": "123"');
+    const [, sentFiles, , parts] = vi.mocked(props.onSend).mock.calls[1]!;
+    expect(sentFiles).toEqual([attachment, secondAttachment]);
+    expect(
+      parts?.map((part: ComposerDraftPart) => (part.type === "attachment" ? part.file : part.text)),
+    ).toEqual([
+      expect.stringMatching(/> Keep this quote[\s\S]*Keep these instructions/),
+      attachment,
+      expect.stringContaining("between files"),
+      secondAttachment,
+      expect.stringContaining("after both"),
+      expect.stringContaining("```local-review-comment"),
+    ]);
+
+    const batch = [
+      { ...comment, id: "789" },
+      {
+        ...comment,
+        id: "1011",
+        body: "Keep the old behavior for this range.",
+        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+      },
+    ];
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+    expect(screen.queryByText("notes.txt")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => batch.forEach(requestLocalReviewContext));
+    expect(screen.getAllByLabelText(/Open local review comment/)).toHaveLength(2);
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toBeEnabled();
+    fireEvent.click(send);
+    expect(props.onSend).toHaveBeenNthCalledWith(3, formatLocalReviewComments(batch), undefined);
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+
+    for (const quote of [false, true]) {
+      fireEvent.change(textarea(), { target: { value: "Only explain the changes" } });
+      if (quote) act(() => ref.current?.appendReplyQuote("Quoted context"));
+      act(() => requestLocalReviewContext(comment));
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      const [message, , reply] = vi.mocked(props.onSend).mock.lastCall!;
+      expect(message).toBe(
+        `Only explain the changes${quote ? "\n\n> Quoted context" : ""}\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
+      );
+      if (reply) expect(serializeReplyDraft(reply)).toBe(message);
+    }
+  });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {
     const props = composerProps();

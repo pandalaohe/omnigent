@@ -223,6 +223,7 @@ _CLEAR_SUCCESSOR_BIND_TIMEOUT_S = 180.0
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
+_MAX_RESPONSE_BOUNDARIES = 128
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 # A batch gets a bounded number of attempts before it is split into
 # source-keyed individual posts. Individual transient failures stay pending
@@ -916,6 +917,8 @@ class TranscriptForwardState:
         has no output yet. Cleared by subsequent output and persisted for retries.
     :param api_error_response_id: Response that produced the retained API error.
         A queued prompt can clear ``current_response_id`` before its hook posts.
+    :param response_boundaries: Recent changes in active response by transcript
+        offset, so a delayed Stop can be correlated after a restart.
     """
 
     transcript_path: Path
@@ -929,6 +932,7 @@ class TranscriptForwardState:
     pending_settled_at: float | None = None
     api_error_context: FailureContext | None = None
     api_error_response_id: str | None = None
+    response_boundaries: tuple[tuple[int, str | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1862,13 +1866,10 @@ async def forward_claude_transcript_to_session(
                             task_subjects=task_subjects,
                             task_statuses=task_statuses,
                             task_order=task_order,
-                            # The turn-end edges (Stop→idle / StopFailure→failed)
-                            # carry the turn's response id so ap-web can CLOSE the
-                            # streaming ``activeResponse`` opened by the turn-start
-                            # ``running`` edge. The transcript forwarder ran just
-                            # above, so ``state.current_response_id`` is the active
-                            # turn's id.
+                            # Stop uses the response at its transcript boundary.
+                            # Older hooks and StopFailure fall back to the current response.
                             response_id=state.current_response_id,
+                            transcript_state=state,
                             diagnostic_health=diagnostic_health,
                             hooks_cutoff_byte_offset=hooks_cutoff_byte_offset,
                         )
@@ -6270,6 +6271,7 @@ async def _forward_available_status_events(
     task_order: list[str],
     compaction_retry_tracker: _PostRetryTracker | None = None,
     response_id: str | None = None,
+    transcript_state: TranscriptForwardState | None = None,
     diagnostic_health: Callable[[], FailureContext] | None = None,
     hooks_cutoff_byte_offset: int | None = None,
 ) -> HookForwardState:
@@ -6316,6 +6318,7 @@ async def _forward_available_status_events(
         closes the streaming ``activeResponse`` opened by the matching
         turn-start ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
+    :param transcript_state: Recent response boundaries for correlating Stop.
     :param diagnostic_health: Latest metadata-only diagnostic follower snapshot.
     :param hooks_cutoff_byte_offset: Hooks-file size taken before this poll's
         transcript read; only records ending at or before it are forwarded, so a
@@ -6612,6 +6615,13 @@ async def _forward_available_status_events(
         failure_context: FailureContext | None = None
         transcript_context: FailureContext | None = None
         status_response_id = response_id
+        superseded = False
+        if (
+            status == "idle"
+            and transcript_state is not None
+            and record.stop_transcript_offset is not None
+        ):
+            status_response_id, superseded = _response_at_stop(record, transcript_state)
         if status == "failed":
             failure_context_phase = "transcript_lookup"
             try:
@@ -6683,7 +6693,7 @@ async def _forward_available_status_events(
                     parent_id=None,
                     status="completed" if status == "idle" else "failed",
                     data={
-                        "turn_id": record.terminal_turn_id or response_id,
+                        "turn_id": record.terminal_turn_id or status_response_id,
                         "input_id": record.terminal_input_id,
                     },
                 ),
@@ -6706,6 +6716,9 @@ async def _forward_available_status_events(
                 if status == "failed"
                 else None,
                 failure_context=failure_context,
+                # The Stop hook may arrive before its final transcript item is mirrored.
+                output=record.completion_output if status == "idle" else None,
+                superseded_response=superseded,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -6749,7 +6762,7 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
-        if status_response_id is not None:
+        if status_response_id is not None and not superseded:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
             # wake (see _promote_pending_settle and the bridge parser).
@@ -6769,6 +6782,40 @@ async def _forward_available_status_events(
     )
     await _write_hook_state_async(bridge_dir, durable)
     return durable
+
+
+def _response_at_stop(
+    record: ClaudeHookRecord, state: TranscriptForwardState
+) -> tuple[str | None, bool]:
+    """Return the stopped response and whether a later transcript turn exists."""
+    offset = record.stop_transcript_offset
+    if offset is None or record.transcript_path != state.transcript_path:
+        return None, True
+    if not state.response_boundaries:
+        return state.current_response_id, False
+    for index in range(len(state.response_boundaries) - 1, -1, -1):
+        boundary_offset, response_id = state.response_boundaries[index]
+        if boundary_offset <= offset:
+            return response_id, index < len(state.response_boundaries) - 1
+    return None, bool(state.response_boundaries)
+
+
+def _response_boundaries(
+    state: TranscriptForwardState, result: TranscriptReadResult
+) -> tuple[tuple[int, str | None], ...]:
+    boundaries = list(state.response_boundaries) or [
+        (state.byte_offset or 0, state.current_response_id)
+    ]
+    for record in result.record_items:
+        # A Stop can see the first bytes of a record before its newline.
+        offset = (
+            record.byte_offset + 1 if record.byte_offset is not None else record.next_byte_offset
+        )
+        if offset > boundaries[-1][0] and record.active_response_id != boundaries[-1][1]:
+            boundaries.append((offset, record.active_response_id))
+    if len(boundaries) == 1 and not state.response_boundaries:
+        return ()
+    return tuple(boundaries[-_MAX_RESPONSE_BOUNDARIES:])
 
 
 async def _ensure_state_for_transcript(
@@ -7610,6 +7657,9 @@ async def _forward_transcript_item_batch(
     )
     if updated != state:
         await _write_forward_state_async(bridge_dir, updated)
+    # These boundaries describe parsed bytes even while failed item delivery
+    # holds the durable item cursor behind them.
+    updated = replace(updated, response_boundaries=_response_boundaries(state, result))
     for item in items:
         if item.source_id in seen:
             continue
@@ -8322,12 +8372,20 @@ def _read_transcript_items_for_state(
             pending_settled_response_id=pending_settled_response_id,
             pending_settled_at=pending_settled_at,
         )
+    response_at_cursor = next(
+        (
+            response
+            for offset, response in reversed(state.response_boundaries)
+            if offset <= state.byte_offset
+        ),
+        state.current_response_id,
+    )
     return read_transcript_items_from_offset(
         state.transcript_path,
         state.byte_offset,
         start_line=state.line_cursor,
         agent_name=agent_name,
-        current_response_id=state.current_response_id,
+        current_response_id=response_at_cursor,
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
         pending_settled_at=pending_settled_at,
@@ -11068,6 +11126,21 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         pending_settled_at=pending_settled_at,
         api_error_context=normalize_failure_context(raw.get("api_error_context")) or None,
         api_error_response_id=api_error_response_id,
+        response_boundaries=_read_response_boundaries(raw.get("response_boundaries")),
+    )
+
+
+def _read_response_boundaries(raw: object) -> tuple[tuple[int, str | None], ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        (entry[0], entry[1])
+        for entry in raw[-_MAX_RESPONSE_BOUNDARIES:]
+        if isinstance(entry, list)
+        and len(entry) == 2
+        and type(entry[0]) is int
+        and entry[0] >= 0
+        and (entry[1] is None or isinstance(entry[1], str))
     )
 
 
@@ -11090,6 +11163,8 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         "seen_source_ids": list(state.seen_source_ids),
         "updated_at": time.time(),
     }
+    if state.response_boundaries:
+        payload["response_boundaries"] = state.response_boundaries
     if state.byte_offset is not None:
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:

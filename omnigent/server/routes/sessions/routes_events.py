@@ -55,6 +55,10 @@ from omnigent.entities.subagent_retry import (
     retry_identity,
 )
 from omnigent.entities.subagent_terminal import (
+    EMPTY_SUBAGENT_RESULT_ITEM,
+    RESULT_IDENTITY_LABEL_PREFIX,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
+    SUBAGENT_RESULT_ITEM_LABEL_KEY,
     TERMINAL_IDENTITY_LABEL_PREFIX,
     TurnIdentity,
 )
@@ -421,6 +425,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     ConversationArchiveClosingError,
+    LabelGroupChange,
     runner_seen_is_fresh,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -4167,6 +4172,17 @@ def register_events_routes(
                     f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            superseded_response = (
+                status == "idle"
+                and body.data.get("turn_completed") is True
+                and body.data.get("superseded_response") is True
+            )
+            if superseded_response and not _has_bound_runner_authority(request, conv):
+                await _require_access_and_level(
+                    user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+                )
+            if not superseded_response:
+                body.data.pop("superseded_response", None)
             sdk_peer_terminal = "sdk_peer_delivery" in body.data
             if status in {"idle", "completed", "failed", "stopped", "killed"}:
                 if not native_terminal_generation_is_current(conv, body.data):
@@ -4439,7 +4455,7 @@ def register_events_routes(
                 data["background_tasks"] = [
                     task.model_dump(exclude_none=True) for task in bg_tasks
                 ]
-            if conv.kind == "sub_agent":
+            if conv.kind == "sub_agent" and not superseded_response:
                 durable_terminal_status = "completed" if status == "idle" else status
                 if status in {"running", "waiting"}:
                     durable_terminal_status = ""
@@ -4460,11 +4476,52 @@ def register_events_routes(
                             16
                         )
                         force_native_child_fanout = True
-                    await asyncio.to_thread(
-                        conversation_store.set_labels,
-                        session_id,
-                        label_updates,
-                    )
+                    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+                    if (
+                        dispatch_id
+                        and status == "idle"
+                        and data.get("turn_completed") is True
+                        and body.data.get("output") == ""
+                    ):
+                        if not _has_bound_runner_authority(request, conv):
+                            await _require_access_and_level(
+                                user_id,
+                                session_id,
+                                LEVEL_OWNER,
+                                permission_store,
+                                conversation_store,
+                            )
+
+                        def pin_empty_completion(labels: dict[str, str]) -> LabelGroupChange:
+                            if labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY) != dispatch_id:
+                                return LabelGroupChange({}, set())
+                            pin = labels.get(SUBAGENT_RESULT_ITEM_LABEL_KEY, "")
+                            if pin.partition(":")[0] == dispatch_id:
+                                return LabelGroupChange(label_updates, set())
+                            identity = TurnIdentity.from_data(data).identity_labels(
+                                RESULT_IDENTITY_LABEL_PREFIX
+                            )
+                            return LabelGroupChange(
+                                {
+                                    **label_updates,
+                                    **identity,
+                                    SUBAGENT_RESULT_ITEM_LABEL_KEY: (
+                                        f"{dispatch_id}:completed:{EMPTY_SUBAGENT_RESULT_ITEM}"
+                                    ),
+                                },
+                                set(),
+                            )
+
+                        await asyncio.to_thread(
+                            conversation_store.mutate_label_group,
+                            session_id,
+                            "omnigent.subagent.",
+                            pin_empty_completion,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels, session_id, label_updates
+                        )
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -4572,7 +4629,9 @@ def register_events_routes(
                     input_generation=provider_input_generation,
                 )
             recovered_from_failure = (
-                turn_completed and _session_status_cache.get(session_id) == "failed"
+                turn_completed
+                and not superseded_response
+                and _session_status_cache.get(session_id) == "failed"
             )
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(
@@ -4608,7 +4667,7 @@ def register_events_routes(
                 active_response = _session_active_response_cache.get(session_id)
                 if active_response is not None and active_response != response_id:
                     return {"queued": False}
-            if conv.parent_conversation_id is not None:
+            if conv.parent_conversation_id is not None and not superseded_response:
                 identity = TurnIdentity.from_data(data)
                 identity_labels = identity.identity_labels()
                 if data.get("event_kind") == "dispatch_failed":
@@ -4616,25 +4675,27 @@ def register_events_routes(
                         "dispatch_failed"
                     )
                 await asyncio.to_thread(conversation_store.set_labels, session_id, identity_labels)
-            _publish_status(
-                session_id,
-                public_status,
-                status_error,
-                turn_completed=turn_completed,
-                failure_origin="external_session_status",
-                failure_intake=failure_intake,
-                failure_context=data.get("failure_context"),
-                response_id=response_id,
-                background_task_count=bg_count,
-                background_tasks=bg_tasks,
-                blocked_on=blocked_on,
-            )
+            if not superseded_response:
+                _publish_status(
+                    session_id,
+                    public_status,
+                    status_error,
+                    turn_completed=turn_completed,
+                    failure_origin="external_session_status",
+                    failure_intake=failure_intake,
+                    failure_context=data.get("failure_context"),
+                    response_id=response_id,
+                    background_task_count=bg_count,
+                    background_tasks=bg_tasks,
+                    blocked_on=blocked_on,
+                )
             if force_native_child_fanout:
                 # A same-value cache edge is still a durable marker change;
                 # always send the latest DB projection to the parent rail.
                 _publish_child_status_to_parent(session_id, None)
             if (
                 conv.parent_conversation_id is not None
+                and not superseded_response
                 and status in {"idle", "completed", "failed", "stopped", "killed"}
                 and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
             ):
@@ -4710,13 +4771,14 @@ def register_events_routes(
                 if flags.enabled(Feature.SESSION_PEER_MESSAGING):
                     try:
                         peer_turn = sdk_peer_turn
-                        if not sdk_peer_terminal:
+                        if not sdk_peer_terminal and (not superseded_response or response_id):
                             peer_turn = await asyncio.to_thread(
                                 classify_child_turn,
                                 conversation_store,
                                 peer_message_store,
                                 conv,
                                 data.get("output"),
+                                response_id=response_id if superseded_response else None,
                             )
                     except Exception:
                         _logger.warning(

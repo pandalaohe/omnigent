@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TERMINAL_IDENTITY_LABEL_PREFIX = "omnigent.subagent.identity."
 RESULT_IDENTITY_LABEL_PREFIX = "omnigent.subagent.result_identity."
+SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
+SUBAGENT_RESULT_ITEM_LABEL_KEY = "omnigent.subagent.result_item"
+EMPTY_SUBAGENT_RESULT_ITEM = "@empty"
 
 
 def _identifier(value: object) -> str | None:

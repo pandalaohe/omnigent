@@ -8213,9 +8213,19 @@ async def test_codex_resume_terminal_keeps_generation_fence(
     }
     if outcome == "failed":
         b["error"] = {"message": "recovered failure"}
+    before_resume = len(recorder.posts)
     await fwd._post_resume_turn_status(
-        recorder, session_id=sid, bridge_dir=tmp_path, thread_id="thread", turns=[a, b]
+        recorder,
+        session_id=sid,
+        bridge_dir=tmp_path,
+        thread_id="thread",
+        turns=[a, b],
+        replay_from_turn_id=current.active_turn_id,
     )
+    if missed_start and outcome != "failed":
+        assert len(recorder.posts) == before_resume
+        assert [data["response_id"] for data in forwarded] == ["codex_A"]
+        return
     recovered = recorder.posts[-1][1]
     assert recovered["data"]["recovered"] is True
     assert (await client.post(url, json=recovered)).status_code == 202
@@ -8493,12 +8503,19 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+@pytest.mark.parametrize(
+    ("wire_output", "superseded"),
+    [(None, False), ("HOOK_FINAL", False), ("", False), ("HOOK_FINAL", True)],
+)
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    wire_output: str | None,
+    superseded: bool,
 ) -> None:
     """
-    Native idle status forwarding includes AP-persisted assistant text.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -8506,7 +8523,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     may not have the Omnigent transcript in local memory.
     """
 
+    from omnigent.server.routes import sessions as sessions_module
+
     forwarded: list[dict[str, Any]] = []
+    pins_at_forward: list[str | None] = []
+    store = SqlAlchemyConversationStore(db_uri)
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """
@@ -8515,10 +8536,15 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         :param request: Request sent to the fake runner.
         :returns: Accepted response.
         """
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_status":
+            session = store.get_conversation(request.url.path.split("/")[-2])
+            assert session is not None
+            pins_at_forward.append(session.labels.get("omnigent.subagent.result_item"))
         forwarded.append(
             {
                 "path": request.url.path,
-                "body": json.loads(request.content),
+                "body": body,
             }
         )
         return httpx.Response(204)
@@ -8541,6 +8567,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         )
         assert child_resp.status_code == 201, child_resp.text
         child = child_resp.json()
+        store.set_labels(child["id"], {"omnigent.subagent.dispatch_id": "child-work"})
 
         item_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
@@ -8563,27 +8590,41 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         assert item_resp.status_code == 202, item_resp.text
 
         forwarded.clear()
+        status_data: dict[str, Any] = {
+            "status": "idle",
+            "response_id": "resp_native_done",
+            "input_id": "native-input",
+            "input_generation": 999,
+        }
+        if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
+            status_data["output"] = wire_output
+            status_data["turn_completed"] = True
+        if superseded:
+            status_data["superseded_response"] = True
+            monkeypatch.setitem(sessions_module._session_status_cache, child["id"], "running")
+            monkeypatch.setitem(
+                sessions_module._session_active_response_cache, child["id"], "resp_next_turn"
+            )
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={
-                "type": "external_session_status",
-                "data": {
-                    "status": "idle",
-                    "response_id": "resp_native_done",
-                    "input_id": "native-input",
-                    "input_generation": 999,
-                },
-            },
+            json={"type": "external_session_status", "data": status_data},
         )
 
     assert status_resp.status_code == 202, status_resp.text
+    assert pins_at_forward == (["child-work:completed:@empty"] if wire_output == "" else [None])
     child_snapshot = await client.get(f"/v1/sessions/{child['id']}")
     assert child_snapshot.status_code == 200, child_snapshot.text
-    assert child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == "completed"
     labels = child_snapshot.json()["labels"]
-    assert labels["omnigent.subagent.identity.turn_id"] == "resp_native_done"
-    assert labels["omnigent.subagent.identity.input_id"] == "native-input"
-    assert labels["omnigent.subagent.identity.input_generation"] == ""
+    if superseded:
+        assert sessions_module._session_status_cache[child["id"]] == "running"
+        assert sessions_module._session_active_response_cache[child["id"]] == "resp_next_turn"
+        assert labels.get("omnigent.subagent.terminal_status") != "completed"
+    else:
+        assert labels["omnigent.subagent.terminal_status"] == "completed"
+        assert labels["omnigent.subagent.identity.turn_id"] == "resp_native_done"
+        assert labels["omnigent.subagent.identity.input_id"] == "native-input"
+        assert labels["omnigent.subagent.identity.input_generation"] == ""
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
@@ -8591,9 +8632,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
                 "type": "external_session_status",
                 "data": {
                     "status": "idle",
-                    "output": "AP_NATIVE_DONE",
+                    "output": "AP_NATIVE_DONE" if wire_output is None else wire_output,
                     "response_id": "resp_native_done",
                     "input_id": "native-input",
+                    **({"turn_completed": True} if wire_output is not None else {}),
+                    **({"superseded_response": True} if superseded else {}),
                 },
                 "model_override": None,
                 "tools": None,

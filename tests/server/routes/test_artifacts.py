@@ -3078,6 +3078,19 @@ async def test_visitor_element_screenshot_is_owned_and_expires(
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from omnigent.server.routes.comments import create_comments_router
+
+    app.include_router(
+        create_comments_router(
+            app.state.test_comment_store,
+            auth_provider=app.state.test_auth_provider,
+            permission_store=app.state.test_permission_store,
+            conversation_store=app.state.test_store,
+            file_store=app.state.test_file_store,
+            artifact_store=app.state.test_artifact_store,
+        ),
+        prefix="/v1",
+    )
     minted = await _mint(client, view="visit")
     started = now_epoch()
     response = await _post_visitor_comment(
@@ -3120,6 +3133,45 @@ async def test_visitor_element_screenshot_is_owned_and_expires(
     content = await client.get(f"/v1/sessions/{_SESSION_ID}/resources/files/{stored.id}/content")
     assert content.status_code == 200
     assert content.content.startswith(b"\x89PNG")
+
+    second = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        anchor_content=_visitor_element_anchor(),
+        screenshot=_visitor_png(),
+    )
+    assert second.status_code == 201, second.text
+    expiry = max(screenshot["expires_at"], second.json()["expires_at"])
+    cleaned_sessions: list[str] = []
+    clean = VisitorScreenshotFiles.clean_expired_and_count
+
+    def record_cleanup(files: VisitorScreenshotFiles, session_id: str, **kwargs: Any) -> int:
+        cleaned_sessions.append(session_id)
+        return clean(files, session_id, **kwargs)
+
+    monkeypatch.setattr(VisitorScreenshotFiles, "clean_expired_and_count", record_cleanup)
+    params = {"include_pr_comments": "true", "include_visitor_drafts": "true", "limit": "1"}
+    first = await client.get(f"/v1/sessions/{_SESSION_ID}/comments", params=params)
+    assert first.status_code == 200, first.text
+    page = first.json()
+    [first_comment] = page["comments"]
+    assert (first_comment["annotation"]["screenshot"] is None) == (
+        first_comment["id"] == forged.id
+    )
+    monkeypatch.setattr("omnigent.server.visitor_screenshots.now_epoch", lambda: expiry)
+    remaining = []
+    while cursor := page["next_cursor"]:
+        continuation = await client.get(
+            f"/v1/sessions/{_SESSION_ID}/comments", params={**params, "after": cursor}
+        )
+        assert continuation.status_code == 200, continuation.text
+        page = continuation.json()
+        [row] = page["comments"]
+        assert row["annotation"]["screenshot"] is None
+        remaining.append(row["id"])
+    assert len(remaining) == 2
+    assert cleaned_sessions == [_SESSION_ID]
+
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.routes_resources.now_epoch",
         lambda: screenshot["expires_at"],

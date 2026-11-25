@@ -69,6 +69,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.entities.subagent_retry import InputExecutionClaim, InputExecutionReceipt
 from omnigent.entities.subagent_terminal import (
+    EMPTY_SUBAGENT_RESULT_ITEM,
     RESULT_IDENTITY_LABEL_PREFIX,
     TerminalEnvelope,
     TurnIdentity,
@@ -1632,7 +1633,11 @@ def _rekey_subagent_work_for_succession(
 
 
 async def _fetch_assistant_item_with_text(
-    server_client: httpx.AsyncClient, session_id: str, text: str
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    text: str,
+    *,
+    response_id: str | None = None,
 ) -> tuple[str | None, str] | None:
     """
     Return the newest assistant item whose joined text equals *text*.
@@ -1644,6 +1649,7 @@ async def _fetch_assistant_item_with_text(
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
     :param text: The terminal edge's reported output text.
+    :param response_id: Restrict lookup to a known response when it was superseded.
     :returns: The server item id and joined text, or ``None`` when no
         assistant item matches.
     :raises _SubagentRecoveryReadError: When a page read fails.
@@ -1652,6 +1658,8 @@ async def _fetch_assistant_item_with_text(
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
+            if response_id is not None and item.get("response_id") != response_id:
+                continue
             if item.get("type") != "message" or item.get("is_meta") is True:
                 continue
             if item.get("role") != "assistant":
@@ -1706,6 +1714,7 @@ async def _result_key(
     snapshot: _SessionSnapshot | None = None,
     *,
     output: str | None = None,
+    response_id: str | None = None,
 ) -> str | None:
     """
     Resolve one terminal result's identity from the result it reports.
@@ -1725,20 +1734,25 @@ async def _result_key(
     :param snapshot: The child's snapshot when one was already read; a failed
         snapshot skips the read rather than paying a doomed request.
     :param output: The terminal edge's reported output text, or ``None``.
+    :param response_id: Exact response to use when a newer response has started.
     :returns: The server item id, or ``None`` when the result cannot be
         identified.
     """
     if snapshot is not None and not snapshot.ok:
         return None
-    reported = output if isinstance(output, str) and output else None
+    if output == "":
+        return None
+    reported = output if isinstance(output, str) else None
     last_error: Exception | None = None
     for _attempt in range(2):
         try:
             if reported is not None:
                 item = await _fetch_assistant_item_with_text(
-                    server_client, child_session_id, reported
+                    server_client, child_session_id, reported, response_id=response_id
                 )
                 return None if item is None else item[0]
+            if response_id is not None:
+                return None
             tail = await _fetch_latest_assistant_item(server_client, child_session_id)
             if tail is None:
                 return None
@@ -9217,7 +9231,7 @@ def create_runner_app(
 
     def _stamp_subagent_result_item_soon(
         child_session_id: str, work_id: str, status: str, result_key: str | None
-    ) -> None:
+    ) -> asyncio.Task[bool] | None:
         """Best-effort pin an undrained parent result's terminal status and item.
 
         Later peer and self-started turns can finish before the parent drains
@@ -9227,30 +9241,47 @@ def create_runner_app(
 
         entry = get_subagent_work(child_session_id)
         if entry is None or entry.work_id != work_id:
-            return
+            return None
         previous = entry.recovery_result
         if previous is not None:
             if entry.recovery_turn_started:
-                return
+                return None
             if previous[1] != result_key and not (
                 previous[0] == "completed"
                 and status in {"failed", "stopped", "killed"}
                 and result_key is None
             ):
-                return
+                return None
         snapshot_output = entry.output if result_key is None else None
         snapshot_terminal = entry.terminal
+        explicit_empty = status == "completed" and snapshot_output == ""
+        empty_stamp = entry.empty_result_stamp
+        if (
+            explicit_empty
+            and empty_stamp is not None
+            and (
+                not empty_stamp.done()
+                or (
+                    not empty_stamp.cancelled()
+                    and empty_stamp.exception() is None
+                    and empty_stamp.result()
+                )
+            )
+        ):
+            return empty_stamp
         entry.recovery_result = (status, result_key, snapshot_output)
         lock = _subagent_work.in_flight_send_lock(child_session_id)
         tracked_entry: _SubagentWorkEntry = entry
 
-        async def _stamp() -> None:
+        async def _stamp() -> bool:
             async with lock:
                 if get_subagent_work(child_session_id) is not tracked_entry:
-                    return
+                    return False
                 current = tracked_entry.recovery_result
                 assert current is not None
                 pinned_status, pinned_key, pinned_output = current
+                if pinned_key is None and pinned_status == "completed" and pinned_output == "":
+                    pinned_key = EMPTY_SUBAGENT_RESULT_ITEM
                 if pinned_key is None:
                     text = pinned_output or (
                         "[System: sub-agent completed with no output]"
@@ -9291,17 +9322,18 @@ def create_runner_app(
                             child_session_id,
                             exc,
                         )
-                        return
+                        return False
                     if not isinstance(pinned_key, str) or not pinned_key:
                         _logger.warning(
                             "Missing persisted sub-agent result id for child=%s", child_session_id
                         )
-                        return
+                        return False
                 if get_subagent_work(child_session_id) is not tracked_entry:
-                    return
+                    return False
                 if (
                     tracked_entry.recovery_result == current
                     and tracked_entry.delivered_result_key is None
+                    and pinned_key != EMPTY_SUBAGENT_RESULT_ITEM
                 ):
                     tracked_entry.delivered_result_key = pinned_key
                 error = await _patch_subagent_label(
@@ -9319,14 +9351,17 @@ def create_runner_app(
                     child_session_id,
                     error,
                 )
+            return error is None
 
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
+            return None
         task = loop.create_task(_stamp())
+        if explicit_empty:
+            entry.empty_result_stamp = task
 
-        def _finished(task: asyncio.Task[None]) -> None:
+        def _finished(task: asyncio.Task[bool]) -> None:
             _background_tasks.discard(task)
             if (
                 get_subagent_work(child_session_id) is None
@@ -9337,6 +9372,7 @@ def create_runner_app(
 
         task.add_done_callback(_finished)
         _background_tasks.add(task)
+        return task
 
     def _record_peer_turn_copy(
         child_session_id: str,
@@ -13023,6 +13059,9 @@ def create_runner_app(
         if body_type == "external_session_status":
             data = body.get("data") if isinstance(body, dict) else None
             status = data.get("status") if isinstance(data, dict) else None
+            superseded_response = (
+                isinstance(data, dict) and data.get("superseded_response") is True
+            )
             if status == "running" and isinstance(data, dict):
                 _turn_identities[conversation_id] = TurnIdentity.from_data(data).model_dump()
             forwarded_output = data.get("output") if isinstance(data, dict) else None
@@ -13082,14 +13121,19 @@ def create_runner_app(
                     # while its parent inbox is still unavailable.
                     terminal_status = "cancelled"
                     output = recovered_entry.output
-            if isinstance(data, dict) and status in (
-                "running",
-                "waiting",
-                "idle",
-                "completed",
-                "failed",
-                "stopped",
-                "killed",
+            if (
+                isinstance(data, dict)
+                and not superseded_response
+                and status
+                in (
+                    "running",
+                    "waiting",
+                    "idle",
+                    "completed",
+                    "failed",
+                    "stopped",
+                    "killed",
+                )
             ):
                 raw_count = data.get("background_task_count")
                 bg_count = (
@@ -13120,9 +13164,9 @@ def create_runner_app(
                     background_task_count=bg_count,
                     background_tasks=bg_tasks,
                 )
-            if status in ("idle", "failed"):
+            if not superseded_response and status in ("idle", "failed"):
                 pr_reports.notify(conversation_id)
-            if status in ("running", "waiting", "idle", "failed"):
+            if not superseded_response and status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too: GET/rebind serve them without emitting a second
                 # completion edge, and the idle watchdog reads them for native turns.
@@ -13154,7 +13198,14 @@ def create_runner_app(
                     # from that hand-back), so an inbox entry and a wake notice
                     # would deliver it twice.
                     return Response(status_code=204)
-                result_key = await _result_key(server_client, conversation_id, output=output)
+                if superseded_response:
+                    response_id = data.get("response_id") if isinstance(data, dict) else None
+                    if isinstance(response_id, str) and response_id:
+                        result_key = await _result_key(
+                            server_client, conversation_id, output=output, response_id=response_id
+                        )
+                else:
+                    result_key = await _result_key(server_client, conversation_id, output=output)
                 if peer_copy:
                     # A peer turn is a silent copy on the parent's runner: no
                     # inbox item, no wake, no work entry and no member settle.
@@ -13247,7 +13298,8 @@ def create_runner_app(
                 and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
             )
             if terminal_status is not None:
-                _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                if not superseded_response:
+                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
                 if terminal_status == "cancelled":
                     output = output or "[System: sub-agent interrupted]"
                 elif terminal_status == "failed":
@@ -13316,7 +13368,8 @@ def create_runner_app(
                         only_if_work_id=interrupt_work_id,
                     )
                 elif status in ("idle", "completed"):
-                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    if not superseded_response:
+                        _native_interrupt_runner.clear_pending_interrupt(conversation_id)
                     # Only a confirmed turn-end (``turn_completed``) may correct an
                     # optimistic grace-timer cancellation; a legacy harness's bare
                     # idle is unconfirmed and must not overturn it.
@@ -13342,6 +13395,27 @@ def create_runner_app(
             if delivery_ack is not None and delivery_ack.pending is not None:
                 delivery_ack = await asyncio.shield(delivery_ack.pending)
             if delivery_ack is not None:
+                settled = delivery_ack.entry
+                if (
+                    delivery_ack.delivered
+                    and turn_completed is True
+                    and output == ""
+                    and settled is not None
+                    and settled.output == ""
+                    and settled.terminal is not None
+                    and settled.terminal.identity_key == external_terminal.identity_key
+                ):
+                    stamp = _stamp_subagent_result_item_soon(
+                        conversation_id, settled.work_id, "completed", None
+                    )
+                    if stamp is not None and not await asyncio.shield(stamp):
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "subagent_delivery_not_confirmed",
+                                "reason": "result_not_persisted",
+                            },
+                        )
                 if delivery_ack.reason == "held":
                     return JSONResponse(
                         status_code=200,
