@@ -1415,12 +1415,22 @@ class AcpExecutor(Executor):
         if kind == _UPDATE_TOOL_CALL:
             self._permission_calls[call_id] = copy.deepcopy(update)
             return
+        is_agy = is_antigravity_acp_command(self._config.command)
         pending = self._permission_calls.get(call_id)
         if pending is None:
+            if (
+                self._config.host_permission_tier
+                and is_agy
+                and update.get("status") == "pending"
+                and call_id not in self._answered_permission_calls
+            ):
+                self._permission_calls[call_id] = {
+                    key: copy.deepcopy(update[key])
+                    for key in ("kind", "name", "title", "rawInput")
+                    if update.get(key) is not None
+                }
             return
-        same_value = (
-            _same_json_value if is_antigravity_acp_command(self._config.command) else operator.eq
-        )
+        same_value = _same_json_value if is_agy else operator.eq
         changes = {
             key: update[key]
             for key in ("kind", "name", "title", "rawInput")
