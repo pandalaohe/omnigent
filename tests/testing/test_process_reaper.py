@@ -13,7 +13,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -30,15 +29,14 @@ from omnigent.testing.process_reaper import (
     write_owner_marker,
 )
 from tests._helpers.polling import poll_until
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 # A child that lives until reaped. The argv embeds marker tokens so the
 # matcher can attribute it by command line.
-_SLEEP_CHILD = "import time\ntime.sleep(120)\n"
+_SLEEP_CHILD = "import time\nprint('{\"ready\": true}', flush=True)\ntime.sleep(120)\n"
 
 # A child that ignores SIGTERM, forcing the reaper's KILL escalation.
-_STUBBORN_CHILD = (
-    "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(120)\n"
-)
+_STUBBORN_CHILD = "import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" + _SLEEP_CHILD
 
 
 @pytest.fixture
@@ -57,7 +55,7 @@ def _spawn(code: str, *argv_markers: str, env: dict[str, str] | None = None) -> 
     :param env: Optional environment override for the child.
     :returns: The child process handle.
     """
-    return subprocess.Popen(
+    child = subprocess.Popen(
         [
             sys.executable,
             "-c",
@@ -66,9 +64,24 @@ def _spawn(code: str, *argv_markers: str, env: dict[str, str] | None = None) -> 
             *argv_markers,
         ],
         env=env,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        text=True,
     )
+    return _wait_ready(child)
+
+
+def _wait_ready(child: subprocess.Popen[str]) -> subprocess.Popen[str]:
+    """Wait for exec completion and any child-specific signal setup."""
+    assert child.stdout is not None
+    try:
+        assert read_json_line(child.stdout, timeout_s=10) == {"ready": True}
+    except BaseException:
+        _kill_quietly(child)
+        raise
+    finally:
+        child.stdout.close()
+    return child
 
 
 def _kill_quietly(proc: subprocess.Popen) -> None:
@@ -184,7 +197,7 @@ def test_ignores_pytest_processes(data_dir: Path, invocation: str) -> None:
         child = subprocess.Popen(
             [sys.executable, "-u", "-c", popen_bootstrapline, "omnigent-suite"],
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             env=env,
@@ -193,6 +206,7 @@ def test_ignores_pytest_processes(data_dir: Path, invocation: str) -> None:
         child.stdin.write(repr(_SLEEP_CHILD) + "\n")
         child.stdin.flush()
         child.stdin.close()
+        _wait_ready(child)
     else:
         child = _spawn(_SLEEP_CHILD, "-m", "pytest", "omnigent-suite", env=env)
     try:
@@ -336,8 +350,6 @@ def test_reap_escalates_to_kill(data_dir: Path) -> None:
     """A TERM-ignoring orphan is KILLed after the grace period."""
     child = _spawn(_STUBBORN_CHILD, "omnigent-daemon-marker", f"{data_dir}/chat.db")
     try:
-        # Give the child a beat to install its SIGTERM handler.
-        time.sleep(1.0)
         reaped, survivors = reap_leaked_omnigent_processes(data_dir, timeout=2)
         assert any("omnigent-daemon-marker" in cmd for cmd in reaped)
         assert survivors == []

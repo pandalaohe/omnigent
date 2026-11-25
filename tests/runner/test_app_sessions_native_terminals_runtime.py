@@ -56,6 +56,7 @@ from omnigent.runtime.prompt import (
     WORKSPACE_IMAGE_INSTRUCTION,
     child_session_question_instruction,
 )
+from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -1328,7 +1329,10 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            patched_external_ids.append(json["external_session_id"])
+            if "external_session_id" in json:
+                patched_external_ids.append(json["external_session_id"])
+            else:
+                assert json["labels"][LAUNCHED_MODEL_LABEL]
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:
@@ -1653,7 +1657,10 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            patched_external_ids.append(json["external_session_id"])
+            if "external_session_id" in json:
+                patched_external_ids.append(json["external_session_id"])
+            else:
+                assert json["labels"][LAUNCHED_MODEL_LABEL]
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:
@@ -5683,6 +5690,71 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
     assert result is not None
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None and state.conversation_id == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replacement", "expected_result"),
+    [
+        ("2a6a4a8b-69da-4b90-ab6f-1c9e4a7d3f22", "2a6a4a8b-69da-4b90-ab6f-1c9e4a7d3f22"),
+        ("agy_conv_recreated", None),
+    ],
+)
+async def test_cold_start_agy_conversation_preserves_a_concurrent_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+    expected_result: str | None,
+) -> None:
+    """An in-flight cold-start preserves reader adoption or a recreated terminal."""
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration as orchestration_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "cc44894f77886259ee71e892a9e2af22"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id="agy_conv_placeholder",
+        ),
+    )
+    convs = bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+    monkeypatch.setattr(
+        rpc_mod,
+        "get_available_models",
+        lambda _port: {"models": {"gemini": {"model": "MODEL_GEMINI"}}},
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(orchestration_mod, "_agy_cold_start_poll_sleep", _no_sleep)
+
+    def _start_cascade(_port: int, cascade_id: str, **_kwargs: Any) -> None:
+        (convs / f"{cascade_id}.db").write_bytes(b"")
+        bridge_mod.write_bridge_state(
+            bridge_dir,
+            bridge_mod.AntigravityNativeBridgeState(
+                session_id=session_id,
+                conversation_id=replacement,
+            ),
+        )
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start_cascade)
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result == expected_result
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == replacement
 
 
 @pytest.mark.asyncio

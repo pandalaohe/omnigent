@@ -61,6 +61,7 @@ from omnigent.tools.builtins.session_open import SysSessionOpenTool
 from omnigent.tools.builtins.session_projects import (
     SysProjectListTool,
     SysProjectUpdateTool,
+    SysSessionLinkPrTool,
     SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
@@ -111,6 +112,7 @@ __all__ = [
     "SysSessionGetInfoTool",
     "SysSessionGetStartupObservationV1Tool",
     "SysSessionHandoverTool",
+    "SysSessionLinkPrTool",
     "SysSessionListTool",
     "SysSessionOpenTool",
     "SysSessionRenameTool",

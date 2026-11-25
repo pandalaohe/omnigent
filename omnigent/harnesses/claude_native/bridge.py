@@ -2144,9 +2144,6 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
     """
     Whether a permission hook is parked on this session's verdict right now.
 
-    Scans every hook's marker for the session; a stale one (a hook killed
-    mid-wait) is removed on the way so they never accumulate.
-
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
@@ -2155,13 +2152,31 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         :data:`APPROVAL_WAIT_ORPHAN_GRACE_S`); ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    return bool(fresh_approval_wait_markers(session_id, bridge_dir=bridge_dir))
+
+
+def fresh_approval_wait_markers(session_id: str, *, bridge_dir: Path | None = None) -> list[str]:
+    """
+    Name each permission hook parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate. Each hook
+    process owns one marker, so a name identifies one wait.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+    :returns: File names of markers touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`, e.g. ``["<digest>.4242.wait"]``;
+        empty when none exists, all are stale, or the root is unreadable.
+    """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
         markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
-        return False
+        return []
     now = time.time()
-    fresh = False
+    fresh: list[str] = []
     for marker in markers:
         try:
             touched_at = marker.stat().st_mtime
@@ -2171,7 +2186,7 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         if age < APPROVAL_WAIT_ORPHAN_GRACE_S or (
             age < APPROVAL_WAIT_MARKER_TTL_S and _approval_wait_owner_alive(marker)
         ):
-            fresh = True
+            fresh.append(marker.name)
         else:
             clear_approval_wait_marker(marker)
     return fresh

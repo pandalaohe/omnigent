@@ -387,12 +387,15 @@ class ConPtyTerminalInstance(TerminalInstance):
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         pane_probe_interval_s: Callable[[], float | None] | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_tick, idle_threshold_s, poll_interval_s, pane_probe_interval_s
+        # ConPTY gets activity and exit from the process without polling the pane.
+        del on_idle, on_tick, idle_poll_backoff_allowed
+        del idle_threshold_s, poll_interval_s, pane_probe_interval_s
         with self._output_lock:
             if not replace and (self._on_activity is not None or self._on_exit is not None):
                 return

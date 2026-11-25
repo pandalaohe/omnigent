@@ -100,6 +100,8 @@ import {
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
+  rewindSession,
+  type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
@@ -119,6 +121,7 @@ import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -141,7 +144,13 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  sessionDraftRevision,
+  sessionDraftWasWritten,
+  setSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetRestoredSend,
   forgetUnsentSend,
@@ -183,7 +192,7 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
-import { uploadFile, type FileUploadProgress } from "@/lib/filesApi";
+import { downloadSessionFile, uploadFile, type FileUploadProgress } from "@/lib/filesApi";
 import { attachmentFilename, attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { mentionItemPath, mentionMarkerFor } from "@/lib/composerMentions";
 import { insertIntoQuestionCard } from "@/lib/questionCardInput";
@@ -1323,6 +1332,12 @@ export interface AppChatState {
    */
   redirectToConversationId: string | null;
   /**
+   * The prompt `/rewind` returned for its new session's composer. The
+   * composer can open before the rewind responds (the stream redirect may win),
+   * so an open, untouched composer for that session takes it, then clears it.
+   */
+  rewindPrefill: (SessionDraft & { conversationId: string }) | null;
+  /**
    * Side-chat child to open as a soft tab in the Workspace rail, or null.
    * `AppShell` observes it, opens/selects that child's side-chat tab on the
    * (still-active) main chat, and clears it — the user stays in the main
@@ -1594,6 +1609,12 @@ export interface ChatActions {
   compact: () => Promise<void>;
   /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
+  /**
+   * Rewind the active session to just before the prompt `itemId`: the server
+   * forks the earlier history onto the same machine, and this opens the fork
+   * with the prompt back in its composer.
+   */
+  rewindToPrompt: (itemId: string) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -2184,6 +2205,49 @@ async function uploadFileBlock(
   return block;
 }
 
+/** Build a file from a base64 `data:` URI, e.g. an image or document a prompt carried inline. */
+function fileFromDataUri(dataUri: string, filename: string): File {
+  const match = dataUri.match(/^data:([^;,]+)(?:;[^;,]+=[^;,]*)*;base64,(.*)$/s);
+  if (!match) throw new Error("Not a base64 data URI");
+  const binary = atob(match[2]!);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new File([bytes], filename, { type: match[1] });
+}
+
+/** Downloads rewind attachments, reuses copied file IDs, and warns about failed downloads. */
+async function rewindAttachmentFiles(
+  sessionId: string,
+  attachments: readonly RewindAttachment[],
+): Promise<File[]> {
+  const downloads = await Promise.all(
+    attachments.map(async (attachment) => {
+      try {
+        // An inline attachment has no stored copy; it uploads on send like a new one.
+        const inline = attachment.imageUrl ?? attachment.fileData;
+        if (inline) return fileFromDataUri(inline, attachment.filename);
+        if (!attachment.fileId) return null;
+        const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
+        const block: ContentBlock = {
+          type: attachment.type,
+          file_id: attachment.fileId,
+          filename: attachment.filename,
+        };
+        uploadedFileBlockCache.set(file, new Map([[sessionId, block]]));
+        return file;
+      } catch (err) {
+        console.warn("Couldn't restore a rewound prompt's attachment", err);
+        return null;
+      }
+    }),
+  );
+  const missing = attachments.filter((_attachment, index) => downloads[index] === null);
+  if (missing.length > 0) {
+    const names = missing.map((attachment) => attachment.filename).join(", ");
+    toast.warning(`Couldn't restore ${names} to the composer. Attach again to send.`);
+  }
+  return downloads.filter((file): file is File => file !== null);
+}
+
 // Must match the message-highlight animation duration in index.css.
 const FLASH_DURATION_MS = 1500;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
@@ -2458,6 +2522,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   codexPermissionReadbacks: {},
   conversationId: null,
   redirectToConversationId: null,
+  rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
@@ -4156,6 +4221,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? { redirectToConversationId: sessionId }
         : {},
     );
+  },
+
+  rewindToPrompt: async (itemId) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const rewound = await rewindSession(conversationId, itemId);
+    if (rewound.attachmentsIncomplete) {
+      toast.warning("Some attachments couldn't be restored. Attach them again before sending.");
+    }
+    const target = rewound.sessionId;
+    // A draft the user has edited, cleared or sent in the new session since
+    // it opened, here or offscreen, wins over the prompt.
+    const untouched = !sessionDraftWasWritten(target);
+    const text: SessionDraft = { text: rewound.prompt, files: [] };
+    if (untouched) setSessionDraft(target, text);
+    useChatStore.setState((s) => ({
+      ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
+      ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
+    }));
+    if (!untouched || rewound.attachments.length === 0) return;
+    // The text is in; the attachments follow once they download, unless the
+    // draft has changed since.
+    const revision = sessionDraftRevision(target);
+    const files = await rewindAttachmentFiles(target, rewound.attachments);
+    if (files.length === 0 || sessionDraftRevision(target) !== revision) return;
+    const draft: SessionDraft = { ...text, files };
+    setSessionDraft(target, draft);
+    useChatStore.setState({ rewindPrefill: { ...draft, conversationId: target } });
   },
 
   refreshSessionState: async (conversationId) => {
@@ -6004,23 +6097,12 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
-    // Each request retries on its own, so a failed one doesn't repeat the other.
-    // Set once a session read times out, and kept set through later failures: the shared
-    // read it may have joined is still the one that never answers.
-    const [session, page] = await Promise.all([
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout(
-          (signal) => getIndependentSessionMetadata(id, { refreshState: true, signal }),
-          snapshotLoadDeadlineMs(attempt),
-        ),
-      ),
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout(
-          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
-          snapshotLoadDeadlineMs(attempt),
-        ),
-      ),
-    ]);
+    const { session, page } = await fetchConversationSnapshot(queryClient, id, {
+      withRetries: (read) => withSnapshotRetries(id, read),
+      withDeadline: (read, attempt) => withReadTimeout(read, snapshotLoadDeadlineMs(attempt)),
+      readSessionIndependently: (signal) =>
+        getIndependentSessionMetadata(id, { refreshState: true, signal }),
+    });
     if (isConversationDisposed(id)) return;
     cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
     const items = page.items;

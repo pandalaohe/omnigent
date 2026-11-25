@@ -132,6 +132,7 @@ def test_codex_app_server_client_uses_codex_remote_handshake(
         "max_size": 128 << 20,
         "compression": None,
         "open_timeout": 120.0,
+        "ping_interval": None,
     }
     assert [json.loads(payload) for payload in fake_websocket.sent] == [
         {

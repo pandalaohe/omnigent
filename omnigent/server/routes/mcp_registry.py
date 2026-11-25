@@ -57,20 +57,10 @@ def create_mcp_registry_router(
                     pass
                 else:
                     defaults.add(service_id)
-            connected = entry.auth == "none"
-            if entry.auth == "env":
-                connected = registry.is_available(entry)
-            elif entry.auth in {"github", "databricks"}:
-                store = getattr(request.app.state, f"{entry.auth}_store", None)
-                connected = (
-                    store is not None and await asyncio.to_thread(store.get, user_id) is not None
-                )
-            elif entry.auth in {"oauth", "bearer"} and registry.store is not None:
-                connected = (
-                    await asyncio.to_thread(registry.store.get, user_id, f"mcp:{entry.id}")
-                    is not None
-                )
-            row = {
+            connected = await asyncio.to_thread(
+                registry.connected, entry, user_id, request.app.state
+            )
+            row: dict[str, Any] = {
                 "id": entry.id,
                 "title": entry.title,
                 "description": entry.description,

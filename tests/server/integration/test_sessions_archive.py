@@ -2654,3 +2654,39 @@ async def test_archived_child_message_keeps_existing_behavior_except_all(
     if mode == "all":
         assert "handover" in response.text
     assert store.get_conversation(target.id).archived
+
+
+@pytest.mark.parametrize("durable", [False, True], ids=["fallback", "durable"])
+async def test_archive_passes_the_servers_sandbox_config_to_the_teardown(
+    app, client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, durable: bool
+) -> None:
+    """The archive teardown gets the deployment config that decides a sandbox stop."""
+    session = await create_test_session(client, name="archive-sandbox-stop")
+    sandbox_config, host_store = object(), HostStore(db_uri)
+    monkeypatch.setattr(app.state, "sandbox_config", sandbox_config, raising=False)
+    monkeypatch.setattr(app.state, "host_store", host_store, raising=False)
+    coordinator = (
+        ArchiveCloseCoordinator(
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            host_store=host_store,
+            host_registry=None,
+            runner_router=None,
+            intent_store=CliReleaseIntentStore(db_uri),
+            sandbox_config=sandbox_config,
+        )
+        if durable
+        else None
+    )
+    monkeypatch.setattr(app.state, "archive_close_coordinator", coordinator)
+    stop_sandbox = AsyncMock(return_value=False)
+    with (
+        patch("omnigent.server.managed_hosts.stop_archived_session_sandbox", stop_sandbox),
+        patch.object(_sessions_orchestration, "stop_archived_session_sandbox", stop_sandbox),
+    ):
+        resp = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+        await _drain_detached_stops()
+    assert resp.status_code == 200, resp.text
+    (call,) = stop_sandbox.await_args_list
+    conv, passed_host_store, _conversations, passed_config = call.args
+    assert conv.id == session["id"] and conv.archived is True
+    assert passed_host_store is host_store and passed_config is sandbox_config

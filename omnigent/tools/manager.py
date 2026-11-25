@@ -43,6 +43,7 @@ from omnigent.tools.builtins import (
     SysSessionGetInfoTool,
     SysSessionGetStartupObservationV1Tool,
     SysSessionHandoverTool,
+    SysSessionLinkPrTool,
     SysSessionListTool,
     SysSessionOpenTool,
     SysSessionRenameTool,
@@ -666,6 +667,7 @@ class ToolManager:
         if not self._spec.tool_groups.projects:
             return
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
         self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 

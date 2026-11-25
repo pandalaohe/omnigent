@@ -19,6 +19,7 @@ from typing import Literal
 
 import yaml
 
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.config import global_config_path, load_global_config
 from omnigent.process_logging import data_dir
 
@@ -85,9 +86,41 @@ def _service_for_current_platform() -> HostService:
     )
 
 
-def _service_command(server_url: str | None) -> list[str]:
+def _wrapper_command(environment: Mapping[str, str]) -> list[str] | None:
+    """Return the configured CLI wrapper, resolved to an absolute path.
+
+    A wrapper's cache venv can be deleted between boots, so don't pin its interpreter.
+    """
+    configured = environment.get(WRAPPER_COMMAND_ENV, "").strip()
+    if not configured:
+        return None
+    try:
+        executable, *arguments = shlex.split(configured)
+    except ValueError as exc:
+        raise HostServiceError(f"Cannot parse {WRAPPER_COMMAND_ENV}={configured!r}.") from exc
+    resolved = shutil.which(executable, path=environment.get("PATH"))
+    if resolved is None:
+        raise HostServiceError(
+            f"Cannot find {executable!r} from {WRAPPER_COMMAND_ENV} on PATH; "
+            "the host service launches through it."
+        )
+    # Resolve parent traversal through symlinks, preserving the wrapper's final symlink.
+    try:
+        parent = os.path.realpath(os.path.dirname(resolved), strict=True)
+    except OSError as exc:
+        raise HostServiceError(f"Cannot resolve wrapper directory for {executable!r}.") from exc
+    absolute = os.path.join(parent, os.path.basename(resolved))
+    if shutil.which(absolute) is None:
+        raise HostServiceError(f"Cannot execute the resolved wrapper {absolute!r}.")
+    return [absolute, *arguments]
+
+
+def _service_command(server_url: str | None, environment: Mapping[str, str]) -> list[str]:
     """Build the persistent service entry-point command."""
     mode = ["--server", server_url] if server_url else ["--local"]
+    wrapper = _wrapper_command(environment)
+    if wrapper is not None:
+        return [*wrapper, "host-service-entry", *mode]
     return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
 
 
@@ -187,7 +220,11 @@ def _systemd_unit(
         "[Service]",
         "Type=simple",
         *env_lines,
-        "ExecStart=" + " ".join(_systemd_quote(part, escape_dollar=True) for part in command),
+        # systemd expands dollars in arguments, but treats argv[0] literally.
+        "ExecStart="
+        + " ".join(
+            _systemd_quote(part, escape_dollar=index > 0) for index, part in enumerate(command)
+        ),
         "Restart=on-failure",
         "RestartPreventExitStatus=78 143",
         "RestartSec=10s",
@@ -340,6 +377,24 @@ def _forget_service(service: HostService) -> None:
         ) from exc
 
 
+def validate_user_host_service(
+    server_url: str | None,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    """Raise :class:`HostServiceError` if the host service cannot be defined.
+
+    :param server_url: Remote server URL, or ``None`` for local mode.
+    :param environment: Environment the service would persist.
+    """
+    service = _service_for_current_platform()
+    clean_environment = _clean_environment(environment)
+    if service.kind != "windows_task":
+        _service_command(server_url, clean_environment)
+    if service.kind == "launchd":
+        launchd_service_launcher_prefix()
+
+
 def enable_user_host_service(
     server_url: str | None,
     *,
@@ -347,16 +402,19 @@ def enable_user_host_service(
 ) -> HostService:
     """Install, enable, and start the current user's host service."""
     service = _service_for_current_platform()
-    command = _service_command(server_url)
     clean_environment = _clean_environment(environment)
     if service.kind == "launchd":
         content = _launchd_payload(
             service,
-            command=[*launchd_service_launcher_prefix(), *command],
+            command=[
+                *launchd_service_launcher_prefix(),
+                *_service_command(server_url, clean_environment),
+            ],
             environment=clean_environment,
         )
         _enable_launchd(service, content)
     elif service.kind == "systemd_user":
+        command = _service_command(server_url, clean_environment)
         content = _systemd_unit(command=command, environment=clean_environment)
         _enable_systemd(service, content)
     else:
@@ -426,6 +484,50 @@ def disable_user_host_service() -> HostService:
     return service
 
 
+def _read_posix_service(
+    service: HostService,
+) -> tuple[list[str], str | None, str | None]:
+    """Read the installed argv, server target and optional saved wrapper setting."""
+    try:
+        content = service.path.read_bytes()
+        command: list[str] = []
+        wrapper_setting = None
+        if service.kind == "launchd":
+            payload = plistlib.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a plist dictionary")
+            command = payload.get("ProgramArguments", [])
+            if not isinstance(command, list) or not all(isinstance(p, str) for p in command):
+                raise ValueError("Expected program arguments")
+            environment = payload.get("EnvironmentVariables")
+            if isinstance(environment, dict):
+                recorded = environment.get(WRAPPER_COMMAND_ENV)
+                if isinstance(recorded, str):
+                    wrapper_setting = recorded
+        else:
+            for line in content.decode().splitlines():
+                if line.startswith("ExecStart="):
+                    # Match _systemd_unit: argv[0] never double-escapes dollars.
+                    parts = shlex.split(line[len("ExecStart=") :])
+                    command = [
+                        (part.replace("$$", "$") if index else part).replace("%%", "%")
+                        for index, part in enumerate(parts)
+                    ]
+                    break
+        # The service mode comes after any launcher or wrapper flags.
+        if command[-2:-1] == ["--server"]:
+            target = command[-1]
+        elif command[-1:] == ["--local"]:
+            target = None
+        else:
+            raise ValueError("Expected a host service mode")
+    except (OSError, ValueError, IndexError, plistlib.InvalidFileException) as exc:
+        raise HostServiceError(
+            f"Cannot read the target of the installed host service {service.path}."
+        ) from exc
+    return command, target, wrapper_setting
+
+
 def installed_user_host_service() -> tuple[HostService, str | None] | None:
     """Read the installed service and its target; unsupported platforms return None."""
     if platform.system() not in ("Darwin", "Linux", "Windows"):
@@ -437,38 +539,29 @@ def installed_user_host_service() -> tuple[HostService, str | None] | None:
         return installed(service)
     if not service.path.exists():
         return None
-    try:
-        content = service.path.read_bytes()
-        command: list[str] = []
-        if service.kind == "launchd":
-            payload = plistlib.loads(content)
-            if not isinstance(payload, dict):
-                raise ValueError("Expected a plist dictionary")
-            command = payload.get("ProgramArguments", [])
-            if not isinstance(command, list) or not all(isinstance(p, str) for p in command):
-                raise ValueError("Expected program arguments")
-            # The service mode is always at the end, after any launcher flags.
-            if command[-2:-1] == ["--server"]:
-                target = command[-1]
-            elif command[-1:] == ["--local"]:
-                target = None
-            else:
-                raise ValueError("Expected a host service mode")
-        else:
-            for line in content.decode().splitlines():
-                if line.startswith("ExecStart="):
-                    # Undo the escaping emitted by _systemd_quote.
-                    command = [
-                        part.replace("%%", "%").replace("$$", "$")
-                        for part in shlex.split(line[len("ExecStart=") :])
-                    ]
-                    break
-            target = None if "--local" in command else command[command.index("--server") + 1]
-    except (OSError, ValueError, IndexError, plistlib.InvalidFileException) as exc:
-        raise HostServiceError(
-            f"Cannot read the target of the installed host service {service.path}."
-        ) from exc
+    _command, target, _wrapper = _read_posix_service(service)
     return service, target
+
+
+def installed_posix_wrapper_command(service: HostService) -> str | None:
+    """Recover the exact wrapper argv for a service refresh from an unwrapped CLI."""
+    command, target, wrapper_setting = _read_posix_service(service)
+    arguments = command[: -(2 if target is not None else 1)]
+    if arguments[-1:] != ["host-service-entry"]:
+        return None
+    wrapper = arguments[:-1]
+    if service.kind == "launchd":
+        if wrapper_setting is not None and wrapper_setting.strip():
+            try:
+                count = len(shlex.split(wrapper_setting))
+            except ValueError as exc:
+                raise HostServiceError("Cannot parse the installed host wrapper setting.") from exc
+            wrapper = wrapper[-count:]
+        else:
+            prefix = launchd_service_launcher_prefix()
+            if wrapper[: len(prefix)] == prefix:
+                wrapper = wrapper[len(prefix) :]
+    return shlex.join(wrapper) if wrapper else None
 
 
 def stop_user_host_service(service: HostService) -> None:

@@ -1804,10 +1804,10 @@ def create_hosts_router(
         ):
             raise OmnigentError("Startup preparation permission expired", code=ErrorCode.CONFLICT)
         if agent_store is not None and agent_cache is not None:
-            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+            from omnigent.server.runtime_compatibility import require_session_runtime_support
 
             await asyncio.to_thread(
-                require_session_registry_mcp_support,
+                require_session_runtime_support,
                 target.conv,
                 conn.hello.capabilities,
                 component="host",

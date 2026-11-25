@@ -8,7 +8,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from operator import ge, gt, le, lt
 from typing import Any, TypeVar, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -26,6 +25,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlScheduledTask,
     SqlScheduledTaskRun,
+    SqlScheduledTaskShare,
     current_workspace_id,
     workspace_scope,
 )
@@ -40,6 +40,7 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
 )
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
@@ -67,6 +68,7 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
 from omnigent.stores.host_store import delete_unused_host_in_session
+from omnigent.stores.permission_store.sqlalchemy_store import delete_deleted_task_grants
 from omnigent.stores.project_store.sqlalchemy_store import (
     assert_project_admits,
     project_archive_batch_is_active,
@@ -79,6 +81,8 @@ from omnigent.stores.scheduled_task_store import (
     ArchivedTarget,
     AutomationFailure,
     ScheduledTaskStore,
+    decode_mcp_services,
+    encode_mcp_services,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
@@ -174,8 +178,25 @@ def _purge_finished_deleted_task(
         .limit(1)
         .with_for_update()
     )
-    if remaining is None:
+    if remaining is None and not _has_task_grants(session, task.workspace_id, task.id):
         session.delete(task)
+
+
+def _has_task_grants(session: Session, workspace_id: int, task_id: str) -> bool:
+    # The task lock serializes new grants. A locking read also bypasses any
+    # older MySQL snapshot established before this transaction locked the task.
+    return (
+        session.scalar(
+            select(SqlScheduledTaskShare.user_id)
+            .where(
+                SqlScheduledTaskShare.workspace_id == workspace_id,
+                SqlScheduledTaskShare.scheduled_task_id == task_id,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        is not None
+    )
 
 
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
@@ -203,6 +224,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         reasoning_effort=row.reasoning_effort,
         speed=row.speed,
         permission_mode=row.permission_mode,
+        mcp_services=decode_mcp_services(row.mcp_services),
         max_cost_usd=row.max_cost_usd,
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
         session_id=row.session_id,
@@ -233,6 +255,7 @@ _SESSION_CREATION_FIELDS = (
     "reasoning_effort",
     "speed",
     "permission_mode",
+    "mcp_services",
     "project_id",
     "updated_at",
 )
@@ -440,6 +463,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         speed: str | None = None,
         permission_mode: str | None = None,
+        mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
@@ -474,6 +498,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 reasoning_effort=reasoning_effort,
                 speed=speed,
                 permission_mode=permission_mode,
+                mcp_services=encode_mcp_services(mcp_services),
                 max_cost_usd=max_cost_usd,
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 session_id=session_id,
@@ -708,6 +733,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = _UNSET,
         speed: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
+        mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
@@ -739,8 +765,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         ``agent_id`` (clearing ``custom_agent_id``).
         """
         updated_at = now_epoch()
+        checks_owner = state is not None and state != "deleted"
 
         def write(session: Session) -> ScheduledTask | None:
+            # Writers lock accounts before resource rows, so the owner read without a
+            # lock is checked first; the recheck below catches a change before the lock.
+            checked_owner = None
+            if checks_owner:
+                checked_owner = session.execute(
+                    select(SqlScheduledTask.user_id, SqlScheduledTask.account_generation).where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+                    )
+                ).one_or_none()
+                if checked_owner is not None:
+                    require_active_account(
+                        session, checked_owner.user_id, generation=checked_owner.account_generation
+                    )
             row = session.get(
                 SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
             )
@@ -753,14 +795,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 current = _to_entity(row)
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    for field in ("rrule", "session_mode", "execution_target")
+                    # The agent and MCP services are validated together, so an
+                    # edit to either since the snapshot invalidates the other.
+                    for field in (
+                        "rrule",
+                        "session_mode",
+                        "execution_target",
+                        "agent_id",
+                        "mcp_services",
+                    )
                 ):
                     raise OmnigentError(
-                        "The automation's schedule or execution settings changed. "
+                        "The automation's schedule, execution, agent or MCP settings changed. "
                         "Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )
-            if state is not None and state != "deleted":
+            if checks_owner and (
+                checked_owner is None
+                or tuple(checked_owner) != (row.user_id, row.account_generation)
+            ):
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
             trigger_before = is_trigger_automation(_to_entity(row))
@@ -803,6 +856,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if permission_mode is not _UNSET and row.permission_mode != permission_mode:
                 row.permission_mode = permission_mode
                 changed = True
+            if mcp_services is not None:
+                encoded_services = encode_mcp_services(mcp_services)
+                if row.mcp_services != encoded_services:
+                    row.mcp_services = encoded_services
+                    changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
                 changed = True
@@ -1080,6 +1138,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     def _purge_deleted_task_page(
         self, task_id: str, *, after: tuple[int, str] | None = None
     ) -> tuple[int, str] | None:
+        if after is None:
+            delete_deleted_task_grants(
+                self._session_immediate, task_id, batch_size=self._cleanup_batch_size
+            )
+
         def write(session: Session) -> tuple[int, str] | None:
             task = session.get(
                 SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True
@@ -1109,7 +1172,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     )
                     .limit(1)
                 )
-                if remaining is None:
+                if remaining is None and not _has_task_grants(session, task.workspace_id, task_id):
                     session.delete(task)
                 return None
             cursor = (runs[-1].scheduled_at, runs[-1].id)
@@ -1439,6 +1502,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
 
+    def has_active_run(self, scheduled_task_id: str, conversation_id: str) -> bool:
+        """Whether the task has a ``starting`` or ``running`` run in a conversation."""
+        active_codes = [
+            encode_scheduled_task_run_status("starting"),
+            encode_scheduled_task_run_status("running"),
+        ]
+        with self._session("select_active_run_by_conversation") as session:
+            stmt = (
+                select(SqlScheduledTaskRun.id)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status.in_(active_codes))
+                .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
+                .limit(1)
+            )
+            return session.execute(stmt).first() is not None
+
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.
 
@@ -1560,20 +1640,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         descending: bool = False,
     ) -> ColumnElement[bool]:
         """MySQL needs scalar ranges to seek past a composite cursor."""
-        compare = lt if descending else gt
-        compare_inclusive = le if descending else ge
-        if self._engine.dialect.name != "mysql":
-            return (compare_inclusive if inclusive else compare)(tuple_(*columns), cursor)
-        return or_(
-            *(
-                and_(
-                    *(columns[previous] == cursor[previous] for previous in range(index)),
-                    (compare_inclusive if inclusive and index == len(columns) - 1 else compare)(
-                        column, cursor[index]
-                    ),
-                )
-                for index, column in enumerate(columns)
-            )
+        return keyset_after(
+            self._engine.dialect.name,
+            columns,
+            cursor,
+            inclusive=inclusive,
+            descending=descending,
         )
 
     def _refresh_schedule(self, row: SqlScheduledTask, after: int) -> None:

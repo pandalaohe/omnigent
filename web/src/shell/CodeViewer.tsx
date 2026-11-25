@@ -39,7 +39,6 @@ import {
   XIcon,
 } from "lucide-react";
 import { useChatStore } from "@/store/chatStore";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -566,6 +565,8 @@ export interface CodeViewerProps {
    * (e.g. after the user revokes links).
    */
   previewKey?: number;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
 }
 
 export function CodeViewer({
@@ -595,6 +596,7 @@ export function CodeViewer({
   onFrameChange,
   onAnnotationOrphansChange,
   previewKey,
+  attachToAgent = false,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -694,13 +696,12 @@ export function CodeViewer({
   }, [position, showMonaco, viewMode, fileQuery.data, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
-  // composer reads — only the native coding-agent harnesses act on it, so
-  // gate the button to them (same set as the "@"-mention feature).
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // composer reads - FileViewer passes ``attachToAgent`` only for sessions
+  // whose agent opens that path (same gate as the "@"-mention feature).
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
   // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
   // non-optional here, but the guard keeps the two surfaces in lockstep.
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent = !!path && attachToAgent;
 
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
@@ -1091,6 +1092,7 @@ export function CodeViewer({
           activeSelection={sourceActiveSelection}
           onSetActiveSelection={onSetActiveSelection}
           pendingBodyRef={pendingBodyRef}
+          attachToAgent={attachToAgent}
         />
       </Suspense>
     );

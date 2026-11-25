@@ -15,6 +15,7 @@ import type { HarnessInventory, HostMcpServer } from "@/hooks/useHarnessInventor
 import { toast } from "sonner";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
+import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 import type { RegistryItem } from "@/hooks/useAgentRegistry";
 import { AgentDefaultsTable } from "@/components/AgentDefaultsTable";
@@ -39,6 +40,11 @@ vi.mock("@/lib/agentLabels", async (original) => ({
 vi.mock("@/components/AgentContextTable", () => ({ AgentPromptCard: () => null }));
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+
+let curatedOut: ReadonlySet<string> = new Set();
+vi.mock("@/hooks/useCuratedOutHarnesses", () => ({
+  useCuratedOutHarnesses: () => curatedOut,
+}));
 
 const setEnabled = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/mcpServerEnabledApi", () => ({ setMcpServerEnabled: setEnabled }));
@@ -303,6 +309,7 @@ afterEach(() => {
   registryData.items = [];
   registryData.legacyProducts = {};
   localStorage.clear();
+  curatedOut = new Set();
 });
 
 describe("Agent setup list", () => {
@@ -315,6 +322,26 @@ describe("Agent setup list", () => {
     expect(screen.queryByTestId("harness-card-pi-native")).toBeNull();
     expect(card("qwen-native")).toBeInTheDocument();
   });
+  it("leaves out the harnesses the deployment curated out, even by direct link", () => {
+    hosts = [ONLINE];
+    curatedOut = new Set(["codex-native"]);
+    renderHarnesses("codex-native");
+
+    // A link to a curated-out harness lands on the grid, like an unknown one.
+    expect(screen.getByRole("heading", { name: "Session picker" })).toBeInTheDocument();
+    expect(card("devin-native")).toBeInTheDocument();
+    expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
+    expect(startupCalls).not.toHaveBeenCalledWith("h1", "codex-native");
+  });
+
+  it("says so when the deployment offers no harness", () => {
+    hosts = [ONLINE];
+    curatedOut = new Set(NATIVE_CODING_AGENTS.map((spec) => spec.harness));
+    renderHarnesses();
+
+    expect(screen.getByText("This server offers no harnesses to set up.")).toBeInTheDocument();
+  });
+
   it("requests accounts only on a capable online host with setup enabled", () => {
     hosts = [{ ...ONLINE, harness_accounts_supported: true }];
     renderHarnesses();

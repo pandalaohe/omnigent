@@ -236,12 +236,10 @@ describe("mergeItemsIntoPages", () => {
     const before = data([conv("a", { title: "alpha" })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "beta" }]]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(
-      before,
-      items,
-      { searchQuery: "alp", includeArchived: false },
-      true,
-    );
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, {
+      searchQuery: "alp",
+      includeArchived: false,
+    });
 
     // The local cache cannot know whether the server-side search still
     // matches via title or item content, so it patches the row then
@@ -294,7 +292,7 @@ describe("mergeItemsIntoPages", () => {
       data: after,
       needsRefetch,
       orderStale,
-    } = mergeItemsIntoPages(before, items, { searchQuery: "alp", includeArchived: false }, true);
+    } = mergeItemsIntoPages(before, items, { searchQuery: "alp", includeArchived: false });
 
     expect(after!.pages[0].data[1].updated_at).toBe(1);
     expect(needsRefetch).toBe(true);
@@ -330,29 +328,31 @@ describe("mergeItemsIntoPages membership-label refetch policy", () => {
     expect(needsRefetch).toBe(false);
   });
 
-  it("flags a refetch when the project label changes", () => {
+  it("reports project membership changes for targeted reconciliation", () => {
     const before = data([conv("a", { labels: { omni_project: "Alpha" } })]);
     const items = new Map<string, SessionListWireItem>([
       ["a", { id: "a", labels: { omni_project: "Beta" } }],
     ]);
 
-    const { needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
+    const { changes, needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // A relabel can move the row between project folders / the project filter,
     // which no local patch can place.
-    expect(needsRefetch).toBe(true);
+    expect(changes.get("a")?.fields).toEqual(new Set(["project"]));
+    expect(needsRefetch).toBe(false);
   });
 
-  it("flags a refetch when the pinned label changes", () => {
+  it("reports pin membership changes for the pinned cache", () => {
     const before = data([conv("a", { labels: {} })]);
     const items = new Map<string, SessionListWireItem>([
       ["a", { id: "a", labels: { "omnigent.pinned": "1700000000000" } }],
     ]);
 
-    const { needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
+    const { changes, needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // Pin membership lives in a separate cache the frame merge doesn't place.
-    expect(needsRefetch).toBe(true);
+    expect(changes.get("a")?.fields).toEqual(new Set(["pinned"]));
+    expect(needsRefetch).toBe(false);
   });
 
   it("flags a refetch when a row gains the side-chat label", () => {
@@ -374,12 +374,10 @@ describe("mergeItemsIntoPages membership-label refetch policy", () => {
       ["a", { id: "a", labels: { omni_project: "Alpha", "omnigent.goal_state": "y" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(
-      before,
-      items,
-      { searchQuery: "al", includeArchived: false },
-      true,
-    );
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, {
+      searchQuery: "al",
+      includeArchived: false,
+    });
 
     // Even with a search list cached, a display-label-only move patches in place.
     expect(after!.pages[0].data[0].labels!["omnigent.goal_state"]).toBe("y");
@@ -430,19 +428,73 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
     expect(needsRefetch).toBe(true);
   });
 
-  it("flags a refetch when a row is relabeled INTO a project so filtered variants reconcile", () => {
+  it("reports a row relabeled INTO a project so the filtered variants can reconcile", () => {
     // The row lives in the unfiltered archived variant; a session moved into
     // "Alpha" isn't in the Alpha-filtered cache yet, so only a server reconcile
-    // can place it. The label change here must trigger the prefix-wide refetch.
+    // can place it. The unfiltered list itself still holds it correctly.
     const before = data([conv("a", { archived: true, labels: {} })]);
     const items = new Map<string, SessionListWireItem>([
       ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered);
+    const { data: after, needsRefetch, changes } = mergeItemsIntoPages(before, items, unfiltered);
 
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
-    expect(needsRefetch).toBe(true);
+    expect(needsRefetch).toBe(false);
+    expect(changes.get("a")?.fields).toEqual(new Set(["project"]));
+    expect(changes.get("a")?.row.labels).toEqual({ omni_project: "Alpha" });
+  });
+
+  it("patches labels no list filters on without a refetch or a membership change", () => {
+    // A failing session gains, then loses, a server-written error label on
+    // every turn; no list's membership or order reads it.
+    const before = data([conv("a", { labels: { omni_project: "Alpha" } })]);
+    const items = new Map<string, SessionListWireItem>([
+      [
+        "a",
+        {
+          id: "a",
+          labels: { omni_project: "Alpha", "omnigent.last_task_error_code": "rate_limited" },
+        },
+      ],
+    ]);
+
+    const { data: after, needsRefetch, changes } = mergeItemsIntoPages(before, items, unfiltered);
+
+    expect(after!.pages[0].data[0].labels["omnigent.last_task_error_code"]).toBe("rate_limited");
+    expect(needsRefetch).toBe(false);
+    expect(changes.size).toBe(0);
+  });
+
+  it("names each membership field a patch moves", () => {
+    const before = data([conv("a", { labels: {} })]);
+    const fieldsFor = (wire: Omit<SessionListWireItem, "id">) =>
+      mergeItemsIntoPages(before, new Map([["a", { id: "a", ...wire }]]), unfiltered).changes.get(
+        "a",
+      )?.fields;
+
+    expect(fieldsFor({ archived: true })).toEqual(new Set(["archived"]));
+    expect(fieldsFor({ title: "renamed" })).toEqual(new Set(["title"]));
+    expect(fieldsFor({ project_id: "proj_1" })).toEqual(new Set(["project"]));
+    expect(fieldsFor({ labels: { "omnigent.pinned": "1" } })).toEqual(new Set(["pinned"]));
+    expect(fieldsFor({ labels: { "omnigent.archived_at": "1" } })).toEqual(new Set(["archived"]));
+    expect(fieldsFor({ labels: { "omnigent.side_chat": "1" } })).toEqual(new Set(["hidden"]));
+  });
+
+  it("refetches a list a row turned into a side chat in, since the server drops it", () => {
+    const before = data([conv("a", { labels: {} })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", labels: { "omnigent.side_chat": "1" } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, items, unfiltered).needsRefetch).toBe(true);
+  });
+
+  it("doesn't refetch an unsearched list for a title change", () => {
+    const before = data([conv("a", { title: "old" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "new" }]]);
+
+    expect(mergeItemsIntoPages(before, items, unfiltered).needsRefetch).toBe(false);
   });
 
   it("keeps a row whose project still matches when a non-label field changes", () => {
@@ -719,6 +771,39 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+
+  it("infers ownership from the row when no viewer id is known", () => {
+    const before = data([conv("a")]);
+    const owned = candidate("new", { owner: "alice" });
+    const mine = insertNewRowsIntoPages(before, owned, { ...DEFAULT_FILTERS, visibility: "mine" });
+    expect(mine.inserted.map((c) => c.id)).toEqual(["new"]);
+    const shared = insertNewRowsIntoPages(before, owned, {
+      ...DEFAULT_FILTERS,
+      visibility: "shared",
+    });
+    expect(shared.inserted).toHaveLength(0);
+  });
+
+  it("treats an ownerless row with a shared grant as shared, not mine", () => {
+    const before = data([conv("a")]);
+    const granted = candidate("new", { permission_level: 1 });
+    const shared = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "shared" },
+      undefined,
+      "alice",
+    );
+    expect(shared.inserted.map((c) => c.id)).toEqual(["new"]);
+    const mine = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "mine" },
+      undefined,
+      "alice",
+    );
+    expect(mine.inserted).toHaveLength(0);
   });
 });
 

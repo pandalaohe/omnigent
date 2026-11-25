@@ -205,8 +205,11 @@ async def test_launch_read_send_exit_and_cleanup(instance, monkeypatch):
     monkeypatch.setattr(conpty.PseudoConsoleProcess, "spawn", spawn)
     monkeypatch.setattr(conpty, "registered_user_environment", dict)
     callback = threading.Event()
+    poll_backoff = Mock(return_value=True)
     await instance.launch(cwd=instance.private_dir)
-    instance.start_idle_watcher_thread(on_exit=callback.set)
+    instance.start_idle_watcher_thread(
+        on_exit=callback.set, idle_poll_backoff_allowed=poll_backoff
+    )
     process.output.put("\x1b[2J\x1b[H你好\r\nready".encode())
     await poll_until_async(lambda: b"ready" in instance._output.snapshot())
     assert "你好" in (await instance.read())["screen"]
@@ -218,6 +221,7 @@ async def test_launch_read_send_exit_and_cleanup(instance, monkeypatch):
     process.code = 7
     process.exited.set()
     await poll_until_async(callback.is_set)
+    poll_backoff.assert_not_called()
     assert instance._last_exit_status == 7 and not instance.running
     assert b"final" in instance._output.snapshot()
     await instance.close()

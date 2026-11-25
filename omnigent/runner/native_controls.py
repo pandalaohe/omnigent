@@ -225,6 +225,7 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
 _CODEX_SETTINGS_READY_POLL_S = 0.1
+_CODEX_SETTINGS_CONTROL_TIMEOUT_S = 60.0
 _CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
 # 20-second forward instead of reporting an unconfirmed timeout.
@@ -672,7 +673,7 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-        control_deadline = asyncio.get_running_loop().time() + 60.0
+        control_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_CONTROL_TIMEOUT_S
         try:
             try:
                 await asyncio.wait_for(

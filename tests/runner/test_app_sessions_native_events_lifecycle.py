@@ -431,7 +431,7 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
 ) -> None:
     """Only a pending write is unconfirmed; all timeout paths release the settings lock."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.runner import native_controls, turn_routing
+    from omnigent.runner import native_controls
 
     conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -445,7 +445,7 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
             active_turn_id=None,
         ),
     )
-    monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_CONTROL_TIMEOUT_S", 0.05)
     monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_CLOSE_TIMEOUT_S", 0.05)
     stall = {"active": True}
 
@@ -5491,12 +5491,14 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_activity: object | None = None,
         on_exit: object | None = None,
         on_tick: object | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_poll_backoff_allowed
+        del idle_threshold_s, poll_interval_s, replace
         del pane_probe_interval_s
         callbacks["on_exit"] = on_exit
 

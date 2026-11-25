@@ -26,6 +26,7 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
     codex_terminal_interactive,
+    fail_pending_mcp_startup,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -925,6 +926,7 @@ async def test_cold_restore_retries_only_the_same_terminal_outcome_at_its_origin
         bridge_dir=bridge_dir,
         thread_id=restored.thread_id,
         turns=[{"id": "turn_old", "status": outcome}],
+        replay_from_turn_id="turn_old",
     )
     [(_, retry)] = client.posts
     assert retry["data"]["response_id"] == "codex_turn_old"
@@ -1447,6 +1449,29 @@ def test_settle_pending_mcp_startup_drops_only_starting(bridge_dir: Path) -> Non
     assert read_mcp_startup(bridge_dir) == servers
     # Fully settled → nothing to drop, nothing rewritten.
     assert settle_pending_mcp_startup(bridge_dir) == (servers, False)
+
+
+def test_fail_pending_mcp_startup_marks_only_starting(bridge_dir: Path) -> None:
+    """
+    Failing the round records the reason on ``starting`` entries only.
+
+    Ready and cancelled servers keep their outcome; once nothing is
+    ``starting`` the band has nothing to spin on, so a second call is a no-op.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+    update_mcp_server_startup(bridge_dir, "omnigent", "ready")
+    update_mcp_server_startup(bridge_dir, "storage-console", "cancelled")
+
+    servers, changed = fail_pending_mcp_startup(bridge_dir, "app-server stopped")
+
+    assert changed is True
+    assert servers == {
+        "safe": {"status": "failed", "error": "app-server stopped"},
+        "omnigent": {"status": "ready", "error": None},
+        "storage-console": {"status": "cancelled", "error": None},
+    }
+    assert read_mcp_startup(bridge_dir) == servers
+    assert fail_pending_mcp_startup(bridge_dir, "app-server stopped") == (servers, False)
 
 
 def test_read_mcp_startup_ignores_malformed_entries(bridge_dir: Path) -> None:

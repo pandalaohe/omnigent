@@ -155,7 +155,7 @@ export { ARCHIVED_PAGE_SIZE };
  * mutations that actually change archived membership or a project label
  * invalidate this key explicitly instead.
  */
-const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
+export const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export async function invalidateProjectArchiveQueries(queryClient: QueryClient): Promise<void> {
   await Promise.all(

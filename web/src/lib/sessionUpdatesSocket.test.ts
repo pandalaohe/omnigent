@@ -89,7 +89,7 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     const { resolveModalHost, setSessionHost } = await import("./sessionHost");
     const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
     setSessionHost("sess_oss", "host_oss");
-    resolveModalHost();
+    resolveModalHost(["host_oss"]);
     try {
       socket.start();
       const first = latestWs();
@@ -111,7 +111,7 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
     const { resolveModalHost } = await import("./sessionHost");
     const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
-    resolveModalHost();
+    resolveModalHost([]);
     try {
       socket.start();
       const first = latestWs();

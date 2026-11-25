@@ -223,6 +223,10 @@ class HarnessCapabilities:
     :param instruction_delivery: Whether and how ``AgentSpec.instructions``
         reach the vendor agent. Defaults to ``UNKNOWN`` for undeclared/
         third-party harnesses.
+    :param workspace_file_mentions: Whether the agent opens a workspace-relative
+        ``[Attached: <path>]`` marker in a user message with its own file tools.
+        Enables the web composer's ``@``-file mentions and the file viewer's
+        "Attach to agent" action. ``None`` makes no claim.
     """
 
     integration_mode: IntegrationMode
@@ -245,6 +249,7 @@ class HarnessCapabilities:
     keep_warm_family: str | None = None
     calling_defaults: CallingDefaultsSupport | None = None
     session_modes: SessionModes | None = None
+    workspace_file_mentions: bool | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
@@ -269,4 +274,5 @@ class HarnessCapabilities:
             "keep_warm_family": self.keep_warm_family,
             "calling_defaults": self.calling_defaults.as_dict() if self.calling_defaults else None,
             "session_modes": self.session_modes.as_dict() if self.session_modes else None,
+            "workspace_file_mentions": self.workspace_file_mentions,
         }

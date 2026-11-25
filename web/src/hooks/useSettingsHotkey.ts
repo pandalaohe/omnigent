@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import {
@@ -9,6 +10,8 @@ import {
   isShortcutActionEnabled,
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
+
+const SETTINGS_CHORD: Chord = { mod: true, alt: true, code: "Comma" };
 
 /**
  * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
@@ -24,9 +27,7 @@ export function isSettingsHotkey(
   }
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("openSettings")) return false;
   if (!hasCustomShortcutBindings("openSettings")) {
-    if (desktopMenu) return false;
-    if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
-    return event.code === "Comma";
+    return !desktopMenu && chordMatches(SETTINGS_CHORD, event, isMac);
   }
   return eventMatchesShortcutAction(event, "openSettings");
 }

@@ -9,6 +9,7 @@ import {
   permissionModeConcept,
   canonicalNativeHarness,
   harnessAccountKey,
+  nativeDefaultPermissionMode,
   nativePermissionOptions,
 } from "./nativeHarnessModes";
 import { CODEX_APPROVAL_PRESETS, CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
@@ -46,18 +47,30 @@ it("keeps Codex native launch, runtime, SDK and defaults on the four current pre
 
 describe("nativePermissionOptions", () => {
   it.each([
-    ["claude-native", ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]],
-    ["codex-native", ["ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"]],
-    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
-    ["antigravity-native", ["ask", "plan", "accept-edits", "auto", "full"]],
-    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
-    ["unknown-harness", []],
-    [null, []],
-    [undefined, []],
-  ] as const)("returns the create-time permission vocabulary for %s", (harness, values) => {
-    const options = nativePermissionOptions(harness);
-    expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
-  });
+    [
+      "claude-native",
+      ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+      "default",
+    ],
+    [
+      "codex-native",
+      ["ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"],
+      "ask-for-approval",
+    ],
+    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"], "default"],
+    ["antigravity-native", ["ask", "plan", "accept-edits", "auto", "full"], "default"],
+    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"], "normal"],
+    ["unknown-harness", [], null],
+    [null, [], null],
+    [undefined, [], null],
+  ] as const)(
+    "returns the create-time permission vocabulary and default for %s",
+    (harness, values, defaultMode) => {
+      const options = nativePermissionOptions(harness);
+      expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
+      expect(nativeDefaultPermissionMode(harness)).toBe(defaultMode);
+    },
+  );
 });
 
 describe("permissionModeConcept", () => {

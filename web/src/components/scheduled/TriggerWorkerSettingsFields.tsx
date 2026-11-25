@@ -1,5 +1,8 @@
 import { cn } from "@/lib/utils";
-import { supportsDelegatedSessionPermission } from "@/lib/nativeHarnessModes";
+import {
+  nativeDefaultPermissionMode,
+  supportsDelegatedSessionPermission,
+} from "@/lib/nativeHarnessModes";
 import { pickerTriggerClass } from "./pickerStyles";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { Label } from "./Label";
@@ -9,6 +12,21 @@ import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings"
 import { ScheduleSelect as Select } from "./ScheduleSelect";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+
+export const INHERITED_PERMISSION_LABEL = "Same as polling session";
+
+/** Whether matching sessions without a mode of their own run in the polling session's. */
+export function inheritsPollingPermission(
+  settings: ReturnType<typeof useScheduledHarnessSettings>,
+  permissionModesSupported: boolean,
+  pollingPermissionMode: string,
+): boolean {
+  return (
+    permissionModesSupported &&
+    pollingPermissionMode !== "" &&
+    settings.permissions.some((option) => option.value === pollingPermissionMode)
+  );
+}
 
 export function TriggerWorkerHarnessField({
   value,
@@ -70,6 +88,9 @@ export function TriggerWorkerSettingsFields({
   settings,
   permissionModesSupported = false,
   taskSession = false,
+  creating = false,
+  followsPolling = false,
+  pollingPermissionMode = "",
   disabled,
   onChange,
   onSelectOpenChange,
@@ -80,6 +101,12 @@ export function TriggerWorkerSettingsFields({
   permissionModesSupported?: boolean;
   /** Every match goes to one task session, so changes wait for the next one. */
   taskSession?: boolean;
+  /** The automation is being created, so no sessions exist yet. */
+  creating?: boolean;
+  /** The values still mirror the polling session's settings. */
+  followsPolling?: boolean;
+  /** The polling session's mode, which workers without their own mode run in. */
+  pollingPermissionMode?: string;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
@@ -95,6 +122,20 @@ export function TriggerWorkerSettingsFields({
     permissionModesSupported &&
     supportsDelegatedSessionPermission(settings.harness, value.permissionMode);
   const unappliedMode = canApplyMode ? "" : value.permissionMode;
+  const pollingInherited = inheritsPollingPermission(
+    settings,
+    permissionModesSupported,
+    pollingPermissionMode,
+  );
+  // An omitted mode follows the polling session's, so a chosen Default names the harness's own.
+  // For Codex, the explicit Ask for approval preset overrides user configuration.
+  const defaultMode =
+    settings.harness === "codex-native" ? "default" : nativeDefaultPermissionMode(settings.harness);
+  const chosenDefault =
+    permissionModesSupported &&
+    supportsDelegatedSessionPermission(settings.harness, defaultMode ?? "")
+      ? (defaultMode ?? "")
+      : "";
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ??
     (unappliedMode === "default" ? "Default" : unappliedMode);
@@ -107,6 +148,9 @@ export function TriggerWorkerSettingsFields({
         speed=""
         settings={{ ...settings, permissions, speedOptions: [] }}
         disabled={disabled}
+        idPrefix="task-worker"
+        inheritedPermissionLabel={pollingInherited ? INHERITED_PERMISSION_LABEL : undefined}
+        defaultPermissionMode={chosenDefault}
         onModelChange={(model) =>
           onChange({
             ...value,
@@ -151,10 +195,15 @@ export function TriggerWorkerSettingsFields({
         </p>
       )}
       <p className="text-sm text-muted-foreground">
-        {taskSession
-          ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
-          : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. "}
+        {creating && taskSession && "The task session started for the first match uses these. "}
+        {creating && !taskSession && "Each session started for a matching item uses these. "}
+        {!creating &&
+          (taskSession
+            ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
+            : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. ")}
+        {followsPolling && "They match the polling session until you change them. "}
         Default uses the selected harness&apos;s configuration.
+        {pollingInherited && " Pick another mode so they don't run in the polling session's."}
         {permissions.length > 0 && " Modes that skip approval aren't available here."}
       </p>
     </div>

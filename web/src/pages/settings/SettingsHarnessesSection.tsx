@@ -40,6 +40,7 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
@@ -112,14 +113,20 @@ function hostHarnessKey(hostId: string, harness: string): string {
 
 /**
  * Settings → Harnesses: the harness grid at /settings/harnesses, or one
- * harness's details at /settings/harnesses/<harness>. An unknown slug shows the
- * grid. Host selection lives here so it survives grid ↔ details navigation.
+ * harness's details at /settings/harnesses/<harness>. An unknown slug, or one
+ * the deployment curated out, shows the grid. Host selection lives here so it
+ * survives grid ↔ details navigation.
  */
 export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
   const registry = useAgentRegistry();
   const capabilities = useHarnessCapabilities();
   const info = useServerInfo();
+  const curatedOut = useCuratedOutHarnesses();
+  const offered = useMemo(
+    () => HARNESS_ENTRIES.filter((entry) => !curatedOut.has(entry.harness)),
+    [curatedOut],
+  );
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
   const requestedHostId = searchParams.get("host");
@@ -189,14 +196,14 @@ export const SettingsHarnessesSection = () => {
   const openFix = (entry: HarnessEntry, targetHost: Host, mode: HarnessFixMode) =>
     setFixTarget({ entry, host: targetHost, mode });
 
-  const notSetUp = HARNESS_ENTRIES.filter(
+  const notSetUp = offered.filter(
     (entry) => !sortedHosts.some((host) => agentPresentOnHost(entry.harness, host)),
   );
 
   const registered = registry.items.find((item) => item.key === `harness:${harness}`);
   const detailEntry =
-    HARNESS_ENTRIES.find((entry) => entry.harness === harness) ??
-    (registered?.harness
+    offered.find((entry) => entry.harness === harness) ??
+    (!curatedOut.has(harness ?? "") && registered?.harness
       ? {
           harness: registered.harness,
           name: registered.label,
@@ -257,7 +264,7 @@ export const SettingsHarnessesSection = () => {
             onFix={(mode) => selectedHost && openFix(detail, selectedHost, mode)}
           />
         </>
-      ) : harness ? (
+      ) : harness && !curatedOut.has(harness) ? (
         <>
           <BackButton label="Agents" to="/settings/agents" />
           <p
@@ -269,6 +276,11 @@ export const SettingsHarnessesSection = () => {
         </>
       ) : (
         <>
+          {offered.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              This server offers no harnesses to set up.
+            </p>
+          )}
           {notSetUp.length > 0 && (
             <details className="border-t border-border pt-4" id="not-set-up">
               <summary className="cursor-pointer text-ui font-medium">

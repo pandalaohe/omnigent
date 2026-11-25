@@ -374,7 +374,7 @@ export function useAgentRegistry() {
     () =>
       buildRegistry(
         catalog.data?.agents ?? [],
-        user.data ?? [],
+        user.data?.agents ?? [],
         library.data ?? [],
         harnesses.data ?? {
           rows: [],
@@ -383,6 +383,7 @@ export function useAgentRegistry() {
           setupSteps: {},
           acpHarnesses: new Set(),
           effortFamilies: {},
+          fileMentionHarnesses: new Set(),
         },
         hosts.data ?? [],
       ),
@@ -395,7 +396,7 @@ export function useAgentRegistry() {
     (library.isError && library.isEnabled);
   const legacyProducts = buildLegacyProductRegistry(
     catalog.data?.agents ?? [],
-    user.data ?? [],
+    user.data?.agents ?? [],
     items,
   );
   const legacyLabels = Object.fromEntries(

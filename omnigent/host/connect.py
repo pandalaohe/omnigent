@@ -903,10 +903,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Runner release flags must survive CLI -> daemon -> runner.
         "OMNIGENT_FEATURES",
-        # Idle-reap windows the runner reads at boot (``0`` disables reaping).
-        # Numeric tuning knobs, not secrets.
+        # Idle-reap windows and the human-wait hold the runner reads at boot
+        # (``0`` disables each). Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -943,6 +944,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Keep the native-terminal idle-poll backoff kill switch (a non-secret
+        # boolean) readable by spawned runners, where the watcher reads it.
+        "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -6336,10 +6340,16 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        # websockets adds its own User-Agent on top of additional_headers; send only ours.
+        ws_headers = dict(headers)
+        from omnigent.telemetry.request_headers import pop_client_user_agent
+
+        user_agent = pop_client_user_agent(ws_headers)
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
-                additional_headers=headers,
+                additional_headers=ws_headers,
+                user_agent_header=user_agent,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -7745,8 +7755,11 @@ def run_host_process(
         to stderr first.
     """
     from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.telemetry.request_headers import set_client_component
     from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
+    # Foreground (`omnigent host`) and daemon hosts both identify as the host.
+    set_client_component("host")
     if is_workspace_hosted_url(server_url):
         # Foreground hosts need the same snapshot as auto-launched daemons.
         # Pinning absence prevents later login metadata retargeting runners.

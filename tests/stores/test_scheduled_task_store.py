@@ -78,6 +78,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        mcp_services=("github", "linear"),
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
@@ -97,6 +98,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.mcp_services == ("github", "linear")
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
@@ -1026,6 +1028,85 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.permission_mode == "acceptEdits"
 
 
+def test_update_mcp_services_replaces_clears_and_keeps(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A tuple replaces the services, ``()`` clears them, and omission keeps them."""
+    store.create(
+        scheduled_task_id=_uid("st_mcp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        mcp_services=("github",),
+    )
+    kept = store.update(_uid("st_mcp"), name="renamed")
+    assert kept is not None
+    assert kept.mcp_services == ("github",)
+    replaced = store.update(_uid("st_mcp"), mcp_services=("slack", "linear"))
+    assert replaced is not None
+    assert replaced.mcp_services == ("slack", "linear")
+    cleared = store.update(_uid("st_mcp"), mcp_services=())
+    assert cleared is not None
+    assert cleared.mcp_services == ()
+    fetched = store.get(_uid("st_mcp"))
+    assert fetched is not None
+    assert fetched.mcp_services == ()
+
+
+def test_mcp_services_longer_than_the_column_are_rejected_on_every_write(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """SQLite does not enforce VARCHAR widths, so the store checks the encoded length."""
+    fits = ("x" * 4092,)  # JSON-encodes to exactly 4,096 characters
+    too_long = ("x" * 4093,)
+    common = {
+        "name": "n",
+        "prompt": "p",
+        "rrule": "FREQ=MINUTELY",
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+    }
+    created = store.create(scheduled_task_id=_uid("st_mcp_fit"), mcp_services=fits, **common)
+    assert created.mcp_services == fits
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.create(scheduled_task_id=_uid("st_mcp_long"), mcp_services=too_long, **common)
+    assert store.get(_uid("st_mcp_long")) is None
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.update(_uid("st_mcp_fit"), mcp_services=too_long)
+    kept = store.get(_uid("st_mcp_fit"))
+    assert kept is not None
+    assert kept.mcp_services == fits
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"agent_id": _uid("ag_b")}, {"mcp_services": ("github",)}),
+        ({"mcp_services": ("github",)}, {"agent_id": _uid("ag_b")}),
+    ],
+    ids=["agent-then-services", "services-then-agent"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
+    store: SqlAlchemyScheduledTaskStore, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """Services are validated against an agent, so neither may change under the other."""
+    snapshot = _session_task(store, "st_stale_mcp")
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **first)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, **second)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
@@ -1446,6 +1527,38 @@ def test_list_latest_run_status_is_workspace_scoped(
         assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {
             _uid("lst_w11"): "succeeded"
         }
+
+
+# ── has_active_run (workers of a live automation run) ─────────────────────────
+
+
+@pytest.mark.parametrize("status", ["starting", "running"])
+def test_has_active_run_counts_starting_and_running(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """A claimed run records its session while still starting, before the prompt is sent."""
+    _seed_running_run(store, "active_other")
+    store.create_run(
+        run_id=_uid(f"run_active_{status}"),
+        scheduled_task_id=_uid("task_active_other"),
+        status=status,
+        scheduled_at=200,
+        conversation_id=_uid(f"conv_active_{status}"),
+    )
+    assert store.has_active_run(_uid("task_active_other"), _uid(f"conv_active_{status}"))
+
+
+def test_has_active_run_false_once_finished_or_for_another_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only this task's live run counts, not a finished one or another task's."""
+    run_id = _seed_running_run(store, "active_fin")
+    _seed_running_run(store, "active_peer")
+    assert store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_peer"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_absent"))
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
 
 
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
@@ -2103,6 +2216,67 @@ def test_deleted_task_keeps_claims_until_last_completion(
     assert store.list_runs(task.id)[0] == []
 
 
+def test_mysql_run_completion_keeps_deleted_task_until_concurrent_grant_is_purged(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL consistent read behavior")
+    with store._engine.connect() as connection:
+        assert connection.get_isolation_level() == "REPEATABLE READ"
+
+    task = _due_task(store, "delete_concurrent_grant")
+    assert task is not None and task.next_run_at is not None
+    now = task.next_run_at
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is not None
+    running = store.transition_starting_run(claimed, now=lambda: now, status="running")
+    assert running is not None
+    permissions = SqlAlchemyPermissionStore(store.storage_location)
+    grantee = "reader@example.com"
+    permissions.ensure_user(grantee)
+
+    def interrupt_cleanup(*args, **kwargs):
+        raise RuntimeError("cleanup interrupted after marking the task deleted")
+
+    grant_committed = False
+
+    def grant_and_delete_after_snapshot(conn, cursor, statement, params, context, many):
+        nonlocal grant_committed
+        compiled = context.compiled.statement if context.compiled is not None else None
+        if (
+            grant_committed
+            or not isinstance(compiled, sa.sql.Select)
+            or list(compiled.selected_columns.keys()) != ["scheduled_task_id"]
+        ):
+            return
+        # The run lookup opened a snapshot. Commit the grant and tombstone on
+        # other connections before completion locks the task on this connection.
+        grant_committed = True
+        permissions.grant_for_scheduled_task(grantee, task.id, 1)
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_purge_deleted_task_page", interrupt_cleanup)
+            assert store.delete(task.id)
+
+    sa.event.listen(store._engine, "after_cursor_execute", grant_and_delete_after_snapshot)
+    try:
+        finished = store.update_run(running.id, status="succeeded", finished_at=now + 1)
+    finally:
+        sa.event.remove(store._engine, "after_cursor_execute", grant_and_delete_after_snapshot)
+
+    assert grant_committed and finished is not None and finished.status == "succeeded"
+    tombstone = store.get(task.id)
+    assert tombstone is not None and tombstone.state == "deleted"
+    assert store.list_runs(task.id) == ([], None)
+    assert len(permissions.list_for_scheduled_task(task.id)[0]) == 1
+    store.purge_deleted_tasks()
+    assert store.get(task.id) is None
+    assert permissions.list_for_scheduled_task(task.id) == ([], None)
+
+
 def test_delete_racing_claim_preserves_any_claim_that_won(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
@@ -2708,6 +2882,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
+        ("mcp_services", ("github",)),
         ("project_id", _uid("proj")),
     ):
         edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")

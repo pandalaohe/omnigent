@@ -56,6 +56,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  Share2Icon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
   WrapTextIcon,
@@ -108,6 +109,8 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
+import { harnessSupportsFileMentions } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -372,6 +375,9 @@ interface FileViewerProps {
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
   onNavigateTo?: (path: string) => void;
+  /** Opens session sharing with a fullscreen link to this file. */
+  onShare?: () => void;
+  shareDisabledReason?: string;
   /**
    * Numeric permission level for the current user on this session
    * (1 = read, 2 = edit, 3 = manage, 4 = owner). ``null`` means
@@ -432,6 +438,8 @@ function FileViewerBody({
   onClose,
   onCloseTab,
   onNavigateTo,
+  onShare,
+  shareDisabledReason,
   permissionLevel,
   frameless,
   mobileOverlay = false,
@@ -445,6 +453,10 @@ function FileViewerBody({
   // Embed hosts carry API calls through a fetcher that an iframe `src` or a
   // top-level artifact URL cannot travel; those surfaces stay on srcdoc.
   const isEmbed = hasOmnigentHostFetcher();
+  // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
+  // shows when the session's agent will open the attached path.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -1428,6 +1440,8 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    disabled?: boolean;
+    disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1705,6 +1719,19 @@ function FileViewerBody({
       onSelect: copyArtifactLink,
     });
   }
+  if (onShare) {
+    toolbarActions.push({
+      key: "share-file",
+      label: "Share file",
+      tooltip: shareDisabledReason ?? "Share file",
+      disabledLabel: shareDisabledReason
+        ? `Share file disabled: ${shareDisabledReason}`
+        : undefined,
+      icon: <Share2Icon className="size-4" />,
+      disabled: !!shareDisabledReason,
+      onSelect: onShare,
+    });
+  }
   if (openInActions.length) {
     toolbarActions.push({
       key: "open-in",
@@ -1737,6 +1764,23 @@ function FileViewerBody({
       `path:${path}`,
     ].join("|"),
   );
+
+  const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
+    const button = (
+      <Button
+        type="button"
+        variant={action.active ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={action.disabledLabel ?? action.label}
+        disabled={action.disabled}
+        tabIndex={interactive ? undefined : -1}
+        onClick={interactive ? action.onSelect : undefined}
+      >
+        {action.icon}
+      </Button>
+    );
+    return action.disabled ? <span className="inline-flex">{button}</span> : button;
+  };
 
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
@@ -1833,18 +1877,7 @@ function FileViewerBody({
       ) : (
         <TooltipProvider key={action.key}>
           <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={action.active ? "default" : "ghost"}
-                size="icon-sm"
-                aria-label={action.label}
-                tabIndex={interactive ? undefined : -1}
-                onClick={interactive ? action.onSelect : undefined}
-              >
-                {action.icon}
-              </Button>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{renderActionButton(action, interactive)}</TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -2051,6 +2084,24 @@ function FileViewerBody({
                               )}
                             </DropdownMenuItem>
                           ))
+                        ) : action.disabled ? (
+                          <TooltipProvider key={action.key}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="block">
+                                  <DropdownMenuItem
+                                    disabled
+                                    aria-label={action.disabledLabel ?? action.label}
+                                    className="whitespace-nowrap"
+                                  >
+                                    {action.icon}
+                                    {action.label}
+                                  </DropdownMenuItem>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -2181,6 +2232,7 @@ function FileViewerBody({
                     }
                     onSetActiveSelection={handleSetActiveSelection}
                     pendingBodyRef={pendingBodyRef}
+                    attachToAgent={attachToAgent}
                     searchOpen={searchOpen}
                     searchFocusNonce={searchFocusNonce}
                     onSearchHandled={handleSearchHandled}
@@ -2216,6 +2268,7 @@ function FileViewerBody({
               onFrameChange={setFrame}
               onAnnotationOrphansChange={setOrphanIds}
               previewKey={previewKey}
+              attachToAgent={attachToAgent}
             />
           )}
         </div>

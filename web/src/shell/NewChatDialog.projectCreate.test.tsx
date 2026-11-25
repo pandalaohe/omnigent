@@ -37,6 +37,10 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
+vi.mock("@/lib/sessionHost", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionHostModule>()),
+  setSessionHost: vi.fn(),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
@@ -68,6 +72,7 @@ import {
   resolveCallingDefaults,
   type CallingDefaultsResolution,
 } from "@/lib/callingDefaultsApi";
+import type * as SessionHostModule from "@/lib/sessionHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -76,6 +81,7 @@ import type { ReactNode } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { setSessionHost } from "@/lib/sessionHost";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
@@ -83,7 +89,11 @@ import { useHosts, useHostModelOptions } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
-import { readLastHostChoice, writeLastHostChoice } from "@/lib/hostPreferences";
+import {
+  readLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+  writeLastHostChoice,
+} from "@/lib/hostPreferences";
 import {
   readProjectLaunchDefaults,
   writeProjectLaunchDefaults,
@@ -685,7 +695,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // the server from filling them in.
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
-    renderLanding({ managed_sandboxes_enabled: true });
+    renderLanding({ managed_sandboxes_enabled: true, request_managed_sandbox_host_id: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
@@ -699,9 +709,12 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect(body.workspace).toBeNull();
     expect("git" in body).toBe(true);
     expect(body.git).toBeNull();
-    expect("host_id" in body).toBe(false);
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     // The resolved agent is still what the dialog shows and sends.
     expect(body.agent_id).toBe("ag_other");
+    // The host picker remembers Sandbox without writing a project host default.
+    expect(readLastHostChoice()).toBe(SANDBOX_HOST_CHOICE);
+    expect(readProjectLaunchDefaults("proj_alpha", config)).toBeNull();
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
@@ -867,6 +880,27 @@ describe("NewChatLandingScreen git controls on a project entry", () => {
     );
     await waitFor(() => expect(vi.mocked(useHostWorktrees)).toHaveBeenCalledWith("host_1", ENTRY));
     expect(vi.mocked(useHostWorktrees)).not.toHaveBeenCalledWith("host_1", ENTRY_CHECKOUT);
+  });
+
+  it("omits host_id and skips setSessionHost on a managed bundled create", async () => {
+    vi.mocked(setSessionHost).mockClear();
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+    renderLanding({ managed_sandboxes_enabled: true, session_bundle_workspaces: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("test-create-pending"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+
+    // Bundle creates allocate their sandbox host server-side until multipart host_id ships.
+    const metadata = vi.mocked(createBundledSession).mock.calls[0][1] ?? {};
+    expect(metadata).toMatchObject({ host_type: "managed" });
+    expect("host_id" in metadata).toBe(false);
+    expect(setSessionHost).not.toHaveBeenCalled();
   });
 });
 

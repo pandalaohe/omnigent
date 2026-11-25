@@ -6957,11 +6957,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
 
         with self._conv_session("list_conversations") as session:
-            # Bound the content-search scan on PostgreSQL and CockroachDB. SET
-            # LOCAL scopes to this transaction and reverts on commit, so it
-            # can't leak to the connection's next pooled use. See
-            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
-            # by a client disconnect, so this is the only server-side bound.
+            # Bound content search on PostgreSQL and CockroachDB even after a disconnect.
+            # SET LOCAL ends with the transaction, before the connection returns to the pool.
             is_postgres = session.bind is not None and is_postgresql_family(
                 session.bind.dialect.name
             )
@@ -11222,6 +11219,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # copied items instead.
             if source_ext_session and not truncated and resume_source_native_session:
                 fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_ext_session
+            elif truncated or not resume_source_native_session:
+                # A directive the source inherited from its own fork source
+                # would resume that ancestor's full transcript instead.
+                fork_labels.pop(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY, None)
             # When the fork binds a native target, mark it so the runner
             # rebuilds the native transcript (clone the source's native
             # transcript when same-family, else build from the copied

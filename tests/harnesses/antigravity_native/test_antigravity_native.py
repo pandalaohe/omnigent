@@ -1409,6 +1409,36 @@ async def test_cli_cold_start_skips_when_conversation_already_real(
     assert after.conversation_id == real_id
 
 
+@pytest.mark.parametrize(
+    "replacement", ["1f5f3f7a-58c9-4a8f-9a5e-0b8d3f6c2e11", "agy_conv_recreated"]
+)
+async def test_cli_cold_start_preserves_a_concurrent_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, replacement: str
+) -> None:
+    """An in-flight cold-start preserves reader adoption or a recreated terminal."""
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_race")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
+
+    def _start_and_adopt(_port: int, _cascade_id: str) -> None:
+        _seed_bridge_state(bridge_dir, replacement)
+
+    monkeypatch.setattr(_mod, "start_cascade", _start_and_adopt)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        timeout_s=1.0,
+    )
+
+    after = read_bridge_state(bridge_dir)
+    assert after is not None
+    assert after.conversation_id == replacement
+
+
 async def test_cli_cold_start_scopes_to_pane_agy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

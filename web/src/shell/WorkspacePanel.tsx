@@ -717,6 +717,8 @@ interface WorkspacePanelProps {
   /** Surface the file viewer's comments-open state up to AppShell (it
    *  widens the rail to fit the comments column). */
   onCommentsOpenChange: (open: boolean) => void;
+  onShareFile?: () => void;
+  shareDisabledReason?: string;
   /** Open a shell as a rail tab (adds/activates its tab), surfacing its
    *  xterm in the content slot. */
   openTerminalTab: (key: string, options?: { focus?: boolean }) => void;
@@ -886,6 +888,8 @@ function WorkspacePanelImpl({
   onCloseFile,
   onShowScopeView,
   onCommentsOpenChange,
+  onShareFile,
+  shareDisabledReason,
   openTerminalTab,
   openTerminals,
   selectedTerminalKey,
@@ -2230,6 +2234,8 @@ function WorkspacePanelImpl({
                 onNavigateTo={openFileViewer}
                 permissionLevel={permissionLevel}
                 onCommentsOpenChange={onCommentsOpenChange}
+                onShare={onShareFile}
+                shareDisabledReason={shareDisabledReason}
                 sort={filesPanelSort}
               />
             </ResponsiveViewerSlot>

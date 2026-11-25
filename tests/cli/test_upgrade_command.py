@@ -147,7 +147,7 @@ def test_upgrade_preserves_enabled_service(
 
         with host_enable.make_context("enable", argv[6:]) as context:
             assert context.params["server"] == (target or "")
-        assert kwargs == {"check": False}
+        assert kwargs == {"check": False, "env": None}
         if outcome == "spawn-failure":
             raise OSError("interpreter unavailable")
         try:
@@ -267,13 +267,72 @@ def test_up_validates_and_rerenders_launchd_launcher(
             "bootstrap",
         ]
         payload = plistlib.loads(installed.path.read_bytes())
-        assert payload["ProgramArguments"] == [str(launcher), *service._service_command(None)]
+        assert payload["ProgramArguments"] == [
+            str(launcher),
+            *service._service_command(None, {"PATH": "/new/bin"}),
+        ]
         assert payload["EnvironmentVariables"] == {"PATH": "/new/bin"}
         assert service.installed_user_host_service() == (installed, None)
     else:
         assert "host.service_launcher" in result.output
         assert events == []
         assert installed.path.read_bytes() == original
+
+
+@pytest.mark.parametrize("kind", ["launchd", "systemd_user"])
+def test_refresh_keeps_installed_wrapper_when_upgrade_is_started_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import shlex
+
+    from omnigent import cli as cli_module
+    from omnigent.host import service
+
+    monkeypatch.delenv(service.WRAPPER_COMMAND_ENV, raising=False)
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_module, "_drain_and_stop_local_server", lambda **_: None)
+    wrapper = tmp_path / "host $$ wrapper"
+    wrapper.touch(mode=0o700)
+    wrapped = [str(wrapper), "--profile", "work $$ profile", "omni"]
+    installed = service.HostService(
+        kind, tmp_path / "host.service", "host", tmp_path / "service.log"
+    )
+    argv = [*wrapped, "host-service-entry", "--local"]
+    old_environment = {service.WRAPPER_COMMAND_ENV: shlex.join(["wrapper", *wrapped[1:]])}
+    if kind == "launchd":
+        installed.path.write_bytes(
+            service._launchd_payload(
+                installed, command=["/opt/bin/old-launcher", *argv], environment=old_environment
+            )
+        )
+    else:
+        installed.path.write_bytes(
+            service._systemd_unit(command=argv, environment=old_environment)
+        )
+    prefix = ["/opt/bin/new-launcher", "--keep-awake"] if kind == "launchd" else []
+    monkeypatch.setattr(service, "launchd_service_launcher_prefix", lambda: prefix)
+    monkeypatch.setattr(service, "_service_for_current_platform", lambda: installed)
+    monkeypatch.setattr(service, "_record_service", lambda _: None)
+    monkeypatch.setattr(service, "stop_user_host_service", lambda _: None)
+    monkeypatch.setattr(service, "_run_checked", lambda _: None)
+    monkeypatch.setattr(service, "_run_best_effort", lambda _: None)
+    monkeypatch.setattr(service, "_wait_for_launchd_unload", lambda _: True)
+
+    def refresh(command, *, check, env):
+        assert not check and command[-2:] == ["--server", ""]
+        assert shlex.split(env[service.WRAPPER_COMMAND_ENV]) == wrapped
+        service.enable_user_host_service(
+            None, environment={service.WRAPPER_COMMAND_ENV: env[service.WRAPPER_COMMAND_ENV]}
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", refresh)
+    with cli_module._upgrade_host_service(force=True):
+        pass
+
+    command, target, _wrapper_setting = service._read_posix_service(installed)
+    assert command == [*prefix, *argv]
+    assert target is None
 
 
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])

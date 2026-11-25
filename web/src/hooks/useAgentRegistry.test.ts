@@ -47,6 +47,7 @@ const harnesses: HarnessCatalog = {
   setupSteps: {},
   acpHarnesses: new Set(),
   effortFamilies: {},
+  fileMentionHarnesses: new Set(),
 };
 
 const hosts: Host[] = [

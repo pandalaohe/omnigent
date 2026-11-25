@@ -45,7 +45,8 @@ function archiveLocatorSearch(url) {
  *
  * The origin is the http(s) origin inferred from the link's host (loopback →
  * http, else https), normalized via normalizeUrl. The path is the SPA
- * conversation route (`/c/<id>`), basename-less — the same shape the SPA
+ * conversation route (`/c/<id>`) with optional file-view parameters,
+ * basename-less — the same shape the SPA
  * already emits for notification `navigatePath`, so the embedded
  * (workspace) build's `basenamedRouting` rebases it under the mount.
  *
@@ -83,7 +84,17 @@ function parseOmnigentDeepLink(raw) {
   } catch {
     return null;
   }
-  return { origin, path: `${path}${archiveSearch}` };
+  if (!path.startsWith("/c/")) return { origin, path: `${path}${archiveSearch}` };
+  // Retain encoded values so file names keep their form-style space/plus semantics.
+  const query = url.search
+    .slice(1)
+    .split("&")
+    .filter((item) => {
+      const name = new URLSearchParams(item).keys().next().value;
+      return name === "file" || name === "fullscreen";
+    })
+    .join("&");
+  return { origin, path: query ? `${path}?${query}` : path };
 }
 
 /**

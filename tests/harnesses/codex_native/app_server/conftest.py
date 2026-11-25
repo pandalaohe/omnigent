@@ -36,3 +36,15 @@ def _no_real_reaper_ps(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureR
     from omnigent.harnesses.codex_native import process_registry
 
     monkeypatch.setattr(process_registry, "_ps_output", lambda _columns: "")
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_codex_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the host's installed Codex catalog from reordering canned listings.
+
+    Tests of that ordering patch ``_codex_catalog_models`` themselves.
+
+    :param monkeypatch: Fixture used to stub the catalog read.
+    """
+    monkeypatch.setattr("omnigent.harnesses.codex_native.app_server._codex_catalog_models", list)

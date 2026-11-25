@@ -252,6 +252,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
         self.resumed: list[str] = []
+        self.stopped: list[str] = []
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -323,6 +324,10 @@ class FakeSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Record the termination."""
         self.terminated.append(sandbox_id)
+
+    def stop(self, sandbox_id: str) -> None:
+        """Record the stop."""
+        self.stopped.append(sandbox_id)
 
     def resume(self, sandbox_id: str) -> None:
         """Record the resume."""
@@ -817,6 +822,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    os_env: dict[str, Any] | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -854,6 +860,7 @@ def build_agent_bundle(
         into the spec, e.g. ``{"shell": {"command": "bash"}}``.
         ``None`` omits it (no declared terminals and no ``sys_terminal_*``
         tools; the workspace rail still offers the default user shell).
+    :param os_env: Optional explicit OS environment for the root agent.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :returns: A gzipped tar archive containing the generated
@@ -877,6 +884,8 @@ def build_agent_bundle(
         config["description"] = description
     if guardrails is not None:
         config["guardrails"] = guardrails
+    if os_env is not None:
+        config["os_env"] = os_env
     if terminals is not None:
         config["terminals"] = terminals
     if executor is not None:
@@ -922,6 +931,9 @@ def build_agent_bundle(
                 # ``sa["executor"]``.
                 "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
+            for key in ("os_env", "terminals"):
+                if key in sa:
+                    sa_config[key] = sa[key]
             if "description" in sa:
                 sa_config["description"] = sa["description"]
             sa_bytes = yaml.dump(sa_config).encode()
@@ -1053,6 +1065,7 @@ async def create_test_session(
     max_iterations: int | None = None,
     executor: dict[str, Any] | None = None,
     skills: list[dict[str, str]] | None = None,
+    bundle: bytes | None = None,
 ) -> dict[str, Any]:
     """
     Create a session via multipart ``POST /v1/sessions``.
@@ -1075,6 +1088,7 @@ async def create_test_session(
         "codex"}}``.
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``.
+    :param bundle: Optional caller-authored bundle instead of the default fixture.
     :returns: Parsed ``GET /v1/sessions/{id}`` snapshot.
     """
     metadata: dict[str, Any] = {}
@@ -1082,12 +1096,16 @@ async def create_test_session(
         metadata["title"] = title
     if labels is not None:
         metadata["labels"] = labels
-    bundle = build_agent_bundle(
-        name=name,
-        description=description,
-        max_iterations=max_iterations,
-        executor=executor,
-        skills=skills,
+    bundle = (
+        bundle
+        if bundle is not None
+        else build_agent_bundle(
+            name=name,
+            description=description,
+            max_iterations=max_iterations,
+            executor=executor,
+            skills=skills,
+        )
     )
     resp = await client.post(
         "/v1/sessions",

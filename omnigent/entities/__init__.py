@@ -33,7 +33,11 @@ from omnigent.entities.file import StoredFile
 from omnigent.entities.github_connection import GithubConnection
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.peer_message import SessionPeerMessage
-from omnigent.entities.permission import ResolvedAccess, SessionPermission
+from omnigent.entities.permission import (
+    ResolvedAccess,
+    ScheduledTaskPermission,
+    SessionPermission,
+)
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import Project
 from omnigent.entities.project_host_binding import ProjectHostBinding
@@ -86,6 +90,7 @@ __all__ = [
     "ResourceEventData",
     "RoutingDecisionData",
     "ScheduledTask",
+    "ScheduledTaskPermission",
     "ScheduledTaskRun",
     "SessionPeerMessage",
     "SessionPermission",

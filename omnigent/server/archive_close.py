@@ -8,7 +8,7 @@ import dataclasses
 import logging
 import secrets
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.cli_release_store import CliReleaseIntent, CliReleaseIntentStore
@@ -19,6 +19,9 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
 )
 from omnigent.stores.host_store import host_is_live
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
 
 _logger = logging.getLogger(__name__)
 _INTENT_CLAIM_STALE_AFTER_S = 15 * 60
@@ -45,6 +48,7 @@ class ArchiveCloseCoordinator:
         runner_router: Any,
         intent_store: CliReleaseIntentStore,
         scan_interval_seconds: float = 30.0,
+        sandbox_config: ManagedSandboxDeployment | None = None,
     ) -> None:
         self._conversation_store = conversation_store
         self._host_store = host_store
@@ -52,6 +56,7 @@ class ArchiveCloseCoordinator:
         self._runner_router = runner_router
         self._intent_store = intent_store
         self._scan_interval_seconds = scan_interval_seconds
+        self._sandbox_config = sandbox_config
         self._root_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._intent_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._scan_task: asyncio.Task[None] | None = None
@@ -710,6 +715,14 @@ class ArchiveCloseCoordinator:
                     self._conversation_store.complete_archive_descendants, root_id, revision
                 )
             await self._remove_archived_worktree(root_id, revision)
+            if self._host_store is not None and self._sandbox_config is not None:
+                from omnigent.server.managed_hosts import stop_archived_session_sandbox
+
+                root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
+                if root is not None and root.archived and root.archive_revision == revision:
+                    await stop_archived_session_sandbox(
+                        root, self._host_store, self._conversation_store, self._sandbox_config
+                    )
             await asyncio.to_thread(
                 self._conversation_store.finalize_archive_close, root_id, revision
             )

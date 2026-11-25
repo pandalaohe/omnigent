@@ -115,6 +115,7 @@ from omnigent.tools.builtins.session_message import (
 from omnigent.tools.builtins.session_projects import (
     SysProjectListTool,
     SysProjectUpdateTool,
+    SysSessionLinkPrTool,
     SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
@@ -447,6 +448,7 @@ _SESSION_ARCHIVE_TOOLS = frozenset({SysSessionArchiveTool.name(), SysSessionUnar
 _PROJECT_TOOLS = frozenset(
     {
         SysProjectListTool.name(),
+        SysSessionLinkPrTool.name(),
         SysSessionUpdateTool.name(),
         SysProjectUpdateTool.name(),
     }
@@ -816,6 +818,7 @@ def build_native_relay_tool_schemas(
             SysSessionHandoverTool,
             SysSessionMessageTool,
             SysProjectListTool,
+            SysSessionLinkPrTool,
             SysSessionUpdateTool,
             SysProjectUpdateTool,
             UiOpenFileTool,
@@ -1901,6 +1904,52 @@ def _subagent_message_from_args(args: _JsonObject) -> str | None:
     return None
 
 
+async def _get_session_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    timeout: float,
+    include_items: bool = False,
+    include_usage: bool = False,
+    include_liveness: bool = False,
+    include_live_status: bool = False,
+    include_preview: bool = False,
+) -> httpx.Response:
+    """
+    Read a session snapshot via ``GET /v1/sessions/{id}``, light by default.
+
+    The defaults skip every costly optional part of the snapshot: the
+    transcript page, the spawn-tree usage aggregate, the runner/host
+    liveness lookup, and the live-status probe of the bound runner (so
+    ``status`` comes from the server's cached or persisted value). Opt in
+    only to the parts the caller reads.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_abc123"``.
+    :param timeout: Request timeout in seconds.
+    :param include_items: Return the latest committed ``items``.
+    :param include_usage: Return ``total_cost_usd`` / ``usage_by_model``.
+    :param include_liveness: Return ``runner_online`` / ``host_online``.
+    :param include_live_status: Probe the bound runner for ``status`` on a
+        server status-cache miss.
+    :param include_preview: Return the latest visible and assistant message excerpts.
+    :returns: The raw server response; callers map its status code.
+    """
+    flags = {
+        "include_items": include_items,
+        "include_usage": include_usage,
+        "include_liveness": include_liveness,
+        "include_live_status": include_live_status,
+    }
+    if include_preview:
+        flags["include_preview"] = True
+    return await server_client.get(
+        _session_url(session_id),
+        params={name: "true" if enabled else "false" for name, enabled in flags.items()},
+        timeout=timeout,
+    )
+
+
 async def _session_turn_actor(
     *,
     server_client: httpx.AsyncClient,
@@ -1908,7 +1957,7 @@ async def _session_turn_actor(
 ) -> str | None:
     """Return the parent turn actor label for runner-originated callbacks."""
     try:
-        resp = await server_client.get(f"{_session_url(conversation_id)}", timeout=10.0)
+        resp = await _get_session_metadata(server_client, conversation_id, timeout=10.0)
     except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
@@ -2260,9 +2309,7 @@ async def _session_snapshot(
     Shared by the dispatch's calling-defaults lookup and parent-model
     inheritance so one dispatch costs at most one session read.
     """
-    params = (
-        {**_SESSION_METADATA_PARAMS, "include_live_status": "false"} if metadata_only else None
-    )
+    params = _SESSION_METADATA_PARAMS if metadata_only else None
     try:
         resp = await server_client.get(_session_url(conversation_id), params=params, timeout=10.0)
     except (httpx.HTTPError, ValueError, RuntimeError):
@@ -2276,11 +2323,12 @@ async def _session_snapshot(
     return _string_object_dict(payload)
 
 
-# Metadata-only session read: transcript, liveness, and subtree usage excluded.
+# Stored metadata avoids probing the runner that is waiting for the response.
 _SESSION_METADATA_PARAMS: dict[str, str] = {
     "include_items": "false",
     "include_liveness": "false",
     "include_usage": "false",
+    "include_live_status": "false",
 }
 
 # Host-name lookups are stable for a runner process; cache the successes so a
@@ -2616,7 +2664,7 @@ async def _inherited_parent_model(
     if not harness_supports_model_override(child_harness):
         return None
     if snapshot is None:
-        snapshot = await _session_snapshot(server_client, conversation_id)
+        snapshot = await _session_snapshot(server_client, conversation_id, metadata_only=True)
     if snapshot is None:
         return None
     # Effective selection: an explicit per-session override wins over the
@@ -3930,10 +3978,7 @@ async def _execute_subagent_tool(
     parent_agent_id = _runner_app.get_session_agent_id(conversation_id)
     if parent_agent_id is None:
         try:
-            sess_resp = await server_client.get(
-                f"{_session_url(conversation_id)}",
-                timeout=10.0,
-            )
+            sess_resp = await _get_session_metadata(server_client, conversation_id, timeout=10.0)
             if sess_resp.status_code == 200:
                 parent_agent_id = sess_resp.json().get("agent_id")
         except (httpx.HTTPError, RuntimeError):
@@ -4946,7 +4991,7 @@ async def _is_descendant(
     :param target_snapshot: The target session's snapshot.
     :returns: ``True`` when the target is strictly below the caller.
     """
-    caller = await _session_snapshot(server_client, caller_id)
+    caller = await _session_snapshot(server_client, caller_id, metadata_only=True)
     if caller is None:
         return False
     target_root = _optional_string(target_snapshot.get("root_conversation_id"))
@@ -5102,7 +5147,7 @@ async def _send_to_existing_session(
     from omnigent.runner import subagent_work as _subagent_work
 
     try:
-        snap = await server_client.get(f"{_session_url(target_session_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_session_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return f"Error: sys_session_send failed to look up session: {exc}"
     if snap.status_code == 404:
@@ -6030,20 +6075,17 @@ def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
     :param placement: The requested placement, e.g. ``"same_host"``.
     :returns: A JSON error, or ``None`` when the arguments are usable.
     """
-    if placement != "child" and args.get("project_id") is not None:
-        return json.dumps(
-            {
-                "error": "sys_session_create takes project_name, the project's name as "
-                "shown in the UI, not project_id"
-            }
-        )
     project_name = args.get("project_name")
-    if project_name is None:
-        return None
-    if placement == "child":
-        return json.dumps({"error": "project_name requires placement='same_host' or 'managed'"})
-    if not isinstance(project_name, str) or not project_name.strip():
-        return json.dumps({"error": "project_name must be a nonempty string"})
+    project_id = args.get("project_id")
+    if project_name is not None and project_id is not None:
+        return json.dumps({"error": "Provide only one of project_name or project_id"})
+    for name, value in (("project_name", project_name), ("project_id", project_id)):
+        if value is None:
+            continue
+        if placement == "child" and name == "project_name":
+            return json.dumps({"error": f"{name} requires an independent placement"})
+        if not isinstance(value, str) or not value.strip():
+            return json.dumps({"error": f"{name} must be a nonempty string"})
     return None
 
 
@@ -6055,10 +6097,10 @@ async def _add_named_project(
     headers: dict[str, str],
 ) -> str | None:
     """
-    Add the project a checked ``sys_session_create`` call names to its create body.
+    Add the requested project ID or resolve its name for an independent create.
 
-    Explicit ``workspace`` and ``git`` nulls keep the project's defaults off the
-    session, so only the filing applies.
+    Preserve explicit placement options; otherwise null out workspace and git
+    so project defaults do not change the requested placement.
 
     :param body: The orchestrated create body to update.
     :param args: Arguments that passed :func:`_project_argument_error`.
@@ -6068,7 +6110,8 @@ async def _add_named_project(
     :returns: A JSON error when the project name can't be used, else ``None``.
     """
     project_name = args.get("project_name")
-    if project_name is None:
+    project_id = args.get("project_id")
+    if project_name is None and project_id is None:
         return None
     # An older nested server refuses another project; refuse before a project is created.
     if (
@@ -6082,12 +6125,17 @@ async def _add_named_project(
             }
         )
     try:
-        project_id = await _project_id_for_name(server_client, str(project_name), headers=headers)
+        if project_id is None:
+            project_id = await _project_id_for_name(
+                server_client, str(project_name), headers=headers
+            )
     except (httpx.HTTPError, ValueError) as exc:
         return json.dumps(
             {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
         )
-    body.update({"project_id": project_id, "workspace": None, "git": None})
+    body["project_id"] = project_id
+    body.setdefault("workspace", None)
+    body.setdefault("git", None)
     return None
 
 
@@ -6675,8 +6723,8 @@ async def _execute_session_create_impl(
             }
         )
     placement_mode = args.get("placement", "child")
-    if placement_mode not in ("child", "same_host", "managed"):
-        return json.dumps({"error": "placement must be child, same_host or managed"})
+    if placement_mode not in ("child", "same_host", "host", "managed"):
+        return json.dumps({"error": "placement must be child, same_host, host or managed"})
     permission_tier = args.get("permission_tier")
     if permission_tier is not None:
         from omnigent.permission_tiers import NON_FULL_TIERS
@@ -6691,6 +6739,31 @@ async def _execute_session_create_impl(
             )
     if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    explicit_placement = {
+        key: args[key] for key in ("host_id", "workspace", "git") if args.get(key) is not None
+    }
+    if placement_mode == "child":
+        explicit_placement.pop("workspace", None)
+    if explicit_placement and placement_mode != "host":
+        return json.dumps({"error": "host_id, workspace and git require placement='host'"})
+    if placement_mode == "host":
+        if any(
+            not isinstance(args.get(key), str) or not str(args[key]).strip()
+            for key in ("host_id", "workspace")
+        ):
+            return json.dumps({"error": "placement='host' requires host_id and workspace"})
+        git = args.get("git")
+        if git is not None and (
+            not isinstance(git, dict)
+            or not isinstance(git.get("branch_name"), str)
+            or not git["branch_name"].strip()
+            or set(git) - {"branch_name", "base_branch"}
+            or (
+                "base_branch" in git
+                and (not isinstance(git["base_branch"], str) or not git["base_branch"].strip())
+            )
+        ):
+            return json.dumps({"error": "git requires branch_name and an optional base_branch"})
     project_error = _project_argument_error(args, placement_mode)
     if project_error is not None:
         return project_error
@@ -6762,7 +6835,7 @@ async def _execute_session_create_impl(
             assert placement_error is not None
             return placement_error
     else:
-        if any(args.get(key) is not None for key in _PLACEMENT_ARG_KEYS):
+        if args.get("host") is not None or args.get("worktree") is not None:
             return json.dumps(
                 {
                     "error": (
@@ -6799,7 +6872,8 @@ async def _execute_session_create_impl(
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
         body.pop("parent_session_id")
-        # The server derives the same host/workspace from this bound source.
+        body.update(explicit_placement)
+        # The server validates placement against this bound source.
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement_mode == "managed":
             body["host_type"] = "managed"
@@ -6822,16 +6896,32 @@ async def _execute_session_create_impl(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement_mode == "child" else "/v1/sessions/orchestrated"
+        if placement_mode == "host":
+            endpoint += "/host"
         host_id = None
         info_data: _JsonObject = {}
         if (
-            placement_mode == "managed"
+            placement_mode in ("managed", "host")
+            or (placement_mode != "child" and args.get("project_id") is not None)
             or args.get("project_name") is not None
             or permission_mode is not None
         ):
             info = await server_client.get("/v1/info", timeout=_SESSION_CREATE_TIMEOUT)
             info.raise_for_status()
             info_data = info.json()
+        if (
+            placement_mode == "host"
+            or (placement_mode != "child" and args.get("project_id") is not None)
+        ) and info_data.get("scripted_sessions") is not True:
+            return json.dumps(
+                {
+                    "error": "Scripted session options are unavailable on this server; "
+                    "no session was created"
+                }
+            )
+        if placement_mode == "host":
+            host_id = str(args["host_id"])
+            unconfirmed_creation["host_id"] = host_id
         # An older server ignores the field, so the session would quietly start in
         # its agent's default mode instead.
         if (
@@ -6864,17 +6954,21 @@ async def _execute_session_create_impl(
                             "no session was created."
                         }
                     )
+            # Sent only when /v1/info reports the server accepts host_id; older servers reject it.
             host_id = (
-                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex
+                if info_data.get("request_managed_sandbox_host_id") is True
+                else None
             )
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-        project_error = await _add_named_project(body, args, server_client, info_data, headers)
-        if project_error is not None:
-            return project_error
+        if placement_mode != "child":
+            project_error = await _add_named_project(body, args, server_client, info_data, headers)
+            if project_error is not None:
+                return project_error
         create_requested = True
-        if placement_mode == "managed":
+        if placement_mode in ("managed", "host"):
             from omnigent.runner.session_requests import post_on_host
 
             resp = await post_on_host(
@@ -6921,7 +7015,7 @@ async def _execute_session_create_impl(
         )
     if placement_mode != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
         return json.dumps(unconfirmed_creation)
-    if placement_mode == "same_host":
+    if placement_mode in ("same_host", "host"):
         from omnigent.runner.session_requests import is_wrong_replica
 
         # Host loss can be reported before persistence or during the later launch.
@@ -6987,7 +7081,7 @@ async def _execute_session_create_impl(
             "project_id": data.get("project_id"),
         }
         initial_message = data.get("initial_message")
-        if placement_mode == "same_host" and args.get("message"):
+        if placement_mode in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
             initial_message = json.loads(
@@ -8689,6 +8783,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "speed",
     "permission_mode",
     "max_cost_usd",
+    "mcp_services",
     "session_mode",
     "session_id",
     "workspace",
@@ -8707,6 +8802,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "reasoning_effort",
     "speed",
     "permission_mode",
+    "mcp_services",
     "max_cost_usd",
     "session_mode",
     "session_id",
@@ -8717,30 +8813,45 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-# Fields a server accepts only once it advertises ``scheduled_task_session_modes``.
-_SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
+# Optional fields an older server forbids, the ``/v1/info`` flag that admits
+# them, and how to retry without them.
+_SCHEDULED_TASK_GATED_FIELDS = (
+    (
+        ("session_mode", "session_id"),
+        "scheduled_task_session_modes",
+        "does not support session_mode or session_id; omit them to start a new "
+        "session on every run",
+    ),
+    (
+        ("mcp_services",),
+        "scheduled_task_mcp_services",
+        "does not support mcp_services; omit it to start runs without MCP services",
+    ),
+)
 
 
 async def _scheduled_task_session_fields_refusal(
     server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
 ) -> str | None:
-    """An error for session fields this server would reject, or ``None`` to send them.
+    """An error for optional fields this server would reject, or ``None`` to send them.
 
     An older server forbids unknown fields, so the payload would fail with a 422
     that does not say why. Asked only when the call carries one of the fields; an
     unreadable ``/v1/info`` counts as unsupported, as for task projects.
     """
-    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
+    gated = [
+        (capability, reason)
+        for fields, capability, reason in _SCHEDULED_TASK_GATED_FIELDS
+        if any(field in payload for field in fields)
+    ]
+    if not gated:
         return None
     info = await server_client.get("/v1/info", timeout=30.0)
-    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
-        return None
-    return json.dumps(
-        {
-            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
-            "session_id; omit them to start a new session on every run"
-        }
-    )
+    advertised = info.json() if info.status_code < 400 else {}
+    for capability, reason in gated:
+        if advertised.get(capability) is not True:
+            return json.dumps({"error": f"{tool_name}: this Omnigent server {reason}"})
+    return None
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
@@ -9110,6 +9221,9 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
+        project = args.get("project")
+        if project is not None and not isinstance(project, str):
+            return json.dumps({"error": "project must be a project name string"})
         agent_name = args.get("agent_name")
         include_archived = args.get("include_archived") is True
         archived = args.get("archived", "include" if include_archived else "exclude")
@@ -9132,7 +9246,9 @@ async def _execute_session_query_tool(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility, archived),
+            _session_list_filters(
+                agent_name, include_archived, visibility, archived=archived, project=project
+            ),
         )
         if isinstance(window, str):
             return window
@@ -9143,6 +9259,7 @@ async def _execute_session_query_tool(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            project=project,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -9614,14 +9731,9 @@ async def _session_info_item(
         non-200 status).
     """
     try:
-        resp = await server_client.get(
-            f"{_session_url(target)}",
-            params={
-                "include_items": "false",
-                "include_liveness": "false",
-                "include_preview": "true",
-            },
-            timeout=30.0,
+        # ``status`` is projected, so keep the live-status probe on a cache miss.
+        resp = await _get_session_metadata(
+            server_client, target, timeout=30.0, include_live_status=True, include_preview=True
         )
     except Exception as exc:  # noqa: BLE001
         return {
@@ -10292,12 +10404,8 @@ async def _spawn_family(
     if conversation_id in _spawn_family_cache:
         return _spawn_family_cache[conversation_id]
     try:
-        resp = await server_client.get(
-            f"{_session_url(conversation_id)}",
-            # Only the routing fields are read, so skip the history and
-            # runner-liveness work the full snapshot would do.
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=_SPAWN_FAMILY_TIMEOUT_S,
+        resp = await _get_session_metadata(
+            server_client, conversation_id, timeout=_SPAWN_FAMILY_TIMEOUT_S
         )
     except Exception:  # noqa: BLE001 — discovery must not fail on this read
         return None
@@ -10383,10 +10491,8 @@ async def _agent_list_host_readiness(
                         diagnostics["host_lookup_reason"] = "readiness_depth_limit"
                     return None
                 seen.add(conversation_id)
-                response = await server_client.get(
-                    f"{_session_url(conversation_id)}",
-                    params={"include_items": "false", "include_liveness": "false"},
-                    timeout=_AGENT_READINESS_TIMEOUT_S,
+                response = await _get_session_metadata(
+                    server_client, conversation_id, timeout=_AGENT_READINESS_TIMEOUT_S
                 )
                 if response.status_code != 200:
                     if diagnostics is not None:
@@ -10766,6 +10872,7 @@ def _session_list_filters(
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     archived: str = "exclude",
+    project: str | None = None,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
@@ -10787,6 +10894,8 @@ def _session_list_filters(
         filters["include_archived"] = True
     if visibility != _SESSION_LIST_DEFAULT_VISIBILITY:
         filters["visibility"] = visibility
+    if project is not None:
+        filters["project"] = project
     return filters
 
 
@@ -10797,6 +10906,7 @@ async def _session_list_via_rest(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    project: str | None = None,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -10845,6 +10955,7 @@ async def _session_list_via_rest(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            project=project,
             after=cursor_state["sessions"][1],
             limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
             archived=archived,
@@ -10856,7 +10967,9 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility, archived),
+        filters=_session_list_filters(
+            agent_name, include_archived, visibility, archived=archived, project=project
+        ),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
@@ -11058,13 +11171,7 @@ async def _rename_current_session_via_rest(
     # rename would corrupt sibling addressing. Refuse explicitly, matching
     # the old seed-gated endpoint's response for child sessions.
     try:
-        info_response = await server_client.get(
-            f"{_session_url(conversation_id)}",
-            # Skip the transcript and the runner/host liveness lookup — the
-            # probe only needs parent_session_id.
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=30.0,
-        )
+        info_response = await _get_session_metadata(server_client, conversation_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_rename failed: {exc}"})
     if info_response.status_code >= 400:
@@ -11467,6 +11574,7 @@ async def _collect_global_sessions(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    project: str | None = None,
     after: str | None,
     limit: int,
     archived: str = "exclude",
@@ -11525,6 +11633,8 @@ async def _collect_global_sessions(
         "visibility": server_visibility,
         "include_preview": 1,
     }
+    if project is not None:
+        params["project"] = project
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if include_archived:
@@ -11707,7 +11817,7 @@ async def _session_parent_id(
     :returns: The parent session id, or ``None``.
     """
     try:
-        snap = await server_client.get(f"{_session_url(conversation_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, conversation_id, timeout=30.0)
         snap.raise_for_status()
         body = snap.json()
         if not isinstance(body, dict) or "parent_session_id" not in body:
@@ -11831,7 +11941,7 @@ async def _fetch_close_target(
         otherwise) suitable for returning verbatim to the LLM.
     """
     try:
-        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
     if snap.status_code == 404:
@@ -11876,8 +11986,8 @@ async def _close_tree_scope_error(
         ``session_not_a_sub_agent``).
     """
     try:
-        caller_snap = await server_client.get(
-            f"{_session_url(caller_conversation_id)}", timeout=30.0
+        caller_snap = await _get_session_metadata(
+            server_client, caller_conversation_id, timeout=30.0
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
@@ -12028,7 +12138,7 @@ async def _fetch_peek_meta(
         payloads (all empty/``None`` on any miss).
     """
     try:
-        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_id, timeout=30.0)
     except Exception:  # noqa: BLE001
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     if snap.status_code != 200:
@@ -12245,6 +12355,10 @@ async def execute_tool(
             from omnigent.runner.session_message import execute_message_tool
 
             output = await execute_message_tool(args, server_client, conversation_id)
+        elif tool_name == SysSessionLinkPrTool.name():
+            from omnigent.runner.session_link_pr import execute_link_pr_tool
+
+            output = await execute_link_pr_tool(args, server_client, conversation_id)
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
                 execute_project_list,
@@ -13066,9 +13180,8 @@ async def _execute_rest_tool(
             # Bind to the parent's runner so event forwarding works.
             if conversation_id is not None:
                 try:
-                    parent_resp = await server_client.get(
-                        f"{_session_url(conversation_id)}",
-                        timeout=10.0,
+                    parent_resp = await _get_session_metadata(
+                        server_client, conversation_id, timeout=10.0
                     )
                     if parent_resp.status_code == 200:
                         parent_runner = parent_resp.json().get("runner_id")
@@ -14670,7 +14783,7 @@ async def _cancel_evicted_native_subagent(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
     try:
-        resp = await server_client.get(f"{_session_url(task_id)}", timeout=10.0)
+        resp = await _get_session_metadata(server_client, task_id, timeout=10.0)
     except (httpx.HTTPError, ValueError) as exc:
         return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
     if resp.status_code != 200:

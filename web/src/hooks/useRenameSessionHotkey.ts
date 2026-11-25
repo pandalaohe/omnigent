@@ -5,7 +5,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 
-/** Cmd/Ctrl+Alt+R; match the physical key because Option changes its character. */
+/** Cmd/Ctrl+Alt+R. */
 export function isRenameSessionHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),

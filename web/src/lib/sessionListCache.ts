@@ -13,6 +13,7 @@ import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { sessionVisibility } from "@/lib/sessionVisibility";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -38,7 +39,6 @@ export const PROJECT_LABEL_KEY = "omni_project";
  * without a hooks-layer import cycle.
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
-const SIDE_CHAT_LABEL_KEY = "omnigent.side_chat";
 
 /** Mutation key shared by every pin, unpin, and pinned-reorder write. */
 export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
@@ -241,64 +241,75 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 }
 
 /**
- * Label keys that decide which list, folder or filter a row belongs to: the
- * project key moves a row between project folders / the project filter, the
- * pinned key decides Pinned-section membership, and the side-chat key removes
- * a row from the server list. A change to any of them can place a
- * row in a cached variant it currently isn't in (or evict it), which no local
- * patch can do; every other label is display metadata patched in place.
+ * The reserved `conversation_labels` key marking a side-chat fork. The server
+ * leaves these sessions out of every `GET /v1/sessions` list.
  */
-const MEMBERSHIP_LABEL_KEYS = [PROJECT_LABEL_KEY, PINNED_LABEL_KEY, SIDE_CHAT_LABEL_KEY] as const;
-
-/** Whether a labels change touched a membership-relevant key. */
-function membershipLabelChanged(
-  current: Record<string, string> | undefined,
-  next: Record<string, string> | undefined,
-): boolean {
-  return MEMBERSHIP_LABEL_KEYS.some((key) => (current ?? {})[key] !== (next ?? {})[key]);
-}
+export const SIDE_CHAT_LABEL_KEY = "omnigent.side_chat";
 
 /**
- * Decide whether a field change needs server-side list reconciliation.
+ * A row property some cached list's server-side filter reads, so changing it
+ * can add the row to another list or drop it from one.
  *
- * The server owns pagination, archive filtering, membership labels, and
- * search matches over title and item content. Push frames update visible
- * row fields immediately except `updated_at`, which stays at its fetched
- * value until the server refreshes page order. This tells the provider when
- * to follow with a list refetch so filtered-query membership converges.
+ * - `archived`: the archive flag (and its `omnigent.archived_at` label).
+ * - `title`: search lists match on it.
+ * - `project`: `project_id` or the legacy `omni_project` label.
+ * - `hidden`: the side-chat label, which removes a row from every list.
+ * - `pinned`: the standalone pin label or canonical family pin state.
  *
- * @param changed - Names of wire fields that changed the cached row.
- * @param searchListCached - Whether any search-scoped `["conversations"]`
- *   variant is cached. Only those lists depend on the server's title/content
- *   matching and result order, so a title/`updated_at` change forces
- *   reconciliation only while one exists.
- * @param membershipChanged - Whether a `labels` change touched a
- *   membership-relevant key (see `MEMBERSHIP_LABEL_KEYS`).
- * @returns `true` when the query should be invalidated after patching.
+ * Any other change (status, error labels, an `updated_at` bump) is patched in
+ * place: every list sorts its loaded rows itself, so it can't move a row in or
+ * out of a list. The exception is the row the next page's cursor names; see
+ * {@link mergeItemsIntoPages}.
  */
-function changedFieldsNeedRefetch(
+export type MembershipField = "archived" | "title" | "project" | "hidden" | "pinned";
+
+/** Every membership field; a row no list holds yet may match on any of them. */
+export const ALL_MEMBERSHIP_FIELDS: ReadonlySet<MembershipField> = new Set<MembershipField>([
+  "archived",
+  "title",
+  "project",
+  "hidden",
+  "pinned",
+]);
+
+const MEMBERSHIP_LABELS: readonly (readonly [string, MembershipField])[] = [
+  [PROJECT_LABEL_KEY, "project"],
+  [ARCHIVED_AT_LABEL_KEY, "archived"],
+  [SIDE_CHAT_LABEL_KEY, "hidden"],
+  [PINNED_LABEL_KEY, "pinned"],
+];
+
+/**
+ * Name the membership fields a patch moved.
+ *
+ * @param before - The cached row.
+ * @param after - The row with the wire item applied.
+ * @param changed - Wire fields that differ between them.
+ */
+function changedMembershipFields(
+  before: Conversation,
+  after: Conversation,
   changed: Set<string>,
-  searchListCached: boolean,
-  membershipChanged: boolean,
-): boolean {
-  // An archived flip must ENTER the row into variants that don't hold it
-  // (the Archived tab, or the default lists on unarchive), which no local
-  // patch can place.
-  if (changed.has("archived")) return true;
-  // A membership-label change can move a row between project-filtered variants
-  // and the project folders (["project-sessions", …]) or into/out of Pinned. A
-  // session relabeled INTO the selected project isn't in that filtered cache
-  // yet, so no local patch can place it; only a server reconcile can. The
-  // unfiltered variant where the row lives detects the label change here and
-  // flags the refetch, and the caller's invalidation is prefix-wide
-  // (["conversations"]), so it reconciles the filtered variants too.
-  if (changed.has("labels") && membershipChanged) return true;
-  // A renamed (or bumped) row may start or stop matching a search-scoped list
-  // — the server matches over title AND item content and owns search result
-  // order, so only it can decide. With no search list cached, order refreshes
-  // can be throttled separately from membership reconciliation.
-  if ((changed.has("title") || changed.has("updated_at")) && searchListCached) return true;
-  return false;
+): Set<MembershipField> {
+  const fields = new Set<MembershipField>();
+  if (changed.has("archived")) fields.add("archived");
+  if (changed.has("title")) fields.add("title");
+  if (changed.has("project_id")) fields.add("project");
+  if (changed.has("family") && before.family?.pinned !== after.family?.pinned) {
+    fields.add("pinned");
+  }
+  if (changed.has("labels")) {
+    for (const [key, field] of MEMBERSHIP_LABELS) {
+      if (before.labels?.[key] !== after.labels?.[key]) fields.add(field);
+    }
+  }
+  return fields;
+}
+
+/** A patched row and the membership fields its patch moved. */
+export interface MembershipChange {
+  row: Conversation;
+  fields: Set<MembershipField>;
 }
 
 /** Query-key namespaces whose pages hold sidebar list rows. */
@@ -341,25 +352,24 @@ export function findCachedListRow(queryClient: QueryClient, id: string): Convers
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @param searchListCached - Whether any search-scoped `["conversations"]`
- *   variant is cached; gates the title/`updated_at`-change refetch (see
- *   `changedFieldsNeedRefetch`). Callers that ignore `needsRefetch` omit it.
  * @returns The possibly updated data, ids found in it, whether this query
- *   needs an immediate refetch, and whether its fetched order is stale.
+ *   needs a server refetch after the local patch, and the membership fields
+ *   each patched row moved, plus whether the fetched order is stale.
  */
 export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-  searchListCached = false,
 ): {
   data: ConversationsInfiniteData | undefined;
   found: Set<string>;
   needsRefetch: boolean;
   orderStale: boolean;
+  changes: Map<string, MembershipChange>;
 } {
   const found = new Set<string>();
-  if (!data) return { data, found, needsRefetch: false, orderStale: false };
+  const changes = new Map<string, MembershipChange>();
+  if (!data) return { data, found, needsRefetch: false, orderStale: false, changes };
   let anyPageChanged = false;
   let needsRefetch = false;
   let orderStale = false;
@@ -385,17 +395,18 @@ export function mergeItemsIntoPages(
       }
       if (changed.has("updated_at")) orderStale = true;
       const nextConv = { ...conv, ...wire, updated_at: conv.updated_at };
+      const fields = changedMembershipFields(conv, nextConv, changed);
+      if (fields.size > 0) changes.set(conv.id, { row: nextConv, fields });
       if (violatesKnownMembership(nextConv, filters)) {
         rowChanged = true;
         needsRefetch = true;
         continue;
       }
       if (
-        changedFieldsNeedRefetch(
-          changed,
-          searchListCached,
-          changed.has("labels") && membershipLabelChanged(conv.labels, wire.labels),
-        ) ||
+        // The server drops side chats from every list, and a retitled row may
+        // stop matching this list's search.
+        fields.has("hidden") ||
+        (filters.searchQuery !== "" && (fields.has("title") || changed.has("updated_at"))) ||
         (conv.id === cursorId && changed.has(filters.sortBy ?? "updated_at"))
       ) {
         needsRefetch = true;
@@ -411,8 +422,8 @@ export function mergeItemsIntoPages(
     anyPageChanged = true;
     return { ...page, data: nextData };
   });
-  if (!anyPageChanged) return { data, found, needsRefetch, orderStale };
-  return { data: { ...data, pages }, found, needsRefetch, orderStale };
+  if (!anyPageChanged) return { data, found, needsRefetch, orderStale, changes };
+  return { data: { ...data, pages }, found, needsRefetch, orderStale, changes };
 }
 
 // ── Recently-created keep-alive ───────────────────────────────────────
@@ -487,12 +498,10 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
-    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
-    // when the row is owned by the viewer (single-user / legacy shape) or
-    // explicitly set to another user's id when the session was shared.
-    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
-    if (filters.visibility === "mine" && !ownedByViewer) continue;
-    if (filters.visibility === "shared" && ownedByViewer) continue;
+    // Same ownership inference as the sidebar scopes and the targeted reconcile.
+    const visibility = sessionVisibility(conv, viewerId ?? null);
+    if (filters.visibility === "mine" && visibility !== "mine") continue;
+    if (filters.visibility === "shared" && visibility !== "shared") continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };

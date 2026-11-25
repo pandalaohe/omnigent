@@ -1224,6 +1224,7 @@ async def _serve_tunnel_once(
     # name the workspace or it routes to the account. Both empty for
     # single-workspace hosts / local unauthenticated runs.
     from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     # Co-locate this runner's tunnel with its host's on one server replica: the
@@ -1235,6 +1236,8 @@ async def _serve_tunnel_once(
     )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # websockets adds its own User-Agent on top of additional_headers; send only ours.
+    user_agent = pop_client_user_agent(headers)
     # Verifying SSL context from a real CA bundle for wss:// — a bare default
     # context loads zero roots on uv / python-build-standalone Pythons (no
     # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
@@ -1271,6 +1274,7 @@ async def _serve_tunnel_once(
         websockets.connect(
             tunnel_url,
             additional_headers=headers,
+            user_agent_header=user_agent,
             open_timeout=_RUNNER_TUNNEL_OPEN_TIMEOUT_S,
             close_timeout=close_timeout,
             max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
@@ -1684,7 +1688,7 @@ async def _send_hello(
         return
 
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
-    from omnigent.host.frames import CAP_MCP_REGISTRY
+    from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
     from omnigent.inner.claude_sdk_executor import claude_peer_receipts_supported
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -1713,6 +1717,7 @@ async def _send_hello(
                     *registered_observation_capabilities(app),
                     # The aggregate route is registered by create_runner_app itself.
                     CONTEXT_INVENTORY_V2,
+                    CAP_TCP_EGRESS,
                     CAP_SIDE_CHAT_SETTINGS,
                     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),

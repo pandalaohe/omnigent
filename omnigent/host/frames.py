@@ -105,6 +105,7 @@ CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
+CAP_TCP_EGRESS = "tcp_egress"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 CAP_HOST_TERMINALS = "host_terminals_v1"
@@ -148,6 +149,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_TOOLS,
     CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
+    CAP_TCP_EGRESS,
     CAP_MCP_INVENTORY,
     CAP_AGENT_SETTINGS,
     CAP_RESOURCE_SNAPSHOT,

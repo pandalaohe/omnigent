@@ -104,7 +104,8 @@ interface SettingsNavGroup {
  * absent only in header single-user mode. The Admin group (Members / Policies)
  * appears for admins in ANY multi-user mode since both accounts and OIDC share
  * the `users.is_admin` flag and the server enforces admin on every route; the
- * Desktop group (Local CLI) appears only in the Electron shell.
+ * Desktop group (Local CLI) appears only in the Electron shell. Harnesses is
+ * left out when the deployment curated out every harness.
  */
 export function settingsNavGroups(
   hasAuthSession: boolean,
@@ -117,6 +118,7 @@ export function settingsNavGroups(
   apiKeysAvailable = false,
   nestedAgentsEnabled = false,
   browserSupported = false,
+  harnessesOffered = true,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "agents",
@@ -160,10 +162,8 @@ export function settingsNavGroups(
     });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
-  groups.push({
-    title: "Customize",
-    items: [harnesses, ...(!isAdmin ? [instructions] : [])],
-  });
+  const customize = [...(harnessesOffered ? [harnesses] : []), ...(!isAdmin ? [instructions] : [])];
+  if (customize.length) groups.push({ title: "Customize", items: customize });
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
@@ -339,8 +339,11 @@ export function useTrackSettingsReturn(): void {
  */
 export function SettingsSidebarBody({
   onNavClick,
+  harnessesOffered = true,
 }: {
   onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  /** False when the deployment curated out every harness, which drops Harnesses. */
+  harnessesOffered?: boolean;
 }) {
   const info = useServerInfo();
   // Account section shows whenever there's a login session (accounts OR OIDC).
@@ -364,6 +367,7 @@ export function SettingsSidebarBody({
     info !== "loading" && info.api_keys_available === true,
     info !== "loading" && info.sibling_sessions === true,
     supportsBrowser(),
+    harnessesOffered,
   );
 
   return (

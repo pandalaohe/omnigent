@@ -101,34 +101,17 @@ def _wait_while_workspace_is_served(server: str) -> None:
         time.sleep(_STANDBY_POLL_S)
 
 
-def main() -> int:
-    """Run the foreground host command and normalize permanent failures."""
-    parser = argparse.ArgumentParser(description="Omnigent host service")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--server", help="Remote Omnigent server URL.")
-    mode.add_argument("--local", action="store_true", help="Run a local Omnigent server.")
-    parser.add_argument("--env-file", type=Path, help="Saved service environment.")
-    parser.add_argument("--service-worker", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+def run(server: str) -> int:
+    """Run the foreground host command and normalize permanent failures.
 
-    if args.env_file is not None:
-        _load_environment(args.env_file)
-    if sys.platform == "win32":
-        _windows_stdio()
-        if args.env_file is not None:
-            from omnigent.host.windows_task import SUPERVISOR_ENV
-
-            os.environ[SUPERVISOR_ENV] = "windows_task"
-            if not args.service_worker:
-                return _windows_supervise(sys.argv[1:])
-
+    :param server: Remote Omnigent server URL, e.g. ``"https://example.com"``,
+        or ``""`` for local mode.
+    :returns: Exit code for the service manager.
+    """
+    from omnigent.cli import cli
     from omnigent.host.restart import mark_service_entry
 
     mark_service_entry()
-
-    from omnigent.cli import cli
-
-    server = "" if args.local else args.server
     try:
         if server:
             _wait_while_workspace_is_served(server)
@@ -149,6 +132,28 @@ def main() -> int:
         # stopped instead of entering a supervisor restart loop.
         return 0 if code == HOST_FATAL_EXIT_CODE else code
     return 0
+
+
+def main() -> int:
+    """Parse the service mode and run the host."""
+    parser = argparse.ArgumentParser(description="Omnigent host service")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--server", help="Remote Omnigent server URL.")
+    mode.add_argument("--local", action="store_true", help="Run a local Omnigent server.")
+    parser.add_argument("--env-file", type=Path, help="Saved service environment.")
+    parser.add_argument("--service-worker", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.env_file is not None:
+        _load_environment(args.env_file)
+    if sys.platform == "win32":
+        _windows_stdio()
+        if args.env_file is not None:
+            from omnigent.host.windows_task import SUPERVISOR_ENV
+
+            os.environ[SUPERVISOR_ENV] = "windows_task"
+            if not args.service_worker:
+                return _windows_supervise(sys.argv[1:])
+    return run("" if args.local else args.server)
 
 
 if __name__ == "__main__":

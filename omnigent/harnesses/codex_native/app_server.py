@@ -225,6 +225,9 @@ _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 CODEX_AUTO_TITLE_SOCKET_ENV = "CODEX_AUTO_TITLE_SOCKET_PATH"
 _AUTO_TITLE_RELAY_CHUNK_BYTES = 64 * 1024
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+# Disable local keepalive so host stalls do not tear down Codex. A live but
+# deadlocked app-server will no longer time out.
+_APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -1479,6 +1482,7 @@ class CodexAppServerClient:
                 open_timeout=_SESSION_CONNECT_TIMEOUT_SECONDS,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         else:
             self._ws = await websockets.unix_connect(
@@ -1487,6 +1491,7 @@ class CodexAppServerClient:
                 uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
@@ -1801,8 +1806,10 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        assert self._ws is not None
         websocket = self._ws
+        assert websocket is not None
+        cancelled = False
+        failure: Exception | None = None
         try:
             async for raw in websocket:
                 if not isinstance(raw, str):
@@ -1853,7 +1860,34 @@ class CodexAppServerClient:
                         message.get("method"), message.get("params")
                     )
                 await self._events.put(message)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except ConnectionClosed:
+            raise
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
+            # Cancellation is our own close(); anything else ends the forwarder,
+            # so record why the stream stopped.
+            if failure is not None:
+                _logger.warning(
+                    "Codex app-server reader failed with the socket still open",
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                    extra=debug_event("codex_app_server_reader_failed"),
+                )
+            elif not cancelled:
+                _logger.warning(
+                    "Codex app-server connection closed: code=%s reason=%r",
+                    websocket.close_code,
+                    websocket.close_reason,
+                    extra=debug_event(
+                        "codex_app_server_connection_closed",
+                        close_code=websocket.close_code,
+                        close_reason=websocket.close_reason,
+                    ),
+                )
             # Wake iter_events() consumers: no further events can arrive.
             if self._context_inventory is not None:
                 self._context_inventory.mark(self._context_inventory.incarnation, "unknown")
@@ -4976,6 +5010,30 @@ def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing
 
 
 def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
+    """List codex-servable ids in Codex's preference order; empty when no listing reads."""
+    from omnigent.models.databricks_model_discovery import order_by_codex_catalog
+
+    listing = _databricks_listed_codex_models(host, profile)
+    if not listing.ids:
+        return listing
+    return DatabricksCodexModelListing(
+        order_by_codex_catalog(listing.ids, _codex_catalog_models()), cached=listing.cached
+    )
+
+
+def _codex_catalog_models() -> list[object]:
+    """Return the installed Codex's catalog rows, or ``[]`` when they cannot be read."""
+    codex_path = _find_codex_cli()
+    if codex_path is None:
+        return []
+    catalog = read_codex_model_catalog(
+        codex_path, _codex_home_config_source_from_env(), timeout=5.0
+    )
+    models = catalog.get("models") if catalog else None
+    return models if isinstance(models, list) else []
+
+
+def _databricks_listed_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
     """List codex-servable ids live, then from ucode's cached copy; empty when neither reads."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 

@@ -641,6 +641,13 @@ class SysSessionListTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": (
+                                'Filter global sessions by project name; "" lists unfiled '
+                                "sessions. Sub_agents is unchanged."
+                            ),
+                        },
                         "agent_name": {
                             "type": "string",
                             "description": (
@@ -1131,7 +1138,9 @@ class SysSessionCreateTool(Tool):
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
             "With agent_id, placement='same_host' creates a private independent session "
-            "on the caller's host/workspace; placement='managed' creates one on a new sandbox "
+            "on the caller's host/workspace; placement='host' uses your chosen host_id "
+            "and absolute workspace, optionally creating a git worktree. "
+            "placement='managed' creates one on a new sandbox "
             "using the server's configured default provider. These sessions are grouped as "
             "nested agents when enabled on the server; otherwise they appear at the top level. "
             "Managed creation requires a "
@@ -1199,9 +1208,9 @@ class SysSessionCreateTool(Tool):
                     "properties": {
                         "placement": {
                             "type": "string",
-                            "enum": ["child", "same_host", "managed"],
+                            "enum": ["child", "same_host", "host", "managed"],
                             "description": (
-                                "Default child; same_host or managed launches a private "
+                                "Default child; same_host, host or managed launches a private "
                                 "independent session (agent_id only), grouped in this family "
                                 "when nested agents are enabled, unless project_name names "
                                 "another project."
@@ -1214,6 +1223,22 @@ class SysSessionCreateTool(Tool):
                                 "Host tier for a registered or default child agent. "
                                 "Use a tier the user authorized for the target harness."
                             ),
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": "Owned host ID; required for placement='host'.",
+                        },
+                        "git": {
+                            "type": "object",
+                            "description": (
+                                "For placement='host', create a new worktree from workspace."
+                            ),
+                            "properties": {
+                                "branch_name": {"type": "string", "minLength": 1},
+                                "base_branch": {"type": "string", "minLength": 1},
+                            },
+                            "required": ["branch_name"],
+                            "additionalProperties": False,
                         },
                         "sandbox_provider": {
                             "type": "string",
@@ -1275,7 +1300,7 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Optional project, by the name shown in the UI (not "
                                 "the project id), to file an independent session "
-                                "(same_host or managed) in: your existing project "
+                                "(same_host, host or managed) in: your existing project "
                                 "with this name, or a new one if you have none. "
                                 "A project other than this session's project gives a "
                                 "standalone session, not a nested agent."
@@ -1353,17 +1378,19 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Placement (agent_id mode): absolute "
-                                "directory the child runs in on the target "
-                                "host, e.g. '/srv/repos/app'. Omit to keep "
-                                "your working directory."
+                                "directory the new session runs in on the target host, "
+                                "e.g. '/srv/repos/app'. Required for placement='host'. "
+                                "For a child on your own host, omit to keep your working "
+                                "directory."
                             ),
                         },
                         "project_id": {
                             "type": "string",
                             "description": (
-                                "Placement (agent_id mode): project id the "
-                                "child joins, e.g. 'project_abc123'. Omit "
-                                "to use the parent session's project."
+                                "Existing project ID, e.g. 'project_abc123'. For a child, "
+                                "omit to inherit the parent's project. An independent session "
+                                "accepts either project_id or project_name and skips "
+                                "project defaults."
                             ),
                         },
                         "worktree": {
