@@ -17,7 +17,11 @@ import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import { signInForTerminal } from "@/lib/identity";
-import { resolveTerminalKeys, writeTerminalKeyPreferences } from "@/lib/terminalKeys";
+import {
+  resolveTerminalKeys,
+  writeTerminalKeyPreferences,
+  type KeyAction,
+} from "@/lib/terminalKeys";
 import * as capabilities from "@/lib/capabilities";
 import * as nativeBridge from "@/lib/nativeBridge";
 import {
@@ -108,6 +112,8 @@ const terminalSessionMock = vi.hoisted(() => ({
     >;
     selectedText: ReturnType<typeof vi.fn<() => string>>;
     sendSoftKey: ReturnType<typeof vi.fn>;
+    sendBarSequence: ReturnType<typeof vi.fn>;
+    sendBarChord: ReturnType<typeof vi.fn>;
     getStickyModifiers: () => TerminalStickyModifiers;
     focus: ReturnType<typeof vi.fn>;
     blur: ReturnType<typeof vi.fn>;
@@ -248,6 +254,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     selectedText = vi.fn(() => "");
     bufferText = vi.fn(() => "terminal contents");
     sendSoftKey = vi.fn();
+    sendBarSequence = vi.fn();
+    sendBarChord = vi.fn();
     cancelBarWrites = vi.fn();
     runBarKey = vi.fn((send: () => void) => send());
     stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
@@ -299,6 +307,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTouchSelection: this.setTouchSelection,
         selectedText: this.selectedText,
         sendSoftKey: this.sendSoftKey,
+        sendBarSequence: this.sendBarSequence,
+        sendBarChord: this.sendBarChord,
         getStickyModifiers: this.getStickyModifiers,
         focus: this.focus,
         blur: this.blur,
@@ -2373,6 +2383,113 @@ describe("TerminalView phone key rows", () => {
       }),
     );
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  const legacyKey = (code: string, modifiers: ("shift" | "control")[] = []): KeyAction => ({
+    type: "legacy",
+    key: { kind: "key", chord: { code, modifiers } },
+  });
+  const repeatKeys = [
+    ["PgUp", legacyKey("PageUp"), "sendSoftKey", ["enter", "\x1b[5~", { focus: false }]],
+    ["PgDn", legacyKey("PageDown"), "sendSoftKey", ["enter", "\x1b[6~", { focus: false }]],
+    ["Up", legacyKey("ArrowUp"), "sendSoftKey", ["arrowUp", undefined, { focus: false }]],
+    ["Down", legacyKey("ArrowDown"), "sendSoftKey", ["arrowDown", undefined, { focus: false }]],
+    ["Left", legacyKey("ArrowLeft"), "sendSoftKey", ["arrowLeft", undefined, { focus: false }]],
+    ["Right", legacyKey("ArrowRight"), "sendSoftKey", ["arrowRight", undefined, { focus: false }]],
+    ["Home", legacyKey("Home"), "sendSoftKey", ["home", undefined, { focus: false }]],
+    ["End", legacyKey("End"), "sendSoftKey", ["end", undefined, { focus: false }]],
+    ["Tab", legacyKey("Tab"), "sendSoftKey", ["tab", undefined, { focus: false }]],
+    ["Backspace", legacyKey("Backspace"), "sendSoftKey", ["enter", "\x7f", { focus: false }]],
+    ["Esc", legacyKey("Escape"), "sendSoftKey", ["escape", undefined, { focus: false }]],
+    ["Enter", legacyKey("Enter"), "sendSoftKey", ["enter", undefined, { focus: false }]],
+    [
+      "Shift+Tab",
+      legacyKey("Tab", ["shift"]),
+      "sendSoftKey",
+      ["enter", "\x1b[Z", { focus: false }],
+    ],
+    [
+      "Ctrl+Up",
+      legacyKey("ArrowUp", ["control"]),
+      "sendSoftKey",
+      ["enter", "\x1b[1;5A", { focus: false }],
+    ],
+    ["Special Tab", { type: "special", special: "tab" }, "sendBarSequence", ["\\t", false]],
+    ["Special Esc", { type: "special", special: "esc" }, "sendBarSequence", ["\\e", false]],
+    ["Custom sequence", { type: "send", send: "hello\\t" }, "sendBarSequence", ["hello\\t", false]],
+    [
+      "Sequence with Enter",
+      { type: "send", send: "hello", autoEnter: true },
+      "sendBarSequence",
+      ["hello", true],
+    ],
+    [
+      "Cmd+Left",
+      { type: "combo", chord: { code: "ArrowLeft", modifiers: ["meta"] } },
+      "sendBarChord",
+      [{ code: "ArrowLeft", modifiers: ["meta"] }],
+    ],
+  ] as const satisfies readonly (readonly [
+    string,
+    KeyAction,
+    "sendSoftKey" | "sendBarSequence" | "sendBarChord",
+    readonly unknown[],
+  ])[];
+
+  describe.each(["shell", "native"] as const)("%s repeat on hold", (keySurface) => {
+    describe.each(["touch", "mouse"] as const)("%s pointer", (pointerType) => {
+      it.each(repeatKeys)("repeats saved %s until release", async (label, action, method, args) => {
+        stubPhoneViewport(390, 844);
+        stubRootRect(390, 788);
+        const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+        keys[keySurface].top.keys = [
+          { id: "repeat-key", label, width: 2, display: "text", action, repeat: true },
+        ];
+        expect(writeTerminalKeyPreferences({ terminalKeys: keys })).toBe("saved");
+        render(
+          <TerminalView keySurface={keySurface} sessionId="conv_abc" terminalId="terminal_a" />,
+        );
+        await act(async () => {});
+        const terminal = terminalSessionMock.instances[0];
+        act(() => terminal.onState({ kind: "connected" }));
+        const toolbar = screen.getByTestId("terminal-key-row");
+        const button = within(screen.getByTestId("terminal-key-row-primary")).getByRole("button");
+        const pointer = { button: 0, pointerId: 1, pointerType, clientX: 50, clientY: 20 };
+        const contextMenu = (type: string, target: HTMLElement) =>
+          fireEvent(
+            target,
+            new PointerEvent("contextmenu", {
+              ...pointer,
+              pointerType: type,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+
+        vi.useFakeTimers();
+        try {
+          fireEvent.pointerDown(button, pointer);
+          act(() => vi.advanceTimersByTime(399));
+          expect(terminal[method]).not.toHaveBeenCalled();
+          act(() => vi.advanceTimersByTime(101));
+          expect(terminal[method].mock.calls).toEqual([args, args]);
+          if (pointerType === "touch") {
+            expect(contextMenu("mouse", button)).toBe(true);
+            // jsdom has no native menu. Model its pointer cancellation only if the menu can open.
+            const menuTarget = keySurface === "shell" ? button : toolbar;
+            if (contextMenu("touch", menuTarget)) fireEvent.pointerCancel(toolbar, pointer);
+          }
+          act(() => vi.advanceTimersByTime(220));
+          expect(terminal[method].mock.calls).toEqual([args, args, args, args, args]);
+          fireEvent.pointerUp(toolbar, pointer);
+          expect(contextMenu("touch", button)).toBe(true);
+          act(() => vi.advanceTimersByTime(240));
+          expect(terminal[method]).toHaveBeenCalledTimes(5);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
   });
 
   it("uses custom order and reacts to live switches", async () => {
