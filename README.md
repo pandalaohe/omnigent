@@ -514,6 +514,30 @@ runs the session.
 
 </details>
 
+<details>
+<summary>Choose how Codex handles a model missing from the host catalog</summary>
+
+By default (`fallback`), a native Codex session with an explicit model pick
+missing from the host's current catalog starts on the agent's listed model
+or the default. Set `as_requested` to keep the pick and pass it to Codex.
+The provider can still reject the model when the turn runs.
+
+```bash
+omnigent config set --global codex_native_unlisted_model=as_requested
+omnigent config unset --global codex_native_unlisted_model
+```
+
+The setting lives in the host user's `~/.omnigent/config.yaml`. Set
+`fallback` or remove the entry to restore the default. The next applicable
+launch reads the setting without a host restart. Databricks profile launches
+and sessions with an inference binding use their existing selection rules.
+
+If the setting value is invalid or its reader cannot read or parse the user
+config during terminal launch, Codex uses `fallback` and logs the reason.
+Omnigent stops at runner startup if it cannot read the user config.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash
@@ -743,12 +767,36 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 
 ## Telemetry
 
-Omnigent collects anonymized usage data (telemetry) by default. This data
-contains no sensitive or personally identifiable information. If you're using
-Omnigent through a managed service or distribution, please consult your managed
-service agreement to determine any data collection that may impact your use of
-the service. To opt out, follow our instructions in
-[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
+Usage telemetry is off by default. An administrator can turn it on or off in
+**Settings → System → Usage telemetry**. Other users can see the effective
+setting. Anonymous usage reports and their configuration requests follow the
+switch immediately. Restart the server to apply changes to configured
+OpenTelemetry traces, metrics, logs, and ZeroBus debug-log uploads. Reload the
+web app to apply changes to configured browser OpenTelemetry.
+
+Set `OMNIGENT_DISABLE_TELEMETRY` or `DISABLE_TELEMETRY` to `1`, `true`, or
+`yes` to lock telemetry off. `DO_NOT_TRACK=1`, `OMNIGENT_ANALYTICS=0`, CI
+markers, and `telemetry: false` in the server configuration also lock it off.
+A locked-off setting overrides legacy `OMNIGENT_TELEMETRY_ENABLED` on the
+server and blocks ZeroBus debug-log uploads and OAuth token requests across
+every Omnigent process (server, host, runner, harness runner, and CLI).
+Set `OMNIGENT_ENABLE_TELEMETRY` to `1`, `true`, or `yes` to lock it on
+when no opt-out is active. The setting shows which override applies.
+
+Host and runner OpenTelemetry still use `OMNIGENT_TELEMETRY_ENABLED` and
+exporter settings from their own process environment.
+Host, runner, harness runner, and CLI processes with an explicitly configured
+ZeroBus debug-log destination (`OMNIGENT_DEBUG_LOG_*`) keep using that
+destination unless one of the deployment opt-outs above is active.
+When the web UI is embedded in a host application, the host-provided analytics
+callback is an embedder boundary controlled by that host application.
+Automatic update checks (the CLI check against PyPI or `git origin`, and the
+desktop app update feed) are outside this switch: they fetch only a public
+version list and send no usage data. To turn them off, set
+`OMNIGENT_NO_UPDATE_CHECK=1` for the CLI, or set `update_mode` to `"manual"`
+(manual checks only) or `"none"` (off) in desktop `settings.json` (supported
+values: `"default"`, `"start"`, `"manual"`, `"none"`).
+Vendor CLI telemetry is managed by each CLI.
 
 ---
 

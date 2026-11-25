@@ -6,6 +6,10 @@ it does not poll your vendor or store your vendor password.
 
 ## Credentials
 
+On a default single-machine install in header mode, the local server accepts
+usage pushes over loopback without credentials. Use `http://127.0.0.1:6767`
+and omit the `Authorization` header from the examples below.
+
 In accounts mode, create a key in **Settings → API keys**, keeping Usage enabled.
 Copy the value when it is shown, then store it in the integration as `USAGE_KEY`.
 The value is shown only once; regenerating a key invalidates its old value immediately.
@@ -53,6 +57,28 @@ entry to revoke. Ordinary authenticated user sessions also work. The old
 
 ## Choose one route
 
+### Gateway request records
+
+To let selected owners read individual gateway requests from Usage Analysis,
+configure the upstream and each owner's report-v2 destination account IDs in
+the server's `config.yaml`.
+
+```yaml
+usage:
+  request_source:
+    base_url: "https://gateway.example.test"
+    owners: ["example-owner"]
+    account_ids:
+      example-owner: ["example-gateway-account"]
+```
+
+`owners` defaults to an empty list. Use the authenticated owner IDs and register
+only the destination IDs that the gateway feed writes for each owner. Omnigent
+intersects these IDs with that owner's stored report accounts before forwarding
+them to the gateway. If the gateway requires an authorization header, set either
+`credential_env` to the environment variable name or `credential_file` to an
+absolute path containing the bearer token.
+
 ### Subscription quota
 
 Claude and Codex plans are read natively on connected hosts. Sign in on the host
@@ -69,6 +95,9 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="$OMNIGENT_URL/v1/me/usage/otlp"
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $USAGE_KEY"
 export OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=DELTA
 ```
+
+For single-machine header mode, set `OMNIGENT_URL` to the loopback URL and omit
+`OTEL_EXPORTER_OTLP_HEADERS` (including any signal-specific Authorization header).
 
 The base appends `/v1/metrics`, `/v1/traces`, or `/v1/logs`. A signal-specific
 endpoint must include the full suffix. JSON and protobuf work; logs are accepted

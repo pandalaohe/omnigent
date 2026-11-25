@@ -1181,6 +1181,9 @@ def _build_runner_env(
     if session_env:
         env.update(session_env)
         env[RUNNER_SESSION_ENV_NAMES_ENV_VAR] = ",".join(sorted(session_env))
+    from omnigent.telemetry.environment import preserve_zerobus_opt_outs
+
+    preserve_zerobus_opt_outs(env, base_env)
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -5946,6 +5949,7 @@ class HostProcess:
         try:
             loop = asyncio.get_running_loop()
             self._maintenance_janitor = HostMaintenanceJanitor.for_host(
+                config_path=self._config_path,
                 harness_tmp_parent=self._harness_tmp_parent,
                 live_runner_log_paths=self._live_runner_log_paths,
                 on_runner_log_rotated=lambda path, size, file_id: loop.call_soon_threadsafe(
@@ -6644,15 +6648,35 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+        from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
         from omnigent.host.restart import supervisor_kind
+        from omnigent.onboarding.acp_auth import acp_agents
 
         supervisor = await asyncio.to_thread(supervisor_kind)
+        try:
+            acp_entries = await asyncio.to_thread(acp_agents)
+        except (OSError, ValueError, TypeError):
+            acp_entries = []
+        acp_permission_tiers = {
+            f"acp:{entry.slug}": entry.permission_tier
+            for entry in acp_entries
+            if entry.permission_tier is not None
+        }
+        agy_acp_harnesses = {
+            f"acp:{entry.slug}"
+            for entry in acp_entries
+            if is_antigravity_acp_command(entry.command)
+        }
+        if acp_entries and f"acp:{acp_entries[0].slug}" in agy_acp_harnesses:
+            agy_acp_harnesses.add("acp")
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
             configured_harnesses=self._configured_harnesses,
+            acp_permission_tiers=acp_permission_tiers,
             platform=sys.platform,
             harness_accounts=self._harness_accounts,
             gateway_inference=self._gateway_inference,
@@ -6665,6 +6689,10 @@ class HostProcess:
             project_code=True,
             capabilities=[
                 *self._terminal_capabilities(),
+                *(
+                    CAP_AGY_ACP_PERMISSIONS_PREFIX + harness
+                    for harness in sorted(agy_acp_harnesses)
+                ),
                 *(["host_restart"] if supervisor else []),
                 *(
                     [CAP_HOST_TERMINALS, CAP_HOST_TERMINAL_LINKS]
@@ -7010,6 +7038,7 @@ class HostProcess:
             self._load_state.add_sample(now, sampler.sample_load_per_core, mem_pct)
         lines = self._load_lines
         level, reason = self._load_state.step(now, lines)
+        decision_load, decision_memory = self._load_state.decision_reading or (None, None)
         previous = self._load_report
         report = LoadLevelReport(
             level=level,
@@ -7020,6 +7049,8 @@ class HostProcess:
             heavy=lines.heavy,
             new_session=lines.new_session,
             lines_synced_at=self._load_lines_synced_at,
+            decision_load_per_core=decision_load,
+            decision_mem_pct=decision_memory,
         )
         self._load_report = report
         frame.load_level = report

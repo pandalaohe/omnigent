@@ -825,7 +825,8 @@ def build_native_controls(
                         conv_id,
                         exc_info=True,
                     )
-        return Response(status_code=204), settings
+        headers = {"X-Omnigent-Model-Applied": "true"} if "model" in applied else None
+        return Response(status_code=204, headers=headers), settings
 
     async def _codex_native_model_and_effort_for_settings_update(
         conv_id: str,
@@ -1959,7 +1960,7 @@ def build_native_controls(
             # The budget can lapse in the dialog watch after ``/model`` was submitted;
             # a pane that already switched must not be rolled back. Read only, no keys.
             if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
-                return Response(status_code=204)
+                return Response(status_code=204, headers={"X-Omnigent-Model-Applied": "true"})
             return _model_failed(exc)
         except (RuntimeError, ValueError, OSError) as exc:
             return _model_failed(exc)
@@ -1975,7 +1976,7 @@ def build_native_controls(
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
-                return Response(status_code=204)
+                return Response(status_code=204, headers={"X-Omnigent-Model-Applied": "true"})
             if await asyncio.to_thread(model_switch_acknowledged, bridge_dir, command=command):
                 # Claude Code acknowledged the command on the pane while the
                 # statusLine snapshot still reads otherwise; the forwarder's
@@ -1987,7 +1988,7 @@ def build_native_controls(
                     current,
                     extra={"session_id": conv_id},
                 )
-                return Response(status_code=204)
+                return Response(status_code=204, headers={"X-Omnigent-Model-Applied": "true"})
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a
                 # live wrapper-managed pane writes one on every render, so
@@ -2627,6 +2628,7 @@ def build_native_controls(
         state = (
             await asyncio.to_thread(read_bridge_state, bridge_dir) if server is not None else None
         )
+        live_applied = False
         if model_ref is not None and server is not None and state is not None:
             # The TUI and the next turn pick the model up from the session.
             client = server.client()
@@ -2645,10 +2647,12 @@ def build_native_controls(
                     extra={"session_id": conv_id},
                 )
             else:
+                live_applied = True
                 await asyncio.to_thread(update_last_applied_model, bridge_dir, model)
             finally:
                 await client.aclose()
-        return Response(status_code=200 if updated else 204)
+        headers = {"X-Omnigent-Model-Applied": "true"} if live_applied else None
+        return Response(status_code=200 if updated else 204, headers=headers)
 
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
         if _session_harness_name(conv_id) != "opencode-native":

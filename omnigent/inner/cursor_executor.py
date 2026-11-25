@@ -54,6 +54,7 @@ from typing import Protocol, TypeAlias, TypedDict
 
 from omnigent.inner.sdk_context_inventory import SdkContextSource
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.shell_timeouts import shell_dispatch_timeout
 from omnigent.startup_protocol import ContextEvidenceV2, ContextKeyV2
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -776,8 +777,8 @@ class CursorExecutor(Executor):
 
         Runs on the SDK callback server's daemon thread and blocks it on the
         main-loop coroutine via ``run_coroutine_threadsafe``. The wait is bounded
-        by ``_TOOL_CALL_TIMEOUT_S`` (generous — ``sys_session_send`` and friends
-        can legitimately run for minutes) so a wedged tool surfaces as a tool
+        by a per-tool budget. Shell calls can run for their execution budget;
+        other tools use ``_TOOL_CALL_TIMEOUT_S``. A wedged tool surfaces as a tool
         error instead of hanging the daemon thread / Cursor turn forever, and any
         exception (a failed or cancelled coroutine) becomes a tool error rather
         than propagating raw onto the daemon thread.
@@ -791,15 +792,15 @@ class CursorExecutor(Executor):
                 return _tool_error_payload(
                     f"Tool {tool_name!r} is unavailable: no tool executor wired."
                 )
-            coro = await_result(self._tool_executor(tool_name, dict(args or {})))
+            arguments = dict(args or {})
+            timeout = shell_dispatch_timeout(tool_name, arguments, _TOOL_CALL_TIMEOUT_S)
+            coro = await_result(self._tool_executor(tool_name, arguments))
             future = asyncio.run_coroutine_threadsafe(coro, loop)
             try:
-                result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
+                result = future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 future.cancel()
-                return _tool_error_payload(
-                    f"Tool {tool_name!r} timed out after {_TOOL_CALL_TIMEOUT_S:.0f}s."
-                )
+                return _tool_error_payload(f"Tool {tool_name!r} timed out after {timeout:.0f}s.")
             # Exception (not BaseException) still covers a cancelled coroutine —
             # future.result() raises concurrent.futures.CancelledError, an
             # Exception — while letting KeyboardInterrupt / SystemExit propagate.

@@ -493,6 +493,12 @@ export interface Session {
    * so the surfaces stay in sync.
    */
   modelOverride?: string | null;
+  /** Originally requested model (from resolution label when rewritten, else override). */
+  requested?: string | null;
+  /** Post-resolution model passed to the harness, or null when unset/unconfirmed. */
+  launched?: string | null;
+  /** Model last reported as actually running by the harness. */
+  running?: string | null;
   /**
    * Per-session cost-control switch: `"on"` activates the spec's
    * configured cost-control mode, `"off"` disables cost control for

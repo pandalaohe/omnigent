@@ -291,6 +291,7 @@ import { ChatPage, CodexPermissionReadbackChip, computeIsWorking } from "./ChatP
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { shouldShowEffortPicker } from "@/lib/composerCapabilities";
 import { withSessionMentionHint } from "@/lib/composerMentions";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -7852,6 +7853,199 @@ describe("Composer file-attachment focus", () => {
     expect(ta.getAttribute("data-has-draft")).toBe("true");
   });
 
+  it("keeps the attachment backdrop aligned on input and resize at the height cap", () => {
+    const notifyTextareaResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends ResizeObserver {
+        constructor(callback: ResizeObserverCallback) {
+          super(callback);
+          const notify = () => callback([], this);
+          this.observe = (element) => {
+            if (element instanceof HTMLTextAreaElement) notifyTextareaResize.add(notify);
+          };
+          this.disconnect = () => {
+            notifyTextareaResize.delete(notify);
+          };
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    render(<Composer {...composerProps()} />);
+    const input = textarea();
+    let top = 12;
+    let width = 400;
+    let contentHeight = 800;
+    Object.defineProperties(input, {
+      offsetTop: { get: () => top },
+      offsetLeft: { value: 16 },
+      offsetWidth: { get: () => width },
+      offsetHeight: { value: 180 },
+      clientHeight: { value: 180 },
+      scrollHeight: { get: () => contentHeight },
+    });
+    input.style.lineHeight = "20px";
+    input.style.padding = "0";
+    const image = new File(["image"], "example.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [image] } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.style.top).toBe("12px");
+    expect(overlay.style.left).toBe("16px");
+    expect(overlay.style.width).toBe("400px");
+    const draft = `${input.value}\n${"Draft line\n".repeat(38)}text`;
+    fireEvent.input(input, { target: { value: draft } });
+    input.scrollTop = 620;
+    fireEvent.scroll(input);
+    expect(overlay.scrollTop).toBe(620);
+
+    const value = `${draft}\nNext line`;
+    contentHeight = 820;
+    input.scrollTop = 640;
+    top = 18;
+    fireEvent.input(input, { target: { value } });
+    expect.soft(overlay.textContent).toBe(value);
+    expect.soft(overlay.style.top).toBe("18px");
+    expect.soft(overlay.scrollTop).toBe(640);
+
+    width = 320;
+    contentHeight = 880;
+    input.scrollTop = 700;
+    act(() => notifyTextareaResize.forEach((notify) => notify()));
+    expect(overlay.style.width).toBe("320px");
+    expect(overlay.style.height).toBe("180px");
+    expect(overlay.scrollTop).toBe(700);
+
+    fireEvent.compositionStart(input);
+    input.setSelectionRange(value.length, value.length);
+    input.scrollTop = 0;
+    fireEvent.compositionEnd(input, { data: "文" });
+    expect(input.scrollTop).toBe(700);
+    expect(overlay.scrollTop).toBe(700);
+  });
+
+  it("keeps the attachment backdrop aligned on IME commit and resize after toggling a reply quote", () => {
+    const notifyTextareaResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends ResizeObserver {
+        constructor(callback: ResizeObserverCallback) {
+          super(callback);
+          const notify = () => callback([], this);
+          this.observe = (element) => {
+            if (element instanceof HTMLTextAreaElement) notifyTextareaResize.add(notify);
+          };
+          this.disconnect = () => {
+            notifyTextareaResize.delete(notify);
+          };
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const input = textarea();
+    let top = 12;
+    let width = 400;
+    let contentHeight = 800;
+    const currentBoxHeight = () => {
+      const parsed = Number.parseFloat(input.style.height);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 200;
+    };
+    Object.defineProperties(input, {
+      offsetTop: { configurable: true, get: () => top },
+      offsetLeft: { configurable: true, value: 16 },
+      offsetWidth: { configurable: true, get: () => width },
+      offsetHeight: { configurable: true, get: currentBoxHeight },
+      clientHeight: { configurable: true, get: currentBoxHeight },
+      scrollHeight: { configurable: true, get: () => contentHeight },
+    });
+    input.style.lineHeight = "20px";
+    input.style.padding = "0";
+
+    // Add a reply quote, then attach an image in the tail textarea so the
+    // attachment backdrop is active before removing the quote toggles maxRows.
+    act(() => ref.current?.appendReplyQuote("Quoted context"));
+    const image = new File(["image"], "example.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [image] } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.style.top).toBe("12px");
+
+    top = 8;
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(overlay.style.top).toBe("8px");
+
+    const draft = `${input.value}\n${"Draft line\n".repeat(38)}text`;
+    fireEvent.input(input, { target: { value: draft } });
+    input.focus();
+    input.setSelectionRange(draft.length, draft.length);
+
+    // Unchanged-value IME commit must reveal the caret before the mirror syncs scroll.
+    fireEvent.compositionStart(input);
+    input.scrollTop = 0;
+    fireEvent.compositionEnd(input, { data: "文" });
+    expect.soft(input.scrollTop).toBe(600);
+    expect.soft(overlay.scrollTop).toBe(600);
+
+    // Resize that keeps the height capped while shrinking scrollHeight must clamp
+    // textarea scrollTop before the mirror copies it.
+    width = 440;
+    contentHeight = 500;
+    act(() => notifyTextareaResize.forEach((notify) => notify()));
+    expect.soft(input.style.height).toBe("200px");
+    expect.soft(overlay.style.width).toBe("440px");
+    expect.soft(overlay.style.height).toBe("200px");
+    expect.soft(input.scrollTop).toBe(300);
+    expect.soft(overlay.scrollTop).toBe(300);
+
+    // Resize below the height cap must re-measure height before the mirror copies it.
+    width = 480;
+    contentHeight = 140;
+    act(() => notifyTextareaResize.forEach((notify) => notify()));
+    expect(input.style.height).toBe("140px");
+    expect(overlay.style.width).toBe("480px");
+    expect(overlay.style.height).toBe("140px");
+    expect(input.scrollTop).toBe(0);
+    expect(overlay.scrollTop).toBe(0);
+  });
+
+  it("moves the attachment backdrop when a reply quote shifts the tail textarea without resizing it", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const input = textarea();
+    let top = 40;
+    Object.defineProperties(input, {
+      offsetTop: { configurable: true, get: () => top },
+      offsetLeft: { configurable: true, value: 16 },
+      offsetWidth: { configurable: true, value: 400 },
+      offsetHeight: { configurable: true, value: 40 },
+    });
+
+    fireEvent.change(input, { target: { value: "Intro" } });
+    act(() => ref.current?.appendReplyQuote("Quoted context"));
+    const image = new File(["image"], "example.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [image] } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.style.top).toBe("40px");
+
+    // Growing the block above the quote shifts the tail textarea without changing
+    // the tail draft or resizing the tail textarea.
+    top = 96;
+    fireEvent.change(screen.getByLabelText("Reply text before quote 1"), {
+      target: { value: "Intro\nLine 2\nLine 3" },
+    });
+    expect(overlay.style.top).toBe("96px");
+
+    // Removing the quote shifts the tail textarea back up without a resize.
+    top = 12;
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(overlay.style.top).toBe("12px");
+  });
+
   it("does not focus the textarea when the attachment is rejected", () => {
     // A file over the limit is dropped by validateAttachments, so no file is
     // added — and with nothing attached there's no reason to yank focus back.
@@ -8852,6 +9046,112 @@ describe("Composer config gear", () => {
         codexModelOptions: CLAUDE_MODEL_OPTIONS,
       });
 
+    it.each(["model first", "effort first"])(
+      "validates SDK combined shortcuts against the staged model (%s)",
+      async (order) => {
+        const options = [
+          {
+            id: "primary",
+            supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+          },
+          { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+        ];
+        const { setModel, setEffort } = useChatStore.getState();
+        useChatStore.setState({
+          sessionHarness: "codex",
+          sessionModelOverride: "primary",
+          llmModel: "primary",
+          sessionReasoningEffort: "high",
+          codexModelOptions: options,
+        });
+        renderWithTooltips(
+          <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+        );
+        act(() => textarea().focus());
+        if (order === "effort first") cycle("KeyE");
+        cycle("KeyM");
+        cycle("KeyE");
+        expect(screen.queryByTestId("composer-agent-effort-ultra")).toBeNull();
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", {
+          expectConfirmation: false,
+        });
+        expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+
+    it("reconciles an applied SDK ultra when the combined shortcut selects a high-only model", async () => {
+      const options = [
+        {
+          id: "primary",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+        { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      ];
+      const { setModel, setEffort } = useChatStore.getState();
+      useChatStore.setState({
+        sessionHarness: "codex",
+        sessionModelOverride: "primary",
+        llmModel: "primary",
+        sessionReasoningEffort: "ultra",
+      });
+      renderWithTooltips(
+        <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+      );
+      cycle("KeyM");
+      cycle("KeyE");
+      expect(screen.queryByTestId("composer-agent-effort-ultra")).toBeNull();
+      await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+      expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: false });
+      expect(vi.mocked(setEffort).mock.calls.map(([effort]) => effort)).toEqual([null, "high"]);
+    });
+
+    it("revalidates SDK staged effort when the target catalog narrows before commit", async () => {
+      const options = [
+        {
+          id: "primary",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+        {
+          id: "alternate",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+        },
+      ];
+      const { setModel, setEffort } = useChatStore.getState();
+      useChatStore.setState({
+        sessionHarness: "codex",
+        sessionModelOverride: "primary",
+        llmModel: "primary",
+        sessionReasoningEffort: "high",
+      });
+      const view = renderWithTooltips(
+        <Composer {...props()} modelPickerKind="sdk" codexModelOptions={options} />,
+      );
+      cycle("KeyM");
+      cycle("KeyE");
+      expect(screen.getByTestId("composer-agent-effort-ultra")).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      view.rerender(
+        <TooltipProvider>
+          <Composer
+            {...props()}
+            modelPickerKind="sdk"
+            codexModelOptions={[
+              options[0],
+              { id: "alternate", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+            ]}
+          />
+        </TooltipProvider>,
+      );
+      await act(async () => fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" }));
+      expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: false });
+      expect(setEffort).not.toHaveBeenCalled();
+    });
+
     it.each(["two idle seconds", "Enter"])(
       "previews every model in a burst and applies only the final choice after %s",
       async (confirmation) => {
@@ -9610,6 +9910,7 @@ describe("Composer config gear", () => {
         sessionHarness: harness,
         sessionModelOverride: "new",
         llmModel: "old",
+        sessionReasoningEffort: "max",
         setModel,
         setEffort,
       });
@@ -9641,10 +9942,74 @@ describe("Composer config gear", () => {
       for (const effort of efforts) {
         expect(screen.getByTestId(`composer-agent-effort-${effort}`)).toBeVisible();
       }
+      fireEvent.click(screen.getByRole("button", { name: "Reset Effort" }));
+      await waitFor(() => expect(setEffort).toHaveBeenCalledWith(null));
       fireEvent.click(screen.getByTestId(`composer-agent-effort-${efforts[0]}`));
       await waitFor(() => expect(setEffort).toHaveBeenCalledWith(efforts[0]));
     },
   );
+
+  it("offers only Reset Effort after an SDK clear failure and allows retry after remount", async () => {
+    const previous = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState(previous, true));
+    const models = [{ id: "plain", supportedReasoningEfforts: [] }];
+    let serverEffort: string | null = "ultra";
+    let refuse = true;
+    const setEffort = vi.fn(async (effort: string | null) => {
+      useChatStore.setState({ sessionReasoningEffort: effort });
+      if (refuse) {
+        refuse = false;
+        useChatStore.setState({ sessionReasoningEffort: serverEffort });
+        throw new Error("Clear refused");
+      }
+      serverEffort = effort;
+    });
+    vi.spyOn(sessionsApi, "refreshSessionModelOptions").mockResolvedValue(models);
+    useChatStore.setState({
+      sessionHarness: "codex",
+      sessionModelOverride: "plain",
+      llmModel: "plain",
+      sessionReasoningEffort: serverEffort,
+      setEffort,
+    });
+    function SavedSdkComposer() {
+      const effort = useChatStore((state) => state.sessionReasoningEffort);
+      const session = {
+        labels: {},
+        harness: "codex",
+        modelOverride: "plain",
+        reasoningEffort: effort,
+      };
+      return (
+        <Composer
+          {...composerProps({
+            modelPickerKind: "sdk",
+            showModels: true,
+            showEffort: shouldShowEffortPicker(session, "codex-native", models),
+            effortLevels: [],
+            codexModelOptions: models,
+          })}
+        />
+      );
+    }
+    const first = renderWithTooltips(<SavedSdkComposer />);
+    await openSessionModels();
+    expect(
+      screen.getByTestId("composer-agent-efforts").querySelectorAll("[data-effort-level]"),
+    ).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("composer-agent-effort-default"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledExactlyOnceWith(null));
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    expect(screen.getByTestId("composer-agent-effort-default")).toBeVisible();
+    first.unmount();
+    renderWithTooltips(<SavedSdkComposer />);
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-effort-default"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledTimes(2));
+    expect(serverEffort).toBeNull();
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+  });
 
   it("renders an ACP composer before session and catalog data are available", () => {
     useChatStore.setState({ conversationId: null, sessionHarness: "acp" });

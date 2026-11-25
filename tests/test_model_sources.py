@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -212,6 +212,31 @@ def test_check_names_missing_env_without_rendering_secret_or_command_output(tmp_
     data = json.loads(result.stdout)
     assert "MODEL_SOURCE_TEST_KEY" in data["harnesses"][0]["hint"]
     assert data["harnesses"][0]["sample"] == []
+
+
+async def test_empty_acp_refresh_cannot_retimestamp_previous_models(tmp_path, monkeypatch):
+    from omnigent.models.model_source import AcpModelProbeError, _source_catalog
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"acp": {"agents": [{"name": "Example", "command": "example-agent acp"}]}})
+    )
+    probe = AsyncMock(
+        side_effect=[
+            {"models": [{"id": "model-a"}], "permission_options": [], "error": None},
+            {"models": [], "permission_options": [], "error": None},
+        ]
+    )
+    monkeypatch.setattr("omnigent.inner.acp_harness.probe_acp_model_options", probe)
+    source = ModelSource("agent")
+    rows = await fetch_model_source("acp:example", source, refresh="force")
+    assert [row["id"] for row in rows] == ["model-a"]
+    namespace, fingerprint, _ = _source_catalog("acp:example", source)
+    path = catalog_path(namespace, fingerprint)
+    original = path.read_bytes()
+
+    with pytest.raises(AcpModelProbeError, match="empty model catalog"):
+        await fetch_model_source("acp:example", source, refresh="force")
+    assert path.read_bytes() == original
 
 
 def test_check_reports_safe_acp_failure_and_private_diagnostic(tmp_path, caplog, monkeypatch):

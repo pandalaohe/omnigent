@@ -49,6 +49,8 @@ from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+    from omnigent.permission_tiers import PermissionTier
+
 _logger = logging.getLogger(__name__)
 
 #: Request fields the calling-defaults chain may fill; presence (even a
@@ -82,6 +84,77 @@ async def cached_acp_permission_options(
     return next(
         (row.get("permission_options", []) for row in records if row["harness"] == harness), []
     )
+
+
+async def session_creation_source_tier(
+    request: Request, source: Conversation, *, require_ready: bool
+) -> PermissionTier | None:
+    """Resolve the creator's tier before applying defaults to a delegated child."""
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+    from omnigent.server.permission_tiers import is_acp_permission_harness, source_permission_tier
+    from omnigent.server.routes._sessions.helpers import _resolve_harness, effective_host_id
+    from omnigent.server.session_collab import collab_owner_for
+
+    state = request.app.state
+    harness = await asyncio.to_thread(
+        _resolve_harness,
+        source,
+        agent_store=getattr(state, "agent_store", None),
+        agent_cache=getattr(state, "agent_cache", None),
+        preserve_acp_namespace=True,
+    )
+    tier = source_permission_tier(
+        harness, source.labels, source.terminal_launch_args or [], require_ready=require_ready
+    )
+    if tier is not None or not require_ready or not is_acp_permission_harness(harness):
+        return tier
+
+    mode = source.labels.get(ACP_SESSION_MODE_LABEL_KEY)
+    read_only_modes = ("plan", "read-only")
+    if mode in read_only_modes:
+        return "plan"
+    host_id = await asyncio.to_thread(effective_host_id, state.conversation_store, source)
+    options = await cached_acp_permission_options(request, host_id, harness)
+    if mode is None:
+        owner = await asyncio.to_thread(
+            collab_owner_for,
+            source,
+            state.conversation_store,
+            getattr(state, "permission_store", None),
+        )
+        project_store = getattr(state, "project_store", None)
+        project = (
+            await asyncio.to_thread(project_store.get, source.project_id, user_id=owner)
+            if project_store is not None and source.project_id is not None
+            else None
+        )
+        master = await load_master(owner, getattr(state, "user_preferences_store", None))
+        # Honor an operator's read-only ceiling even when the catalog lacks a mode for it.
+        options = [
+            *options,
+            *({"value": value, "concept": "read-only"} for value in read_only_modes),
+        ]
+        mode = resolve_calling(
+            explicit={"agent_id": source.agent_id, "harness_override": harness},
+            explicit_fields={"agent_id", "harness_override"},
+            project_config=project.config if project is not None else None,
+            master=master,
+            host_id=host_id,
+            agent_harness=lambda _: harness,
+            permission_options=lambda *_: options,
+        ).permission
+    if mode in read_only_modes:
+        return "plan"
+    concept = next(
+        (option.get("concept") for option in options if option.get("value") == mode), None
+    )
+    if concept == "read-only":
+        return "plan"
+    if concept == "manual":
+        return "ask"
+    if concept == "edit-automatic":
+        return "accept-edits"
+    return None
 
 
 async def session_prompt_warnings(

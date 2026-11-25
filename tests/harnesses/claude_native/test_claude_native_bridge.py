@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 from unittest.mock import Mock
 
 import httpx
@@ -5644,10 +5644,10 @@ def _prompt_flags(args: list[str]) -> list[str]:
     ],
     ids=["inline-spaced", "inline-joined", "file-spaced", "file-joined"],
 )
-def test_augment_claude_args_keeps_text_inline_beside_caller_prompt_flag(
+def test_augment_claude_args_preserves_caller_prompt_flags(
     tmp_path: Path, where: str, caller_prompt: tuple[str, ...]
 ) -> None:
-    """A caller prompt flag, passed or configured, is left alone and our text goes inline."""
+    """Only an inline pass-through value can be combined directly with framework text."""
     claude_args = ("--model", "claude-new", *(caller_prompt if where == "pass-through" else ()))
 
     args = augment_claude_args(
@@ -5658,18 +5658,19 @@ def test_augment_claude_args_keeps_text_inline_beside_caller_prompt_flag(
         configured_args=caller_prompt if where == "configured" else (),
     )
 
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
     if where == "pass-through" and "file" not in caller_prompt[0]:
         assert args[:2] == ["--model", "claude-new"]
         if len(caller_prompt) == 2:
             assert args[2:4] == ["--append-system-prompt", "ours\n\ncaller"]
         else:
             assert args[2] == "--append-system-prompt=ours\n\ncaller"
+        assert len(_prompt_flags(args)) == 1
+        assert not startup_context.exists()
     else:
         assert args[: len(claude_args)] == list(claude_args)
-        assert args[args.index("ours") - 1] == "--append-system-prompt"
-    assert len(_prompt_flags(args)) == (
-        2 if where == "pass-through" and "file" in caller_prompt[0] else 1
-    )
+        assert _prompt_flags(args) == _prompt_flags(list(claude_args))
+        assert startup_context.read_text(encoding="utf-8") == "ours"
     assert not (tmp_path / "startup-instructions.txt").exists()
 
 
@@ -10982,6 +10983,66 @@ async def test_session_create_relay_waits_for_created_handle(
 
 
 @pytest.mark.asyncio
+async def test_session_update_relay_waits_for_single_slow_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.session_projects import execute_session_update
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(
+        claude_native_bridge, "_SESSION_UPDATE_TOOL_CALL_TIMEOUT_S", 3.0, raising=False
+    )
+    source_id, target_id = "a" * 32, "b" * 32
+    requests: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_settings_source_checks": True})
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4})
+        await asyncio.sleep(0.25)
+        return httpx.Response(200, json={"model_override": "host-model"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def execute(name: str, arguments: dict[str, object]) -> object:
+            assert name == "sys_session_update"
+            return json.loads(await execute_session_update(arguments, client, source_id))
+
+        bridge_dir = tmp_path / "bridge"
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[{"name": "sys_session_update", "parameters": {}}],
+            tool_executor=execute,
+            loop=asyncio.get_running_loop(),
+        )
+        try:
+            result = await asyncio.to_thread(
+                claude_native_bridge._call_relay_tool,
+                bridge_dir,
+                "sys_session_update",
+                {"session_id": target_id, "model": "host-model"},
+            )
+        finally:
+            relay.close()
+
+    assert not result.get("isError"), result
+    assert json.loads(result["content"][0]["text"]) == {
+        "session_id": target_id,
+        "status": "updated",
+        "model": "host-model",
+    }
+    assert requests == [
+        ("GET", "/v1/info"),
+        ("GET", f"/v1/sessions/{target_id}"),
+        ("PATCH", f"/v1/sessions/{target_id}"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_relay_names_empty_dispatch_exception() -> None:
     async def execute(name: str, arguments: dict[str, Any]) -> object:
         raise TimeoutError()
@@ -11930,6 +11991,86 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
     finally:
         if relay is not None:
             relay.close()
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_mcp_honors_explicit_long_shell_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    data = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data))
+    monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", data / "antigravity-native")
+    bridge_dir = agy_bridge.prepare_bridge_dir("conv_agy")
+    agy_bridge.write_mcp_bridge_config(bridge_dir)
+    server = agy_bridge.build_mcp_config(bridge_dir)["mcpServers"]["omnigent"]
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    class ElapsedDeadline(ToolCallDeadline):
+        def __init__(self, seconds: float) -> None:
+            super().__init__(seconds)
+            self._started -= 600
+
+        def remaining(self) -> float:
+            remaining = super().remaining()
+            if remaining > 0:
+                loop.call_soon_threadsafe(release.set)
+            return remaining
+
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", ElapsedDeadline)
+
+    async def execute(name, arguments):
+        assert name == "sys_os_shell"
+        assert arguments == {"command": "echo done", "timeout": 720}
+        await release.wait()
+        return {"stdout": "done", "exit_code": 0}
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_os_shell"}],
+        tool_executor=execute,
+        loop=loop,
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            server["command"],
+            *server["args"],
+            env={**os.environ, **server["env"]},
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            for request in (
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sys_os_shell",
+                        "arguments": {"command": "echo done", "timeout": 720},
+                    },
+                },
+            ):
+                proc.stdin.write((json.dumps(request) + "\n").encode())
+                await proc.stdin.drain()
+                response = json.loads(await asyncio.wait_for(proc.stdout.readline(), timeout=8))
+                assert response["id"] == request["id"]
+            result = response["result"]
+            assert json.loads(result["content"][0]["text"]) == {"stdout": "done", "exit_code": 0}
+        finally:
+            proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+    finally:
+        relay.close()
 
 
 @pytest.mark.asyncio
@@ -19039,12 +19180,15 @@ def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return clock
 
 
-def _hook_relay(tmp_path, monkeypatch, client, *, permission_tier_control=None):
+def _hook_relay(tmp_path, monkeypatch, client, *, permission_tier_control=None, bridge_dir=None):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
-    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
-    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
+    if bridge_dir is None:
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native"
+        )
+        bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
 
     async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
         """Accept any relayed tool call."""
@@ -19081,11 +19225,44 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
 
 
 @pytest.mark.asyncio
-async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("antigravity", [False, True])
+async def test_permission_state_relay_is_session_scoped_and_minimal(
+    tmp_path, monkeypatch, antigravity
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+
     requests = []
+    waits = []
+    bridge_dir = None
+    if antigravity:
+        monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+        bridge_dir = agy_bridge.prepare_bridge_dir("conv_hook_eval")
+
+    def submit(coro, loop):
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        result = future.result
+
+        def observe_wait(*, timeout):
+            waits.append(timeout)
+            return result(timeout=timeout)
+
+        monkeypatch.setattr(future, "result", observe_wait)
+        return future
+
+    relay_asyncio = Mock(wraps=asyncio)
+    relay_asyncio.run_coroutine_threadsafe.side_effect = submit
+    monkeypatch.setattr(claude_native_bridge, "asyncio", relay_asyncio)
+    snapshot_options = {
+        "include_items": "false",
+        "include_liveness": "false",
+        "include_live_status": "false",
+        "include_usage": "false",
+    }
 
     def handle(request):
         requests.append(request)
+        if dict(request.url.params) != snapshot_options:
+            return httpx.Response(503)
         return httpx.Response(
             200,
             json={
@@ -19100,7 +19277,7 @@ async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, mo
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), base_url="http://server"
     ) as upstream:
-        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream)
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream, bridge_dir=bridge_dir)
         try:
             body = await asyncio.to_thread(
                 _relay_request_raw, bridge_dir, "/permission-tiers/state", {}
@@ -19113,6 +19290,7 @@ async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, mo
             }
             assert requests[0].url.path == "/v1/sessions/conv_hook_eval"
             assert requests[0].headers["X-Omnigent-Permission-Tiers"] == "1"
+            assert waits == [90.0 if antigravity else 5.0]
         finally:
             relay.close()
 
@@ -20806,7 +20984,10 @@ def test_prune_orphaned_bridge_dirs_respects_forwarder_cursor_activity_and_7_day
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A recent transcript_forwarder.json holds a dead-owner dir until both age past 7 days."""
-    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
+    from omnigent.harnesses.claude_native.bridge import (
+        prune_orphaned_bridge_dirs,
+        prune_orphaned_bridge_runtime_files,
+    )
 
     root = tmp_path / "claude-native"
     root.mkdir(parents=True)
@@ -20827,6 +21008,11 @@ def test_prune_orphaned_bridge_dirs_respects_forwarder_cursor_activity_and_7_day
     assert bridge_dir.exists()
 
     os.utime(cursor_file, (eight_days_ago, eight_days_ago))
+    runtime_file = bridge_dir / "server.json"
+    runtime_file.write_text("{}", encoding="utf-8")
+    assert prune_orphaned_bridge_runtime_files() == 0
+    assert cursor_file.exists()
+    assert not runtime_file.exists()
     assert prune_orphaned_bridge_dirs() == 1
     assert not bridge_dir.exists()
 
@@ -23666,11 +23852,11 @@ async def test_relay_approval_outlives_execution_and_http_timeouts(
 async def test_relay_approval_does_not_extend_another_calls_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A parked create cannot keep an unrelated stuck shell call alive."""
+    """A parked create cannot keep an unrelated stuck read alive."""
     from omnigent.runner import pending_approvals
 
     monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
-    waiting, shell_cancelled = asyncio.Event(), asyncio.Event()
+    waiting, read_cancelled = asyncio.Event(), asyncio.Event()
 
     async def executor(name, arguments):
         if name == "sys_scheduled_task_create":
@@ -23686,7 +23872,7 @@ async def test_relay_approval_does_not_extend_another_calls_budget(
         try:
             await asyncio.Future()
         finally:
-            shell_cancelled.set()
+            read_cancelled.set()
 
     loop = asyncio.get_running_loop()
     approval = asyncio.create_task(
@@ -23698,13 +23884,13 @@ async def test_relay_approval_does_not_extend_another_calls_budget(
         await asyncio.wait_for(waiting.wait(), 1)
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_shell", {}
+                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_read", {}
             ),
             1,
         )
         assert result["isError"]
         assert "active work" in result["content"][0]["text"]
-        await asyncio.wait_for(shell_cancelled.wait(), 1)
+        await asyncio.wait_for(read_cancelled.wait(), 1)
         assert not approval.done()
         assert pending_approvals.resolve("elicit_concurrent", False)
         assert not (await asyncio.wait_for(approval, 1)).get("isError")
@@ -23989,6 +24175,56 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments", "elapsed", "completes"),
+    [
+        ("sys_os_shell", {"command": "echo done", "timeout": 720}, 600, True),
+        ("sys_os_shell", {"command": "echo done"}, 1800, True),
+        ("sys_os_shell", {"command": "echo done"}, 2200, False),
+        ("sys_custom", {"timeout": 720}, 600, False),
+        ("sys_os_shell", {"command": "echo done", "timeout": 12000}, 7300, False),
+    ],
+)
+async def test_relay_preserves_explicit_long_shell_timeout(
+    monkeypatch, name, arguments, elapsed, completes
+):
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    class ElapsedDeadline(ToolCallDeadline):
+        def __init__(self, seconds):
+            super().__init__(seconds)
+            self._started -= elapsed
+
+        def remaining(self):
+            remaining = super().remaining()
+            if remaining > 0:
+                loop.call_soon_threadsafe(release.set)
+            return remaining
+
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", ElapsedDeadline)
+
+    async def executor(_name, _arguments):
+        await release.wait()
+        return {"completed": True}
+
+    result = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        executor,
+        loop,
+        name,
+        arguments,
+    )
+    if completes:
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    else:
+        assert result["isError"]
+        assert "timed out after" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_relay_returns_created_handle_after_inner_startup_budget(monkeypatch):
     from omnigent.runner import tool_dispatch
     from omnigent.runtime.tool_call_deadline import ToolCallDeadline
@@ -24015,7 +24251,8 @@ async def test_relay_returns_created_handle_after_inner_startup_budget(monkeypat
         {},
     )
     assert not result.get("isError")
-    assert json.loads(result["content"][0]["text"])["conversation_id"] == "existing_child"
+    content = cast(list[dict[str, str]], result["content"])
+    assert json.loads(content[0]["text"])["conversation_id"] == "existing_child"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

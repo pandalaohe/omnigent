@@ -1,4 +1,9 @@
+import { randomUUID } from "@/lib/randomUUID";
 import { canonicalTerminalFields } from "@/lib/terminalKeyBar";
+import {
+  applyTerminalKeyboardChanges,
+  type TerminalKeyboardChange,
+} from "@/lib/terminalKeyboardChanges";
 
 export type UserPreferenceNamespace =
   | "keyboard_shortcuts"
@@ -35,7 +40,7 @@ export const USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT =
 
 /**
  * Window event fired when the Server permanently rejects a namespace patch
- * (HTTP 422). Detail: `{ namespace, status: 422 }`.
+ * (HTTP 422). Detail includes the namespace, status, and optional server reason.
  */
 export const USER_PREFERENCES_PATCH_REJECTED_EVENT = "omnigent:user-preference-rejected";
 
@@ -136,6 +141,8 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
 const USER_PREFERENCES_SCOPE_KEY = "omnigent:user-preferences-owner";
 export const USER_PREFERENCES_DIRTY_KEY = "omnigent:user-preferences-dirty";
 const USER_PREFERENCES_DIRTY_VALUES_KEY = "omnigent:user-preferences-dirty-values";
+// Older clients interpret an incomplete mobile_assistant snapshot as a deletion.
+const TERMINAL_KEYBOARD_DIRTY_KEY = "omnigent:terminal-keyboard-dirty";
 const MOBILE_ASSISTANT_DEVICE_STORAGE_KEY = "omnigent:mobile-assistant-device-state";
 
 let preferenceFetcher: PreferenceFetcher | null = null;
@@ -145,6 +152,7 @@ let activeOwnerId: string | null = null;
 let activeServerId = "__default__";
 let activeConnectionId = "__default__";
 let syncGeneration = 0;
+let terminalKeyboardSaveVersion = 0;
 let preferenceConnectionIsCurrent = () => true;
 
 function isCurrentPreferenceGeneration(generation: number): boolean {
@@ -153,6 +161,7 @@ function isCurrentPreferenceGeneration(generation: number): boolean {
 let refreshListenersInstalled = false;
 let lastFocusRefreshAt = 0;
 const pendingTimers = new Map<UserPreferenceNamespace, number>();
+const patchScheduleSequences = new Map<UserPreferenceNamespace, number>();
 const lastAcknowledged = new Map<UserPreferenceNamespace, string>();
 // Last known Server value per namespace: a permanently rejected patch (HTTP
 // 422) restores local state from here instead of retrying.
@@ -181,7 +190,7 @@ function dirtyOwnerKey(): string {
   return `${activeServerId}:${activeOwnerId ?? "__local__"}`;
 }
 
-function readDirtyNamespaces(
+function readLegacyDirtyNamespaces(
   raw: string | null = window.localStorage.getItem(USER_PREFERENCES_DIRTY_KEY),
 ): Set<UserPreferenceNamespace> {
   const parsed = safeParse(raw);
@@ -191,6 +200,14 @@ function readDirtyNamespaces(
   return new Set(
     values.filter((value): value is UserPreferenceNamespace => value in CATEGORY_CONFIG),
   );
+}
+
+function readDirtyNamespaces(raw?: string | null): Set<UserPreferenceNamespace> {
+  const dirty = readLegacyDirtyNamespaces(raw);
+  if (readQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, "mobile_assistant").found) {
+    dirty.add("mobile_assistant");
+  }
+  return dirty;
 }
 
 export function isUserPreferenceNamespaceDirty(
@@ -213,8 +230,11 @@ function writeDirtyNamespaces(values: Set<UserPreferenceNamespace>): void {
   else window.localStorage.setItem(USER_PREFERENCES_DIRTY_KEY, JSON.stringify(all));
 }
 
-function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; value: unknown } {
-  const parsed = safeParse(window.localStorage.getItem(USER_PREFERENCES_DIRTY_VALUES_KEY));
+function readQueueValue(
+  key: string,
+  namespace: UserPreferenceNamespace,
+): { found: boolean; value: unknown } {
+  const parsed = safeParse(window.localStorage.getItem(key));
   if (!parsed || typeof parsed !== "object") return { found: false, value: null };
   const ownerValues = (parsed as Record<string, unknown>)[dirtyOwnerKey()];
   if (!ownerValues || typeof ownerValues !== "object" || Array.isArray(ownerValues)) {
@@ -226,8 +246,24 @@ function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; v
   return { found: true, value: (ownerValues as Record<string, unknown>)[namespace] };
 }
 
-function writeDirtyValue(namespace: UserPreferenceNamespace, value: unknown, remove = false): void {
-  const parsed = safeParse(window.localStorage.getItem(USER_PREFERENCES_DIRTY_VALUES_KEY));
+function readDirtyValue(namespace: UserPreferenceNamespace): { found: boolean; value: unknown } {
+  const legacy = readQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace);
+  if (namespace !== "mobile_assistant") return legacy;
+  const keyboard = readQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace);
+  if (!keyboard.found) return legacy;
+  return {
+    found: true,
+    value: { ...(legacy.value as object | null), terminal_keyboard: keyboard.value },
+  };
+}
+
+function writeQueueValue(
+  key: string,
+  namespace: UserPreferenceNamespace,
+  value: unknown,
+  remove = false,
+): void {
+  const parsed = safeParse(window.localStorage.getItem(key));
   const all =
     parsed && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
   const current = all[dirtyOwnerKey()];
@@ -239,23 +275,41 @@ function writeDirtyValue(namespace: UserPreferenceNamespace, value: unknown, rem
   else ownerValues[namespace] = value;
   if (Object.keys(ownerValues).length === 0) Reflect.deleteProperty(all, dirtyOwnerKey());
   else all[dirtyOwnerKey()] = ownerValues;
-  if (Object.keys(all).length === 0)
-    window.localStorage.removeItem(USER_PREFERENCES_DIRTY_VALUES_KEY);
-  else window.localStorage.setItem(USER_PREFERENCES_DIRTY_VALUES_KEY, JSON.stringify(all));
+  if (Object.keys(all).length === 0) window.localStorage.removeItem(key);
+  else window.localStorage.setItem(key, JSON.stringify(all));
 }
 
 function markDirty(namespace: UserPreferenceNamespace, value: unknown): void {
-  const dirty = readDirtyNamespaces();
+  let legacyValue = value;
+  if (namespace === "mobile_assistant") {
+    const { fields, keyboard } = splitMobilePatch(value);
+    writeQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace, keyboard, !keyboard);
+    if (keyboard) {
+      legacyValue = mobileSyncValue(fields);
+      if (legacyValue === null) {
+        clearLegacyDirty(namespace);
+        return;
+      }
+    }
+  }
+  const dirty = readLegacyDirtyNamespaces();
   dirty.add(namespace);
   writeDirtyNamespaces(dirty);
-  writeDirtyValue(namespace, value);
+  writeQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace, legacyValue);
+}
+
+function clearLegacyDirty(namespace: UserPreferenceNamespace): void {
+  const dirty = readLegacyDirtyNamespaces();
+  dirty.delete(namespace);
+  writeDirtyNamespaces(dirty);
+  writeQueueValue(USER_PREFERENCES_DIRTY_VALUES_KEY, namespace, null, true);
 }
 
 function clearDirty(namespace: UserPreferenceNamespace): void {
-  const dirty = readDirtyNamespaces();
-  dirty.delete(namespace);
-  writeDirtyNamespaces(dirty);
-  writeDirtyValue(namespace, null, true);
+  if (namespace === "mobile_assistant") {
+    writeQueueValue(TERMINAL_KEYBOARD_DIRTY_KEY, namespace, null, true);
+  }
+  clearLegacyDirty(namespace);
 }
 
 function safeParse(raw: string | null): unknown | null {
@@ -310,6 +364,115 @@ function mobileSyncValue(value: unknown): unknown | null {
       ? { chatActionsRevision: raw.chatActionsRevision }
       : {}),
   });
+}
+
+type QueuedKeyboardChange = TerminalKeyboardChange & { queueId?: string };
+
+interface TerminalKeyboardPatch {
+  defaults: Record<string, unknown>;
+  changes: QueuedKeyboardChange[];
+}
+
+function splitMobilePatch(value: unknown) {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const { terminal_keyboard, ...fields } = raw;
+  return { fields, keyboard: terminal_keyboard as TerminalKeyboardPatch | undefined };
+}
+
+function sameKeyboardField(first: TerminalKeyboardChange, second: TerminalKeyboardChange) {
+  return first.platform === second.platform && first.field === second.field;
+}
+
+function withQueueIds(changes: QueuedKeyboardChange[]): QueuedKeyboardChange[] {
+  return changes.map((change) =>
+    change.queueId === undefined ? { ...change, queueId: randomUUID() } : change,
+  );
+}
+
+function mergeMobilePatch(previous: unknown, value: unknown): unknown {
+  if (value === null) return null;
+  const { fields, keyboard } = splitMobilePatch(value);
+  const prior = splitMobilePatch(previous);
+  if (keyboard) {
+    const otherChanges =
+      prior.keyboard?.changes.filter(
+        (change) => !keyboard.changes.some((next) => sameKeyboardField(change, next)),
+      ) ?? [];
+    return {
+      ...prior.fields,
+      ...fields,
+      terminal_keyboard: {
+        ...keyboard,
+        changes: withQueueIds([...otherChanges, ...keyboard.changes]),
+      },
+    };
+  }
+  const normalized = mobileSyncValue({
+    ...fields,
+    terminalKeyboard:
+      fields.terminalKeyboard === undefined
+        ? prior.fields.terminalKeyboard
+        : fields.terminalKeyboard,
+  });
+  return prior.keyboard && normalized && fields.terminalKeyboard === undefined
+    ? {
+        ...(normalized as object),
+        terminal_keyboard: { ...prior.keyboard, changes: withQueueIds(prior.keyboard.changes) },
+      }
+    : normalized;
+}
+
+function applyMobilePatch(serverValue: unknown, patch: unknown) {
+  if (patch === null) return null;
+  const { fields, keyboard } = splitMobilePatch(patch);
+  let merged = { ...(serverValue as object | null), ...fields };
+  if (keyboard) {
+    if (
+      merged.version !== 2 ||
+      typeof merged.enabled !== "boolean" ||
+      !Array.isArray(merged.buttons)
+    )
+      merged = { ...merged, ...keyboard.defaults };
+    merged.terminalKeyboard = applyTerminalKeyboardChanges(
+      merged.terminalKeyboard,
+      keyboard.changes,
+    );
+  }
+  return merged;
+}
+
+function pendingMobilePatch(current: unknown, acknowledged: unknown): unknown {
+  const latest = splitMobilePatch(current);
+  const sent = splitMobilePatch(acknowledged);
+  const changes = latest.keyboard?.changes.filter(
+    (change) =>
+      change.queueId === undefined ||
+      !sent.keyboard?.changes.some((saved) => saved.queueId === change.queueId),
+  );
+  const { terminalKeyboard, ...latestFields } = latest.fields;
+  const { terminalKeyboard: sentKeyboard, ...sentFields } = sent.fields;
+  // A full keyboard snapshot carried forward with a toolbar edit is already saved.
+  // An explicit full replacement removes the queued scoped changes.
+  const replaceKeyboard =
+    terminalKeyboard !== undefined &&
+    (JSON.stringify(terminalKeyboard) !== JSON.stringify(sentKeyboard) ||
+      (sent.keyboard && !latest.keyboard));
+  const fields = replaceKeyboard
+    ? latest.fields
+    : JSON.stringify(latestFields) === JSON.stringify(sentFields)
+      ? {}
+      : latestFields;
+  if (changes?.length) {
+    return { ...fields, terminal_keyboard: { ...latest.keyboard, changes } };
+  }
+  return Object.keys(fields).length ? fields : null;
+}
+
+function withoutTerminalKeyboardChange(current: unknown, rejectedId: string) {
+  const { fields, keyboard } = splitMobilePatch(current);
+  const changes = keyboard?.changes.filter((change) => change.queueId !== rejectedId);
+  if (changes?.length) return { ...fields, terminal_keyboard: { ...keyboard, changes } };
+  return Object.keys(fields).length ? fields : null;
 }
 
 function sessionCollabSyncValue(value: unknown): unknown {
@@ -397,6 +560,8 @@ function serializedNamespaceValue(
   namespace: UserPreferenceNamespace,
   value: unknown | null,
 ): string {
+  if (namespace === "mobile_assistant" && splitMobilePatch(value).keyboard)
+    return JSON.stringify(value);
   return JSON.stringify(normalizedSyncValue(namespace, value));
 }
 
@@ -405,17 +570,25 @@ function latestNamespaceValue(namespace: UserPreferenceNamespace): unknown | nul
   return dirty.found ? dirty.value : localNamespaceValue(namespace);
 }
 
-function hydrateServerEnvelope(envelope: UserPreferencesEnvelope): void {
+function hydrateServerEnvelope(envelope: UserPreferencesEnvelope, skipMobile = false): void {
   const dirty = readDirtyNamespaces();
   const pendingDirty: UserPreferenceNamespace[] = [];
   applyingServerPreferences = true;
   try {
     for (const namespace of Object.keys(CATEGORY_CONFIG) as UserPreferenceNamespace[]) {
+      if (skipMobile && namespace === "mobile_assistant") continue;
       const serverNamespace = normalizedSyncValue(namespace, envelope.settings[namespace] ?? null);
       lastServerValues.set(namespace, serverNamespace);
       if (dirty.has(namespace)) {
         const retained = readDirtyValue(namespace);
-        if (retained.found) applyNamespace(namespace, retained.value);
+        if (retained.found) {
+          applyNamespace(
+            namespace,
+            namespace === "mobile_assistant"
+              ? applyMobilePatch(serverNamespace, retained.value)
+              : retained.value,
+          );
+        }
         pendingDirty.push(namespace);
       } else {
         applyNamespace(namespace, serverNamespace);
@@ -438,6 +611,7 @@ export async function refreshUserPreferencesFromServer(): Promise<void> {
   const fetcher = preferenceFetcher;
   const generation = syncGeneration;
   if (!serverSupportsPreferences || fetcher === null || !preferenceConnectionIsCurrent()) return;
+  const keyboardSaveVersion = terminalKeyboardSaveVersion;
   try {
     const response = await fetcher("/v1/me", { cache: "no-store" });
     if (!isCurrentPreferenceGeneration(generation)) return;
@@ -450,7 +624,10 @@ export async function refreshUserPreferencesFromServer(): Promise<void> {
       !isEnvelope(data.preferences)
     )
       return;
-    hydrateServerEnvelope(data.preferences);
+    // The GET may have taken its snapshot before a keyboard PATCH committed.
+    const skipMobile = keyboardSaveVersion !== terminalKeyboardSaveVersion;
+    hydrateServerEnvelope(data.preferences, skipMobile);
+    if (skipMobile) void refreshUserPreferencesFromServer();
   } catch {
     // The durable dirty map retains offline edits for the next focus/reload.
   }
@@ -478,6 +655,7 @@ function cancelPreferenceActivity(): void {
   for (const waiter of patchWaiters) waiter.finish(new Error("The account or server changed."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
+  patchScheduleSequences.clear();
   patchesAfterFlight.clear();
   inFlightPatches.clear();
   lastAcknowledged.clear();
@@ -605,26 +783,38 @@ export async function initializeUserPreferencesSync(
   hydrateServerEnvelope(serverValue);
 }
 
-function announceRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
+function announceRejectedNamespace(
+  namespace: UserPreferenceNamespace,
+  detail?: unknown,
+  terminalKeyboard = false,
+): void {
   window.dispatchEvent(
     new CustomEvent(USER_PREFERENCES_PATCH_REJECTED_EVENT, {
-      detail: { namespace, status: 422, ...(typeof detail === "string" ? { detail } : {}) },
+      detail: {
+        namespace,
+        status: 422,
+        ...(terminalKeyboard ? { terminalKeyboard: true } : {}),
+        ...(typeof detail === "string" ? { detail } : {}),
+      },
     }),
   );
 }
 
-/**
- * A 422 is permanent for a namespace: cancel any queued work, drop the dirty
- * mark, restore the last Server value (absent → remove the local key) exactly
- * as hydration does, and announce the rejection. No retry is scheduled.
- */
-function discardRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
+function cancelQueuedPatch(namespace: UserPreferenceNamespace): void {
   const queuedTimer = pendingTimers.get(namespace);
   if (queuedTimer !== undefined) {
     window.clearTimeout(queuedTimer);
     pendingTimers.delete(namespace);
   }
   patchesAfterFlight.delete(namespace);
+}
+
+function discardRejectedNamespace(
+  namespace: UserPreferenceNamespace,
+  detail?: unknown,
+  terminalKeyboard = false,
+): void {
+  cancelQueuedPatch(namespace);
   const serverValue = lastServerValues.get(namespace) ?? null;
   clearDirty(namespace);
   lastAcknowledged.set(namespace, serializedNamespaceValue(namespace, serverValue));
@@ -634,7 +824,7 @@ function discardRejectedNamespace(namespace: UserPreferenceNamespace, detail?: u
   } finally {
     applyingServerPreferences = false;
   }
-  announceRejectedNamespace(namespace, detail);
+  announceRejectedNamespace(namespace, detail, terminalKeyboard);
 }
 
 function schedulePatch(
@@ -645,9 +835,13 @@ function schedulePatch(
   attempt: number,
 ): void {
   const generation = syncGeneration;
+  // A replay supersedes the older request as soon as it is scheduled.
+  const sequence = (patchScheduleSequences.get(namespace) ?? 0) + 1;
+  patchScheduleSequences.set(namespace, sequence);
   const fetcher = preferenceFetcher;
   const existing = pendingTimers.get(namespace);
   if (existing !== undefined) window.clearTimeout(existing);
+  patchesAfterFlight.delete(namespace);
   pendingTimers.set(
     namespace,
     window.setTimeout(() => {
@@ -662,59 +856,152 @@ function schedulePatch(
       }
       if (fetcher === null) return;
       inFlightPatches.set(namespace, generation);
+      const serverBeforePatch = lastServerValues.get(namespace);
       void (async () => {
         try {
+          const mobile = namespace === "mobile_assistant" ? splitMobilePatch(syncValue) : undefined;
           const response = await fetcher(`/v1/me/preferences/${namespace}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ value: syncValue }),
+            body: JSON.stringify(
+              mobile?.keyboard
+                ? {
+                    value: mobile.fields,
+                    terminal_keyboard: {
+                      ...mobile.keyboard,
+                      changes: mobile.keyboard.changes.map(({ platform, field, value }) => ({
+                        platform,
+                        field,
+                        value,
+                      })),
+                    },
+                  }
+                : { value: syncValue },
+            ),
           });
           if (!isCurrentPreferenceGeneration(generation)) return;
           if (response?.status === 422) {
             const body = await response.json().catch(() => null);
             if (!isCurrentPreferenceGeneration(generation)) return;
+            const detail = body?.detail;
+            const terminalKeyboard = mobile?.keyboard !== undefined;
+            if (terminalKeyboard && detail === "Invalid preferences payload") {
+              // A rolled-back server rejects the extra request field. Leave the
+              // dirty records for the next refresh or connection to replay.
+              if (patchScheduleSequences.get(namespace) === sequence) cancelQueuedPatch(namespace);
+              return;
+            }
+            const rejected =
+              detail?.code === "terminal_keyboard_conflict" &&
+              Number.isInteger(detail.change_index) &&
+              typeof detail.message === "string"
+                ? mobile?.keyboard?.changes[detail.change_index]?.queueId
+                : undefined;
+            const reason = rejected ? detail.message : detail;
             settlePatchWaiters(
               namespace,
               serialized,
               Object.assign(
                 new Error(
-                  typeof body?.detail === "string"
-                    ? body.detail
-                    : "The server rejected these settings (422).",
+                  typeof reason === "string" ? reason : "The server rejected these settings (422).",
                 ),
                 { status: 422 },
               ),
             );
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
-            if (currentSerialized !== serialized) {
-              // A newer local edit arrived while this patch was in flight: send
-              // the newest value next (a stale queued patch could cancel its timer).
-              markDirty(namespace, current);
+            const retained = rejected ? readDirtyValue(namespace) : undefined;
+            const retry = rejected
+              ? withoutTerminalKeyboardChange(retained?.value, rejected)
+              : current;
+            const retryPending = retained
+              ? retry !== null || (retained.found && retained.value === null)
+              : currentSerialized !== serialized;
+            if (retryPending) {
+              markDirty(namespace, retry);
               patchesAfterFlight.set(namespace, {
-                syncValue: current,
-                serialized: currentSerialized,
+                syncValue: retry,
+                serialized: serializedNamespaceValue(namespace, retry),
                 delayMs: 0,
                 attempt: 0,
               });
-              announceRejectedNamespace(namespace, body?.detail);
+              if (rejected) {
+                applyingServerPreferences = true;
+                try {
+                  applyNamespace(
+                    namespace,
+                    applyMobilePatch(lastServerValues.get(namespace), retry),
+                  );
+                } finally {
+                  applyingServerPreferences = false;
+                }
+              }
+              announceRejectedNamespace(namespace, reason, terminalKeyboard);
             } else {
-              discardRejectedNamespace(namespace, body?.detail);
+              discardRejectedNamespace(namespace, reason, terminalKeyboard);
+              if (terminalKeyboard) void refreshUserPreferencesFromServer();
             }
             return;
           }
           if (!response?.ok) throw new Error("preference patch failed");
-          lastAcknowledged.set(namespace, serialized);
-          lastServerValues.set(namespace, syncValue);
-          settlePatchWaiters(namespace, serialized);
-          window.dispatchEvent(
-            new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
-              detail: { namespace },
-            }),
-          );
+          const body = mobile ? ((await response.json().catch(() => null)) as unknown) : null;
+          if (!isCurrentPreferenceGeneration(generation)) return;
           const current = latestNamespaceValue(namespace);
           const currentSerialized = serializedNamespaceValue(namespace, current);
-          if (currentSerialized === serialized) {
+          const mergeKeyboard =
+            mobile &&
+            (mobile.keyboard ||
+              mobile.fields.terminalKeyboard !== undefined ||
+              splitMobilePatch(current).keyboard);
+          const refreshOverlapped =
+            mergeKeyboard && serverBeforePatch !== lastServerValues.get(namespace);
+          const serverValue = mobile
+            ? isEnvelope(body)
+              ? (body.settings.mobile_assistant ?? null)
+              : applyMobilePatch(lastServerValues.get(namespace), syncValue)
+            : syncValue;
+          lastAcknowledged.set(namespace, serialized);
+          if (!refreshOverlapped) lastServerValues.set(namespace, serverValue);
+          if (mergeKeyboard) {
+            terminalKeyboardSaveVersion += 1;
+            const remaining =
+              currentSerialized === serialized ? null : pendingMobilePatch(current, syncValue);
+            const deletePending = current === null && currentSerialized !== serialized;
+            if (remaining === null && !deletePending) {
+              clearDirty(namespace);
+              cancelQueuedPatch(namespace);
+              lastAcknowledged.set(
+                namespace,
+                serializedNamespaceValue(namespace, lastServerValues.get(namespace)),
+              );
+            } else {
+              markDirty(namespace, remaining);
+              patchesAfterFlight.set(namespace, {
+                syncValue: remaining,
+                serialized: serializedNamespaceValue(namespace, remaining),
+                delayMs: 0,
+                attempt: 0,
+              });
+            }
+            if (refreshOverlapped) {
+              // Keep the hydrated local view until a fresh read can order the two responses.
+              void refreshUserPreferencesFromServer();
+            } else {
+              applyingServerPreferences = true;
+              try {
+                applyNamespace(
+                  namespace,
+                  remaining !== null
+                    ? applyMobilePatch(serverValue, remaining)
+                    : deletePending
+                      ? null
+                      : serverValue,
+                );
+              } finally {
+                applyingServerPreferences = false;
+              }
+            }
+          } else if (currentSerialized === serialized) {
             clearDirty(namespace);
           } else {
             markDirty(namespace, current);
@@ -725,6 +1012,12 @@ function schedulePatch(
               attempt: 0,
             });
           }
+          settlePatchWaiters(namespace, serialized);
+          window.dispatchEvent(
+            new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+              detail: { namespace },
+            }),
+          );
         } catch {
           if (isCurrentPreferenceGeneration(generation)) {
             const current = latestNamespaceValue(namespace);
@@ -780,8 +1073,11 @@ export function queueUserPreferencePatch(
   ) {
     return;
   }
-  const syncValue = normalizedSyncValue(namespace, value);
-  const serialized = JSON.stringify(syncValue);
+  const syncValue =
+    namespace === "mobile_assistant"
+      ? mergeMobilePatch(readDirtyValue(namespace).value, value)
+      : normalizedSyncValue(namespace, value);
+  const serialized = serializedNamespaceValue(namespace, syncValue);
   for (const waiter of patchWaiters) {
     if (waiter.namespace === namespace && waiter.serialized !== serialized) {
       waiter.finish(new Error("A newer edit replaced this save. Please retry."));
@@ -853,6 +1149,7 @@ export function resetUserPreferencesSyncForTests(): void {
   for (const waiter of patchWaiters) waiter.finish(new Error("Settings sync reset."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
+  patchScheduleSequences.clear();
   patchesAfterFlight.clear();
   inFlightPatches.clear();
   lastAcknowledged.clear();
@@ -863,6 +1160,7 @@ export function resetUserPreferencesSyncForTests(): void {
   activeServerId = "__default__";
   activeConnectionId = "__default__";
   syncGeneration = 0;
+  terminalKeyboardSaveVersion = 0;
   preferenceConnectionIsCurrent = () => true;
   lastFocusRefreshAt = 0;
   if (refreshListenersInstalled) {

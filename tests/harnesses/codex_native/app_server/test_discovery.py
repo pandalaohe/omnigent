@@ -636,7 +636,7 @@ async def test_discovery_process_captures_stderr_in_memory(
     )
     monkeypatch.setattr(
         "omnigent.config.load_effective_config",
-        lambda: (
+        lambda **_kwargs: (
             {
                 "harness": {
                     "codex-native": {

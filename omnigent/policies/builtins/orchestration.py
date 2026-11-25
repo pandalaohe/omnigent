@@ -15,7 +15,7 @@ import shlex
 from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
 
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import SHELL_TOOLS, shell_command
 from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
@@ -390,16 +390,11 @@ def blast_radius(
             factory params).
         :returns: ALLOW / ASK / DENY decision dict.
         """
-        # Native harnesses use different names for the same command-shaped
-        # shell tool; all are normalized to a ``command`` argument.
         args = _tool_call(event, _SHELL_TOOLS)
         if args is None:
             return _ALLOW
-        command = args.get("command")
-        # A Bash / sys_os_shell call always carries a string ``command`` by
-        # contract; a non-str is a malformed payload no pattern can classify, so
-        # there is nothing to gate.
-        if not isinstance(command, str):
+        command = shell_command(event["data"]["name"], args)
+        if command is None:
             return _ALLOW
         # rm + git push are classified by flag/refspec-robust helpers (a regex
         # missed split/long rm flags, root children, and force/delete refspecs);

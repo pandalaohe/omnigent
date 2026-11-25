@@ -61,6 +61,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.config import codex_native_allows_unlisted_model
 from omnigent.debug_logging import StageTimings, debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -95,6 +96,10 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.native.native_terminal_generation import (
+    NativeTerminalGeneration,
+    persisted_terminal_generation,
+)
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
@@ -570,12 +575,22 @@ _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 # stop record there once the server is gone.
 _AUTO_CODEX_BRIDGE_DIRS: dict[str, Path] = {}
 
+# A failed listing does not renew the last successful observation.
+_CODEX_BACKGROUND_TERMINAL_FRESHNESS_S = 120.0
+
 
 @dataclasses.dataclass
 class _CodexForwarderOwner:
     session_id: str
     subagent_router: SubagentRouter | None
     turn_router: TurnRouter | None
+    terminal_instance: TerminalInstance | None
+    background_terminals_running: bool | None = None
+    background_terminals_observed_at: float = 0.0
+
+    def note_background_terminals(self, running: bool) -> None:
+        self.background_terminals_running = running
+        self.background_terminals_observed_at = time.monotonic()
 
 
 _CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexForwarderOwner] = (
@@ -584,12 +599,34 @@ _CODEX_FORWARDER_OWNERS: weakref.WeakKeyDictionary[asyncio.Task[object], _CodexF
 
 
 def _track_codex_forwarder(
-    session_id: str, subagent_router: SubagentRouter | None, turn_router: TurnRouter | None
+    session_id: str,
+    subagent_router: SubagentRouter | None,
+    turn_router: TurnRouter | None,
+    terminal_instance: TerminalInstance | None,
 ) -> _CodexForwarderOwner:
-    owner = _CodexForwarderOwner(session_id, subagent_router, turn_router)
+    owner = _CodexForwarderOwner(session_id, subagent_router, turn_router, terminal_instance)
     if (task := asyncio.current_task()) is not None:
         _CODEX_FORWARDER_OWNERS[task] = owner
     return owner
+
+
+def codex_pane_background_terminal_status(
+    session_id: str, instance: TerminalInstance
+) -> bool | None:
+    """Use the live forwarder's last app-server listing for this pane incarnation."""
+    task = _AUTO_FORWARDER_TASKS.get(session_id)
+    if task is None or task.done() or task.cancelling():
+        return None
+    owner = _CODEX_FORWARDER_OWNERS.get(task)
+    if owner is None or owner.session_id != session_id or owner.terminal_instance is not instance:
+        return None
+    if (
+        owner.background_terminals_running
+        and time.monotonic() - owner.background_terminals_observed_at
+        >= _CODEX_BACKGROUND_TERMINAL_FRESHNESS_S
+    ):
+        return None
+    return owner.background_terminals_running
 
 
 def _prepare_codex_forwarder_transfer(
@@ -1498,6 +1535,7 @@ class _CodexNativeLaunchConfig:
         reads. A session the forwarder rotated onto carries the original
         session's id here. ``None`` when unlabelled: the bridge is then keyed
         by the session id.
+    :param terminal_generation: Last terminal accepted for the runner binding.
     """
 
     workspace: Path
@@ -1517,6 +1555,8 @@ class _CodexNativeLaunchConfig:
     service_tier: str | None = None
     parent_session_id: str | None = None
     bridge_id: str | None = None
+    terminal_generation: NativeTerminalGeneration | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1566,6 +1606,7 @@ class _PiNativeLaunchConfig:
     model_override: str | None = None
     reasoning_effort: str | None = None
     native_usage_baseline: dict[str, int | float] | None = None
+    launched_model: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2173,6 +2214,13 @@ async def _pi_native_launch_config(
             and cost >= 0
         ):
             native_usage_baseline["cumulative_cost_usd"] = cost
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
     return _PiNativeLaunchConfig(
         parent_session_id=snapshot.get("parent_session_id")
         if isinstance(snapshot.get("parent_session_id"), str)
@@ -2189,6 +2237,7 @@ async def _pi_native_launch_config(
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
         native_usage_baseline=native_usage_baseline,
+        launched_model=launched_model,
     )
 
 
@@ -2357,6 +2406,14 @@ async def _codex_native_launch_config(
         harness_override=_harness_override if isinstance(_harness_override, str) else None,
         labels=labels if isinstance(labels, dict) else None,
     )
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    launched_model: str | None = None
+    if isinstance(labels, dict):
+        _lm = labels.get(LAUNCHED_MODEL_LABEL)
+        if isinstance(_lm, str) and _lm.strip():
+            launched_model = _lm.strip()
+    runner_id = snapshot.get("runner_id")
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -2375,6 +2432,11 @@ async def _codex_native_launch_config(
         reasoning_effort=reasoning_effort,
         parent_session_id=parent_session_id,
         bridge_id=bridge_id,
+        terminal_generation=persisted_terminal_generation(
+            labels if isinstance(labels, dict) else {},
+            runner_id if isinstance(runner_id, str) else None,
+        ),
+        launched_model=launched_model,
     )
 
 
@@ -4112,6 +4174,12 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _arg_value(pi_args, "--model"),
+        current_launched=launch_config.launched_model,
+    )
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -4232,17 +4300,15 @@ async def _post_native_launch_notice(
     server_client: httpx.AsyncClient | None,
     code: str,
     notice: str,
+    level: Literal["info", "warning"] = "info",
 ) -> None:
-    """Surface an informational launch notice (e.g. an ignored effort setting).
-
-    Posts an ``error`` item with ``level: "info"`` so the web UI renders a
-    neutral notice pill rather than a destructive banner. The session still
-    works; the notice only explains how the launch adapted the user's choice.
+    """Surface a non-blocking native launch notice in the session transcript.
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
     :param code: Stable notice code, e.g. ``"pi_native_effort_ignored"``.
     :param notice: The user-facing notice text to surface.
+    :param level: Presentation level for the notice.
     """
     if server_client is None:
         return
@@ -4257,7 +4323,7 @@ async def _post_native_launch_notice(
                         "source": "execution",
                         "code": code,
                         "message": notice,
-                        "level": "info",
+                        "level": level,
                     },
                 },
             },
@@ -6266,7 +6332,9 @@ async def _launch_codex_native_tui(
     )
 
     # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
+    _codex_harness_cfg = load_effective_config(
+        workspace=workspace, ignore_invalid_user_config=True
+    )
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
@@ -6642,9 +6710,12 @@ async def _auto_create_codex_terminal(
                     session_id,
                     extra={"session_id": session_id},
                 )
-            elif reachable is None and _codex_launch.profile is None:
-                # A list can lag what the provider serves and never shows router pins, so
-                # launch the explicit pick as requested; the provider's answer decides.
+            elif (
+                reachable is None
+                and _codex_launch.profile is None
+                and await asyncio.to_thread(codex_native_allows_unlisted_model)
+            ):
+                # An opted-in host lets the provider decide whether it serves the pick.
                 offered = ", ".join(
                     str(row.get("id") or row.get("model") or "") for row in _launch_models.rows
                 )
@@ -6740,7 +6811,11 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(bridge_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
-    clear_bridge_state(bridge_dir)
+    clear_bridge_state(
+        bridge_dir,
+        session_id=session_id,
+        terminal_generation=launch_config.terminal_generation,
+    )
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a
     # machine-wide ``ps`` scan on their terminal-interactivity path.
@@ -7373,6 +7448,7 @@ async def _auto_create_codex_terminal(
                 client=retained_resume_client,
                 inventory_incarnation_id=inventory_incarnation_id,
                 app_server=app_server,
+                terminal_instance=terminal_instance,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -7387,6 +7463,12 @@ async def _auto_create_codex_terminal(
             server_client,
             expected_model_override=pick_to_reset,
         )
+    await _record_launched_model(
+        session_id,
+        server_client,
+        _codex_launch.model,
+        current_launched=launch_config.launched_model,
+    )
     if model_reset_notice is not None:
         await _post_native_launch_notice(
             session_id=session_id,
@@ -7722,7 +7804,7 @@ async def _codex_discover_thread_and_forward(
         _RunnerDatabricksAuth,
     )
 
-    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router, terminal_instance)
     if login_required:
         # The launch router already knows this TUI can only render the
         # sign-in screen: no provider routes the codex harness and Codex
@@ -8039,6 +8121,7 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_background_terminals=owner.note_background_terminals,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -8099,6 +8182,7 @@ async def _codex_forward_known_thread(
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
     inventory_incarnation_id: str | None = None,
+    terminal_instance: TerminalInstance | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -8122,6 +8206,7 @@ async def _codex_forward_known_thread(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param terminal_instance: Pane owned by this forwarder for liveness checks.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -8132,7 +8217,7 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
-    owner = _track_codex_forwarder(session_id, subagent_router, turn_router)
+    owner = _track_codex_forwarder(session_id, subagent_router, turn_router, terminal_instance)
     cancelled = False
     try:
         _bind_codex_inventory_client(
@@ -8151,6 +8236,7 @@ async def _codex_forward_known_thread(
             thread_id=thread_id,
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_background_terminals=owner.note_background_terminals,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -8482,7 +8568,7 @@ async def _auto_create_antigravity_terminal(
     effort = snapshot.get("reasoning_effort")
     raw_model_options = snapshot.get("model_options")
     catalog_models = raw_model_options if isinstance(raw_model_options, list) else None
-    argv, launch_env = await asyncio.to_thread(
+    launch = await asyncio.to_thread(
         build_agy_launch,
         conversation_id=external_session_id if resume else None,
         model=model,
@@ -8492,8 +8578,9 @@ async def _auto_create_antigravity_terminal(
         log_dir=bridge_dir,
         catalog_models=catalog_models,
     )
-    env_overrides.update(launch_env)
-    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    model_warning = await launch.check_subscription_model()
+    env_overrides.update(launch.env)
+    argv = [launch.argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
     argv = wrap_agy_gateway_launch(argv, env_overrides)
@@ -8689,6 +8776,15 @@ async def _auto_create_antigravity_terminal(
                 session_id,
                 exc_info=True,
             )
+
+    if model_warning is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="antigravity_native_model_unverified",
+            notice=model_warning,
+            level="warning",
+        )
 
     # Announce the terminal to clients ONLY after the reader is started and
     # registered. ``session_resource_view_to_dict`` serialization + the publish
@@ -10479,6 +10575,96 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+_BACKGROUND_LAUNCHED_MODEL_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _record_launched_model(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+    *,
+    current_launched: str | None = None,
+) -> None:
+    """Record the concrete model a native terminal actually launched with."""
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
+        return
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"labels": {LAUNCHED_MODEL_LABEL: value}},
+            params={"include_usage": "false"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except (httpx.HTTPError, RuntimeError):
+        _logger.debug(
+            "native terminal: could not record launched model for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _schedule_launched_model_record(
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    model: str | None,
+    *,
+    current_launched: str | None = None,
+) -> asyncio.Task[None] | None:
+    """Schedule ``_record_launched_model`` off envelope terminal startup."""
+    if server_client is None or not callable(getattr(server_client, "patch", None)):
+        return None
+    value = model.strip() if isinstance(model, str) and model.strip() else ""
+    current = (
+        current_launched.strip()
+        if isinstance(current_launched, str) and current_launched.strip()
+        else ""
+    )
+    if value == current:
+        return None
+    task = asyncio.create_task(
+        _record_launched_model(
+            session_id,
+            server_client,
+            model,
+            current_launched=current_launched,
+        ),
+        name=f"native-launched-model-{session_id}",
+    )
+    _BACKGROUND_LAUNCHED_MODEL_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_LAUNCHED_MODEL_TASKS.discard)
+    return task
+
+
+def _arg_value(args: Sequence[str], flag: str) -> str | None:
+    """Return the last value passed for *flag* (``--flag val`` or ``--flag=val``)."""
+    prefix = f"{flag}="
+    found: str | None = None
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
+        if token == flag and idx + 1 < len(args):
+            found = args[idx + 1]
+            idx += 2
+            continue
+        if token.startswith(prefix):
+            val = token[len(prefix) :]
+            if val:
+                found = val
+        idx += 1
+    return found
+
+
 async def _clear_session_model_override(
     session_id: str,
     server_client: httpx.AsyncClient,
@@ -11504,6 +11690,24 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+    effective_claude_model = _arg_value(launch_args, "--model") or launch_model
+    current_claude_launched = (launch_metadata.labels or {}).get(LAUNCHED_MODEL_LABEL)
+    if session_init is not None:
+        _schedule_launched_model_record(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
+    else:
+        await _record_launched_model(
+            session_id,
+            server_client,
+            effective_claude_model,
+            current_launched=current_claude_launched,
+        )
     if unserved_pick is not None:
         await _post_native_launch_notice(
             session_id=session_id,

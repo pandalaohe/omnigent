@@ -1905,6 +1905,47 @@ async def test_create_terminal_native_bootstrap_exempt_from_gate(
     ]
 
 
+@pytest.mark.parametrize("surface", ["resource", "message"])
+@pytest.mark.parametrize("model", [None, "example-model"])
+async def test_agy_runner_ensure_has_time_to_check_saved_model(client, app, surface, model):
+    from omnigent._wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.harnesses.antigravity_native.launch import AGY_MODEL_LAUNCH_TIMEOUT_S
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conv = app.state.test_conversation_store.get_conversation(session_id)
+    conv.labels[WRAPPER_LABEL_KEY] = ANTIGRAVITY_NATIVE_WRAPPER_VALUE
+    conv.model_override = model
+    path = f"/v1/sessions/{session_id}/resources/terminals"
+    fake_runner = _FakeRunnerClient(payload={"id": "terminal_antigravity_main", "metadata": {}})
+    fake_runner.post = AsyncMock(wraps=fake_runner.post)
+
+    if surface == "resource":
+        set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+        response = await client.post(
+            path,
+            json={
+                "terminal": "antigravity",
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+    else:
+        outcome = await _ensure_native_terminal_ready(
+            cast(httpx.AsyncClient, fake_runner), session_id, conv
+        )
+        assert outcome.error is None
+
+    [call] = fake_runner.post.await_args_list
+    timeout = call.kwargs["timeout"]
+    if model is None:
+        assert timeout == 10.0
+    else:
+        assert timeout.read == AGY_MODEL_LAUNCH_TIMEOUT_S
+        assert timeout.connect == 10.0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body",
@@ -9027,6 +9068,7 @@ async def test_relay_persists_harness_reported_model(
                 "type": "session.model",
                 "conversation_id": session_id,
                 "model": "claude-opus-4-8",
+                "reported": True,
             }
         ]
     )

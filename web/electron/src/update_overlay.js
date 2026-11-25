@@ -281,6 +281,10 @@ function createUpdateOverlay({
     });
     ipcMain.handle("omnigent:overlay-update-download", async (event) => {
       const overlay = guard(event);
+      if (updater.getStatus()?.info?.downloadUrl) {
+        await updater.downloadUpdate();
+        return;
+      }
       const parent = parentOf(overlay);
       if (!parent || parent.isDestroyed()) {
         throw new Error("The update prompt no longer has an active parent window");

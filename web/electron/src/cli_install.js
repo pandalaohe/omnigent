@@ -238,10 +238,14 @@ function commandExists(name, env = process.env) {
 async function installCli(deps = {}) {
   const platform = deps.platform ?? process.platform;
   const onOutput = deps.onOutput || (() => {});
+  const installDocsUrl =
+    typeof deps.installDocsUrl === "string" && deps.installDocsUrl.trim()
+      ? deps.installDocsUrl.trim()
+      : "https://omnigent.ai/";
   if (platform !== "darwin") {
     return {
       ok: false,
-      error: "In-app install is macOS-only for now. Install the CLI from https://omnigent.ai/.",
+      error: `In-app install is macOS-only for now. Install the CLI from ${installDocsUrl}.`,
     };
   }
   const script = (deps.resolveInstallScript || resolveInstallScript)();

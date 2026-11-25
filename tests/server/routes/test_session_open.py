@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import generate_agent_id
@@ -681,6 +681,31 @@ async def test_failed_create_after_row_keeps_the_session_owned(
         sid = captured["kwargs"]["conversation_id"]
         assert env["conversations"].get_conversation(sid) is not None
         assert env["permissions"].get(ALICE, sid) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["session_choice_ask", "agent_busy", "agent_exhausted"])
+@pytest.mark.parametrize("persist_before_error", [False, True])
+async def test_session_choice_rejection_preserves_detail_and_only_cleans_up_orphans(
+    open_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    persist_before_error: bool,
+) -> None:
+    env = open_env
+    detail = {"code": code, "message": "Session choice rejected this request"}
+    captured = _patch_create(
+        env,
+        monkeypatch,
+        error=HTTPException(status_code=409, detail=detail),
+        persist_before_error=persist_before_error,
+    )
+    async with await _client(env) as client:
+        rejected = await _post(client, env["sender"].id, env["sender_token"])
+    assert rejected == {"error": code, **detail}
+    sid = captured["kwargs"]["conversation_id"]
+    assert (env["conversations"].get_conversation(sid) is not None) == persist_before_error
+    assert (env["permissions"].get(ALICE, sid) is not None) == persist_before_error
 
 
 @pytest.mark.asyncio

@@ -806,7 +806,8 @@ class SysSessionGetInfoTool(Tool):
         return (
             "Return one or more sessions' metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
-            "host + configured harness readiness, reasoning effort, model, "
+            "host + configured harness readiness, reasoning effort, model "
+            "(plus requested, launched, and running when reliable for the harness), "
             "parent session, workspace, project_id, project_name, persisted last-activity time, "
             "outstanding approval prompts, cost, context usage "
             "(compact_used_fraction is occupancy against the harness's "
@@ -1204,6 +1205,14 @@ class SysSessionCreateTool(Tool):
                                 "independent session (agent_id only), grouped in this family "
                                 "when nested agents are enabled, unless project_name names "
                                 "another project."
+                            ),
+                        },
+                        "permission_tier": {
+                            "type": "string",
+                            "enum": ["ask", "plan", "accept-edits", "auto"],
+                            "description": (
+                                "Host tier for a registered or default child agent. "
+                                "Use a tier the user authorized for the target harness."
                             ),
                         },
                         "sandbox_provider": {

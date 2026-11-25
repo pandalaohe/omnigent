@@ -40,7 +40,7 @@ export function isLegacyNativeKeepWarmHarness(harness: string | null | undefined
 export const KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_SECONDS = 3300;
 export const KEEP_WARM_CODEX_DEFAULT_INTERVAL_SECONDS = 1500;
 export const KEEP_WARM_DEFAULT_MAX_SECONDS = 14400;
-export const KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS = 14400;
+export const KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS = 0;
 
 export const KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_SECONDS = { min: 300, max: 3540 } as const;
 export const KEEP_WARM_CODEX_INTERVAL_BOUNDS_SECONDS = { min: 300, max: 1740 } as const;
@@ -469,11 +469,14 @@ function mirrorKeepWarmPreferences(
   mirrorLegacyChildKeepWarm(legacyChildKeepWarmEnabled);
 }
 
-function persistKeepWarmPreferences(preferences: KeepWarmPreferences): KeepWarmPreferences {
+function persistKeepWarmPreferences(
+  preferences: KeepWarmPreferences,
+  keepDefaults = false,
+): KeepWarmPreferences {
   const normalized = normalizeKeepWarmPreferences(preferences);
-  const isDefault = isKeepWarmPreferencesDefault(normalized);
   try {
-    if (isDefault) window.localStorage.removeItem(KEEP_WARM_STORAGE_KEY);
+    if (!keepDefaults && isKeepWarmPreferencesDefault(normalized))
+      window.localStorage.removeItem(KEEP_WARM_STORAGE_KEY);
     else window.localStorage.setItem(KEEP_WARM_STORAGE_KEY, JSON.stringify(normalized));
   } catch {
     // Storage denial or quota exhaustion must not break the settings page.
@@ -517,8 +520,13 @@ export async function saveKeepWarmPreferences(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw new Error("Save cancelled.");
-  const normalized = persistKeepWarmPreferences(preferences);
-  await queueAcknowledgedUserPreferencePatch("keep_warm", namespaceValue(normalized), signal);
+  // An explicit zero archive delay must survive older servers whose default is four hours.
+  const normalized = persistKeepWarmPreferences(preferences, true);
+  await queueAcknowledgedUserPreferencePatch(
+    "keep_warm",
+    namespaceValue(normalized) ?? normalized,
+    signal,
+  );
   mirrorKeepWarmPreferences(normalized, agentIdentities);
 }
 

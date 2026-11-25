@@ -25,6 +25,8 @@ import type { AnyBlock } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
@@ -166,6 +168,86 @@ describe("ApprovalCard — binary approve/reject", () => {
     view.rerender(<ApprovalCard {...props} />);
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
     expect(screen.getByText(/Only the host owner's/)).toBeVisible();
+    terminalViewer.id = "alice";
+  });
+
+  it("hides approve buttons with a short reason on terminal-access and host-restart cards in single-user mode", () => {
+    const submit = vi.fn();
+    terminalViewer.id = "local";
+    const terminalProps = {
+      elicitationId: "root-access-single-user",
+      message: "Allow agent read_write access to terminal bash:admin?",
+      phase: "tool_call",
+      policyName: "__ask_on_terminal_agent_access",
+      contentPreview: "",
+      requestedSchema: {},
+      status: "pending" as const,
+      response: null,
+      terminalAccess: {
+        owner: "local",
+        terminalId: "terminal_bash_admin",
+        instanceId: "instance-a",
+        hostId: "host-a",
+      },
+      onSubmit: submit,
+    };
+    const restartProps = {
+      elicitationId: "host-restart-single-user",
+      message: "Restart host local-host?",
+      phase: "tool_call",
+      policyName: "__ask_on_host_restart",
+      contentPreview: "",
+      requestedSchema: {},
+      status: "pending" as const,
+      response: null,
+      onSubmit: submit,
+    };
+    const singleUserInfo = {
+      ...FALLBACK_SERVER_INFO,
+      single_user: true,
+      browser_approval_available: false,
+    };
+
+    const view = render(
+      <CapabilitiesProvider info={singleUserInfo}>
+        <ApprovalCard {...terminalProps} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
+    expect(screen.getByText(/accounts sign-in/i)).toBeVisible();
+
+    view.rerender(
+      <CapabilitiesProvider info={singleUserInfo}>
+        <ApprovalCard {...restartProps} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
+
+    for (const info of [
+      {
+        ...singleUserInfo,
+        accounts_enabled: true,
+        login_url: "/login",
+        browser_approval_available: true,
+      },
+      { ...singleUserInfo, login_url: "/auth/login", browser_approval_available: true },
+      { ...singleUserInfo, single_user: false },
+    ]) {
+      for (const props of [restartProps, terminalProps]) {
+        view.rerender(
+          <CapabilitiesProvider info={info}>
+            <ApprovalCard {...props} />
+          </CapabilitiesProvider>,
+        );
+        expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeVisible();
+        expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
+      }
+    }
     terminalViewer.id = "alice";
   });
   it("renders Approve and Reject buttons when requestedSchema has no enum", () => {

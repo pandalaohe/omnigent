@@ -147,3 +147,42 @@ it("keeps remote connections available without a CLI or installer", async () => 
   expect(startLocalServer).not.toHaveBeenCalled();
   expect(installCli).not.toHaveBeenCalled();
 });
+
+it("routes manual install instructions and post-install recovery hints to installDocsUrl when supplied", async () => {
+  const distDocs = "https://github.com/example-org/omnigent-dist/blob/main/docs/install.md";
+  // Windows (installSupported: false) manual instructions point at the distribution guide.
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus: async () => ({
+      installed: false,
+      installSupported: false,
+      installDocsUrl: distDocs,
+    }),
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /get started locally/i }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+  expect(screen.getByRole("link", { name: "Installation instructions" })).toHaveAttribute(
+    "href",
+    distDocs,
+  );
+  cleanup();
+
+  // macOS (installSupported: true) post-install not-detected recovery hint points at the distribution guide.
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus: async () => ({
+      installed: false,
+      installSupported: true,
+      installDocsUrl: distDocs,
+    }),
+    installCli: async () => ({ ok: true, installed: false }),
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /get started locally/i }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+  expect(
+    await screen.findByText(new RegExp(distDocs.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/omnigent\.ai/)).not.toBeInTheDocument();
+});

@@ -44,16 +44,22 @@ function makeUpdater({
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
   getCurrentVersion,
+  externalReleaseRepo = null,
+  fetchFeed,
+  openExternal,
 } = {}) {
   let store = { ...settings };
   const calls = {
     sent: [],
     showMessageBox: [],
     appQuit: 0,
+    checkForUpdates: 0,
     downloadUpdate: 0,
     quitAndInstall: [],
     intervals: [],
     clearedIntervals: 0,
+    openedExternal: [],
+    fetchedUrls: [],
   };
 
   const win = {
@@ -114,6 +120,19 @@ function makeUpdater({
     forceDevUpdateConfig,
     updatesEnabled,
     getCurrentVersion,
+    externalReleaseRepo,
+    fetchFeed: fetchFeed
+      ? (url) => {
+          calls.fetchedUrls.push(url);
+          return fetchFeed(url);
+        }
+      : undefined,
+    openExternal:
+      openExternal ??
+      ((url) => {
+        calls.openedExternal.push(url);
+        return Promise.resolve();
+      }),
   };
 
   const updater = createDesktopUpdater(deps);
@@ -479,5 +498,433 @@ describe("desktop_updater — install handoff", () => {
     // Nothing pending → the before-quit handoff is a no-op.
     assert.equal(h.updater.quitAndInstallIfPending(), false);
     assert.deepEqual(h.calls.quitAndInstall, []);
+  });
+});
+
+function atomFeed(tags, repo = "example-org/omnigent-dist") {
+  const entries = tags
+    .map(
+      (tag) =>
+        `<entry><id>tag:github.com,2008:Repository/1/${tag}</id>` +
+        `<link rel="alternate" type="text/html" href="https://github.com/${repo}/releases/tag/${tag}"/>` +
+        `<title>omnigent-dist ${tag}</title></entry>`,
+    )
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">${entries}</feed>`;
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe("desktop_updater — external release feed mode (unsigned mac build)", () => {
+  it("parses and compares -wukong.N versions exactly (including BigInt neighbours) and ignores non-wukong suffixes", () => {
+    const {
+      isNewerDistributionVersion,
+      parseDistributionVersion,
+      parseReleasesAtom,
+      normalizeExternalReleaseRepo,
+      parseExpectedReleaseTagUrl,
+    } = require("../src/desktop_updater");
+
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.10", "0.21.0-wukong.9"), true);
+    assert.equal(isNewerDistributionVersion("0.22.0-wukong.13", "0.21.0-wukong.12"), true);
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.12", "0.21.0-wukong.12"), false);
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.11", "0.21.0-wukong.12"), false);
+    // Exact BigInt comparison beyond Number.MAX_SAFE_INTEGER (9007199254740991).
+    assert.equal(
+      isNewerDistributionVersion(
+        "0.21.0-wukong.9007199254740993",
+        "0.21.0-wukong.9007199254740992",
+      ),
+      true,
+    );
+    assert.equal(
+      isNewerDistributionVersion(
+        "0.21.0-wukong.9007199254740992",
+        "0.21.0-wukong.9007199254740993",
+      ),
+      false,
+    );
+    assert.equal(
+      isNewerDistributionVersion(
+        "0.21.0-wukong.9007199254740992",
+        "0.21.0-wukong.9007199254740992",
+      ),
+      false,
+    );
+    // Oversized (>64 digits) and other pre-release suffixes are rejected.
+    assert.equal(parseDistributionVersion(`0.21.0-wukong.${"9".repeat(65)}`), null);
+    for (const bad of [
+      "0.99.0",
+      "0.21.0-rc.1",
+      "0.21.0-beta.2",
+      "0.21.0-alpha.1",
+      "0.21.0-wukong.12-rc.1",
+      "0.21.0-wukong.12+build.1",
+      "0.21.0.dev0",
+    ]) {
+      assert.equal(isNewerDistributionVersion(bad, "0.21.0-wukong.12"), false);
+    }
+
+    // Repo validation rejects dot segments and malformed values.
+    assert.equal(
+      normalizeExternalReleaseRepo("example-org/omnigent-dist"),
+      "example-org/omnigent-dist",
+    );
+    for (const badRepo of ["../evil", "./repo", "owner/..", "owner/.", "a/b/c", "noslash", ""]) {
+      assert.equal(normalizeExternalReleaseRepo(badRepo), null);
+      assert.throws(() => parseReleasesAtom(atomFeed([]), badRepo));
+    }
+
+    // Strict release URL validation rejects foreign repos, credentials, ports, query, fragment, dot segments, encoded separators.
+    for (const badUrl of [
+      "https://github.com/other-org/other-repo/releases/tag/v0.22.0-wukong.99",
+      "https://evil.example/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "http://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "https://user:pass@github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "https://github.com:443/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "https://github.com:8443/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99?foo=1",
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99#frag",
+      "https://github.com/other/repo/../../example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99",
+      "https://github.com/example-org/omnigent-dist/releases/tag/./v0.22.0-wukong.99",
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99%2fextra",
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.99%5cextra",
+    ]) {
+      assert.equal(parseExpectedReleaseTagUrl(badUrl, "example-org/omnigent-dist"), null, badUrl);
+    }
+
+    // Foreign-repo same-format entry, ID-only entry, non-alternate link, and oversized entry are skipped one by one.
+    const mixedFeed =
+      '<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">' +
+      "<entry><id>tag:github.com,2008:Repository/1/v9.9.9-wukong.99</id>" +
+      '<link rel="alternate" href="https://github.com/foreign-org/foreign-repo/releases/tag/v9.9.9-wukong.99"/></entry>' +
+      "<entry><id>tag:github.com,2008:Repository/1/v8.8.8-wukong.88</id></entry>" +
+      '<entry><link rel="related" href="https://github.com/example-org/omnigent-dist/releases/tag/v7.7.7-wukong.77"/></entry>' +
+      `<entry><link rel="alternate" href="https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.${"9".repeat(70)}"/></entry>` +
+      '<entry><link rel="alternate" href="https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.9"/></entry>' +
+      '<entry><link rel="alternate" href="https://github.com/example-org/omnigent-dist/releases/tag/v0.99.0"/></entry>' +
+      '<entry><link rel="alternate" href="https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.13"/></entry>' +
+      "</feed>";
+    const parsed = parseReleasesAtom(mixedFeed, "example-org/omnigent-dist");
+    assert.deepEqual(parsed, {
+      version: "0.22.0-wukong.13",
+      tag: "v0.22.0-wukong.13",
+      releaseUrl: "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.13",
+    });
+
+    // Corrupt XML or non-Atom documents throw so callers treat them as errors.
+    for (const corrupt of [
+      "",
+      "<html><body>Not an Atom feed</body></html>",
+      '<?xml version="1.0"?><feed><entry><link href="https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.13"/>',
+      '<?xml version="1.0"?><feed><entry></feed>',
+      '<?xml version="1.0"?><!DOCTYPE feed><feed/>',
+      '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><link href="a" href="b"/></entry></feed>',
+    ]) {
+      assert.throws(() => parseReleasesAtom(corrupt, "example-org/omnigent-dist"), corrupt);
+    }
+  });
+
+  it("exposes stable deliveryMode='manual-download' in getConfig only for external mode", () => {
+    const ext = makeUpdater({
+      isPackaged: true,
+      externalReleaseRepo: "example-org/omnigent-dist",
+    });
+    assert.equal(ext.updater.getConfig().deliveryMode, "manual-download");
+
+    const legacy = makeUpdater({ isPackaged: true });
+    assert.equal(legacy.updater.getConfig().deliveryMode, undefined);
+  });
+
+  it("announces a newer release with a download URL and opens it without calling autoUpdater", async () => {
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => ({
+        status: 200,
+        text: atomFeed(["v0.21.0-wukong.12", "v0.21.0-wukong.13"]),
+      }),
+    });
+    h.updater.init();
+    await h.updater.checkForUpdates({ manual: true });
+
+    assert.deepEqual(h.calls.fetchedUrls, [
+      "https://github.com/example-org/omnigent-dist/releases.atom",
+    ]);
+    assert.equal(h.calls.checkForUpdates, 0);
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "available",
+      currentVersion: "0.21.0-wukong.12",
+      info: {
+        version: "0.21.0-wukong.13",
+        downloadUrl: "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+      },
+    });
+
+    await h.updater.downloadUpdate();
+    assert.equal(h.calls.downloadUpdate, 0);
+    assert.deepEqual(h.calls.openedExternal, [
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+    ]);
+    assert.equal(h.updater.installUpdateNow(), false);
+    assert.equal(h.updater.quitAndInstallIfPending(), false);
+    assert.deepEqual(h.calls.quitAndInstall, []);
+  });
+
+  it("re-checks the normalised release URL right before openExternal", async () => {
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => ({
+        status: 200,
+        text: atomFeed(["v0.21.0-wukong.13"]),
+      }),
+    });
+    h.updater.init();
+    await h.updater.checkForUpdates({ manual: true });
+    // Tamper the cached downloadUrl with query/dot-segments before downloadUpdate().
+    h.updater.getStatus().info.downloadUrl =
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13?evil=1";
+    await assert.rejects(h.updater.downloadUpdate(), /No release download link/);
+    assert.deepEqual(h.calls.openedExternal, []);
+  });
+
+  it("refuses redirects to another origin or repo and treats corrupt XML as an error", async () => {
+    const responses = [
+      { status: 302, text: "" },
+      {
+        status: 200,
+        url: "https://github.com/other-org/other-repo/releases.atom",
+        text: atomFeed(["v0.21.0-wukong.99"]),
+      },
+      { status: 200, text: "<html>broken</html>" },
+      { status: 200, text: '<?xml version="1.0"?><feed><entry>' },
+    ];
+    await Promise.all(
+      responses.map(async (response) => {
+        const h = makeUpdater({
+          isPackaged: true,
+          settings: { update_mode: "manual" },
+          getCurrentVersion: () => "0.21.0-wukong.12",
+          externalReleaseRepo: "example-org/omnigent-dist",
+          fetchFeed: async () => response,
+        });
+        h.updater.init();
+
+        await h.updater.checkForUpdates({ manual: false });
+        assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+
+        await h.updater.checkForUpdates({ manual: true });
+        assert.deepEqual(plain(h.updater.getStatus()), {
+          state: "idle",
+          manualOnly: true,
+          lastError: "Couldn't check for updates.",
+        });
+      }),
+    );
+  });
+
+  it("defaultFetchFeed refuses HTTP 302 redirects to another origin or repo", async (t) => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 302,
+      headers: {
+        get: (k) =>
+          k.toLowerCase() === "location" ? "https://github.com/evil/repo/releases.atom" : null,
+      },
+      text: async () => "",
+    });
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: undefined,
+    });
+    h.updater.init();
+    await h.updater.checkForUpdates({ manual: true });
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "idle",
+      manualOnly: true,
+      lastError: "Couldn't check for updates.",
+    });
+  });
+
+  it("stays silent on background up-to-date/empty/404 and reports up-to-date on manual check", async () => {
+    const cases = [
+      { status: 404, text: "Not Found" },
+      { status: 200, text: atomFeed([]) },
+      { status: 200, text: atomFeed(["v0.21.0-wukong.12"]) },
+    ];
+    await Promise.all(
+      cases.map(async (response) => {
+        const h = makeUpdater({
+          isPackaged: true,
+          settings: { update_mode: "manual" },
+          getCurrentVersion: () => "0.21.0-wukong.12",
+          externalReleaseRepo: "example-org/omnigent-dist",
+          fetchFeed: async () => response,
+        });
+        h.updater.init();
+
+        await h.updater.checkForUpdates({ manual: false });
+        assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+
+        await h.updater.checkForUpdates({ manual: true });
+        assert.deepEqual(plain(h.updater.getStatus()), { state: "none", manualOnly: true });
+        assert.equal(h.calls.showMessageBox.length, 0);
+      }),
+    );
+  });
+
+  it("shares one in-flight external check across startup and manual calls (both join orders) and protects manual feedback", async () => {
+    // Order 1: startup background check in flight -> manual joins -> resolves with 404 -> manual gets up-to-date.
+    const d1 = deferred();
+    let fetchCount1 = 0;
+    const h1 = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: () => {
+        fetchCount1 += 1;
+        return d1.promise;
+      },
+    });
+    h1.updater.init();
+    const bg1 = h1.updater.checkForUpdates({ manual: false });
+    assert.equal(h1.updater.getStatus().state, "idle");
+    const man1 = h1.updater.checkForUpdates({ manual: true });
+    assert.equal(h1.updater.getStatus().state, "checking");
+    assert.equal(fetchCount1, 1);
+    d1.resolve({ status: 404, text: "Not Found" });
+    await Promise.all([bg1, man1]);
+    assert.deepEqual(plain(h1.updater.getStatus()), { state: "none", manualOnly: true });
+
+    // Order 2: startup background check in flight -> manual joins -> rejects -> manual gets inline error.
+    const d2 = deferred();
+    let fetchCount2 = 0;
+    const h2 = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: () => {
+        fetchCount2 += 1;
+        return d2.promise;
+      },
+    });
+    h2.updater.init();
+    const bg2 = h2.updater.checkForUpdates({ manual: false });
+    const man2 = h2.updater.checkForUpdates({ manual: true });
+    assert.equal(fetchCount2, 1);
+    d2.reject(new Error("ENOTFOUND github.com"));
+    await Promise.all([bg2, man2]);
+    assert.deepEqual(plain(h2.updater.getStatus()), {
+      state: "idle",
+      manualOnly: true,
+      lastError: "Couldn't check for updates.",
+    });
+
+    // Order 3: manual check starts first -> background joins -> resolves with empty -> manual still gets manual result.
+    const d3 = deferred();
+    let fetchCount3 = 0;
+    const h3 = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: () => {
+        fetchCount3 += 1;
+        return d3.promise;
+      },
+    });
+    h3.updater.init();
+    const man3 = h3.updater.checkForUpdates({ manual: true });
+    const bg3 = h3.updater.checkForUpdates({ manual: false });
+    const man3Dup = h3.updater.checkForUpdates({ manual: true });
+    assert.equal(fetchCount3, 1);
+    d3.resolve({ status: 200, text: atomFeed(["v0.21.0-wukong.12"]) });
+    await Promise.all([man3, bg3, man3Dup]);
+    assert.deepEqual(plain(h3.updater.getStatus()), { state: "none", manualOnly: true });
+
+    // Order 4: manual completes first (available / up-to-date / error), then later background 404/error NEVER overwrites it.
+    let nextResp = { status: 200, text: atomFeed(["v0.21.0-wukong.13"]) };
+    let nextErrorMessage = null;
+    const h4 = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => {
+        if (nextErrorMessage) throw new Error(nextErrorMessage);
+        return nextResp;
+      },
+    });
+    h4.updater.init();
+    await h4.updater.checkForUpdates({ manual: true });
+    const availableSnap = plain(h4.updater.getStatus());
+    assert.equal(availableSnap.state, "available");
+
+    nextResp = { status: 404, text: "Not Found" };
+    await h4.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h4.updater.getStatus()), availableSnap);
+
+    nextErrorMessage = "transient network error";
+    await h4.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h4.updater.getStatus()), availableSnap);
+
+    // Manual up-to-date is also preserved across later background 404/error.
+    nextErrorMessage = null;
+    nextResp = { status: 200, text: atomFeed(["v0.21.0-wukong.12"]) };
+    await h4.updater.checkForUpdates({ manual: true });
+    assert.deepEqual(plain(h4.updater.getStatus()), { state: "none", manualOnly: true });
+    nextResp = { status: 404, text: "Not Found" };
+    await h4.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h4.updater.getStatus()), { state: "none", manualOnly: true });
+    nextErrorMessage = "offline";
+    await h4.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h4.updater.getStatus()), { state: "none", manualOnly: true });
+  });
+
+  it("stays silent on background network error and reports a plain message on manual check", async () => {
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => {
+        throw new Error("ENOTFOUND github.com");
+      },
+    });
+    h.updater.init();
+
+    await h.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+    assert.equal(h.calls.showMessageBox.length, 0);
+
+    await h.updater.checkForUpdates({ manual: true });
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "idle",
+      manualOnly: true,
+      lastError: "Couldn't check for updates.",
+    });
+    assert.equal(h.calls.showMessageBox.length, 0);
   });
 });

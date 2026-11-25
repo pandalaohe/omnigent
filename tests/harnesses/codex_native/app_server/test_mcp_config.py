@@ -82,7 +82,7 @@ args = []
     assert parsed["mcp_servers"]["other"]["command"] == "other"
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
-        "tool_timeout_sec": 330,
+        "tool_timeout_sec": 1110,
         "args": [
             "-I",
             "-m",
@@ -429,6 +429,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
     without cosmetic leading whitespace from the generated section
     separator logic.
     """
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+    from omnigent.runner import session_projects
+
     real_codex_home = tmp_path / "real-codex-home"
     real_codex_home.mkdir()
     codex_home = tmp_path / "codex-home"
@@ -448,9 +451,15 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
         assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
         assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
+    assert (
+        2 * session_projects._UPDATE_PREFLIGHT_TIMEOUT_S
+        + session_projects._SETTINGS_PATCH_TIMEOUT_S
+        < claude_native_bridge._SESSION_UPDATE_TOOL_CALL_TIMEOUT_S
+        < parsed["mcp_servers"]["omnigent"]["tool_timeout_sec"]
+    )
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
-        "tool_timeout_sec": 330,
+        "tool_timeout_sec": 1110,
         "args": [
             "-I",
             "-m",

@@ -20,7 +20,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import routing_host_id
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import AuthProvider
-from omnigent.server.browser_approval import require_owner_browser_approval
+from omnigent.server.browser_approval import (
+    BROWSER_APPROVAL_UNAVAILABLE_REASON,
+    is_single_user_without_browser_approval,
+    require_owner_browser_approval,
+)
 from omnigent.server.host_registry import HostConnection
 from omnigent.stores import ConversationStore
 
@@ -175,6 +179,10 @@ async def terminal_access_card_fields(
     """Validate and reserve before either policy path publishes an ASK card."""
     if tool_name is None or tool_name.removeprefix("mcp__omnigent__") != TERMINAL_ACCESS_TOOL:
         return {}
+    from omnigent.server.routes._sessions.common import get_server_auth_provider
+
+    if is_single_user_without_browser_approval(get_server_auth_provider()):
+        raise OmnigentError(BROWSER_APPROVAL_UNAVAILABLE_REASON, code=ErrorCode.FORBIDDEN)
     if store is None or not isinstance(tool_input, dict):
         raise OmnigentError("Terminal access approval is unavailable", code=ErrorCode.CONFLICT)
     if any(

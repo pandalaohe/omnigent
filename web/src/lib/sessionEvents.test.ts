@@ -1583,6 +1583,18 @@ describe("session.model (FLAT envelope)", () => {
     expect(ev.type).toBe("session_model");
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.model).toBe("opus");
+    expect(ev.reported).toBeUndefined();
+  });
+
+  it("carries reported=true only when explicitly marked by the server", () => {
+    const events = parse("session.model", {
+      conversation_id: "conv_abc",
+      model: "claude-opus-4-8",
+      reported: true,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionModelEvent;
+    expect(ev.reported).toBe(true);
   });
 
   it("rejects missing model", () => {
@@ -1591,6 +1603,26 @@ describe("session.model (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.model", { model: "opus" })).toEqual([]);
+  });
+});
+
+describe("session.launched_model (FLAT envelope)", () => {
+  it("lifts conversation_id and launched model (including null clear)", () => {
+    const setEvents = parse("session.launched_model", {
+      conversation_id: "conv_abc",
+      launched: "gpt-6.2-sol",
+    });
+    expect(setEvents).toEqual([
+      { type: "session_launched_model", conversationId: "conv_abc", launched: "gpt-6.2-sol" },
+    ]);
+
+    const clearEvents = parse("session.launched_model", {
+      conversation_id: "conv_abc",
+      launched: null,
+    });
+    expect(clearEvents).toEqual([
+      { type: "session_launched_model", conversationId: "conv_abc", launched: null },
+    ]);
   });
 });
 

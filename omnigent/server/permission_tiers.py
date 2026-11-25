@@ -6,15 +6,23 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.permission_tiers import (
     AGY_PERMISSION_TIER_LABEL_KEY,
     DEFAULT_PERMISSION_TIER,
+    NON_FULL_TIERS,
     PI_PERMISSION_TIER_LABEL_KEY,
     PermissionTier,
     normalize_permission_tier,
 )
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+if TYPE_CHECKING:
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.spec.types import AgentSpec
 
 PERMISSION_STATE_LABEL_KEY = "omnigent.permission_tier.state"
 PERMISSION_MIGRATION_LABEL_KEY = "omnigent.permission_tier.migrated_from"
@@ -26,16 +34,63 @@ PERMISSION_PROTOCOL_VERSION = "1"
 # Sent only on a server-to-runner inspection after catalog and selection checks.
 REGISTRY_TOOL_INSPECTION_HEADER = "X-Omnigent-Registry-Tool-Inspection"
 TIER_HARNESSES = frozenset({"pi", "pi-native", "antigravity-native"})
+ACP_PERMISSION_TIER_LABEL_KEY = "omnigent.acp.permission_tier"
 PERMISSION_LABEL_KEYS = frozenset(
     {
         PI_PERMISSION_TIER_LABEL_KEY,
         AGY_PERMISSION_TIER_LABEL_KEY,
+        ACP_PERMISSION_TIER_LABEL_KEY,
         PERMISSION_STATE_LABEL_KEY,
         PERMISSION_MIGRATION_LABEL_KEY,
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_RUNTIME_ID_LABEL_KEY,
     }
 )
+
+
+def is_acp_permission_harness(harness: str | None) -> bool:
+    return harness is not None and (harness == "acp" or harness.startswith("acp:"))
+
+
+def configured_acp_default_tier(
+    registry: HostRegistry | None, host_id: str | None, harness: str | None
+) -> str | None:
+    if registry is None or not host_id or not is_acp_permission_harness(harness):
+        return None
+    connection = registry.get(host_id)
+    if connection is None:
+        return None
+    tiers = getattr(connection.hello, "acp_permission_tiers", None) or {}
+    tier = tiers.get(harness)
+    return tier if tier in NON_FULL_TIERS else None
+
+
+def supports_delegated_acp_tier(
+    registry: HostRegistry | None, host_id: str | None, harness: str | None, spec: AgentSpec | None
+) -> bool:
+    """Default to managed tiers only for ACP launches with a known tool schema."""
+    from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+
+    config = spec.executor.config if spec is not None else {}
+    if "acp_agent" in config:
+        embedded = config["acp_agent"]
+        command = embedded.get("command") if isinstance(embedded, dict) else None
+        return isinstance(command, str) and is_antigravity_acp_command(command)
+    if registry is None or not host_id or harness is None:
+        return False
+    connection = registry.get(host_id)
+    return connection is not None and (
+        CAP_AGY_ACP_PERMISSIONS_PREFIX + harness in connection.hello.capabilities
+    )
+
+
+def permission_tier_active(harness: str | None, labels: Mapping[str, str]) -> bool:
+    """ACP opts into managed tiers; existing managed harnesses always require them."""
+    return harness in TIER_HARNESSES or (
+        is_acp_permission_harness(harness)
+        and (ACP_PERMISSION_TIER_LABEL_KEY in labels or PERMISSION_STATE_LABEL_KEY in labels)
+    )
 
 
 def is_permission_label_key(key: str) -> bool:
@@ -66,6 +121,8 @@ def tier_label_key(harness: str) -> str:
         return AGY_PERMISSION_TIER_LABEL_KEY
     if harness in {"pi", "pi-native"}:
         return PI_PERMISSION_TIER_LABEL_KEY
+    if is_acp_permission_harness(harness):
+        return ACP_PERMISSION_TIER_LABEL_KEY
     raise ValueError(f"Harness does not support permission tiers: {harness}")
 
 
@@ -154,16 +211,26 @@ def creation_permission_tier(
     explicit: object = None,
     default: object = None,
     inherited: PermissionTier | None = None,
+    ceiling: PermissionTier | None = None,
 ) -> PermissionTier:
     """Honor explicit selections and saved defaults without copying full authority."""
     tier_label_key(harness)
     if explicit is not None:
         try:
-            return normalize_permission_tier(explicit, harness=harness, legacy=True)
+            selected = normalize_permission_tier(explicit, harness=harness, legacy=True)
         except ValueError as exc:
-            from omnigent.errors import ErrorCode, OmnigentError
-
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        # Auto denies some edits outright that accept-edits would run without a card.
+        if (
+            ceiling not in (None, "full", selected)
+            and selected != "plan"
+            and not (selected == "ask" and ceiling in ("accept-edits", "auto"))
+        ):
+            raise OmnigentError(
+                "A child session cannot exceed its creator's permission tier",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return selected
     if inherited is not None:
         return DEFAULT_PERMISSION_TIER if inherited == "full" else inherited
     if default is None:
@@ -181,6 +248,38 @@ def legacy_permission_tier(
     if harness == "antigravity-native" and "--dangerously-skip-permissions" in launch_args:
         return "full"
     return "ask"
+
+
+def agent_originated_create(headers: Mapping[str, str]) -> bool:
+    """Recognize the runner's create paths without treating a UI fork as delegated."""
+    return (
+        headers.get(CREATE_ORIGIN_HEADER, "").strip().lower() == CREATE_ORIGIN_AGENT
+        or RUNNER_TUNNEL_TOKEN_HEADER in headers
+        or ORCHESTRATION_SOURCE_HEADER in headers
+    )
+
+
+def source_permission_tier(
+    harness: str | None,
+    labels: Mapping[str, str],
+    launch_args: Sequence[str],
+    *,
+    require_ready: bool = False,
+) -> PermissionTier | None:
+    """Read the source's tier in its own harness, including legacy sessions."""
+    if harness is None or not permission_tier_active(harness, labels):
+        return None
+    try:
+        if require_ready and PERMISSION_STATE_LABEL_KEY in labels:
+            state = read_permission_state(labels, harness=harness)
+            if state.status != "ready":
+                raise ValueError("Source runtime permission state is not ready")
+            return state.tier
+        return legacy_permission_tier(harness=harness, labels=labels, launch_args=launch_args)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"Source permission tier requires recovery: {exc}", code=ErrorCode.INVALID_INPUT
+        ) from exc
 
 
 @dataclass(frozen=True)

@@ -1126,8 +1126,9 @@ export function TerminalView({
         onClose={() => setCopySheet(null)}
       />
       <TerminalPasteBox
-        open={terminalPaste.showPasteBox}
+        text={terminalPaste.pasteBoxText}
         enabled={state.kind === "connected" && !readOnly}
+        onChange={terminalPaste.setPasteBoxText}
         onSend={terminalPaste.pasteFromBox}
         onClose={() => cancelPaste()}
       />

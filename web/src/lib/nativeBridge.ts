@@ -635,16 +635,21 @@ export interface GlobalShortcutStatus extends GlobalShortcutSetting {
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
+export type UpdateDeliveryMode = "auto" | "manual-download";
 
 export interface UpdateConfig {
   mode: UpdateMode;
   autoInstall: boolean;
   skippedVersion: string | null;
+  /** How updates are delivered; `"manual-download"` opens a release page instead of self-installing. */
+  deliveryMode?: UpdateDeliveryMode;
 }
 
 export type UpdateStatus = {
   /** Installed Electron app version; absent on older desktop shells. */
   currentVersion?: string;
+  /** True when the desktop build opens a release download link instead of self-updating. */
+  manualOnly?: boolean;
 } & (
   | {
       state: "idle" | "checking" | "none";
@@ -654,7 +659,7 @@ export type UpdateStatus = {
     }
   | {
       state: "available" | "downloaded";
-      info?: { version: string; releaseNotes?: string };
+      info?: { version: string; releaseNotes?: string; downloadUrl?: string };
       progress?: undefined;
       lastError?: string;
     }

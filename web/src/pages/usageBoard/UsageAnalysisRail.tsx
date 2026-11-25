@@ -24,6 +24,7 @@ export const analysisSections = {
   cumulative: "Cumulative",
   compare: "Compare with last period",
   items: "Each item",
+  records: "Usage records",
   hosts: "Hosts",
   shares: "Token and cost share",
   composition: "Composition",

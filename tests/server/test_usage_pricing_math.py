@@ -640,13 +640,14 @@ def test_recorded_gateway_range_and_native_old_ref_survive_import_changes(monkey
     result = value_usage(sample, PricingBaseline())["api_value"]
     assert (result.state, result.low, result.high) == ("range", "10", "12")
     assert result.price_sources[0].version == "v1"
+    assert result.price_sources[0].name == "gateway list"
     sample.rows[0].price_estimate = None
     sample.rows[0].account_id = "native:codex"
     sample.rows[0].basis = "subscription"
     sample.rows[0].coverage = None
     result = value_usage(sample, PricingBaseline())["api_value"]
     assert result.low == "999"
-    assert result.price_sources[0].name == "记录时估价，来源未记录"
+    assert result.price_sources[0].name == "Recorded estimate, source not recorded"
 
 
 @pytest.mark.parametrize("with_card", [False, True])

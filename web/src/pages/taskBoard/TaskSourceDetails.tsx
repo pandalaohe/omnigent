@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Copy, Check, FileText } from "lucide-react";
-import { boardFiles } from "./taskBoardVisual";
+import { boardFiles, isFileDetailRow } from "./taskBoardVisual";
 import type { TaskDisplay } from "./taskBoardDisplay";
 import { safeSourceLink } from "./taskBoardData";
 import { t, formatDate } from "./taskBoardText";
@@ -35,7 +35,7 @@ export function TaskSourceDetails({
     display?.rows?.filter(
       (row) =>
         !isBlankDetailValue(row.value) &&
-        !/^path(?:[._-]|$)/.test(row.id) &&
+        !isFileDetailRow(row) &&
         row.id !== "event_age" &&
         !(
           row.id === "parent" &&
@@ -105,7 +105,7 @@ export function TaskSourceDetails({
           {rows.map((row) => (
             <div key={row.id} className="min-w-0">
               <dt className="text-xs text-muted-foreground">{row.label}</dt>
-              <dd className={row.id === "task_id" ? "tb-source-id" : undefined}>
+              <dd className={row.monospace ? "tb-source-monospace" : undefined}>
                 <TaskBoardFoldText
                   key={row.value}
                   value={row.value.replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, (value) =>
@@ -185,7 +185,9 @@ function FilePath({ file }: { file: ReturnType<typeof boardFiles>[number] }) {
       <FileText size={13} />
       <span className="tb-file-kind">{file.kind}</span>
       <span className="tb-file-name">{file.name}</span>
-      {file.old ? <small>{file.version}</small> : file.showExt ? <small>{file.ext}</small> : null}
+      {file.old
+        ? file.version && <small>{file.version}</small>
+        : file.showExt && <small>{file.ext}</small>}
       {result === "copied" ? <Check size={13} /> : <Copy size={13} />}
       <span role="status">
         {t(

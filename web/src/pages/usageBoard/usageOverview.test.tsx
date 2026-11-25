@@ -63,7 +63,7 @@ it.each(["", "?account=codex"])(
   async (query) => {
     const { container } = mountOverview(query);
     await screen.findByTestId("usage-overview");
-    for (const label of ["Quota", "Cost", "Card pricing", "Used in", "Hosts", "事件记录"])
+    for (const label of ["Quota", "Cost", "Card pricing", "Used in", "Hosts", "Event history"])
       expect(screen.getByRole("heading", { name: label })).toBeTruthy();
     expect(container.querySelector(".usage-tiles, .usage-strip")).toBeNull();
     const cells = screen.getByRole("group", { name: "Cost time range" });

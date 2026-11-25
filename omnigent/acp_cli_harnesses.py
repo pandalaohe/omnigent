@@ -40,8 +40,22 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 
 from omnigent.harness_install_spec import HarnessInstallSpec
+
+
+def is_antigravity_acp_command(command: str) -> bool:
+    """Recognize the direct launch whose tool calls use Antigravity's schema."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    return (
+        len(argv) >= 2
+        and PureWindowsPath(argv[0]).name.lower() in {"agy", "agy.exe"}
+        and argv[1] == "acp"
+    )
 
 
 @dataclass(frozen=True)

@@ -67,6 +67,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     AGY_SWITCH_STEP_TIMEOUT_S,
     resolve_agy_permission_tier,
 )
+from omnigent.harnesses.antigravity_native.launch import AGY_RUNNER_INIT_TIMEOUT_S
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -510,6 +511,46 @@ def _runner_reply_field(body: str, key: str) -> object:
     except ValueError:
         return None
     return result.get(key) if isinstance(result, dict) else None
+
+
+def _native_model_change_confirmed(
+    forward_result: _RunnerForwardResult | None,
+    *,
+    model_override: str | None,
+    clear_model: bool,
+    codex_native: bool,
+    agy_native: bool,
+    unconfirmed: bool,
+    unsupported: str | None,
+    forward_failed: bool,
+) -> bool:
+    """Whether a native live ``model_change`` forward genuinely confirmed applying a model.
+
+    Excludes Antigravity (launch requests only), no-op clears, deferred/queued
+    202/204 responses (such as Pi bridge enqueue or Claude busy-turn deferral),
+    and unconfirmed/failed forwards.
+    """
+    if (
+        agy_native
+        or clear_model
+        or not isinstance(model_override, str)
+        or not model_override.strip()
+        or unconfirmed
+        or unsupported is not None
+        or forward_failed
+        or forward_result is None
+        or not (200 <= forward_result.status_code < 300)
+    ):
+        return False
+    if _runner_reply_field(forward_result.body, "deferred") is True:
+        return False
+    if (
+        forward_result.model_applied
+        or _runner_reply_field(forward_result.body, "model_applied") is True
+    ):
+        return True
+    del codex_native
+    return False
 
 
 async def _restore_refused_settings(
@@ -3456,6 +3497,7 @@ def register_core_routes(
         )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            session_creation_source_tier,
             validate_session_model_metadata,
         )
 
@@ -3477,12 +3519,21 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=True,
         )
-        from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+        from omnigent.server.permission_tiers import (
+            TIER_HARNESSES,
+            agent_originated_create,
+            configured_acp_default_tier,
+            creation_permission_tier,
+            is_acp_permission_harness,
+            require_permission_protocol,
+            supports_delegated_acp_tier,
+        )
 
         require_permission_protocol(request, harness=spec.executor.harness_kind)
         if (
             parsed_metadata.permission_tier is not None
             and spec.executor.harness_kind not in TIER_HARNESSES
+            and not is_acp_permission_harness(spec.executor.harness_kind)
         ):
             raise OmnigentError(
                 "permission_tier is only supported by Pi and Antigravity sessions",
@@ -3864,33 +3915,28 @@ def register_core_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
         )
         bundle_harness = spec_harness(spec)
-        if bundle_harness in TIER_HARNESSES:
-            assert bundle_harness is not None
-            from omnigent.server.permission_tiers import (
-                creation_permission_tier,
-                legacy_permission_tier,
+        agent_create = agent_originated_create(request.headers)
+        acp_tier_enabled = False
+        default_tier = project_resolution.permission
+        if is_acp_permission_harness(bundle_harness):
+            host_registry = getattr(request.app.state, "host_registry", None)
+            permission_host_id = parsed_metadata.host_id or (
+                effective_host_id(conversation_store, parent_conv) if parent_conv else None
             )
-
-            inherited_tier = None
-            if parent_conv is not None:
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=bundle_harness,
-                        labels=parent_conv.labels or {},
-                        launch_args=parent_conv.terminal_launch_args or [],
+            default_tier = configured_acp_default_tier(
+                host_registry, permission_host_id, bundle_harness
+            )
+            acp_tier_enabled = (
+                parsed_metadata.permission_tier is not None
+                or default_tier is not None
+                or (
+                    agent_create
+                    and supports_delegated_acp_tier(
+                        host_registry, permission_host_id, bundle_harness, spec
                     )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Parent permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
-            tier = creation_permission_tier(
-                harness=bundle_harness,
-                explicit=parsed_metadata.permission_tier,
-                default=project_resolution.permission,
-                inherited=inherited_tier,
+                )
             )
-            parsed_metadata = parsed_metadata.model_copy(update={"permission_tier": tier})
+            require_permission_protocol(request, harness=bundle_harness, required=acp_tier_enabled)
         if (
             getattr(request.app.state, "startup_admission", None) is not None
             and parsed_metadata.host_id is not None
@@ -4008,12 +4054,37 @@ def register_core_routes(
                                 }
                             )
                 with creation_stage("create_persistence_ms"):
+                    metadata = parsed_metadata
+                    if bundle_harness in TIER_HARNESSES or acp_tier_enabled:
+                        assert bundle_harness is not None
+                        source = parent_conv
+                        if source is not None and agent_create:
+                            source = await asyncio.to_thread(
+                                conversation_store.get_conversation, source.id
+                            )
+                            if source is None:
+                                raise _session_not_found()
+                        inherited_tier = (
+                            await session_creation_source_tier(
+                                request, source, require_ready=agent_create
+                            )
+                            if source is not None
+                            else None
+                        )
+                        tier = creation_permission_tier(
+                            harness=bundle_harness,
+                            explicit=metadata.permission_tier,
+                            default=default_tier,
+                            inherited=inherited_tier,
+                            ceiling=inherited_tier if agent_create else None,
+                        )
+                        metadata = metadata.model_copy(update={"permission_tier": tier})
                     result = await complete_child_write(
                         asyncio.to_thread(
                             _create_session_from_bundle,
                             conversation_store,
                             artifact_store,
-                            parsed_metadata,
+                            metadata,
                             bundle_bytes,
                             inherited_runner_id,
                             spec,
@@ -6170,6 +6241,8 @@ def register_core_routes(
             ) from exc
         # The terminal already launched its fallback. This only retires metadata;
         # forwarding another model change could undo a concurrent live selection.
+        # Winning compare-and-clear also clears session-level model-resolution
+        # notes atomically inside the same store transaction.
         reset = await asyncio.to_thread(
             conversation_store.clear_model_override_if_matches,
             session_id,
@@ -6359,6 +6432,20 @@ def register_core_routes(
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = labels_to_set.pop(
                 scalar_keys[0]
             )
+        from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+        launched_keys = [
+            key
+            for key in labels_to_set
+            if _may_collate_to(key, LAUNCHED_MODEL_LABEL, prefix=False)
+        ]
+        if len(launched_keys) > 1:
+            raise OmnigentError(
+                "labels contains duplicate launched model keys",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if launched_keys:
+            labels_to_set[LAUNCHED_MODEL_LABEL] = labels_to_set.pop(launched_keys[0])
         from omnigent.server.session_collab import (
             AGENT_SESSION_HEADER,
             require_session_action_allowed,
@@ -6411,7 +6498,11 @@ def register_core_routes(
                     getattr(request.app.state, "user_preferences_store", None),
                     action="unarchive",
                 )
-        from omnigent.server.permission_tiers import require_permission_protocol
+        from omnigent.server.permission_tiers import (
+            is_acp_permission_harness,
+            permission_tier_active,
+            require_permission_protocol,
+        )
 
         conv_for_protocol = await asyncio.to_thread(
             conversation_store.get_conversation, session_id
@@ -6423,15 +6514,14 @@ def register_core_routes(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
             )
+            managed_tier = permission_tier_active(effective_harness, conv_for_protocol.labels)
             require_permission_protocol(
                 request,
                 harness=effective_harness,
+                required=managed_tier,
             )
-            if body.permission_mode is not None and effective_harness in {
-                "pi",
-                "pi-native",
-                "antigravity-native",
-            }:
+            if managed_tier and body.permission_mode is not None:
+                assert effective_harness is not None
                 from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
                 from omnigent.server.permission_tiers import (
                     PERMISSION_CAPABILITY_VALUE,
@@ -6453,6 +6543,7 @@ def register_core_routes(
                 allowed_tiers = (
                     NON_FULL_TIERS
                     if effective_harness == "antigravity-native"
+                    or is_acp_permission_harness(effective_harness)
                     else PERMISSION_TIERS
                 )
                 if target not in allowed_tiers or (
@@ -6505,13 +6596,14 @@ def register_core_routes(
                 blocked = ConfirmedPermissionState(
                     state.tier, state.revision, "blocked", transaction_id
                 )
-                changed = await asyncio.to_thread(
-                    conversation_store.compare_and_set_label,
-                    session_id,
-                    PERMISSION_STATE_LABEL_KEY,
-                    raw_state,
-                    switching.state_label(),
-                )
+                async with request.app.state.child_cap_locks.hold(session_id):
+                    changed = await asyncio.to_thread(
+                        conversation_store.compare_and_set_label,
+                        session_id,
+                        PERMISSION_STATE_LABEL_KEY,
+                        raw_state,
+                        switching.state_label(),
+                    )
                 if not changed:
                     raise OmnigentError(
                         "Permission tier revision changed",
@@ -6697,7 +6789,28 @@ def register_core_routes(
                 "Antigravity permission tier is server-owned", code=ErrorCode.INVALID_INPUT
             )
         if body.labels:
-            _reject_server_reserved_label_seed(body.labels)
+            if LAUNCHED_MODEL_LABEL in labels_to_set:
+                from omnigent.server.routes._sessions.helpers import _has_runner_tunnel_authority
+
+                _conv_for_launched = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if _conv_for_launched is None or not _has_runner_tunnel_authority(
+                    request, _conv_for_launched, runner_tunnel_tokens
+                ):
+                    raise OmnigentError(
+                        f"label {LAUNCHED_MODEL_LABEL!r} is server-internal and cannot be set by clients",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                _reject_server_reserved_label_seed(
+                    {
+                        k: v
+                        for k, v in body.labels.items()
+                        if not _may_collate_to(k, LAUNCHED_MODEL_LABEL, prefix=False)
+                    }
+                )
+            else:
+                _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -7352,11 +7465,26 @@ def register_core_routes(
                         request,
                         suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
                     )
+                    runner_init_timeout = _RUNNER_SESSION_INIT_TIMEOUT_S
+                    if (
+                        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                        in (
+                            ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+                            ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+                        )
+                        or _resolve_harness(
+                            conv,
+                            agent_store=agent_store,
+                            agent_cache=agent_cache,
+                        )
+                        == "antigravity-native"
+                    ):
+                        runner_init_timeout = AGY_RUNNER_INIT_TIMEOUT_S
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
                             json=init_body,
-                            timeout=10.0,
+                            timeout=runner_init_timeout,
                         )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
@@ -7795,6 +7923,7 @@ def register_core_routes(
                     else "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
+        native_model_applied = False
         if live_model_change:
             if not combined_model_forward:
                 _model_forward = await _forward_session_change_to_runner(
@@ -7939,6 +8068,17 @@ def register_core_routes(
                         "Please check the current selection and try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
+                if _native_model_change_confirmed(
+                    _model_forward,
+                    model_override=updated.model_override,
+                    clear_model=clear_model,
+                    codex_native=codex_native,
+                    agy_native=agy_native,
+                    unconfirmed=unconfirmed,
+                    unsupported=unsupported,
+                    forward_failed=forward_failed,
+                ):
+                    native_model_applied = True
             else:
                 await _persist_model_change_note(
                     session_id,
@@ -8158,10 +8298,21 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
+        from omnigent.server.model_resolution import (
+            mutate_session_resolution_notes,
+        )
+
+        if native_model_applied and updated.model_override:
+            labels_to_set[LAUNCHED_MODEL_LABEL] = updated.model_override
+        launched_model_updated = LAUNCHED_MODEL_LABEL in labels_to_set
+        launched_model_value = (
+            labels_to_set[LAUNCHED_MODEL_LABEL].strip() or None if launched_model_updated else None
+        )
         _labels_to_clear: list[str] = []
         for _clear_key in (
             PROJECT_LABEL_KEY,
             pinned_label_key(user_id),
+            LAUNCHED_MODEL_LABEL,
         ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
@@ -8170,6 +8321,40 @@ def register_core_routes(
             await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if not body.silent and (model_override is not None or clear_model):
+            # Tie session-note cleanup to the winning override update and run
+            # atomically against the live resolution label group.
+            async with write_guard:
+                latest_for_notes = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if (
+                    latest_for_notes is not None
+                    and latest_for_notes.model_override == updated.model_override
+                ):
+                    await asyncio.to_thread(
+                        mutate_session_resolution_notes,
+                        conversation_store,
+                        session_id,
+                        lambda notes: [
+                            note
+                            for note in notes
+                            if isinstance(note.get("setting"), str)
+                            and note["setting"].startswith("member:")
+                        ],
+                    )
+        if launched_model_updated:
+            from omnigent.runtime import session_stream
+            from omnigent.server.schemas import SessionLaunchedModelEvent
+
+            session_stream.publish(
+                session_id,
+                SessionLaunchedModelEvent(
+                    type="session.launched_model",
+                    conversation_id=session_id,
+                    launched=launched_model_value,
+                ).model_dump(),
+            )
         if SPEED_TIER_LABEL_KEY in labels_to_set:
             _publish_speed_tier(session_id, labels_to_set[SPEED_TIER_LABEL_KEY])
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
@@ -8407,13 +8592,6 @@ def register_core_routes(
                 "Source session has no agent binding — cannot fork.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.server.permission_tiers import require_permission_protocol
-
-        source_harness = await asyncio.to_thread(
-            _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
-        )
-        require_permission_protocol(request, harness=source_harness)
-
         sandbox_profile = await prepare_profile(
             request, body, user_id=user_id, inherited_session_id=source_id
         )
@@ -8609,7 +8787,9 @@ def register_core_routes(
         # labels from the fork; otherwise the copied label would shadow the
         # freshly chosen mode. Only on an explicit pick: an untouched picker
         # sends no launch args and the label carries over as before.
-        dropped_label_keys_set: set[str] = set()
+        from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+
+        dropped_label_keys_set: set[str] = {LAUNCHED_MODEL_LABEL}
         if launch_args_set:
             dropped_label_keys_set |= {
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -8698,18 +8878,29 @@ def register_core_routes(
             TIER_HARNESSES,
             ConfirmedPermissionState,
             creation_permission_tier,
-            legacy_permission_tier,
+            is_acp_permission_harness,
+            permission_tier_active,
             require_permission_protocol,
+            source_permission_tier,
         )
 
         source_harness = await asyncio.to_thread(
             _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
         )
-        require_permission_protocol(request, harness=source_harness)
-        require_permission_protocol(request, harness=target_harness)
-        if body.permission_tier is not None and target_harness not in TIER_HARNESSES:
+        source_managed = permission_tier_active(source_harness, source.labels)
+        target_acp = is_acp_permission_harness(target_harness)
+        target_managed = target_harness in TIER_HARNESSES or (
+            target_acp
+            and (
+                body.permission_tier is not None
+                or (is_acp_permission_harness(source_harness) and source_managed)
+            )
+        )
+        require_permission_protocol(request, harness=source_harness, required=source_managed)
+        require_permission_protocol(request, harness=target_harness, required=target_managed)
+        if body.permission_tier is not None and not target_managed:
             raise OmnigentError(
-                "permission_tier is only supported by Pi and Antigravity forks",
+                "The target harness does not support permission tiers",
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.permission_mode is not None:
@@ -8763,29 +8954,16 @@ def register_core_routes(
                         _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
                     }
                 )
-        if source_harness in TIER_HARNESSES or target_harness in TIER_HARNESSES:
-            dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
+        dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
         tier = None
-        if target_harness in TIER_HARNESSES:
+        if target_managed:
             assert target_harness is not None
-            inherited_tier = None
-            if source_harness in TIER_HARNESSES:
-                assert source_harness is not None
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=source_harness,
-                        labels=source.labels or {},
-                        launch_args=source.terminal_launch_args or [],
-                    )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Source permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
             tier = creation_permission_tier(
                 harness=target_harness,
                 explicit=body.permission_tier,
-                inherited=inherited_tier,
+                inherited=source_permission_tier(
+                    source_harness, source.labels, source.terminal_launch_args or []
+                ),
             )
             extra_labels.update(
                 ConfirmedPermissionState(tier, 1, "blocked").labels(target_harness)
@@ -9349,7 +9527,26 @@ def register_core_routes(
             )
             or key.startswith(MEMBER_LABEL_PREFIX)
         }
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            is_acp_permission_harness,
+            require_permission_protocol,
+            source_permission_tier,
+        )
         from omnigent.server.session_mcp_selection import resolve_session_mcp_selection
+
+        continued_harness = await asyncio.to_thread(
+            _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if continued_harness is not None and is_acp_permission_harness(continued_harness):
+            tier = source_permission_tier(
+                continued_harness, source.labels, source.terminal_launch_args or []
+            )
+            if tier is not None:
+                require_permission_protocol(request, harness=continued_harness, required=True)
+                continued_labels.update(
+                    ConfirmedPermissionState(tier, 1, "blocked").labels(continued_harness)
+                )
 
         continued_labels.update(
             resolve_session_mcp_selection(None, None, user_id, source_labels=source.labels).labels

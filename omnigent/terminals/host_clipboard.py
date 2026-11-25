@@ -49,7 +49,7 @@ async def read_host_clipboard() -> tuple[str, bool]:
                 commands.append(("/usr/bin/pbpaste",))
             elif sys.platform == "win32":
                 # Isolate delayed rendering in a process that can be stopped by the timeout.
-                commands.append((sys.executable, "-m", __name__))
+                commands.append((sys.executable, "-P", "-m", __name__))
             elif sys.platform == "linux":
                 if os.environ.get("WAYLAND_DISPLAY"):
                     commands.append(("wl-paste", "--no-newline", "--type", "text"))

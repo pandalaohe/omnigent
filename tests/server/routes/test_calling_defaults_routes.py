@@ -8,6 +8,7 @@ statuses the route must record (ok / failed / offline) without a tunnel.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
@@ -24,6 +25,9 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
+import omnigent.server.routes.calling_defaults as calling_defaults_routes
+from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.utils import now_epoch
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -89,11 +93,13 @@ class _Stores:
     prefs: SqlAlchemyUserPreferencesStore
 
 
-def _seed_agent(stores: _Stores, agent_id: str, harness: str) -> None:
+def _seed_agent(
+    stores: _Stores, agent_id: str, harness: str, *, name: str = "calling-defaults-agent"
+) -> None:
     """Register a template agent whose spec resolves to *harness*."""
     location = f"{agent_id}/bundle"
     stores.artifact_store.put(location, _bundle(harness))
-    stores.agent_store.create(agent_id, "calling-defaults-agent", location)
+    stores.agent_store.create(agent_id, name, location)
 
 
 @pytest.fixture()
@@ -182,7 +188,7 @@ async def test_acp_delivery_metadata_without_manual_sync(
     proxy = AsyncMock(
         return_value={
             "status": status,
-            "models": [],
+            "models": [{"id": "available"}] if status == "ok" else [],
             "error": "probe failed" if status == "failed" else None,
             "injects_prompt": False,
         }
@@ -335,6 +341,152 @@ async def test_catalogs_filter_reads_one_cached_row_without_probing(
     assert full.status_code == 200, full.text
     proxy.assert_awaited_once()
     assert proxy.await_args.kwargs["host_conn"].host_id == HOST_B
+
+
+@pytest.mark.parametrize("seed", ["missing", "expired"])
+async def test_agy_catalog_refreshes_without_manual_sync(client, app, stores, monkeypatch, seed):
+    harness = "antigravity-native"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    _register_host(app, HOST_A)
+    if seed == "expired":
+        stores.cache.upsert(HOST_A, harness, [{"id": "retired"}], now_epoch() - 301)
+    models = [{"id": model} for model in ("gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon")]
+    proxy = AsyncMock(return_value={"status": "ok", "models": models})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    params = {"host_id": HOST_A, "harness": harness}
+
+    started_at = now_epoch()
+    response = await client.get("/v1/calling-defaults/catalogs", params=params)
+    assert response.status_code == 200, response.text
+    row = response.json()["rows"][0]
+    assert row["models"] == models
+    assert row["fetched_at"] >= started_at
+    assert row["stale"] is False
+    repeated = await client.get("/v1/calling-defaults/catalogs", params=params)
+    assert repeated.json()["rows"] == [row]
+    proxy.assert_awaited_once()
+
+
+@pytest.mark.parametrize("online", [True, False])
+async def test_agy_catalog_preserves_old_rows_when_refresh_unavailable(
+    client, app, stores, monkeypatch, online
+):
+    harness = "antigravity-native"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    if online:
+        _register_host(app, HOST_A)
+    fetched_at = now_epoch() - 301
+    models = [{"id": "last-known"}]
+    stores.cache.upsert(HOST_A, harness, models, fetched_at)
+    proxy = AsyncMock(return_value={"status": "failed", "error": "probe unavailable"})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+
+    response = await client.get(
+        "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+    )
+    assert response.status_code == 200, response.text
+    row = response.json()["rows"][0]
+    assert row["models"] == models
+    assert row["fetched_at"] == fetched_at
+    assert row["stale"] is True
+    assert row["error"] == ("probe unavailable" if online else None)
+    assert proxy.await_count == int(online)
+    assert (
+        await client.get(
+            "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+        )
+    ).json()["rows"] == [row]
+    assert proxy.await_count == int(online)
+    if online:
+        recovered = [{"id": "available-again"}]
+        proxy.return_value = {"status": "ok", "models": recovered}
+        synced = await client.post(
+            "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
+        )
+        assert synced.json()["rows"][0]["models"] == recovered
+        assert proxy.await_count == 2
+
+
+async def test_slow_agy_refresh_does_not_hold_catalog_readers(client, app, stores, monkeypatch):
+    harness = "antigravity-native"
+    acp = "acp:example"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True, acp: True})
+    _register_host(app, HOST_A)
+    fetched_at = now_epoch() - 301
+    stores.cache.upsert(HOST_A, harness, [{"id": "last-known"}], fetched_at)
+    stores.cache.upsert(HOST_A, "codex", [{"id": "codex-cached"}], now_epoch())
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def proxy(*, harness, **_kwargs):
+        if harness == acp:
+            return {"status": "ok", "models": [], "injects_prompt": True}
+        assert harness == "antigravity-native"
+        started.set()
+        await finish.wait()
+        return {"status": "ok", "models": [{"id": "current-model"}]}
+
+    lookup = AsyncMock(side_effect=proxy)
+    monkeypatch.setattr(calling_defaults_routes, "_proxy_model_options", lookup)
+    monkeypatch.setattr(calling_defaults_routes, "_AGY_FILTERED_READ_WAIT_S", 0.01)
+    params = {"host_id": HOST_A, "harness": harness}
+
+    try:
+        async with asyncio.timeout(2):
+            full = await client.get("/v1/calling-defaults/catalogs")
+            await started.wait()
+            rows = {row["harness"]: row for row in full.json()["rows"]}
+            assert rows["codex"]["models"] == [{"id": "codex-cached"}]
+            assert rows[acp]["injects_prompt"] is True
+            assert rows[harness]["stale"] is True
+
+            filtered = await client.get("/v1/calling-defaults/catalogs", params=params)
+            assert filtered.json()["rows"] == [rows[harness]]
+            assert rows[harness]["models"] == [{"id": "last-known"}]
+            assert rows[harness]["fetched_at"] == fetched_at
+    finally:
+        finish.set()
+    monkeypatch.setattr(calling_defaults_routes, "_AGY_FILTERED_READ_WAIT_S", 2)
+    synced = await client.get("/v1/calling-defaults/catalogs", params=params)
+    row = synced.json()["rows"][0]
+    assert row["models"] == [{"id": "current-model"}]
+    assert row["stale"] is False
+    assert [call.kwargs["harness"] for call in lookup.await_args_list].count(harness) == 1
+
+
+async def test_same_agy_host_id_refreshes_each_workspace(client, app, stores, monkeypatch):
+    harness = "antigravity-native"
+    for workspace in (1, 2):
+        with workspace_scope(workspace):
+            stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+            stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+            _register_host(app, HOST_A)
+    active = set()
+    both_started = asyncio.Event()
+
+    async def proxy(**_kwargs):
+        workspace = current_workspace_id()
+        active.add(workspace)
+        if active == {1, 2}:
+            both_started.set()
+        await both_started.wait()
+        return {"status": "ok", "models": [{"id": f"model-{workspace}"}]}
+
+    monkeypatch.setattr(calling_defaults_routes, "_proxy_model_options", proxy)
+
+    async def read(workspace):
+        with workspace_scope(workspace):
+            return await client.get(
+                "/v1/calling-defaults/catalogs", params={"host_id": HOST_A, "harness": harness}
+            )
+
+    async with asyncio.timeout(2):
+        first, second = await asyncio.gather(read(1), read(2))
+    assert first.json()["rows"][0]["models"] == [{"id": "model-1"}]
+    assert second.json()["rows"][0]["models"] == [{"id": "model-2"}]
 
 
 async def test_resolve_exposes_unavailable_defaults(client, stores, monkeypatch):
@@ -503,7 +655,7 @@ async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
     assert body["problems"] == []
     assert body["notes"][0]["outcome"] == "missing"
     assert body["notes"][0]["saved"] == "gpt-6-sol"
-    assert any("trying it as unknown" in warning for warning in body["warnings"])
+    assert any("passing it to the host unchanged" in warning for warning in body["warnings"])
 
     # Once the pair is stale, the offered check is skipped entirely.
     stores.cache.mark_error(HOST_A, "codex", "unsupported")
@@ -643,6 +795,339 @@ async def test_acp_session_patch_preserves_literal_values_and_null_reset(
         assert response.json()["reasoning_effort"] == effort
 
 
+async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+    from omnigent.session_default_modes import ACP_SESSION_MODE_LABEL_KEY
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:ag": True})
+    _register_host(app, HOST_A)
+    _seed_agent(stores, AGENT_ID, "acp:ag")
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    stores.cache.upsert(
+        HOST_A,
+        "acp:ag",
+        [],
+        1,
+        permission_options=[{"value": "plan", "label": "Plan", "concept": "read-only"}],
+    )
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {"*": {"*": {"permission": "read-only"}}}
+    )
+    legacy = await client.post("/v1/sessions", json=request)
+    assert legacy.status_code == 201, legacy.text
+    assert legacy.json()["permission_tier"] is None
+    assert legacy.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "plan"
+
+    delegated = await client.post(
+        "/v1/sessions",
+        json=request,
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert delegated.status_code == 201, delegated.text
+    assert delegated.json()["permission_tier"] == "plan"
+    assert delegated.json()["permission_tier_state"] == "blocked"
+
+    connection = app.state.host_registry.get(HOST_A)
+    connection.hello.acp_permission_tiers = {"acp:ag": "auto"}
+    defaulted = await client.post("/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS)
+    assert defaulted.status_code == 201, defaulted.text
+    assert defaulted.json()["permission_tier"] == "auto"
+
+    explicit = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "accept-edits"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert explicit.status_code == 201, explicit.text
+    assert explicit.json()["permission_tier"] == "accept-edits"
+    assert explicit.json()["permission_tier_state"] == "blocked"
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
+@pytest.mark.parametrize(
+    "mode,calling_default,expected",
+    [
+        ("plan", False, "plan"),
+        ("review", False, "plan"),
+        (None, True, "plan"),
+        (None, False, "auto"),
+        (None, False, None),
+    ],
+)
+async def test_delegated_acp_respects_unmanaged_source_restrictions(
+    client, app, stores, bundled, mode, calling_default, expected
+):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    harness = "acp:opencode" if expected is None else "acp:ag"
+    _seed_agent(stores, AGENT_ID, harness)
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, harness: True})
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
+    if mode == "review":
+        stores.cache.upsert(
+            HOST_A,
+            harness,
+            [],
+            1,
+            permission_options=[{"value": "review", "label": "Review", "concept": "read-only"}],
+        )
+    if calling_default:
+        stores.prefs.patch_namespace(
+            "local", "calling_defaults", {"*": {"*": {"permission": "read-only"}}}
+        )
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+        labels={ACP_SESSION_MODE_LABEL_KEY: mode} if mode else {},
+    )
+    headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+
+    async def create(**overrides):
+        metadata = {"parent_session_id": parent.id, **overrides}
+        if bundled:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(metadata)},
+                files={"bundle": ("agent.tar.gz", _bundle(harness), "application/gzip")},
+                headers=headers,
+            )
+        return await client.post(
+            "/v1/sessions", json={"agent_id": AGENT_ID, **metadata}, headers=headers
+        )
+
+    created = await create()
+    assert created.status_code == 201, created.text
+    snapshot = created
+    if bundled:
+        snapshot = await client.get(f"/v1/sessions/{created.json()['session_id']}")
+    assert snapshot.json()["permission_tier"] == expected
+    if expected == "plan":
+        denied = await create(permission_tier="auto")
+        assert denied.status_code == 403, denied.text
+
+
+async def test_delegated_acp_bundle_inherits_the_creator_tier(client, app, stores, monkeypatch):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, "antigravity-native")
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+        labels={
+            **ConfirmedPermissionState("plan", 1, "ready").labels("antigravity-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    metadata = {"parent_session_id": parent.id}
+    headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    bundle = {"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")}
+    created = await client.post(
+        "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=bundle, headers=headers
+    )
+    assert created.status_code == 201, created.text
+    snapshot = await client.get(f"/v1/sessions/{created.json()['session_id']}")
+    assert snapshot.json()["permission_tier"] == "plan"
+    assert snapshot.json()["permission_tier_state"] == "blocked"
+
+    denied = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({**metadata, "permission_tier": "auto"})},
+        files=bundle,
+        headers=headers,
+    )
+    assert denied.status_code == 403, denied.text
+
+    original_member_labels = routes_core._member_snapshot_labels
+
+    async def change_source_tier(*args, **kwargs):
+        conversations.set_labels(
+            parent.id, ConfirmedPermissionState("ask", 2, "blocked").labels("antigravity-native")
+        )
+        return await original_member_labels(*args, **kwargs)
+
+    monkeypatch.setattr(routes_core, "_member_snapshot_labels", change_source_tier)
+    stale = await client.post(
+        "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=bundle, headers=headers
+    )
+    assert stale.status_code == 400, stale.text
+    assert "Source runtime permission state is not ready" in stale.text
+
+
+async def test_named_acp_child_uses_its_own_host_tier(client, app, stores):
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+    from tests.server.helpers import create_test_agent
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.acp_permission_tiers = {"acp:neutral": "plan"}
+    agent = await create_test_agent(
+        client,
+        sub_agents=[
+            {
+                "name": "worker",
+                "prompt": "Read the workspace",
+                "executor": {"type": "omnigent", "config": {"harness": "acp:neutral"}},
+            }
+        ],
+    )
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=agent["id"], host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "sub_agent_name": "worker", "parent_session_id": parent.id},
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["permission_tier"] == "plan"
+
+
+@pytest.mark.parametrize("harness", ["acp:ag", "pi", "pi-native", "antigravity-native"])
+async def test_agent_created_child_cannot_widen_the_source_tier(client, app, stores, harness):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
+
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 2, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    placement = {}
+    if harness == "acp:ag":
+        stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+        _register_host(app, HOST_A)
+        app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:acp:ag")
+        placement = {
+            "host_id": HOST_A,
+            "workspace": "/neutral/project",
+            "runner_id": "test-runner",
+        }
+    parent = conversations.create_conversation(agent_id=AGENT_ID, labels=labels, **placement)
+
+    request = {"agent_id": AGENT_ID, "parent_session_id": parent.id}
+    agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    denied = await client.post(
+        "/v1/sessions", json={**request, "permission_tier": "auto"}, headers=agent_headers
+    )
+    assert denied.status_code == 403, denied.text
+    allowed = await client.post("/v1/sessions", json=request, headers=agent_headers)
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["permission_tier"] == "plan"
+    user_selected = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "auto"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert user_selected.status_code == 201, user_selected.text
+    assert user_selected.json()["permission_tier"] == "auto"
+
+
+async def test_expired_acp_model_catalog_refreshes_once_and_preserves_last_success(
+    client, app, stores, monkeypatch
+):
+    import asyncio
+
+    from tests._helpers.polling import poll_until_async
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp:neutral": True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    stores.cache.upsert(HOST_A, "acp:neutral", previous, 100)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def failed_probe(**kwargs):
+        assert kwargs["refresh"] == "force"
+        started.set()
+        await release.wait()
+        return {"status": "failed", "error": "ACP probe timed out"}
+
+    proxy = AsyncMock(side_effect=failed_probe)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults.now_epoch", lambda: 1000)
+    params = {"host_id": HOST_A, "harness": "acp:neutral"}
+    try:
+        first = await client.get("/v1/calling-defaults/catalogs", params=params)
+        row = first.json()["rows"][0]
+        assert row["stale"] is True
+        assert row["models"] == previous
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = await client.get("/v1/calling-defaults/catalogs", params=params)
+        assert second.json()["rows"][0]["models"] == previous
+        proxy.assert_awaited_once()
+    finally:
+        release.set()
+    await poll_until_async(
+        lambda: stores.cache.list([HOST_A])[0]["error"] is not None, timeout_s=2
+    )
+    row = stores.cache.list([HOST_A])[0]
+    assert row["models"] == previous
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe timed out"
+
+
+@pytest.mark.parametrize("surface", ["sync", "model-refresh"])
+async def test_empty_acp_refresh_cannot_replace_the_server_catalog(
+    client, app, stores, monkeypatch, surface
+):
+    harness = "acp:neutral"
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {harness: True})
+    _register_host(app, HOST_A)
+    previous = [{"id": "previous-model"}]
+    previous_modes = [{"value": "default", "label": "Default"}]
+    stores.cache.upsert(HOST_A, harness, previous, 100, permission_options=previous_modes)
+    proxy = AsyncMock(return_value={"status": "ok", "models": [], "injects_prompt": False})
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_model_options", proxy)
+
+    if surface == "sync":
+        response = await client.post(
+            "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": harness}
+        )
+        assert response.status_code == 200, response.text
+    else:
+        response = await client.get(
+            f"/v1/hosts/{HOST_A}/harnesses/{harness}/model-options?refresh=force"
+        )
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "ACP probe returned an empty model catalog"
+    row = next(row for row in stores.cache.list([HOST_A]) if row["harness"] == harness)
+    assert row["models"] == previous
+    assert row["permission_options"] == previous_modes
+    assert row["fetched_at"] == 100
+    assert row["error"] == "ACP probe returned an empty model catalog"
+
+
 async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
     from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
 
@@ -666,6 +1151,7 @@ async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stor
     )
     assert synced.status_code == 200, synced.text
     assert synced.json()["rows"][0]["permission_options"] == options
+    assert proxy.await_args.kwargs["refresh"] == "force"
     stores.prefs.patch_namespace(
         "local", "calling_defaults", {"*": {"*": {"permission": "automatic"}}}
     )
@@ -734,6 +1220,51 @@ async def test_acp_mode_label_survives_fork_and_continue(client, stores):
         response = await client.post(f"/v1/sessions/{source.id}/{operation}", json={})
         assert response.status_code == 201, response.text
         assert response.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "review"
+
+
+@pytest.mark.parametrize("operation", ["fork", "continue", "switch"])
+async def test_managed_acp_derivation_builds_fresh_permission_state(client, stores, operation):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    harness = "acp:neutral"
+    _seed_agent(stores, AGENT_ID, harness)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = ConfirmedPermissionState("plan", 7, "ready").labels(harness)
+    labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    labels[PERMISSION_RUNTIME_ID_LABEL_KEY] = "source-runtime"
+    source = conversations.create_conversation(agent_id=AGENT_ID, labels=labels)
+    body = {}
+    if operation == "switch":
+        _seed_agent(stores, HOST_B, "codex", name="other-agent")
+        body = {"agent_id": HOST_B}
+    if operation == "continue":
+        archived = await client.patch(
+            f"/v1/sessions/{source.id}", json={"archived": True}, headers=PERMISSION_TIERS_HEADERS
+        )
+        assert archived.status_code == 200, archived.text
+    response = await client.post(
+        f"/v1/sessions/{source.id}/{'continue' if operation == 'continue' else 'fork'}",
+        json=body,
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert response.status_code == 201, response.text
+    derived = conversations.get_conversation(response.json()["id"])
+    assert PERMISSION_RUNTIME_ID_LABEL_KEY not in derived.labels
+    assert PERMISSION_CAPABILITY_LABEL_KEY not in derived.labels
+    if operation == "switch":
+        assert PERMISSION_STATE_LABEL_KEY not in derived.labels
+        assert response.json()["permission_tier"] is None
+    else:
+        assert read_permission_state(derived.labels, harness=harness) == ConfirmedPermissionState(
+            "plan", 1, "blocked"
+        )
 
 
 async def test_acp_mode_unreported_by_an_older_host_is_refused(client, stores):
@@ -893,6 +1424,31 @@ async def test_acp_readback_selection_accepts_repeated_reports_and_fences_new_ch
     assert len(published) == 2
 
 
+async def test_acp_unrequested_mode_readback_cannot_replace_an_explicit_selection(stores):
+    from omnigent.sdk_permission_modes import (
+        ACP_SESSION_MODE_LABEL_KEY,
+        ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+    )
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    labels = {ACP_SESSION_MODE_LABEL_KEY: "go", ACP_SESSION_MODE_SELECTION_LABEL_KEY: "new-choice"}
+    conv = store.create_conversation(harness_override="acp:neutral", labels=labels)
+    event = {
+        "type": "session.permission_mode",
+        "harness": "acp",
+        "conversation_id": conv.id,
+        "permission_mode": "plan",
+    }
+    stream = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=stream)),
+        base_url="http://runner",
+    ) as runner:
+        await orch._relay_runner_stream_once(conv.id, runner, store)
+    assert store.get_conversation(conv.id).labels == labels
+
+
 async def test_snapshot_uses_active_agent_model_until_the_turn_end_report(stores):
     from omnigent.server.routes._sessions import orchestration as orch
 
@@ -953,7 +1509,9 @@ async def test_acp_running_model_refresh_keeps_catalog_sources_separate(
 
 
 @pytest.mark.parametrize("protocol", ["mode-config", "mode-legacy"])
-@pytest.mark.parametrize("failure", ["", "mode-notify-refusal", "mode-multiple-readbacks"])
+@pytest.mark.parametrize(
+    "failure", ["", "mode-notify-refusal", "mode-multiple-readbacks", "initial-plan"]
+)
 async def test_acp_mode_crosses_server_runner_and_scripted_agent(
     client, app, stores, tmp_path, protocol, failure, monkeypatch
 ):
@@ -977,6 +1535,7 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
         ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     )
     from omnigent.server.routes.host_tunnel import _receive_loop
+    from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
     from tests._helpers.polling import poll_until_async
     from tests.runner.conftest import _runner_client
     from tests.runtime.harnesses.test_acp_model_switching import _FAKE_ACP_AGENT
@@ -1002,6 +1561,8 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
     ]
     _register_host(app, HOST_A)
     conn = app.state.host_registry.get(HOST_A)
+    conn.hello.capabilities.append("agy_acp_permissions:acp:ag")
+    requested_mode = None if failure == "initial-plan" else "go"
 
     async def receive_host_reply():
         outgoing = await conn.outbound_queue.get()
@@ -1053,14 +1614,14 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
         json={
             "agent_id": AGENT_ID,
             "parent_session_id": parent.id,
-            "permission_mode": "go",
+            **({"permission_mode": requested_mode} if requested_mode else {}),
             "reasoning_effort": "high",
             "session_prompt": "Kept for this chat",
         },
     )
     assert created.status_code == 201, created.text
     saved = conversations.get_conversation(created.json()["id"])
-    assert saved.labels[ACP_SESSION_MODE_LABEL_KEY] == "go"
+    assert saved.labels.get(ACP_SESSION_MODE_LABEL_KEY) == requested_mode
     assert saved.session_prompt == "Kept for this chat"
     assert created.json()["warnings"] == [
         "session_prompt not sent: this agent builds its own prompt"
@@ -1122,10 +1683,12 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
 
                 observed = await asyncio.wait_for(mode_readback(), timeout=10)
                 assert observed["harness"] == "acp"
-                assert observed["requested_mode"] == "go"
-                assert observed["permission_mode"] == ("review" if failure else "go")
-                assert (
-                    observed["selection_id"] == saved.labels[ACP_SESSION_MODE_SELECTION_LABEL_KEY]
+                assert observed.get("requested_mode") == requested_mode
+                assert observed["permission_mode"] == (
+                    "plan" if requested_mode is None else "review" if failure else "go"
+                )
+                assert observed.get("selection_id") == saved.labels.get(
+                    ACP_SESSION_MODE_SELECTION_LABEL_KEY
                 )
                 from omnigent.server.routes._sessions import orchestration as orch
 
@@ -1150,6 +1713,36 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
                     conversations.get_conversation(saved.id).labels[ACP_SESSION_MODE_LABEL_KEY]
                     == observations[-1]["permission_mode"]
                 )
+                if requested_mode is None:
+                    stores.prefs.patch_namespace(
+                        "local", "session_collab", {"sessionRestrictions": "off"}
+                    )
+                    headers = {
+                        **PERMISSION_TIERS_HEADERS,
+                        CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT,
+                    }
+                    metadata = {"parent_session_id": saved.id}
+                    for tier, expected_status in [(None, 201), ("auto", 403)]:
+                        child = await client.post(
+                            "/v1/sessions",
+                            json={
+                                **metadata,
+                                "agent_id": AGENT_ID,
+                                "harness_override": "acp:ag",
+                                **({"permission_tier": tier} if tier else {}),
+                            },
+                            headers=headers,
+                        )
+                        assert child.status_code == expected_status, child.text
+                        if tier is None:
+                            assert child.json()["permission_tier"] == "plan"
+                        else:
+                            assert "cannot exceed its creator's permission tier" in child.text
+                    assert not any(
+                        row["method"] in ("session/set_mode", "session/set_config_option")
+                        for row in requests()
+                    )
+                    return
                 monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
                 changed = await client.patch(
                     f"/v1/sessions/{saved.id}", json={"permission_mode": "review"}

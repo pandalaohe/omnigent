@@ -138,4 +138,26 @@ describe("UpdateBanner", () => {
       expect(screen.queryByText("Omnigent Desktop 0.4.0 is available")).toBeNull();
     });
   });
+
+  it("renders a Download link notice for external-release updates", async () => {
+    const { bridge } = installBridge({
+      state: "available",
+      currentVersion: "0.21.0-wukong.12",
+      info: {
+        version: "0.21.0-wukong.13",
+        downloadUrl: "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+      },
+    });
+
+    render(<UpdateBanner />);
+
+    expect(await screen.findByText("New version 0.21.0-wukong.13 available")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update now" })).toBeNull();
+    expect(screen.queryByText("Updating won’t interrupt existing sessions.")).toBeNull();
+    const downloadButton = screen.getByRole("button", { name: "Download" });
+    fireEvent.click(downloadButton);
+    await waitFor(() => {
+      expect(bridge.download).toHaveBeenCalledTimes(1);
+    });
+  });
 });

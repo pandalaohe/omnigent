@@ -21,12 +21,11 @@ from omnigent.tools.builtins.session_projects import (
 )
 
 _DEFAULT_LISTED_SESSIONS = 50
-_SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
-# The shared-runner check reads only the caller's runner binding.
-_CALLER_RUNNER_PARAMS = {
-    **_SNAPSHOT_PARAMS,
-    "include_usage": "false",
+_SNAPSHOT_PARAMS = {
+    "include_items": "false",
+    "include_liveness": "false",
     "include_live_status": "false",
+    "include_usage": "false",
 }
 _CONCURRENT_NAME_READS = 8
 _SESSION_SETTING_FIELDS = {"model": "model_override", "reasoning_effort": "reasoning_effort"}
@@ -38,6 +37,10 @@ _MAX_LOOKUP_PAGES = 20
 _MOVE_SOURCE_CHECKS = "session_move_source_checks"
 _ORGANIZE_SOURCE_CHECKS = "session_organize_source_checks"
 _SETTINGS_SOURCE_CHECKS = "session_settings_source_checks"
+_UPDATE_PREFLIGHT_TIMEOUT_S = 120.0
+# A combined update can perform two 310s native Codex forwards with older runners.
+# Leave room for the session lock and response work after those forwards.
+_SETTINGS_PATCH_TIMEOUT_S = 720.0
 
 
 async def resolve_project_id(
@@ -346,19 +349,39 @@ def _refusal(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}: {detail}"
 
 
+async def _update_request(
+    client: httpx.AsyncClient, method: str, path: str, *, wait_s: float, **kwargs: Any
+) -> httpx.Response:
+    """Apply a hard deadline as well as HTTPX's per-operation timeouts."""
+    io_timeout_s = 60.0 if method == "PATCH" else 30.0
+    try:
+        async with asyncio.timeout(wait_s):
+            return await client.request(
+                method, path, timeout=httpx.Timeout(io_timeout_s, read=wait_s), **kwargs
+            )
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(f"no complete response within {wait_s:g}s") from exc
+
+
 async def _updatable_snapshot(
     client: httpx.AsyncClient, session_id: str, *, set_project: bool, allow_child: bool
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Return ``(snapshot, None)`` for a session this tool may update, else ``(None, error)``."""
     try:
-        snapshot = await client.get(
-            f"/v1/sessions/{session_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
+        snapshot = await _update_request(
+            client,
+            "GET",
+            f"/v1/sessions/{session_id}",
+            params=_SNAPSHOT_PARAMS,
+            wait_s=_UPDATE_PREFLIGHT_TIMEOUT_S,
         )
         if snapshot.is_error:
             return None, _refusal(snapshot)
         current = snapshot.json()
+        if not isinstance(current, dict):
+            raise ValueError("expected a session object")
     except (httpx.HTTPError, ValueError) as exc:
-        return None, f"session could not be read: {exc}"
+        return None, f"session could not be read: {str(exc) or type(exc).__name__}"
     level = current.get("permission_level")
     # Refuse here so a readable foreign session is never "unchanged".
     if isinstance(level, int) and level < LEVEL_OWNER:
@@ -414,40 +437,53 @@ async def _patch_session(
     """Apply changes and read settings back when the runner may have adjusted them."""
     if not payload:
         return "unchanged", None, {}
+    path = f"/v1/sessions/{session_id}"
     try:
-        updated = await client.patch(
-            f"/v1/sessions/{session_id}",
-            json=payload,
-            headers=headers,
-            timeout=60.0 if read_settings else 30.0,
-        )
+        if read_settings:
+            updated = await _update_request(
+                client,
+                "PATCH",
+                path,
+                json=payload,
+                headers=headers,
+                params={"include_usage": "false"},
+                wait_s=_SETTINGS_PATCH_TIMEOUT_S,
+            )
+        else:
+            updated = await client.patch(path, json=payload, headers=headers, timeout=30.0)
         if updated.is_error:
             return "error", _refusal(updated), {}
         applied = updated.json() if read_settings else {}
     except (httpx.HTTPError, ValueError) as exc:
-        return "error", f"update could not be confirmed: {exc}", {}
+        detail = str(exc) or type(exc).__name__
+        return "error", f"update could not be confirmed: PATCH {path}: {detail}", {}
     if not isinstance(applied, dict):
         return "error", "update could not be confirmed: invalid response", {}
     return "updated", None, applied
 
 
-async def _server_checks_source(client: httpx.AsyncClient, *flags: str) -> bool:
-    """Whether ``/v1/info`` says the server refuses these writes from an edit-shared source."""
+async def _source_check_refusal(
+    client: httpx.AsyncClient, tool: str, where: str, *flags: str
+) -> str | None:
+    """Require server-side source session validation before a tool mutates state."""
+    probe = f"{tool}: GET /v1/info"
     try:
-        info = await client.get("/v1/info", timeout=30.0)
-        body = info.json() if info.status_code == 200 else None
-    except (httpx.HTTPError, ValueError):
-        return False
-    return isinstance(body, dict) and any(body.get(flag) is True for flag in flags)
-
-
-def _unchecked_server_error(tool_name: str, where: str) -> str:
-    return json.dumps(
-        {
-            "error": f"{tool_name}: this Omnigent server cannot check the calling "
-            f"session's sharing before changing {where}; upgrade the server or use "
-            "the sidebar"
-        }
+        info = await _update_request(client, "GET", "/v1/info", wait_s=_UPDATE_PREFLIGHT_TIMEOUT_S)
+    except httpx.HTTPError as exc:
+        return f"{probe} failed: {str(exc) or type(exc).__name__}"
+    if info.status_code != 200:
+        return f"{probe} returned HTTP {info.status_code} while checking source sharing support"
+    try:
+        body = info.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return f"{probe} returned an invalid capability response"
+    if any(body.get(flag) is True for flag in flags):
+        return None
+    return (
+        f"{tool}: this Omnigent server cannot check the calling "
+        f"session's sharing before changing {where}; upgrade the server or use the sidebar"
     )
 
 
@@ -464,7 +500,7 @@ async def _shares_runner(
         return False
     try:
         response = await client.get(
-            f"/v1/sessions/{source_id}", params=_CALLER_RUNNER_PARAMS, timeout=30.0
+            f"/v1/sessions/{source_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
         )
         if response.is_error:
             return True
@@ -573,8 +609,8 @@ async def execute_session_update(
         flags = (_SETTINGS_SOURCE_CHECKS, _ORGANIZE_SOURCE_CHECKS)
     else:
         flags = (_MOVE_SOURCE_CHECKS,)
-    if not await _server_checks_source(client, *flags):
-        return _unchecked_server_error("sys_session_update", "a session")
+    if error := await _source_check_refusal(client, "sys_session_update", "a session", *flags):
+        return json.dumps({"error": error})
     current, error = await _updatable_snapshot(
         client,
         canonical,
@@ -754,8 +790,10 @@ async def execute_project_update(
         icon = icon.strip()
     if client is None or source_id is None:
         return json.dumps({"error": "sys_project_update requires an authenticated runner"})
-    if not await _server_checks_source(client, _ORGANIZE_SOURCE_CHECKS):
-        return _unchecked_server_error("sys_project_update", "a project")
+    if error := await _source_check_refusal(
+        client, "sys_project_update", "a project", _ORGANIZE_SOURCE_CHECKS
+    ):
+        return json.dumps({"error": error})
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     try:
         project = await _find_project(client, current_name)

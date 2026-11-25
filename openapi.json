@@ -2214,7 +2214,7 @@
             "type": "array"
           },
           "stale": {
-            "description": "Whether the row should be treated as untrustworthy \u2014 its last sync failed, or the host is offline on this replica.",
+            "description": "Whether the last sync failed, the host is offline on this replica, or the native Antigravity catalog has expired.",
             "title": "Stale",
             "type": "boolean"
           }
@@ -2730,6 +2730,18 @@
             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
             "title": "Last Task Error"
           },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Post-resolution model passed to the child's harness (`model_override`), or `None` when unset or not confirmed by the harness (e.g. `antigravity-native`).",
+            "title": "Launched"
+          },
           "native_activity_unverified": {
             "default": false,
             "title": "Native Activity Unverified",
@@ -2752,6 +2764,18 @@
             "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
+          },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model originally requested for the child \u2014 `saved` from `omnigent.model_resolution` when resolution rewrote it, else `model_override`. `None` when unset.",
+            "title": "Requested"
           },
           "routed_model": {
             "anyOf": [
@@ -2776,6 +2800,18 @@
             ],
             "description": "Identifier of the routing decision that produced `routed_model`, mirroring `RoutingDecisionData.decision_id`. Read from the child's `omnigent.routing.decision_id` label, stamped when routing pins the model. `None` when the child was not routed.",
             "title": "Routing Decision Id"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model last reported as actually running by the child's harness (`reported_model`), or `None` when not yet reported.",
+            "title": "Running"
           },
           "session_name": {
             "anyOf": [
@@ -11021,6 +11057,10 @@
             "title": "Browser Annotations Available",
             "type": "boolean"
           },
+          "browser_approval_available": {
+            "title": "Browser Approval Available",
+            "type": "boolean"
+          },
           "connected_apps_available": {
             "default": false,
             "title": "Connected Apps Available",
@@ -11120,6 +11160,10 @@
             ],
             "title": "Public Sharing Max Level",
             "type": "string"
+          },
+          "push_credentials_required": {
+            "title": "Push Credentials Required",
+            "type": "boolean"
           },
           "request_managed_sandbox_host_id": {
             "default": true,
@@ -11313,6 +11357,9 @@
             "title": "Task Board Enabled",
             "type": "boolean"
           },
+          "telemetry": {
+            "$ref": "#/components/schemas/TelemetryStatus"
+          },
           "usage_board_enabled": {
             "default": false,
             "title": "Usage Board Enabled",
@@ -11326,6 +11373,9 @@
         },
         "required": [
           "accounts_enabled",
+          "browser_approval_available",
+          "push_credentials_required",
+          "telemetry",
           "single_user",
           "login_url",
           "needs_setup",
@@ -11391,6 +11441,7 @@
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.input.sending": "#/components/schemas/SessionInputSendingEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.launched_model": "#/components/schemas/SessionLaunchedModelEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -11427,6 +11478,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionLaunchedModelEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTitleEvent"
@@ -13339,6 +13393,51 @@
         "title": "SessionLabelsResponse",
         "type": "object"
       },
+      "SessionLaunchedModelEvent": {
+        "description": "Confirmed launched-model update for an active session header.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launched"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.launched_model",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionLaunchedModelEvent",
+        "type": "object"
+      },
       "SessionList": {
         "description": "Paginated list of sessions; `data` is a page of `SessionListItem`.",
         "properties": {
@@ -14264,6 +14363,18 @@
             "description": "The model the harness reports the session is on, VERBATIM in the harness's own spelling, e.g. `\"claude-opus-4-8[1m]\"` or `\"gpt-5.6-luna\"` \u2014 never collapsed to a picker alias. Category: **transient** (SSE-only). The server also writes `reported_model` on the conversation (served on the snapshot's `llm_model`), so on reconnect clients restore the display from the snapshot rather than from a replayed event.",
             "title": "Model",
             "type": "string"
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reported"
           },
           "sequence_number": {
             "anyOf": [
@@ -15760,6 +15871,18 @@
             "description": "Total token count (input + output) from the most recently completed task's `usage`, e.g. `45231`. `None` when no task has completed yet. Lets clients seed their context-ring on conversation resume without waiting for the next `response.completed` SSE event.",
             "title": "Last Total Tokens"
           },
+          "launched": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Post-resolution model passed to the harness (`model_override`), or `None` when unset or not confirmed by the harness (e.g. `antigravity-native`).",
+            "title": "Launched"
+          },
           "llm_model": {
             "anyOf": [
               {
@@ -15956,6 +16079,18 @@
             "description": "Per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, and `\"max\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
             "title": "Reasoning Effort"
           },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model originally requested for the session \u2014 `saved` from `omnigent.model_resolution` when resolution rewrote it, else `model_override`. `None` when unset.",
+            "title": "Requested"
+          },
           "root_conversation_id": {
             "anyOf": [
               {
@@ -15991,6 +16126,18 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model last reported as actually running by the harness (`reported_model`), or `None` when not yet reported.",
+            "title": "Running"
           },
           "running_since": {
             "anyOf": [
@@ -18486,6 +18633,42 @@
         "title": "StoreHarnessCredentialRequest",
         "type": "object"
       },
+      "TelemetrySettingsUpdate": {
+        "properties": {
+          "telemetry_enabled": {
+            "title": "Telemetry Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "telemetry_enabled"
+        ],
+        "title": "TelemetrySettingsUpdate",
+        "type": "object"
+      },
+      "TelemetryStatus": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "locked": {
+            "title": "Locked",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "locked",
+          "source"
+        ],
+        "title": "TelemetryStatus",
+        "type": "object"
+      },
       "TerminalCommandData": {
         "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
         "properties": {
@@ -20055,6 +20238,11 @@
             ],
             "title": "Incomplete Reason"
           },
+          "requests_configured": {
+            "default": false,
+            "title": "Requests Configured",
+            "type": "boolean"
+          },
           "span": {
             "$ref": "#/components/schemas/AnalysisSpan"
           }
@@ -20164,6 +20352,11 @@
               }
             ],
             "title": "Previous"
+          },
+          "requests_configured": {
+            "default": false,
+            "title": "Requests Configured",
+            "type": "boolean"
           },
           "rows": {
             "items": {
@@ -20680,6 +20873,365 @@
           }
         },
         "title": "UsageReport",
+        "type": "object"
+      },
+      "UsageRequestRow": {
+        "description": "Allowlisted per-request row fields; prompt text is never carried.",
+        "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account"
+          },
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
+          "at": {
+            "title": "At",
+            "type": "string"
+          },
+          "cost_basis": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Basis"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Class"
+          },
+          "fallback": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback"
+          },
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host"
+          },
+          "http_status": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Http Status"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "model_requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Requested"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/UsageRequestTokens"
+          },
+          "tps": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tps"
+          },
+          "ttft_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttft Ms"
+          }
+        },
+        "required": [
+          "id",
+          "at"
+        ],
+        "title": "UsageRequestRow",
+        "type": "object"
+      },
+      "UsageRequestSection": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "UsageRequestSection",
+        "type": "object"
+      },
+      "UsageRequestTokens": {
+        "properties": {
+          "cache_read": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read"
+          },
+          "cache_write": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          }
+        },
+        "title": "UsageRequestTokens",
+        "type": "object"
+      },
+      "UsageRequestsView": {
+        "properties": {
+          "hour": {
+            "format": "int64",
+            "title": "Hour",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "retained_from": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained From"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRequestRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "sections": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/UsageRequestSection"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sections"
+          },
+          "state": {
+            "enum": [
+              "ok",
+              "expired",
+              "partial"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "tz": {
+            "default": "UTC",
+            "title": "Tz",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hour",
+          "state"
+        ],
+        "title": "UsageRequestsView",
         "type": "object"
       },
       "UsageWindowView": {
@@ -22184,7 +22736,7 @@
     },
     "/v1/calling-defaults/catalogs": {
       "get": {
-        "description": "Return the caller's own cached catalogs, stale rows included.\n\nA `host_id` or `harness` filter reads the cache only: it skips the\nfirst-use ACP metadata sync, so it never waits on a host probe.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
+        "description": "Return the caller's own cached catalogs, stale rows included.\n\nOnly an explicit AG harness filter waits briefly for an AG refresh.\nOther reads use cached AG rows while the refresh runs in the background.\nFirst-use ACP metadata sync remains exclusive to unfiltered reads.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
         "operationId": "list_calling_default_catalogs_v1_calling_defaults_catalogs_get",
         "parameters": [
           {
@@ -26204,6 +26756,9 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
+                  "terminal_keyboard": {
+                    "type": "object"
+                  },
                   "value": {}
                 },
                 "required": [
@@ -32881,6 +33436,164 @@
           }
         },
         "summary": "Preview Baseline"
+      }
+    },
+    "/v1/me/usage/requests": {
+      "get": {
+        "operationId": "read_usage_requests_v1_me_usage_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "hour",
+            "required": true,
+            "schema": {
+              "title": "Hour",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "account",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 8,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageRequestsView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Usage Requests"
       }
     },
     "/v1/me/usage/sources": {
@@ -43207,6 +43920,44 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/v1/system/telemetry": {
+      "put": {
+        "operationId": "update_telemetry_v1_system_telemetry_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TelemetrySettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Telemetry"
       }
     },
     "/v1/usage": {

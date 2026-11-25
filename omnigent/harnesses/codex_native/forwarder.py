@@ -1173,6 +1173,8 @@ class _CodexForwarderState:
     background_tasks_unsupported: bool = False
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
+    background_terminal_thread_closed: bool = False
+    on_background_terminals: Callable[[bool], None] | None = None
     goal_unknown: bool = False
 
     def __post_init__(self) -> None:
@@ -1469,7 +1471,8 @@ class _CodexForwarderState:
         self.goal_status = None
         self.goal_updates += 1
         self.goal_unknown = False
-        self.background_terminals = None
+        self.background_terminal_thread_closed = False
+        self.note_background_terminals(None)
         self.posted_background_work_running = None
         self.posted_background_tasks = None
         self.goal_failure_awaits_turn = False
@@ -1480,6 +1483,12 @@ class _CodexForwarderState:
     def has_background_terminals(self) -> bool:
         """Whether the last listing found a background terminal still running."""
         return bool(self.background_terminals)
+
+    def note_background_terminals(self, terminals: list[_JsonObject] | None) -> None:
+        """Record the list and update the runner's local liveness signal."""
+        self.background_terminals = terminals
+        if self.on_background_terminals is not None:
+            self.on_background_terminals(self.has_background_terminals)
 
     async def forget_posted_terminals(self) -> None:
         """
@@ -2162,6 +2171,7 @@ class _CodexTurnStatusEdge:
     terminal_outcome: str | None = None
     bridge_revision: int | None = None
     bridge_thread_id: str | None = None
+    cold_retry_state: CodexNativeBridgeState | None = None
 
 
 @dataclass(frozen=True)
@@ -3136,6 +3146,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    on_background_terminals: Callable[[bool], None] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -3158,6 +3169,7 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param on_background_terminals: Runner-local observer for running background terminals.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -3216,6 +3228,7 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
+            on_background_terminals=on_background_terminals,
         )
         bridge_state = read_bridge_state(bridge_dir)
         if bridge_state is not None and bridge_state.permission_profile:
@@ -4521,6 +4534,7 @@ def _resume_turn_status_edge_for_latest_turn(
         error = _terminal_error_from_turn({"turn": turn})
         outcome = None
         revision = None
+        cold_retry_revision = None
         if status == "running":
             update_active_turn_id(bridge_dir, turn_id)
         else:
@@ -4537,10 +4551,21 @@ def _resume_turn_status_edge_for_latest_turn(
                 for item in turns
                 if isinstance(item, dict) and (value := _turn_id_from_payload(item)) is not None
             ]
-            current = record_resumed_terminal(bridge_dir, state, turn_ids, outcome)
+
+            def capture_cold_retry(revision: int) -> None:
+                nonlocal cold_retry_revision
+                cold_retry_revision = revision
+
+            current = record_resumed_terminal(
+                bridge_dir, state, turn_ids, outcome, on_cold_retry=capture_cold_retry
+            )
             if current is None:
                 return None
-            revision = current.active_turn_revision
+            revision = (
+                current.active_turn_revision
+                if cold_retry_revision is None
+                else cold_retry_revision
+            )
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -4549,6 +4574,7 @@ def _resume_turn_status_edge_for_latest_turn(
             terminal_outcome=outcome,
             bridge_revision=revision,
             bridge_thread_id=thread_id if revision is not None else None,
+            cold_retry_state=state if cold_retry_revision is not None else None,
         )
     return None
 
@@ -4747,6 +4773,19 @@ async def _handle_event(
         return
     if forwarder_state is not None and bridge_dir != Path():
         forwarder_state.child_usage_baseline_dir = bridge_dir
+    if method == "thread/closed":
+        if (
+            forwarder_state is not None
+            and expected_thread_id is not None
+            and _thread_id_from_params(params) == expected_thread_id
+        ):
+            forwarder_state.background_terminal_thread_closed = True
+            forwarder_state.cancel_background_terminal_poll()
+            forwarder_state.note_background_terminals([])
+            await _sync_background_work_running(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+        return
     terminal_event = method in {"turn/completed", "turn/failed"} or (
         method == "error" and params.get("willRetry") is not True
     )
@@ -5933,6 +5972,8 @@ async def _refresh_background_terminals(
     :returns: ``True`` when a terminal is still running, or was before a
         failed listing, so the caller should list again.
     """
+    if forwarder_state.background_terminal_thread_closed:
+        return False
     keep_listing = False
     if forwarder_state.background_terminals_supported:
         try:
@@ -5943,7 +5984,7 @@ async def _refresh_background_terminals(
         except CodexAppServerResponseError as exc:
             if codex_rejects_request_method(exc, _CODEX_BACKGROUND_TERMINALS_LIST_METHOD):
                 forwarder_state.background_terminals_supported = False
-                forwarder_state.background_terminals = None
+                forwarder_state.note_background_terminals(None)
                 log_info_once(
                     _logger,
                     "Codex app-server cannot list background terminals; "
@@ -5956,12 +5997,14 @@ async def _refresh_background_terminals(
             _logger.warning("Codex background terminal listing failed", exc_info=True)
             keep_listing = forwarder_state.has_background_terminals
         else:
-            forwarder_state.background_terminals = _background_terminal_tasks(terminals)
+            if forwarder_state.background_terminal_thread_closed:
+                return False
+            forwarder_state.note_background_terminals(_background_terminal_tasks(terminals))
             keep_listing = forwarder_state.has_background_terminals
     await _sync_background_work_running(
         ap_client, session_id=session_id, forwarder_state=forwarder_state
     )
-    return keep_listing
+    return keep_listing and not forwarder_state.background_terminal_thread_closed
 
 
 async def _poll_background_terminals(
@@ -10961,10 +11004,18 @@ async def _post_turn_status_edge(
         if bridge_dir is None or edge.bridge_revision is None:
             return True
         current = read_bridge_state(bridge_dir)
+        if current is None or current.thread_id != edge.bridge_thread_id:
+            return False
+        if (cold := edge.cold_retry_state) is not None:
+            return (
+                current.session_id == cold.session_id
+                and current.socket_path == cold.socket_path
+                and current.active_turn_revision == cold.active_turn_revision
+                and current.active_turn_id is None
+                and current.last_terminal_turn_id is None
+            )
         return (
-            current is not None
-            and current.thread_id == edge.bridge_thread_id
-            and current.active_turn_revision == edge.bridge_revision
+            current.active_turn_revision == edge.bridge_revision
             and current.last_terminal_turn_id == edge.turn_id
             and current.last_terminal_outcome == edge.terminal_outcome
         )

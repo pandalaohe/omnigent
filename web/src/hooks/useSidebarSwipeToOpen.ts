@@ -19,10 +19,10 @@ import {
 // Touches this close to the left screen edge belong to the OS / shell back or
 // edge-swipe gesture, so this gesture never competes with it.
 export const EDGE_EXCLUSION_PX = 24;
-// Text inputs and terminals handle their own horizontal touch (caret moves,
-// selection, terminal scrollback).
+// Text inputs, terminals, and opt-out controls handle their own horizontal
+// touch (caret moves, selection, terminal scrollback, key-bar swipes).
 const OWN_TOUCH_SELECTOR =
-  'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .xterm';
+  'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .xterm, [data-sidebar-swipe-ignore]';
 
 /**
  * True when the touch should be left alone: it is outside `surface`, inside a

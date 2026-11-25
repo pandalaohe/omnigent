@@ -5,6 +5,7 @@ import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
 import { localDay, repositoryCommitTotals } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
+import { interfaceText } from "@/lib/interfaceText";
 import { BoardIdentityMark, boardIdentityColor } from "./BoardIdentityMark";
 import {
   activityNumber,
@@ -103,7 +104,7 @@ export function TaskBoardToday({
   const quotes = tasks
     .flatMap((task) =>
       (task["omnigent.ai:sourceDisplay"]?.quotes ?? [])
-        .filter((q) => q.text.length > 8 && !/^推荐|^按表格/.test(q.text))
+        .filter((q) => q.text.length > 8 && q.showInSummary !== false)
         .map((q) => ({ task, q })),
     )
     .sort(
@@ -316,10 +317,10 @@ export function TaskBoardToday({
                   if (target) onSelect(target);
                 }}
               >
-                {"「"}
+                {interfaceText("quoteOpen")}
                 {q.text.slice(0, 80)}
                 {q.text.length > 80 ? "…" : ""}
-                {"」"}
+                {interfaceText("quoteClose")}
                 <cite>
                   {activityTaskName(task)}
                   {q.date ? " · " + q.date : ""}

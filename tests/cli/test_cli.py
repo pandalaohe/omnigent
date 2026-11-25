@@ -6065,6 +6065,34 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     assert _resolve_auto_open_conversation_from_config(cfg) is True
 
 
+def test_config_edits_native_history_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.config import native_history_cleanup_enabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("host:\n  name: test-host\n", encoding="utf-8")
+    runner = CliRunner()
+    key = "host.native_history_cleanup"
+
+    assert not native_history_cleanup_enabled()
+    assert runner.invoke(cli, ["config", "set", f"{key}=true"]).exit_code != 0
+    assert runner.invoke(cli, ["config", "set", "--global", f"{key}=invalid"]).exit_code != 0
+
+    result = runner.invoke(cli, ["config", "set", "--global", f"{key}=true"])
+    assert result.exit_code == 0, result.output
+    assert native_history_cleanup_enabled()
+    assert f"{key}=True" in runner.invoke(cli, ["config", "list"]).output
+
+    result = runner.invoke(cli, ["config", "unset", "--global", key])
+    assert result.exit_code == 0, result.output
+    assert not native_history_cleanup_enabled()
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {
+        "host": {"name": "test-host"}
+    }
+
+
 def test_config_set_global_writes_session_title_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6090,6 +6118,7 @@ def test_config_set_global_writes_session_title_instructions(
 @pytest.mark.parametrize(
     "setting",
     [
+        "codex_native_unlisted_model=as_requested",
         "session_title_instructions=Prefix titles with the current date.",
         "server=https://example.com",
     ],
@@ -6126,6 +6155,7 @@ def test_config_set_requires_global_for_server_settings(
 @pytest.mark.parametrize(
     "key,value",
     [
+        ("codex_native_unlisted_model", "as_requested"),
         ("session_title_instructions", "Prefix titles with the current date."),
         ("server", "http://project.example.invalid"),
     ],
@@ -6149,6 +6179,31 @@ def test_config_list_warns_about_project_local_user_level_settings(
     assert f"ignored user-level-only setting(s): {key}" in result.output
     assert "set with --global" in result.output
     assert f"  {key}=" not in result.output
+
+
+def test_config_set_and_unset_global_codex_unlisted_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    key = "codex_native_unlisted_model"
+    config_path.write_text("model: gpt-5.6-sol\n")
+    runner = CliRunner()
+
+    for mode in ("as_requested", "fallback"):
+        result = runner.invoke(cli, ["config", "set", "--global", f"{key}={mode}"])
+        assert result.exit_code == 0, result.output
+        assert yaml.safe_load(config_path.read_text())[key] == mode
+
+    result = runner.invoke(cli, ["config", "set", "--global", f"{key}=yes"])
+    assert result.exit_code != 0
+    assert f"{key} must be as_requested or fallback" in result.output
+    assert yaml.safe_load(config_path.read_text())[key] == "fallback"
+
+    result = runner.invoke(cli, ["config", "unset", "--global", key])
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(config_path.read_text()) == {"model": "gpt-5.6-sol"}
 
 
 def test_config_set_global_reports_effective_config_home(

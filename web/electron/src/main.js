@@ -33,8 +33,7 @@ const {
   systemPreferences,
   webContents: electronWebContents,
 } = require("electron");
-const { autoUpdater } = require("electron-updater");
-const { createDesktopUpdater } = require("./desktop_updater");
+const { createDesktopUpdater, normalizeExternalReleaseRepo } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
 const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
@@ -43,7 +42,13 @@ const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
-const { omnigentBuild, productName, appId } = require("../package.json");
+const {
+  omnigentBuild,
+  productName,
+  appId,
+  omnigentExternalReleaseRepo,
+  omnigentDistributionRepo,
+} = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
@@ -1662,6 +1667,37 @@ function activateAppWindow() {
   if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
 }
 
+const distributionRepo =
+  typeof omnigentDistributionRepo === "string"
+    ? normalizeExternalReleaseRepo(omnigentDistributionRepo)
+    : null;
+const distributionInstallDocsUrl = distributionRepo
+  ? `https://github.com/${distributionRepo}/blob/main/docs/install.md`
+  : undefined;
+const distributionCliOptions = distributionRepo
+  ? {
+      installCommand:
+        process.platform === "win32"
+          ? `irm https://raw.githubusercontent.com/${distributionRepo}/main/scripts/install_oss.ps1 | iex`
+          : `curl -fsSL https://raw.githubusercontent.com/${distributionRepo}/main/scripts/install_oss.sh | sh`,
+      installDocsUrl: distributionInstallDocsUrl,
+    }
+  : undefined;
+const externalReleaseRepo =
+  !isDevBuild && process.platform === "darwin" && typeof omnigentExternalReleaseRepo === "string"
+    ? normalizeExternalReleaseRepo(omnigentExternalReleaseRepo)
+    : null;
+
+let cachedAutoUpdater = null;
+function getAutoUpdater() {
+  if (!cachedAutoUpdater) {
+    // Lazily access `electron-updater` only on legacy auto-update builds so
+    // unsigned macOS external-release builds never construct MacUpdater.
+    ({ autoUpdater: cachedAutoUpdater } = require("electron-updater"));
+  }
+  return cachedAutoUpdater;
+}
+
 /**
  * Effective version for development update checks and UI. Packaged builds
  * always use Electron's real app version.
@@ -1675,9 +1711,10 @@ function configureDesktopVersion() {
   try {
     // electron-updater stores a SemVer instance here and reads it when deciding
     // eligibility. Reuse its constructor so comparisons keep the expected type.
-    const Version = autoUpdater.currentVersion.constructor;
+    const updaterClient = getAutoUpdater();
+    const Version = updaterClient.currentVersion.constructor;
     const version = new Version(override);
-    autoUpdater.currentVersion = version;
+    updaterClient.currentVersion = version;
     return version.version;
   } catch (err) {
     throw new Error(
@@ -1701,7 +1738,7 @@ const updater = createDesktopUpdater({
   ipcMain,
   dialog,
   nativeImage,
-  autoUpdater,
+  autoUpdater: externalReleaseRepo ? null : getAutoUpdater(),
   loadSettings,
   saveSettings,
   isPinnedOriginSender,
@@ -1715,6 +1752,8 @@ const updater = createDesktopUpdater({
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
   updatesEnabled: !app.isPackaged || !isDevBuild,
+  externalReleaseRepo,
+  openExternal: (url) => shell.openExternal(url),
 });
 
 /**
@@ -1801,7 +1840,8 @@ const aboutWindow = createAboutWindow({
       nativeImage,
       fallbackIconPath: ICON_PNG,
     }),
-  getCliStatus: () => omnigentCli.getCliStatus(loadSettings().omnigent_path),
+  getCliStatus: () =>
+    omnigentCli.getCliStatus(loadSettings().omnigent_path, distributionCliOptions),
   onDesktopDownloadStarted: (parent) => updateOverlay.suppress(parent),
   onClosed: (parent) => updateOverlay.unsuppress(parent),
   aboutPage: ABOUT_PAGE,
@@ -2007,7 +2047,7 @@ function hostCliCommand(serverUrl) {
  */
 async function applyCliPath(configuredPath) {
   const trimmed = String(configuredPath ?? "").trim();
-  const status = await omnigentCli.getCliStatus(trimmed || null);
+  const status = await omnigentCli.getCliStatus(trimmed || null, distributionCliOptions);
   const accepted = status.installed && status.source === "configured";
   if (accepted) {
     const settings = loadSettings();
@@ -2031,7 +2071,7 @@ async function clearCliPath() {
   const settings = loadSettings();
   delete settings.omnigent_path;
   saveSettings(settings);
-  return omnigentCli.getCliStatus(null);
+  return omnigentCli.getCliStatus(null, distributionCliOptions);
 }
 
 /** Maximum number of entries kept in the persisted recent-servers list. */
@@ -5337,11 +5377,12 @@ function registerIpc() {
     }
     // Concurrent: the setup page holds its first paint on this.
     const [status, localUrl] = await Promise.all([
-      omnigentCli.getCliStatus(loadSettings().omnigent_path),
+      omnigentCli.getCliStatus(loadSettings().omnigent_path, distributionCliOptions),
       omnigentCli.localServerHealthy(),
     ]);
     return {
       ...status,
+      ...(distributionInstallDocsUrl ? { installDocsUrl: distributionInstallDocsUrl } : {}),
       customizationDisabled: databricksInternalFeaturesEnabled(),
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
@@ -5361,7 +5402,7 @@ function registerIpc() {
     }
     if (databricksInternalFeaturesEnabled()) {
       return {
-        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path, distributionCliOptions)),
         customizationDisabled: true,
         accepted: false,
       };
@@ -5427,8 +5468,14 @@ function registerIpc() {
       }
     };
     cliInstallInFlight = (async () => {
-      const result = await cliInstall.installCli({ onOutput });
-      const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
+      const result = await cliInstall.installCli({
+        onOutput,
+        installDocsUrl: distributionInstallDocsUrl,
+      });
+      const status = await omnigentCli.getCliStatus(
+        loadSettings().omnigent_path,
+        distributionCliOptions,
+      );
       return { ...result, installed: status.installed === true };
     })().finally(() => {
       cliInstallInFlight = null;
@@ -5489,7 +5536,7 @@ function registerIpc() {
       return null;
     }
     return {
-      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path, distributionCliOptions)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
     };
   });
@@ -5506,7 +5553,7 @@ function registerIpc() {
     }
     if (databricksInternalFeaturesEnabled()) {
       return {
-        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path, distributionCliOptions)),
         customizationDisabled: true,
       };
     }
@@ -6731,7 +6778,7 @@ if (!gotLock) {
           clearQuitForceExitTimer();
           // A failed install (e.g. the user cancels the admin prompt) must not
           // leave the torn-down app running.
-          autoUpdater.once("error", () => app.exit(0));
+          getAutoUpdater().once("error", () => app.exit(0));
           updater.quitAndInstallIfPending();
           // Squirrel.Mac installs asynchronously and, for a bundle the user
           // can't write (root-owned install), shows an admin password prompt

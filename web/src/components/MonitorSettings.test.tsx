@@ -39,6 +39,7 @@ const SETTINGS = {
     default: { heavy: 4, new_session: 5 },
     hosts: { host_1: { heavy: 3, new_session: 6 } },
     queue_enabled: true,
+    notices_enabled: false,
   },
   default_health_check_prompt: "Default prompt.",
 };
@@ -150,12 +151,32 @@ describe("MonitorSettingsDialog", () => {
       target: { value: "4.5" },
     });
     fireEvent.click(within(form).getByRole("switch", { name: "Queue new child sessions" }));
+    fireEvent.click(within(form).getByRole("switch", { name: "Send host load notices" }));
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(settingsPutCall()).toBeDefined());
     const putInit = settingsPutCall()?.[1] as RequestInit;
     expect(JSON.parse(String(putInit.body))).toEqual({
-      load_lines: { default: { heavy: 3, new_session: 4.5 }, queue_enabled: false },
+      load_lines: {
+        default: { heavy: 3, new_session: 4.5 },
+        queue_enabled: false,
+        notices_enabled: true,
+      },
+    });
+  });
+
+  it("saves threshold edits without overwriting either automation switch", async () => {
+    renderPanel();
+    const form = await screen.findByTestId("load-lines-form");
+    fireEvent.change(within(form).getByLabelText("Heavy work (per core)"), {
+      target: { value: "3" },
+    });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(settingsPutCall()).toBeDefined());
+    const putInit = settingsPutCall()?.[1] as RequestInit;
+    expect(JSON.parse(String(putInit.body))).toEqual({
+      load_lines: { default: { heavy: 3, new_session: SETTINGS.load_lines.default.new_session } },
     });
   });
 

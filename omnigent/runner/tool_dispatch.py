@@ -79,6 +79,7 @@ from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_AGENT,
     CREATE_ORIGIN_HEADER,
 )
+from omnigent.shell_timeouts import MAX_SHELL_DISPATCH_TIMEOUT_S
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -231,8 +232,7 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
-_OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
-_RUNNER_EXECUTION_TIMEOUT_S = 7200.0
+_RUNNER_EXECUTION_TIMEOUT_S = MAX_SHELL_DISPATCH_TIMEOUT_S
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "stopped", "killed"}
@@ -252,7 +252,7 @@ _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, co
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
 # timeouts, so these must sit above the runner's execution timeout rather than
-# only above the 120-second shell default. Keep the outer hop larger so the
+# only above the default shell budget. Keep the outer hop larger so the
 # AP→runner leg fails first with the more specific error when the proxy wedges.
 MCP_PROXY_FORWARD_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 30.0
 MCP_PROXY_CALL_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 60.0
@@ -3347,11 +3347,11 @@ async def _get_server_object(
 
 async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient | None) -> str:
     """
-    List one host's cached launch catalog for an agent's harness.
+    List one host's launch catalog for an agent's harness.
 
     The server maps the agent to its harness as a session create would
-    (``/v1/calling-defaults/resolve``); the rows are the cached catalog the
-    new-session picker reads (``/v1/calling-defaults/catalogs``).
+    (``/v1/calling-defaults/resolve``); the rows come from the same catalog
+    the new-session picker reads (``/v1/calling-defaults/catalogs``).
 
     :param args: Tool arguments carrying ``host`` (id or exact name) and
         ``agent_id``.
@@ -3399,7 +3399,8 @@ async def _list_host_catalog(args: _JsonObject, server_client: httpx.AsyncClient
                 ),
             }
         )
-    # The filtered read is cache-only, so other hosts' probes never delay it.
+    # The filters keep any refresh scoped to this host and harness. The server
+    # bounds an AG read below this client's HTTP timeout and can return stale rows.
     catalogs, error = await _get_server_object(
         server_client,
         "/v1/calling-defaults/catalogs",
@@ -5926,6 +5927,7 @@ def _build_session_create_body(
     reasoning_effort: object = None,
     placement: _CreatePlacement | None = None,
     speed: object = None,
+    permission_tier: str | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -5970,6 +5972,8 @@ def _build_session_create_body(
         body["agent_id"] = agent_id
     if speed is not None:
         body["labels"] = {"omnigent.speed_tier": speed}
+    if permission_tier is not None:
+        body["permission_tier"] = permission_tier
     if placement is not None:
         if placement.host_id is not None:
             body["host_id"] = placement.host_id
@@ -6664,6 +6668,18 @@ async def _execute_session_create_impl(
     placement_mode = args.get("placement", "child")
     if placement_mode not in ("child", "same_host", "managed"):
         return json.dumps({"error": "placement must be child, same_host or managed"})
+    permission_tier = args.get("permission_tier")
+    if permission_tier is not None:
+        from omnigent.permission_tiers import NON_FULL_TIERS
+
+        if not isinstance(permission_tier, str) or permission_tier not in NON_FULL_TIERS:
+            return json.dumps(
+                {"error": "permission_tier must be ask, plan, accept-edits, or auto"}
+            )
+        if placement_mode != "child" or has_config_path:
+            return json.dumps(
+                {"error": "permission_tier requires a registered or default child agent"}
+            )
     if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     project_error = _project_argument_error(args, placement_mode)
@@ -6749,8 +6765,15 @@ async def _execute_session_create_impl(
         reasoning_effort=args.get("reasoning_effort"),
         placement=placement,
         speed=args.get("speed"),
+        permission_tier=cast(str | None, permission_tier),
     )
     headers: dict[str, str] = dict(_AGENT_CREATE_HEADERS)
+    from omnigent.server.permission_tiers import (
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+    )
+
+    headers[PERMISSION_PROTOCOL_HEADER] = PERMISSION_PROTOCOL_VERSION
     headers["x-omnigent-session-choice"] = "1"
     for key in ("work_type", "user_named", "choice_reason", "exclude", "differ_from"):
         if key in args:
@@ -7149,13 +7172,21 @@ async def _upload_config_bundle(
         if unsupported is not None:
             return unsupported
 
+    from omnigent.server.permission_tiers import (
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+    )
+
     async def post() -> httpx.Response:
         return await server_client.post(
             "/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
             timeout=_SESSION_CREATE_TIMEOUT,
-            headers=_AGENT_CREATE_HEADERS,
+            headers={
+                **_AGENT_CREATE_HEADERS,
+                PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION,
+            },
         )
 
     try:
@@ -9669,6 +9700,9 @@ async def _session_info_item(
             if snap.get("harness") == "antigravity-native"
             else snap.get("model_override") or snap.get("llm_model")
         ),
+        "requested": snap.get("requested"),
+        "launched": snap.get("launched"),
+        "running": snap.get("running"),
         "workspace": snap.get("workspace"),
         "worktree": snap.get("worktree"),
         "git_branch": snap.get("git_branch"),

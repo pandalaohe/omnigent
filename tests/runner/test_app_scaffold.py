@@ -71,7 +71,7 @@ def test_runner_app_moves_the_claude_forwarder_with_its_pane(runner_app: FastAPI
     from omnigent.runner.native import orchestration
 
     registry = runner_app.state.session_resource_registry
-    assert registry._claude_terminal_transfer_listener is (
+    assert registry._native_terminal_transfer_listeners["claude"][0] is (
         orchestration._rekey_auto_forwarder_task
     )
 

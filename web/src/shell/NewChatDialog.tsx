@@ -4164,11 +4164,22 @@ function NewChatLandingContent({
   const declaredPermissionOptions = useMemo(
     () =>
       acpHarness
-        ? acpPermissionOptions.map((option) => ({
-            ...option,
-            description:
-              option.description ?? "Sets the agent's own mode. What it covers is up to the agent.",
-          }))
+        ? [
+            { value: "", label: "Default" },
+            ...acpPermissionOptions.map((option) => ({
+              ...option,
+              description:
+                option.description ??
+                "Sets the agent's own mode. What it covers is up to the agent.",
+            })),
+            ...AGY_NATIVE_PERMISSION_TIERS.filter(
+              (option) => option.value !== AGY_NATIVE_FULL_PERMISSION_TIER,
+            ).map((option) => ({
+              ...option,
+              value: `host-tier:${option.value}`,
+              label: `Host tier · ${option.label}`,
+            })),
+          ]
         : selectionHarness
           ? sessionDefaultModeOptions(
               selectionHarness,
@@ -4184,7 +4195,7 @@ function NewChatLandingContent({
   const hasDeclaredPermissionMode =
     selectionHarness !== null &&
     (acpHarness !== null
-      ? acpPermissionOptions.length > 0
+      ? declaredPermissionOptions.length > 0
       : harnessCapabilities[selectionHarness]?.session_modes?.permission != null);
   const hasGenericPermissionMode =
     hasDeclaredPermissionMode &&
@@ -6432,7 +6443,10 @@ function NewChatLandingContent({
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(backdropRef, textareaRef, mentionTokensShown);
+  // The backdrop re-checks the token against the value before tinting it.
+  const commandToken = /^\s*([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/.exec(message)?.[1] ?? null;
+  const backdropActive = commandToken !== null || mentionTokensShown || hasTint(message, files);
+  useComposerMirrorAlignment(backdropRef, textareaRef, backdropActive);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -7582,9 +7596,13 @@ function NewChatLandingContent({
           reasoning_effort:
             normalizedReasoningEffort ??
             (createProjectId !== null && effortTouchedRef.current ? null : undefined),
-          ...(sdkHarness === "claude-sdk" || hasGenericPermissionMode
-            ? { permission_mode: permissionMode || undefined }
-            : {}),
+          ...(hasGenericPermissionMode &&
+          acpHarness !== null &&
+          permissionMode.startsWith("host-tier:")
+            ? { permission_tier: permissionMode.slice("host-tier:".length) }
+            : sdkHarness === "claude-sdk" || hasGenericPermissionMode
+              ? { permission_mode: permissionMode || undefined }
+              : {}),
           ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
           ...(agentSupportsAgyPermissionTier && !smartRoutingHarnessSelected
             ? { permission_tier: agySkipMode }
@@ -7910,10 +7928,6 @@ function NewChatLandingContent({
         ? `Start a new session in ${selectedProject}`
         : "Describe a task to start a new session…";
 
-  // Same anchored shape as upstream's command split; the backdrop re-checks
-  // it against the value before tinting. A live token also mounts the overlay.
-  const commandToken = /^\s*([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/.exec(message)?.[1] ?? null;
-  const backdropActive = commandToken !== null || mentionTokensShown || hasTint(message, files);
   const activeTokenIndex = tailCaret === null ? null : tokenAt(message, tailCaret, files);
 
   const focusToken = (index: number) => {
@@ -8540,11 +8554,6 @@ function NewChatLandingContent({
                   // dictation inserts there instead of at the end of the draft.
                   dictation.noteFocus();
                 },
-                onScroll: (e) => {
-                  // Keep the overlay's scroll position locked to the textarea's.
-                  if (backdropRef.current)
-                    backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-                },
                 onBlur: () => {
                   // Menu rows preventDefault on mousedown so selecting one keeps focus.
                   setInputFocused(false);
@@ -8612,7 +8621,6 @@ function NewChatLandingContent({
                     files={files}
                     command={commandToken}
                     activeIndex={hoveredFileIndex ?? activeTokenIndex}
-                    anchor={textareaRef}
                   />
                 ) : undefined,
                 beforeInput: (

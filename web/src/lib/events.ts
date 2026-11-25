@@ -649,6 +649,13 @@ export interface SessionModelEvent {
   type: "session_model";
   conversationId: string;
   model: string;
+  reported?: boolean;
+}
+
+export interface SessionLaunchedModelEvent {
+  type: "session_launched_model";
+  conversationId: string;
+  launched: string | null;
 }
 
 /**
@@ -1153,6 +1160,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionLaunchedModelEvent
   | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent

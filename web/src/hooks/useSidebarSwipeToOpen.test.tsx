@@ -33,6 +33,11 @@ function Harness(props: {
           <div data-testid="overlay" style={{ position: "fixed" }}>
             <span data-testid="overlay-content">drawer</span>
           </div>
+          <div data-sidebar-swipe-ignore>
+            <button type="button" data-testid="ignored-control">
+              key
+            </button>
+          </div>
         </main>
       </div>
       <div data-testid="outside">portal</div>
@@ -151,6 +156,7 @@ describe("useSidebarSwipeToOpen", () => {
     ["horizontally scrollable content", "scroller-content"],
     ["a text field", "composer"],
     ["a floating overlay", "overlay-content"],
+    ["a swipe-ignored control", "ignored-control"],
     ["content outside the shell", "outside"],
   ])("leaves swipes on %s alone", (_label, testId) => {
     const { getByTestId, onDragProgress, onSettle } = setup();

@@ -65,6 +65,7 @@ import {
   codexPermissionReadback,
 } from "@/lib/codexApprovalMode";
 import type { Session } from "@/lib/types";
+import { reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
   clearUnsentSends,
@@ -2160,6 +2161,27 @@ describe("chatStore — switchTo", () => {
     expect(bubble).not.toHaveProperty("sendingSinceMs");
   });
 
+  it("lets an exact history receipt supersede a stale native pending snapshot", async () => {
+    const id = "conv_native_snapshot_receipt";
+    const committed = {
+      ...userMessage("persisted_native_turn", "same prompt"),
+      web_stable_id: "a".repeat(32),
+    };
+    const content = [{ type: "input_text" as const, text: "same prompt" }];
+    const unreadId = "b".repeat(32);
+    seedSession(id, [committed]);
+    seedPendingInputs(id, [
+      { pending_id: "pending_settled", stable_id: committed.web_stable_id, content },
+      { pending_id: "pending_unread", stable_id: unreadId, content },
+    ]);
+
+    await useChatStore.getState().switchTo(id);
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      { tempId: "pending_unread", stableId: unreadId, content },
+    ]);
+  });
+
   it("replays the server send time for a native message waiting for delivery", async () => {
     seedSession("conv_native", []);
     const waiting = {
@@ -3385,6 +3407,217 @@ describe("chatStore — switchTo", () => {
       return defaultFetchHandler(input, init);
     };
   }
+
+  it("hydrates and PATCHes Codex SDK per-model effort and resets to Default", async () => {
+    seedSession("conv_sdk_codex", []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_sdk_codex" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_sdk_codex",
+          agent_id: "agent_xyz",
+          status: "running",
+          created_at: 0,
+          labels: {},
+          harness: "codex",
+          reasoning_effort: "ultra",
+          model_override: "model-a",
+          model_options: [
+            {
+              id: "model-a",
+              supportedReasoningEfforts: ["none", "minimal", "max", "ultra"].map(
+                (reasoningEffort) => ({ reasoningEffort }),
+              ),
+            },
+          ],
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_sdk_codex");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    fetchMock.mockClear();
+    await useChatStore.getState().setEffort("minimal");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("minimal");
+    await useChatStore.getState().setEffort(null);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(
+      fetchMock.mock.calls
+        .filter(
+          ([u, init]) => String(u) === "/v1/sessions/conv_sdk_codex" && init?.method === "PATCH",
+        )
+        .map(([, init]) => JSON.parse(String(init?.body))),
+    ).toEqual([{ reasoning_effort: "minimal" }, { reasoning_effort: "default" }]);
+  });
+
+  it.each([false, true])(
+    "clears Codex SDK effort after switching to a model with no ladder (refused=%s)",
+    async (refused) => {
+      const id = "conv_sdk_no_ladder";
+      seedSession(id, []);
+      client.setQueryData(["harness-labels"], {
+        labels: {},
+        setupSteps: {},
+        acpHarnesses: new Set<string>(),
+        effortFamilies: { codex: "codex-native" },
+      });
+      const models = [
+        { id: "model-a", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+        { id: "model-b", supportedReasoningEfforts: [] },
+      ];
+      const wire = {
+        id,
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        labels: {},
+        harness: "codex",
+        model_override: "model-a",
+        reasoning_effort: "high" as string | null,
+        model_options: models,
+      };
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+          if (init?.method === "PATCH") {
+            const body = JSON.parse(String(init.body));
+            if ("reasoning_effort" in body) {
+              if (refused)
+                return mockResponse({ detail: "Setting refused" }, { ok: false, status: 403 });
+              wire.reasoning_effort =
+                body.reasoning_effort === "default" ? null : body.reasoning_effort;
+            }
+            if ("model_override" in body) wire.model_override = body.model_override;
+          }
+          return mockResponse(wire);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().switchTo(id);
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+      await useChatStore.getState().setModel("model-b");
+      await useChatStore.getState().refreshSessionState();
+      expect(useChatStore.getState().sessionModelOverride).toBe("model-b");
+      const reconciled = reconcileEffortOnModelChange("codex", models, "model-b", "high");
+      expect(reconciled).toBeNull();
+      fetchMock.mockClear();
+      const patches = () =>
+        fetchMock.mock.calls
+          .filter(([u, init]) => String(u) === `/v1/sessions/${id}` && init?.method === "PATCH")
+          .map(([, init]) => JSON.parse(String(init?.body)));
+      await useChatStore.getState().setEffort("high");
+      expect(patches()).toEqual([]);
+      expect(wire.reasoning_effort).toBe("high");
+      const cleared = useChatStore.getState().setEffort(reconciled);
+      if (refused) await expect(cleared).rejects.toThrow();
+      else await cleared;
+      expect(patches()).toEqual([{ reasoning_effort: "default" }]);
+      expect(wire.reasoning_effort).toBe(refused ? "high" : null);
+      expect(useChatStore.getState().sessionReasoningEffort).toBe(refused ? "high" : null);
+    },
+  );
+
+  it("preserves a no-ladder SDK override across cold reload, clear refusal and retry", async () => {
+    const id = "conv_sdk_reload_clear";
+    seedSession(id, []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    const wire = {
+      id,
+      agent_id: "agent_xyz",
+      status: "idle",
+      created_at: 0,
+      labels: {},
+      harness: "codex",
+      model_override: "plain",
+      reasoning_effort: "ultra" as string | null,
+      model_options: [{ id: "plain", supportedReasoningEfforts: [] }],
+    };
+    let clears = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+        if (init?.method === "PATCH") {
+          expect(JSON.parse(String(init.body))).toEqual({ reasoning_effort: "default" });
+          clears += 1;
+          if (clears === 1)
+            return mockResponse({ detail: "Clear refused" }, { ok: false, status: 403 });
+          wire.reasoning_effort = null;
+        }
+        return mockResponse(wire);
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    await expect(useChatStore.getState().setEffort(null)).rejects.toThrow();
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    initChatStore(client);
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("ultra");
+    await useChatStore.getState().setEffort(null);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    initChatStore(client);
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(clears).toBe(2);
+  });
+
+  it.each([
+    { inference_configured: true },
+    { parent_session_id: "parent" },
+    { labels: { "omnigent.wrapper": "codex-native-ui-subagent" } },
+    { labels: { "omnigent.closed": "true" } },
+  ])("keeps the no-ladder SDK reset restricted for %j", async (restriction) => {
+    const id = "conv_sdk_reset_restricted";
+    seedSession(id, []);
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { codex: "codex-native" },
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === `/v1/sessions/${id}` &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          labels: {},
+          harness: "codex",
+          model_override: "model-b",
+          reasoning_effort: "high",
+          model_options: [{ id: "model-b", supportedReasoningEfforts: [] }],
+          ...restriction,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    fetchMock.mockClear();
+    await useChatStore.getState().setEffort(null);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([u, init]) => String(u) === `/v1/sessions/${id}` && init?.method === "PATCH",
+      ),
+    ).toEqual([]);
+  });
 
   it.each(["anthropic", "none", "unavailable"])(
     "hydrates an SDK session's saved effort without a catalog, but waits for %s before PATCHing",
@@ -12013,6 +12246,287 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().pendingModelChange).toBe("haiku");
     });
+
+    it("updates session.running only for confirmed harness reports, not speculative router picks", () => {
+      client.setQueryData(["session", "conv_speculative"], {
+        id: "conv_speculative",
+        harness: "codex-native",
+        requested: "gpt-6.2-sol",
+        launched: null,
+        running: null,
+        labels: {},
+      } as unknown as Session);
+      useChatStore.setState({
+        conversationId: "conv_speculative",
+        llmModel: null,
+      });
+
+      // Speculative router pick keeps legacy llmModel picker sync but does not set running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-sol",
+      });
+      expect(useChatStore.getState().llmModel).toBe("gpt-6.2-sol");
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBeNull();
+
+      // Confirmed harness report updates running.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_speculative",
+        model: "gpt-6.2-astra",
+        reported: true,
+      } as Parameters<typeof handleSessionEvent>[0]);
+      expect(client.getQueryData<Session>(["session", "conv_speculative"])?.running).toBe(
+        "gpt-6.2-astra",
+      );
+    });
+
+    it("preserves a newer confirmed running report when an older reconnect snapshot finishes", async () => {
+      const id = "conv_reconnect_running";
+      const otherId = "conv_reconnect_other";
+      seedSession(id, []);
+      seedSession(otherId, []);
+      await useChatStore.getState().switchTo(id);
+      await useChatStore.getState().switchTo(otherId);
+
+      let releaseItems!: (r: Response) => void;
+      let metadataReturned = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          metadataReturned = true;
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              requested: "model-a",
+              launched: "model-a",
+              running: "model-a",
+              status: "idle",
+              labels: {},
+            }),
+          );
+        }
+        if (path === `/v1/sessions/${id}/items`) {
+          return new Promise<Response>((resolve) => {
+            releaseItems = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Revisiting the retained live session runs reconcileSessionAfterReconnect (parallel metadata + items).
+      const revisit = useChatStore.getState().switchTo(id);
+      await tick();
+      expect(metadataReturned).toBe(true);
+
+      // While history fetch is still in flight, a confirmed live model report arrives.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older snapshot completes after the live report; running must remain model-b.
+      releaseItems(mockResponse({ items: [], has_more: false }));
+      await revisit;
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
+
+    it("updates the header session query cache on successful model PATCH and session.launched_model", async () => {
+      const id = "conv_patch_header_cache";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      client.setQueryData(["session", id], {
+        id,
+        harness: "codex-native",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      } as unknown as Session);
+
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              harness: "codex-native",
+              model_override: "model-b",
+              requested: "model-b",
+              launched: "model-b",
+              running: "model-a",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().setModel("model-b");
+      expect(client.getQueryData<Session>(["session", id])).toMatchObject({
+        requested: "model-b",
+        launched: "model-b",
+      });
+
+      // SDK/native launch SSE updates launched in the open header cache.
+      handleSessionEvent(
+        {
+          type: "session_launched_model",
+          conversationId: id,
+          launched: "model-c",
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.launched).toBe("model-c");
+    });
+
+    it("preserves a newer confirmed running report across startup-input refresh", async () => {
+      const id = "conv_startup_refresh_running";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+
+      let releaseStartupRead!: (r: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseStartupRead = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      // Trigger refreshFailedInputs via a failed sandbox startup status edge.
+      handleSessionEvent(
+        {
+          type: "session_sandbox_status",
+          conversationId: id,
+          stage: "failed",
+          error: "sandbox failed",
+        },
+        id,
+      );
+      await tick();
+
+      // While startup-input refresh is in flight, a confirmed model report lands.
+      handleSessionEvent(
+        {
+          type: "session_model",
+          conversationId: id,
+          model: "model-b",
+          reported: true,
+        },
+        id,
+      );
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+
+      // Older startup-input snapshot returns with running: "model-a"; must not revert model-b.
+      releaseStartupRead(
+        mockResponse({
+          id,
+          harness: "codex-native",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          status: "failed",
+          labels: {},
+        }),
+      );
+      await tick();
+      expect(client.getQueryData<Session>(["session", id])?.running).toBe("model-b");
+    });
+
+    it("guards fetchSessionHostId and preserves PATCH requested over an older in-flight GET", async () => {
+      const { fetchSessionHostId } = await import("@/lib/fetchSessionHostId");
+      const id = "conv_host_and_requested_freshness";
+      client.setQueryData(["session", id], {
+        id,
+        title: "Freshness",
+        agentId: "agent_1",
+        status: "idle",
+        createdAt: 100,
+        updatedAt: 200,
+        modelOverride: "model-a",
+        requested: "model-a",
+        launched: "model-a",
+        running: "model-a",
+        labels: {},
+      });
+      useChatStore.setState({ conversationId: id, sessionModelOverride: "model-a" });
+
+      let releaseHostGet!: (response: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        if (path === `/v1/sessions/${id}` && (!init?.method || init.method === "GET")) {
+          return new Promise<Response>((resolve) => {
+            releaseHostGet = resolve;
+          });
+        }
+        if (path === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              title: "Freshness",
+              agent_id: "agent_1",
+              status: "idle",
+              created_at: 100,
+              updated_at: 205,
+              model_override: "model-c",
+              requested: "model-c",
+              launched: "model-a",
+              running: "model-b",
+              labels: {},
+            }),
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const hostFetch = fetchSessionHostId(id, { queryClient: client });
+      await tick();
+
+      // A confirmed live Running report AND an authoritative model PATCH arrive
+      // while the host-chain GET is still in flight.
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: id,
+        model: "model-b",
+        reported: true,
+      });
+      await useChatStore.getState().setModel("model-c");
+
+      // Now the older host GET resolves with stale model-a fields.
+      releaseHostGet(
+        mockResponse({
+          id,
+          title: "Freshness",
+          agent_id: "agent_1",
+          status: "idle",
+          created_at: 100,
+          updated_at: 200,
+          host_id: "host_1",
+          model_override: "model-a",
+          requested: "model-a",
+          launched: "model-a",
+          running: "model-a",
+          labels: {},
+        }),
+      );
+      await hostFetch;
+
+      const cached = client.getQueryData<Session>(["session", id]);
+      expect(cached?.running).toBe("model-b");
+      expect(cached?.requested).toBe("model-c");
+    });
   });
 
   describe("rotation failure notice", () => {
@@ -12426,6 +12940,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
+    it.each([
+      { tempId: "tmp_web", pendingId: "pending_web" },
+      { tempId: "pending_web", sendingSinceMs: 1000 },
+    ])("keeps an unread native send after same-text terminal input: %j", (identity) => {
+      const content = [{ type: "input_text" as const, text: "Check the status." }];
+      const pending: PendingUserMessage = { ...identity, content };
+      const terminalEcho: SessionInputConsumedEvent = {
+        type: "session_input_consumed",
+        itemId: "terminal_item",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [pending] });
+
+      handleSessionEvent(terminalEcho);
+      handleSessionEvent(terminalEcho);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "terminal_item",
+      ]);
+
+      handleSessionEvent({ ...terminalEcho, itemId: "web_item", clearedPendingId: "pending_web" });
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "terminal_item",
+        "web_item",
+      ]);
+    });
+
     it.each([false, true])(
       "keeps a received input waiting when a mirror cannot name its send (already mirrored=%s)",
       (alreadyMirrored) => {
@@ -20053,6 +20599,83 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it.each([
+    { alreadyShown: false, unreadOnServer: false, terminalOrder: "none" },
+    { alreadyShown: true, unreadOnServer: true, terminalOrder: "none" },
+    { alreadyShown: false, unreadOnServer: false, terminalOrder: "before" },
+    { alreadyShown: true, unreadOnServer: false, terminalOrder: "after" },
+  ])(
+    "uses a persisted native send id to settle only its bubble on reconnect (shown=$alreadyShown, on server=$unreadOnServer, terminal=$terminalOrder)",
+    async ({ alreadyShown, unreadOnServer, terminalOrder }) => {
+      const id = "conv_native_plain_text_receipt";
+      const before = userMessage("before_receipt_gap", "before the gap");
+      const settledText = terminalOrder === "none" ? "same prompt" : "continue the build";
+      const unreadPendingId = "pending-unread";
+      const settled = {
+        tempId: "settled-bubble",
+        pendingId: "pending-settled",
+        stableId: "a".repeat(32),
+        content: [{ type: "input_text" as const, text: settledText }],
+        posted: true,
+        sentMidTurn: true,
+      };
+      const unread = {
+        tempId: "unread-bubble",
+        stableId: "b".repeat(32),
+        content: [{ type: "input_text" as const, text: "same prompt" }],
+        ...(terminalOrder === "after" ? {} : { pendingId: unreadPendingId, posted: true }),
+        sentMidTurn: true,
+      };
+      const committed = {
+        ...userMessage("native_plain_text_turn", settledText),
+        web_stable_id: settled.stableId,
+      };
+      const reply = assistantMessage("native_plain_text_turn", "the reply");
+      const terminal = userMessage("terminal_turn", "same prompt");
+      const shownHistory = alreadyShown ? [before, committed, reply] : [before];
+      const history = [
+        before,
+        ...(terminalOrder === "before" ? [terminal] : []),
+        committed,
+        reply,
+        ...(terminalOrder === "after" ? [terminal] : []),
+      ];
+      seedSession(id, shownHistory);
+      seedPendingInputs(
+        id,
+        unreadOnServer
+          ? [{ pending_id: unreadPendingId, stable_id: unread.stableId, content: unread.content }]
+          : [],
+      );
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: itemsToBlocks(shownHistory),
+        pendingUserMessages: terminalOrder === "none" ? [unread, settled] : [settled, unread],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+      seedSessionItems(id, history);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(
+        history.map((item) => item.id),
+      );
+      expect(useChatStore.getState().pendingUserMessages).toEqual([unread]);
+    },
+  );
+
   it.each(
     (["shell", "command", "skill", "queued"] as const).flatMap((kind) =>
       ["backfill", "window"].map((recovery) => ({ kind, recovery })),
@@ -20621,6 +21244,69 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await loop;
     },
   );
+
+  it("settles a Claude resend when reconnect misses its named receipt", async () => {
+    const id = "conv_retry_during_disconnect";
+    const before = { ...userMessage("failed_send", "ship it"), delivery_confirmed: false };
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    let releasePost!: () => void;
+    let holdHistory = false;
+    let releaseHistory!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input).split("?")[0];
+      if (url === `/v1/sessions/${id}/events` && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          releasePost = () => resolve(mockResponse({ queued: true, pending_id: "retry_pending" }));
+        });
+      }
+      if (holdHistory && url === `/v1/sessions/${id}/items`) {
+        return new Promise<Response>((resolve) => {
+          releaseHistory = () => resolve(route(input, init));
+        });
+      }
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      sessionHarness: "claude-native",
+      isNativeTerminalSession: true,
+      blocks: itemsToBlocks([before]),
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    const sending = getState().send("ship it", "agent_xyz");
+    await drainAsync();
+    expect(releasePost).toBeTypeOf("function");
+
+    holdHistory = true;
+    sinks[0]!.error();
+    // The named live receipt was lost with the stream. The durable mirror
+    // of a same-text resend can have its own item id and no web stable id.
+    const mirror = userMessage("retry_mirror", "ship it");
+    seedSessionItems(id, [before, mirror]);
+    await drainAsync();
+    expect(releaseHistory).toBeTypeOf("function");
+
+    releasePost();
+    await sending;
+    expect(getState().pendingUserMessages).toMatchObject([{ pendingId: "retry_pending" }]);
+    holdHistory = false;
+    releaseHistory();
+    await drainAsync();
+
+    const state = getState();
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual([before.id, mirror.id]);
+    expect(state.pendingUserMessages).toEqual([]);
+  });
 
   it("keeps a server-refused restored draft when the snapshot holds its persisted item", async () => {
     const stableId = "d".repeat(32);

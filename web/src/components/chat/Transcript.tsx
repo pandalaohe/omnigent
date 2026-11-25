@@ -8,6 +8,9 @@ import {
   ConversationContent,
   ConversationEmptyState,
   ConversationScrollButton,
+  isQuestionCardScrollHeld,
+  pauseQuestionCardScroll,
+  QUESTION_CARD_SCROLL_CHANGE_EVENT,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
@@ -426,6 +429,7 @@ function TranscriptImpl({
         )}
       >
         <Conversation
+          data-transcript-session={selectedConversationId ?? undefined}
           className={cn(
             !isMobileViewport &&
               (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
@@ -889,6 +893,7 @@ export function VirtualBubbleList({
           previous?.el === scrollEl &&
           previous.scrollable &&
           scrollable &&
+          !isQuestionCardScrollHeld(scrollEl) &&
           Math.abs(offset - previous.offset) >= 1 &&
           scrollEl.scrollTop > 0
         ) {
@@ -976,6 +981,23 @@ export function VirtualBubbleList({
     scrollMargin,
     measureElement: measureRowAndPin(pinRef),
   });
+  // While answering, the card anchor compensates actual layout above it.
+  // A separate virtual-row estimate correction would apply the same shift
+  // twice, or move the viewport even if the estimate never reached paint.
+  const syncRowAdjustment = useCallback(() => {
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange =
+      prependCommitRef.current || (scrollEl && isQuestionCardScrollHeld(scrollEl))
+        ? () => false
+        : undefined;
+  }, [scrollEl, virtualizer]);
+  useLayoutEffect(() => {
+    syncRowAdjustment();
+    // A row can be measured between a card's layout cleanup and the next list render.
+    scrollEl?.addEventListener(QUESTION_CARD_SCROLL_CHANGE_EVENT, syncRowAdjustment);
+    return () => {
+      scrollEl?.removeEventListener(QUESTION_CARD_SCROLL_CHANGE_EVENT, syncRowAdjustment);
+    };
+  }, [scrollEl, syncRowAdjustment]);
 
   // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
   // has recorded its shift. Measuring it right after the commit corrects the scroll first.
@@ -1151,6 +1173,8 @@ export function VirtualBubbleList({
         (b.kind === "assistant" && b.responseId === itemId),
     );
     if (index < 0) return false;
+    const el = virtualizerRef.current.scrollElement;
+    if (el) pauseQuestionCardScroll(el);
     const c = ctxRef.current;
     c.stopScroll();
     c.state.isAtBottom = false;
@@ -1213,7 +1237,7 @@ export function VirtualBubbleList({
       }
     }
     prependCommitRef.current = false;
-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+    syncRowAdjustment();
     const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
     const prevFirstKey = prevFirstKeyRef.current;
     const prevSnapshot = rowSnapshotRef.current;
@@ -1223,7 +1247,13 @@ export function VirtualBubbleList({
     // Only a prepend (grew or was renamed at the top, some earlier row still
     // present). A switch replaces the list (no row survives) — handled by the
     // mount scroll-to-bottom. Streaming appends leave the first key unchanged.
-    if (!scrollEl || prevFirstKey === undefined || firstKey === prevFirstKey) return;
+    if (
+      !scrollEl ||
+      isQuestionCardScrollHeld(scrollEl) ||
+      prevFirstKey === undefined ||
+      firstKey === prevFirstKey
+    )
+      return;
     const indexByKey = new Map(bubbles.map((bubble, index) => [rowKey(bubble), index]));
     const survivors = prevSnapshot.filter((row) => indexByKey.has(row.key));
     const unrenamed = survivors.find((row) => !renamedRowKeysRef.current.has(row.key));
@@ -1255,7 +1285,7 @@ export function VirtualBubbleList({
     // write as a reader scroll.
     c.state.scrollTop = scrollEl.scrollTop + delta;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bubbles, scrollEl, virtualizer]);
+  }, [bubbles, scrollEl, syncRowAdjustment, virtualizer]);
 
   // Publish geometry (scroll handle, active turn, range nonce) up to the rail
   // and spacer. rangeNonce bumps on any mounted-range change so a windowed-out

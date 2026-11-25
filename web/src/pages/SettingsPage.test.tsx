@@ -26,6 +26,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as ContextUsageModule from "@/components/ContextUsageSettings";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
+import { interfaceText } from "@/lib/interfaceText";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import {
   useProjectFolderCollapse,
@@ -497,7 +498,7 @@ it.each(["#child-sessions", "#child-idle"])(
       within(opening).getByRole("textbox", { name: "Open children per parent" }),
     ).toBeVisible();
     expect(within(checkins).getByTestId("child-idle-settings")).toBeVisible();
-    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(4);
+    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(0);
     expect(screen.getAllByRole("spinbutton", { name: /Archive children/ })).toHaveLength(1);
   },
 );
@@ -576,6 +577,13 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("opens Usage telemetry from the System settings route", () => {
+    renderPage("/settings/system");
+    expect(
+      screen.getByRole("heading", { name: interfaceText("settingsSystem") }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(interfaceText("usageTelemetry"), { exact: true })).toBeInTheDocument();
+  });
   it("mounts one custom-agent section even without the installed-agent flags", () => {
     renderPage("/settings/custom-agents");
     expect(screen.getAllByTestId("custom-agent-settings")).toHaveLength(1);
@@ -927,6 +935,20 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("transcript-view-default-chat")).not.toHaveClass("border-2");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("keeps the other session markers in Appearance without the Agent badges switch", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.queryByRole("switch", { name: "Show Agent badges" })).not.toBeInTheDocument();
+    const sessionMarkers = within(screen.getByTestId("settings-group-session-markers"));
+    expect(
+      sessionMarkers.getByRole("switch", { name: "Show session title in the mobile top bar" }),
+    ).toBeVisible();
+    expect(
+      sessionMarkers.getByRole("switch", { name: "Show Goal markers in the session list" }),
+    ).toBeVisible();
+    expect(sessionMarkers.getByTestId("host-colors-settings")).toBeVisible();
   });
 
   it("opens the moved context controls from the old deep link", async () => {
@@ -1920,6 +1942,20 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
     });
+    expect(
+      screen.getByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the install-on-quit toggle in manual-download delivery mode", async () => {
+    installUpdateBridge({ ...DEFAULT_UPDATE_CONFIG, deliveryMode: "manual-download" });
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Update mode" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeNull();
   });
 
   it("surfaces manual update-check failures in Settings", async () => {

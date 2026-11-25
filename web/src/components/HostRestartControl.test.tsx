@@ -3,6 +3,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as IdentityModule from "@/lib/identity";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
 import { HostRestartControl } from "./HostRestartControl";
 
@@ -37,19 +39,21 @@ const status = {
 const fetchMock = vi.mocked(authenticatedFetch);
 let client: QueryClient;
 
-function show(fields: Partial<Host> = {}) {
+function show(fields: Partial<Host> = {}, serverInfo: ServerInfo | "loading" = "loading") {
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   client.setQueryData(["hosts"], []);
   client.setQueryData(["system-status"], {});
   return render(
-    <QueryClientProvider client={client}>
-      <HostRestartControl
-        host={{ ...host, ...fields }}
-        sessionTitles={new Map([["session_one", "Fix sign-in"]])}
-      />
-    </QueryClientProvider>,
+    <CapabilitiesProvider info={serverInfo}>
+      <QueryClientProvider client={client}>
+        <HostRestartControl
+          host={{ ...host, ...fields }}
+          sessionTitles={new Map([["session_one", "Fix sign-in"]])}
+        />
+      </QueryClientProvider>
+    </CapabilitiesProvider>,
   );
 }
 
@@ -195,12 +199,14 @@ describe("Host restart", () => {
     await act(() => vi.advanceTimersByTimeAsync(2100));
     expect(screen.getByText("Waiting for the host to reconnect")).toBeVisible();
     view.rerender(
-      <QueryClientProvider client={client}>
-        <HostRestartControl
-          host={{ ...host, status: "offline", capabilities: [] }}
-          sessionTitles={new Map()}
-        />
-      </QueryClientProvider>,
+      <CapabilitiesProvider info="loading">
+        <QueryClientProvider client={client}>
+          <HostRestartControl
+            host={{ ...host, status: "offline", capabilities: [] }}
+            sessionTitles={new Map()}
+          />
+        </QueryClientProvider>
+      </CapabilitiesProvider>,
     );
     current = {
       ...status,
@@ -271,5 +277,38 @@ describe("Host restart", () => {
     expect(screen.getByText("Host restarted")).toBeVisible();
     expect(screen.queryByText(/Could not check restart status/)).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(2);
+  });
+
+  it("disables Restart when the single-user server lacks browser approval", () => {
+    const info = { ...FALLBACK_SERVER_INFO, single_user: true, browser_approval_available: false };
+    show({}, info);
+    const button = screen.getByRole("button", { name: "Restart" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
+    expect(screen.getByText(/accounts sign-in/i)).toBeVisible();
+    fireEvent.click(button);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("keeps Restart enabled on a multi-user header server", () => {
+    show({}, { ...FALLBACK_SERVER_INFO, single_user: false, browser_approval_available: false });
+    expect(screen.getByRole("button", { name: "Restart" })).toBeEnabled();
+    expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
+  });
+
+  it.each([
+    { accounts_enabled: true, login_url: "/login" },
+    { accounts_enabled: false, login_url: "/auth/login" },
+  ])("enables Restart on one machine with browser sign-in at $login_url", (auth) => {
+    const info = {
+      ...FALLBACK_SERVER_INFO,
+      ...auth,
+      single_user: true,
+      browser_approval_available: true,
+    };
+    show({}, info);
+    expect(screen.getByRole("button", { name: "Restart" })).toBeEnabled();
+    expect(screen.queryByText(/needs a signed-in browser/i)).not.toBeInTheDocument();
   });
 });

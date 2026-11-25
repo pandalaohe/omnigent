@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.models.model_reference import canonical_model, canonical_pool, canonical_pool_values
 from omnigent.quota_pace import QuotaTiers
 from omnigent.runtime.instruction_layers import agent_key_for_harness
@@ -27,20 +29,26 @@ from omnigent.server.session_choice import (
     ChoiceRequest,
     DrainLock,
     Link,
+    ProviderAttempt,
     RunningIdentity,
     RunningSnapshot,
     SessionChoice,
     WorkType,
     active_on,
     candidate_lines,
+    canonical_provider_route,
     check_candidate_limits,
     codex_route_pool,
     holds_slot,
+    is_mapped_codex_pool,
+    model_notes,
+    needs_route_model,
     ordered_links,
     parse_session_choice,
     pool_limits,
     pool_of,
     pool_of_session,
+    provider_route,
     quota_reset_at,
     resolve_work_type,
     resolved_link,
@@ -54,6 +62,7 @@ from omnigent.server.session_choice_external import (
     route_states,
 )
 from omnigent.server.user_preferences_store import SessionChoiceSnapshot
+from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
 
 CHOICE_PROTOCOL_HEADER = "x-omnigent-session-choice"
 _logger = logging.getLogger(__name__)
@@ -64,7 +73,7 @@ def choice_settings(app, owner):
 
 
 def choice_settings_snapshot(app, owner):
-    prefs = app.state.user_preferences_store
+    prefs = getattr(app.state, "user_preferences_store", None)
     if prefs is None:
         return SessionChoice(), SessionChoiceSnapshot()
     try:
@@ -117,6 +126,7 @@ async def _close_drain_locks(
     prefs = getattr(app.state, "user_preferences_store", None)
     groups = await asyncio.to_thread(read_provider_groups, prefs, owner) if pools else {}
     closed_pools = {canonical_pool(pool, groups) for pool in pools}
+    closed_route = canonical_provider_route(route, groups) if route is not None else None
 
     def matches(lock: DrainLock) -> bool:
         if drops:
@@ -125,7 +135,10 @@ async def _close_drain_locks(
         return (
             (first_attempt or lock.since <= retry_cutoff)
             and (not closed_pools or canonical_pool(lock.pool, groups) in closed_pools)
-            and (route is None or lock.route == route)
+            and (
+                closed_route is None
+                or canonical_provider_route(lock.route, groups) == closed_route
+            )
             and (host is None or lock.host_id == host)
             and (agent is None or lock.saved_link.agent_id == agent)
         )
@@ -154,7 +167,8 @@ async def _persist_admitted_drain(app, owner, snapshot, admitted) -> bool:
         return False
 
 
-def session_identity(app, session):
+def session_identity(app, session, settings: SessionChoice | None = None):
+    """Use the configured pool for limit identity, and the launch route for events."""
     from omnigent.runner.routing import routing_host_id
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
@@ -167,22 +181,30 @@ def session_identity(app, session):
             agent_cache=getattr(app.state, "agent_cache", None),
         )
     )
-    if session.model_override and model and "/" not in model:
-        product = agent_key_for_harness(
-            _resolve_harness_impl(
-                session,
-                agent_store=getattr(app.state, "agent_store", None),
-                agent_cache=getattr(app.state, "agent_cache", None),
-            )
+    product = agent_key_for_harness(
+        _resolve_harness_impl(
+            session,
+            agent_store=getattr(app.state, "agent_store", None),
+            agent_cache=getattr(app.state, "agent_cache", None),
         )
-        if codex_route_pool(session.model_override, product):
-            # A bare runner report changes the model name, not the launch route.
-            model = f"{session.model_override.partition('/')[0]}/{model}"
+    )
+    route, _, launch_model = (session.model_override or "").partition("/")
+    if (
+        product == "codex"
+        and route
+        and launch_model
+        and model
+        and "/" not in model
+        and (settings is None or codex_route_pool(settings, session.model_override, product))
+    ):
+        # A bare runner report changes the model name, not the launch route.
+        model = f"{route}/{model}"
     return RunningIdentity(
         session.id,
         session.agent_id,
         routing_host_id(session, app.state.conversation_store),
         model,
+        product=product,
     )
 
 
@@ -212,7 +234,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
     )
     if tile is None:
         return None, ()
-    identity = session_identity(app, session)
+    identity = session_identity(app, session, settings)
     if any(
         rule.agent == identity.agent
         and (rule.host is None or identity.host is None or rule.host == identity.host)
@@ -338,7 +360,7 @@ def tile_of_session(
             ),
             Link(agent=session.agent_id or "unknown", model=model),
         )
-        return pool_of(link, product, groups)
+        return pool_of(settings, link, product, groups)
     pool = pool_of_session(
         session,
         settings,
@@ -351,7 +373,7 @@ def tile_of_session(
     )
     if pool in readings:
         return pool
-    if product == "codex" and pool in {"codex-pro", "krill"}:
+    if product == "codex" and is_mapped_codex_pool(settings, pool, groups or {}):
         return None
     if product is None:
         return None
@@ -553,8 +575,8 @@ async def enforce_stop_lines(app):
                 _logger.exception("Quota stop round failed for owner %s", owner)
 
 
-def choice_labels(choice: Choice) -> dict[str, str]:
-    return _payload_labels(choice.payload())
+def choice_labels(choice: Choice, pool_route: str) -> dict[str, str]:
+    return _payload_labels({**choice.payload(), "poolRoute": pool_route})
 
 
 def _payload_labels(payload: dict[str, Any]) -> dict[str, str]:
@@ -592,7 +614,7 @@ async def record_quota_exhaustion(
 
     from omnigent.runner.launch_failure import provider_billing_refusal
     from omnigent.server.auth import RESERVED_USER_LOCAL
-    from omnigent.server.session_choice import ProviderRefusal, provider_route
+    from omnigent.server.session_choice import ProviderRefusal
     from omnigent.server.session_collab import collab_owner_for
 
     now = time.time()
@@ -636,25 +658,28 @@ async def record_quota_exhaustion(
             or input_generation <= 0
         ):
             return
-        current = session_identity(app, session)
-        if (
-            record
-            and record.get("model")
-            and provider_route(None, None, record["model"])
-            != provider_route(None, None, current.model)
+        attempt = state.provider_attempts.get((owner, session.id))
+        if attempt is None or (attempt.response_id, attempt.generation, attempt.pool) != (
+            response_id,
+            input_generation,
+            canonical_pool(pool, attempt.provider_groups),
         ):
             return
-        route = provider_route(current.host, current.agent, current.model)
-        key = (owner, pool, route)
-        attempt = state.provider_attempts.get((*key, session.id))
-        if (
-            attempt is None
-            or attempt[:2] != (response_id, input_generation)
-            or attempt[2] <= state.provider_recoveries.get(key, float("-inf"))
+        current = session_identity(app, session)
+        key = (owner, attempt.pool, attempt.route)
+        if provider_route(
+            current.host,
+            current.agent,
+            current.model,
+            route_pools=attempt.route_pools,
+            product=current.product,
+            groups=attempt.provider_groups,
+        ) != attempt.observed_route or attempt.started_at <= state.provider_recoveries.get(
+            key, float("-inf")
         ):
             return
         state.refusals[key] = ProviderRefusal(reason, now, until, session.id, identity[1])
-        await _close_drain_locks(app, owner, receipt=identity, pools=(pool,), route=route)
+        await _close_drain_locks(app, owner, receipt=identity, pools=(pool,), route=attempt.route)
 
 
 async def record_provider_recovery(
@@ -668,7 +693,6 @@ async def record_provider_recovery(
         or input_generation <= 0
     ):
         return
-    from omnigent.server.session_choice import provider_route
     from omnigent.server.session_collab import collab_owner_for
 
     record = choice_record(session)
@@ -679,31 +703,99 @@ async def record_provider_recovery(
     owner = await asyncio.to_thread(
         collab_owner_for, session, conversations, getattr(app.state, "permission_store", None)
     )
-    current = session_identity(app, session)
-    route = provider_route(current.host, current.agent, current.model)
     state = state_for(app)
-    key = (owner, pool, route)
-    execution = (*key, session.id)
+    execution = (owner, session.id)
     attempt = state.provider_attempts.get(execution)
     if started:
-        # Keep one generation watermark per session/route, including after success.
-        # Duplicate or superseded running reports must not acquire a newer timestamp.
-        if attempt is None or input_generation > attempt[1]:
-            state.provider_attempts[execution] = (response_id, input_generation, time.time())
+        if attempt is not None and input_generation <= attempt.generation:
+            return
+        try:
+            settings = await asyncio.to_thread(choice_settings, app, owner)
+        except HTTPException:
+            return
+        groups = await asyncio.to_thread(
+            read_provider_groups, getattr(app.state, "user_preferences_store", None), owner
+        )
+        current = session_identity(app, session)
+        route_pools = settings.codex_route_pools
+        route = provider_route(
+            current.host,
+            current.agent,
+            current.model,
+            route_pools=route_pools,
+            product=current.product,
+            groups=groups,
+        )
+        model = record.get("model") if record else None
+        if isinstance(model, str) and route != provider_route(
+            current.host,
+            current.agent,
+            model,
+            route_pools=route_pools,
+            product=current.product,
+            groups=groups,
+        ):
+            return
+        # Recheck the watermark after loading settings. Duplicate or superseded starts
+        # must not acquire a newer timestamp.
+        attempt = state.provider_attempts.get(execution)
+        if attempt is None or input_generation > attempt.generation:
+            bound_route = record.get("poolRoute") if record else None
+            try:
+                saved_route = json.loads(bound_route) if isinstance(bound_route, str) else None
+            except ValueError:
+                saved_route = None
+            route_key = route
+            if (
+                isinstance(saved_route, list)
+                and len(saved_route) == 3
+                and isinstance(saved_route[2], str)
+            ):
+                route_key = json.dumps(
+                    [current.host, current.agent, canonical_pool(saved_route[2], groups)]
+                )
+            state.provider_attempts[execution] = ProviderAttempt(
+                response_id,
+                input_generation,
+                time.time(),
+                canonical_pool(pool, groups),
+                route_key,
+                route,
+                dict(route_pools),
+                groups,
+            )
         return
-    if attempt is None or attempt[:2] != (response_id, input_generation):
+    if attempt is None or (attempt.response_id, attempt.generation, attempt.pool) != (
+        response_id,
+        input_generation,
+        canonical_pool(pool, attempt.provider_groups),
+    ):
         return
-    started_at = attempt[2]
+    current = session_identity(app, session)
+    if (
+        provider_route(
+            current.host,
+            current.agent,
+            current.model,
+            route_pools=attempt.route_pools,
+            product=current.product,
+            groups=attempt.provider_groups,
+        )
+        != attempt.observed_route
+    ):
+        return
+    key = (owner, attempt.pool, attempt.route)
+    started_at = attempt.started_at
     state.provider_recoveries[key] = max(
         state.provider_recoveries.get(key, started_at), started_at
     )
-    for key, refusal in tuple(state.refusals.items()):
-        if (
-            key == (owner, pool, route)
-            and started_at > refusal.observed_at
-            and (refusal.session_id != session.id or refusal.response_id != response_id)
-        ):
-            state.refusals.pop(key, None)
+    refusal = state.refusals.get(key)
+    if (
+        refusal is not None
+        and started_at > refusal.observed_at
+        and (refusal.session_id != session.id or refusal.response_id != response_id)
+    ):
+        state.refusals.pop(key, None)
 
 
 async def observe_external_admission(
@@ -891,7 +983,7 @@ async def context_request(
     records = {row["harness"]: row for row in await asyncio.to_thread(catalogs.list, [host])}
     harnesses = set()
     for configured_link in ordered_links(settings):
-        link = resolved_link(configured_link, request)
+        link = resolved_link(settings, configured_link, request)
         saved_model = link._model_resolution.saved if link._model_resolution else link.model
         if (
             not saved_model
@@ -903,7 +995,10 @@ async def context_request(
         probe = Conversation(
             id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
         )
-        harness = await asyncio.to_thread(
+        override = options.get("catalog_harness_override")
+        if options.get("catalog_override_agent") not in (None, link.agent_id):
+            override = None
+        harness = override or await asyncio.to_thread(
             _resolve_harness_impl,
             probe,
             agent_store=app.state.agent_store,
@@ -959,6 +1054,8 @@ def _context_request(
     master: dict | None = None,
     project_config: dict | None = None,
     additional_agents: tuple[str, ...] = (),
+    catalog_harness_override: str | None = None,
+    catalog_override_agent: str | None = None,
 ) -> ChoiceRequest:
     from omnigent.harness_availability import harness_launch_availability
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
@@ -990,9 +1087,11 @@ def _context_request(
         probe = Conversation(
             id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=agent_id
         )
-        harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
+        harness = _resolve_harness_impl(
+            probe, agent_store=agents, agent_cache=cache, agent=agent, preserve_acp_namespace=True
+        )
         harnesses[agent_id] = harness
-        products[agent_id] = agent_key_for_harness(harness)
+        products[agent_id] = agent_key_for_harness(canonicalize_harness(harness) or harness)
         if agent_id in default_agents:
             default_models[agent_id] = _resolve_llm_model(
                 probe, agent_store=agents, agent_cache=cache
@@ -1006,9 +1105,15 @@ def _context_request(
         for harness, row in records.items()
         if usable_catalog(row) is not None
     }
+    catalog_harnesses = {
+        agent: catalog_harness_override
+        if catalog_harness_override and catalog_override_agent in (None, agent)
+        else harness
+        for agent, harness in harnesses.items()
+    }
     models = {
         agent: ids
-        for agent, harness in harnesses.items()
+        for agent, harness in catalog_harnesses.items()
         if (ids := usable_catalog(records.get(harness or ""))) is not None
     }
     groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
@@ -1030,7 +1135,7 @@ def _context_request(
             )
             defaults = [
                 entry.get("id") or entry.get("model")
-                for entry in catalog.get(harness, ())
+                for entry in catalog.get(catalog_harnesses[agent], ())
                 if entry.get("isDefault") is True and (entry.get("id") or entry.get("model"))
             ]
             effective_models[agent] = (
@@ -1145,7 +1250,6 @@ async def authorize_agents(app: Any, request: ChoiceRequest) -> ChoiceRequest:
 def running_pools(
     app: Any, owner: str, settings: SessionChoice, products: Any, now: float, groups=None
 ):
-    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
     from omnigent.server.session_collab import collab_owners_for
 
     store = app.state.conversation_store
@@ -1166,16 +1270,11 @@ def running_pools(
             resolved_owner = owners.get(session.id)
             if resolved_owner is not None and resolved_owner != owner:
                 continue
-            identity = session_identity(app, session)
-            product = agent_key_for_harness(
-                _resolve_harness_impl(
-                    session, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
-                )
-            )
+            identity = session_identity(app, session, settings)
             pool = pool_of_session(
                 session,
                 settings,
-                product=product,
+                product=identity.product,
                 model=identity.model,
                 products=products,
                 groups=groups,
@@ -1229,7 +1328,7 @@ def inputs(app: Any, settings: SessionChoice, request: ChoiceRequest, now: float
 def limit_receipt(app, settings, revision, link, request, running, now, *, include_running=False):
     from omnigent.server.session_choice_preview import explain_limits
 
-    pool = pool_of(link, request.products.get(link.agent_id), request.provider_groups)
+    pool = pool_of(settings, link, request.products.get(link.agent_id), request.provider_groups)
     legacy = (
         pool_limits(settings, link, request.products.get(link.agent_id), request.provider_groups)
         if any(canonical_pool(key, request.provider_groups) == pool for key in settings.limits)
@@ -1264,6 +1363,7 @@ class CreateChoice:
     stack: AsyncExitStack
     owner: str
     snapshot: SessionChoiceSnapshot
+    pool_route: str
     drain_lock: DrainLock | None = None
     committed_drain: bool = False
 
@@ -1296,7 +1396,102 @@ class CreateChoice:
             if self.choice.outcome == "hold" or host_load_held
             else f"admitted@{self.host}@{self.choice.pool}@{now}"
         )
-        return {**choice_labels(self.choice), SLOT_LABEL: marker}
+        return {**choice_labels(self.choice, self.pool_route), SLOT_LABEL: marker}
+
+
+def _named_chain_link(settings: SessionChoice, host: str, work_type: str, agent: str) -> Link:
+    tiers = settings.hosts.get(host, {}).get(work_type, ())
+    link = next(
+        (link for tier in tiers for row in tier for link in row.links if link.agent_id == agent),
+        None,
+    )
+    if link is not None and link.model:
+        return link
+    raise HTTPException(
+        409,
+        {
+            "code": "session_choice_ask",
+            "agent": agent,
+            "host": host,
+            "work_type": work_type,
+            "reason": "No model on the named agent's first matching link. Pass model explicitly.",
+        },
+    )
+
+
+def _with_named_pool_cap(
+    settings: SessionChoice,
+    link: Link,
+    pool: str | None,
+    product: str | None,
+    request: ChoiceRequest,
+) -> Link:
+    if link.meter or link.max_running is not None:
+        return link
+    cap = pool_limits(settings, link, product, request.provider_groups).max_running
+    if pool and not cap:
+        cap = next(
+            (
+                configured.max_running
+                for configured in ordered_links(settings)
+                if pool_of(
+                    settings,
+                    configured,
+                    request.products.get(configured.agent_id),
+                    request.provider_groups,
+                )
+                == pool
+            ),
+            None,
+        )
+    return link if cap is None else link.model_copy(update={"max_running": cap})
+
+
+def _explicit_named_link(
+    app: Any, body: Any, settings: SessionChoice, request: ChoiceRequest
+) -> tuple[Link, str | None, ChoiceRequest]:
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+
+    link = Link(agent=body.agent_id, model=body.model_override, effort=body.reasoning_effort)
+    probe = Conversation(
+        id="",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="",
+        agent_id=body.agent_id,
+        model_override=body.model_override,
+        harness_override=body.harness_override,
+    )
+    product = agent_key_for_harness(
+        _resolve_harness_impl(
+            probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
+        )
+    )
+    if settings.schema_version == 2:
+        request = replace(request, products={**request.products, link.agent_id: product})
+    link = resolved_link(settings, link, request)
+    pool = pool_of_session(
+        replace(probe, model_override=link.model),
+        settings,
+        product=product,
+        model=link.model,
+        products=request.products,
+        groups=request.provider_groups,
+    )
+    if settings.schema_version == 2 and pool is None:
+        pool = pool_of(settings, link, product, request.provider_groups)
+    meter = next(
+        (
+            configured.meter
+            for configured in ordered_links(settings)
+            if configured.meter
+            and canonical_pool(configured.meter, request.provider_groups) == pool
+        ),
+        None,
+    )
+    if meter is not None:
+        link = link.model_copy(update={"meter": meter})
+    return _with_named_pool_cap(settings, link, pool, product, request), pool, request
 
 
 @asynccontextmanager
@@ -1352,6 +1547,13 @@ async def admit_create(
             yield None
             return
         now = time.time()
+        from omnigent.server.permission_tiers import is_acp_permission_harness
+
+        catalog_harness = body.harness_override
+        if catalog_harness == "auto":
+            catalog_harness = None
+        if catalog_harness and not is_acp_permission_harness(catalog_harness):
+            catalog_harness = canonicalize_harness(catalog_harness) or catalog_harness
         request = await context_request(
             app,
             owner,
@@ -1363,6 +1565,8 @@ async def admit_create(
             additional_agents=(body.agent_id,)
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
+            catalog_harness_override=catalog_harness,
+            catalog_override_agent=body.agent_id if named else None,
             pin=pin,
             exclude=tuple(body.exclude),
             differ_from=body.differ_from,
@@ -1376,6 +1580,8 @@ async def admit_create(
 
         if named:
             request = replace(request, preview=True)
+        elif body.model_override is not None:
+            request = replace(request, required_model=body.model_override)
         try:
             plan = state.select(
                 settings,
@@ -1407,84 +1613,17 @@ async def admit_create(
             if drops and not await _close_drain_locks(app, owner, drops=drops):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
         if named:
-            from omnigent.server.routes._sessions.helpers import (
-                _resolve_harness_impl,
-                _resolve_llm_model,
-            )
-
-            link = Link.model_validate(
-                {
-                    "agent": body.agent_id,
-                    "model": body.model_override,
-                    "effort": body.reasoning_effort,
-                }
-            )
-            probe = Conversation(
-                id="",
-                created_at=0,
-                updated_at=0,
-                root_conversation_id="",
-                agent_id=body.agent_id,
-                model_override=body.model_override,
-                harness_override=body.harness_override,
-            )
-            product = agent_key_for_harness(
-                _resolve_harness_impl(
-                    probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
-                )
-            )
-            model = (
-                body.model_override
-                or request.effective_models.get(body.agent_id)
-                or await asyncio.to_thread(
-                    _resolve_llm_model,
-                    probe,
-                    agent_store=app.state.agent_store,
-                    agent_cache=app.state.agent_cache,
-                )
-            )
-            if product == "codex" and model:
-                link = link.model_copy(update={"model": model})
-            pool = pool_of_session(
-                probe,
-                settings,
-                product=product,
-                model=model,
-                products=request.products,
-                groups=request.provider_groups,
-            )
-            if settings.schema_version == 2:
-                link = link.model_copy(update={"model": model})
-                request = replace(request, products={**request.products, body.agent_id: product})
-                if pool is None:
-                    pool = pool_of(link, product, request.provider_groups)
-            meter = next(
-                (
-                    item.meter
-                    for item in ordered_links(settings)
-                    if item.meter and canonical_pool(item.meter, request.provider_groups) == pool
-                ),
-                None,
-            )
-            if meter is not None:
-                link = link.model_copy(update={"meter": meter})
-            cap = pool_limits(settings, link, product, request.provider_groups).max_running
-            if pool and not cap:
-                cap = next(
-                    (
-                        item.max_running
-                        for item in ordered_links(settings)
-                        if pool_of(
-                            item, request.products.get(item.agent_id), request.provider_groups
-                        )
-                        == pool
-                    ),
-                    None,
-                )
-            if not link.meter and cap:
-                link = link.model_copy(update={"max_running": cap})
-            link = resolved_link(link, request)
             work, _ = resolve_work_type(settings, body.work_type)
+            if body.model_override is None:
+                link = resolved_link(
+                    settings, _named_chain_link(settings, host, work.id, body.agent_id), request
+                )
+                product = request.products.get(link.agent_id)
+                pool = pool_of(settings, link, product, request.provider_groups)
+                if settings.schema_version == 1:
+                    link = _with_named_pool_cap(settings, link, pool, product, request)
+            else:
+                link, pool, request = _explicit_named_link(app, body, settings, request)
             failure = check_candidate_limits(
                 settings,
                 work,
@@ -1525,6 +1664,7 @@ async def admit_create(
                 pool=pool,
                 reason="Named by user" if body.user_named else body.choice_reason,
                 flags=("user_named" if body.user_named else "choice_reason",),
+                notes=model_notes(link, request),
             )
         if choice.outcome == "ask":
             payload = choice.payload()
@@ -1542,8 +1682,38 @@ async def admit_create(
             )
         assert choice.link is not None
         link = choice.link
+        if (effort := body.reasoning_effort) is not None:
+            from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+
+            probe = Conversation(
+                id="",
+                created_at=0,
+                updated_at=0,
+                root_conversation_id="",
+                agent_id=link.agent_id,
+                harness_override=body.harness_override,
+            )
+            harness = await asyncio.to_thread(
+                _resolve_harness_impl,
+                probe,
+                agent_store=app.state.agent_store,
+                agent_cache=app.state.agent_cache,
+            )
+            supported = efforts_for_harness(harness)
+            if supported == frozenset():
+                raise HTTPException(
+                    400, f"Harness {harness!r} does not support a reasoning_effort override"
+                )
+            if supported:
+                try:
+                    effort = validate_effort(effort, harness or "the selected harness", supported)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if effort is None:
+                    raise HTTPException(400, "reasoning_effort must be non-empty")
+            link = link.model_copy(update={"effort": effort})
         product = request.products.get(link.agent_id)
-        if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
+        if needs_route_model(settings, link, product, request.provider_groups):
             raise HTTPException(
                 409,
                 {"code": "session_choice_ask", "reason": "Choose a model for this Codex route"},
@@ -1566,7 +1736,21 @@ async def admit_create(
             }
         )
         yield CreateChoice(
-            updated, choice, host, stack, owner, snapshot, plan.lock if not named else None
+            updated,
+            choice,
+            host,
+            stack,
+            owner,
+            snapshot,
+            provider_route(
+                host,
+                link.agent_id,
+                link.model,
+                route_pools=settings.codex_route_pools,
+                product=product,
+                groups=request.provider_groups,
+            ),
+            plan.lock if not named else None,
         )
 
 
@@ -1609,7 +1793,7 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             update={"meter": record.get("pool") if record.get("meter") else None}
         )
         if settings.schema_version == 2:
-            identity = await asyncio.to_thread(session_identity, app, current)
+            identity = await asyncio.to_thread(session_identity, app, current, settings)
             if identity.agent is None or identity.host != host:
                 return False
             link = link.model_copy(update={"agent_id": identity.agent, "model": identity.model})
@@ -1624,6 +1808,33 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             app, owner, host, settings, None, additional_agents=(link.agent_id,)
         )
         request = await authorize_agents(app, request)
+        bound_pool = record.get("pool")
+        bound_route = record.get("poolRoute")
+        product = request.products.get(link.agent_id)
+        if isinstance(bound_route, str):
+            object.__setattr__(link, "_bound_routes", (bound_route,))
+        if isinstance(bound_pool, str) and pool_of(
+            settings, link, product, request.provider_groups
+        ) != canonical_pool(bound_pool, request.provider_groups):
+            object.__setattr__(link, "_bound_pool", bound_pool)
+            if not link._bound_routes:
+                # Older labels saved the pool without recording whether the route was mapped.
+                prefix = (link.model or "").partition("/")[0]
+                object.__setattr__(
+                    link,
+                    "_bound_routes",
+                    (
+                        provider_route(host, link.agent_id, link.model),
+                        provider_route(
+                            host,
+                            link.agent_id,
+                            link.model,
+                            route_pools={prefix: bound_pool},
+                            product=product,
+                            groups=request.provider_groups,
+                        ),
+                    ),
+                )
         readings, running, floors = await asyncio.to_thread(inputs, app, settings, request, now)
         running = (
             running.without(session.id)

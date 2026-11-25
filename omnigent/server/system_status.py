@@ -1003,7 +1003,9 @@ class SystemStatusHub:
         """Copy settings; a workspace argument projects only its load-line settings."""
         settings = copy.deepcopy(self._settings)
         if workspace_id is not None:
+            settings.pop("load_notices_enabled", None)
             settings["load_lines"] = self._workspace_lines(workspace_id)
+            settings["load_lines"]["notices_enabled"] = self.notices_enabled(workspace_id)
         return settings
 
     def put_settings(self, payload: dict[str, Any], *, workspace_id: int = 0) -> dict[str, Any]:
@@ -1021,11 +1023,28 @@ class SystemStatusHub:
             an id outside 1-64 chars, or a prompt over 20 000 chars.
         """
         settings = self.get_settings()
+        workspace_key = str(workspace_id)
         for key, value in payload.items():
             if key == "health_check":
                 settings[key] = _coerce_health_check(value)
             elif key == "load_lines":
-                settings[key][str(workspace_id)] = _patch_load_lines(
+                if isinstance(value, dict) and "notices_enabled" in value:
+                    value = dict(value)
+                    enabled = value.pop("notices_enabled")
+                    if not isinstance(enabled, bool):
+                        raise ValueError("load_lines.notices_enabled must be a boolean")
+                    # Older servers reject workspace load lines with unrecognized fields.
+                    notices = settings.get("load_notices_enabled", {})
+                    if enabled:
+                        notices[workspace_key] = True
+                        settings["load_notices_enabled"] = notices
+                    else:
+                        notices.pop(workspace_key, None)
+                        if not notices:
+                            settings.pop("load_notices_enabled", None)
+                    if not value:
+                        continue
+                settings[key][workspace_key] = _patch_load_lines(
                     self._workspace_lines(workspace_id), value
                 )
             else:
@@ -1049,6 +1068,10 @@ class SystemStatusHub:
     def queue_enabled(self, workspace_id: int) -> bool:
         """Whether agent-created children may be held in this workspace."""
         return self._workspace_lines(workspace_id)["queue_enabled"]
+
+    def notices_enabled(self, workspace_id: int) -> bool:
+        """Whether host-load transitions can send messages in this workspace."""
+        return self._settings.get("load_notices_enabled", {}).get(str(workspace_id)) is True
 
     def host_load_keys(self) -> list[tuple[int, str]]:
         return list(self._entries)
@@ -1095,13 +1118,19 @@ class SystemStatusHub:
         return entry.name if entry is not None else host_id
 
     def host_load(
-        self, workspace_id: int, host_id: str, *, now: float | None = None
+        self,
+        workspace_id: int,
+        host_id: str,
+        *,
+        now: float | None = None,
+        include_decision: bool = False,
     ) -> dict[str, Any]:
         """Current host-reported load; stale or disconnected telemetry fails open."""
         entry = self._entries.get((workspace_id, host_id))
         if entry is not None:
             self._expire_load(entry, time.time() if now is None else now)
-        machine = (entry.last_snapshot or {}).get("machine", {}) if entry is not None else {}
+        snapshot = entry.last_snapshot or {} if entry is not None else {}
+        machine = snapshot.get("machine", {})
         workspace = self._settings["load_lines"].get(str(workspace_id))
         source = (
             "host"
@@ -1111,7 +1140,7 @@ class SystemStatusHub:
             else "factory"
         )
         lines = self.effective_load_lines(workspace_id, host_id)
-        return {
+        load = {
             "load_per_core": machine.get("load_per_core"),
             "load_equiv": machine.get("load_equiv"),
             "estimate": machine.get("estimate", False),
@@ -1123,10 +1152,13 @@ class SystemStatusHub:
             "lines_source": source,
             "queued_children": self._queued_children.get((workspace_id, host_id), 0),
             "mem_pct": _mem_pct(machine) if machine else None,
-            "sampled_at": entry.last_snapshot.get("sampled_at")
-            if entry is not None and entry.last_snapshot
-            else None,
+            "sampled_at": snapshot.get("sampled_at"),
         }
+        if include_decision and load["level"] != "unknown":
+            report = snapshot.get("load_level") or {}
+            load["decision_load_per_core"] = report.get("decision_load_per_core")
+            load["decision_mem_pct"] = report.get("decision_mem_pct")
+        return load
 
     def drain_level_changes(self) -> list[LevelChange]:
         """Transfer pending transitions to the notifier once per tick."""
@@ -1200,6 +1232,16 @@ class SystemStatusHub:
                                 )
                             except ValueError:
                                 continue
+                elif key == "load_notices_enabled" and isinstance(value, dict):
+                    enabled_workspaces = {
+                        workspace_id: True
+                        for workspace_id, enabled in value.items()
+                        if isinstance(workspace_id, str)
+                        and workspace_id.isdecimal()
+                        and enabled is True
+                    }
+                    if enabled_workspaces:
+                        settings[key] = enabled_workspaces
                 else:
                     settings[key] = _coerce_setting(key, value)
             except ValueError:
@@ -1384,7 +1426,7 @@ def _factory_workspace_lines() -> dict[str, Any]:
     return {
         "default": {"heavy": FACTORY_LINES.heavy, "new_session": FACTORY_LINES.new_session},
         "hosts": {},
-        "queue_enabled": True,
+        "queue_enabled": False,
     }
 
 

@@ -80,6 +80,7 @@ from omnigent.policies.builtins._shell import (
     is_shell_interpreter,
     is_unresolved_invocation,
     real_invocation_tokens,
+    shell_command,
     spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
@@ -1331,7 +1332,7 @@ def github_policy(
         args = args if isinstance(args, dict) else {}
 
         if raw_tool in shell_tool_names:
-            command = args.get("command")
+            command = shell_command(raw_tool, args)
             if not isinstance(command, str) or not command.strip():
                 return None
             return _evaluate_shell(command)

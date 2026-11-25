@@ -82,6 +82,8 @@ export interface ServerSelectorV2Setup {
   installed?: boolean;
   /** Whether the shell can install the CLI automatically. */
   installSupported?: boolean;
+  /** Distribution-specific CLI installation guide URL when provided by the shell. */
+  installDocsUrl?: string;
   /** Refresh CLI status after a manual install; true when detected. */
   onRecheckCli?: () => Promise<boolean>;
   /** Has connected to any server before (returning user). The shell counts MDM
@@ -484,6 +486,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "terminal" &&
           (manualInstall ? (
             <CliInstallStep
+              installDocsUrl={setup.installDocsUrl}
               onBack={() => setStep(terminalTarget.back)}
               onRecheck={setup.onRecheckCli}
               onConnectAnyway={connectAnyway}

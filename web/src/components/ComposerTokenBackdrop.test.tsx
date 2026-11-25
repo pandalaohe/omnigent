@@ -1,52 +1,24 @@
-import { StrictMode, createRef } from "react";
+import { StrictMode, useRef } from "react";
 import { act, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { useComposerMirrorAlignment } from "@/components/composer/MentionTokenOverlay";
 import { assignLabels } from "@/lib/composerTokens";
 import { ComposerTokenBackdrop, hasTint } from "./ComposerTokenBackdrop";
-
-/** Captures rAF callbacks so a test can flush exactly one frame, the way the
- *  browser would after the synchronous measure cap trips. */
-function installManualRaf() {
-  const pending = new Map<number, FrameRequestCallback>();
-  let nextId = 1;
-  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
-    const id = nextId++;
-    pending.set(id, cb);
-    return id;
-  });
-  vi.stubGlobal("cancelAnimationFrame", (id: number) => {
-    pending.delete(id);
-  });
-  return {
-    flush() {
-      const callbacks = [...pending.values()];
-      pending.clear();
-      act(() => {
-        callbacks.forEach((cb) => cb(0));
-      });
-    },
-  };
-}
 
 function img(name = "a.png"): File {
   return new File([new Uint8Array(1)], name, { type: "image/png" });
 }
 
 function renderBackdrop(props: Partial<React.ComponentProps<typeof ComposerTokenBackdrop>> = {}) {
-  const anchor = createRef<HTMLTextAreaElement>();
   const { container } = render(
-    <>
-      <textarea ref={anchor} />
-      <ComposerTokenBackdrop
-        value={props.value ?? ""}
-        files={props.files ?? []}
-        command={props.command ?? null}
-        activeIndex={props.activeIndex ?? null}
-        anchor={anchor}
-        mentionTokens={props.mentionTokens}
-      />
-    </>,
+    <ComposerTokenBackdrop
+      value={props.value ?? ""}
+      files={props.files ?? []}
+      command={props.command ?? null}
+      activeIndex={props.activeIndex ?? null}
+      mentionTokens={props.mentionTokens}
+    />,
   );
   return container.querySelector('[data-testid="composer-highlight-overlay"]') as HTMLElement;
 }
@@ -72,10 +44,6 @@ describe("hasTint", () => {
 });
 
 describe("ComposerTokenBackdrop", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   it("paints session mentions and upload tokens together without changing the text", () => {
     const image = img();
     assignLabels([image], []);
@@ -134,10 +102,10 @@ describe("ComposerTokenBackdrop", () => {
     expect(node.textContent).toBe("see [image 9]");
   });
 
-  it("renders a trailing newline as one <br>, no extra text node", () => {
+  it("keeps the blank line after a trailing newline in the backdrop's scroll range", () => {
     const node = renderBackdrop({ value: "hello\n" });
     expect(node.querySelectorAll("br")).toHaveLength(1);
-    expect(node.textContent).toBe("hello");
+    expect(node.textContent).toBe("hello\u00a0");
   });
 
   it("textContent equals the value exactly when it has no trailing newline", () => {
@@ -152,165 +120,99 @@ describe("ComposerTokenBackdrop", () => {
     expect(node.className).not.toMatch(/\bpx-3\b|\bpt-3\b|\bpb-1\b/);
   });
 
-  it("F1 — re-measures the anchor's position on every render, not only on resize", () => {
-    const anchor = createRef<HTMLTextAreaElement>();
-    const { rerender, container } = render(
-      <>
-        <textarea ref={anchor} />
-        <ComposerTokenBackdrop
-          value="a"
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-      </>,
+  it("aligns on oscillating anchor reads without triggering a React update loop", () => {
+    const notifyResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        private notify: () => void;
+        constructor(callback: ResizeObserverCallback) {
+          this.notify = () => callback([], this as unknown as ResizeObserver);
+        }
+        observe() {
+          notifyResize.add(this.notify);
+        }
+        unobserve() {}
+        disconnect() {
+          notifyResize.delete(this.notify);
+        }
+      },
     );
-    const node = () =>
-      container.querySelector('[data-testid="composer-highlight-overlay"]') as HTMLElement;
-    expect(node().style.top).toBe("0px");
-    // The anchor moved (a reply quote was inserted above it) without any
-    // resize — jsdom never fires ResizeObserver for this, so only a
-    // render-scoped remeasure can pick it up.
-    act(() => {
-      Object.defineProperty(anchor.current!, "offsetTop", { value: 120, configurable: true });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
     });
-    rerender(
-      <>
-        <textarea ref={anchor} />
-        <ComposerTokenBackdrop
-          value="b"
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-      </>,
-    );
-    expect(node().style.top).toBe("120px");
-  });
 
-  it("N4 — caps synchronous re-measures when the anchor's box oscillates between reads", () => {
-    const anchor = createRef<HTMLTextAreaElement>();
     const widths = [300, 340];
     let reads = 0;
-    const oscillatingRef = (el: HTMLTextAreaElement | null) => {
-      anchor.current = el;
-      if (!el) return;
-      Object.defineProperty(el, "offsetWidth", {
-        configurable: true,
-        get: () => widths[reads++ % widths.length],
-      });
-    };
-    const ui = (value: string) => (
-      <>
-        <textarea ref={oscillatingRef} />
-        <ComposerTokenBackdrop
-          value={value}
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-      </>
-    );
-    const { container, rerender } = render(ui("hello"));
-    expect(() => rerender(ui("hello [file 1]"))).not.toThrow();
-    const node = container.querySelector(
-      '[data-testid="composer-highlight-overlay"]',
-    ) as HTMLElement;
-    expect(["300px", "340px"]).toContain(node.style.width);
-  });
+    let top = 20;
 
-  it("R1 — retries a capped measure after a position-only anchor move", () => {
-    const raf = installManualRaf();
-    const anchor = createRef<HTMLTextAreaElement>();
-    const ui = (value: string) => (
-      <>
-        <textarea ref={anchor} />
-        <ComposerTokenBackdrop
-          value={value}
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-      </>
-    );
-    const { container, rerender } = render(ui("a"));
-    // Each rerender is one layout-effect measure; after the cap trips, the
-    // measure is skipped until the pending frame flushes.
-    for (const value of ["b", "c", "d", "e", "f"]) rerender(ui(value));
-    // A position-only move (a reply quote above the anchor): ResizeObserver
-    // never sees it, so only the frame's retry can pick it up.
-    act(() => {
-      Object.defineProperty(anchor.current!, "offsetLeft", { value: 42, configurable: true });
-    });
-    raf.flush();
-    const node = container.querySelector(
-      '[data-testid="composer-highlight-overlay"]',
-    ) as HTMLElement;
-    expect(node.style.left).toBe("42px");
-  });
+    function AlignedBackdrop({ value }: { value: string }) {
+      const overlayRef = useRef<HTMLDivElement>(null);
+      const textareaRef = useRef<HTMLTextAreaElement>(null);
+      useComposerMirrorAlignment(overlayRef, textareaRef, true);
+      const attachAnchor = (el: HTMLTextAreaElement | null) => {
+        textareaRef.current = el;
+        if (!el) return;
+        Object.defineProperties(el, {
+          offsetTop: { configurable: true, get: () => top },
+          offsetLeft: { configurable: true, value: 10 },
+          offsetHeight: { configurable: true, value: 60 },
+          offsetWidth: {
+            configurable: true,
+            get: () => widths[reads++ % widths.length],
+          },
+        });
+      };
+      // Mount backdrop before textarea, matching ChatComposer's DOM order.
+      return (
+        <>
+          <ComposerTokenBackdrop
+            ref={overlayRef}
+            value={value}
+            files={[]}
+            command={null}
+            activeIndex={null}
+          />
+          <textarea ref={attachAnchor} value={value} onChange={() => {}} />
+        </>
+      );
+    }
 
-  it("R2 — under StrictMode, frames still lift the cap so a later move re-aligns", () => {
-    const raf = installManualRaf();
-    const anchor = createRef<HTMLTextAreaElement>();
-    const ui = (value: string) => (
+    const { container, rerender } = render(
       <StrictMode>
-        <textarea ref={anchor} />
-        <ComposerTokenBackdrop
-          value={value}
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-      </StrictMode>
-    );
-    const { container, rerender } = render(ui("a"));
-    // StrictMode replays the mount effects: its simulated unmount cancels the
-    // frame and resets the cap, so later renders must still schedule frames.
-    for (const value of ["b", "c", "d", "e", "f"]) rerender(ui(value));
-    raf.flush();
-    act(() => {
-      Object.defineProperty(anchor.current!, "offsetLeft", { value: 64, configurable: true });
-    });
-    rerender(ui("g"));
-    const node = container.querySelector(
-      '[data-testid="composer-highlight-overlay"]',
-    ) as HTMLElement;
-    expect(node.style.left).toBe("64px");
-  });
-
-  it("N3 — measures on mount even when rendered before its anchor (ChatComposer's real order)", () => {
-    const anchor = createRef<HTMLTextAreaElement>();
-    const stubGeometry = (el: HTMLTextAreaElement | null) => {
-      anchor.current = el;
-      if (!el) return;
-      Object.defineProperty(el, "offsetTop", { value: 20, configurable: true });
-      Object.defineProperty(el, "offsetLeft", { value: 10, configurable: true });
-      Object.defineProperty(el, "offsetWidth", { value: 300, configurable: true });
-      Object.defineProperty(el, "offsetHeight", { value: 60, configurable: true });
-    };
-    const { container } = render(
-      <>
-        <ComposerTokenBackdrop
-          value="hello"
-          files={[]}
-          command={null}
-          activeIndex={null}
-          anchor={anchor}
-        />
-        <textarea ref={stubGeometry} />
-      </>,
+        <AlignedBackdrop value="hello" />
+      </StrictMode>,
     );
     const node = container.querySelector(
       '[data-testid="composer-highlight-overlay"]',
     ) as HTMLElement;
     expect(node.style.top).toBe("20px");
     expect(node.style.left).toBe("10px");
-    expect(node.style.width).toBe("300px");
     expect(node.style.height).toBe("60px");
+    expect(["300px", "340px"]).toContain(node.style.width);
+
+    // Repeated rerenders and resize notifications with alternating widths must
+    // never loop or drop a synchronous position update.
+    expect(() => {
+      for (const value of ["a", "b", "c", "d", "e", "hello [file 1]"]) {
+        rerender(
+          <StrictMode>
+            <AlignedBackdrop value={value} />
+          </StrictMode>,
+        );
+      }
+    }).not.toThrow();
+    top = 48;
+    rerender(
+      <StrictMode>
+        <AlignedBackdrop value="moved [file 1]" />
+      </StrictMode>,
+    );
+    expect(node.style.top).toBe("48px");
+    expect(["300px", "340px"]).toContain(node.style.width);
+
+    const beforeResizeWidth = node.style.width;
+    act(() => notifyResize.forEach((notify) => notify()));
+    expect(node.style.width).toBe(beforeResizeWidth === "300px" ? "340px" : "300px");
   });
 });

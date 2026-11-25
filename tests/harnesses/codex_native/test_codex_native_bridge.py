@@ -16,6 +16,7 @@ import pytest
 
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
@@ -54,7 +55,13 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.native.native_terminal_generation import (
+    NATIVE_TERMINAL_GENERATION_LABEL,
+    NativeTerminalGeneration,
+    persisted_terminal_generation,
+)
 from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -799,6 +806,48 @@ def test_full_state_publication_preserves_revision_for_the_same_owner(
     )
 
 
+@pytest.mark.parametrize(
+    ("session_id", "terminal_revision", "expected_revision"),
+    [("conv_test", 0, 4), ("conv_test", 8, 8), ("conv_new", 0, 0)],
+)
+def test_bridge_relaunch_preserves_only_the_same_sessions_revision(
+    bridge_dir: Path, session_id: str, terminal_revision: int, expected_revision: int
+) -> None:
+    _seed_active_turn(bridge_dir, "turn_old")
+    previous = read_bridge_state(bridge_dir)
+    assert previous is not None
+    write_bridge_state(bridge_dir, replace(previous, active_turn_revision=4))
+
+    terminal_generation = (
+        NativeTerminalGeneration(
+            generation=terminal_revision,
+            turn_id="codex_turn_old",
+            runner_id="runner",
+            status="idle",
+            turn_completed=True,
+            turn_outcome=None,
+        )
+        if terminal_revision
+        else None
+    )
+    clear_bridge_state(bridge_dir, session_id=session_id, terminal_generation=terminal_generation)
+    clear_bridge_state(bridge_dir)  # A failed launch can clear before publishing.
+    assert read_bridge_state(bridge_dir) is None
+
+    relaunched = replace(
+        previous,
+        session_id=session_id,
+        socket_path="ws://127.0.0.1:1234",
+        active_turn_id=None,
+        active_turn_revision=0,
+    )
+    write_bridge_state(bridge_dir, relaunched)
+
+    assert read_bridge_state(bridge_dir) == replace(
+        relaunched, active_turn_revision=expected_revision
+    )
+
+
 def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir: Path) -> None:
     _seed_active_turn(bridge_dir, "turn_a")
     observed = read_bridge_state(bridge_dir)
@@ -810,6 +859,108 @@ def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir:
         is None
     )
     assert read_bridge_state(bridge_dir) == current
+
+
+@pytest.mark.parametrize(
+    ("server_status", "local_outcome"),
+    [(None, "failed"), ("failed", "completed"), ("idle", None)],
+)
+async def test_cold_restore_retries_only_the_same_terminal_outcome_at_its_original_revision(
+    bridge_dir: Path, server_status: str | None, local_outcome: str | None
+) -> None:
+    _seed_active_turn(bridge_dir, "turn_old" if local_outcome else None)
+    seeded = read_bridge_state(bridge_dir)
+    assert seeded is not None
+    write_bridge_state(bridge_dir, replace(seeded, active_turn_revision=3 if local_outcome else 4))
+    if local_outcome is not None:
+        assert clear_active_turn_id_if_matches(
+            bridge_dir, "turn_old", terminal_outcome=local_outcome
+        )
+    previous = read_bridge_state(bridge_dir)
+    assert previous is not None
+
+    labels = {}
+    if server_status is not None:
+        labels[NATIVE_TERMINAL_GENERATION_LABEL] = NativeTerminalGeneration(
+            generation=3,
+            turn_id="codex_turn_old",
+            runner_id="runner",
+            status=server_status,
+            turn_completed=server_status == "idle",
+            turn_outcome=None,
+        ).model_dump_json()
+    clear_bridge_state(
+        bridge_dir,
+        session_id=previous.session_id,
+        terminal_generation=persisted_terminal_generation(labels, "runner"),
+    )
+    clear_bridge_state(bridge_dir)
+    write_bridge_state(
+        bridge_dir,
+        replace(
+            previous,
+            socket_path="ws://127.0.0.1:1234",
+            active_turn_revision=0,
+            last_terminal_turn_id=None,
+            last_terminal_outcome=None,
+        ),
+    )
+
+    restored = read_bridge_state(bridge_dir)
+    assert restored is not None
+    assert restored.active_turn_revision == 4
+    assert restored.active_turn_id is None
+    assert restored.last_terminal_turn_id is None
+    assert restored.last_terminal_outcome is None
+
+    outcome = "completed" if server_status == "idle" else "failed"
+    assert (
+        codex_native_bridge.record_resumed_terminal(bridge_dir, restored, ["turn_old"], outcome)
+        == restored
+    )
+    client = _RecordingClient()
+    await codex_native_forwarder._post_resume_turn_status(
+        client,
+        session_id=restored.session_id,
+        bridge_dir=bridge_dir,
+        thread_id=restored.thread_id,
+        turns=[{"id": "turn_old", "status": outcome}],
+    )
+    [(_, retry)] = client.posts
+    assert retry["data"]["response_id"] == "codex_turn_old"
+    assert retry["data"]["native_turn_generation"] == (3 if server_status else 4)
+    assert retry["data"]["status"] == ("idle" if outcome == "completed" else "failed")
+
+    different = "failed" if outcome == "completed" else "completed"
+    assert (
+        codex_native_bridge.record_resumed_terminal(bridge_dir, restored, ["turn_old"], different)
+        is None
+    )
+    assert read_bridge_state(bridge_dir) == restored
+
+    # Compaction can drop the old ID even when it was known to the local bridge.
+    history = ["turn_old", "turn_new"] if server_status == "idle" else ["turn_new"]
+    new = codex_native_bridge.record_resumed_terminal(bridge_dir, restored, history, "completed")
+    assert new is not None
+    assert new.active_turn_revision == restored.active_turn_revision + 1 == 5
+    assert new.last_terminal_turn_id == "turn_new"
+
+
+def test_cold_restore_without_read_access_to_revision_floor(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_text = Path.read_text
+
+    def read_without_floor(path: Path, *args, **kwargs) -> str:
+        if path.name == codex_native_bridge._CLEARED_TURN_REVISION_FILE:
+            raise PermissionError(errno.EACCES, "revision floor is unreadable")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_without_floor)
+    clear_bridge_state(bridge_dir, session_id="conv_test")
+    _seed_active_turn(bridge_dir, None)
+    restored = read_bridge_state(bridge_dir)
+    assert restored is not None and restored.active_turn_revision == 0
 
 
 @pytest.mark.parametrize(
@@ -1582,17 +1733,19 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
 
 
 @pytest.mark.parametrize(
-    ("activity_age_days", "expect_pruned", "expect_trimmed"),
+    ("activity_age_days", "expire_history", "expect_pruned", "expect_trimmed"),
     [
-        (8, 0, True),
-        (6, 0, False),
-        (71, 1, True),
+        (8, True, 0, True),
+        (6, True, 0, False),
+        (71, True, 1, True),
+        (71, False, 0, True),
     ],
 )
 def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     activity_age_days: int,
+    expire_history: bool,
     expect_pruned: int,
     expect_trimmed: bool,
 ) -> None:
@@ -1656,7 +1809,12 @@ def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
     os.utime(owner_marker, (aged_at, aged_at))
     os.utime(rollout, (aged_at, aged_at))
 
-    assert codex_native_bridge.prune_orphaned_bridge_dirs() == expect_pruned
+    prune = (
+        codex_native_bridge.prune_orphaned_bridge_dirs
+        if expire_history
+        else codex_native_bridge.prune_orphaned_bridge_runtime_files
+    )
+    assert prune() == expect_pruned
 
     if expect_pruned:
         assert not dead_dir.exists()
@@ -1676,7 +1834,7 @@ def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
         assert cache_dir.exists() != expect_trimmed
         assert (skills_dir / "s.md").exists() != expect_trimmed
         assert plugins_dir.exists() != expect_trimmed
-        assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+        assert prune() == 0
         assert dead_dir.exists()
 
     assert (plugin_target / "plugin.txt").read_text(encoding="utf-8") == "plugin"

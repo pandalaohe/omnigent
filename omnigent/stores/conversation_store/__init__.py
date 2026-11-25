@@ -502,6 +502,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.child_idle_resume",
         "omnigent.last_provider_usage_limits",
         "omnigent.startup",
+        "omnigent.launched_model",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,

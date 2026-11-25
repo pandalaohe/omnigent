@@ -76,6 +76,9 @@ import os, sys, termios, tty
 
 PROMPT_GLYPH = "\\u276f"
 RULE = "\\u2500" * 30
+PASTE_START = b"\\x1b[200~"
+PASTE_END = b"\\x1b[201~"
+CLEAR_KEYS = (b"\\x1b[107;5u", b"\\x1b[117;5u")
 
 
 def render(draft, transcript):
@@ -83,7 +86,7 @@ def render(draft, transcript):
     for line in transcript:
         sys.stdout.write(line + "\\r\\n")
     sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.write(PROMPT_GLYPH + " " + draft + "\\r\\n")
+    sys.stdout.write(PROMPT_GLYPH + " " + draft.replace("\\n", "\\r\\n  ") + "\\r\\n")
     sys.stdout.write(RULE + "\\r\\n")
     sys.stdout.flush()
 
@@ -94,6 +97,9 @@ def main():
     tty.setraw(fd)
     chars = []
     transcript = []
+    escape_sequence = b""
+    pasting = False
+    sys.stdout.write("\\x1b[?2004h")
     render("", transcript)
     try:
         while True:
@@ -103,19 +109,38 @@ def main():
             byte = data[0]
             if byte == 3:  # Ctrl-C tears the pane down on teardown
                 break
+            if byte == 27:
+                escape_sequence = data
+                continue
+            if escape_sequence:
+                escape_sequence += data
+                if escape_sequence == b"\\x1b[" or (
+                    escape_sequence.startswith(b"\\x1b[") and byte < 0x40
+                ):
+                    continue
+                if escape_sequence in (PASTE_START, PASTE_END):
+                    pasting = escape_sequence == PASTE_START
+                elif escape_sequence in CLEAR_KEYS:
+                    chars.clear()
+                    render("", transcript)
+                escape_sequence = b""
+                continue
             if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
+                if pasting:
+                    chars.append("\\n")
+                    render("".join(chars), transcript)
+                elif chars:
+                    transcript.append("sent: " + "".join(chars).rstrip("\\n"))
                     chars = []
                     render("", transcript)
                 continue
             if byte < 0x20:
-                # Swallow control bytes (Escape, the ESC of bracketed-paste
-                # markers); the visible message content is printable.
                 continue
             chars.append(chr(byte))
             render("".join(chars), transcript)
     finally:
+        sys.stdout.write("\\x1b[?2004l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
@@ -371,7 +396,7 @@ async def test_transient_attachment_read_does_not_drop_native_attachment(
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, "claude")
-        if "[Attached:" in pane or "could not be loaded" in pane:
+        if "sent: " in pane:
             break
         time.sleep(0.2)
 
@@ -381,7 +406,7 @@ async def test_transient_attachment_read_does_not_drop_native_attachment(
         "'could not be loaded' marker even though the resource was readable "
         f"again on the very next read. pane:\n{pane}"
     )
-    assert "[Attached:" in pane, (
+    assert "sent: [Attached:" in pane, (
         "the attachment reference never reached the Claude pane after a "
         f"transient read blip. pane:\n{pane}"
     )

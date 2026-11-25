@@ -855,3 +855,29 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
         sessions_common._session_status_cache[source["id"]] = "idle"
     await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
     assert torn_down == ([] if undone else [source["id"]])
+
+
+@_ONE_ENVIRONMENT
+async def test_settings_update_checks_source_sharing_for_an_owned_child(
+    auth_client, peers, db_uri
+):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+    )
+    updated = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=child.id, model="gpt-6-sol"
+    )
+    assert updated == {"session_id": child.id, "status": "updated", "model": "gpt-6-sol"}
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
+    refused = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=child.id, model="gpt-5.4"
+    )
+    assert "HTTP 403" in refused["error"]
+    assert "shared with edit access cannot" in refused["error"]
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.model_override == "gpt-6-sol"

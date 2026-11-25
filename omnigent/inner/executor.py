@@ -144,10 +144,10 @@ class ExecutorEvent:
 
 @dataclass
 class SessionModeChanged(ExecutorEvent):
-    """Agent mode readback fenced to the selection applied by this turn."""
+    """Agent mode readback, with the applied selection when one was requested."""
 
     mode: str
-    requested_mode: str
+    requested_mode: str | None
     selection_id: str | None = None
 
 

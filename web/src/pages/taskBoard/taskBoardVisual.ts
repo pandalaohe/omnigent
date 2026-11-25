@@ -26,37 +26,33 @@ export function boardSourceColors(tasks: BoardTask[]) {
   return new Map(order.map((id, index) => [id, sourcePalette[index] ?? "var(--muted-foreground)"]));
 }
 
-export function boardFiles(rows: NonNullable<TaskDisplay["rows"]>) {
+type DetailRows = NonNullable<TaskDisplay["rows"]>;
+
+export function isFileDetailRow(row: DetailRows[number]) {
+  return row.file !== undefined || /^path(?:[._-]|$)/.test(row.id);
+}
+
+export function boardFiles(rows: DetailRows) {
   const seen = new Set<string>();
   const files = rows
     .filter(
       (row) =>
-        !isBlankDetailValue(row.value) &&
-        /^path(?:[._-]|$)/.test(row.id) &&
+        isFileDetailRow(row) &&
+        (row.file !== undefined || !isBlankDetailValue(row.value)) &&
         !seen.has(row.value) &&
         !!seen.add(row.value),
     )
     .map((row) => {
-      const path = row.value,
-        parts = path.split(/[\\/]/),
-        base = parts.at(-1) ?? path;
+      const path = row.value;
+      const base = path.split(/[\\/]/).at(-1) || path;
       const ext = base.match(/\.([a-z0-9]+)$/i)?.[1] ?? "";
-      const stem = ext ? base.slice(0, -ext.length - 1) : base;
-      const kind = stem.match(/_(pretask|design|report|evidence|spec|research)$/)?.[1] ?? row.label;
-      const name =
-        stem
-          .replace(/^\d{6}_/, "")
-          .replace(/^T\d{6}-[A-Z]+-[A-Z]+-\d+_/, "")
-          .replace(/_(pretask|design|report|evidence|spec|research)$/, "")
-          .replace(/[-_]+/g, " ")
-          .trim() || base;
       return {
         path,
-        name,
-        kind,
+        name: row.file?.name ?? base,
+        kind: row.label,
         ext,
-        old: parts.includes("generation-history"),
-        version: parts.at(-2) ?? "",
+        old: row.file?.archived ?? false,
+        version: row.file?.versionLabel,
       };
     });
   return files.map((file) => ({

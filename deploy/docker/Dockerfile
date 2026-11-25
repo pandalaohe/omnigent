@@ -101,6 +101,7 @@ COPY browsers/shared/ ./browsers/shared/
 # The settings model list renders the connect-models guide shipped with the server.
 COPY omnigent/resources/connect_models.md ./omnigent/resources/connect_models.md
 ARG VITE_OMNIGENT_HOST_ROUTING=false
+ARG VITE_OMNIGENT_UI_LANGUAGE=en
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────

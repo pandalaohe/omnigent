@@ -540,6 +540,7 @@ class UsageAnalysisHoursView(BaseModel):
         | None
     )
     approx: bool
+    requests_configured: bool = False
     hours: list[AnalysisHourV2]
 
 
@@ -561,6 +562,7 @@ class UsageAnalysisV2View(BaseModel):
         | None
     )
     approx: bool
+    requests_configured: bool = False
     totals: AnalysisAmountsV2
     series: list[dict[str, Any]]
     groups: list[dict[str, Any]]

@@ -491,6 +491,31 @@ Fields:
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
     command uses) so the web picker and the TUI stay in sync.
 
+  requested (string or null)
+    Model originally requested for the active selection: `saved` from
+    the active session note in `omnigent.model_resolution` when catalog
+    resolution rewrote the current override, else `model_override`.
+    Preserved across same-selection resume catalog misses; cleared
+    atomically when the user selects another model or a fallback reset
+    wins so historical aliases are not revived. `null` when unset.
+    Also exposed on `ChildSessionSummary` beside `routed_model`.
+
+  launched (string or null)
+    Model recorded in server-owned `omnigent.launched_model` once a
+    harness launch (claude, codex, pi including explicit `--model`),
+    harness-confirmed live model switch, or accepted SDK/ACP turn
+    actually used it, or `null` when unlaunched, forked, pending the
+    next turn, or not confirmed at launch by the harness (e.g.
+    `antigravity-native`, where overrides are launch requests only).
+    Live updates publish `session.launched_model`. Also exposed on
+    `ChildSessionSummary` beside `routed_model`.
+
+  running (string or null)
+    Model last reported as actually running by the harness
+    (`reported_model`), verbatim. `null` before the harness reports a
+    concrete model or on older sessions without one. Also exposed on
+    `ChildSessionSummary` beside `routed_model`.
+
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for

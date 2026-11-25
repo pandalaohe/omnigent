@@ -5919,6 +5919,7 @@ function SectionHeader({
       onMouseDown={(event) => headerDrag?.listeners?.onMouseDown?.(event)}
       onKeyDown={(event) => headerDrag?.listeners?.onKeyDown?.(event)}
       data-project-order-name={headerDrag ? title : undefined}
+      data-layout-overlay={onSelect || hasAction || hasPersistentAction ? "hit-area" : undefined}
       type="button"
       aria-expanded={onSelect ? undefined : !collapsed}
       aria-current={!onSelect && active ? "page" : undefined}
@@ -8558,6 +8559,7 @@ function ConversationRowImpl({
       <Link
         to={selectionMode ? "#" : `/c/${conversation.id}`}
         componentId="sidebar.conversation_switcher"
+        data-layout-overlay={!selectionMode && !isProvisionalRow ? "hit-area" : undefined}
         aria-keyshortcuts={
           shortcutSlot !== undefined
             ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])

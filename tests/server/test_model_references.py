@@ -120,7 +120,7 @@ async def test_legacy_and_explicit_create_values_resolve_and_missing_is_unknown(
         warnings=warnings,
     )
     assert missing.model == "old/x" and missing.notes[0]["outcome"] == "missing"
-    assert any("trying it as unknown" in warning for warning in warnings)
+    assert any("passing it to the host unchanged" in warning for warning in warnings)
 
 
 async def test_resume_resolves_persists_and_labels_the_override(references_env, db_uri):
@@ -278,8 +278,160 @@ async def test_library_launch_retains_lead_and_member_resolution_notes(
         assert saved_spec.executor.model == "old/x"
         assert member["model"] == "old/y"
         assert "unavailable" not in member
-        assert any("trying it as unknown" in warning for warning in result.warnings)
+        assert any("passing it to the host unchanged" in warning for warning in result.warnings)
     notes = notes_from_labels(saved.labels)
     assert {note["setting"] for note in notes} >= {"member:worker", "library_agent"}
     assert {note["outcome"] for note in notes} == {"renamed" if provider_rename else "missing"}
     assert result.notes == notes
+
+
+async def test_switching_away_from_alias_does_not_revive_historical_requested_model(
+    references_env, db_uri
+):
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.model_resolution import (
+        LAUNCHED_MODEL_LABEL,
+        resolve_session_model,
+        session_model_display,
+    )
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    env = references_env
+    env.catalogs.upsert(HOST, "codex", [{"id": "new/x"}, {"id": "other/y"}], 1)
+    env.prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
+    conversations = env.app.state.conversation_store
+    conv = conversations.create_conversation(
+        agent_id=env.agent, host_id=HOST, workspace="/opt/work/example", model_override="old/x"
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(OWNER)
+    permissions.grant(OWNER, conv.id, LEVEL_OWNER)
+
+    # First resolution renames old/x -> new/x.
+    await resolve_session_model(
+        conv,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    renamed = conversations.get_conversation(conv.id)
+    assert renamed is not None
+    assert renamed.model_override == "new/x"
+    # Resuming on the same resolved model keeps requested=old/x.
+    await resolve_session_model(
+        renamed,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    resumed = conversations.get_conversation(conv.id)
+    assert resumed is not None
+    resumed_display = session_model_display(
+        {**resumed.labels, LAUNCHED_MODEL_LABEL: "new/x"},
+        resumed.model_override,
+        "new/x",
+        harness="codex-native",
+    )
+    assert resumed_display.requested == "old/x"
+
+    # User switches to other/y, then later explicitly chooses new/x (exact match).
+    conversations.update_conversation(conv.id, model_override="other/y")
+    switched = conversations.get_conversation(conv.id)
+    assert switched is not None
+    await resolve_session_model(
+        switched,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    conversations.update_conversation(conv.id, model_override="new/x")
+    explicit = conversations.get_conversation(conv.id)
+    assert explicit is not None
+    await resolve_session_model(
+        explicit,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    current = conversations.get_conversation(conv.id)
+    assert current is not None
+    explicit_display = session_model_display(
+        {**current.labels, LAUNCHED_MODEL_LABEL: "new/x"},
+        current.model_override,
+        "new/x",
+        harness="codex-native",
+    )
+    assert explicit_display.requested == "new/x"
+
+
+async def test_resume_catalog_miss_for_same_selection_keeps_active_alias_provenance(
+    references_env, db_uri
+):
+    """P2: a same-selection catalog miss (B->B) on resume keeps active A->B provenance."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.model_resolution import (
+        LAUNCHED_MODEL_LABEL,
+        notes_from_labels,
+        resolve_session_model,
+        session_model_display,
+    )
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    env = references_env
+    env.catalogs.upsert(HOST, "codex", [{"id": "new/x"}], 1)
+    env.prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
+    conversations = env.app.state.conversation_store
+    conv = conversations.create_conversation(
+        agent_id=env.agent, host_id=HOST, workspace="/opt/work/example", model_override="old/x"
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(OWNER)
+    permissions.grant(OWNER, conv.id, LEVEL_OWNER)
+
+    # First resolution renames old/x -> new/x.
+    await resolve_session_model(
+        conv,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    # Later, the host's usable catalog loses new/x before resume.
+    env.catalogs.upsert(HOST, "codex", [{"id": "other/y"}], 2)
+    resuming = conversations.get_conversation(conv.id)
+    assert resuming is not None
+    await resolve_session_model(
+        resuming,
+        conversations=conversations,
+        permissions=permissions,
+        agents=env.app.state.agent_store,
+        agent_cache=env.app.state.agent_cache,
+        preferences=env.prefs,
+        catalogs=env.catalogs,
+    )
+    after = conversations.get_conversation(conv.id)
+    assert after is not None
+    display = session_model_display(
+        {**after.labels, LAUNCHED_MODEL_LABEL: "new/x"},
+        after.model_override,
+        "new/x",
+        harness="codex-native",
+    )
+    assert display.requested == "old/x"
+    outcomes = {(n["saved"], n["model"], n["outcome"]) for n in notes_from_labels(after.labels)}
+    assert ("old/x", "new/x", "renamed") in outcomes
+    assert ("new/x", "new/x", "missing") in outcomes

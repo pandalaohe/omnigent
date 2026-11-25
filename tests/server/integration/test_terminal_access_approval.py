@@ -22,7 +22,9 @@ from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.oidc import mint_session_cookie
+from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import routes_hooks
 from omnigent.server.schemas import ElicitationRequestParams, SessionEventInput
 from omnigent.server.terminal_agent_access import (
     _requests,
@@ -31,6 +33,7 @@ from omnigent.server.terminal_agent_access import (
     require_terminal_card_approval,
     terminal_access_card_fields,
 )
+from omnigent.server.user_preferences_store import ApprovalTimeout
 from omnigent.spec import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -39,7 +42,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 
 @pytest_asyncio.fixture
@@ -630,3 +633,99 @@ async def test_real_card_timeout_releases_reservation_without_another_request(
     await poll_until_async(lambda: not _requests, timeout_s=2)
     assert not _requests
     assert pending_elicitations.lookup(eid, conversation_id=env.sid) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate", ["mcp", "relay", "park", "native-hook", "permission-hook", "deferred-hook"]
+)
+async def test_single_user_terminal_access_returns_reason_without_posting_card(
+    terminal_access, monkeypatch, gate
+):
+    env = terminal_access
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setattr(env.provider, "_source", "header")
+    monkeypatch.setattr(env.provider, "_accounts_config", None)
+    monkeypatch.setattr(env.provider, "_local_single_user", True)
+    published = []
+    monkeypatch.setattr(session_stream, "publish", lambda *args: published.append(args))
+    if gate == "mcp":
+        response = await orchestration._handle_mcp_tools_call(
+            1,
+            env.sid,
+            {"name": "sys_terminal_request_access", "arguments": env.args},
+            env.store,
+            None,
+            None,
+        )
+        body = json.loads(bytes(response.body))
+        assert "error" in body, body
+        reason = body["error"]["message"]
+    elif gate == "relay":
+        verdict = await orchestration._evaluate_independent_tool_call_policy(
+            env.sid,
+            env.store.get_conversation(env.sid),
+            SessionEventInput(
+                type="function_call",
+                data={"name": "sys_terminal_request_access", "arguments": json.dumps(env.args)},
+            ),
+            env.store,
+            env.agents,
+            None,
+        )
+        assert verdict is not None and verdict["verdict"] == "deny", verdict
+        reason = verdict["reason"]
+    elif gate == "park":
+        ready = asyncio.Event()
+        result = await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=env.sid,
+            params=ElicitationRequestParams(mode="form", message="Access?"),
+            timeout_s=0.05,
+            conversation_store=env.store,
+            tool_name="mcp__omnigent__sys_terminal_request_access",
+            tool_input=env.args,
+            published=ready,
+        )
+        assert result is not None and result.action == "decline" and ready.is_set()
+        reason = (result.content or {}).get("reason", "")
+    else:
+        forwarded = AsyncMock()
+        monkeypatch.setattr(routes_hooks, "_forward_session_change_to_runner", forwarded)
+        headers = {"X-Forwarded-Email": env.owner}
+        name = "mcp__omnigent__sys_terminal_request_access"
+        if gate == "native-hook":
+            response = await env.client.post(
+                f"/v1/sessions/{env.sid}/policies/evaluate",
+                json=policy_tool_call_request("sys_terminal_request_access", env.args),
+                headers=headers,
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["result"] == "POLICY_ACTION_DENY", body
+            reason = body["reason"]
+        else:
+            monkeypatch.setattr(
+                sessions_route,
+                "read_approval_timeout",
+                lambda *_: ApprovalTimeout(
+                    timeout_s=1, stop_turn=True, async_approvals=gate == "deferred-hook"
+                ),
+            )
+            response = await env.client.post(
+                f"/v1/sessions/{env.sid}/hooks/permission-request",
+                json={"tool_name": name, "tool_input": env.args},
+                headers=headers,
+            )
+            assert response.status_code == 200, response.text
+            decision = response.json()["hookSpecificOutput"]["decision"]
+            assert decision["behavior"] == "deny" and "interrupt" not in decision
+            reason = decision.get("message", "")
+        assert "signed-in browser" in reason.lower(), reason
+        forwarded.assert_not_called()
+    assert "signed-in browser" in reason.lower(), reason
+    assert "accounts sign-in" in reason.lower(), reason
+    assert [event["type"] for _, event in published] == (
+        ["response.policy_denied"] if gate == "native-hook" else []
+    )
+    assert not _requests

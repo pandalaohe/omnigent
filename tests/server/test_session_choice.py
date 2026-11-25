@@ -724,10 +724,17 @@ async def test_api_registered_owner_scoped_revision_and_field_errors(db_uri, tmp
         headers = {"X-Test-User": OWNER}
         url = "/v1/me/session-choice"
         initial = (await client.get(url, headers=headers)).json()
-        body = {"settings": document(), "expected_revision": initial["revision"]}
+        route_pools = {"route-a": "pool-a"}
+        body = {
+            "settings": {**document(), "codexRoutePools": route_pools},
+            "expected_revision": initial["revision"],
+        }
         result = await client.put(url, headers=headers, json=body)
         assert result.status_code == 200, result.text
         assert result.json()["corrected"] == []
+        assert (await client.get(url, headers=headers)).json()["settings"]["codexRoutePools"] == (
+            route_pools
+        )
         assert (await client.put(url, headers=headers, json=body)).status_code == 409
         bad = deepcopy(result.json()["settings"])
         bad["hosts"]["host-a"]["implementation"][0][0]["weight"] = 12
@@ -1013,7 +1020,7 @@ def pick(
 
 def fallback_table(*, second_mode="drain", third_mode="return", **changes):
     links = [
-        {"agent": "official", "model": "gpt-official", "meter": "pool-0"},
+        {"agent": "route-primary", "model": "gpt-primary", "meter": "pool-0"},
         {
             "agent": "alternate",
             "model": "gpt-alternate",
@@ -1722,14 +1729,26 @@ def test_exact_attribution_order_label_and_model_families():
 
 
 @pytest.mark.parametrize(
-    "caller_model", ["gpt-small", "official/gpt-small", "krill/gpt-small", "ccs-krill/gpt-small"]
+    "caller_model",
+    [
+        "gpt-small",
+        "route-primary/gpt-small",
+        "route-secondary/gpt-small",
+        "route-secondary-alt/gpt-small",
+    ],
 )
 def test_codex_ability_cap_compares_route_pins_by_plain_model(caller_model):
-    raw = table().model_dump(mode="json", by_alias=True)
+    raw = table(
+        codexRoutePools={
+            "route-primary": "pool-primary",
+            "route-secondary": "pool-secondary",
+            "route-secondary-alt": "pool-secondary",
+        }
+    ).model_dump(mode="json", by_alias=True)
     raw["abilityOrder"] = [["p0"], ["p1"]]
     rows = raw["hosts"]["host-a"]["work"][0]
     for index, model in enumerate(("gpt-large", "gpt-small")):
-        link = {"agent": f"agent-{index}", "model": model, "meter": "codex-pro"}
+        link = {"agent": f"agent-{index}", "model": model, "meter": "pool-primary"}
         rows[index]["links"] = [link]
         raw["presets"][index]["links"] = [link]
     choice = pick(
@@ -1743,24 +1762,29 @@ def test_codex_ability_cap_compares_route_pins_by_plain_model(caller_model):
         ),
     )
     assert choice.link.model == "gpt-small"
-    assert choice.pool == "codex-pro"
+    assert choice.pool == "pool-primary"
     assert choice.skipped[0].why == "above_caller"
 
 
 def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
-    raw = table().model_dump(mode="json", by_alias=True)
+    raw = table(
+        codexRoutePools={
+            "route-primary": "pool-primary",
+            "route-secondary": "pool-secondary",
+        }
+    ).model_dump(mode="json", by_alias=True)
     rows = raw["hosts"]["host-a"]["work"][0]
-    for row, route in zip(rows, ("official", "krill"), strict=True):
+    for row, route in zip(rows, ("route-primary", "route-secondary"), strict=True):
         row["links"][0] = {"agent": row["links"][0]["agent"], "model": f"{route}/gpt-example"}
     raw["limits"] = {
-        "codex-pro": {
+        "pool-primary": {
             "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
             "maxRunning": 1,
         },
-        "krill": {"maxRunning": 1},
+        "pool-secondary": {"maxRunning": 1},
     }
     # A router that offers route pins lists the pinned ids themselves.
-    pinned = frozenset({"gpt-example", "official/gpt-example", "krill/gpt-example"})
+    pinned = frozenset({"gpt-example", "route-primary/gpt-example", "route-secondary/gpt-example"})
     request = ChoiceRequest(
         OWNER,
         "host-a",
@@ -1769,22 +1793,69 @@ def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
     )
     settings = parse_session_choice(raw)
     selected = pick(settings, request=request)
-    assert (selected.pool, selected.link.model) == ("codex-pro", "official/gpt-example")
+    assert (selected.pool, selected.link.model) == ("pool-primary", "route-primary/gpt-example")
     assert selected.warnings == ()
-    warned = pick(settings, request=request, readings={"codex-pro": reading(used=90)})
-    assert (warned.pool, warned.link.model) == ("krill", "krill/gpt-example")
+    warned = pick(settings, request=request, readings={"pool-primary": reading(used=90)})
+    assert (warned.pool, warned.link.model) == ("pool-secondary", "route-secondary/gpt-example")
     assert warned.skipped[0].why == "reserve"
-    raw["limits"]["codex-pro"]["reserveExempt"] = ["work"]
+    raw["limits"]["pool-primary"]["reserveExempt"] = ["work"]
     exempt = parse_session_choice(raw)
     assert (
-        pick(exempt, request=request, readings={"codex-pro": reading(used=90)}).pool == "codex-pro"
+        pick(exempt, request=request, readings={"pool-primary": reading(used=90)}).pool
+        == "pool-primary"
     )
-    assert pick(exempt, request=request, readings={"codex-pro": reading(used=95)}).pool == "krill"
-    busy = pick(settings, request=request, running={"codex-pro": ("official-child",)})
-    assert busy.pool == "krill" and busy.skipped[0].why == "busy"
+    assert (
+        pick(exempt, request=request, readings={"pool-primary": reading(used=95)}).pool
+        == "pool-secondary"
+    )
+    busy = pick(settings, request=request, running={"pool-primary": ("primary-child",)})
+    assert busy.pool == "pool-secondary" and busy.skipped[0].why == "busy"
 
 
-@pytest.mark.parametrize("meter", ["codex-pro", "krill"])
+def test_route_pool_is_opt_in_and_survives_document_round_trip():
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
+        "agent": "agent-0",
+        "model": "route-a/gpt-example",
+        "meter": "pool-default",
+    }
+    request = ChoiceRequest(OWNER, "host-a", products={"agent-0": "codex"})
+    assert pick(parse_session_choice(raw), request=request).pool == "pool-default"
+
+    configured = parse_session_choice({**raw, "codexRoutePools": {"route-a": "pool-a"}})
+    saved = choice_document(configured)
+    assert saved["codexRoutePools"] == {"route-a": "pool-a"}
+    assert pick(parse_session_choice(saved), request=request).pool == "pool-a"
+    assert pick(parse_session_choice({**saved, "codexRoutePools": {}}), request=request).pool == (
+        "pool-default"
+    )
+
+
+def test_mapped_pool_alias_uses_the_same_quota_and_running_ids_as_a_meter():
+    from omnigent.models.model_reference import provider_groups
+
+    pool = "codex:new/account"
+    settings = table(
+        (1,),
+        codexRoutePools={"route-a": "codex:old/account"},
+        tiers=[[{"links": [{"agent": "agent-0", "model": "route-a/gpt-example"}]}]],
+        limits={pool: {"maxRunning": 1}},
+    )
+    groups = provider_groups([("new", "old")])
+    request = ChoiceRequest(OWNER, "host-a", products={"agent-0": "codex"}, provider_groups=groups)
+    assert pick(settings, request=request).pool == pool
+    assert pick(settings, request=request, running={pool: ("child",)}).reason == "busy"
+    session = Conversation(
+        id="child",
+        created_at=NOW,
+        updated_at=NOW,
+        root_conversation_id="child",
+        model_override="route-a/gpt-example",
+    )
+    assert pool_of_session(session, settings, product="codex", groups=groups) == pool
+
+
+@pytest.mark.parametrize("meter", ["pool-primary", "pool-secondary"])
 def test_codex_meter_keeps_the_link_model_as_written(meter):
     raw = table((1,)).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
@@ -1798,7 +1869,7 @@ def test_codex_meter_keeps_the_link_model_as_written(meter):
         OWNER,
         "host-a",
         products={"agent-0": "codex"},
-        models={"agent-0": frozenset({"official/gpt-6.1-sol"})},
+        models={"agent-0": frozenset({"route-primary/gpt-6.1-sol"})},
     )
     for running, outcome in (({}, "pick"), ({meter: ("child",)}, "hold")):
         choice = pick(settings, request=request, running=running)
@@ -1809,9 +1880,11 @@ def test_codex_meter_keeps_the_link_model_as_written(meter):
         )
 
 
-@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
+@pytest.mark.parametrize(
+    "route,pool", [("route-primary", "pool-primary"), ("route-secondary", "pool-secondary")]
+)
 def test_explicit_codex_route_pin_keeps_its_launch_model(route, pool):
-    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw = table((1,), codexRoutePools={route: pool}).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
         "agent": "agent-0",
         "model": f"{route}/gpt-6.1-sol",
@@ -1829,9 +1902,16 @@ def test_explicit_codex_route_pin_keeps_its_launch_model(route, pool):
 
 
 @pytest.mark.parametrize(
-    "route,pool", [("official", "codex-pro"), ("krill", "krill"), ("ccs-krill", "krill")]
+    "route,pool",
+    [
+        ("route-primary", "pool-primary"),
+        ("route-secondary", "pool-secondary"),
+        ("route-secondary-alt", "pool-secondary"),
+    ],
 )
 def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, pool):
+    from omnigent.server.json_labels import encode_json_labels
+
     conv = Conversation(
         id="child",
         created_at=NOW,
@@ -1841,19 +1921,32 @@ def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, poo
         reported_model="gpt-example",
         labels={CHOICE_LABEL: '{"pool":"outdated-meter"}'},
     )
-    assert pool_of_session(conv, parse_session_choice({}), product="codex") == pool
+    assert pool_of_session(conv, parse_session_choice({}), product="codex") == "outdated-meter"
+    settings = parse_session_choice({"codexRoutePools": {route: pool}})
+    assert pool_of_session(conv, settings, product="codex") == pool
     conv.labels[CHOICE_LABEL] = f'{{"pool":"outdated-meter","model":"{route}/gpt-example"}}'
     conv.model_override = None
-    assert pool_of_session(conv, parse_session_choice({}), product="codex") == pool
+    assert pool_of_session(conv, settings, product="codex") == pool
+    conv.model_override = f"{route}/gpt-example"
+    conv.labels = {
+        **encode_json_labels(
+            CHOICE_LABEL,
+            {"pool": pool, "model": conv.model_override, "reason": "x" * 300},
+            metadata={"pool": pool},
+        ),
+        SLOT_LABEL: f"admitted@host-a@{pool}@{NOW}",
+    }
+    remapped = parse_session_choice({"codexRoutePools": {route: "pool-replacement"}})
+    assert pool_of_session(conv, remapped, product="codex") == pool
 
 
 @pytest.mark.parametrize(
     "product,model",
     [
-        ("pi", "krill/gpt-example"),
+        ("pi", "route-secondary/gpt-example"),
         ("codex", "other/gpt-example"),
-        ("codex", "ccs-krill/gpt-example"),
-        ("codex", "official/gpt-example"),
+        ("codex", "route-secondary-alt/gpt-example"),
+        ("codex", "route-primary/gpt-example"),
     ],
 )
 def test_catalog_has_no_alias_for_a_configured_link_model(product, model):
@@ -1934,7 +2027,7 @@ def test_ambiguous_catalog_miss_tries_the_saved_link_without_exclusion():
     )
     assert result.outcome == "pick" and result.link.model == "old/x"
     assert result.skipped == () and result.notes[0]["outcome"] == "missing"
-    assert any("trying it as unknown" in warning for warning in result.warnings)
+    assert any("passing it to the host unchanged" in warning for warning in result.warnings)
 
 
 @pytest.mark.parametrize(
@@ -2200,11 +2293,14 @@ def test_period_exception_survives_provider_rename_in_rank_and_warning(model_rul
     assert exceptions == saved
 
 
-@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
+@pytest.mark.parametrize(
+    "route,pool", [("route-primary", "pool-primary"), ("route-secondary", "pool-secondary")]
+)
 def test_route_pin_candidate_matches_only_the_exact_model_period(route, pool):
     settings = shared_pool(
         {"agent": "agent-0", "model": f"{route}/gpt-large"},
         {"agent": "agent-1", "model": f"{route}/gpt-small"},
+        codexRoutePools={route: pool},
     )
     quotas = {pool: windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"), pool=pool)}
     request = period_request(
@@ -2228,7 +2324,7 @@ def test_period_exception_matches_native_labels_and_preserves_bucket_ids(db_uri,
     from tests.server.test_agent_quota import service_with_store, usage_report
 
     service = service_with_store(db_uri)
-    service.report_account(OWNER, "codex-pro", usage_report(account_product="codex"), now=NOW)
+    service.report_account(OWNER, "pool-primary", usage_report(account_product="codex"), now=NOW)
     service.report(
         OWNER,
         "host-a",
@@ -2253,23 +2349,34 @@ def test_period_exception_matches_native_labels_and_preserves_bucket_ids(db_uri,
         now=NOW + 1,
     )
     quotas = service.pool_readings(QuotaContext(OWNER, "host-a"), now=NOW + 1)
-    assert [(w.id, w.label) for w in quotas["codex-pro"].windows] == [
+    assert [(w.id, w.label) for w in quotas["pool-primary"].windows] == [
         ("codex-primary", "5h"),
         ("relay-primary", "5h"),
     ]
     # The other pool's tight reading beats low quota, but loses a weighted tie.
     quotas["other"] = reading("other", state="tight", pace=35)
-    first = {"agent": "agent-0", "model": "official/gpt-large"}
+    first = {"agent": "agent-0", "model": "route-primary/gpt-large"}
     second = {"agent": "agent-1", "model": "model-1", "meter": "other"}
     request = period_request(
         products={"agent-0": "codex"},
-        quota_periods={("agent-0", "official/gpt-large"): period},
+        quota_periods={("agent-0", "route-primary/gpt-large"): period},
     )
-    picked = pick(shared_pool(first, second), readings=quotas, request=request, now=NOW + 1)
+    route_pools = {"route-primary": "pool-primary"}
+    picked = pick(
+        shared_pool(first, second, codexRoutePools=route_pools),
+        readings=quotas,
+        request=request,
+        now=NOW + 1,
+    )
     assert picked.link.agent_id == ("agent-0" if period == "relay-primary" else "agent-1")
-    warning = pick(shared_pool(first), readings=quotas, request=request, now=NOW + 1)
+    warning = pick(
+        shared_pool(first, codexRoutePools=route_pools),
+        readings=quotas,
+        request=request,
+        now=NOW + 1,
+    )
     assert warning.warnings == (
-        () if period == "relay-primary" else ("codex-pro may not last until its reset",)
+        () if period == "relay-primary" else ("pool-primary may not last until its reset",)
     )
 
 

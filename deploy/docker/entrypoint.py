@@ -359,10 +359,19 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     database_url = resolved_config.database_url
     artifact_dir = resolved_config.artifact_dir
 
+    # Resolve server boot telemetry before constructing the first DB engine so
+    # stored opt-ins instrument SQLAlchemy and locked-off values beat legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    telemetry_enabled_at_start = configure_server_boot_telemetry(cfg)
+    if telemetry_enabled_at_start:
+        from omnigent.debug_logging import attach_debug_log_sink
+
+        attach_debug_log_sink([logging.getLogger()], source="server", level=logging.INFO)
+
     # ── Stores ───────────────────────────────────────────────
 
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
@@ -397,8 +406,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
-
-    telemetry.init()
 
     agent_store = SqlAlchemyAgentStore(database_url)
     file_store = SqlAlchemyFileStore(database_url)
@@ -544,6 +551,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)

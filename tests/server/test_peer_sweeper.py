@@ -131,11 +131,20 @@ class _FakePeerStore(PeerMessageStore):
         return self._rows.get(peer_id)
 
     def claim_oldest(
-        self, peer_id: str, reason: str | None, expected_states: tuple[str, ...]
+        self,
+        peer_id: str,
+        reason: str | None,
+        expected_states: tuple[str, ...],
+        *,
+        exclude_reason_prefix: str | None = None,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
             if row is None or row.state not in expected_states:
+                return False
+            if exclude_reason_prefix is not None and (row.reason or "").startswith(
+                exclude_reason_prefix
+            ):
                 return False
             if any(
                 older.id != row.id
@@ -182,6 +191,7 @@ class _FakePeerStore(PeerMessageStore):
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
+        exclude_reason_prefix: str | None = None,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
@@ -190,6 +200,10 @@ class _FakePeerStore(PeerMessageStore):
             if expected_states is not None and row.state not in expected_states:
                 return False
             if expected_reason is not None and row.reason != expected_reason:
+                return False
+            if exclude_reason_prefix is not None and (row.reason or "").startswith(
+                exclude_reason_prefix
+            ):
                 return False
             row.state = state
             if reason is not None:
@@ -1841,3 +1855,121 @@ async def test_replay_owed_notices_posts_all_past_the_batch_limit() -> None:
     posted = "\n".join(call["text"] for call in h.post_event.calls)
     assert f"peer message {first.id}" in posted
     assert f"peer message {second.id}" in posted
+
+
+async def test_stale_snapshot_never_resends_a_copy_claimed_after_it_was_read(
+    db_uri: str,
+) -> None:
+    """A record read before the runner's claim cannot be put back for a resend."""
+    from omnigent.server.peer_sweeper import _RECONCILE_GRACE_S, mark_peer_copy_claimed
+
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    conv_store = _FakeConversationStore()
+    sender = _conv(uuid.uuid4().hex, title="Sender")
+    receiver = _conv(uuid.uuid4().hex, title="Receiver")
+    conv_store.convs[sender.id] = sender
+    conv_store.convs[receiver.id] = receiver
+    created = now_epoch()
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="ref-1",
+            text="hello",
+            state="delivering",
+            created_at=created,
+            updated_at=created,
+            expires_at=created + 3600,
+        )
+    )
+    now = created + _RECONCILE_GRACE_S + 60
+    post_event = _PostEventScript()
+    sweeper = _store_sweeper(
+        store, conv_store, _TrueStateScript(), _DeliverScript(), post_event, now=now
+    )
+    stale = _row(store, record.id)
+    assert mark_peer_copy_claimed(store, receiver.id, record.id, "a" * 32)
+
+    await sweeper._reconcile_one(stale, now, age_from=created)
+    claimed = _row(store, record.id)
+    assert (claimed.state, claimed.reason) == ("delivering", "native_claimed:" + "a" * 32)
+
+    # The live row ends once, unconfirmed, with one notice; nothing is resent.
+    await sweeper._reconcile_stale_delivering(now)
+    await sweeper._reconcile_stale_delivering(now)
+    ended = _row(store, record.id)
+    assert (ended.state, ended.reason) == ("failed", "delivery_uncertain")
+    assert len(post_event.calls) == 1
+    assert "delivery_uncertain" in post_event.calls[0]["text"]
+
+
+async def test_a_claimed_record_waiting_in_pending_is_never_forwarded_again(
+    harness: _Harness,
+) -> None:
+    record = harness.seed_record(state="pending", reason="native_claimed:" + "a" * 32)
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
+    assert harness.deliver.calls == []
+
+
+async def test_claim_mark_is_refused_once_the_sweeper_reverted_the_record(
+    harness: _Harness,
+) -> None:
+    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+
+    reverted = harness.seed_record(state="pending")
+    attempt = "a" * 32
+    assert not mark_peer_copy_claimed(harness.store, "receiver", reverted.id, attempt)
+    assert _row(harness.store, reverted.id).reason is None
+    held = harness.seed_record(state="delivering")
+    assert mark_peer_copy_claimed(harness.store, "receiver", held.id, attempt)
+    # The same paste asking again keeps its grant; another attempt does not get one.
+    assert mark_peer_copy_claimed(harness.store, "receiver", held.id, attempt)
+    assert not mark_peer_copy_claimed(harness.store, "receiver", held.id, "b" * 32)
+    assert not mark_peer_copy_claimed(harness.store, "other-receiver", held.id, attempt)
+
+
+async def test_sweeper_does_not_forward_a_copy_claimed_during_its_recheck(db_uri: str) -> None:
+    """An earlier copy claimed between the re-claim and the forward is not sent again."""
+    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    conv_store = _FakeConversationStore()
+    sender = _conv(uuid.uuid4().hex, title="Sender")
+    receiver = _conv(uuid.uuid4().hex, title="Receiver")
+    conv_store.convs[sender.id] = sender
+    conv_store.convs[receiver.id] = receiver
+    now = now_epoch()
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="ref-1",
+            text="hello",
+            state="pending",
+            created_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    receiver_reads = {"count": 0}
+
+    async def _true_state(conv: Conversation, receiver: bool = False) -> tuple[str, bool]:
+        if receiver:
+            receiver_reads["count"] += 1
+            if receiver_reads["count"] == 2:
+                # The stalled earlier copy's runner claims while this pass re-checks.
+                assert mark_peer_copy_claimed(store, conv.id, record.id, "a" * 32)
+        return "idle", True
+
+    deliver = _DeliverScript()
+    sweeper = _store_sweeper(
+        store, conv_store, cast(Any, _true_state), deliver, _PostEventScript(), now=now
+    )
+    await sweeper._process_due(_row(store, record.id), now)
+
+    assert receiver_reads["count"] == 2
+    assert deliver.calls == []
+    stored = _row(store, record.id)
+    assert (stored.state, stored.reason) == ("delivering", "native_claimed:" + "a" * 32)

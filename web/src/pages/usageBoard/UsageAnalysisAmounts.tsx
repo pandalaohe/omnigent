@@ -13,6 +13,7 @@ import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 import { UsageName } from "./UsageName";
 import { moneyText } from "./UsageAccountMoney";
 import { formatOverviewTokens, formatRingPercent } from "./usageBoardFormat";
+import { interfaceText } from "@/lib/interfaceText";
 import { useState, type CSSProperties } from "react";
 import type { FilterDimension, PageFilter } from "./usageAnalysisFilters";
 import { analysisSections } from "./UsageAnalysisRail";
@@ -292,7 +293,6 @@ export function UsageAnalysisFailures({
   );
 }
 
-export const paymentRestriction = "实付不分 Host / Agent / 模型 / 时段";
 export const paymentRestricted = (filter: PageFilter) =>
   !!(filter.host.length || filter.agent.length || filter.model.length || filter.slot);
 export const v2Tokens = (tokens: number | null | undefined) =>
@@ -328,7 +328,8 @@ export function AnalysisV2Items({
     },
     {
       title: "Paid",
-      display: (row: V2Row) => (restricted ? "未知" : analysisValueText(row.paid)),
+      display: (row: V2Row) =>
+        restricted ? interfaceText("paymentUnknown") : analysisValueText(row.paid),
       value: (row: V2Row) => (restricted ? null : amountSort(row.paid)),
     },
     {
@@ -343,7 +344,8 @@ export function AnalysisV2Items({
     },
     {
       title: "Payback",
-      display: (row: V2Row) => (restricted ? "未知" : analysisValueText(row.payback, "ratio")),
+      display: (row: V2Row) =>
+        restricted ? interfaceText("paymentUnknown") : analysisValueText(row.payback, "ratio"),
       value: (row: V2Row) => (restricted ? null : amountSort(row.payback)),
     },
     { title: "Failure rate", display: (row: V2Row) => percent(v2Failure(row)), value: v2Failure },
@@ -364,7 +366,7 @@ export function AnalysisV2Items({
   const active = filter[filter.group];
   return (
     <AnalysisSection id="items" title={analysisSections.items}>
-      {restricted ? <p className="usage-caption">{paymentRestriction}</p> : null}
+      {restricted ? <p className="usage-caption">{interfaceText("paymentRestriction")}</p> : null}
       {ordered.length ? (
         <div className="ua-v2-table-scroll">
           <table className="ua-v2-table" aria-label={analysisSections.items}>

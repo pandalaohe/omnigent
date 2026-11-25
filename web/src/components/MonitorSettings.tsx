@@ -55,6 +55,7 @@ interface LoadLinesDraft {
   heavy: string;
   newSession: string;
   queueEnabled: boolean;
+  noticesEnabled: boolean;
 }
 
 function toLoadLinesDraft(lines: SystemLoadLinesSettings): LoadLinesDraft {
@@ -62,23 +63,39 @@ function toLoadLinesDraft(lines: SystemLoadLinesSettings): LoadLinesDraft {
     heavy: String(lines.default.heavy),
     newSession: String(lines.default.new_session),
     queueEnabled: lines.queue_enabled,
+    noticesEnabled: lines.notices_enabled ?? false,
   };
 }
 
-/** The workspace's default load lines and the queue switch; the pair is checked before saving. */
+/** The workspace's default load lines and automation switches. */
 function LoadLinesSettingsForm({ lines }: { lines: SystemLoadLinesSettings }) {
   const update = useUpdateSystemStatusSettings();
   const [draft, setDraft] = useState<LoadLinesDraft>(() => toLoadLinesDraft(lines));
   const [invalid, setInvalid] = useState<string | null>(null);
-  const lastSynced = useRef(JSON.stringify(toLoadLinesDraft(lines)));
+  const lastSynced = useRef(toLoadLinesDraft(lines));
 
   useEffect(() => {
     const next = toLoadLinesDraft(lines);
-    setDraft((current) => (JSON.stringify(current) === lastSynced.current ? next : current));
-    lastSynced.current = JSON.stringify(next);
+    const previous = lastSynced.current;
+    setDraft((current) => ({
+      heavy: current.heavy === previous.heavy ? next.heavy : current.heavy,
+      newSession: current.newSession === previous.newSession ? next.newSession : current.newSession,
+      queueEnabled:
+        current.queueEnabled === previous.queueEnabled ? next.queueEnabled : current.queueEnabled,
+      noticesEnabled:
+        current.noticesEnabled === previous.noticesEnabled
+          ? next.noticesEnabled
+          : current.noticesEnabled,
+    }));
+    lastSynced.current = next;
   }, [lines]);
 
-  const unchanged = JSON.stringify(draft) === JSON.stringify(toLoadLinesDraft(lines));
+  const saved = toLoadLinesDraft(lines);
+  const linesChanged = draft.heavy !== saved.heavy || draft.newSession !== saved.newSession;
+  const queueChanged = draft.queueEnabled !== saved.queueEnabled;
+  const noticesChanged =
+    lines.notices_enabled !== undefined && draft.noticesEnabled !== saved.noticesEnabled;
+  const unchanged = !linesChanged && !queueChanged && !noticesChanged;
 
   return (
     <form
@@ -86,6 +103,7 @@ function LoadLinesSettingsForm({ lines }: { lines: SystemLoadLinesSettings }) {
       className="mt-4 flex flex-col gap-4"
       onSubmit={(event) => {
         event.preventDefault();
+        if (unchanged) return;
         const pair = {
           heavy: parseLoadLine(draft.heavy),
           new_session: parseLoadLine(draft.newSession),
@@ -93,7 +111,13 @@ function LoadLinesSettingsForm({ lines }: { lines: SystemLoadLinesSettings }) {
         const error = loadLinePairError(pair.heavy, pair.new_session);
         setInvalid(error);
         if (error !== null) return;
-        update.mutate({ load_lines: { default: pair, queue_enabled: draft.queueEnabled } });
+        update.mutate({
+          load_lines: {
+            ...(linesChanged && { default: pair }),
+            ...(queueChanged && { queue_enabled: draft.queueEnabled }),
+            ...(noticesChanged && { notices_enabled: draft.noticesEnabled }),
+          },
+        });
       }}
     >
       <div className="grid grid-cols-2 gap-3">
@@ -151,6 +175,29 @@ function LoadLinesSettingsForm({ lines }: { lines: SystemLoadLinesSettings }) {
           </span>
         </div>
       </div>
+      {lines.notices_enabled !== undefined && (
+        <div className="flex items-start gap-3 pl-6">
+          <Switch
+            id="load-lines-notices-enabled"
+            checked={draft.noticesEnabled}
+            onCheckedChange={(noticesEnabled) =>
+              setDraft((current) => ({ ...current, noticesEnabled }))
+            }
+            className="mt-0.5 shrink-0"
+          />
+          <div className="flex flex-col gap-0.5">
+            <label
+              htmlFor="load-lines-notices-enabled"
+              className="text-ui font-normal md:font-medium"
+            >
+              Send host load notices
+            </label>
+            <span className="text-sm text-muted-foreground">
+              Related parent sessions receive a message when a host crosses a load line or recovers.
+            </span>
+          </div>
+        </div>
+      )}
       {(invalid !== null || update.isError) && (
         <p role="alert" className="text-sm text-destructive">
           {invalid ?? update.error?.message}

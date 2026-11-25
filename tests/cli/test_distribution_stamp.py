@@ -27,11 +27,13 @@ def test_version_line_names_the_distribution_when_stamped(
 
 def test_version_line_is_unchanged_without_a_stamp() -> None:
     assert distribution.DISTRIBUTION_VERSION is None
+    assert distribution.DISTRIBUTION_RELEASE_REPO is None
     assert _format_version() == f"omnigent {VERSION}"
 
 
 def test_stamp_line_is_unique_for_the_snapshot_builder() -> None:
-    """The builder rewrites exactly one ``DISTRIBUTION_VERSION`` assignment."""
+    """The builder rewrites exactly one version and one release-repo assignment."""
     source = Path(distribution.__file__).read_text(encoding="utf-8")
 
     assert source.count("DISTRIBUTION_VERSION: str | None = None\n") == 1
+    assert source.count("DISTRIBUTION_RELEASE_REPO: str | None = None\n") == 1

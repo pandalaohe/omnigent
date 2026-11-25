@@ -87,10 +87,13 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  telemetry?: TelemetryStatus;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
+  browser_approval_available?: boolean;
+  push_credentials_required?: boolean;
   /** Accounts-mode Chrome annotation routes are configured on a shared database. */
   browser_annotations_available?: boolean;
   /** Signed-in delegated grants can be listed and individually revoked. */
@@ -360,6 +363,21 @@ export interface ServerInfo {
    * an older server, which means no restriction.
    */
   picker?: PickerCuration;
+}
+
+export interface TelemetryStatus {
+  enabled: boolean;
+  locked: boolean;
+  source: string;
+}
+
+export function parseTelemetryStatus(value: unknown): TelemetryStatus | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { enabled, locked, source } = value as Partial<TelemetryStatus>;
+  if (typeof enabled !== "boolean" || typeof locked !== "boolean" || typeof source !== "string") {
+    return undefined;
+  }
+  return { enabled, locked, source };
 }
 
 /** Keys of the ``attachment_limits`` payload the web understands. */
@@ -653,12 +671,21 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          telemetry: parseTelemetryStatus(data.telemetry),
           sibling_sessions: data.sibling_sessions === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),
           session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
+          browser_approval_available:
+            typeof data.browser_approval_available === "boolean"
+              ? data.browser_approval_available
+              : undefined,
+          push_credentials_required:
+            typeof data.push_credentials_required === "boolean"
+              ? data.push_credentials_required
+              : undefined,
           browser_annotations_available: data.browser_annotations_available === true,
           api_keys_available: data.api_keys_available === true,
           connected_apps_available: data.connected_apps_available === true,
@@ -773,6 +800,19 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+export function isSingleUserWithoutBrowserApproval(info: ServerInfo | "loading"): boolean {
+  if (info === "loading" || !info.single_user) return false;
+  // Older servers only report the deployment marker and login options.
+  return (
+    info.browser_approval_available === false ||
+    (info.browser_approval_available === undefined && !info.accounts_enabled && !info.login_url)
+  );
+}
+
+export function pushCredentialsRequired(info: ServerInfo | "loading"): boolean {
+  return info === "loading" || info.push_credentials_required !== false;
 }
 
 /**

@@ -2,7 +2,7 @@
    amber and red are quota state; text steps down through three cool greys;
    other categories use one five-colour series set. Type steps follow the app's
    UI size. Numbers use tabular figures. */
-:is(.usage-board-scroll, .usage-palette) {
+:is(.usage-scroll, .usage-palette) {
   --usage-background: #f5f6f8;
   --usage-ink: #0f141c;
   --usage-ink-2: #3a4454;
@@ -34,8 +34,8 @@
   --usage-series-4: #e87ba4;
   --usage-series-5: #4a3aa7;
 }
-.dark :is(.usage-board-scroll:not([data-usage-theme="light"]), .usage-palette),
-.usage-board-scroll[data-usage-theme="dark"] {
+.dark :is(.usage-scroll:not([data-usage-theme="light"]), .usage-palette),
+.usage-scroll[data-usage-theme="dark"] {
   --usage-background: #10141b;
   --usage-ink: #eaeef4;
   --usage-ink-2: #b6becc;
@@ -64,17 +64,17 @@
   --usage-series-4: #d55181;
   --usage-series-5: #5243cc;
 }
-.usage-board-scroll {
+.usage-scroll {
   background-color: var(--usage-background);
 }
 /* Keep the scroll viewport below the shell overlay so its controls can receive clicks. */
-main[data-shell-header="visible"] .usage-board-scroll {
+main[data-shell-header="visible"] .usage-scroll {
   margin-top: calc(var(--omnigent-header-height) + var(--omnigent-inset-top));
 }
-.usage-board-scroll[data-usage-theme="light"] {
+.usage-scroll[data-usage-theme="light"] {
   color-scheme: light;
 }
-.usage-board-scroll[data-usage-theme="dark"] {
+.usage-scroll[data-usage-theme="dark"] {
   color-scheme: dark;
 }
 .usage-surface {

@@ -12,6 +12,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { copyText } from "@/lib/clipboard";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { pushCredentialsRequired } from "@/lib/capabilities";
 import { buildConnectCommand, CONNECT_SOURCES, type ConnectSource } from "./usageBoardConnect";
 import { t } from "./usageText";
 
@@ -22,7 +24,19 @@ export function UsageSourceConnect({
 }) {
   const [source, setSource] = useState(initialSource);
   const [result, setResult] = useState<"copied" | "copyFailed" | null>(null);
-  const command = buildConnectCommand(window.location.origin, source);
+  const info = useServerInfo();
+  const requireCredentials = pushCredentialsRequired(info);
+  const usesOidc = info !== "loading" && info.login_url === "/auth/login";
+  const command = buildConnectCommand(window.location.origin, source, {
+    requireAuthHeader: requireCredentials,
+  });
+  const sourceHelp =
+    !requireCredentials && source === "otel" ? t("otelHelpSingleUser") : t(`${source}Help`);
+  const credentialHelp = !requireCredentials
+    ? "credentialHelpSingleUser"
+    : usesOidc
+      ? "credentialHelpOidc"
+      : "credentialHelp";
   return (
     <div className="flex flex-col gap-3">
       <label className="flex flex-wrap items-center gap-2 text-sm">
@@ -39,7 +53,7 @@ export function UsageSourceConnect({
           className="h-auto w-56 max-w-full rounded-none! bg-transparent p-0"
         />
       </label>
-      <p className="text-xs leading-relaxed text-muted-foreground">{t(`${source}Help`)}</p>
+      <p className="text-xs leading-relaxed text-muted-foreground">{sourceHelp}</p>
       {source !== "subscription" ? (
         <>
           <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border bg-muted/40 p-2.5 font-mono text-[11.5px] leading-relaxed">
@@ -72,7 +86,7 @@ export function UsageSourceConnect({
               {result ? t(result) : null}
             </span>
           </div>
-          <p className="text-xs leading-relaxed text-muted-foreground">{t("credentialHelp")}</p>
+          <p className="text-xs leading-relaxed text-muted-foreground">{t(credentialHelp)}</p>
         </>
       ) : null}
       <p className="text-xs leading-relaxed text-muted-foreground">{t("storageHelp")}</p>

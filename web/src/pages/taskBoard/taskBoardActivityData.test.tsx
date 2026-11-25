@@ -23,6 +23,40 @@ import {
 } from "./taskBoardActivityData";
 
 const fetcher = vi.hoisted(() => vi.fn());
+const serverInfoState = vi.hoisted(() => ({
+  usage_board_enabled: false,
+  single_user: false,
+  accounts_enabled: false,
+  login_url: null as string | null,
+  push_credentials_required: true,
+}));
+
+it("shows Today decisions by source visibility regardless of language or prefix", () => {
+  const task: BoardTask = {
+    uid: "task",
+    title: "Release plan",
+    "omnigent.ai:source": "example",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      quotes: [
+        {
+          id: "shown",
+          task: { source: "example", uid: "task" },
+          text: "按表格更新这条来自外部来源的决定",
+        },
+        {
+          id: "hidden",
+          task: { source: "example", uid: "task" },
+          text: "Internal draft wording",
+          showInSummary: false,
+        },
+      ],
+    },
+  };
+  render(<TaskBoardToday tasks={[task]} sessions={[]} caches={{}} now={0} onSelect={vi.fn()} />);
+  expect(screen.getByText(/按表格更新/)).toBeTruthy();
+  expect(screen.queryByText(/Internal draft wording/)).toBeNull();
+});
 
 it("shows the frozen Taipei 225 repository commits beside 172 linked without assigning links to repositories", () => {
   const { cache, now } = dailyRepositoryFixture(Intl.DateTimeFormat().resolvedOptions().timeZone);
@@ -94,10 +128,14 @@ it("deduplicates repeated repositories, withholds conflicting totals and incompa
   expect(repositoryCommitTotals({}, now)).toMatchObject({ total: null, partial: true });
 });
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ usage_board_enabled: false }),
+  useServerInfo: () => serverInfoState,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetcher }));
 afterEach(() => {
+  serverInfoState.single_user = false;
+  serverInfoState.accounts_enabled = false;
+  serverInfoState.login_url = null;
+  serverInfoState.push_credentials_required = true;
   cleanup();
   fetcher.mockReset();
 });
@@ -860,4 +898,38 @@ it("offers an available standards reference before a source is connected", () =>
   expect(screen.getByRole("link", { name: "JSCalendar reference" }).getAttribute("href")).toBe(
     "https://www.rfc-editor.org/rfc/rfc8984.html",
   );
+});
+
+it("uses the effective credential requirement for task sources on one machine", () => {
+  const source = taskBoardFixture().sources[0];
+  const prefs = {
+    ...boardDefaults,
+    view: "settings" as const,
+    mode: "order" as const,
+    focus: [],
+    aliases: {},
+    hiddenSources: [],
+    pinnedQuota: [],
+  };
+  serverInfoState.single_user = true;
+  serverInfoState.push_credentials_required = false;
+  const view = wrap(<TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />);
+  expect(view.container.textContent).toMatch(/no api key is needed on this machine/i);
+  expect(view.container.textContent).not.toContain("Authorization: Bearer");
+
+  view.unmount();
+  serverInfoState.push_credentials_required = true;
+  for (const login of ["/login", "/auth/login"]) {
+    serverInfoState.login_url = login;
+    serverInfoState.accounts_enabled = login === "/login";
+    const authenticated = wrap(
+      <TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />,
+    );
+    expect(authenticated.container.textContent).toContain(
+      login === "/login"
+        ? "Authorization: Bearer <your tasks-scoped key>"
+        : "Authorization: Bearer <your access token>",
+    );
+    authenticated.unmount();
+  }
 });

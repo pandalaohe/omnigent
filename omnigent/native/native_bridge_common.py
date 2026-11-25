@@ -222,7 +222,7 @@ def prune_orphaned_dirs(
         if not entry.is_dir() or entry.name == _LOCK_DIR_NAME:
             continue
         with try_bridge_dir_cleanup_lock(entry) as acquired:
-            if not acquired:
+            if not acquired or entry.is_symlink() or entry.is_junction():
                 continue
             marker = entry / OWNER_PID_FILENAME
             pid: int | None
@@ -306,14 +306,14 @@ def prune_expired_attachment_caches(attachments_dir: Path | None = None) -> int:
     return removed
 
 
-def reap_orphaned_native_bridge_dirs() -> int:
+def reap_orphaned_native_bridge_dirs(*, expire_history: bool | None = None) -> int:
     """
     Sweep orphaned bridge dirs across every native harness during maintenance.
 
     Iterates the registered native coding agents and invokes each one's
-    module-level ``prune_orphaned_bridge_dirs`` (if it defines one), so
-    adding a new native harness needs no edit here — it participates simply
-    by exposing that function. The bridge module name is derived from the
+    module-level ``prune_orphaned_bridge_dirs`` when history expiry is enabled.
+    Otherwise it invokes ``prune_orphaned_bridge_runtime_files`` if defined.
+    The bridge module name is derived from the
     agent key (``omnigent.harnesses.<key>_native.bridge``). Each harness's prune is
     isolated: an import failure, a missing pruner, or a raising pruner
     never aborts the sweep of the others.
@@ -322,12 +322,20 @@ def reap_orphaned_native_bridge_dirs() -> int:
     standalone runners call this to reclaim dirs leaked by a prior runner that
     died without running the explicit delete path.
 
+    :param expire_history: The host's resolved opt-in, read here for standalone runners.
     :returns: The total number of orphaned bridge dirs and expired attachment caches removed.
     """
     # Imported lazily to avoid an import cycle: the per-harness bridge
     # modules import this module for the marker/prune helpers.
     from omnigent.harness_plugins import native_agents
 
+    if expire_history is None:
+        from omnigent.config import native_history_cleanup_enabled
+
+        expire_history = native_history_cleanup_enabled()
+    prune_method = (
+        "prune_orphaned_bridge_dirs" if expire_history else "prune_orphaned_bridge_runtime_files"
+    )
     pruned = 0
     for agent in native_agents():
         module_name = f"omnigent.harnesses.{agent.key}_native.bridge"
@@ -352,7 +360,7 @@ def reap_orphaned_native_bridge_dirs() -> int:
                 module_name,
             )
             continue
-        prune = getattr(module, "prune_orphaned_bridge_dirs", None)
+        prune = getattr(module, prune_method, None)
         if prune is None:
             continue
         try:
@@ -362,10 +370,11 @@ def reap_orphaned_native_bridge_dirs() -> int:
                 "Error pruning orphaned bridge dirs for native agent %s",
                 agent.key,
             )
-    try:
-        pruned += prune_expired_attachment_caches()
-    except Exception:
-        _logger.exception("Error pruning expired native attachment caches")
+    if expire_history:
+        try:
+            pruned += prune_expired_attachment_caches()
+        except Exception:
+            _logger.exception("Error pruning expired native attachment caches")
     return pruned
 
 

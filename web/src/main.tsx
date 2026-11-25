@@ -25,7 +25,6 @@ import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
-import { initBrowserTelemetry } from "./lib/telemetry";
 import { installTerminalHardwareInput } from "./lib/terminalHardwareInput";
 import {
   applyStoredUiFontSize,
@@ -40,10 +39,6 @@ import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
 
-// Start tracing before any request fires so fetch/XHR are patched in time
-// and a trace begins in the browser. No-op unless a collector endpoint is
-// configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
-initBrowserTelemetry();
 installTerminalHardwareInput();
 
 // Single client at module scope — shared across the whole app.
@@ -130,6 +125,15 @@ applyThemePalette(readThemePalette());
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
 const bootServerInfo = createBootServerInfo(resolveServerInfo());
+void bootServerInfo.settled
+  .then(async ({ telemetry }) => {
+    if (telemetry?.enabled !== true || !import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT?.trim()) {
+      return;
+    }
+    const { initBrowserTelemetry } = await import("./lib/telemetry");
+    initBrowserTelemetry(telemetry.enabled);
+  })
+  .catch((error: unknown) => console.warn("Could not initialize browser telemetry", error));
 
 // Same 1.5s safety net for the identity probe: a hung /v1/me must not
 // deadlock first paint. On timeout we render anyway and the app degrades

@@ -5483,6 +5483,31 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_hello_advertises_managed_tools_only_for_antigravity_acp(monkeypatch):
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    entries = [
+        AcpAgentEntry("ag", "AG", r'"C:\\Program Files\\AG\\agy.exe" acp --stdio'),
+        AcpAgentEntry("opencode", "OpenCode", "opencode acp"),
+        AcpAgentEntry("not-acp", "Not ACP", "agy chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda: entries)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert {
+        capability.removeprefix(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+        for capability in hello.capabilities
+        if capability.startswith(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+    } == {"acp", "acp:ag"}
+
+
 async def test_hello_does_not_wait_for_forkserver_control(
     tmp_path: Path,
 ) -> None:
@@ -8498,15 +8523,18 @@ def _patch_connect(monkeypatch: pytest.MonkeyPatch, spy: _ConnectSpy) -> None:
 
 def _host(
     server_url: str = "https://app.example.databricks.com",
+    *,
+    config_path: Path | None = None,
 ) -> HostProcess:
     """Build a HostProcess for the fail-loud tests.
 
     :param server_url: Server URL the host connects to, e.g.
         ``"https://app.example.databricks.com"``.
+    :param config_path: The host's startup config file, if specified.
     :returns: A configured :class:`HostProcess`.
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
-    return HostProcess(identity, server_url)
+    return HostProcess(identity, server_url, config_path=config_path)
 
 
 @pytest.mark.asyncio
@@ -10001,6 +10029,7 @@ def test_run_host_process_announces_session_log_dir_on_start(
 
 async def test_run_starts_and_shuts_down_host_maintenance(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Host lifecycle owns the janitor without joining runner startup."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -10032,9 +10061,11 @@ async def test_run_starts_and_shuts_down_host_maintenance(
     janitor_live_paths: list[object] = []
     janitor_rotation_callbacks: list[object] = []
     janitor_servers: list[tuple[object, object, object]] = []
+    janitor_configs: list[Path | None] = []
 
     def _for_host(
         *,
+        config_path: Path | None = None,
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: object = None,
         on_runner_log_rotated: object = None,
@@ -10042,6 +10073,7 @@ async def test_run_starts_and_shuts_down_host_maintenance(
         server_headers: object = None,
         host_id: object = None,
     ) -> _RecordingJanitor:
+        janitor_configs.append(config_path)
         janitor_roots.append(harness_tmp_parent)
         janitor_live_paths.append(live_runner_log_paths)
         janitor_rotation_callbacks.append(on_runner_log_rotated)
@@ -10049,13 +10081,15 @@ async def test_run_starts_and_shuts_down_host_maintenance(
         return janitor
 
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
-    host = _host()
+    config_path = tmp_path / "host.yaml"
+    host = _host(config_path=config_path)
     host._lifecycle_lock = _RecordingLifecycleLock()  # type: ignore[assignment]
     monkeypatch.setattr(host, "_cleanup_runners", lambda: calls.append("cleanup_runners"))
 
     await host.run()
 
     assert calls == ["acquire", "start", "shutdown", "cleanup_runners", "release"]
+    assert janitor_configs == [config_path]
     assert janitor_roots == [host._harness_tmp_parent]
     # The runner-log sweep must be able to exclude this host's live logs.
     assert janitor_live_paths == [host._live_runner_log_paths]

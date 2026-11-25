@@ -5502,19 +5502,22 @@ async def test_sys_session_send_family_guard_runs_before_normalization(
 def _host_catalog_server(
     requests: list[httpx.Request],
     fail: str | None = None,
+    *,
+    harness: str = "codex-native",
 ) -> Callable[[httpx.Request], httpx.Response]:
     """
     Serve the host list, agent-to-harness resolution and cached catalogs.
 
-    ``ag_known`` runs on ``codex-native``, ``ag_uncached`` on a harness with
+    ``ag_known`` runs on the selected harness, ``ag_uncached`` on a harness with
     no cached row, and any other agent resolves to no harness.
 
     :param requests: Receives every request the handler sees.
     :param fail: ``"hosts-502"``, ``"hosts-html"`` or ``"catalogs-500"`` to
         break that read, or ``None``.
+    :param harness: Harness for the selected agent and its catalog row.
     :returns: An ``httpx.MockTransport`` handler.
     """
-    harnesses = {"ag_known": "codex-native", "ag_uncached": "pi-native"}
+    harnesses = {"ag_known": harness, "ag_uncached": "pi-native"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -5552,7 +5555,7 @@ def _host_catalog_server(
                 },
                 {
                     "host_id": "host-a",
-                    "harness": "codex-native",
+                    "harness": harness,
                     "models": [
                         {"id": "relay/model-x", "displayName": "Model X", "isDefault": True},
                         {"id": "row-2", "model": "relay/model-y", "hidden": True},
@@ -5641,7 +5644,8 @@ async def test_sys_list_models_requires_agent_spec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
+@pytest.mark.parametrize("harness", ["codex-native", "antigravity-native"])
+async def test_sys_list_models_lists_host_catalog_for_agent(harness: str) -> None:
     """
     ``host`` + ``agent_id`` return that host's cached rows for the agent's harness.
 
@@ -5653,7 +5657,7 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
 
     requests: list[httpx.Request] = []
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_host_catalog_server(requests)),
+        transport=httpx.MockTransport(_host_catalog_server(requests, harness=harness)),
         base_url="http://server",
     ) as server_client:
         output = await execute_tool(
@@ -5668,7 +5672,7 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
         "host": "alpha",
         "host_id": "host-a",
         "agent_id": "ag_known",
-        "harness": "codex-native",
+        "harness": harness,
         "source": "host_catalog",
         "fetched_at": 1700000000,
         "stale": True,
@@ -5700,9 +5704,9 @@ async def test_sys_list_models_lists_host_catalog_for_agent() -> None:
     }
     resolve = next(r for r in requests if r.url.path == "/v1/calling-defaults/resolve")
     assert dict(resolve.url.params) == {"host_id": "host-a", "agent_id": "ag_known"}
-    # The catalog read is the filtered, cache-only one.
+    # Keep a refresh scoped to this host and harness.
     catalogs = next(r for r in requests if r.url.path == "/v1/calling-defaults/catalogs")
-    assert dict(catalogs.url.params) == {"host_id": "host-a", "harness": "codex-native"}
+    assert dict(catalogs.url.params) == {"host_id": "host-a", "harness": harness}
 
 
 @pytest.mark.asyncio
@@ -9565,7 +9569,13 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
             output = await execute_tool(
                 tool_name="sys_session_create",
                 arguments=json.dumps(
-                    {"agent_id": "ag_x", "title": "auth", "message": "start", "speed": "fast"}
+                    {
+                        "agent_id": "ag_x",
+                        "title": "auth",
+                        "message": "start",
+                        "speed": "fast",
+                        "permission_tier": "auto",
+                    }
                 ),
                 server_client=server_client,
                 conversation_id="conv_caller",
@@ -9580,6 +9590,7 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
+    assert captured["permission_tier"] == "auto"
     attempt = captured["labels"].pop("omnigent.create_attempt")
     assert len(attempt) == 32 and int(attempt, 16) > 0
     assert captured["labels"] == {"omnigent.speed_tier": "fast"}
@@ -9895,6 +9906,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     )
     # Agent origin rides the multipart create too: the server counts it.
     assert create_requests[0].headers["X-Omnigent-Create-Origin"] == "agent"
+    assert create_requests[0].headers["X-Omnigent-Permission-Tiers"] == "1"
     parts = _parse_multipart_create(create_requests[0])
     attempt = parts["metadata"].pop("labels")["omnigent.create_attempt"]
     assert len(attempt) == 32 and int(attempt, 16) > 0
@@ -11689,6 +11701,70 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
     assert info["running_seconds"] == 20
     assert info["idle_seconds"] == 10
     assert info["age_seconds"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_projects_requested_launched_running() -> None:
+    """``sys_session_get_info`` exposes requested, launched, and running from the snapshot."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_renamed":
+            return httpx.Response(
+                200,
+                headers={"date": _SESSION_INFO_DATE},
+                json={
+                    **_session_info_snapshot("conv_renamed"),
+                    "harness": "codex-native",
+                    "model_override": "krill/gpt-6.2-sol",
+                    "llm_model": "gpt-6.2-sol",
+                    "requested": "ccs-krill/gpt-6.2-sol",
+                    "launched": "krill/gpt-6.2-sol",
+                    "running": "gpt-6.2-sol",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_agy":
+            return httpx.Response(
+                200,
+                headers={"date": _SESSION_INFO_DATE},
+                json={
+                    **_session_info_snapshot("conv_agy"),
+                    "harness": "antigravity-native",
+                    "model_override": "gemini-4-neon",
+                    "llm_model": "Gemini 4 Neon (High)",
+                    "requested": "gemini-4-neon",
+                    "launched": None,
+                    "running": "Gemini 4 Neon (High)",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        renamed_out = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_renamed"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+        agy_out = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_agy"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    renamed = json.loads(renamed_out)
+    assert renamed["requested"] == "ccs-krill/gpt-6.2-sol"
+    assert renamed["launched"] == "krill/gpt-6.2-sol"
+    assert renamed["running"] == "gpt-6.2-sol"
+
+    agy = json.loads(agy_out)
+    assert agy["requested"] == "gemini-4-neon"
+    assert agy["launched"] is None
+    assert agy["running"] == "Gemini 4 Neon (High)"
 
 
 @pytest.mark.asyncio

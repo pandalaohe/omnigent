@@ -11,10 +11,11 @@ depth hold and rate delays, reply detection, and the GET / action routes.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from typing import Any, cast
 
@@ -185,6 +186,430 @@ async def test_claim_capable_buffered_peer_stays_uncertain_through_delivery(
             pending_inputs.resolve(receiver.id, web_pending)
 
 
+def _real_claude_dispatch(
+    peer_env: dict[str, Any],
+    runner: httpx.AsyncClient,
+    receiver_id: str,
+) -> Callable[[str, Any], Awaitable[dict[str, Any]]]:
+    """The receiver's native dispatch and the response the events route builds from it."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _dispatch(session_id: str, body: Any) -> dict[str, Any]:
+        if session_id != receiver_id:
+            # A back-notice to the sender.
+            return {"queued": True, "item_id": "notice"}
+        conv = peer_env["conv_store"].get_conversation(session_id)
+        result = await orchestration._dispatch_session_event_to_runner_impl(
+            session_id,
+            conv,
+            body,
+            peer_env["conv_store"],
+            runner,
+            agent_name=None,
+            file_store=None,
+            artifact_store=None,
+            native_terminal_ready=True,
+        )
+        response: dict[str, Any] = {"queued": True, "forwarded": result.forwarded}
+        if result.native_receipt_pending:
+            response["native_receipt_pending"] = True
+        if result.pending_id is not None:
+            response["pending_id"] = result.pending_id
+        return response
+
+    return _dispatch
+
+
+async def _mirror_runner_event(
+    peer_env: dict[str, Any], receiver: Conversation, event: dict[str, Any]
+) -> bool:
+    """Persist the CLI's mirror of a forwarded copy as the external-item route does."""
+    from omnigent.server import peer_sweeper
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import SessionEventInput
+
+    item_id, replayed = await orchestration._persist_external_conversation_item(
+        receiver.id,
+        receiver,
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": event["content"]},
+                "response_id": f"resp-{uuid.uuid4().hex}",
+            },
+        ),
+        peer_env["conv_store"],
+    )
+    assert item_id is not None and not replayed
+    return await asyncio.to_thread(
+        peer_sweeper.settle_from_mirrored_envelope,
+        peer_env["peer_store"],
+        peer_env["conv_store"],
+        receiver.id,
+        item_id,
+    )
+
+
+def _claim_runner_event(
+    peer_env: dict[str, Any], receiver: Conversation, event: dict[str, Any]
+) -> None:
+    """The runner's paste claim, as the claim route grants and records it."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server import peer_sweeper
+
+    assert pending_inputs.claim_runner_input(
+        receiver.id, event["pending_id"], "paste", expected_attempt_id=event["delivery_attempt_id"]
+    )
+    peer_id = pending_inputs.peer_message_id_for(receiver.id, event["pending_id"])
+    assert peer_id is not None
+    assert peer_sweeper.mark_peer_copy_claimed(
+        peer_env["peer_store"], receiver.id, peer_id, event["delivery_attempt_id"]
+    )
+
+
+def _delivery_errors(peer_env: dict[str, Any], receiver: Conversation) -> list[Any]:
+    return [
+        item
+        for item in peer_env["conv_store"].list_items(receiver.id).data
+        if item.type == "error"
+    ]
+
+
+@pytest.mark.parametrize("finished_first", ["failure", "mirror"])
+async def test_accepted_claude_peer_copy_keeps_the_outcome_that_landed_before_the_reply(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    finished_first: str,
+) -> None:
+    """A failure or mirror that removes the entry before the 202 is read decides the record."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.peer_sweeper import _RECONCILE_GRACE_S
+    from omnigent.server.routes._sessions import orchestration
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    events: list[dict[str, Any]] = []
+
+    async def _runner(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        events.append(event)
+        # The runner's paste task claims before its 202 reaches the server.
+        _claim_runner_event(peer_env, receiver, event)
+        if finished_first == "failure":
+            # Claude refused the pasted prompt (e.g. a prompt hook) and is idle again.
+            assert await orchestration._settle_lost_runner_input(
+                peer_env["conv_store"],
+                receiver.id,
+                event["pending_id"],
+                "native_input_refused",
+                claim_outcome=False,
+                expected_attempt_id=event["delivery_attempt_id"],
+            )
+        else:
+            assert await _mirror_runner_event(peer_env, receiver, event)
+        return httpx.Response(
+            202, json={"status": "accepted"}, headers={"X-Omnigent-Pending-Input-Claim": "1"}
+        )
+
+    runner = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(_runner))
+    peer_env["fake"].dispatch = _real_claude_dispatch(peer_env, runner, receiver.id)
+    try:
+        result = await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"],
+            receiver_id=receiver.id,
+            text=f"accepted-{uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        assert len(events) == 1
+        assert not pending_inputs.holds_peer_message(receiver.id, result["peer_id"])
+        stored = peer_env["peer_store"].get(result["peer_id"])
+        assert stored is not None
+        sweeper = peer_env["app"].state.peer_sweeper
+        after_grace = int(time.time()) + _RECONCILE_GRACE_S + 1
+        if finished_first == "mirror":
+            # The sender's result follows the record the mirror already settled.
+            assert result["disposition"] == "delivered", result
+            assert stored.state == "delivered"
+            await sweeper._reconcile_stale_delivering(after_grace)
+            assert peer_env["peer_store"].get(stored.id).state == "delivered"
+            return
+        assert (result["disposition"], result["reason"]) == ("queued", "uncertain")
+        assert stored.state == "delivering"
+        monkeypatch.setitem(
+            cast(Any, sessions_module._session_status_cache), receiver.id, "running"
+        )
+        await sweeper._reconcile_stale_delivering(after_grace)
+        assert peer_env["peer_store"].get(stored.id).state == "delivering"
+        monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "idle")
+        await sweeper._reconcile_stale_delivering(after_grace)
+        await sweeper._reconcile_stale_delivering(after_grace)
+        # A claimed copy ends once, with its one card; it is never resent.
+        ended = peer_env["peer_store"].get(stored.id)
+        assert (ended.state, ended.reason) == ("failed", "delivery_uncertain")
+        assert len(_delivery_errors(peer_env, receiver)) == 1
+        assert len(events) == 1
+    finally:
+        peer_env["fake"].dispatch = None
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
+@pytest.mark.parametrize("ending", ["lost-before-claim", "lease-expired-after-claim"])
+async def test_claude_peer_copy_without_a_mirror_is_resent_only_if_never_claimed(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    """A pasted copy whose runner dropped before the mirror is not delivered a second time."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.peer_sweeper import _RECONCILE_GRACE_S
+    from omnigent.server.routes._sessions import orchestration
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    events: list[dict[str, Any]] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        events.append(json.loads(request.content))
+        return httpx.Response(
+            202, json={"status": "accepted"}, headers={"X-Omnigent-Pending-Input-Claim": "1"}
+        )
+
+    runner = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(_runner))
+    peer_env["fake"].dispatch = _real_claude_dispatch(peer_env, runner, receiver.id)
+    try:
+        result = await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"],
+            receiver_id=receiver.id,
+            text=f"run-once-{uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        assert (result["disposition"], result["reason"]) == ("queued", "uncertain")
+        (event,) = events
+        pending_id = event["pending_id"]
+        if ending == "lost-before-claim":
+            # The runner exits before its claim; the next queue snapshot lacks the copy.
+            await orchestration._reconcile_runner_input_leases(
+                peer_env["conv_store"],
+                receiver.id,
+                {"active_pending_ids": [], "queued_pending_ids": []},
+                {pending_id},
+            )
+        else:
+            # Claude ran the pasted copy, then the runner dropped before its mirror.
+            _claim_runner_event(peer_env, receiver, event)
+            expired = time.time() + pending_inputs._CLAIMED_INPUT_TIMEOUT_S + 1
+            monkeypatch.setattr(pending_inputs, "_now", lambda: expired)
+            await orchestration._watch_runner_input_lease(
+                peer_env["conv_store"], receiver.id, pending_id
+            )
+        assert not pending_inputs.holds_peer_message(receiver.id, result["peer_id"])
+        monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "idle")
+        await peer_env["app"].state.peer_sweeper._reconcile_stale_delivering(
+            int(time.time()) + _RECONCILE_GRACE_S + 1
+        )
+        ended = peer_env["peer_store"].get(result["peer_id"])
+        assert ended is not None
+        if ending == "lost-before-claim":
+            # Never claimed: the copy provably did not reach Claude and may go again.
+            assert ended.state == "pending"
+        else:
+            assert (ended.state, ended.reason) == ("failed", "delivery_uncertain")
+            (error,) = _delivery_errors(peer_env, receiver)
+            assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+        assert len(events) == 1
+    finally:
+        peer_env["fake"].dispatch = None
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
+@pytest.mark.parametrize(
+    ("runner_status", "claim_capable"),
+    [("accepted", True), ("accepted", False), ("buffered", True)],
+    ids=["accepted", "old-runner", "buffered"],
+)
+async def test_claude_peer_copy_mirror_releases_the_pair_at_once(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str,
+    claim_capable: bool,
+) -> None:
+    """The first copy's mirror settles it at once, so the next same-pair send goes straight out."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.routes._sessions import orchestration
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    headers = {"X-Omnigent-Pending-Input-Claim": "1"} if claim_capable else {}
+    events: list[dict[str, Any]] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        events.append(json.loads(request.content))
+        return httpx.Response(202, json={"status": runner_status}, headers=headers)
+
+    runner = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(_runner))
+    peer_env["fake"].dispatch = _real_claude_dispatch(peer_env, runner, receiver.id)
+
+    async def _send(text: str) -> dict[str, Any]:
+        return await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"], receiver_id=receiver.id, text=text, correlation_id=None
+        )
+
+    try:
+        first = await _send(f"first-{uuid.uuid4().hex}")
+        first_record = peer_env["peer_store"].get(first["peer_id"])
+        assert first_record is not None
+        if claim_capable:
+            # The reply only says the runner has it (or holds it); the mirror settles it,
+            # seconds later rather than after the sweeper's 120 s grace.
+            assert (first["disposition"], first["reason"]) == ("queued", "uncertain")
+            assert first_record.state == "delivering"
+            assert pending_inputs.holds_peer_message(receiver.id, first_record.id)
+            _claim_runner_event(peer_env, receiver, events[0])
+            assert await _mirror_runner_event(peer_env, receiver, events[0])
+            assert peer_env["peer_store"].get(first_record.id).state == "delivered"
+        else:
+            assert first["disposition"] == "delivered", first
+            assert first_record.state == "delivered"
+        second = await _send(f"second-{uuid.uuid4().hex}")
+        # Forwarded on the spot, not queued behind the first record.
+        assert len(events) == 2
+        second_record = peer_env["peer_store"].get(second["peer_id"])
+        assert second_record is not None
+        assert second_record.state == ("delivering" if claim_capable else "delivered")
+    finally:
+        peer_env["fake"].dispatch = None
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
+async def test_claimed_peer_copy_whose_reply_was_lost_waits_for_its_mirror(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy the runner claimed before its 202 was lost is not reported delivered."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.routes._sessions import orchestration
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    events: list[dict[str, Any]] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        events.append(event)
+        _claim_runner_event(peer_env, receiver, event)
+        raise httpx.ReadTimeout("reply lost", request=request)
+
+    runner = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(_runner))
+    peer_env["fake"].dispatch = _real_claude_dispatch(peer_env, runner, receiver.id)
+    try:
+        result = await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"],
+            receiver_id=receiver.id,
+            text=f"reply-lost-{uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        assert (result["disposition"], result["reason"]) == ("queued", "uncertain"), result
+        stored = peer_env["peer_store"].get(result["peer_id"])
+        assert stored is not None
+        assert (stored.state, stored.reason) == (
+            "delivering",
+            f"native_claimed:{events[0]['delivery_attempt_id']}",
+        )
+        assert await _mirror_runner_event(peer_env, receiver, events[0])
+        assert peer_env["peer_store"].get(stored.id).state == "delivered"
+        assert len(events) == 1
+    finally:
+        peer_env["fake"].dispatch = None
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
+async def test_failed_re_read_keeps_an_uncertain_send_trackable(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a confirmed delivered record upgrades the result; a read error does not."""
+    from omnigent.runtime import pending_inputs, session_stream
+    from omnigent.server.routes._sessions import orchestration
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    events: list[dict[str, Any]] = []
+    fail_reads = {"next": False}
+    original_get = SqlAlchemyPeerMessageStore.get
+
+    def _get(self: SqlAlchemyPeerMessageStore, peer_id: str) -> SessionPeerMessage | None:
+        if fail_reads["next"]:
+            fail_reads["next"] = False
+            raise RuntimeError("peer store unavailable")
+        return original_get(self, peer_id)
+
+    monkeypatch.setattr(SqlAlchemyPeerMessageStore, "get", _get)
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        events.append(json.loads(request.content))
+        fail_reads["next"] = True
+        return httpx.Response(
+            202, json={"status": "accepted"}, headers={"X-Omnigent-Pending-Input-Claim": "1"}
+        )
+
+    runner = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(_runner))
+    peer_env["fake"].dispatch = _real_claude_dispatch(peer_env, runner, receiver.id)
+    text = f"re-read-{uuid.uuid4().hex}"
+    try:
+        result = await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"], receiver_id=receiver.id, text=text, correlation_id=None
+        )
+        assert not fail_reads["next"]
+        assert (result["disposition"], result["reason"]) == ("queued", "uncertain"), result
+        stored = peer_env["peer_store"].get(result["peer_id"])
+        assert stored is not None
+        assert stored.state == "delivering"
+        # The uncertain verdict keeps the reservation: an identical resend is not forwarded.
+        await peer_env["app"].state.peer_send(
+            sender=peer_env["sender"], receiver_id=receiver.id, text=text, correlation_id=None
+        )
+        assert len(events) == 1
+    finally:
+        peer_env["fake"].dispatch = None
+        await runner.aclose()
+        for task in list(orchestration._runner_input_lease_tasks):
+            task.cancel()
+        for pending_id in pending_inputs.pending_ids(receiver.id):
+            pending_inputs.resolve(receiver.id, pending_id)
+        session_stream.close(receiver.id)
+
+
 def _build_peer_app(
     *,
     conversation_store: SqlAlchemyConversationStore,
@@ -260,11 +685,14 @@ class _FakePostEvent:
         self.outcome: dict[str, Any] = outcome or {"queued": True, "item_id": "item_1"}
         self.calls: list[dict[str, Any]] = []
         self.error: BaseException | None = None
+        self.dispatch: Callable[[str, Any], Awaitable[dict[str, Any]]] | None = None
 
     async def __call__(self, request: Any, session_id: str, body: Any, **_kwargs: Any) -> Any:
         self.calls.append({"session_id": session_id, "type": body.type, "data": body.data})
         if self.error is not None:
             raise self.error
+        if self.dispatch is not None:
+            return await self.dispatch(session_id, body)
         return dict(self.outcome)
 
 
@@ -435,6 +863,7 @@ def _native_receiver(
     harness: str = "claude-native",
     cached_status: str | None = None,
     wrapper: str | None = None,
+    harness_override: str | None = None,
 ) -> Conversation:
     """A native terminal receiver, optionally a dispatched child or a mirror."""
     conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
@@ -445,6 +874,7 @@ def _native_receiver(
         runner_id="rst",
         parent_conversation_id=parent_id,
         labels={WRAPPER_LABEL_KEY: wrapper} if wrapper is not None else None,
+        harness_override=harness_override,
     )
     peer_env["perm_store"].grant(ALICE, receiver.id, LEVEL_OWNER)
     monkeypatch.setattr(
@@ -1417,6 +1847,45 @@ async def test_busy_recheck_after_record_creation_queues_same_record(
     assert len(records) == 1, f"expected exactly one record, got {len(records)}"
     assert records[0].id == resp.json()["peer_id"]
     assert records[0].state == "queued"
+
+
+async def test_busy_recheck_keeps_a_copy_claimed_meanwhile_delivering(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """A delayed busy re-check does not queue a record another copy's runner claimed."""
+    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    peer_store: Any = peer_env["peer_store"]
+    real_claim = peer_store.claim_oldest
+    mark = "native_claimed:" + "d" * 32
+
+    def _claim_then_stall(peer_id: str, *args: Any, **kwargs: Any) -> bool:
+        claimed = real_claim(peer_id, *args, **kwargs)
+        # While the re-check stalls, the sweeper re-sent the copy and its runner claimed it.
+        assert mark_peer_copy_claimed(peer_store, receiver.id, peer_id, "d" * 32)
+        sessions_module._session_status_cache[receiver.id] = "running"
+        return claimed
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(peer_store, "claim_oldest", _claim_then_stall)
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"bc-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+    finally:
+        monkeypatch.undo()
+        sessions_module._session_status_cache.pop(receiver.id, None)
+    assert resp.status_code == 200, resp.text
+    assert fake.calls == []
+    stored = peer_store.get(resp.json()["peer_id"])
+    assert stored is not None
+    # The winner can still retry its claim and the mirror can still settle it.
+    assert (stored.state, stored.reason) == ("delivering", mark)
 
 
 async def test_busy_recheck_child_is_queued_not_steered(
@@ -2404,6 +2873,51 @@ async def test_list_receiver_records(
         )
         assert listed.status_code == 200, listed.text
         assert sent.json()["peer_id"] in [r["peer_id"] for r in listed.json()["data"]]
+    finally:
+        peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
+
+
+async def test_held_claimed_record_is_not_released_for_a_resend(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Hold and release keep a copy a runner may already have pasted from forwarding."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    now = int(time.time())
+    mark = "native_claimed:" + "c" * 32
+    record = peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="ref-held-claimed",
+            text="claimed copy",
+            state="queued",
+            reason=mark,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "hold"})
+    try:
+        sweeper = peer_env["app"].state.peer_sweeper
+        sweeper._app = peer_env["app"]
+        await sweeper._process_due(record, now)
+        held = peer_env["peer_store"].get(record.id)
+        assert held is not None
+        assert (held.state, held.reason) == ("held", mark)
+        released = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages/{record.id}/action",
+            json={"action": "release"},
+            headers=_headers(ALICE, None),
+        )
+        assert released.status_code == 409, released.text
+        after = peer_env["peer_store"].get(record.id)
+        assert after is not None
+        assert (after.state, after.reason) == ("held", mark)
+        await sweeper._process_due(after, now)
+        assert [call for call in peer_env["fake"].calls if call["session_id"] == receiver.id] == []
     finally:
         peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
 

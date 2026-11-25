@@ -589,10 +589,15 @@ async def test_summary_uses_side_chat_routing_host_and_reports_unknown(preview_e
 
 
 @pytest.mark.asyncio
-async def test_conversion_proves_exact_pool_and_undo_preserves_later_rules(preview_env):
+@pytest.mark.parametrize("mapped_route", [False, True])
+async def test_conversion_proves_exact_pool_and_undo_preserves_later_rules(
+    preview_env, mapped_route
+):
     env = preview_env
-    pool = "codex:model-x"
+    model = "route-a/model-x" if mapped_route else "model-x"
+    pool = "pool-a" if mapped_route else f"codex:{model}"
     legacy = {
+        **({"codexRoutePools": {"route-a": pool}} if mapped_route else {}),
         "enabled": False,
         "workTypes": [{"id": "work", "label": "Work"}],
         "limits": {
@@ -604,7 +609,7 @@ async def test_conversion_proves_exact_pool_and_undo_preserves_later_rules(previ
                 "id": "exact",
                 "name": "Exact",
                 "links": [
-                    {"agent": env.agent, "model": "model-x"},
+                    {"agent": env.agent, "model": model},
                     {"agent": env.agent, "model": "model-y", "meter": "shared"},
                 ],
             }
@@ -622,12 +627,20 @@ async def test_conversion_proves_exact_pool_and_undo_preserves_later_rules(previ
         kind="sub_agent",
         host_id=HOST,
         workspace="/opt/work/project",
-        model_override="model-x",
+        model_override=model,
         labels={SLOT_LABEL: f"admitted@{HOST}@{pool}@{time.time()}"},
     )
     response = await env.client.post(URL + "/preview", json={"host_id": HOST, "conversion": True})
     assert response.status_code == 200, response.text
     plan = response.json()["legacyConversion"]
+    if mapped_route:
+        assert not plan["convertible"]
+        assert not plan["replacedPaths"]
+        assert any(
+            row["path"] == ["limits", pool] and row["reason"] == "shared_pool"
+            for row in plan["unmapped"]
+        )
+        return
     assert plan["convertible"] is True
     assert plan["replacedPaths"] == [["limits", pool]]
     assert plan["newRules"][0]["agent"] == env.agent

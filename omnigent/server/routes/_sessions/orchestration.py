@@ -1099,10 +1099,10 @@ async def _publish_and_wait_for_harness_elicitation(
         restart_fields = await restart_card_fields(
             session_id, elicitation_id, tool_name, tool_input, conversation_store
         )
-    except OmnigentError:
+    except OmnigentError as exc:
         if published is not None:
             published.set()
-        return ElicitationResult(action="decline")
+        return ElicitationResult(action="decline", content={"reason": exc.message})
     if restart_fields:
         params = params.model_copy(update=restart_fields)
     from omnigent.server.terminal_agent_access import terminal_access_card_fields
@@ -3185,12 +3185,12 @@ def _build_session_response(
     from omnigent.server.permission_tiers import (
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_CAPABILITY_VALUE,
-        TIER_HARNESSES,
         legacy_permission_tier,
+        permission_tier_active,
         read_permission_state,
     )
 
-    if harness in TIER_HARNESSES:
+    if permission_tier_active(harness, conv.labels):
         assert harness is not None
         try:
             confirmed = read_permission_state(conv.labels, harness=harness)
@@ -3211,8 +3211,16 @@ def _build_session_response(
             permission_tiers_capability = (
                 conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
             )
+    from omnigent.server.model_resolution import session_model_display
     from omnigent.server.routes._session_create_validation import session_acp_harness
     from omnigent.server.session_choice_runtime import choice_record
+
+    model_display = session_model_display(
+        conv.labels,
+        conv.model_override,
+        conv.reported_model,
+        harness=harness,
+    )
 
     return SessionResponse(
         id=conv.id,
@@ -3266,6 +3274,9 @@ def _build_session_response(
         permission_tier_state=permission_tier_state,
         permission_tiers_capability=permission_tiers_capability,
         model_override=conv.model_override,
+        requested=model_display.requested,
+        launched=model_display.launched,
+        running=model_display.running,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,
@@ -3587,6 +3598,7 @@ async def _persist_relay_reported_model(
             type="session.model",
             conversation_id=session_id,
             model=model,
+            reported=True,
         ).model_dump(exclude_none=True),
     )
 
@@ -5642,7 +5654,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
-                and match_method != "attachment_attempt"
+                and match_method not in ("attachment_attempt", "unattributed_claim")
                 and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
@@ -5767,9 +5779,13 @@ async def _persist_external_conversation_item_unlocked(
         # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
         # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
         spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
-        for spelling in spellings:
-            command_line = f"/{spelling} {item.data.arguments}".strip()
-            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        command_lines = tuple(
+            f"/{spelling} {item.data.arguments}".strip() for spelling in spellings
+        )
+        for command_line in command_lines:
+            matched = pending_inputs.resolve_matching_text(
+                session_id, command_line, hold=True, echo_spellings=command_lines
+            )
             if matched.matched is not None:
                 break
         drained = matched.matched
@@ -5921,6 +5937,17 @@ async def _persist_external_conversation_item_unlocked(
     _publish_persisted_external_item(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
+    if drains_pending_inputs and isinstance(persisted.data, MessageData):
+        log_input_event(
+            _logger,
+            "native_input_consumed_published",
+            session_id=session_id,
+            attributes={"item_id": persisted.id},
+            response_id=persisted.response_id,
+            matched_pending_id=cleared_pending_id,
+            input_stable_id=persisted.data.web_stable_id,
+            match_method=match_method,
+        )
     await _drive_terminal_resolved_elicitation_from_store(
         session_id, persisted, conversation_store
     )
@@ -6424,7 +6451,9 @@ async def _watch_runner_input_lease(
             )
             if pending_inputs.runner_lease_remaining(session_id, pending_id) is None:
                 return
-        await asyncio.sleep(remaining if remaining > 0 else 15)
+        # A mirror normally settles long before the deadline. Release its
+        # watcher promptly instead of retaining a sleeping task for two hours.
+        await asyncio.sleep(min(remaining, 60) if remaining > 0 else 15)
 
 
 async def _reconcile_runner_input_leases(
@@ -6432,7 +6461,6 @@ async def _reconcile_runner_input_leases(
     session_id: str,
     event: Mapping[str, Any],
     previous_ids: set[str],
-    runner_id: str | None = None,
 ) -> None:
     active, queued = event.get("active_pending_ids"), event.get("queued_pending_ids")
     if not isinstance(active, list) or not isinstance(queued, list):
@@ -6441,7 +6469,7 @@ async def _reconcile_runner_input_leases(
         return
     active_ids = set(active)
     held_ids = active_ids.union(queued)
-    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids, runner_id)
+    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids)
     for pending_id, since in sending.items():
         session_stream.publish(
             session_id,
@@ -9240,6 +9268,11 @@ async def _ensure_native_terminal_ready(
     """
     display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
     terminal_name = _native_terminal_name_for_harness(harness)
+    timeout: float | httpx.Timeout = 10.0
+    if harness == "antigravity-native" and conv.model_override:
+        from omnigent.harnesses.antigravity_native.launch import AGY_MODEL_LAUNCH_TIMEOUT_S
+
+        timeout = httpx.Timeout(10.0, read=AGY_MODEL_LAUNCH_TIMEOUT_S)
 
     async def _post_ensure() -> httpx.Response:
         if runner_router is not None:
@@ -9252,7 +9285,7 @@ async def _ensure_native_terminal_ready(
                 "ensure_native_terminal": True,
                 "persist_resource_event": persist_resource_event,
             },
-            timeout=10.0,
+            timeout=timeout,
         )
 
     def _is_tunnel_loss(exc: httpx.HTTPError | ConnectionError) -> bool:
@@ -10311,7 +10344,7 @@ def _publish_routed_model(session_id: str, model: str) -> None:
         conversation_id=session_id,
         model=model,
     )
-    session_stream.publish(session_id, event.model_dump())
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
 def _runner_reject_detail(response: httpx.Response) -> str:
@@ -11048,6 +11081,7 @@ async def _forward_event_to_runner(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         shell_forwarded = True
+        launched_model_seq = _next_launched_model_seq(session_id)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if annotation_pending:
@@ -11187,7 +11221,115 @@ async def _forward_event_to_runner(
         elif taken_notes is not None:
             shell_notes.release(session_id, taken_notes)
 
+    if shell_forwarded:
+        _schedule_sdk_launched_model_record(
+            session_id,
+            conv,
+            effective_runner_override,
+            conversation_store,
+            seq=launched_model_seq,
+        )
+
     return persisted_items[0].id
+
+
+_LAUNCHED_MODEL_DISPATCH_SEQ: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_LAUNCHED_MODEL_LOCKS: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache()
+_LAUNCHED_MODEL_TASKS: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
+
+
+def _next_launched_model_seq(session_id: str) -> int:
+    """Reserve the next monotonic dispatch sequence for *session_id*."""
+    seq = _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id, 0) + 1
+    _LAUNCHED_MODEL_DISPATCH_SEQ[session_id] = seq
+    return seq
+
+
+def _schedule_sdk_launched_model_record(
+    session_id: str,
+    conv: Conversation,
+    model_override: str | None,
+    conversation_store: ConversationStore,
+    *,
+    seq: int | None = None,
+) -> asyncio.Task[None] | None:
+    """Record the dispatched SDK/ACP launched model off the delivery ack path.
+
+    Runs in a retained background task fenced by per-session monotonic dispatch
+    order and lock so a slow or failing label write never delays or fails
+    ``input.consumed``, and an older delayed write cannot overwrite a newer
+    dispatch's record.
+    """
+    effective_seq = _next_launched_model_seq(session_id) if seq is None else seq
+    dispatched_model = (
+        model_override.strip()
+        if isinstance(model_override, str) and model_override.strip()
+        else None
+    )
+
+    async def _write() -> None:
+        lock = _LAUNCHED_MODEL_LOCKS.setdefault(session_id, asyncio.Lock())
+        try:
+            async with lock:
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                if await asyncio.to_thread(_is_native_terminal_session, conv):
+                    return
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                from omnigent.server.model_resolution import LAUNCHED_MODEL_LABEL
+                from omnigent.server.schemas import SessionLaunchedModelEvent
+
+                live_conv = (
+                    await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    if callable(getattr(conversation_store, "get_conversation", None))
+                    else None
+                )
+                if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) != effective_seq:
+                    return
+                live_labels = live_conv.labels if live_conv is not None else conv.labels
+                current_launched = live_labels.get(LAUNCHED_MODEL_LABEL)
+                changed = False
+                if dispatched_model is not None and current_launched != dispatched_model:
+                    set_labels = getattr(conversation_store, "set_labels", None)
+                    if callable(set_labels):
+                        await asyncio.to_thread(
+                            set_labels, session_id, {LAUNCHED_MODEL_LABEL: dispatched_model}
+                        )
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                            conv.labels[LAUNCHED_MODEL_LABEL] = dispatched_model
+                        changed = True
+                elif dispatched_model is None and LAUNCHED_MODEL_LABEL in live_labels:
+                    delete_label = getattr(conversation_store, "delete_label", None)
+                    if callable(delete_label):
+                        await asyncio.to_thread(delete_label, session_id, LAUNCHED_MODEL_LABEL)
+                        if _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                            conv.labels.pop(LAUNCHED_MODEL_LABEL, None)
+                        changed = True
+                if changed and _LAUNCHED_MODEL_DISPATCH_SEQ.get(session_id) == effective_seq:
+                    session_stream.publish(
+                        session_id,
+                        SessionLaunchedModelEvent(
+                            type="session.launched_model",
+                            conversation_id=session_id,
+                            launched=dispatched_model,
+                        ).model_dump(),
+                    )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "launched_model: failed to persist launched model for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        finally:
+            if not lock.locked() and _LAUNCHED_MODEL_LOCKS.get(session_id) is lock:
+                _LAUNCHED_MODEL_LOCKS.pop(session_id, None)
+
+    task = asyncio.create_task(_write(), name=f"launched-model-{session_id}-{effective_seq}")
+    _LAUNCHED_MODEL_TASKS.add(task)
+    task.add_done_callback(_LAUNCHED_MODEL_TASKS.discard)
+    return task
 
 
 async def _stamp_routing_decision_label(
@@ -11326,7 +11468,7 @@ def _session_is_starting(conversation_id: str) -> bool:
         parked in :mod:`omnigent.runtime.pending_inputs`.
     """
     return _dispatch_in_flight.get(conversation_id, 0) > 0 or pending_inputs.has_pending(
-        conversation_id
+        conversation_id, include_claimed=False
     )
 
 
@@ -11894,6 +12036,7 @@ async def _dispatch_session_event_to_runner_impl(
             else None
         )
         forwarded = False
+        native_receipt_pending = False
         try:
             if taken_notes is not None and (
                 pending_id is None
@@ -11940,6 +12083,9 @@ async def _dispatch_session_event_to_runner_impl(
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
                 if claude_native and supports_claim:
                     pending_inputs.enable_runner_lease(session_id, pending_id)
+                    # The runner answers before it claims or pastes, and a failure
+                    # or mirror may remove the entry before the caller reads it.
+                    native_receipt_pending = bool(body.data.get("peer_message_id"))
             log_input_event(
                 _logger,
                 "native_input_forward_finished",
@@ -11971,6 +12117,8 @@ async def _dispatch_session_event_to_runner_impl(
             )
             if lost_confirmation:
                 raise _NativeDeliveryUncertain("The runner's delivery reply was lost.") from exc
+            if claimed and claude_native and isinstance(exc, _NativeForwardReplyLost):
+                native_receipt_pending = bool(body.data.get("peer_message_id"))
             if not (claimed and isinstance(exc, _NativeForwardReplyLost)):
                 raise
         finally:
@@ -12020,7 +12168,9 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_native_decision_harness,
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, native_receipt_pending=native_receipt_pending
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None, forwarded=False)
     item_id = await _forward_event_to_runner(
@@ -12851,6 +13001,7 @@ async def _relay_runner_stream_once(
                         from omnigent.server.routes._session_create_validation import (
                             session_acp_harness,
                         )
+                        from omnigent.stores.conversation_store import LabelGroupChange
 
                         requested = event.get("requested_mode")
                         actual = event.get("permission_mode")
@@ -12859,14 +13010,37 @@ async def _relay_runner_stream_once(
                             conversation_store.get_conversation, session_id
                         )
                         if (
-                            not isinstance(requested, str)
-                            or not isinstance(actual, str)
+                            not isinstance(actual, str)
                             or not actual
                             or conv is None
                             or not session_acp_harness(conv, None, None)
                         ):
                             continue
-                        if isinstance(selection_id, str):
+                        if requested is None and selection_id is None:
+                            # A startup report cannot replace an operator's newer choice.
+                            def observe_mode(
+                                labels: dict[str, str], mode: str = actual
+                            ) -> LabelGroupChange:
+                                return LabelGroupChange(
+                                    {ACP_SESSION_MODE_LABEL_KEY: mode}
+                                    if ACP_SESSION_MODE_SELECTION_LABEL_KEY not in labels
+                                    else {},
+                                    set(),
+                                )
+
+                            try:
+                                labels = await asyncio.to_thread(
+                                    conversation_store.mutate_label_group,
+                                    session_id,
+                                    ACP_SESSION_MODE_LABEL_KEY,
+                                    observe_mode,
+                                )
+                            except ConversationNotFoundError:
+                                continue
+                            accepted = ACP_SESSION_MODE_SELECTION_LABEL_KEY not in labels
+                        elif not isinstance(requested, str):
+                            accepted = False
+                        elif isinstance(selection_id, str):
                             if ACP_SESSION_MODE_SELECTION_LABEL_KEY not in conv.labels:
                                 await asyncio.to_thread(
                                     conversation_store.insert_label_if_absent,
@@ -12926,7 +13100,6 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 event,
                                 previous_pending_ids,
-                                runner_id=runner_id,
                             )
                         continue
 
@@ -15691,6 +15864,7 @@ async def _create_session_from_existing_agent_impl(
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        session_creation_source_tier,
     )
 
     request_fields_set = body.model_fields_set
@@ -16380,10 +16554,21 @@ async def _create_session_from_existing_agent_impl(
         or (_spec_harness(selection_spec) if selection_spec is not None else None)
         or await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
     )
-    from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+    from omnigent.server.permission_tiers import (
+        TIER_HARNESSES,
+        agent_originated_create,
+        configured_acp_default_tier,
+        is_acp_permission_harness,
+        require_permission_protocol,
+        supports_delegated_acp_tier,
+    )
 
     require_permission_protocol(request, harness=selected_harness)
-    if body.permission_tier is not None and selected_harness not in TIER_HARNESSES:
+    if (
+        body.permission_tier is not None
+        and selected_harness not in TIER_HARNESSES
+        and not is_acp_permission_harness(selected_harness)
+    ):
         raise OmnigentError(
             "permission_tier is only supported by Pi and Antigravity sessions",
             code=ErrorCode.INVALID_INPUT,
@@ -16885,38 +17070,63 @@ async def _create_session_from_existing_agent_impl(
         initial_labels.update(sdk_permission_labels)
 
     create_harness = selected_harness
-    require_permission_protocol(request, harness=create_harness)
-    if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
-        raise OmnigentError(
-            "permission_tier is only supported by Pi and Antigravity sessions",
-            code=ErrorCode.INVALID_INPUT,
+    agent_create = agent_originated_create(request.headers)
+    permission_source = parent_conv
+    permission_source_id = body.parent_session_id or created_by_session_id
+    if agent_create and permission_source_id is not None:
+        permission_source = await asyncio.to_thread(
+            conversation_store.get_conversation, permission_source_id
         )
-    if create_harness in TIER_HARNESSES:
+        if permission_source is None:
+            raise OmnigentError("Source session not found", code=ErrorCode.NOT_FOUND)
+    default_tier = project_resolution.permission if body.sub_agent_name is None else None
+    acp_tier_enabled = False
+    if is_acp_permission_harness(create_harness):
+        from omnigent.models.model_catalog import spec_harness as declared_spec_harness
+        from omnigent.permission_tiers import NON_FULL_TIERS
+
+        effective_spec = sub_spec or selection_spec
+        if harness_override:
+            acp_harness = harness_override
+        elif effective_spec is not None:
+            acp_harness = declared_spec_harness(effective_spec)
+        else:
+            acp_harness = await asyncio.to_thread(
+                _create_resolved_harness, agent, harness_override, agent_cache
+            )
+        if permission_host_id is None and parent_conv is not None:
+            permission_host_id = await asyncio.to_thread(
+                effective_host_id, conversation_store, parent_conv
+            )
+        host_registry = getattr(request.app.state, "host_registry", None)
+        default_tier = configured_acp_default_tier(host_registry, permission_host_id, acp_harness)
+        if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
+            raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
+        acp_tier_enabled = (
+            body.permission_tier is not None
+            or default_tier is not None
+            or (
+                agent_create
+                and supports_delegated_acp_tier(
+                    host_registry, permission_host_id, acp_harness, effective_spec
+                )
+            )
+        )
+    require_permission_protocol(request, harness=create_harness, required=acp_tier_enabled)
+    if create_harness in TIER_HARNESSES or acp_tier_enabled:
         assert create_harness is not None
         from omnigent.server.permission_tiers import (
             ConfirmedPermissionState,
             creation_permission_tier,
-            legacy_permission_tier,
         )
 
-        inherited_tier = None
-        if parent_conv is not None:
-            parent_harness = await asyncio.to_thread(
-                _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
+        inherited_tier = (
+            await session_creation_source_tier(
+                request, permission_source, require_ready=agent_create
             )
-            if parent_harness in TIER_HARNESSES:
-                assert parent_harness is not None
-                try:
-                    inherited_tier = legacy_permission_tier(
-                        harness=parent_harness,
-                        labels=parent_conv.labels or {},
-                        launch_args=parent_conv.terminal_launch_args or [],
-                    )
-                except ValueError as exc:
-                    raise OmnigentError(
-                        f"Parent permission tier requires recovery: {exc}",
-                        code=ErrorCode.INVALID_INPUT,
-                    ) from exc
+            if permission_source is not None
+            else None
+        )
         tier = creation_permission_tier(
             harness=create_harness,
             explicit=(
@@ -16926,8 +17136,9 @@ async def _create_session_from_existing_agent_impl(
                 if explicit_permission_application is not None
                 else None
             ),
-            default=project_resolution.permission if body.sub_agent_name is None else None,
+            default=default_tier,
             inherited=inherited_tier,
+            ceiling=inherited_tier if agent_create else None,
         )
         initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))
         if create_harness == "antigravity-native":
@@ -17419,13 +17630,15 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    if _spec_harness(spec) in {"pi", "pi-native", "antigravity-native"}:
+    harness = _spec_harness(spec)
+    if harness in {"pi", "pi-native", "antigravity-native"} or (
+        harness == "acp" and metadata.permission_tier is not None
+    ):
         from omnigent.server.permission_tiers import (
             ConfirmedPermissionState,
             creation_permission_tier,
         )
 
-        harness = _spec_harness(spec)
         labels = dict(metadata.labels or {})
         tier = creation_permission_tier(harness=harness, explicit=metadata.permission_tier)
         labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))

@@ -254,6 +254,50 @@ def test_ask_user_async_is_registered_for_every_agent() -> None:
     assert "ask_user_async" in names
 
 
+def test_advertised_tool_parameter_patterns_compile_with_re2() -> None:
+    import re2
+
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.tools.builtins import INSTANTIABLE_BUILTINS
+
+    spec = AgentSpec(
+        spec_version=1,
+        spawn=True,
+        timers=True,
+        skills_filter="none",
+        os_env=OSEnvSpec(type="caller_process"),
+        tools=ToolsConfig(
+            builtins=[BuiltinToolConfig(name=name) for name in sorted(INSTANTIABLE_BUILTINS)]
+        ),
+    )
+    manager = ToolManager(
+        spec,
+        os_env_schema_only=True,
+        peer_messaging_enabled=True,
+        session_open_enabled=True,
+        terminal_access_requests_enabled=True,
+    )
+    schemas = {row["function"]["name"]: row["function"] for row in manager.get_tool_schemas()}
+    assert "sys_child_cap" in schemas
+    for name, function in schemas.items():
+        remaining = [function.get("parameters", {})]
+        while remaining:
+            node = remaining.pop()
+            if isinstance(node, list):
+                remaining.extend(node)
+            if not isinstance(node, dict):
+                continue
+            patterns = list(node.get("patternProperties", {}))
+            if isinstance(node.get("pattern"), str):
+                patterns.append(node["pattern"])
+            for pattern in patterns:
+                try:
+                    re2.compile(pattern)
+                except re2.error as exc:
+                    pytest.fail(f"{name} advertises a pattern RE2 rejects: {pattern!r}: {exc}")
+            remaining.extend(node.values())
+
+
 def test_ask_user_async_schema_has_no_count_or_length_caps() -> None:
     """Questions are bounded only by 'non-empty' — no caps beyond the body limit."""
     schemas = ToolManager(_make_spec()).get_tool_schemas()

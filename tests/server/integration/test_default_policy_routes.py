@@ -88,6 +88,20 @@ def _make_user(db_uri: str, email: str = "user@example.com") -> None:
     perm_store.ensure_user(email, is_admin=False)
 
 
+async def test_telemetry_setting_refuses_non_admin_write(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    headers = _admin_headers("user@example.com")
+    read = await auth_client.get("/v1/info", headers=headers)
+    assert read.status_code == 200
+    assert "telemetry" in read.json()
+    denied = await auth_client.put(
+        "/v1/system/telemetry", json={"telemetry_enabled": True}, headers=headers
+    )
+    assert denied.status_code == 403
+
+
 # ── CRUD happy path ──────────────────────────────────────────────────────────
 
 

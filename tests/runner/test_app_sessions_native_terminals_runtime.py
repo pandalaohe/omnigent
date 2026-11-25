@@ -1098,6 +1098,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             ),
             # The forwarder tears down only the app-server this launch started.
             "app_server": app_server,
+            "terminal_instance": None,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -2833,6 +2834,7 @@ async def _run_antigravity_auto_create(
     lsof_attributes_ports: bool = False,
     build_agy_launch_calls: list[dict[str, Any]] | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    launch_notices: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -2867,6 +2869,8 @@ async def _run_antigravity_auto_create(
         the auto-create path forwards (e.g. snapshot ``terminal_launch_args`` →
         ``extra_args``).
     :param auth_token_factory: Optional runner credential source for the launch.
+    :param launch_notices: When provided, run an inconclusive model probe and
+        record the launch warnings posted to the session.
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -2888,12 +2892,17 @@ async def _run_antigravity_auto_create(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "home"))
 
     # No-op the launch builder + onboarding seed so nothing tries to find agy.
-    def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
+    def _fake_build_agy_launch(**kwargs: Any) -> launch_mod.AgyLaunchCommand:
         if build_agy_launch_calls is not None:
             build_agy_launch_calls.append(kwargs)
-        return (("agy",), {"AGY_ENV": "1"})
+        model = kwargs["model"] if launch_notices is not None else None
+        return launch_mod.AgyLaunchCommand(["agy"], {"AGY_ENV": "1"}, subscription_model=model)
 
     monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
+    if launch_notices is not None:
+        monkeypatch.setattr(
+            launch_mod, "_probe_agy_subscription_model", AsyncMock(return_value=None)
+        )
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
@@ -2973,6 +2982,12 @@ async def _run_antigravity_auto_create(
             patch_calls.append((url, json))
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
+        async def post(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}/events"
+            assert launch_notices is not None
+            launch_notices.append(json)
+            return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+
     class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the required-terminal launch."""
 
@@ -3015,6 +3030,27 @@ async def _run_antigravity_auto_create(
         start_cascade_calls,
         reader_calls,
         patch_calls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_surfaces_inconclusive_model_check(tmp_path, monkeypatch):
+    notices = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id="agy-model-unverified",
+        snapshot={"model_override": "example-model"},
+        candidate_ports=[],
+        launch_notices=notices,
+    )
+    [notice] = notices
+    assert notice["type"] == "external_conversation_item"
+    assert notice["data"]["item_data"]["code"] == "antigravity_native_model_unverified"
+    assert notice["data"]["item_data"]["level"] == "warning"
+    assert (
+        "Could not verify Antigravity model 'example-model'"
+        in notice["data"]["item_data"]["message"]
     )
 
 
@@ -3720,7 +3756,9 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setattr(
-        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+        launch_mod,
+        "build_agy_launch",
+        lambda **_kwargs: launch_mod.AgyLaunchCommand(["agy"], {"AGY_ENV": "1"}),
     )
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
@@ -3959,7 +3997,9 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     # Capture the env build_agy_launch starts from so we can assert it is preserved
     # without a HOME override (the launch env is the captured spec's ``env`` below).
     monkeypatch.setattr(
-        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+        launch_mod,
+        "build_agy_launch",
+        lambda **_kwargs: launch_mod.AgyLaunchCommand(["agy"], {"AGY_ENV": "1"}),
     )
 
     def _noop_reader(*_args: Any, **_kwargs: Any) -> Any:
@@ -4138,7 +4178,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     monkeypatch.setattr(
         launch_mod,
         "build_agy_launch",
-        lambda **_kwargs: (("agy", *generated_tail), {}),
+        lambda **_kwargs: launch_mod.AgyLaunchCommand(["agy", *generated_tail], {}),
     )
 
     def _noop_reader(*_args: Any, **_kwargs: Any) -> Any:
@@ -6562,10 +6602,13 @@ async def test_codex_forwarder_survives_old_owner_cleanup_after_pane_transfer(
                 patch = AsyncMock(wraps=server.patch)
                 monkeypatch.setattr(server, "patch", patch)
 
-                def stop_before_spawn(path: Path) -> None:
+                def stop_before_spawn(
+                    path: Path, *, session_id: str, terminal_generation: object
+                ) -> None:
                     assert path == codex_native_bridge.bridge_dir_for_bridge_id(
                         f"{old_id}-cleared"
                     )
+                    assert (session_id, terminal_generation) == (old_id, None)
                     raise RuntimeError("stop before spawning Codex")
 
                 with monkeypatch.context() as scoped:

@@ -146,7 +146,7 @@ async def validate_known_windows(app, owner, settings):
                     Link(agent=agent, model=resolved),
                 ).model_copy(update={"model": resolved})
                 reading = readings.get(
-                    pool_of(link, context.products.get(agent), context.provider_groups)
+                    pool_of(settings, link, context.products.get(agent), context.provider_groups)
                 )
                 window = (
                     next((w for w in reading.windows if w.id == reserve.window), None)
@@ -289,7 +289,9 @@ async def candidate_preview(
             now=now,
         ),
         "legacyChecks": {
-            "pool": pool_of(link, context.products.get(agent_id), context.provider_groups),
+            "pool": pool_of(
+                settings, link, context.products.get(agent_id), context.provider_groups
+            ),
             "limits": pool_limits(
                 settings, link, context.products.get(agent_id), context.provider_groups
             ),

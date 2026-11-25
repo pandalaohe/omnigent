@@ -887,6 +887,7 @@ def test_fast_hosts_leases(tmp_path: Path) -> None:
 
 def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> None:
     hub = SystemStatusHub(tmp_path, None)
+    assert hub.queue_enabled(1) is False
     hub.put_settings(
         {
             "load_lines": {
@@ -898,7 +899,13 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         workspace_id=1,
     )
     stored = hub.put_settings(
-        {"load_lines": {"hosts": {"host_a": {"heavy": 8, "new_session": 9}}}},
+        {
+            "load_lines": {
+                "hosts": {"host_a": {"heavy": 8, "new_session": 9}},
+                "queue_enabled": True,
+                "notices_enabled": True,
+            }
+        },
         workspace_id=2,
     )
     system_status.write_settings(hub.settings_path, stored)
@@ -908,6 +915,8 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
     assert hub.effective_load_lines(2, "host_a").heavy == 8
     assert hub.queue_enabled(1) is False
     assert hub.queue_enabled(2) is True
+    assert hub.get_settings(2)["load_lines"]["notices_enabled"] is True
+    assert hub.get_settings(3)["load_lines"]["notices_enabled"] is False
     assert hub.host_load(1, "host_a")["lines_source"] == "host"
     assert hub.host_load(3, "host_a")["lines_source"] == "factory"
 
@@ -919,10 +928,44 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         "default": {"heavy": 2.0, "new_session": 3.0},
         "hosts": {},
         "queue_enabled": False,
+        "notices_enabled": False,
     }
     copied = hub.get_settings(2)
     copied["load_lines"]["hosts"].clear()
     assert hub.effective_load_lines(2, "host_a").heavy == 8
+
+
+@pytest.mark.parametrize("enable_notices", [False, True])
+async def test_saved_load_lines_remain_readable_after_rollback(
+    tmp_path: Path, enable_notices: bool
+) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    workspace_lines = {
+        "default": {"heavy": 2, "new_session": 3},
+        "hosts": {"host_a": {"heavy": 6, "new_session": 7}},
+        "queue_enabled": True,
+    }
+    hub.put_settings({"load_lines": workspace_lines}, workspace_id=1)
+    if enable_notices:
+        hub.put_settings({"load_lines": {"notices_enabled": True}}, workspace_id=1)
+    await hub.save_settings(hub.put_settings({"mem_pct": 75}, workspace_id=1))
+    stored = json.loads(hub.settings_path.read_text())
+    # The rollback reader rejects the entire workspace on any fourth field.
+    assert stored["load_lines"] == {"1": workspace_lines}
+    assert stored.get("load_notices_enabled") == ({"1": True} if enable_notices else None)
+    hub.close()
+
+    hub = SystemStatusHub(tmp_path, None)
+    try:
+        assert hub.notices_enabled(1) is enable_notices
+        projected = hub.get_settings(1)
+        assert "load_notices_enabled" not in projected
+        assert projected["load_lines"]["notices_enabled"] is enable_notices
+        cleared = hub.put_settings({"load_lines": {"notices_enabled": False}}, workspace_id=1)
+        assert "load_notices_enabled" not in cleared
+        assert cleared["load_lines"] == stored["load_lines"]
+    finally:
+        hub.close()
 
 
 @pytest.mark.parametrize(
@@ -941,6 +984,7 @@ def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> No
         {"hosts": {"": {"heavy": 2, "new_session": 3}}},
         {"hosts": []},
         {"queue_enabled": 1},
+        {"notices_enabled": 1},
     ],
 )
 def test_load_lines_validation_is_atomic(tmp_path: Path, patch: object) -> None:

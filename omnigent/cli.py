@@ -62,6 +62,9 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    CODEX_NATIVE_UNLISTED_MODEL_KEY,
+    CODEX_NATIVE_UNLISTED_MODEL_MODES,
+    NATIVE_HISTORY_CLEANUP_KEY,
     _ignored_project_harness_keys,
     _merge_effective_config,
     global_config_path,
@@ -680,11 +683,17 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "opencode_model",
         "server",
         "session_title_instructions",
+        NATIVE_HISTORY_CLEANUP_KEY,
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
+        CODEX_NATIVE_UNLISTED_MODEL_KEY,
     }
 )
-_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"server", "session_title_instructions"})
-_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"server", "session_title_instructions", CODEX_NATIVE_UNLISTED_MODEL_KEY}
+)
+_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset(
+    {_AUTO_OPEN_CONVERSATION_CONFIG_KEY, NATIVE_HISTORY_CLEANUP_KEY}
+)
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
 _ConfigValue: TypeAlias = (
@@ -1230,7 +1239,12 @@ def _save_global_config(  # type: ignore[explicit-any]
         else:
             cfg[key] = value
     for key in unset_keys:
-        cfg.pop(key, None)
+        if key == NATIVE_HISTORY_CLEANUP_KEY:
+            host_config = cfg.get("host")
+            if isinstance(host_config, dict):
+                host_config.pop("native_history_cleanup", None)
+        else:
+            cfg.pop(key, None)
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
     from omnigent.private_file import write_private_text
@@ -4041,6 +4055,9 @@ def _build_host_daemon_env(
     pin = _host_databricks_org_pin(server_url)
     if pin is not None:
         env[PINNED_DATABRICKS_ORG_ENV_VAR] = pin
+    from omnigent.telemetry.environment import preserve_zerobus_opt_outs
+
+    preserve_zerobus_opt_outs(env, os.environ)
     return env
 
 
@@ -4930,7 +4947,7 @@ def server(
             else {}
         )
         key_config = global_cfg if resolve_config_path() is None else load_server_config()
-        for key in ("api_keys", "frame_ancestors"):
+        for key in ("api_keys", "frame_ancestors", "telemetry"):
             if key in key_config:
                 title_server_config[key] = key_config[key]
 
@@ -4953,6 +4970,12 @@ def server(
     # connects, else a fresh <data_dir> (first run, or a cleared dir) fails
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
+
+    # Resolve server OTel on/off before constructing the first SQLAlchemy engine
+    # so a stored opt-in instruments SQL queries and a lock-off blocks legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    telemetry_enabled_at_start = configure_server_boot_telemetry(title_server_config)
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
@@ -5038,13 +5061,6 @@ def server(
         global_instructions_store=global_instructions_store,
         caps=caps,
     )
-
-    # Initialize OpenTelemetry observability. No-op when
-    # OTEL_EXPORTER_OTLP_ENDPOINT is unset; see
-    # designs/OBSERVABILITY.md for the env var reference.
-    from omnigent.runtime import telemetry
-
-    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -5175,11 +5191,6 @@ def server(
 
     from omnigent.process_logging import configure_process_logging
 
-    server_log_path = configure_process_logging(
-        "server",
-        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
-    )
-
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -5215,6 +5226,12 @@ def server(
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
+    )
+    server_log_path = configure_process_logging(
+        "server",
+        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
+        debug_log_enabled=app.state.telemetry_enabled_at_start,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
@@ -6579,6 +6596,183 @@ def _upgrade_to_nightly(
         )
 
 
+def _upgrade_distribution_install(
+    info: _InstalledWheelInfo,
+    *,
+    repo: str,
+    current: str,
+    check_only: bool,
+    force: bool,
+    extra_overrides: tuple[str, ...],
+    target_version: str | None,
+    dry_run: bool,
+) -> None:
+    """Upgrade a non-VCS stamped distribution install from verified local release wheels."""
+    import shlex
+    import tempfile
+
+    from omnigent.distribution import DISTRIBUTION_NAME
+    from omnigent.update_check import (
+        _UPGRADE_INDEX_TIMEOUT_SECONDS,
+        _UV_REINSTALL_PACKAGE,
+        DistributionWheelError,
+        _distribution_recovery_command,
+        _extras_str,
+        _is_newer_distribution_version,
+        _parse_distribution_version,
+        _probe_distribution_version,
+        _run_upgrade_command,
+        _upgrade_failure_message,
+        _UpgradeSuggestion,
+        _uv_python_pin,
+        _uv_tool_receipt_path,
+        download_verified_distribution_wheels,
+        fetch_distribution_wheel_manifest,
+        fetch_latest_distribution_release,
+    )
+
+    extras = sorted(set(info.extras) | set(extra_overrides))
+    recovery = _distribution_recovery_command(repo, extras)
+
+    if target_version:
+        target = target_version.removeprefix("v")
+        if _parse_distribution_version(target) is None:
+            raise click.ClickException(
+                f"Unsupported {DISTRIBUTION_NAME} version: {target_version!r} "
+                "(expected X.Y.Z-wukong.N).\n\n"
+                f"To reinstall {DISTRIBUTION_NAME}, run:\n\n    {recovery}"
+            )
+        click.echo(f"Targeting {DISTRIBUTION_NAME} {target}.")
+    else:
+        status, latest = fetch_latest_distribution_release(
+            repo, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
+        )
+        if status == "error":
+            raise click.ClickException(
+                f"Couldn't reach https://github.com/{repo}/releases.atom to check for a "
+                f"newer {DISTRIBUTION_NAME} release. Check your connection and try again.\n\n"
+                f"Or reinstall manually:\n\n    {recovery}"
+            )
+        if status == "empty" or latest is None:
+            click.echo(f"No published {DISTRIBUTION_NAME} releases found yet.")
+            return
+        if not _is_newer_distribution_version(latest, current):
+            click.echo(f"{DISTRIBUTION_NAME} is up to date ({current}).")
+            return
+        target = latest
+        click.echo(f"A new {DISTRIBUTION_NAME} release is available: {current} → {target}.")
+
+    if check_only:
+        raise SystemExit(1)
+
+    if info.detected_installer == "pip":
+        click.echo(
+            "omnigent was installed with pip, and pip does not record which extras "
+            f"were requested. `{cli_invocation(name='omni')} upgrade` cannot preserve them "
+            f"safely. Reinstall {DISTRIBUTION_NAME} with the official wheel installer:\n\n"
+            f"    {recovery}"
+        )
+        raise SystemExit(0)
+    if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
+        click.echo(
+            "omnigent was installed with `uv pip`, not `uv tool install`. "
+            "`uv pip` does not record which extras were requested, so "
+            f"`{cli_invocation(name='omni')} upgrade` cannot preserve them safely. "
+            f"Reinstall {DISTRIBUTION_NAME} with the official wheel installer:\n\n"
+            f"    {recovery}"
+        )
+        raise SystemExit(0)
+    if (info.detected_installer or info.installer) != "uv":
+        raise click.ClickException(
+            f"Automatic wheel upgrades for {DISTRIBUTION_NAME} require `uv tool install`. "
+            f"Reinstall with the official wheel installer:\n\n    {recovery}"
+        )
+
+    extras_suffix = _extras_str(extras)
+    if dry_run:
+        try:
+            manifest = fetch_distribution_wheel_manifest(
+                repo, target, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
+            )
+        except DistributionWheelError as exc:
+            raise click.ClickException(
+                f"{exc}\n\nYour current install and running services were not touched. "
+                f"Recover with:\n\n    {recovery}"
+            ) from exc
+        client_name = manifest["omnigent-client"][0]
+        ui_sdk_name = manifest["omnigent-ui-sdk"][0]
+        core_name = manifest["omnigent"][0]
+        preview = _UpgradeSuggestion(
+            command=(
+                f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                f"--with 'omnigent-client @ file://<verified-dir>/{client_name}' "
+                f"--with 'omnigent-ui-sdk @ file://<verified-dir>/{ui_sdk_name}' "
+                f"'omnigent{extras_suffix} @ file://<verified-dir>/{core_name}'"
+            ),
+            runnable=True,
+        )
+        _echo_upgrade_plan(info, preview, extra_overrides)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="omnigent-wheels-") as tmp_dir:
+        try:
+            wheel_paths = download_verified_distribution_wheels(
+                repo, target, Path(tmp_dir), timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
+            )
+        except DistributionWheelError as exc:
+            raise click.ClickException(
+                f"{exc}\n\nYour current install and running services were not touched. "
+                f"Recover with:\n\n    {recovery}"
+            ) from exc
+
+        client_spec = shlex.quote(
+            f"omnigent-client @ {wheel_paths['omnigent-client'].resolve().as_uri()}"
+        )
+        ui_sdk_spec = shlex.quote(
+            f"omnigent-ui-sdk @ {wheel_paths['omnigent-ui-sdk'].resolve().as_uri()}"
+        )
+        core_spec = shlex.quote(
+            f"omnigent{extras_suffix} @ {wheel_paths['omnigent'].resolve().as_uri()}"
+        )
+        suggestion = _UpgradeSuggestion(
+            command=(
+                f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                f"--with {client_spec} --with {ui_sdk_spec} {core_spec}"
+            ),
+            runnable=True,
+        )
+
+        with _upgrade_host_service(force=force):
+            console = Console()
+            code = _run_upgrade_command(suggestion.command, console)
+            if code != 0:
+                raise click.ClickException(
+                    _upgrade_failure_message(
+                        code,
+                        extras,
+                        recovery_command=recovery,
+                    )
+                )
+
+            new_dist = _probe_distribution_version()
+            if new_dist is None:
+                click.echo(
+                    "Ran the upgrade command, but couldn't confirm the installed version. "
+                    f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
+                )
+                return
+            if new_dist == target or _is_newer_distribution_version(new_dist, current):
+                click.echo(
+                    f"✓ Upgraded to {DISTRIBUTION_NAME} {new_dist}. Re-run your command — the "
+                    "local server will start on the new version."
+                )
+                return
+            raise click.ClickException(
+                f"The upgrade command ran but {DISTRIBUTION_NAME} is still {new_dist} "
+                f"(expected {target}). Recover with:\n\n    {recovery}"
+            )
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -6672,6 +6866,7 @@ def upgrade(
     from omnigent.update_check import (
         _UPGRADE_INDEX_TIMEOUT_SECONDS,
         _build_upgrade_suggestion,
+        _distribution_release_config,
         _find_repo_root,
         _is_newer,
         _probe_installed_distribution,
@@ -6707,11 +6902,20 @@ def upgrade(
             "This is an editable install — update it with `git pull`, "
             f"not `{cli_invocation(name='omni')} upgrade`."
         )
+    dist_cfg = _distribution_release_config()
     # Nightly channel: resolved from git tags, not the index, and applies to
     # every install shape, so it dispatches before the VCS-vs-registry split
     # (a VCS install pinned to an older nightly tag must move tags, not
     # re-pull its pinned ref).
     if nightly:
+        if dist_cfg is not None:
+            from omnigent.distribution import DISTRIBUTION_NAME
+
+            raise click.ClickException(
+                f"{DISTRIBUTION_NAME} does not publish upstream nightly builds; "
+                f"run `{cli_invocation(name='omni')} up` for the latest "
+                f"{DISTRIBUTION_NAME} release."
+            )
         _upgrade_to_nightly(
             info,
             check_only=check_only,
@@ -6743,6 +6947,19 @@ def upgrade(
 
             setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
             raise
+        return
+
+    if dist_cfg is not None:
+        _upgrade_distribution_install(
+            info,
+            repo=dist_cfg[0],
+            current=dist_cfg[1],
+            check_only=check_only,
+            force=force,
+            extra_overrides=extra_overrides,
+            target_version=target_version,
+            dry_run=dry_run,
+        )
         return
 
     # pip / ``uv pip`` do not record which extras were requested for a plain
@@ -12404,6 +12621,13 @@ def _parse_config_settings(
             value = str(Path(value).resolve())
         if key in _BOOLEAN_CONFIG_KEYS:
             parsed[key] = _parse_config_bool(key, value)
+        elif (
+            key == CODEX_NATIVE_UNLISTED_MODEL_KEY
+            and value not in CODEX_NATIVE_UNLISTED_MODEL_MODES
+        ):
+            raise click.ClickException(
+                f"{key} must be {' or '.join(CODEX_NATIVE_UNLISTED_MODEL_MODES)}."
+            )
         else:
             parsed[key] = value
     return parsed
@@ -12438,6 +12662,8 @@ def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: boo
     """Reject project-local writes for user-owned server settings."""
     if is_global:
         return
+    if NATIVE_HISTORY_CLEANUP_KEY in settings:
+        raise click.ClickException(f"Config key {NATIVE_HISTORY_CLEANUP_KEY!r} requires --global.")
     user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
     if user_only:
         names = ", ".join(repr(key) for key in user_only)
@@ -12545,7 +12771,11 @@ def _print_config_defaults() -> None:
     # Only user-facing defaults (the keys ``config set`` accepts).
     # Internal blocks (``providers``, ``host``, ``tui``) are omitted — the
     # ``providers`` block is shown in the credentials-by-harness section.
-    global_cfg = {k: v for k, v in _load_global_config().items() if k in _GLOBAL_CONFIG_KEYS}
+    raw_global_cfg = _load_global_config()
+    global_cfg = {k: v for k, v in raw_global_cfg.items() if k in _GLOBAL_CONFIG_KEYS}
+    host_config = raw_global_cfg.get("host")
+    if isinstance(host_config, Mapping) and "native_history_cleanup" in host_config:
+        global_cfg[NATIVE_HISTORY_CLEANUP_KEY] = host_config["native_history_cleanup"] is True
     raw_local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
     global_path = _effective_global_config_path()
     local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
@@ -12891,10 +13121,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project defaults take precedence except for harness
     executables and arguments, which are user-owned.
 
-    Supported keys: auto_open_conversation, default_agent, harness,
-    model, server, session_title_instructions. Server selection and session
-    title instructions require ``--global``. A project-local ``server`` is
-    ignored; use ``--server`` for a per-invocation destination.
+    Supported keys: auto_open_conversation, codex_native_unlisted_model,
+    default_agent, harness, model, server, session_title_instructions.
+    Server selection, session title instructions and the Codex unlisted-model
+    setting require ``--global``. Use ``--server`` for a per-invocation destination.
+
+    Set ``--global host.native_history_cleanup=true`` to let this host expire
+    old native bridge and attachment files. Restart the host to apply it.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -12910,6 +13143,9 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     _validate_config_set_scope(parsed, is_global=is_global)
     deep_keys = _harness_deep_merge_keys(parsed)
     if is_global:
+        if NATIVE_HISTORY_CLEANUP_KEY in parsed:
+            parsed["host"] = {"native_history_cleanup": parsed.pop(NATIVE_HISTORY_CLEANUP_KEY)}
+            deep_keys += ("host",)
         _save_global_config(parsed, (), deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
@@ -12935,6 +13171,8 @@ def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
     :param keys: Keys to remove, e.g. ``("server", "model")``.
     """
     validated = _validate_unset_keys(keys)
+    if not is_global and NATIVE_HISTORY_CLEANUP_KEY in validated:
+        raise click.ClickException(f"Config key {NATIVE_HISTORY_CLEANUP_KEY!r} requires --global.")
     if is_global:
         _save_global_config({}, tuple(validated))
         config_path: Path = _effective_global_config_path()

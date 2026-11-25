@@ -2596,3 +2596,482 @@ def test_read_installed_wheel_info_reads_pipx_metadata(
     assert info.installer == "pip"
     assert info.detected_installer == "pipx"
     assert info.extras == ("all",)
+
+
+# ------------------------------------------------------------------
+# Distribution release checks (stamped builds, e.g. omnigent-wukong)
+# ------------------------------------------------------------------
+
+
+def _releases_atom(*tags: str, repo: str = "example-org/omnigent-dist") -> str:
+    entries = "".join(
+        f"<entry><id>tag:github.com,2008:Repository/1/{tag}</id>"
+        f'<link rel="alternate" type="text/html" href="https://github.com/{repo}/releases/tag/{tag}"/>'
+        f"<title>omnigent-dist {tag}</title></entry>"
+        for tag in tags
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'
+
+
+def test_distribution_version_comparison_strict_numeric_and_ignores_non_matching() -> None:
+    """Distribution comparator orders ``X.Y.Z-wukong.N`` numerically and ignores foreign tags."""
+    from omnigent.update_check import _is_newer_distribution_version, _parse_distribution_version
+
+    assert _is_newer_distribution_version("0.21.0-wukong.10", "0.21.0-wukong.9") is True
+    assert _is_newer_distribution_version("0.22.0-wukong.13", "0.21.0-wukong.12") is True
+    assert _is_newer_distribution_version("0.21.0-wukong.12", "0.21.0-wukong.12") is False
+    assert _is_newer_distribution_version("0.21.0-wukong.11", "0.21.0-wukong.12") is False
+    # Exact comparison for large neighbour fields (> 2^53).
+    assert (
+        _is_newer_distribution_version(
+            "0.21.0-wukong.9007199254740993", "0.21.0-wukong.9007199254740992"
+        )
+        is True
+    )
+    assert (
+        _is_newer_distribution_version(
+            "0.21.0-wukong.9007199254740992", "0.21.0-wukong.9007199254740993"
+        )
+        is False
+    )
+    # Oversized fields (>64 digits, including >4300 Python int_max_str_digits) return None safely.
+    assert _parse_distribution_version(f"0.21.0-wukong.{'9' * 65}") is None
+    assert _parse_distribution_version(f"0.21.0-wukong.{'9' * 5000}") is None
+    # Non-matching tags and other pre-release suffixes must never fall back to string inequality.
+    for bad in (
+        "0.99.0",
+        "0.21.0-rc.1",
+        "0.21.0-beta.2",
+        "0.21.0-alpha.1",
+        "0.21.0-wukong.12-rc.1",
+        "0.21.0-wukong.12+build.1",
+        "0.21.0.dev0",
+    ):
+        assert _is_newer_distribution_version(bad, "0.21.0-wukong.12") is False
+        assert _is_newer_distribution_version("0.21.0-wukong.12", bad) is False
+
+
+def test_fetch_latest_distribution_release_parses_atom_and_picks_highest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atom parser picks the numerically highest ``-wukong.N`` tag bound to the expected repo."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    seen: list[tuple[str, object]] = []
+    base = "https://github.com/example-org/omnigent-dist/releases/tag"
+    huge_n = "9" * 5000
+    # Mix foreign-repo same-format entry, ID-only entry, non-alternate link, oversized field,
+    # dot-segment/query/port URLs, and valid entries — only valid bound entries participate.
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry><id>tag:github.com,2008:Repository/1/v9.9.9-wukong.99</id>"
+        '<link rel="alternate" '
+        'href="https://github.com/foreign-org/foreign-repo/releases/tag/v9.9.9-wukong.99"/></entry>'
+        "<entry><id>tag:github.com,2008:Repository/1/v8.8.8-wukong.88</id></entry>"
+        f'<entry><link rel="related" href="{base}/v7.7.7-wukong.77"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v6.6.6-wukong.66?x=1"/></entry>'
+        '<entry><link rel="alternate" '
+        'href="https://github.com:443/example-org/omnigent-dist/releases/tag/v5.5.5-wukong.55"/></entry>'
+        '<entry><link rel="alternate" '
+        'href="https://github.com/other/repo/../../example-org/omnigent-dist/releases/tag/v4.4.4-wukong.44"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.22.0-wukong.{huge_n}"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.21.0-wukong.9"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.99.0"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.21.0-wukong.10"/></entry>'
+        f'<entry><link rel="alternate" href="{base}/v0.22.0-wukong.13"/></entry>'
+        "</feed>"
+    )
+
+    def _get(url: str, **kw: object) -> _FakeResp:
+        seen.append((url, kw.get("follow_redirects")))
+        return _FakeResp(status_code=200, content_type="application/atom+xml", text=xml)
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    status, latest = fetch_latest_distribution_release("example-org/omnigent-dist")
+
+    assert seen == [("https://github.com/example-org/omnigent-dist/releases.atom", False)]
+    assert status == "ok"
+    assert latest == "0.22.0-wukong.13"
+
+
+def test_fetch_latest_distribution_release_rejects_bad_repo_redirects_and_corrupt_xml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed repo metadata, redirects, and corrupt XML return ``('error', None)``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    # Malformed repo metadata (including dot segments) fails without making a request.
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not fetch invalid repo")),
+    )
+    for bad_repo in ("../evil", "./repo", "owner/..", "owner/.", "a/b/c", "noslash", ""):
+        assert fetch_latest_distribution_release(bad_repo) == ("error", None)
+
+    # HTTP 302 redirect refused.
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_k: _FakeResp(status_code=302, text=""))
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+    # Foreign resolved response URL refused.
+    class _RedirectedResp(_FakeResp):
+        url = "https://github.com/foreign-org/foreign-repo/releases.atom"
+
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _RedirectedResp(
+            status_code=200,
+            text=_releases_atom("v0.22.0-wukong.99", repo="example-org/omnigent-dist"),
+        ),
+    )
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+    # Corrupt XML and non-<feed> XML return error (not empty).
+    for bad_xml in ("<html><body>oops</body></html>", "<feed><entry>", "not xml at all"):
+        monkeypatch.setattr(
+            httpx, "get", lambda *_a, _b=bad_xml, **_k: _FakeResp(status_code=200, text=_b)
+        )
+        assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("error", None)
+
+
+def test_refresh_update_cache_writes_throttle_entry_on_corrupt_or_oversized_feed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Background refresh still writes throttle cache when XML is corrupt or fields overflow."""
+    import httpx
+
+    import omnigent.distribution as distribution
+    from omnigent.update_check import refresh_update_cache
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.21.0.dev0")
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(status_code=200, text="<feed><entry>corrupt"),
+    )
+
+    refresh_update_cache()
+
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.kind == "distribution"
+    assert not _is_stale(cached)
+
+
+def test_download_verified_distribution_wheels_verifies_sha256_and_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wheel downloader validates redirects, rejects duplicates/mismatches, and writes files."""
+    import hashlib
+
+    import httpx
+
+    from omnigent.update_check import (
+        DistributionWheelError,
+        download_verified_distribution_wheels,
+    )
+
+    repo = "example-org/omnigent-dist"
+    tag = "v0.21.0-wukong.13"
+    base = f"https://github.com/{repo}/releases/download/{tag}"
+    blobs = {
+        "omnigent-0.21.0.dev0-py3-none-any.whl": b"core-wheel-bytes",
+        "omnigent_client-0.21.0.dev0-py3-none-any.whl": b"client-wheel-bytes",
+        "omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl": b"ui-sdk-wheel-bytes",
+    }
+    shas = {name: hashlib.sha256(data).hexdigest() for name, data in blobs.items()}
+    manifest = (
+        f"# tag {tag}\n"
+        f"omnigent\tomnigent-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent-0.21.0.dev0-py3-none-any.whl']}\n"
+        f"omnigent-client\tomnigent_client-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent_client-0.21.0.dev0-py3-none-any.whl']}\n"
+        f"omnigent-ui-sdk\tomnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl']}\n"
+    )
+
+    class _BytesResp:
+        def __init__(
+            self,
+            status_code: int = 200,
+            *,
+            content: bytes = b"",
+            headers: dict[str, str] | None = None,
+            url: str = "",
+        ) -> None:
+            self.status_code = status_code
+            self.content = content
+            self.text = content.decode("utf-8", errors="replace")
+            self.headers = headers or {}
+            self.url = url
+
+    # Happy path: GitHub release URL redirects to objects.githubusercontent.com CDN.
+    def _ok_get(url: str, **kw: object) -> _BytesResp:
+        assert kw.get("follow_redirects") is False
+        if url == f"{base}/wukong-wheels.txt":
+            return _BytesResp(
+                302,
+                headers={
+                    "location": "https://objects.githubusercontent.com/signed/manifest?sig=1"
+                },
+            )
+        if url == "https://objects.githubusercontent.com/signed/manifest?sig=1":
+            return _BytesResp(200, content=manifest.encode("utf-8"), url=url)
+        for name, data in blobs.items():
+            if url == f"{base}/{name}":
+                return _BytesResp(
+                    302,
+                    headers={
+                        "location": f"https://release-assets.githubusercontent.com/signed/{name}?t=1"
+                    },
+                )
+            if url == f"https://release-assets.githubusercontent.com/signed/{name}?t=1":
+                return _BytesResp(200, content=data, url=url)
+        return _BytesResp(404)
+
+    monkeypatch.setattr(httpx, "get", _ok_get)
+    out_dir = tmp_path / "ok"
+    out_dir.mkdir()
+    local = download_verified_distribution_wheels(repo, "0.21.0-wukong.13", out_dir)
+    assert set(local) == {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    for pkg, path in local.items():
+        assert path.is_file()
+        assert path.read_bytes() == blobs[path.name]
+
+    # Digest mismatch on any wheel is refused.
+    def _bad_digest_get(url: str, **kw: object) -> _BytesResp:
+        resp = _ok_get(url, **kw)
+        if url.endswith("omnigent-0.21.0.dev0-py3-none-any.whl?t=1"):
+            return _BytesResp(200, content=b"tampered-bytes", url=url)
+        return resp
+
+    monkeypatch.setattr(httpx, "get", _bad_digest_get)
+    with pytest.raises(DistributionWheelError, match="SHA-256"):
+        download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "bad-sha")
+
+    # Duplicate package row in manifest is refused.
+    dup_manifest = manifest + (
+        f"omnigent\tomnigent-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent-0.21.0.dev0-py3-none-any.whl']}\n"
+    )
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **_k: _BytesResp(200, content=dup_manifest.encode("utf-8"), url=url),
+    )
+    with pytest.raises(DistributionWheelError, match="manifest"):
+        download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "dup")
+
+    # Disallowed redirect targets (foreign host, HTTP, credentials, port, wrong tag) refused.
+    for bad_location in (
+        "https://evil.example/wukong-wheels.txt",
+        "http://objects.githubusercontent.com/signed/manifest",
+        "https://user:pass@objects.githubusercontent.com/signed/manifest",
+        "https://objects.githubusercontent.com:8443/signed/manifest",
+        f"https://github.com/{repo}/releases/download/v0.21.0-wukong.12/wukong-wheels.txt",
+        f"https://github.com/foreign-org/foreign-repo/releases/download/{tag}/wukong-wheels.txt",
+    ):
+        monkeypatch.setattr(
+            httpx,
+            "get",
+            lambda _url, _loc=bad_location, **_k: _BytesResp(302, headers={"location": _loc}),
+        )
+        with pytest.raises(DistributionWheelError):
+            download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "bad-redir")
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (404, "Not Found"),
+        (200, _releases_atom()),
+        (200, _releases_atom("v0.21.0")),
+    ],
+)
+def test_fetch_latest_distribution_release_empty_or_404(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    body: str,
+) -> None:
+    """Before the first public release (404 or empty Atom), return ``('empty', None)``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_distribution_release
+
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(
+            status_code=status_code, content_type="application/atom+xml", text=body
+        ),
+    )
+
+    assert fetch_latest_distribution_release("example-org/omnigent-dist") == ("empty", None)
+
+
+def test_stamped_vcs_install_notifies_from_distribution_cache_without_pypi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stamped VCS install (tracking default branch) gets a once-per-release notice."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="distribution",
+            latest_version="0.21.0-wukong.13",
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.21.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-dist.git",
+            "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+
+    _run_installed_wheel_check()
+    err = _strip_rich_panel(capsys.readouterr().err)
+    assert "0.21.0-wukong.13" in err
+    assert "0.21.0-wukong.12" in err
+    assert "omni up" in err
+
+    # Second run stays quiet for the same release.
+    _run_installed_wheel_check()
+    assert capsys.readouterr().err == ""
+
+
+def test_stamped_pinned_vcs_install_notice_mentions_reinstall_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A tag-pinned VCS install tells the user how to move pins instead of bare ``omni up``."""
+    import omnigent.distribution as distribution
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="distribution",
+            latest_version="0.21.0-wukong.13",
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.21.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-dist.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "a" * 40,
+                "requested_revision": "v0.21.0-wukong.12",
+            },
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+    err = _strip_rich_panel(capsys.readouterr().err)
+    assert "0.21.0-wukong.13" in err
+    assert "@v0.21.0-wukong.13" in err
+
+
+def test_refresh_update_cache_stamped_caches_empty_on_404_and_never_hits_pypi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the first public release, background refresh caches empty result silently."""
+    import httpx
+
+    import omnigent.distribution as distribution
+    from omnigent.update_check import refresh_update_cache
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", "0.21.0-wukong.12")
+    monkeypatch.setattr(distribution, "DISTRIBUTION_RELEASE_REPO", "example-org/omnigent-dist")
+    _point_cache_at(tmp_path, monkeypatch)
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.21.0.dev0")
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr(
+        "omnigent.update_check.fetch_latest_version",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not query PyPI")),
+    )
+    monkeypatch.setattr(
+        httpx, "get", lambda *_a, **_k: _FakeResp(status_code=404, text="Not Found")
+    )
+
+    refresh_update_cache()
+
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.kind == "distribution"
+    assert cached.latest_version == ""
+    assert not _is_stale(cached)
+
+
+def test_unstamped_vcs_install_still_skips_passive_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Our own hosts (unstamped VCS installs) stay untouched and spawn no refresh."""
+    import omnigent.distribution as distribution
+
+    assert distribution.DISTRIBUTION_VERSION is None
+    assert distribution.DISTRIBUTION_RELEASE_REPO is None
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        version="0.22.0.dev0",
+        direct_url={
+            "url": "https://github.com/example-org/omnigent-custom.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b" * 40,
+                "requested_revision": "local/host-custom",
+            },
+        },
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+    assert spawned == []

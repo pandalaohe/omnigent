@@ -57,6 +57,7 @@ import {
 } from "./taskBoardSessionData";
 import type { SourceCache } from "./taskBoardSnapshotData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
+import { interfaceText } from "@/lib/interfaceText";
 
 const icons: Record<string, typeof ActivityIcon> = {
   read: BookOpenIcon,
@@ -716,9 +717,10 @@ export function TaskBoardSessions({
                 title={quote.date || quote.at}
               >
                 <blockquote>
-                  {"「"}
+                  {interfaceText("quoteOpen")}
                   {quote.text.slice(0, 58)}
-                  {quote.text.length > 58 ? "…」" : "」"}
+                  {quote.text.length > 58 ? "…" : ""}
+                  {interfaceText("quoteClose")}
                   <cite>
                     {task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}
                     {" · "}

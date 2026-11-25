@@ -290,7 +290,8 @@ from omnigent.sdk_permission_modes import (
 from omnigent.server.permission_tiers import (
     PERMISSION_STATE_LABEL_KEY,
     REGISTRY_TOOL_INSPECTION_HEADER,
-    TIER_HARNESSES,
+    is_acp_permission_harness,
+    permission_tier_active,
 )
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -3122,7 +3123,9 @@ def create_runner_app(
                 if item.get("type") == "message":
                     mark_purged_message_attachments(item, session_id, purged)
 
-    def _session_has_cli_retention_protection(session_id: str) -> bool:
+    def _session_has_cli_retention_protection(
+        session_id: str, *, include_background_tasks: bool = True
+    ) -> bool:
         if session_id in _active_turns:
             return True
         if process_manager is not None and process_manager.has_active_turn(session_id):
@@ -3135,7 +3138,7 @@ def create_runner_app(
             return True
         if any(not task.done() for task in _session_timers.get(session_id, {}).values()):
             return True
-        if _session_background_task_counts.get(session_id, 0) > 0:
+        if include_background_tasks and _session_background_task_counts.get(session_id, 0) > 0:
             return True
         return any(
             entry.status in {"launching", "launch_unconfirmed", "running", "waiting"}
@@ -3446,6 +3449,7 @@ def create_runner_app(
         *,
         failure_detail: str | None = None,
         inferred: bool = False,
+        replayed: bool = False,
     ) -> None:
         hold_until = _keep_warm_status_hold.get(session_id)
         if hold_until is not None:
@@ -3461,7 +3465,7 @@ def create_runner_app(
             else:
                 _keep_warm_status_hold.pop(session_id, None)
         pane_reaper = getattr(app.state, "native_pane_reaper", None)
-        if pane_reaper is not None:
+        if pane_reaper is not None and not replayed:
             pane_reaper.note_activity(session_id)
         background_agents: list[dict[str, object]] = []
         wire_status = status
@@ -4846,6 +4850,13 @@ def create_runner_app(
                 },
             )
 
+        if is_acp_permission_harness(harness_name):
+            spawn_env = {
+                **(spawn_env or {}),
+                "HARNESS_ACP_HOST_PERMISSION_TIER": (
+                    "1" if permission_tier_active(harness_name, init_context.labels or {}) else "0"
+                ),
+            }
         try:
             init_harness_client = await process_manager.get_client(
                 session_id,
@@ -10971,12 +10982,22 @@ def create_runner_app(
 
         if harness_name is not None:
             await prepare_capture(server_client, conv_id, harness_name)
-        if harness_name in TIER_HARNESSES:
+        acp_harness = is_acp_permission_harness(harness_name)
+        managed_tier = permission_tier_active(harness_name, startup_labels or {}) or (
+            acp_harness and permission_tiers.observation_harness(conv_id) == harness_name
+        )
+        if managed_tier:
             permission_state = permission_tiers.state(conv_id)
             if permission_state is None or permission_state.status != "ready":
                 init_error = await _wait_for_permission_initialization(conv_id)
                 if init_error is not None:
                     return init_error
+        acp_host_tier = managed_tier and acp_harness
+        if acp_harness:
+            spawn_env = {
+                **(spawn_env or {}),
+                "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier else "0",
+            }
         _clean_terminal_exit_responses.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
@@ -11861,6 +11882,16 @@ def create_runner_app(
                                     _eval_id = event.get("evaluation_id", "")
                                     _eval_phase = event.get("phase", "")
                                     _eval_data = event.get("data") or {}
+                                    acp_tier = None
+                                    if (
+                                        acp_host_tier
+                                        and _eval_phase == "PHASE_TOOL_CALL"
+                                        and "_omnigent_acp_call" in _eval_data
+                                    ):
+                                        _eval_data = dict(_eval_data)
+                                        acp_tier = permission_tiers.evaluate_acp_call(
+                                            conv_id, _eval_data.pop("_omnigent_acp_call", None)
+                                        )
                                     _track_dispatch_task(
                                         _asyncio.create_task(
                                             _evaluate_policy_via_omnigent(
@@ -11870,6 +11901,11 @@ def create_runner_app(
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                **(
+                                                    {"acp_tier": acp_tier}
+                                                    if acp_tier is not None
+                                                    else {}
+                                                ),
                                                 # A dead verdict-delivery channel
                                                 # parks the harness turn forever;
                                                 # route it to the recovery entry,
@@ -13487,7 +13523,10 @@ def create_runner_app(
                         allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
-                        return JSONResponse({"codex_settings_applied": True})
+                        return JSONResponse(
+                            {"codex_settings_applied": True, "model_applied": True},
+                            headers={"X-Omnigent-Model-Applied": "true"},
+                        )
                     return response
                 if harness == "antigravity-native":
                     effort = body.get("effort")
@@ -13681,14 +13720,22 @@ def create_runner_app(
             from omnigent.server.permission_tiers import read_permission_state
 
             harness = _session_harness_name(conversation_id)
-            if harness not in {"pi", "pi-native", "antigravity-native"}:
+            if harness not in {"pi", "pi-native", "antigravity-native"} and not (
+                is_acp_permission_harness(harness)
+                and permission_tiers.observation_harness(conversation_id) == harness
+            ):
                 return JSONResponse(status_code=400, content={"error": "unsupported_harness"})
             if not isinstance(body, dict):
                 return JSONResponse(status_code=400, content={"error": "invalid_input"})
             target = body.get("permission_tier")
             transaction_id = body.get("transaction_id")
             expected_revision = body.get("expected_revision")
-            allowed_tiers = NON_FULL_TIERS if harness == "antigravity-native" else PERMISSION_TIERS
+            assert harness is not None
+            allowed_tiers = (
+                NON_FULL_TIERS
+                if harness == "antigravity-native" or is_acp_permission_harness(harness)
+                else PERMISSION_TIERS
+            )
             if (
                 target not in allowed_tiers
                 or not isinstance(transaction_id, str)
@@ -13791,7 +13838,7 @@ def create_runner_app(
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
                                 deadline=agy_switch_deadline,
                             )
-                        else:
+                        elif harness in ("pi", "pi-native"):
                             from omnigent.harnesses.pi_native.bridge import (
                                 apply_pi_permission_tier,
                             )
@@ -13895,7 +13942,7 @@ def create_runner_app(
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
                                 deadline=agy_switch_deadline,
                             )
-                        else:
+                        elif harness in ("pi", "pi-native"):
                             from omnigent.harnesses.pi_native.bridge import (
                                 apply_pi_permission_tier,
                             )
@@ -15192,6 +15239,9 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from omnigent.harnesses.antigravity_native.bridge import (
+            agy_pane_has_running_background_tasks,
+        )
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
@@ -15199,14 +15249,20 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S,
+            BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
+            NativePaneActivityUnavailable,
             NativePaneReaper,
             NativePaneStillAlive,
             PaneRef,
         )
 
+        background_shell_hold_since: dict[str, float] = {}
+
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
+            live_instance_ids: set[str] = set()
             for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
                 terminal_id = terminal_resource_id(name, "main")
                 if is_native_harness(
@@ -15214,6 +15270,7 @@ def create_runner_app(
                 ):
                     instance = _pane_reaper_registry.get(conv_id, name, "main")
                     if instance is not None:
+                        live_instance_ids.add(instance.diagnostic_id)
                         panes.append(
                             PaneRef(
                                 conv_id,
@@ -15224,6 +15281,8 @@ def create_runner_app(
                                 sub_agent=_is_sub_agent_session(conv_id),
                             )
                         )
+            for gone in background_shell_hold_since.keys() - live_instance_ids:
+                del background_shell_hold_since[gone]
             return panes
 
         async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
@@ -15267,9 +15326,53 @@ def create_runner_app(
             resource_registry.note_external_session_status(conv_id, status)
             return False
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(pane: PaneRef) -> bool | None:
+            busy = await _native_pane_busy_without_background_shell(pane)
+            if pane.terminal_name not in ("claude", "antigravity", "codex"):
+                return busy
+            instance = _pane_reaper_registry.get(pane.conversation_id, pane.terminal_name, "main")
+            if instance is None or (pane.instance is not None and pane.instance is not instance):
+                return busy
+            instance_id = instance.diagnostic_id
+            if busy:
+                background_shell_hold_since.pop(instance_id, None)
+                return True
+            if pane.terminal_name == "claude":
+                running = (
+                    pane.conversation_id in _sessions_with_background_shell
+                    or resource_registry.session_has_reported_background_shells(
+                        pane.conversation_id
+                    )
+                )
+            elif pane.terminal_name == "codex":
+                running = _native_runtime.codex_pane_background_terminal_status(
+                    pane.conversation_id, instance
+                )
+                if running is None:
+                    return False
+            else:
+                try:
+                    async with asyncio.timeout(AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S):
+                        capture = await instance.read()
+                except TimeoutError:
+                    running = None
+                else:
+                    screen = capture.get("screen")
+                    if not isinstance(screen, str):
+                        return False
+                    running = agy_pane_has_running_background_tasks(screen)
+            if running is False:
+                background_shell_hold_since.pop(instance_id, None)
+                return False
+            now = time.monotonic()
+            held_since = background_shell_hold_since.setdefault(instance_id, now)
+            return running if now - held_since < BACKGROUND_SHELL_PANE_HOLD_S else False
+
+        async def _native_pane_busy_without_background_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            if _session_has_cli_retention_protection(conv_id):
+            if _session_has_cli_retention_protection(
+                conv_id, include_background_tasks=pane.terminal_name != "claude"
+            ):
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the
@@ -15341,16 +15444,20 @@ def create_runner_app(
                             "native pane changed or became busy before retention release"
                         )
                     # A message can reuse the pane while the reap waits for the lock.
-                    if not pane.allow_busy_release and await _native_pane_is_busy(pane):
-                        _logger.info(
-                            "native pane reaper: pane for conversation %s became busy while "
-                            "the reap waited; leaving it",
-                            conv_id,
-                            extra={"session_id": conv_id},
-                        )
-                        raise RuntimeError(
-                            "native pane changed or became busy before retention release"
-                        )
+                    if not pane.allow_busy_release:
+                        busy = await _native_pane_is_busy(pane)
+                        if busy is None:
+                            raise NativePaneActivityUnavailable
+                        if busy:
+                            _logger.info(
+                                "native pane reaper: pane for conversation %s became busy while "
+                                "the reap waited; leaving it",
+                                conv_id,
+                                extra={"session_id": conv_id},
+                            )
+                            raise RuntimeError(
+                                "native pane changed or became busy before retention release"
+                            )
                     _capture_codex_release(conv_id, snapshot)
                     outcome = await resource_registry.close_terminal_detailed(
                         pane.conversation_id,
@@ -15588,7 +15695,9 @@ def create_runner_app(
             )
         reaper = app.state.native_pane_reaper
         snapshot = None
-        protected = _session_has_cli_retention_protection(session_id)
+        protected = _session_has_cli_retention_protection(
+            session_id, include_background_tasks=False
+        )
         if protected:
             if reaper is not None:
                 reaper.note_activity(session_id)
@@ -15612,6 +15721,9 @@ def create_runner_app(
             else:
                 reaper.unmanage(session_id)
         if snapshot is None and process_manager is not None:
+            if not protected and _session_background_task_counts.get(session_id, 0) > 0:
+                protected = True
+                process_manager.note_activity(session_id)
             process_manager.manage_for_retention(session_id)
             snapshot = await process_manager.retention_snapshot(
                 session_id,
@@ -15736,7 +15848,10 @@ def create_runner_app(
                     status_code=409,
                     content={"session_id": session_id, "status": "stale_policy"},
                 )
-            if _session_has_cli_retention_protection(session_id):
+            pane_release = token.startswith("pane:") and reaper is not None
+            if _session_has_cli_retention_protection(
+                session_id, include_background_tasks=not pane_release
+            ):
                 if reaper is not None:
                     reaper.note_activity(session_id)
                 if process_manager is not None:

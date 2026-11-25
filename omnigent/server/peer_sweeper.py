@@ -52,12 +52,14 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.routes.sessions.routes_peer import (
     _NATIVE_ATTEMPT_REASON_PREFIX,
+    _NATIVE_CLAIMED_REASON_PREFIX,
     _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     _PEER_RELEASED_REASON,
     _first_text_block,
     _native_attempt_id,
+    _native_claimed,
     _needs_native_peer_receipt,
     _peer_envelope_msg_id,
     _released_peer_reason,
@@ -97,6 +99,78 @@ def _is_record_marker(item: Any, record_id: str) -> bool:
         return False
     text = _first_text_block(data.content)
     return text is not None and _peer_envelope_msg_id(text) == record_id
+
+
+def settle_from_mirrored_envelope(
+    store: PeerMessageStore,
+    conversation_store: ConversationStore,
+    session_id: str,
+    item_id: str,
+) -> bool:
+    """Settle the ``delivering`` record a committed native mirror names, at once.
+
+    The reconcile grace only guards resends without a marker; this receiver's
+    own non-failed envelope row is the receipt. Native-attempt and SDK records
+    keep their own receipt rules.
+
+    :returns: Whether the record moved to ``delivered``.
+    """
+    item = conversation_store.get_item(session_id, item_id)
+    data = getattr(item, "data", None)
+    if item is None or getattr(item, "status", None) == "failed":
+        return False
+    if not isinstance(data, MessageData):
+        return False
+    text = _first_text_block(data.content)
+    peer_id = _peer_envelope_msg_id(text) if text is not None else None
+    if peer_id is None or not _is_record_marker(item, peer_id):
+        return False
+    if not _legacy_delivering(store.get(peer_id), session_id):
+        return False
+    return store.transition(peer_id, "delivered", None, ("delivering",))
+
+
+def mark_peer_copy_claimed(
+    store: PeerMessageStore, session_id: str, peer_id: str, attempt_id: str
+) -> bool:
+    """Durably record that one delivery attempt's runner may paste this copy.
+
+    The caller's in-memory claim already pinned the entry, attempt and claim
+    id. Only the first attempt to mark the record may paste; a forward the
+    sweeper re-sent carries another attempt id and is refused. A record the
+    sweeper already reverted, ended or never had takes no mark.
+
+    :returns: Whether the record now carries this attempt's mark.
+    """
+    mark = f"{_NATIVE_CLAIMED_REASON_PREFIX}{attempt_id}"
+    record = store.get(peer_id)
+    if not _legacy_delivering(record, session_id):
+        return False
+    assert record is not None
+    if _native_claimed(record.reason):
+        return record.reason == mark
+    if store.transition(
+        peer_id,
+        "delivering",
+        mark,
+        ("delivering",),
+        exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
+    ):
+        return True
+    # An identical same-second rewrite can report no changed row.
+    current = store.get(peer_id)
+    return current is not None and current.state == "delivering" and current.reason == mark
+
+
+def _legacy_delivering(record: SessionPeerMessage | None, session_id: str) -> bool:
+    """A ``delivering`` record of this receiver without a native or SDK attempt."""
+    return (
+        record is not None
+        and record.receiver_session_id == session_id
+        and record.state == "delivering"
+        and _native_attempt_id(record.reason) is None
+        and sdk_attempt(record.reason) is None
+    )
 
 
 class PeerSweeper:
@@ -416,7 +490,11 @@ class PeerSweeper:
         if state not in ("idle", "steerable"):
             return
         moved = await asyncio.to_thread(
-            self._store.claim_oldest, record.id, attempt_reason, (origin_state,)
+            self._store.claim_oldest,
+            record.id,
+            attempt_reason,
+            (origin_state,),
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
         if not moved:
             # Lost the CAS race — another tick (or the inline route) already
@@ -445,6 +523,15 @@ class PeerSweeper:
             await self._revert_delivering(
                 record, origin_state, "busy_recheck", expected_reason=attempt_reason
             )
+            return
+        if (
+            _native_attempt_id(attempt_reason) is None
+            and sdk_attempt(attempt_reason) is None
+            and not await asyncio.to_thread(self._still_unclaimed, record.id, attempt_reason)
+        ):
+            # An earlier copy was claimed after this attempt took the record; a
+            # second forward could only be refused at paste.
+            _logger.warning("Peer sweeper skipped forwarding claimed record %s", record.id)
             return
         request = self._synthetic_request(receiver.id, self._app)
         receiver_owner = effective_owner_id(
@@ -516,6 +603,26 @@ class PeerSweeper:
             expected_reason=attempt_reason,
         )
 
+    def _still_unclaimed(self, peer_id: str, attempt_reason: str | None) -> bool:
+        """Whether this attempt still holds an unclaimed ``delivering`` record."""
+        if self._store.transition(
+            peer_id,
+            "delivering",
+            None,
+            ("delivering",),
+            expected_reason=attempt_reason,
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
+        ):
+            return True
+        # An identical same-second rewrite can report no changed row.
+        current = self._store.get(peer_id)
+        return (
+            current is not None
+            and current.state == "delivering"
+            and not _native_claimed(current.reason)
+            and (attempt_reason is None or current.reason == attempt_reason)
+        )
+
     async def _revert_delivering(
         self,
         record: SessionPeerMessage,
@@ -541,6 +648,7 @@ class PeerSweeper:
             _PEER_RELEASED_REASON if _released_peer_reason(record.reason) else reason,
             ("delivering",),
             expected_reason=expected_reason,
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
         _logger.warning(
             "Peer sweeper reverted delivering record %s to %s (%s)",
@@ -893,13 +1001,36 @@ class PeerSweeper:
             # would re-send a copy still on its way. Expiry above still
             # ends the record.
             return
+        if _native_claimed(record.reason):
+            # The runner may have pasted this copy and Claude may have run it;
+            # a resend could run it twice, so it ends here unconfirmed.
+            moved = await asyncio.to_thread(
+                self._store.transition,
+                record.id,
+                "failed",
+                "delivery_uncertain",
+                ("delivering",),
+                expected_reason=record.reason,
+                notice=True,
+            )
+            if moved:
+                await self._notify_for(
+                    record,
+                    "failed",
+                    "delivery_uncertain",
+                    receiver.title if receiver is not None else None,
+                    self._app,
+                )
+            return
+        # A claim landing after this record was read keeps it from resending.
         await asyncio.to_thread(
             self._store.transition,
             record.id,
             "pending",
             None,
             ("delivering",),
+            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
         )
 
 
-__all__ = ["PeerSweeper"]
+__all__ = ["PeerSweeper", "mark_peer_copy_claimed", "settle_from_mirrored_envelope"]

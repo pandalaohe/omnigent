@@ -921,7 +921,7 @@ async def test_fresh_catalog_missing_default_model_warns_and_tries_unknown(
     assert body["model_override"] == "gpt-6-sol"
     assert body["reasoning_effort"] == "high"
     assert body["warnings"] == [
-        "gpt-6-sol is not in this host's model catalog; trying it as unknown."
+        "gpt-6-sol is not in this host's model catalog; passing it to the host unchanged."
     ]
     assert {(note["setting"], note["outcome"]) for note in body["notes"]} == {
         ("project_host", "missing"),
@@ -952,7 +952,7 @@ async def test_fresh_catalog_missing_legacy_all_hosts_model_warns_and_tries_unkn
     body = response.json()
     assert body["model_override"] == "gpt-6-sol"
     assert body["warnings"] == [
-        "gpt-6-sol is not in this host's model catalog; trying it as unknown."
+        "gpt-6-sol is not in this host's model catalog; passing it to the host unchanged."
     ]
     assert {(note["setting"], note["outcome"]) for note in body["notes"]} == {
         ("project_legacy", "missing"),
