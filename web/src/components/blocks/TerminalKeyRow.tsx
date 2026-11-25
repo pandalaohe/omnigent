@@ -668,6 +668,7 @@ export function TerminalKeyRow({
       aria-label="Terminal keys"
       aria-disabled={disabled ? "true" : "false"}
       data-testid="terminal-key-row"
+      data-sidebar-swipe-ignore
       data-page={String(clampedTopPage)}
       data-page-count={String(topPageCount)}
       data-bottom-page={String(clampedBottomPage)}
