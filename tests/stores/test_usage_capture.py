@@ -1230,6 +1230,15 @@ def test_native_gate_correlation_survives_capture_off_and_child_stop(
     assert records[3].usage_admission_id == "admitted"
 
 
+def test_finishing_old_admission_keeps_new_pending_admission(tmp_path: Path) -> None:
+    spool = UsageOutbox(tmp_path / "outbox")
+    spool.begin_admission("session", "claude-sdk", {"admission_id": "new"})
+    spool.end_admitted_turn("session", "claude-sdk", "old")
+    assert spool.pending_admission("session", "claude-sdk") == {"admission_id": "new"}
+    spool.end_admitted_turn("session", "claude-sdk", "new")
+    assert spool.pending_admission("session", "claude-sdk") is None
+
+
 @pytest.mark.asyncio
 async def test_native_terminal_closes_only_its_bound_admission(tmp_path: Path) -> None:
     from omnigent.harnesses.codex_native.bridge import (

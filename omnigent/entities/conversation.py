@@ -379,6 +379,7 @@ class StartupInputOptions(BaseModel):
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
     recovery_id: str | None = None
+    managed_move_attempt: str | None = None
     scheduled_run: ScheduledRunLogContext | None = None
 
 

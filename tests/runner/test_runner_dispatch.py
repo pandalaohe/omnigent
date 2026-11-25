@@ -13925,6 +13925,67 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.asyncio
+async def test_stream_superseded_during_usage_admission_never_reaches_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from omnigent.usage_export import runtime as usage_runtime
+
+    session_id = "conv_superseded_usage"
+    harness = _RecoveryScriptedHarnessClient([])
+    manager = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    loop = asyncio.get_running_loop()
+    admitted = asyncio.Event()
+    resume = threading.Event()
+    ended: list[str] = []
+    delivered: list[bool] = []
+
+    def hold_admission(*_args: object) -> None:
+        loop.call_soon_threadsafe(admitted.set)
+        assert resume.wait(timeout=5)
+
+    async def end_admission(_client, target, _harness, admission_id) -> None:
+        assert target == session_id
+        ended.append(admission_id)
+
+    @asynccontextmanager
+    async def stream(*_args: object, **_kwargs: object):
+        delivered.append(True)
+        yield SimpleNamespace(status_code=503)
+
+    monkeypatch.setattr(usage_runtime, "begin_admitted_turn", hold_admission)
+    monkeypatch.setattr(usage_runtime, "finish_admitted_turn", end_admission)
+    monkeypatch.setattr(harness, "stream", stream)
+    async with _recovery_runner_client(app) as client:
+        pending = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "harness": "claude-sdk",
+                    "content": [{"type": "input_text", "text": "earlier work"}],
+                    "usage_admission": {"admission_id": "earlier"},
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(admitted.wait(), 5)
+            app.state.begin_turn_slot(session_id)
+        finally:
+            resume.set()
+            response = await asyncio.wait_for(pending, 5)
+        assert response.status_code == 200
+    assert delivered == []
+    assert ended == ["earlier"]
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:

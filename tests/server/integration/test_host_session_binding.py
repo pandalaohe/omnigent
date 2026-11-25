@@ -1188,9 +1188,11 @@ async def _session_released_from_laptop(env: ManagedSessionEnv, *, agent_name: s
     return session_id
 
 
+@pytest.mark.parametrize("admission_enabled", [False, True])
 async def test_session_moves_from_its_host_onto_a_new_managed_sandbox(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    admission_enabled: bool,
 ) -> None:
     """
     ``POST /v1/sessions/{id}/managed-host`` moves a session off a connected host
@@ -1214,6 +1216,15 @@ async def test_session_moves_from_its_host_onto_a_new_managed_sandbox(
     install_fake_modal_launcher(monkeypatch, fake)
     session_id = await _session_released_from_laptop(env, agent_name="move-to-sandbox-agent")
     env.conv_store.set_labels(session_id, _STALE_SANDBOX_LABELS)
+    admissions: list[str] = []
+
+    async def admit_after_handoff(_conn: object, target: str) -> None:
+        current = env.conv_store.get_conversation(target)
+        assert current is not None and current.runner_id is None
+        admissions.append(target)
+
+    if admission_enabled:
+        monkeypatch.setattr(env.app.state.host_registry, "startup_admitter", admit_after_handoff)
 
     resp = await env.client.post(
         f"/v1/sessions/{session_id}/managed-host",
@@ -1235,7 +1246,7 @@ async def test_session_moves_from_its_host_onto_a_new_managed_sandbox(
     await poll_until_async(
         lambda: (
             (current := env.conv_store.get_conversation(session_id)) is not None
-            and current.runner_id != moving.runner_id
+            and current.runner_id not in (None, moving.runner_id)
         )
     )
     conv = env.conv_store.get_conversation(session_id)
@@ -1252,6 +1263,7 @@ async def test_session_moves_from_its_host_onto_a_new_managed_sandbox(
     assert sandbox_host.sandbox_provider == "modal"
     assert sandbox_host.user_id == RESERVED_USER_LOCAL
     assert env.host_store.get_host(_LAPTOP_HOST_ID) is not None
+    assert admissions == ([session_id] if admission_enabled else [])
     del tunnels
 
 
@@ -1485,6 +1497,8 @@ async def test_released_claim_lets_another_host_keep_the_session(
     """
     import threading
 
+    from omnigent.server.routes._sessions.common import _managed_launch_tasks
+
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
     start, host_futures = _fake_host_connector(env, asyncio.get_running_loop())
@@ -1502,12 +1516,8 @@ async def test_released_claim_lets_another_host_keep_the_session(
     env.conv_store.set_host_id(session_id, _LAPTOP_HOST_ID, "/Users/alice/repo")
     provisioned.set()
 
-    def handed_off() -> bool:
-        current = env.conv_store.get_conversation(session_id)
-        return current is not None and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
-
     await poll_until_async(lambda: fake.terminated == ["sb-fake-1"])
-    await poll_until_async(handed_off)
+    await asyncio.gather(*list(_managed_launch_tasks))
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
     assert (conv.host_id, conv.workspace, conv.runner_id) == (
@@ -1539,8 +1549,11 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
     """
     import threading
 
+    from starlette.datastructures import Headers
+
     from omnigent.server.managed_hosts import is_move_claim
     from omnigent.server.routes._sessions.common import _managed_launch_tasks
+    from omnigent.server.schemas import SessionEventInput
 
     env = managed_session_env
     provisioned = threading.Event()
@@ -1561,8 +1574,16 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
         env.conv_store.set_labels(session_id, {STARTUP_LABEL: "ready"})
 
     took_over: list[bool] = []
+    expected_statuses = ["failed"]
     if rebind == "before_cleanup":
         take_over()
+        startup = env.app.state.startup_inputs
+        event = SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": "on the new host"}]},
+        )
+        await startup.enqueue(session_id, event, user_id=None, headers=Headers({}), first=False)
+        expected_statuses.append("in_progress")
     else:
         clear_runner_id = env.conv_store.clear_runner_id
 
@@ -1585,7 +1606,7 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
             and current.runner_id == "runner_other_tab"
             and (launch is None or launch.settled.is_set())
             and [item.status for item in env.conv_store.list_pending_inputs(session_id)]
-            == ["failed"]
+            == expected_statuses
         )
 
     await poll_until_async(settled)
@@ -1598,9 +1619,11 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
         "/Users/alice/repo",
         "runner_other_tab",
     )
-    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+    assert [
+        item.status for item in env.conv_store.list_pending_inputs(session_id)
+    ] == expected_statuses
     if rebind == "before_cleanup":
-        assert conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+        assert conv.labels.get(STARTUP_LABEL) == "ready"
         assert env.app.state.managed_launches.get(session_id) is None
         snapshot = await env.client.get(f"/v1/sessions/{session_id}")
         assert snapshot.status_code == 200, snapshot.text
@@ -2021,6 +2044,13 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
 
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-cancel-detach-agent")
+    env.conv_store.set_host_id(
+        session_id,
+        _LAPTOP_HOST_ID,
+        "/opt/work/repo/nested",
+        "feature/x",
+        worktree="/opt/work/repo",
+    )
     detaching, release = threading.Event(), threading.Event()
     clear_host_binding = env.conv_store.clear_host_binding
 
@@ -2045,10 +2075,11 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
     await poll_until_async(rolled_back)
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
-    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.worktree, conv.runner_id) == (
         _LAPTOP_HOST_ID,
-        "/Users/alice/repo",
+        "/opt/work/repo/nested",
         "feature/x",
+        "/opt/work/repo",
         None,
     )
     assert env.app.state.managed_launches.get(session_id) is None

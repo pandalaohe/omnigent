@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -88,6 +89,14 @@ def _settled_startup(conv: Conversation) -> str | None:
 def initial_input_id(session_id: str) -> str:
     """Stable identity for a create request's first input."""
     return uuid5(NAMESPACE_URL, f"initial-input:{session_id}").hex
+
+
+def _managed_move_attempt(runner_id: str | None) -> str | None:
+    from omnigent.server.managed_hosts import is_move_claim
+
+    if runner_id is None or not is_move_claim(runner_id):
+        return None
+    return hashlib.sha256(runner_id.encode()).hexdigest()
 
 
 def input_content(item: ConversationItem) -> list[dict[str, Any]]:
@@ -402,6 +411,7 @@ class ManagedStartupInputs:
         headers: Headers,
         first: bool = True,
         while_label: str | None = None,
+        held_runner_id: str | None = None,
     ) -> ConversationItem:
         from omnigent.server.background_session_titles import background_session_titles_enabled
         from omnigent.server.routes._sessions.helpers import (
@@ -415,6 +425,9 @@ class ManagedStartupInputs:
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         await cancel_turn_recovery(self.conversations, session_id)
+        if not first and held_runner_id is None:
+            current = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+            held_runner_id = current.runner_id if current is not None else None
         raw_id = event.data.get("stable_id")
         input_id = (
             initial_input_id(session_id)
@@ -438,6 +451,7 @@ class ManagedStartupInputs:
                     model_override=event.model_override,
                     tools=event.tools,
                     background_titles_enabled=background_session_titles_enabled(headers),
+                    managed_move_attempt=_managed_move_attempt(held_runner_id),
                     scheduled_run=current_scheduled_run(),
                 )
             }
@@ -448,10 +462,19 @@ class ManagedStartupInputs:
             )
         else:
             saved = await asyncio.to_thread(self.conversations.append, session_id, [item])
-        if saved[0].deduplicated and not _stable_id_reuse_is_exact_retry(saved[0], item):
-            raise OmnigentError(
-                "This input id already belongs to a different message", code=ErrorCode.CONFLICT
-            )
+        if saved[0].deduplicated:
+            # A retry refers to the persisted input, even if the host move changed afterward.
+            saved_options = getattr(saved[0].data, "startup_options", None)
+            if isinstance(item.data, (MessageData, SlashCommandData)):
+                options = item.data.startup_options
+                if options is not None:
+                    options.managed_move_attempt = (
+                        saved_options.managed_move_attempt if saved_options is not None else None
+                    )
+            if not _stable_id_reuse_is_exact_retry(saved[0], item):
+                raise OmnigentError(
+                    "This input id already belongs to a different message", code=ErrorCode.CONFLICT
+                )
         if first:
             await asyncio.to_thread(
                 self.conversations.set_labels, session_id, {STARTUP_LABEL: "pending"}
@@ -547,7 +570,12 @@ class ManagedStartupInputs:
         return reason
 
     async def release_held_inputs(
-        self, session_id: str, message: str, *, move_claim: str | None
+        self,
+        session_id: str,
+        message: str,
+        *,
+        move_claim: str | None,
+        superseded: bool = False,
     ) -> None:
         """
         Settle a startup whose launch won't happen, without failing the session.
@@ -563,15 +591,33 @@ class ManagedStartupInputs:
             weren't sent.
         :param move_claim: The claim of the move whose launch this was, or
             ``None`` for a create's launch.
+        :param superseded: A successor owns the startup label. Only settle inputs
+            recorded under the losing move's claim.
         """
-        labels = {STARTUP_LABEL: STARTUP_WITHDRAWN}
-        if move_claim is not None:
-            labels[STARTUP_SETTLED_BY_LABEL] = move_claim
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
+        attempt = _managed_move_attempt(move_claim)
+        if not superseded:
+            labels = {STARTUP_LABEL: STARTUP_WITHDRAWN}
+            if move_claim is not None:
+                labels[STARTUP_SETTLED_BY_LABEL] = move_claim
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
         undelivered = False
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
-            if item.status == "in_progress":
+            if superseded:
+                options = getattr(item.data, "startup_options", None)
+                if attempt is None or options is None or options.managed_move_attempt != attempt:
+                    continue
+            if (
+                isinstance(self.conversations, SqlAlchemyConversationStore)
+                and await asyncio.to_thread(
+                    self.conversations.annotation_receipt_for_item, session_id, item.id
+                )
+                is not None
+            ):
+                await asyncio.to_thread(
+                    self.conversations.defer_annotation_input, session_id, item.id
+                )
+            elif item.status == "in_progress":
                 undelivered |= await asyncio.to_thread(
                     self.conversations.transition_pending_input,
                     session_id,

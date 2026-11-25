@@ -504,6 +504,23 @@ async def test_generic_startup_reconciliation_does_not_consume_annotation(
     )
 
 
+@pytest.mark.asyncio
+async def test_startup_withdrawal_keeps_annotation_retriable(db_uri: str) -> None:
+    store = _ready_store(db_uri)
+    batch = _batch()
+    receipt, _ = store.admit_annotation_batch(
+        USER_ID, GRANT_ID, GENERATION, SESSION_ID, batch, target_live=True
+    )
+    await ManagedStartupInputs(store, HostRegistry()).release_held_inputs(
+        SESSION_ID, "The sandbox move was withdrawn.", move_claim=None
+    )
+
+    (pending,) = store.list_pending_inputs(SESSION_ID)
+    assert (pending.id, pending.status) == (receipt["item_id"], "in_progress")
+    saved = store.get_annotation_receipt(USER_ID, GRANT_ID, batch.batch_id)
+    assert saved["dispatch_phase"] == "ready" and saved["retry_required"] is True
+
+
 def test_old_grant_lookup_is_owner_scoped_and_absence_is_definitive_only_after_close(
     db_uri: str,
 ) -> None:

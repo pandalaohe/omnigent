@@ -11310,7 +11310,7 @@ def create_runner_app(
                     task.cancel()
 
             _dispatch_owner = (stream_epoch or 0, _cancel_dispatch_tasks)
-            _turn_dispatch_cancellers[conv_id] = _dispatch_owner
+            dispatched = False
             _response_data: _JsonObject = {}
             _terminal_response_type: str | None = None
             _stream_failed_error: _JsonObject | None = None
@@ -11400,6 +11400,9 @@ def create_runner_app(
                 return lifecycle_event
 
             try:
+                if not _owns_live_turn():
+                    return
+                _turn_dispatch_cancellers[conv_id] = _dispatch_owner
                 execution_key = (conv_id, str(event_body.get("input_id", "")))
                 execution = _input_execution_claims.get(execution_key)
                 if (
@@ -11413,6 +11416,7 @@ def create_runner_app(
                     deadline = time.time() + _BUFFERED_INPUT_ADMISSION_TIMEOUT_S
                     event_body["input_admission_deadline"] = deadline
                     _input_execution_claims[execution_key] = (None, deadline, "ordinary")
+                dispatched = True
                 async with client.stream(
                     "POST",
                     f"/v1/sessions/{conv_id}/events",
@@ -12210,11 +12214,10 @@ def create_runner_app(
                     await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
                 if _turn_dispatch_cancellers.get(conv_id) is _dispatch_owner:
                     _turn_dispatch_cancellers.pop(conv_id, None)
-                if isinstance(usage_admission, dict) and harness_name in {
-                    "claude-sdk",
-                    "codex",
-                    "codex-sdk",
-                }:
+                if isinstance(usage_admission, dict) and (
+                    harness_name in {"claude-sdk", "codex", "codex-sdk"}
+                    or (not dispatched and harness_name in {"claude-native", "codex-native"})
+                ):
                     from omnigent.usage_export.runtime import finish_admitted_turn
 
                     try:

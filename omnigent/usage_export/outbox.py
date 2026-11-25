@@ -831,8 +831,9 @@ class UsageOutbox:
                     str(time.time()),
                 )
             db.execute(
-                "DELETE FROM pending_admissions WHERE session_id=? AND harness=?",
-                (session_id, harness),
+                "DELETE FROM pending_admissions WHERE session_id=? AND harness=? "
+                "AND json_extract(admission,'$.admission_id')=?",
+                (session_id, harness, admission_id),
             )
 
     def admission_for_turn(

@@ -7746,14 +7746,15 @@ async def _bind_and_launch_managed_runner(
     async def rollback_fresh_host() -> None:
         if relaunch_host is not None:
             return
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                conversation_store.clear_host_binding,
-                session_id,
-                expected_host_id=managed.host_id,
-                expected_sandbox_id=managed.sandbox_id,
-                clear_profile=sandbox_profiles is not None,
-            )
+        if not superseded:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    session_id,
+                    expected_host_id=managed.host_id,
+                    expected_sandbox_id=managed.sandbox_id,
+                    clear_profile=sandbox_profiles is not None,
+                )
         host = await asyncio.to_thread(host_store.get_host, managed.host_id)
         if host is not None and (
             managed.sandbox_id is None
@@ -7790,14 +7791,20 @@ async def _bind_and_launch_managed_runner(
         _publish_sandbox_status(session_id, "connecting")
         runner_id: str | None = None
         host_conn = host_registry.get(managed.host_id) if host_registry is not None else None
-        if host_conn is None and held_runner_id is not None:
-            # The host's replica starts the runner, and only once none is bound,
-            # so hand the session over without the move's claim on it.
-            with contextlib.suppress(ConversationNotFoundError, ValueError):
+        if held_runner_id is not None and (
+            host_conn is None
+            or (host_registry is not None and host_registry.startup_admitter is not None)
+        ):
+            # The host's recovery worker owns queued starts, even on this replica.
+            # It cannot advance a startup while the move's claim is still bound.
+            try:
                 await asyncio.to_thread(
                     conversation_store.clear_runner_id, session_id, expected_binding=conv
                 )
-        if host_registry is not None:
+            except (ConversationNotFoundError, ValueError):
+                reason, superseded = _SESSION_REBOUND_REASON, True
+                return
+        elif host_registry is not None:
             if host_conn is not None:
                 try:
                     launch_attempt = await _launch_runner_on_host(

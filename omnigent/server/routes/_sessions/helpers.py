@@ -8573,7 +8573,7 @@ def _start_managed_launch_task(
         _publish_sandbox_status(session_id, "ready")
         if startup is not None:
             await startup.release_held_inputs(
-                session_id, superseded_note, move_claim=held_runner_id
+                session_id, superseded_note, move_claim=held_runner_id, superseded=True
             )
 
     async def settle(held: str, record: Callable[[], Awaitable[object]] | None) -> None:
@@ -8632,7 +8632,7 @@ def _start_managed_launch_task(
         if entry is not None and entry.superseded:
             if startup is not None:
                 await startup.release_held_inputs(
-                    session_id, superseded_note, move_claim=held_runner_id
+                    session_id, superseded_note, move_claim=held_runner_id, superseded=True
                 )
             return
         failed = tracker.get(session_id)

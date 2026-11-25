@@ -2947,7 +2947,12 @@ def register_events_routes(
             # Identity is needed for deferred authorization; a saved task stays
             # accepted after later sharing.
             saved = await startup.enqueue(
-                session_id, body, user_id=user_id, headers=request.headers, first=False
+                session_id,
+                body,
+                user_id=user_id,
+                headers=request.headers,
+                first=False,
+                held_runner_id=current.runner_id,
             )
             if current.host_id is not None:
                 startup.host_changed(request.app, current.host_id)

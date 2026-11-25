@@ -2295,6 +2295,7 @@ def register_core_routes(
         host_id: str,
         workspace: str,
         git_branch: str | None,
+        worktree: str | None,
         labels: dict[str, str] | None,
         claim: str,
     ) -> None:
@@ -2323,6 +2324,7 @@ def register_core_routes(
         :param host_id: The host it was bound to before the move.
         :param workspace: Its working directory on that host.
         :param git_branch: Its worktree branch there, or ``None``.
+        :param worktree: Its worktree root when different from the working directory.
         :param labels: The sandbox labels the move removed, or ``None``.
         :param claim: The runner id the move claimed the session with.
         """
@@ -2340,6 +2342,7 @@ def register_core_routes(
                         host_id,
                         workspace,
                         git_branch,
+                        worktree=worktree,
                         expected_runner_id=claim,
                     )
                 except ValueError:
@@ -9888,6 +9891,7 @@ def register_core_routes(
                     host_id=previous_host_id,
                     workspace=previous_workspace,
                     git_branch=conv.git_branch,
+                    worktree=conv.worktree,
                     labels=stale_labels,
                     claim=claim,
                 )
