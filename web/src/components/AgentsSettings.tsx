@@ -475,6 +475,7 @@ export function AgentsSettings({
         <div>{soloPage.map(renderCustomAgent)}</div>
         <SettingsPager label="Custom agent pages" {...soloPager} />
       </section>
+      <AgentBadgeDisplaySetting />
       <div>
         <h2 className="mb-2 text-sm text-muted-foreground">Team agents</h2>
         <p className="text-xs text-muted-foreground">
@@ -712,15 +713,21 @@ export function AgentsSettings({
   );
 }
 
-export function AgentBadgeDisplaySetting() {
+function AgentBadgeDisplaySetting() {
   const preferences = useAgentBadgePreferences();
   return (
     <div className="flex items-center justify-between gap-4">
-      <label htmlFor="show-agent-badges" className="text-sm">
-        Show Agent badges
-      </label>
+      <div className="min-w-0">
+        <label htmlFor="show-agent-badges" className="text-sm">
+          Show Agent badges
+        </label>
+        <p id="show-agent-badges-description" className="text-xs text-muted-foreground">
+          Show configured badges next to agent names.
+        </p>
+      </div>
       <Switch
         id="show-agent-badges"
+        aria-describedby="show-agent-badges-description"
         checked={preferences.enabled}
         onCheckedChange={(enabled) =>
           writeAgentBadgePreferences({ ...readAgentBadgePreferences(), enabled })

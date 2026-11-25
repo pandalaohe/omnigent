@@ -929,6 +929,20 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("keeps the other session markers in Appearance without the Agent badges switch", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.queryByRole("switch", { name: "Show Agent badges" })).not.toBeInTheDocument();
+    const sessionMarkers = within(screen.getByTestId("settings-group-session-markers"));
+    expect(
+      sessionMarkers.getByRole("switch", { name: "Show session title in the mobile top bar" }),
+    ).toBeVisible();
+    expect(
+      sessionMarkers.getByRole("switch", { name: "Show Goal markers in the session list" }),
+    ).toBeVisible();
+    expect(sessionMarkers.getByTestId("host-colors-settings")).toBeVisible();
+  });
+
   it("opens the moved context controls from the old deep link", async () => {
     renderPage("/settings/context-usage");
     const toggle = await screen.findByTestId("compact-progress-indicator-toggle");

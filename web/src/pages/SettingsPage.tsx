@@ -31,7 +31,6 @@ import { BrowserSection } from "./settings/browser/BrowserSection";
  *   Unarchive opens the restored session.
  */
 
-import { AgentBadgeDisplaySetting } from "@/components/AgentsSettings";
 import { ChatReserveWidthSetting } from "@/components/ChatReserveWidthSetting";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { interfaceText } from "@/lib/interfaceText";
@@ -1490,10 +1489,7 @@ function AppearanceSection() {
           </SettingsGroup>
 
           <SettingsGroup title="Session markers" testId="settings-group-session-markers">
-            <AgentBadgeDisplaySetting />
-            <div className="mt-4 border-t border-border pt-4">
-              <MobileSessionTitleSetting />
-            </div>
+            <MobileSessionTitleSetting />
             <div className="mt-4 border-t border-border pt-4">
               <GoalMarkersSetting />
             </div>
