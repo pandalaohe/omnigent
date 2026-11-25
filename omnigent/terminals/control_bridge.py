@@ -903,6 +903,7 @@ async def bridge_tmux_control_to_websocket(
     attach_registered = asyncio.Event()
     browser_layout_ready = asyncio.Event()
     layout_size: str | None = None
+    resize_generation = 0
     pane_output_seen = False
     command_write_lock = asyncio.Lock()
     pending_commands: deque[asyncio.Future[bool]] = deque()
@@ -1106,23 +1107,35 @@ async def bridge_tmux_control_to_websocket(
 
     async def _refresh_quiet_attach_seed() -> None:
         """Replay a quiet pane at the grid the browser actually established."""
-        await browser_layout_ready.wait()
-        target = registered_session_id
-        size = browser_size
-        if pane_output_seen or target is None or current_session_id != target:
-            return
-        resized_seed = await _run_tmux_capture(socket_path, target)
-        async with ws_send_lock:
-            if (
-                resized_seed is not None
-                and not pane_output_seen
-                and current_session_id == target
-                and size == browser_size == layout_size
-            ):
+        while not pane_output_seen:
+            await browser_layout_ready.wait()
+            browser_layout_ready.clear()
+            target = registered_session_id
+            if pane_output_seen or target is None or current_session_id != target:
+                return
+            if browser_size != layout_size:
+                continue
+            generation = resize_generation
+            resized_seed = await _run_tmux_capture(socket_path, target)
+            if resized_seed is None or pane_output_seen:
+                return
+            # tmux queues command replies behind pending pane output for this
+            # control client. Read through that boundary before deciding whether
+            # the capture already includes bytes the forwarder will send.
+            if not await _send_command(b"display-message -p ''\n", wait_reply=True):
+                return
+            async with ws_send_lock:
+                if pane_output_seen or current_session_id != target:
+                    return
+                if generation != resize_generation:
+                    if browser_size == layout_size:
+                        browser_layout_ready.set()
+                    continue
                 # The initial seed already replayed history. Replace it along
                 # with the visible grid so this replay doesn't duplicate it.
                 with contextlib.suppress(RuntimeError, WebSocketDisconnect):
                     await websocket.send_bytes(b"\x1b[3J" + resized_seed)
+                return
 
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
@@ -1136,7 +1149,7 @@ async def bridge_tmux_control_to_websocket(
         :returns: ``True`` to continue reading, ``False`` to stop.
         """
         nonlocal size_lost, registered_session_id, current_session_id, active_command_reply
-        nonlocal layout_size, pane_output_seen
+        nonlocal layout_size, pane_output_seen, resize_generation
         if line.startswith(b"%begin "):
             parts = line.split(b" ")
             if len(parts) >= 4 and parts[3] == b"1":
@@ -1159,7 +1172,9 @@ async def bridge_tmux_control_to_websocket(
             # %output %<pane-id> <escaped-bytes>
             parts = line.split(b" ", 2)
             if len(parts) == 3:
-                pane_output_seen = True
+                if not pane_output_seen:
+                    pane_output_seen = True
+                    browser_layout_ready.set()
                 output = window_name_filter.feed(unescape_control_output(parts[2]))
                 if output:
                     if not read_only and (waiting_to_size or size_lost):
@@ -1202,7 +1217,9 @@ async def bridge_tmux_control_to_websocket(
             return True
         changed_size = _layout_change_size(line)
         if changed_size is not None:
-            layout_size = changed_size
+            if changed_size != layout_size:
+                layout_size = changed_size
+                resize_generation += 1
             if browser_size == layout_size:
                 browser_layout_ready.set()
             if not read_only and not waiting_to_size and browser_size is not None:
@@ -1312,7 +1329,7 @@ async def bridge_tmux_control_to_websocket(
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
-        nonlocal last_client_input_at, browser_size
+        nonlocal last_client_input_at, browser_size, resize_generation
         try:
             await host_clipboard.advertise()
             while True:
@@ -1348,9 +1365,12 @@ async def bridge_tmux_control_to_websocket(
                                 tmux_target,
                             )
                             continue
-                        browser_size = f"{cols}x{rows}"
-                        pending_browser_sizes.add(browser_size)
-                        await _send_command(f"refresh-client -C {browser_size}\n".encode())
+                        requested_size = f"{cols}x{rows}"
+                        if requested_size != browser_size:
+                            browser_size = requested_size
+                            resize_generation += 1
+                        pending_browser_sizes.add(requested_size)
+                        await _send_command(f"refresh-client -C {requested_size}\n".encode())
                 elif data is not None and not read_only:
                     if data and on_input is not None:
                         on_input()

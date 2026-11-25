@@ -36,6 +36,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import create_terminal_instance
+from omnigent.terminals import control_bridge
 from omnigent.terminals.control_bridge import (
     _CURSOR_REPLY_WINDOW_S,
     _SEND_KEYS_HEX_BYTES_PER_CALL,
@@ -1864,6 +1865,149 @@ async def test_narrow_browser_attaches_to_detached_no_echo_prompt(
         if task is not None:
             await _kill_and_join(sock, task)
         await instance.close()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_resize_seed_does_not_replay_unread_pane_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock, target = await _new_private_tmux(
+        """sh -c 'stty -echo; printf "Input: "; read -r line; """
+        """printf "\\r\\nresize-race-line\\n"; exec cat'"""
+    )
+    marker = b"resize-race-line"
+    output_buffered = asyncio.Event()
+    release_output = asyncio.Event()
+    real_spawn = asyncio.create_subprocess_exec
+
+    class _RaceWebSocket(_LiveWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            await super().send_bytes(data)
+            if data.startswith(b"\x1b[3J"):
+                release_output.set()
+
+    async def _delay_control_output(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        proc = await real_spawn(*args, **kwargs)
+        if str(sock) in args and "-C" in args and "attach" in args:
+            assert proc.stdout is not None and proc.stdin is not None
+            original_read = proc.stdout.read
+            original_write = proc.stdin.write
+
+            async def _read(size: int) -> bytes:
+                data = await original_read(size)
+                if marker in data:
+                    output_buffered.set()
+                    await release_output.wait()
+                return data
+
+            def _write(data: bytes) -> None:
+                original_write(data)
+                if output_buffered.is_set() and data.startswith(b"display-message "):
+                    release_output.set()
+
+            monkeypatch.setattr(proc.stdout, "read", _read)
+            monkeypatch.setattr(proc.stdin, "write", _write)
+        return proc
+
+    async def _capture_after_pane_writes(socket_path: str, tmux_target: str) -> bytes | None:
+        if tmux_target.startswith("$"):
+            await _tmux_output(sock, "send-keys", "-t", target, "Enter")
+            await asyncio.wait_for(output_buffered.wait(), timeout=5)
+            seed = await _run_tmux_capture(socket_path, tmux_target)
+            assert seed and marker in seed
+            return seed
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    ws = _RaceWebSocket(_resize_frame(63, 24))
+
+    async def live_output_received() -> bool:
+        return any(marker in frame and b"\x1b[3J" not in frame for frame in ws.sent)
+
+    task: asyncio.Task[None] | None = None
+    try:
+        await _capture_when(sock, target, lambda seed: b"Input:" in seed)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _delay_control_output)
+        monkeypatch.setattr(control_bridge, "_run_tmux_capture", _capture_after_pane_writes)
+        task = _start_bridge(ws, sock, target, browser_resize=True)
+        await _wait_for(live_output_received, True)
+        assert b"".join(ws.sent).count(marker) == 1
+    finally:
+        release_output.set()
+        if task is not None:
+            await _kill_and_join(sock, task)
+        else:
+            await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_resize_seed_rejects_delayed_intermediate_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock, target = await _new_private_tmux(
+        """sh -c 'printf "%67s" "" | tr " " x; printf "Input: "; exec cat'"""
+    )
+    capture_started = asyncio.Event()
+    capture_intermediate = asyncio.Event()
+    intermediate_captured = asyncio.Event()
+    release_capture = asyncio.Event()
+    layouts: asyncio.Queue[str] = asyncio.Queue()
+    real_layout_change_size = control_bridge._layout_change_size
+
+    def _observe_layout(line: bytes) -> str | None:
+        size = real_layout_change_size(line)
+        if size is not None:
+            layouts.put_nowait(size)
+        return size
+
+    async def _capture_during_round_trip(socket_path: str, tmux_target: str) -> bytes | None:
+        if tmux_target.startswith("$") and not capture_started.is_set():
+            capture_started.set()
+            await capture_intermediate.wait()
+            seed = await _run_tmux_capture(socket_path, tmux_target)
+            assert seed and b"\x1b[1;75H" in seed
+            intermediate_captured.set()
+            await release_capture.wait()
+            return seed
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    async def _wait_for_layout(size: str) -> None:
+        async with asyncio.timeout(5):
+            while await layouts.get() != size:
+                pass
+
+    ws = _LiveWebSocket(_resize_frame(63, 24))
+
+    def _replayed_seeds() -> list[bytes]:
+        return [frame for frame in ws.sent if frame.startswith(b"\x1b[3J")]
+
+    task: asyncio.Task[None] | None = None
+    try:
+        await _capture_when(sock, target, lambda seed: b"Input:" in seed)
+        monkeypatch.setattr(control_bridge, "_layout_change_size", _observe_layout)
+        monkeypatch.setattr(control_bridge, "_run_tmux_capture", _capture_during_round_trip)
+        task = _start_bridge(ws, sock, target, browser_resize=True)
+        await _wait_for_layout("63x24")
+        await asyncio.wait_for(capture_started.wait(), timeout=5)
+        ws.frames.put_nowait(_resize_frame(80, 24))
+        await _wait_for_layout("80x24")
+        capture_intermediate.set()
+        await asyncio.wait_for(intermediate_captured.wait(), timeout=5)
+        ws.frames.put_nowait(_resize_frame(63, 24))
+        await _wait_for_layout("63x24")
+        release_capture.set()
+        await poll_until_async(_replayed_seeds, timeout_s=5)
+        replay = _replayed_seeds()
+        assert len(replay) == 1
+        assert b"\x1b[1;12H" in replay[0]
+    finally:
+        capture_intermediate.set()
+        release_capture.set()
+        if task is not None:
+            await _kill_and_join(sock, task)
+        else:
+            await _kill_tmux(sock)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
