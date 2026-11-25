@@ -51,6 +51,7 @@ import copy
 import json
 import logging
 import math
+import operator
 import os
 import secrets
 import shlex
@@ -62,6 +63,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.acp_cli_harnesses import is_antigravity_acp_command
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
@@ -152,6 +154,24 @@ _CLIENT_NOTIFICATION_SESSION_CANCEL = "session/cancel"
 
 # Server-initiated request methods (agent → client).
 _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
+
+_AGY_ACP_COMMAND_FIELDS = {
+    "CommandLine": str,
+    "WaitMsBeforeAsync": int,
+    "toolSummary": str,
+    "RunPersistent": bool,
+    "RequestedTerminalID": str,
+}
+_AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
+_AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
+# toolSummary is display metadata shared by agy tools.
+_AGY_ACP_SHELL_FIELDS = (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"}) | {"Cwd"}
+_AGY_ACP_READ_CONFLICT_FIELDS = (
+    _AGY_ACP_SHELL_FIELDS
+    | _AGY_ACP_WRITE_TARGETS
+    | _AGY_ACP_WRITE_FIELDS
+    | {"Edits", "Target", "Replacement"}
+)
 
 # session/update.update.sessionUpdate discriminator values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
@@ -312,6 +332,27 @@ class _AcpRequestError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+@dataclass
+class _AcpPermissionTrace:
+    tier_verdict: str = "unreported"
+    once_offer: str = "unchecked"
+
+
+def _same_json_value(left: object, right: object) -> bool:
+    """Compare ACP values without treating booleans and numbers as interchangeable."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_json_value(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _looks_like_missing_file(message: str) -> bool:
@@ -1350,6 +1391,10 @@ class AcpExecutor(Executor):
         """
         return self._config.permission_mode == "bypassPermissions"
 
+    @property
+    def _managed_agy(self) -> bool:
+        return self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
+
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
@@ -1373,10 +1418,13 @@ class AcpExecutor(Executor):
         pending = self._permission_calls.get(call_id)
         if pending is None:
             return
+        same_value = (
+            _same_json_value if is_antigravity_acp_command(self._config.command) else operator.eq
+        )
         changes = {
             key: update[key]
             for key in ("kind", "name", "title", "rawInput")
-            if update.get(key) is not None and update[key] != pending.get(key)
+            if update.get(key) is not None and not same_value(update[key], pending.get(key))
         }
         if changes:
             self._permission_calls[call_id] = {**pending, **copy.deepcopy(changes)}
@@ -1397,22 +1445,74 @@ class AcpExecutor(Executor):
         if observed is None or call_id in self._answered_permission_calls:
             return None
         self._answered_permission_calls.add(call_id)
+        is_agy = is_antigravity_acp_command(self._config.command)
+        same_value = _same_json_value if is_agy else operator.eq
         for key in ("kind", "name", "title", "rawInput"):
-            if call.get(key) is not None and call[key] != observed.get(key):
+            if call.get(key) is not None and not same_value(call[key], observed.get(key)):
                 return None
         arguments = observed.get("rawInput")
         if not isinstance(arguments, dict):
             return None
         kind = observed.get("kind")
-        name = "unknown"
-        if kind == "execute" and isinstance(arguments.get("CommandLine"), str):
+        if is_agy:
+            agy_tool = self._validate_agy_permission_tool(kind, arguments)
+            if agy_tool is None:
+                return None
+            name, arguments = agy_tool
+        elif kind == "execute" and isinstance(arguments.get("CommandLine"), str):
             name = "run_command"
         elif kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
             name = "view_file"
         elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
+        else:
+            name = "unknown"
         return {"call_id": call_id, "name": name, "arguments": arguments}
+
+    @staticmethod
+    def _validate_agy_permission_tool(
+        kind: object, arguments: _AcpJsonObject
+    ) -> tuple[str, _AcpJsonObject] | None:
+        """Reject mixed and malformed known agy shapes before consulting policy."""
+        keys = arguments.keys()
+        if (kind == "read" or "AbsolutePath" in keys) and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
+            return None
+        if "CommandLine" in keys:
+            command = arguments["CommandLine"]
+            if (
+                not isinstance(command, str)
+                or not command.strip()
+                or any(
+                    type(value) is not _AGY_ACP_COMMAND_FIELDS.get(key)
+                    for key, value in arguments.items()
+                )
+            ):
+                return None
+            return "run_command", arguments
+        write_targets = keys & _AGY_ACP_WRITE_TARGETS
+        if len(write_targets) > 1:
+            return None
+        if write_targets and keys & _AGY_ACP_WRITE_FIELDS:
+            target_field = "Path" if "Path" in keys else "TargetFile"
+            target = arguments.get(target_field)
+            if (
+                keys - (_AGY_ACP_WRITE_FIELDS | {target_field})
+                or not isinstance(target, str)
+                or not target
+                or not isinstance(arguments.get("Content"), str)
+                or not isinstance(arguments.get("Overwrite", False), bool)
+            ):
+                return None
+            return "write_to_file", {**arguments, "TargetFile": target}
+        if kind == "edit" and isinstance(arguments.get("TargetFile"), str):
+            if keys & _AGY_ACP_SHELL_FIELDS:
+                return None
+            return "write_to_file", arguments
+        path = arguments.get("AbsolutePath")
+        if kind == "read" and isinstance(path, str):
+            return ("view_file", arguments) if path else None
+        return "unknown", arguments
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
         """Label the agent's options for a choice card, or ``None`` if unusable.
@@ -1515,21 +1615,51 @@ class AcpExecutor(Executor):
         if not self._config.host_permission_tier:
             return await self._evaluate_permission(params)
         bound_call = self._bound_permission_call(params)
-        if bound_call is None:
-            return False, None
-        call_id = bound_call["call_id"]
-        pending = self._permission_calls[call_id]
-        result = await self._evaluate_permission(params, bound_call)
-        if (
-            self._active_prompt_request_id is None
-            or self._permission_calls.get(call_id) is not pending
-        ):
-            return False, None
-        self._permission_calls.pop(call_id)
+        trace = _AcpPermissionTrace() if self._managed_agy else None
+        binding = "unbound"
+        result: tuple[bool | None, str | None] = False, None
+        if bound_call is not None:
+            call_id = bound_call["call_id"]
+            pending = self._permission_calls[call_id]
+            decision = await self._evaluate_permission(params, bound_call, trace)
+            if (
+                self._active_prompt_request_id is None
+                or self._permission_calls.get(call_id) is not pending
+            ):
+                binding = "changed"
+            else:
+                binding = "current"
+                self._permission_calls.pop(call_id)
+                result = decision
+        if trace is not None:
+            tool_name = bound_call["name"] if bound_call is not None else "unbound"
+            intent_kind = {
+                "unbound": "unbound",
+                "run_command": "execute",
+                "view_file": "read",
+                "write_to_file": "edit",
+            }.get(tool_name, "unknown")
+            allowed, option_id = result
+            option_kind = "none"
+            if option_id is not None:
+                option_kind = "allow_once" if allowed else "reject_once"
+            logger.info(
+                "acp agy permission decision: tool=%s intent=%s binding=%s tier=%s "
+                "once_offer=%s option=%s",
+                tool_name,
+                intent_kind,
+                binding,
+                trace.tier_verdict,
+                trace.once_offer,
+                option_kind,
+            )
         return result
 
     async def _evaluate_permission(
-        self, params: _AcpJsonObject, bound_call: _AcpJsonObject | None = None
+        self,
+        params: _AcpJsonObject,
+        bound_call: _AcpJsonObject | None = None,
+        trace: _AcpPermissionTrace | None = None,
     ) -> tuple[bool | None, str | None]:
         """Decide a permission request — policy then elicitation.
 
@@ -1558,7 +1688,7 @@ class AcpExecutor(Executor):
             tool_name, tool_input = self._extract_tool_call(params)
         policy_eval = getattr(self, "_policy_evaluator", None)
         action: str | None = None
-        verdict_data: object = None
+        tier: str | None = None
         # Either bridge can carry the question to the user.
         can_ask = (
             self._elicitation_handler is not None or self._elicitation_choice_handler is not None
@@ -1572,9 +1702,13 @@ class AcpExecutor(Executor):
                 verdict = await policy_eval("PHASE_TOOL_CALL", data)
                 action = getattr(verdict, "action", None)
                 verdict_data = getattr(verdict, "data", None)
+                if bound_call is not None and isinstance(verdict_data, dict):
+                    tier = verdict_data.get("_omnigent_acp_tier")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("acp TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
                 action = None
+            if trace is not None and tier in ("allow", "ask", "deny"):
+                trace.tier_verdict = tier
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
                 return False, None
@@ -1589,16 +1723,17 @@ class AcpExecutor(Executor):
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if bound_call is not None:
-            tier = (
-                verdict_data.get("_omnigent_acp_tier") if isinstance(verdict_data, dict) else None
-            )
             if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") or tier not in (
                 "allow",
                 "ask",
             ):
                 return False, None
-            if tier == "allow" and (option_id := self._allow_once_id(params)):
-                return True, option_id
+            if tier == "allow":
+                option_id = self._allow_once_id(params)
+                if trace is not None:
+                    trace.once_offer = "valid" if option_id is not None else "missing"
+                if option_id is not None:
+                    return True, option_id
             return (
                 await self._ask_user(tool_name, tool_input, params) if can_ask else (False, None)
             )
@@ -2586,9 +2721,7 @@ class AcpExecutor(Executor):
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         await self._drain_stale_queue()
-        managed_agy = (
-            self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
-        )
+        managed_agy = self._managed_agy
         if managed_agy:
             # In agy Auto, tools can run without a client permission request.
             # Keep the CLI in its request-producing mode for a host-tier session.
