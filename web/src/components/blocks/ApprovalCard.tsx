@@ -38,7 +38,7 @@ import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext, useMemo } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isBrowserApprovalUnavailable } from "@/lib/capabilities";
+import { isSingleUserWithoutBrowserApproval } from "@/lib/capabilities";
 import { interfaceText } from "@/lib/interfaceText";
 import {
   isHostRestartPolicyName,
@@ -489,7 +489,7 @@ export function ApprovalCard({
   const isTerminalAccess = Boolean(terminalAccess) || isTerminalAccessPolicyName(policyName);
   const isHostRestart = isHostRestartPolicyName(policyName);
   const browserApprovalBlocked =
-    (isTerminalAccess || isHostRestart) && isBrowserApprovalUnavailable(serverInfo);
+    (isTerminalAccess || isHostRestart) && isSingleUserWithoutBrowserApproval(serverInfo);
   // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
   const hotkeyTarget = useApprovesOnHotkey(
     elicitationId,

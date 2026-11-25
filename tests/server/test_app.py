@@ -495,6 +495,19 @@ async def test_info_reports_effective_auth_capabilities_on_one_machine(
     assert info["single_user"] is True
     assert info["browser_approval_available"] is (source != "header")
     assert info["push_credentials_required"] is (source != "header")
+    assert "set-cookie" not in response.headers
+    loopback = await auth_client.get("http://127.0.0.1:6767/v1/info")
+    assert loopback.status_code == 200
+    if source == "header":
+        marker = loopback.headers["set-cookie"].lower()
+        assert marker.startswith("omnigent_local_artifact_browser=")
+        assert "; httponly" in marker
+        assert "; samesite=strict" in marker
+        assert "; path=/v1/artifacts/" in marker
+        assert "; domain=" not in marker
+        assert loopback.headers["cache-control"] == "no-store"
+    else:
+        assert "set-cookie" not in loopback.headers
 
 
 @pytest.mark.asyncio

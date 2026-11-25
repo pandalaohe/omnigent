@@ -29,7 +29,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isBrowserApprovalUnavailable, isSingleUserMode } from "@/lib/capabilities";
+import { isSingleUserWithoutBrowserApproval } from "@/lib/capabilities";
 import {
   isHostRestartPolicyName,
   isTerminalAccessPolicyName,
@@ -184,8 +184,7 @@ export function ApprovePage() {
     (Boolean(state.data.native_delivery) ||
       Boolean(state.data.permission_directories?.length) ||
       isTerminalAccessPolicyName(state.data.policy_name ?? "") ||
-      (isSingleUserMode(serverInfo) &&
-        isBrowserApprovalUnavailable(serverInfo) &&
+      (isSingleUserWithoutBrowserApproval(serverInfo) &&
         isHostRestartPolicyName(state.data.policy_name ?? "")) ||
       Boolean(parseTerminalAccess(state.data)) ||
       fileEdit !== null);

@@ -227,11 +227,16 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
     expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
 
-    for (const auth of [
-      { accounts_enabled: true, login_url: "/login" },
-      { accounts_enabled: false, login_url: "/auth/login" },
+    for (const info of [
+      {
+        ...singleUserInfo,
+        accounts_enabled: true,
+        login_url: "/login",
+        browser_approval_available: true,
+      },
+      { ...singleUserInfo, login_url: "/auth/login", browser_approval_available: true },
+      { ...singleUserInfo, single_user: false },
     ]) {
-      const info = { ...singleUserInfo, ...auth, browser_approval_available: true };
       for (const props of [restartProps, terminalProps]) {
         view.rerender(
           <CapabilitiesProvider info={info}>
@@ -239,6 +244,7 @@ describe("ApprovalCard — binary approve/reject", () => {
           </CapabilitiesProvider>,
         );
         expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeVisible();
         expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
       }
     }

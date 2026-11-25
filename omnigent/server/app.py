@@ -125,6 +125,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes.artifacts import set_local_artifact_browser_cookie
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.calling_defaults import create_calling_defaults_router
 from omnigent.server.routes.comments import create_comments_router
@@ -4307,7 +4308,7 @@ def create_app(
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
-    async def info() -> ServerInfoResponse:
+    async def info(request: Request, response: Response) -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -4457,6 +4458,7 @@ def create_app(
 
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         automations_enabled = app.state.automations_available()
+        set_local_artifact_browser_cookie(request, response, auth_provider)
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,

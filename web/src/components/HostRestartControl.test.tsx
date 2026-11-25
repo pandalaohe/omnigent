@@ -291,6 +291,12 @@ describe("Host restart", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("keeps Restart enabled on a multi-user header server", () => {
+    show({}, { ...FALLBACK_SERVER_INFO, single_user: false, browser_approval_available: false });
+    expect(screen.getByRole("button", { name: "Restart" })).toBeEnabled();
+    expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
+  });
+
   it.each([
     { accounts_enabled: true, login_url: "/login" },
     { accounts_enabled: false, login_url: "/auth/login" },

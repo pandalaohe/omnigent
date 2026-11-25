@@ -68,6 +68,7 @@ describe("ApprovePage states", () => {
       accounts: true,
       login: "/login",
     },
+    { mode: "multi-user header", single: false, available: false, accounts: false, login: null },
   ])(
     "renders the standalone restart approval for $mode",
     async ({ single, available, accounts, login }) => {
@@ -87,9 +88,10 @@ describe("ApprovePage states", () => {
       };
       renderPage("sess_1", "eli_1", info);
       expect(await screen.findByText("Restart the host?")).toBeVisible();
-      if (available) {
+      if (available || !single) {
         expect(screen.getByText("Approval required")).toBeVisible();
         expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled();
       } else {
         expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
         expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();

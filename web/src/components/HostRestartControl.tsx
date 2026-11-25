@@ -13,7 +13,7 @@ import {
 import { useHostRestart, type HostRestartPhase } from "@/hooks/useHostRestart";
 import type { Host } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isBrowserApprovalUnavailable } from "@/lib/capabilities";
+import { isSingleUserWithoutBrowserApproval } from "@/lib/capabilities";
 import { interfaceText } from "@/lib/interfaceText";
 
 const PHASE_LABELS: Record<HostRestartPhase, string> = {
@@ -41,7 +41,7 @@ export function HostRestartControl({
   const [expired, setExpired] = useState(false);
   const starting = useRef(false);
   const serverInfo = useServerInfo();
-  const browserApprovalUnavailable = isBrowserApprovalUnavailable(serverInfo);
+  const browserApprovalUnavailable = isSingleUserWithoutBrowserApproval(serverInfo);
   const { preview, start, status } = useHostRestart(host.host_id, requestId);
   const canRestart =
     host.status === "online" &&

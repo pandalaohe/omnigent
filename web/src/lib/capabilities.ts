@@ -773,15 +773,12 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
 }
 
-export function isBrowserApprovalUnavailable(info: ServerInfo | "loading"): boolean {
-  if (info === "loading") return false;
+export function isSingleUserWithoutBrowserApproval(info: ServerInfo | "loading"): boolean {
+  if (info === "loading" || !info.single_user) return false;
   // Older servers only report the deployment marker and login options.
   return (
     info.browser_approval_available === false ||
-    (info.browser_approval_available === undefined &&
-      info.single_user &&
-      !info.accounts_enabled &&
-      !info.login_url)
+    (info.browser_approval_available === undefined && !info.accounts_enabled && !info.login_url)
   );
 }
 
