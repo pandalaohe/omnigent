@@ -681,6 +681,28 @@ export function touchScrollPayload(
   };
 }
 
+class TerminalFitAddon extends FitAddon {
+  tmuxBacked = false;
+  private readonly terminal: Terminal;
+
+  constructor(terminal: Terminal) {
+    super();
+    this.terminal = terminal;
+  }
+
+  override proposeDimensions() {
+    const proposed = super.proposeDimensions();
+    if (!this.tmuxBacked) return proposed;
+    const { cols, rows } =
+      proposed && Number.isFinite(proposed.cols) && Number.isFinite(proposed.rows)
+        ? proposed
+        : this.terminal;
+    // A transient resize below the tmux floor would clamp xterm's cursor and
+    // reflow its buffer even when the effective grid never changes.
+    return { cols: Math.max(cols, MIN_FORWARDED_COLS), rows: Math.max(rows, MIN_FORWARDED_ROWS) };
+  }
+}
+
 /**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
@@ -695,7 +717,7 @@ export function touchScrollPayload(
 export class TerminalSession {
   private readonly container: HTMLElement;
   private readonly term: Terminal;
-  private readonly fit: FitAddon;
+  private readonly fit: TerminalFitAddon;
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
@@ -703,7 +725,6 @@ export class TerminalSession {
   private readonly osc52Dispose: { dispose: () => void };
   /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
   private queryReplies: { dispose: () => void } | null = null;
-  private tmuxBacked = false;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   private readonly onClipboardAction?: TerminalClipboardAction;
@@ -810,7 +831,7 @@ export class TerminalSession {
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
-    this.fit = new FitAddon();
+    this.fit = new TerminalFitAddon(this.term);
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links; xterm alone
     // renders them as plain text.
@@ -928,8 +949,8 @@ export class TerminalSession {
             this.queryReplies?.dispose();
             this.queryReplies =
               tmuxAnswers.size > 0 ? suppressRepliesTmuxSends(this.term, tmuxAnswers) : null;
-            if (!this.tmuxBacked) {
-              this.tmuxBacked = true;
+            if (!this.fit.tmuxBacked) {
+              this.fit.tmuxBacked = true;
               this.sendResize();
             }
           }
@@ -1501,17 +1522,9 @@ export class TerminalSession {
     // Keep the last real size while hidden; the ResizeObserver re-fits once
     // the surface is laid out again.
     if (!this.hasLayoutBox()) return;
-    const fitGrid = () => {
-      this.fit.fit();
-      if (this.tmuxBacked) {
-        const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
-        const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
-        if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
-      }
-    };
     try {
-      if (this.touchSelection) this.touchSelection.refit(fitGrid);
-      else fitGrid();
+      if (this.touchSelection) this.touchSelection.refit(() => this.fit.fit());
+      else this.fit.fit();
     } catch {
       return;
     }
