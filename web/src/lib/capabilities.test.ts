@@ -69,6 +69,16 @@ async function probe(body: unknown) {
   return resolveServerInfo();
 }
 
+it.each([false, true])("preserves %s auth capabilities from /v1/info", async (available) => {
+  const parsed = await probe({
+    single_user: true,
+    browser_approval_available: available,
+    push_credentials_required: available,
+  });
+  expect(parsed.browser_approval_available).toBe(available);
+  expect(parsed.push_credentials_required).toBe(available);
+});
+
 describe("sandboxProviderOptions", () => {
   it("yields one entry per configured provider, in order", () => {
     // The order the operator configured is the order the user sees.

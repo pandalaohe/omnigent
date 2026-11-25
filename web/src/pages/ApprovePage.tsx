@@ -28,6 +28,8 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBrowserApprovalUnavailable, isSingleUserMode } from "@/lib/capabilities";
 import {
   isHostRestartPolicyName,
   isTerminalAccessPolicyName,
@@ -57,6 +59,7 @@ type PageState =
   | { kind: "error"; message: string };
 
 export function ApprovePage() {
+  const serverInfo = useServerInfo();
   const { sessionId, elicitationId } = useParams<{
     sessionId: string;
     elicitationId: string;
@@ -181,7 +184,9 @@ export function ApprovePage() {
     (Boolean(state.data.native_delivery) ||
       Boolean(state.data.permission_directories?.length) ||
       isTerminalAccessPolicyName(state.data.policy_name ?? "") ||
-      isHostRestartPolicyName(state.data.policy_name ?? "") ||
+      (isSingleUserMode(serverInfo) &&
+        isBrowserApprovalUnavailable(serverInfo) &&
+        isHostRestartPolicyName(state.data.policy_name ?? "")) ||
       Boolean(parseTerminalAccess(state.data)) ||
       fileEdit !== null);
 

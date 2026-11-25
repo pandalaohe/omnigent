@@ -192,7 +192,7 @@ describe("ArtifactSharingSettings", () => {
     );
     await screen.findByRole("switch", { name: "External access" });
     expect(screen.getByTestId("artifact-sharing-single-machine-hint")).toHaveTextContent(
-      /reachable only from this machine unless the server is exposed/i,
+      /Copied links open on this machine.*Sharing with others requires accounts sign-in.*gives anyone full control/i,
     );
     view.unmount();
 

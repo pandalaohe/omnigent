@@ -897,6 +897,8 @@ def register_artifact_routes(
             return False
         if request.headers.get("x-forwarded-for") or request.headers.get("forwarded"):
             return False
+        # A local proxy that rewrites Host to loopback and drops forwarding headers
+        # already gives unauthenticated callers the local owner's API access.
         peer = request.client.host if request.client is not None else None
         return _host_is_loopback(peer) and _host_is_loopback(request.url.hostname)
 

@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { copyText } from "@/lib/clipboard";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { pushCredentialsRequired } from "@/lib/capabilities";
 import { buildConnectCommand, CONNECT_SOURCES, type ConnectSource } from "./usageBoardConnect";
 import { t } from "./usageText";
 
@@ -24,11 +24,19 @@ export function UsageSourceConnect({
 }) {
   const [source, setSource] = useState(initialSource);
   const [result, setResult] = useState<"copied" | "copyFailed" | null>(null);
-  const singleUser = isSingleUserMode(useServerInfo());
+  const info = useServerInfo();
+  const requireCredentials = pushCredentialsRequired(info);
+  const usesOidc = info !== "loading" && info.login_url === "/auth/login";
   const command = buildConnectCommand(window.location.origin, source, {
-    requireAuthHeader: !singleUser,
+    requireAuthHeader: requireCredentials,
   });
-  const sourceHelp = singleUser && source === "otel" ? t("otelHelpSingleUser") : t(`${source}Help`);
+  const sourceHelp =
+    !requireCredentials && source === "otel" ? t("otelHelpSingleUser") : t(`${source}Help`);
+  const credentialHelp = !requireCredentials
+    ? "credentialHelpSingleUser"
+    : usesOidc
+      ? "credentialHelpOidc"
+      : "credentialHelp";
   return (
     <div className="flex flex-col gap-3">
       <label className="flex flex-wrap items-center gap-2 text-sm">
@@ -78,9 +86,7 @@ export function UsageSourceConnect({
               {result ? t(result) : null}
             </span>
           </div>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {t(singleUser ? "credentialHelpSingleUser" : "credentialHelp")}
-          </p>
+          <p className="text-xs leading-relaxed text-muted-foreground">{t(credentialHelp)}</p>
         </>
       ) : null}
       <p className="text-xs leading-relaxed text-muted-foreground">{t("storageHelp")}</p>

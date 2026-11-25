@@ -202,8 +202,11 @@ describe("ApprovalCard — binary approve/reject", () => {
       response: null,
       onSubmit: submit,
     };
-    const singleUserInfo = { ...FALLBACK_SERVER_INFO, single_user: true };
-    const accountsInfo = { ...FALLBACK_SERVER_INFO, single_user: false, accounts_enabled: true };
+    const singleUserInfo = {
+      ...FALLBACK_SERVER_INFO,
+      single_user: true,
+      browser_approval_available: false,
+    };
 
     const view = render(
       <CapabilitiesProvider info={singleUserInfo}>
@@ -224,13 +227,21 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
     expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
 
-    view.rerender(
-      <CapabilitiesProvider info={accountsInfo}>
-        <ApprovalCard {...restartProps} />
-      </CapabilitiesProvider>,
-    );
-    expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
-    expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
+    for (const auth of [
+      { accounts_enabled: true, login_url: "/login" },
+      { accounts_enabled: false, login_url: "/auth/login" },
+    ]) {
+      const info = { ...singleUserInfo, ...auth, browser_approval_available: true };
+      for (const props of [restartProps, terminalProps]) {
+        view.rerender(
+          <CapabilitiesProvider info={info}>
+            <ApprovalCard {...props} />
+          </CapabilitiesProvider>,
+        );
+        expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+        expect(screen.queryByText(/needs a signed-in browser/i)).toBeNull();
+      }
+    }
     terminalViewer.id = "alice";
   });
   it("renders Approve and Reject buttons when requestedSchema has no enum", () => {

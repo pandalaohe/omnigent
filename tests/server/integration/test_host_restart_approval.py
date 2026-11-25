@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -20,6 +20,7 @@ from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import LEVEL_EDIT, UnifiedAuthProvider
 from omnigent.server.host_restart_approval import approved_tool_preview
 from omnigent.server.oidc import mint_session_cookie
+from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.orchestration import (
     _handle_mcp_tools_call,
@@ -27,13 +28,15 @@ from omnigent.server.routes._sessions.orchestration import (
     _register_policy_elicitation,
 )
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.sessions import routes_hooks
 from omnigent.server.schemas import ElicitationRequestParams
+from omnigent.server.user_preferences_store import ApprovalTimeout
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import PolicyAction
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 
 @pytest.mark.asyncio
@@ -341,7 +344,7 @@ async def test_invalid_restart_target_never_publishes_card(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gate", ["mcp", "relay", "park"])
+@pytest.mark.parametrize("gate", ["mcp", "relay", "park", "native-hook", "permission-hook"])
 async def test_single_user_host_restart_returns_reason_without_posting_card(
     auth_app, auth_client, db_uri, monkeypatch, gate
 ):
@@ -427,7 +430,7 @@ async def test_single_user_host_restart_returns_reason_without_posting_card(
         )
         assert verdict is not None and verdict["verdict"] == "deny", verdict
         reason = verdict["reason"]
-    else:
+    elif gate == "park":
         ready = asyncio.Event()
         result = await _publish_and_wait_for_harness_elicitation(
             None,
@@ -441,9 +444,42 @@ async def test_single_user_host_restart_returns_reason_without_posting_card(
         )
         assert result is not None and result.action == "decline" and ready.is_set()
         reason = (result.content or {}).get("reason", "")
+    else:
+        forwarded = AsyncMock()
+        popup = Mock()
+        monkeypatch.setattr(routes_hooks, "_forward_session_change_to_runner", forwarded)
+        monkeypatch.setattr(orchestration, "_spawn_native_approval_popup_forward", popup)
+        if gate == "native-hook":
+            response = await auth_client.post(
+                f"/v1/sessions/{session_id}/policies/evaluate",
+                json=policy_tool_call_request("sys_host_restart", args),
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["result"] == "POLICY_ACTION_DENY", body
+            reason = body["reason"]
+        else:
+            monkeypatch.setattr(
+                sessions_route,
+                "read_approval_timeout",
+                lambda *_: ApprovalTimeout(timeout_s=1, stop_turn=True, async_approvals=False),
+            )
+            response = await auth_client.post(
+                f"/v1/sessions/{session_id}/hooks/permission-request",
+                json={"tool_name": "sys_host_restart", "tool_input": args},
+            )
+            assert response.status_code == 200, response.text
+            decision = response.json()["hookSpecificOutput"]["decision"]
+            assert decision["behavior"] == "deny" and "interrupt" not in decision
+            reason = decision.get("message", "")
+        assert "signed-in browser" in reason.lower(), reason
+        forwarded.assert_not_called()
+        popup.assert_not_called()
     assert "signed-in browser" in reason.lower(), reason
     assert "accounts sign-in" in reason.lower(), reason
-    assert not published
+    assert [event["type"] for _, event in published] == (
+        ["response.policy_denied"] if gate == "native-hook" else []
+    )
     assert not registry.restarts.previews
     denied = await auth_client.post(
         f"/v1/hosts/{host_id}/restart",

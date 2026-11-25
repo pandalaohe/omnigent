@@ -26,6 +26,9 @@ const fetcher = vi.hoisted(() => vi.fn());
 const serverInfoState = vi.hoisted(() => ({
   usage_board_enabled: false,
   single_user: false,
+  accounts_enabled: false,
+  login_url: null as string | null,
+  push_credentials_required: true,
 }));
 
 it("shows Today decisions by source visibility regardless of language or prefix", () => {
@@ -130,6 +133,9 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetcher }));
 afterEach(() => {
   serverInfoState.single_user = false;
+  serverInfoState.accounts_enabled = false;
+  serverInfoState.login_url = null;
+  serverInfoState.push_credentials_required = true;
   cleanup();
   fetcher.mockReset();
 });
@@ -894,7 +900,7 @@ it("offers an available standards reference before a source is connected", () =>
   );
 });
 
-it("explains loopback push without an API key in single-user mode and keeps bearer header in multi-user mode", () => {
+it("uses the effective credential requirement for task sources on one machine", () => {
   const source = taskBoardFixture().sources[0];
   const prefs = {
     ...boardDefaults,
@@ -906,12 +912,24 @@ it("explains loopback push without an API key in single-user mode and keeps bear
     pinnedQuota: [],
   };
   serverInfoState.single_user = true;
+  serverInfoState.push_credentials_required = false;
   const view = wrap(<TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />);
   expect(view.container.textContent).toMatch(/no api key is needed on this machine/i);
   expect(view.container.textContent).not.toContain("Authorization: Bearer");
 
   view.unmount();
-  serverInfoState.single_user = false;
-  const multi = wrap(<TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />);
-  expect(multi.container.textContent).toContain("Authorization: Bearer <your tasks-scoped key>");
+  serverInfoState.push_credentials_required = true;
+  for (const login of ["/login", "/auth/login"]) {
+    serverInfoState.login_url = login;
+    serverInfoState.accounts_enabled = login === "/login";
+    const authenticated = wrap(
+      <TaskBoardSources sources={[source]} preferences={prefs} update={vi.fn()} />,
+    );
+    expect(authenticated.container.textContent).toContain(
+      login === "/login"
+        ? "Authorization: Bearer <your tasks-scoped key>"
+        : "Authorization: Bearer <your access token>",
+    );
+    authenticated.unmount();
+  }
 });

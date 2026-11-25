@@ -32,9 +32,10 @@ describe("source connection", () => {
     }
   });
 
-  it("omits API key guidance in single-user mode and preserves it in multi-user mode", () => {
+  it("uses the effective credential requirement for pushes on one machine", () => {
+    const local = { ...FALLBACK_SERVER_INFO, single_user: true, push_credentials_required: false };
     const view = render(
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, single_user: true }}>
+      <CapabilitiesProvider info={local}>
         <UsageSourceConnect initialSource="report" />
       </CapabilitiesProvider>,
     );
@@ -49,17 +50,25 @@ describe("source connection", () => {
     expect(document.querySelector("pre")?.textContent ?? "").not.toContain("Authorization: Bearer");
     expect(screen.queryByText(/Authorization: Bearer \$USAGE_KEY/)).toBeNull();
 
-    view.rerender(
-      <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, single_user: false, accounts_enabled: true }}
-      >
-        <UsageSourceConnect initialSource="report" />
-      </CapabilitiesProvider>,
-    );
-    expect(document.querySelector("pre")?.textContent ?? "").toContain(
-      "Authorization: Bearer $USAGE_KEY",
-    );
-    expect(screen.getByText(/Settings → API keys/)).toBeVisible();
+    for (const auth of [
+      { accounts_enabled: true, login_url: "/login" },
+      { accounts_enabled: false, login_url: "/auth/login" },
+    ]) {
+      const info = { ...local, ...auth, push_credentials_required: true };
+      view.rerender(
+        <CapabilitiesProvider info={info}>
+          <UsageSourceConnect initialSource="report" />
+        </CapabilitiesProvider>,
+      );
+      expect(document.querySelector("pre")?.textContent ?? "").toContain(
+        "Authorization: Bearer $USAGE_KEY",
+      );
+      expect(
+        screen.getByText(
+          auth.accounts_enabled ? /Settings → API keys/ : /a bearer token this server accepts/i,
+        ),
+      ).toBeVisible();
+    }
   });
 
   it("shows a zero balance and its own old reading with no pace, in both densities", () => {

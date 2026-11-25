@@ -279,8 +279,9 @@ describe("Host restart", () => {
     expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(2);
   });
 
-  it("disables Restart with a short reason in single-user mode and keeps multi-user enabled", () => {
-    const view = show({}, { ...FALLBACK_SERVER_INFO, single_user: true });
+  it("disables Restart when the single-user server lacks browser approval", () => {
+    const info = { ...FALLBACK_SERVER_INFO, single_user: true, browser_approval_available: false };
+    show({}, info);
     const button = screen.getByRole("button", { name: "Restart" });
     expect(button).toBeDisabled();
     expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
@@ -288,9 +289,19 @@ describe("Host restart", () => {
     fireEvent.click(button);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    view.unmount();
+  });
 
-    show({}, { ...FALLBACK_SERVER_INFO, single_user: false, accounts_enabled: true });
+  it.each([
+    { accounts_enabled: true, login_url: "/login" },
+    { accounts_enabled: false, login_url: "/auth/login" },
+  ])("enables Restart on one machine with browser sign-in at $login_url", (auth) => {
+    const info = {
+      ...FALLBACK_SERVER_INFO,
+      ...auth,
+      single_user: true,
+      browser_approval_available: true,
+    };
+    show({}, info);
     expect(screen.getByRole("button", { name: "Restart" })).toBeEnabled();
     expect(screen.queryByText(/needs a signed-in browser/i)).not.toBeInTheDocument();
   });

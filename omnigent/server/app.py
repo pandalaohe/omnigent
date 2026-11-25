@@ -98,6 +98,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.browser_approval import browser_approval_supported
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
@@ -298,6 +299,8 @@ class FilesystemAttachmentsInfo(BaseModel):
 
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
+    browser_approval_available: bool
+    push_credentials_required: bool
     browser_annotations_available: bool = False
     api_keys_available: bool = False
     connected_apps_available: bool = False
@@ -4457,6 +4460,8 @@ def create_app(
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
+                "browser_approval_available": browser_approval_supported(auth_provider),
+                "push_credentials_required": authentication_requires_identity(auth_provider),
                 "browser_annotations_available": annotation_enabled
                 and annotation_storage_supported,
                 "api_keys_available": api_keys_enabled,

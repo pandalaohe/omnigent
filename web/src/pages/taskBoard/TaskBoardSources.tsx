@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { SettingsIcon, Trash2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { pushCredentialsRequired } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { safeSourceLink, type TaskSource } from "./taskBoardData";
 import type { BoardPreferences } from "./taskBoardPreferences";
@@ -20,7 +20,9 @@ export function TaskBoardSources({
   update: (change: Partial<BoardPreferences>) => boolean | void;
 }) {
   const client = useQueryClient();
-  const singleUser = isSingleUserMode(useServerInfo());
+  const info = useServerInfo();
+  const requireCredentials = pushCredentialsRequired(info);
+  const usesOidc = info !== "loading" && info.login_url === "/auth/login";
   const [confirm, setConfirm] = useState<string | null>(null),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState("");
@@ -136,10 +138,10 @@ export function TaskBoardSources({
                     url: `${window.location.origin}/v1/me/tasks/sources/${encodeURIComponent(source.id)}`,
                   })}
                 </code>
-                {singleUser ? (
-                  <p className="text-xs text-muted-foreground">{t("sources.noKeySingleUser")}</p>
+                {requireCredentials ? (
+                  <code>{t(usesOidc ? "sources.oidcHeader" : "sources.header")}</code>
                 ) : (
-                  <code>{t("sources.header")}</code>
+                  <p className="text-xs text-muted-foreground">{t("sources.noKeySingleUser")}</p>
                 )}
                 <a
                   href="https://www.rfc-editor.org/rfc/rfc8984.html"

@@ -90,6 +90,8 @@ export interface ServerInfo {
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
+  browser_approval_available?: boolean;
+  push_credentials_required?: boolean;
   /** Accounts-mode Chrome annotation routes are configured on a shared database. */
   browser_annotations_available?: boolean;
   /** Signed-in delegated grants can be listed and individually revoked. */
@@ -648,6 +650,14 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           ),
           session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
+          browser_approval_available:
+            typeof data.browser_approval_available === "boolean"
+              ? data.browser_approval_available
+              : undefined,
+          push_credentials_required:
+            typeof data.push_credentials_required === "boolean"
+              ? data.push_credentials_required
+              : undefined,
           browser_annotations_available: data.browser_annotations_available === true,
           api_keys_available: data.api_keys_available === true,
           connected_apps_available: data.connected_apps_available === true,
@@ -761,6 +771,22 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+export function isBrowserApprovalUnavailable(info: ServerInfo | "loading"): boolean {
+  if (info === "loading") return false;
+  // Older servers only report the deployment marker and login options.
+  return (
+    info.browser_approval_available === false ||
+    (info.browser_approval_available === undefined &&
+      info.single_user &&
+      !info.accounts_enabled &&
+      !info.login_url)
+  );
+}
+
+export function pushCredentialsRequired(info: ServerInfo | "loading"): boolean {
+  return info === "loading" || info.push_credentials_required !== false;
 }
 
 /**

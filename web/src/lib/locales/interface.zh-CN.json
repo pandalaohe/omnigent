@@ -30,6 +30,6 @@
   "quotaNoValidReading": "无有效读数",
   "quoteOpen": "「",
   "quoteClose": "」",
-  "browserApprovalUnavailable": "需要已登录的浏览器会话——启用账号登录模式后可用。",
-  "artifactSharingSingleMachineHint": "单机安装下，分享链接与访客评论/批注仅本机可访问，除非将服务端对外暴露。"
+  "browserApprovalUnavailable": "需要已登录的浏览器会话。请使用账号登录或 OIDC。",
+  "artifactSharingSingleMachineHint": "复制的链接可在本机打开。与他人分享需要账号登录。将无需登录的单用户服务对外暴露，会让任何人获得完整控制权。"
 }
