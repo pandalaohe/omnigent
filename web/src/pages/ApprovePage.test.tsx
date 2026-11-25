@@ -11,6 +11,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
 
@@ -30,12 +32,19 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
 }
 
 /** Render the page at a concrete `/approve/:sessionId/:elicitationId` route. */
-function renderPage(sessionId = "sess_1", elicitationId = "eli_1") {
+function renderPage(sessionId = "sess_1", elicitationId = "eli_1", info = FALLBACK_SERVER_INFO) {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
         <Routes>
-          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+          <Route
+            path="/approve/:sessionId/:elicitationId"
+            element={
+              <CapabilitiesProvider info={info}>
+                <ApprovePage />
+              </CapabilitiesProvider>
+            }
+          />
         </Routes>
       </MemoryRouter>
     </TooltipProvider>,
@@ -48,6 +57,48 @@ afterEach(() => {
 });
 
 describe("ApprovePage states", () => {
+  it.each([
+    { mode: "local header", single: true, available: false, accounts: false, login: null },
+    { mode: "accounts", single: true, available: true, accounts: true, login: "/login" },
+    { mode: "OIDC", single: true, available: true, accounts: false, login: "/auth/login" },
+    {
+      mode: "multi-user accounts",
+      single: false,
+      available: true,
+      accounts: true,
+      login: "/login",
+    },
+    { mode: "multi-user header", single: false, available: false, accounts: false, login: null },
+  ])(
+    "renders the standalone restart approval for $mode",
+    async ({ single, available, accounts, login }) => {
+      vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+        jsonResponse({
+          status: "pending",
+          policy_name: "__ask_on_host_restart",
+          message: "Restart the host?",
+        }),
+      );
+      const info = {
+        ...FALLBACK_SERVER_INFO,
+        single_user: single,
+        accounts_enabled: accounts,
+        login_url: login,
+        browser_approval_available: available,
+      };
+      renderPage("sess_1", "eli_1", info);
+      expect(await screen.findByText("Restart the host?")).toBeVisible();
+      if (available || !single) {
+        expect(screen.getByText("Approval required")).toBeVisible();
+        expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled();
+      } else {
+        expect(screen.getByText(/needs a signed-in browser/i)).toBeVisible();
+        expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+      }
+    },
+  );
+
   it("fails closed when the backend omits the terminal card fields", async () => {
     vi.mocked(identity.authenticatedFetch).mockResolvedValue(
       jsonResponse({

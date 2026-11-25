@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { UsageSourceConnect } from "./UsageSourceConnect";
 import { UsageTile } from "./UsageTile";
 import { usageBoardData } from "./usageBoardFixtures";
@@ -27,6 +29,45 @@ describe("source connection", () => {
         expect(document.querySelector("pre")?.textContent).toBe(command);
         expect(connectCommandPayload(command, 1794000000)).toBeTruthy();
       }
+    }
+  });
+
+  it("uses the effective credential requirement for pushes on one machine", () => {
+    const local = { ...FALLBACK_SERVER_INFO, single_user: true, push_credentials_required: false };
+    const view = render(
+      <CapabilitiesProvider info={local}>
+        <UsageSourceConnect initialSource="report" />
+      </CapabilitiesProvider>,
+    );
+    const command = document.querySelector("pre")?.textContent ?? "";
+    expect(command).not.toContain("Authorization: Bearer");
+    expect(connectCommandPayload(command, 1794000000)).toBeTruthy();
+    expect(screen.getByText(/no api key is needed on this machine/i)).toBeVisible();
+    expect(screen.queryByText(/Settings → API keys/)).toBeNull();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: t("otel") } });
+    fireEvent.click(screen.getByRole("option", { name: t("otel") }));
+    expect(document.querySelector("pre")?.textContent ?? "").not.toContain("Authorization: Bearer");
+    expect(screen.queryByText(/Authorization: Bearer \$USAGE_KEY/)).toBeNull();
+
+    for (const auth of [
+      { accounts_enabled: true, login_url: "/login" },
+      { accounts_enabled: false, login_url: "/auth/login" },
+    ]) {
+      const info = { ...local, ...auth, push_credentials_required: true };
+      view.rerender(
+        <CapabilitiesProvider info={info}>
+          <UsageSourceConnect initialSource="report" />
+        </CapabilitiesProvider>,
+      );
+      expect(document.querySelector("pre")?.textContent ?? "").toContain(
+        "Authorization: Bearer $USAGE_KEY",
+      );
+      expect(
+        screen.getByText(
+          auth.accounts_enabled ? /Settings → API keys/ : /a bearer token this server accepts/i,
+        ),
+      ).toBeVisible();
     }
   });
 

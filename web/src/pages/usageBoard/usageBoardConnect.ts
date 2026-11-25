@@ -19,7 +19,12 @@ function secondsFromNow(offset: number): string {
  * a bare number: a single-quoted body would leave `observed_at` a string and the
  * route rejects that with 422.
  */
-export function buildConnectCommand(origin: string, source: ConnectSource = "report"): string {
+export function buildConnectCommand(
+  origin: string,
+  source: ConnectSource = "report",
+  options: { requireAuthHeader?: boolean } = {},
+): string {
+  const requireAuthHeader = options.requireAuthHeader ?? true;
   const window =
     `{"id":"month","percent_used":41,"window_minutes":43200,` +
     `"resets_at":${secondsFromNow(CONNECT_SAMPLE_RESET_SECONDS)}}`;
@@ -43,7 +48,7 @@ export function buildConnectCommand(origin: string, source: ConnectSource = "rep
   const quoted = json.replace(/"/g, '\\"');
   return [
     `curl --fail-with-body -X ${method} "${endpoint}" \\`,
-    '  -H "Authorization: Bearer $USAGE_KEY" \\',
+    ...(requireAuthHeader ? ['  -H "Authorization: Bearer $USAGE_KEY" \\'] : []),
     '  -H "Content-Type: application/json" \\',
     `  -d "${quoted}"`,
   ].join("\n");

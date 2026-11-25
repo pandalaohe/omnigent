@@ -1098,10 +1098,10 @@ async def _publish_and_wait_for_harness_elicitation(
         restart_fields = await restart_card_fields(
             session_id, elicitation_id, tool_name, tool_input, conversation_store
         )
-    except OmnigentError:
+    except OmnigentError as exc:
         if published is not None:
             published.set()
-        return ElicitationResult(action="decline")
+        return ElicitationResult(action="decline", content={"reason": exc.message})
     if restart_fields:
         params = params.model_copy(update=restart_fields)
     from omnigent.server.terminal_agent_access import terminal_access_card_fields

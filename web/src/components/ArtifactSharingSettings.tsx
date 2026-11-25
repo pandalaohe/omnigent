@@ -8,7 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { showToast } from "@/components/ui/toast";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { interfaceText } from "@/lib/interfaceText";
 import { SettingRow } from "@/components/SettingsFields";
 
 /** Response shape of `GET`/`PUT /v1/artifact-sharing`. */
@@ -35,6 +38,7 @@ export function ArtifactSharingSettings() {
   const [reloadKey, setReloadKey] = useState(0);
   const [codeDraft, setCodeDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  const singleUser = isSingleUserMode(useServerInfo());
 
   useEffect(() => {
     let cancelled = false;
@@ -98,6 +102,14 @@ export function ArtifactSharingSettings() {
 
   return (
     <div className="flex flex-col">
+      {singleUser && (
+        <p
+          data-testid="artifact-sharing-single-machine-hint"
+          className="mb-4 text-sm text-muted-foreground"
+        >
+          {interfaceText("artifactSharingSingleMachineHint")}
+        </p>
+      )}
       <SettingRow
         label="External access"
         hint="Let visitors open shared file links outside the app."

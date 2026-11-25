@@ -10,6 +10,10 @@ export function isTerminalAccessPolicyName(name: string): boolean {
   return name === "ask_on_terminal_agent_access" || name === "__ask_on_terminal_agent_access";
 }
 
+export function isHostRestartPolicyName(name: string): boolean {
+  return name === "ask_on_host_restart" || name === "__ask_on_host_restart";
+}
+
 export function parseTerminalAccess(value: unknown): TerminalAccessRequest | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const params = value as Record<string, unknown>;

@@ -10,6 +10,7 @@ import time
 import weakref
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -61,6 +62,10 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
     AuthProvider,
+)
+from omnigent.server.browser_approval import (
+    BROWSER_APPROVAL_UNAVAILABLE_REASON,
+    browser_approval_unavailable_for_tool,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -1907,6 +1912,11 @@ def register_hooks_routes(
                 f"{native_agent.display_name} harness.",
                 code=ErrorCode.CONFLICT,
             )
+        if browser_approval_unavailable_for_tool(auth_provider, tool_name, tool_input):
+            return _permission_hook_response(
+                {"behavior": "deny", "message": BROWSER_APPROVAL_UNAVAILABLE_REASON},
+                is_claude=is_claude,
+            )
         # Deferral applies to the Claude-native hook only: Kimi / Devin
         # drop the deny message, so those bridges keep blocking. The
         # timeout fields stay Claude-only too: those bridges keep their
@@ -2878,6 +2888,23 @@ def register_hooks_routes(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
+
+        if (
+            result.action == PolicyAction.ASK
+            and phase == Phase.TOOL_CALL
+            and isinstance(data, dict)
+            and browser_approval_unavailable_for_tool(
+                auth_provider, data.get("name"), data.get("arguments")
+            )
+        ):
+            result = replace(
+                result,
+                action=PolicyAction.DENY,
+                reason=BROWSER_APPROVAL_UNAVAILABLE_REASON,
+                set_labels=None,
+                data=None,
+                state_updates=None,
+            )
 
         # URL-based elicitation for blocking phases: on a TOOL_CALL or
         # LLM_REQUEST ASK, hold the gate server-side rather than

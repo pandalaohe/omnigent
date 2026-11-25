@@ -194,6 +194,8 @@
   "sources.connect": "Connect this source",
   "sources.report": "PUT {{url}}",
   "sources.header": "Authorization: Bearer <your tasks-scoped key>",
+  "sources.oidcHeader": "Authorization: Bearer <your access token>",
+  "sources.noKeySingleUser": "No API key is needed on this machine. Push directly to the local server over loopback.",
   "sources.docs": "JSCalendar reference",
   "sources.delete": "Delete source",
   "sources.deleting": "Deleting…",

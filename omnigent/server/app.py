@@ -98,6 +98,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.browser_approval import browser_approval_supported
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
@@ -124,6 +125,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes.artifacts import set_local_artifact_browser_cookie
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.calling_defaults import create_calling_defaults_router
 from omnigent.server.routes.comments import create_comments_router
@@ -298,6 +300,8 @@ class FilesystemAttachmentsInfo(BaseModel):
 
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
+    browser_approval_available: bool
+    push_credentials_required: bool
     browser_annotations_available: bool = False
     api_keys_available: bool = False
     connected_apps_available: bool = False
@@ -3394,6 +3398,9 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    from omnigent.server.routes._sessions.common import set_server_auth_provider
+
+    set_server_auth_provider(auth_provider)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The
@@ -4301,7 +4308,7 @@ def create_app(
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
-    async def info() -> ServerInfoResponse:
+    async def info(request: Request, response: Response) -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -4451,9 +4458,12 @@ def create_app(
 
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         automations_enabled = app.state.automations_available()
+        set_local_artifact_browser_cookie(request, response, auth_provider)
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
+                "browser_approval_available": browser_approval_supported(auth_provider),
+                "push_credentials_required": authentication_requires_identity(auth_provider),
                 "browser_annotations_available": annotation_enabled
                 and annotation_storage_supported,
                 "api_keys_available": api_keys_enabled,

@@ -24,8 +24,10 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
 import http
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -86,7 +88,7 @@ from omnigent.server.artifact_sharing import (
     remember_cookie_valid,
     verify_share_code,
 )
-from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -771,6 +773,71 @@ class VisitorCommentRequest(BaseModel):
         return self
 
 
+_LOCAL_ARTIFACT_BROWSER_COOKIE = "omnigent_local_artifact_browser"
+
+
+def _host_is_loopback(host: str | None) -> bool:
+    """Match loopback hostnames and IPs, including IPv4-mapped IPv6."""
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return addr.is_loopback or (mapped is not None and mapped.is_loopback)
+
+
+def _is_single_user_loopback_request(request: Request, auth_provider: AuthProvider | None) -> bool:
+    if not (
+        isinstance(auth_provider, UnifiedAuthProvider)
+        and auth_provider._source == "header"
+        and auth_provider._local_single_user
+    ):
+        return False
+    if any(
+        h in ("forwarded", "x-real-ip") or h.startswith("x-forwarded-") for h in request.headers
+    ):
+        return False
+    peer = request.client.host if request.client is not None else None
+    return _host_is_loopback(peer) and _host_is_loopback(request.url.hostname)
+
+
+def _artifact_cookie_path(request: Request) -> str:
+    base_path = getattr(request.app.state, "base_path", "") or ""
+    return f"{base_path}/v1/artifacts/"
+
+
+def _local_browser_signature(key: bytes) -> bytes:
+    return hmac.digest(key, b"omnigent-local-artifact-browser", "sha256").hex().encode("ascii")
+
+
+def set_local_artifact_browser_cookie(
+    request: Request, response: Response, auth_provider: AuthProvider | None
+) -> None:
+    """Mark the local browser during SPA bootstrap, outside the artifact routes."""
+    if (
+        not _is_single_user_loopback_request(request, auth_provider)
+        or _get_user_id(request, auth_provider) != RESERVED_USER_LOCAL
+    ):
+        return
+    state = request.app.state
+    key = getattr(state, "local_artifact_browser_key", None)
+    if key is None:
+        key = state.local_artifact_browser_key = secrets.token_bytes(32)
+    response.set_cookie(
+        _LOCAL_ARTIFACT_BROWSER_COOKIE,
+        _local_browser_signature(key).decode("ascii"),
+        path=_artifact_cookie_path(request),
+        httponly=True,
+        samesite="strict",
+        secure=request.url.scheme == "https",
+    )
+    response.headers["Cache-Control"] = "no-store"
+
+
 def register_artifact_routes(
     router: APIRouter,
     *,
@@ -868,6 +935,24 @@ def register_artifact_routes(
     def _is_login(user_id: str | None) -> bool:
         """Whether *user_id* is a real identity, not a reserved sentinel."""
         return user_id is not None and user_id != RESERVED_USER_LOCAL
+
+    def _is_single_user_loopback_owner(
+        request: Request, user_id: str | None, owner: str | None
+    ) -> bool:
+        if user_id != RESERVED_USER_LOCAL or owner != RESERVED_USER_LOCAL:
+            return False
+        if not _is_single_user_loopback_request(request, auth_provider):
+            return False
+        # A loopback proxy rewriting Host and dropping forwarding headers gives
+        # callers the local owner's API access if it exposes the whole app.
+        # An artifact-only proxy cannot issue this SPA bootstrap cookie.
+        cookie = request.cookies.get(_LOCAL_ARTIFACT_BROWSER_COOKIE)
+        key = getattr(request.app.state, "local_artifact_browser_key", None)
+        return (
+            key is not None
+            and cookie is not None
+            and hmac.compare_digest(cookie.encode("utf-8"), _local_browser_signature(key))
+        )
 
     async def _identity_allowed(request: Request, claims: ArtifactTokenClaims) -> bool:
         """Whether the request's identity passes the mint's read rule.
@@ -974,7 +1059,9 @@ def register_artifact_routes(
         # external off. A URL whose grant is bad is evaluated here as a bare one.
         if record is not None and record.external and record.code_hash is None:
             return None, record
-        if _is_login(user_id) and await _identity_allowed(request, claims):
+        if (
+            _is_login(user_id) or _is_single_user_loopback_owner(request, user_id, owner)
+        ) and await _identity_allowed(request, claims):
             return (
                 _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
                 record,
@@ -990,11 +1077,6 @@ def register_artifact_routes(
             )
         return _form_page(401), record
 
-    def _remember_cookie_path(request: Request) -> str:
-        """The cookie's Path: the artifact route family under the base path."""
-        base_path = getattr(request.app.state, "base_path", "") or ""
-        return f"{base_path}/v1/artifacts/"
-
     def _attach_remember_cookie(
         response: Response, request: Request, owner: str, gate_key: str
     ) -> None:
@@ -1004,7 +1086,7 @@ def register_artifact_routes(
             remember_cookie_name(owner, secure=secure),
             issue_remember_cookie(gate_key, owner, now_epoch()),
             max_age=REMEMBER_COOKIE_MAX_AGE_SECONDS,
-            path=_remember_cookie_path(request),
+            path=_artifact_cookie_path(request),
             httponly=True,
             samesite="lax",
             secure=secure,

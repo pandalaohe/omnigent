@@ -6,6 +6,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { ArtifactSharingSettings } from "./ArtifactSharingSettings";
 
@@ -179,5 +181,30 @@ describe("ArtifactSharingSettings", () => {
     expect(screen.getByRole("button", { name: "Clear code" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a single-machine reachability hint only in single-user mode", async () => {
+    fetchMock.mockResolvedValueOnce(sharingResponse({ external: false, share_code_set: false }));
+    const view = render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, single_user: true }}>
+        <ArtifactSharingSettings />
+      </CapabilitiesProvider>,
+    );
+    await screen.findByRole("switch", { name: "External access" });
+    expect(screen.getByTestId("artifact-sharing-single-machine-hint")).toHaveTextContent(
+      /Copied links open on this machine.*Sharing with others requires accounts sign-in.*gives anyone full control/i,
+    );
+    view.unmount();
+
+    fetchMock.mockResolvedValueOnce(sharingResponse({ external: false, share_code_set: false }));
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, single_user: false, accounts_enabled: true }}
+      >
+        <ArtifactSharingSettings />
+      </CapabilitiesProvider>,
+    );
+    await screen.findByRole("switch", { name: "External access" });
+    expect(screen.queryByTestId("artifact-sharing-single-machine-hint")).toBeNull();
   });
 });

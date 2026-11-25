@@ -29,5 +29,7 @@
   "quotaLastValidReading": "Last valid reading {{time}}",
   "quotaNoValidReading": "No valid reading",
   "quoteOpen": "“",
-  "quoteClose": "”"
+  "quoteClose": "”",
+  "browserApprovalUnavailable": "Needs a signed-in browser. Use accounts sign-in or OIDC.",
+  "artifactSharingSingleMachineHint": "Copied links open on this machine. Sharing with others requires accounts sign-in. Exposing a single-user server without sign-in gives anyone full control."
 }

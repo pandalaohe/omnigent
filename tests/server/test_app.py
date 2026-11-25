@@ -471,6 +471,46 @@ async def test_info_includes_server_version(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["header", "accounts", "oidc"])
+async def test_info_reports_effective_auth_capabilities_on_one_machine(
+    auth_app, auth_client, monkeypatch, source
+):
+    from omnigent.server.accounts_config import AccountsConfig
+    from tests.server.integration.oidc_fixtures import make_oidc_config
+
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    provider = auth_app.state.mcp_registry_auth
+    monkeypatch.setattr(provider, "_local_single_user", True)
+    monkeypatch.setattr(provider, "_source", source)
+    monkeypatch.setattr(
+        provider,
+        "_accounts_config",
+        AccountsConfig(b"a" * 32, 8, "http://test", None, 3600, 300),
+    )
+    monkeypatch.setattr(provider, "_oidc_config", make_oidc_config())
+
+    response = await auth_client.get("/v1/info")
+    assert response.status_code == 200, response.text
+    info = response.json()
+    assert info["single_user"] is True
+    assert info["browser_approval_available"] is (source != "header")
+    assert info["push_credentials_required"] is (source != "header")
+    assert "set-cookie" not in response.headers
+    loopback = await auth_client.get("http://127.0.0.1:6767/v1/info")
+    assert loopback.status_code == 200
+    if source == "header":
+        marker = loopback.headers["set-cookie"].lower()
+        assert marker.startswith("omnigent_local_artifact_browser=")
+        assert "; httponly" in marker
+        assert "; samesite=strict" in marker
+        assert "; path=/v1/artifacts/" in marker
+        assert "; domain=" not in marker
+        assert loopback.headers["cache-control"] == "no-store"
+    else:
+        assert "set-cookie" not in loopback.headers
+
+
+@pytest.mark.asyncio
 async def test_info_publishes_default_attachment_limits(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
