@@ -79,8 +79,8 @@ vi.mock("@/lib/soundDevice", () => ({
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: useLoadedConversationsMock,
 }));
-vi.mock("@/hooks/useSessionErrors", () => ({
-  useSessionErrorStates: useSessionErrorStatesMock,
+vi.mock("@/hooks/useSessionBadgeStates", () => ({
+  useLatestSessionErrors: useSessionErrorStatesMock,
 }));
 vi.mock("@/hooks/useSessionNavigationPreferences", () => ({
   useSessionNavigationPreferences: useSessionNavigationPreferencesMock,

@@ -305,8 +305,7 @@ async def resolve_session_model(
         if has_session_rewrite:
             session_notes = list(new_session_notes)
         elif session_resolved_model is not None:
-            # Keep active rename provenance (A -> B) through same-selection
-            # resumes and catalog misses (B -> B); drop notes from older picks.
+            # Keep rename and calling-default provenance for the same selection.
             session_notes = [
                 note
                 for note in existing_session
@@ -314,6 +313,7 @@ async def resolve_session_model(
                 and note["model"].strip() == session_resolved_model
                 and (
                     not new_session_notes
+                    or str(note.get("setting", "")).startswith("project_")
                     or (
                         isinstance(note.get("saved"), str)
                         and note["saved"].strip() != session_resolved_model

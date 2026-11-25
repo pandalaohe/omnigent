@@ -402,6 +402,7 @@ from omnigent.server.routes._sessions.helpers import (
     _priced_cost_for_display,
     _provision_managed_sandbox,
     _prune_pre_resolved_harness_elicitations,
+    _publish_child_status_to_parent,
     _publish_elicitation_request_to_ancestors,
     _publish_elicitation_resolved,
     _publish_elicitation_resolved_to_ancestors,
@@ -466,6 +467,7 @@ from omnigent.server.runner_session_init import (
 )
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AgentCost,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -534,6 +536,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
     NativeRecoveryItemSkipped,
     NativeReplayConflictError,
+    SpawnTreeUsage,
     drop_server_secret_labels,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -878,6 +881,10 @@ _DELIVER_RETRY_MAX_S = 1800.0
 
 class _NativeForwardReplyLost(HTTPException):
     """The runner's response was lost, so the paste outcome still needs proof."""
+
+
+class NativeForwardRejected(HTTPException):
+    """The native runner did not take the input."""
 
 
 class _NativeDeliveryUncertain(RuntimeError):
@@ -1927,31 +1934,49 @@ async def _archive_stop_one(
             target_id,
             runner_router,
             conversation=conversation,
+            for_control=True,
         )
         if runner_client is not None:
-            response = await runner_client.post(
-                f"/v1/sessions/{target_id}/cli-retention/release",
-                json={
-                    "reason": "archive",
-                    "archive_scope_id": archive_scope_id or target_id,
-                    **(
-                        {"archive_revision": archive_revision}
-                        if archive_revision is not None
-                        else {}
-                    ),
-                },
-                timeout=10.0,
+            response = await asyncio.wait_for(
+                runner_client.post(
+                    f"/v1/sessions/{target_id}/cli-retention/release",
+                    json={
+                        "reason": "archive",
+                        "archive_scope_id": archive_scope_id or target_id,
+                        **(
+                            {"archive_revision": archive_revision}
+                            if archive_revision is not None
+                            else {}
+                        ),
+                    },
+                    timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
+                ),
+                timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
             )
             released = response.status_code < 400 or response.status_code == 404
+            if not released:
+                _logger.warning(
+                    "Runner failed to release archived CLI resources for %s (status=%s)",
+                    target_id,
+                    response.status_code,
+                    extra={"session_id": target_id},
+                )
         elif conversation.runner_id is None or (not stop_host_runner and not release_required):
             # Nothing addressable of this target's own is left: it either never had a
             # runner, or it does not own this binding's teardown. The last target on
             # the runner still has to prove the runner is gone. A runner a live session
             # keeps is never stopped, so its targets must prove their own release.
             released = True
+    except TimeoutError:
+        _logger.warning(
+            "Archive runner resource release failed for %s: timed out",
+            target_id,
+            exc_info=True,
+            extra={"session_id": target_id},
+        )
     except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
         _logger.debug(
-            "Archive target release failed for %s",
+            "Archive runner resource release failed for %s",
             target_id,
             exc_info=True,
             extra={"session_id": target_id},
@@ -2012,6 +2037,7 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S = 10.0
 # A session that archives itself keeps its runner until the turn that asked
 # ends. The wait is bounded so a turn that never settles still gets torn down.
 _SELF_ARCHIVE_TURN_POLL_S = 2.0
@@ -2276,21 +2302,25 @@ async def _archive_stop(
                 target_id,
                 runner_router,
                 conversation=target_conversations.get(target_id),
+                for_control=True,
             )
             if runner_client is None:
                 continue
-            response = await runner_client.post(
-                f"/v1/sessions/{target_id}/cli-retention/release",
-                json={
-                    "reason": "archive",
-                    "archive_scope_id": session_id,
-                    **(
-                        {"archive_revision": root_archive_revision}
-                        if isinstance(root_archive_revision, int)
-                        else {}
-                    ),
-                },
-                timeout=10.0,
+            response = await asyncio.wait_for(
+                runner_client.post(
+                    f"/v1/sessions/{target_id}/cli-retention/release",
+                    json={
+                        "reason": "archive",
+                        "archive_scope_id": session_id,
+                        **(
+                            {"archive_revision": root_archive_revision}
+                            if isinstance(root_archive_revision, int)
+                            else {}
+                        ),
+                    },
+                    timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
+                ),
+                timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
             )
             if response.status_code >= 400 and response.status_code != 404:
                 release_results[target_id] = False
@@ -3041,6 +3071,80 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentCost]:
+    """
+    Display costs for *session_id* and its descendants from one loaded tree.
+
+    An agent's cost is its priced subtree total, the figure its own session
+    displays. An agent with nothing priced instead gets the display-only
+    ``subagent_costs_usd`` estimate of its nearest ancestor that reported one
+    (a Claude session reports its nested sub-agents too), which no total sums.
+
+    :param tree: The whole spawn tree, from
+        :meth:`ConversationStore.list_spawn_tree_usage`.
+    :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
+    :returns: One :class:`AgentCost` per subtree member, in tree order.
+    """
+    by_id = {row.id: row for row in tree}
+    children: dict[str, list[SpawnTreeUsage]] = {}
+    for row in tree:
+        if row.parent_conversation_id is not None:
+            children.setdefault(row.parent_conversation_id, []).append(row)
+    # One depth-first walk of the whole tree (cycle-safe). A row is another's
+    # ancestor exactly when its entry/exit ticks enclose the other's, and rows
+    # exit after all their descendants.
+    enter: dict[str, int] = {}
+    leave: dict[str, int] = {}
+    exits: list[SpawnTreeUsage] = []
+    pending = [(row, False) for row in tree if row.parent_conversation_id not in by_id]
+    while pending:
+        row, done = pending.pop()
+        if done:
+            leave[row.id] = len(enter) + len(leave)
+            exits.append(row)
+        elif row.id not in enter:
+            enter[row.id] = len(enter) + len(leave)
+            pending.append((row, True))
+            pending.extend((child, False) for child in children.get(row.id, ()))
+
+    def is_ancestor(outer: str, inner: str) -> bool:
+        return (
+            outer in leave
+            and inner in leave
+            and enter[outer] < enter[inner]
+            and leave[inner] < leave[outer]
+        )
+
+    totals: dict[str, float] = {}
+    for row in exits:
+        cost = _priced_cost_for_display(row.session_usage)
+        if cost is not None:
+            totals[row.id] = totals.get(row.id, 0.0) + cost
+        parent_id = row.parent_conversation_id
+        if row.id in totals and parent_id is not None and parent_id in by_id:
+            totals[parent_id] = totals.get(parent_id, 0.0) + totals[row.id]
+    # Each child's estimate from its nearest reporting ancestor (latest entry tick).
+    estimates: dict[str, tuple[int, float]] = {}
+    for row in tree:
+        reported = row.session_usage.get("subagent_costs_usd")
+        if not isinstance(reported, dict):
+            continue
+        for child_id, estimate in reported.items():
+            if is_ancestor(row.id, child_id) and enter[row.id] > estimates.get(child_id, (-1,))[0]:
+                estimates[child_id] = (enter[row.id], estimate)
+    return [
+        AgentCost(
+            id=row.id,
+            cost_usd=totals.get(row.id),
+            estimated_cost_usd=(
+                estimates[row.id][1] if row.id not in totals and row.id in estimates else None
+            ),
+        )
+        for row in tree
+        if row.id == session_id or is_ancestor(session_id, row.id)
+    ]
+
+
 class _UnresolvedHarness:
     """Sentinel: the caller has not resolved the session harness yet."""
 
@@ -3652,6 +3756,45 @@ async def _persist_relay_reported_model(
     )
 
 
+# Estimates kept per session. 200 × (32-hex id + 6-decimal float) stays near 12 KB of
+# JSON, far below the 64 KB usage column, so they never fail the authoritative write.
+_MAX_SUBAGENT_COSTS = 200
+_CONVERSATION_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
+    """
+    Read the well-formed entries of an optional ``subagent_costs_usd`` map.
+
+    The estimates are display-only, so a malformed map or entry is dropped
+    rather than failing the report whose authoritative costs it rides along.
+
+    :param data: The ``external_session_usage`` event ``data`` dict.
+    :returns: ``{child_id: usd}`` for conversation ids with finite
+        non-negative numbers, rounded to 6 decimals; empty when the key is
+        absent or holds no such entry.
+    """
+    raw = data.get("subagent_costs_usd")
+    if not isinstance(raw, dict):
+        return {}
+    costs: dict[str, float] = {}
+    for child_id, value in raw.items():
+        if (
+            not isinstance(child_id, str)
+            or not _CONVERSATION_ID_RE.fullmatch(child_id)
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
+            continue
+        try:
+            cost = float(value)
+        except OverflowError:  # an integer too large for a float
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            costs[child_id] = round(cost, 6)
+    return costs
+
+
 def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
@@ -3698,6 +3841,12 @@ def _persist_native_cumulative_usage(
       a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
+    - ``subagent_costs_usd`` — display-only per-child estimates, e.g.
+      claude-native's ``{"<child conversation id>": 0.55}``. This session's
+      own cost already includes them, so they are stored apart (each child's
+      maximum, for at most :data:`_MAX_SUBAGENT_COSTS` children) and never
+      summed into totals, policy or the daily rollup. Malformed entries are
+      dropped, never rejected.
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -3721,6 +3870,7 @@ def _persist_native_cumulative_usage(
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
+    subagent_costs = _subagent_costs_from_report(data)
     tokens_by_model = _cumulative_tokens_by_model(data)
     if (
         cost is None
@@ -3917,6 +4067,14 @@ def _persist_native_cumulative_usage(
     # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
+    if subagent_costs:
+        stored = current.get("subagent_costs_usd")
+        merged: dict[str, float] = dict(stored) if isinstance(stored, dict) else {}
+        for child_id, child_cost in subagent_costs.items():
+            # Past the cap, new children stay unestimated; known ones keep updating.
+            if child_id in merged or len(merged) < _MAX_SUBAGENT_COSTS:
+                merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
+        current["subagent_costs_usd"] = merged
 
     # Per-model token growth a Claude host reports alongside its cost. The
     # baseline is monotonic per model, so a retried post adds nothing and a
@@ -9966,6 +10124,8 @@ def _build_native_terminal_message_event(
     }
     if agent_revision is not None:
         event["agent_revision"] = agent_revision
+    if body.workflow_run_id is not None:
+        event["workflow_run_id"] = body.workflow_run_id
     if data.auto_retry is not None:
         event["auto_retry"] = data.auto_retry.model_dump(mode="json")
     # The web's stable id for this message rides along so the runner can name
@@ -10117,12 +10277,15 @@ async def _forward_native_terminal_message(
         forward_timeout += 5.0
         if before_forward is not None:
             await before_forward()
+        event_path = (
+            f"/v1/sessions/{session_id}/workflow-control"
+            if body.workflow_run_id is not None
+            else f"/v1/sessions/{session_id}/events"
+        )
         # The websocket transport does not apply HTTPX's per-request timeout.
         async with asyncio.timeout(forward_timeout if confirm else None):
             resp = await runner_client.post(
-                f"/v1/sessions/{session_id}/events?stream=true"
-                if confirm
-                else f"/v1/sessions/{session_id}/events",
+                f"{event_path}?stream=true" if confirm else event_path,
                 json=event,
                 timeout=forward_timeout,
                 **forward_options,
@@ -10147,7 +10310,7 @@ async def _forward_native_terminal_message(
             extra={"session_id": session_id},
         )
         error_type = (
-            HTTPException
+            NativeForwardRejected
             if isinstance(exc, (TunnelRequestNotSent, httpx.ConnectError, httpx.ConnectTimeout))
             else _NativeForwardReplyLost
         )
@@ -10166,7 +10329,7 @@ async def _forward_native_terminal_message(
             resp.text,
             extra={"session_id": session_id},
         )
-        raise HTTPException(
+        raise NativeForwardRejected(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed ({resp.status_code})",
         )
@@ -10190,7 +10353,8 @@ async def _forward_native_terminal_message(
             failure.message,
             extra={"session_id": session_id},
         )
-        raise HTTPException(
+        failure_type = NativeForwardRejected if failure.undelivered else HTTPException
+        raise failure_type(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed: {failure.message}",
         )
@@ -10771,79 +10935,85 @@ async def _forward_event_to_runner(
         and annotation_lookup is not None
         and await asyncio.to_thread(annotation_lookup, session_id, startup_input_id) is not None
     )
-    # A card replay after persistence would create a second transcript item.
-    if before_forward is not None:
-        await before_forward()
-    if annotation_pending:
-        assert startup_input_id is not None
-        canonical = await asyncio.to_thread(
-            conversation_store.get_item, session_id, startup_input_id
-        )
-        if (
-            canonical is None
-            or canonical.response_id != PENDING_INPUT_RESPONSE_ID
-            or canonical.status != "incomplete"
-        ):
-            raise HTTPException(409, "Annotation input owner changed")
-        persisted_items = [canonical]
-    elif startup_attempt is not None or (
-        startup_context is not None and startup_context.recovery_id is not None
-    ):
-        canonical = (
-            await asyncio.to_thread(conversation_store.get_item, session_id, startup_input_id)
-            if startup_input_id is not None
-            else None
-        )
-        if (
-            canonical is None
-            or canonical.id != startup_input_id
-            or canonical.response_id != PENDING_INPUT_RESPONSE_ID
-            or canonical.status != "incomplete"
-        ):
-            raise HTTPException(409, "Startup input owner changed")
-        persisted_items = [canonical]
-    elif sdk_peer or retry_guard is not None or final_input is not None:
-        # The peer store owns undelivered input. Only an SDK accepted receipt
-        # may put it in conversation history, where recovery could replay it.
-        persisted_items = [
-            ConversationItem(
-                id=retry_guard.input_id
-                if retry_guard
-                else (
-                    final_input.input_id
-                    if final_input
-                    else body.data["peer_delivery"]["attempt_id"]
-                ),
-                type=item.type,
-                response_id=turn_id,
-                data=item.data,
-                status="completed",
-                created_at=now_epoch(),
+
+    async def persist_input() -> list[ConversationItem]:
+        nonlocal item
+        # A card replay after persistence would create a second transcript item.
+        if before_forward is not None:
+            await before_forward()
+        if annotation_pending:
+            assert startup_input_id is not None
+            canonical = await asyncio.to_thread(
+                conversation_store.get_item, session_id, startup_input_id
             )
-        ]
-    else:
-        persisted_items = await asyncio.to_thread(
-            conversation_store.append,
-            session_id,
-            [item],
-        )
-    if (
-        item.stable_id is not None
-        and persisted_items[0].deduplicated
-        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
-    ):
-        # A persisted retry may still need forwarding if the first attempt
-        # failed before reaching the runner. A different body under the id
-        # (a pre-adoption web bundle resending an edited restored draft) is a
-        # new message: give it a store-assigned id so it runs under the item
-        # that holds it.
-        item = _build_new_item(body, turn_id, created_by=created_by)
-        persisted_items = await asyncio.to_thread(
-            conversation_store.append,
-            session_id,
-            [item],
-        )
-    if not sdk_peer:
+            if (
+                canonical is None
+                or canonical.response_id != PENDING_INPUT_RESPONSE_ID
+                or canonical.status != "incomplete"
+            ):
+                raise HTTPException(409, "Annotation input owner changed")
+            persisted_items = [canonical]
+        elif startup_attempt is not None or (
+            startup_context is not None and startup_context.recovery_id is not None
+        ):
+            canonical = (
+                await asyncio.to_thread(conversation_store.get_item, session_id, startup_input_id)
+                if startup_input_id is not None
+                else None
+            )
+            if (
+                canonical is None
+                or canonical.id != startup_input_id
+                or canonical.response_id != PENDING_INPUT_RESPONSE_ID
+                or canonical.status != "incomplete"
+            ):
+                raise HTTPException(409, "Startup input owner changed")
+            persisted_items = [canonical]
+        elif sdk_peer or retry_guard is not None or final_input is not None:
+            # The peer store owns undelivered input. Only an SDK accepted receipt
+            # may put it in conversation history, where recovery could replay it.
+            persisted_items = [
+                ConversationItem(
+                    id=retry_guard.input_id
+                    if retry_guard
+                    else (
+                        final_input.input_id
+                        if final_input
+                        else body.data["peer_delivery"]["attempt_id"]
+                    ),
+                    type=item.type,
+                    response_id=turn_id,
+                    data=item.data,
+                    status="completed",
+                    created_at=now_epoch(),
+                )
+            ]
+        else:
+            persisted_items = await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                [item],
+            )
+        if (
+            item.stable_id is not None
+            and persisted_items[0].deduplicated
+            and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
+        ):
+            # A persisted retry may still need forwarding if the first attempt
+            # failed before reaching the runner. A different body under the id
+            # (a pre-adoption web bundle resending an edited restored draft) is a
+            # new message: give it a store-assigned id so it runs under the item
+            # that holds it.
+            item = _build_new_item(body, turn_id, created_by=created_by)
+            persisted_items = await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                [item],
+            )
+        return persisted_items
+
+    persisted_items = await persist_input() if body.workflow_run_id is None else None
+    if not sdk_peer and persisted_items is not None:
         await _seed_missing_title_from_user_message(conv, item, conversation_store)
     # Don't publish status="running" or input.consumed here —
     # wait until after the forward to the runner succeeds.
@@ -10923,12 +11093,10 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
-        # Id of the item just persisted for this turn. On a cold runner
-        # cache the runner reloads history (which includes this item in
-        # PRE-resolution form) and drops it by id, appending its own
-        # resolved copy — id-based dedup, not a role/content guess.
-        "persisted_item_id": persisted_items[0].id,
     }
+    runner_body.pop("workflow_run_id", None)
+    if body.workflow_run_id is not None:
+        runner_body["workflow_run_id"] = body.workflow_run_id
     runner_body.pop("recovered", None)
     if startup_context is not None and startup_context.recovery_id is not None:
         runner_body.update(
@@ -10940,30 +11108,34 @@ async def _forward_event_to_runner(
     runner_body.pop("input_generation", None)
     runner_body.pop("_input_admission_required", None)
     runner_body.pop("_runtime_notice", None)
-    if body.data.get("_input_admission_required") is True:
-        runner_body["input_admission_required"] = True
-        runner_body["input_id"] = persisted_items[0].id
-    if await _resolve_harness_async(conv) == "pi":
-        runner_body["input_admission_required"] = True
-        runner_body.setdefault("input_id", persisted_items[0].id)
-        runner_body.setdefault("turn_id", "turn_" + persisted_items[0].id)
-    if conv.parent_conversation_id is not None and not runner_body.get("recovered"):
-        runner_body.update(
-            turn_id="turn_" + persisted_items[0].id,
-            input_id=persisted_items[0].id,
-        )
-        identity = TurnIdentity.from_data(runner_body)
-        await asyncio.to_thread(
-            conversation_store.set_labels, session_id, identity.identity_labels()
-        )
+    requires_pi_input = await _resolve_harness_async(conv) == "pi"
+
+    async def apply_input_identity(input_id: str) -> None:
+        if body.data.get("_input_admission_required") is True:
+            runner_body["input_admission_required"] = True
+            runner_body["input_id"] = input_id
+        if requires_pi_input:
+            runner_body["input_admission_required"] = True
+            runner_body.setdefault("input_id", input_id)
+            runner_body.setdefault("turn_id", "turn_" + input_id)
+        if conv.parent_conversation_id is not None and not runner_body.get("recovered"):
+            runner_body.update(
+                turn_id="turn_" + input_id,
+                input_id=input_id,
+            )
+            identity = TurnIdentity.from_data(runner_body)
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, identity.identity_labels()
+            )
+
+    if persisted_items is not None:
+        await apply_input_identity(persisted_items[0].id)
     runner_body.pop("startup_attempt", None)
     runner_body.pop("startup_required", None)
     if startup_required or startup_attempt is not None:
         runner_body["startup_required"] = True
     if startup_attempt is not None:
         runner_body["startup_attempt"] = startup_attempt.model_dump(mode="json")
-    if sdk_peer:
-        runner_body.pop("persisted_item_id")
     if runner_body["type"] == "message" and runner_body.get("role") == "user":
         archive_states = await runner_archive_states_for_conversation(
             conv,
@@ -11306,6 +11478,18 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    if persisted_items is None:
+        from omnigent.server.session_journal import require_current_workflow_run
+
+        await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
+        persisted_items = await persist_input()
+        if not sdk_peer:
+            await _seed_missing_title_from_user_message(conv, item, conversation_store)
+        await apply_input_identity(persisted_items[0].id)
+    # A cold runner replaces this stored, unresolved input with the resolved body by ID.
+    if not sdk_peer:
+        runner_body["persisted_item_id"] = persisted_items[0].id
+
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
@@ -11333,7 +11517,9 @@ async def _forward_event_to_runner(
         ) or _input_admission_deadline(body.data)
         await claim_retry_forward(session_id, runner_body, deadline=forward_deadline)
         _forward_resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
+            f"/v1/sessions/{session_id}/workflow-control"
+            if body.workflow_run_id is not None
+            else f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=httpx.Timeout(
                 max(0.001, forward_deadline - time.time()) + 5.0,
@@ -11863,6 +12049,8 @@ async def _forward_codex_side_chat_turn(
     child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
     if not parent_id or not child_thread_id:
         return None
+    if body.workflow_run_id is not None:
+        raise HTTPException(409, "Workflow controls are unavailable in Codex side chats.")
     if before_forward is not None:
         await before_forward()
     resp = await runner_client.post(
@@ -12015,10 +12203,12 @@ async def _dispatch_session_event_to_runner_impl(
         (claude-native message bypass).
     """
     from omnigent.server.host_load_queue import require_start_allowed
+    from omnigent.server.session_journal import require_current_workflow_run
 
     require_start_allowed(conv)
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
+    await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
     usage_admission = None
     if body.type == "message":
         # G1 usage cutover gate: refuse while the session's domain (or any
@@ -12358,6 +12548,10 @@ async def _dispatch_session_event_to_runner_impl(
         forwarded = False
         native_receipt_pending = False
         try:
+            # Native initialization or model routing may outlast the run shown by the UI.
+            await require_current_workflow_run(
+                conversation_store, session_id, body.workflow_run_id
+            )
             if taken_notes is not None and (
                 pending_id is None
                 or not pending_inputs.set_injected_prefix(
@@ -16195,7 +16389,7 @@ async def _create_session_from_existing_agent(
     body: SessionCreateInput,
     request: Request,
     **kwargs: Any,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER, admit_create
 
     if request.headers.get(CHOICE_PROTOCOL_HEADER) != "1":
@@ -16267,7 +16461,7 @@ async def _create_session_from_existing_agent_impl(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
 
@@ -16305,13 +16499,15 @@ async def _create_session_from_existing_agent_impl(
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP
         services of its own starts with the source's.
-    :returns: The newly created session snapshot and its conversation row.
+    :returns: The newly created session snapshot, its conversation row, and
+        the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        server_sandbox_providers,
         session_creation_source_tier,
     )
 
@@ -16443,6 +16639,7 @@ async def _create_session_from_existing_agent_impl(
         parent_host_id=parent_host_id,
         calling_path_label=calling_path_label,
         warnings=calling_warnings,
+        launchable_sandbox_providers=server_sandbox_providers(request),
     )
     body = project_resolution.body
     project_id = project_resolution.project_id
@@ -17322,7 +17519,9 @@ async def _create_session_from_existing_agent_impl(
     if body.sub_agent_name:
         try:
             validated_launch_args = (
-                _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
+                _derive_terminal_launch_args_from_spec(sub_spec)
+                if sub_spec is not None and _spec_harness(sub_spec) == selected_harness
+                else None
             )
         except ValueError as exc:
             raise OmnigentError(
@@ -17395,7 +17594,11 @@ async def _create_session_from_existing_agent_impl(
                 exc_info=True,
             )
 
-    if needs_launch_args_from_spec and own_spec is not None:
+    if (
+        needs_launch_args_from_spec
+        and own_spec is not None
+        and _spec_harness(own_spec) == selected_harness
+    ):
         try:
             validated_launch_args = _derive_terminal_launch_args_from_spec(
                 own_spec, headless_defaults=False
@@ -18053,7 +18256,7 @@ async def _create_session_from_existing_agent_impl(
     if choice_admission is not None and choice_admission.committed_drain:
         assert response.session_choice is not None
         response.session_choice["reason"] = choice_admission.choice.reason
-    return response, conv
+    return response, conv, body
 
 
 def _create_session_from_bundle(
@@ -19605,6 +19808,7 @@ async def _run_runner_status_probe(
                                 raw == "idle" and previous in (None, "running", "waiting")
                             ),
                         )
+                        _publish_child_status_to_parent(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"

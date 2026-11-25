@@ -808,6 +808,19 @@ def error_message_text(step: dict[str, object]) -> str | None:
     return f"[antigravity: {detail}]"
 
 
+def _is_internal_empty_output_retry(step: dict[str, object]) -> bool:
+    message = step.get("errorMessage")
+    if not isinstance(message, dict) or message.get("shouldShowUser") is True:
+        return False
+    error = message.get("error")
+    if not isinstance(error, dict):
+        return False
+    diagnostic = error.get("fullError")
+    return isinstance(diagnostic, str) and (
+        "NewEmptyOutputContinuationCheckHookWithMaxRetries" in diagnostic
+    )
+
+
 def _planner_error_event(
     *, conversation_id: str, step_idx: int, step: dict[str, object]
 ) -> OutboundEvent:
@@ -1073,6 +1086,10 @@ def map_step_to_events(
 
     error_text = error_message_text(step)
     if error_text is not None:
+        # A continuation can recover this internal failure. The reader still
+        # reports it as a failed outcome if the cascade ends on the error.
+        if _is_internal_empty_output_retry(step):
+            return []
         return [
             _message_event(
                 conversation_id=conversation_id,

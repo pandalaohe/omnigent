@@ -266,6 +266,7 @@ async def test_transport_aclose_is_noop() -> None:
     ("method", "path", "reported"),
     [
         pytest.param("POST", "/v1/sessions/conv_1/events", True, id="session-event"),
+        pytest.param("POST", "/v1/sessions/conv_1/workflow-control", True, id="workflow-control"),
         pytest.param("GET", "/v1/sessions/conv_1/events", False, id="read"),
         pytest.param("POST", "/v1/sessions/conv_1/resources", False, id="other-post"),
     ],

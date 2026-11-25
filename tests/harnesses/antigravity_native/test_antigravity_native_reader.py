@@ -3706,42 +3706,115 @@ def test_turn_close_true_for_error_planner() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continuation_retry", [False, True], ids=["normal", "continuation-retry"])
 async def test_a_streamed_tool_turn_stays_running_until_the_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
+    continuation_retry: bool,
 ) -> None:
-    """
-    REGRESSION: the spinner must not clear when agy dispatches a tool.
-
-    The whole streamed turn, in the live order: the user's prompt, the planner
-    that dispatches a tool, the tool's result, then the answering planner. IDLE
-    belongs at the END of that sequence — one edge, after the answer.
-
-    The predicate test below pins the cause; this pins the symptom the user
-    actually saw, which is what the suite was missing: the dispatching planner
-    fired IDLE, so the session showed idle while its tools kept running, and
-    RUNNING could not re-open (it is gated on USER_INPUT).
-    """
+    """A tool turn stays running through a transient retry until its final answer."""
+    frames = [_frame([_load("user_input")])]
+    if continuation_retry:
+        frames.append(
+            _frame(
+                [
+                    {
+                        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+                        "status": "CORTEX_STEP_STATUS_DONE",
+                        "metadata": {
+                            "sourceTrajectoryStepInfo": {
+                                "trajectoryId": _CASCADE_ID,
+                                "stepIndex": 5,
+                            }
+                        },
+                        "errorMessage": {
+                            "error": {
+                                "modelErrorMessage": (
+                                    "model output error: model output must contain either "
+                                    "output text or tool calls, these cannot both be empty, "
+                                    "please try again"
+                                ),
+                                "fullError": (
+                                    "google3/third_party/jetski/cortex/executors/posthooks/"
+                                    "posthooks.NewEmptyOutputContinuationCheckHookWithMaxRetries.func1"
+                                ),
+                            }
+                        },
+                    }
+                ]
+            )
+        )
+    frames.extend(
+        [
+            _frame([_load("stream_planner_tool_call")]),
+            _frame([_load("stream_run_command_done")]),
+            _frame([_load("stream_planner_text_done")]),
+        ]
+    )
     sink = _PostSink()
-    await _run_stream(
-        bridge_dir=_bridge_dir(tmp_path),
-        sink=sink,
-        stream=_FrameScript(
-            [
-                _frame([_load("user_input")]),
-                _frame([_load("stream_planner_tool_call")]),
-                _frame([_load("stream_run_command_done")]),
-                _frame([_load("stream_planner_text_done")]),
-            ]
+    answered = False
+
+    def summaries(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        status = "CASCADE_RUN_STATUS_IDLE" if answered else "CASCADE_RUN_STATUS_RUNNING"
+        return {"trajectorySummaries": {_CASCADE_ID: {"status": status}}}
+
+    async def stream(_port: int, _cascade_id: str) -> AsyncIterator[dict[str, Any]]:
+        nonlocal answered
+        for frame in frames:
+            yield frame
+        answered = True
+        # An open native stream gives the independent completion detector time
+        # to read the settled cascade and its final snapshot.
+        while "idle" not in sink.statuses():
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", summaries)
+    await asyncio.wait_for(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=stream,
+            poll_steps=_StepScript([[_load("stream_planner_text_done")]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
         ),
-        poll_steps=_StepScript([[]]),
-        monkeypatch=monkeypatch,
-        iterations=1,
+        timeout=5,
     )
 
-    assert sink.statuses() == ["running"]
-    assert "function_call_output" in sink.item_types()
+    assert sink.statuses() == ["running", "idle"], (
+        f"the turn must open once and close once; got {sink.statuses()}"
+    )
+    # WHERE the idle edge lands is the whole point — the count alone is
+    # identical whether it fires at dispatch or after the answer, because the
+    # second close is deduped by ``turn_active``. Assert its position.
+    timeline = [
+        f"status:{data['status']}"
+        if event_type == "external_session_status"
+        else f"item:{data.get('item_type')}"
+        for event_type, data in sink.posts
+        if event_type in ("external_session_status", "external_conversation_item")
+    ]
+    assert timeline.index("status:idle") > timeline.index("item:function_call_output"), (
+        f"IDLE fired before the tool finished — the spinner cleared mid-turn: {timeline}"
+    )
+    messages = [
+        data
+        for kind, data in sink.posts
+        if kind == "external_conversation_item"
+        and data.get("item_type") == "message"
+        and data["item_data"].get("role") == "assistant"
+    ]
+    assert len(messages) == 1
+    assert "error" not in str(messages[0]).lower()
+    assert "error" not in sink.item_types()
+    answer_index = sink.posts.index(("external_conversation_item", messages[0]))
+    idle_index = next(
+        index
+        for index, (kind, data) in enumerate(sink.posts)
+        if kind == "external_session_status" and data.get("status") == "idle"
+    )
+    assert answer_index < idle_index
 
 
 def test_turn_close_false_for_streamed_planner_that_dispatched_a_tool() -> None:

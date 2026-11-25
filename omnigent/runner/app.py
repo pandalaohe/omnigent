@@ -139,6 +139,11 @@ from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMP
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+from omnigent.runner.journal_tools import (
+    invalidate_server_workflow_flag,
+    server_workflows_enabled,
+    workflow_run_is_current,
+)
 from omnigent.runner.launch_failure import (
     TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
     FailureDiagnosis,
@@ -2291,6 +2296,7 @@ def create_runner_app(
     process_manager: HarnessProcessManager | None = None,
     spec_resolver: SpecResolver | None = None,
     server_client: httpx.AsyncClient,
+    mcp_reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     terminal_registry: TerminalRegistry | None = None,
     resource_registry: SessionResourceRegistry | None = None,
     runner_workspace: Path | None = None,
@@ -2315,6 +2321,8 @@ def create_runner_app(
         elicitation/approval forwarding.
         In-process: pointed at the Omnigent ASGI app.
         Out-of-process: pointed at the server's HTTP URL.
+    :param mcp_reattach_client_factory: Open an independently owned server client
+        after a tunnel reconnect, preserving server authentication and routing.
     :param terminal_registry: TerminalRegistry instance for
         runner-local terminal tool dispatch (Phase 2).
         ``None`` → terminal tools relay upstream.
@@ -2524,7 +2532,7 @@ def create_runner_app(
     _session_acp_mode_selection: dict[str, str] = {}
     _session_approval_mode: dict[str, str] = {}
     _session_service_tier: dict[str, str] = {}
-    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+    _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     # session_id → worktree path, from the session-init envelope or the REST
     # snapshot. Absence leaves git readers on the launch directory they use
@@ -4404,6 +4412,7 @@ def create_runner_app(
                 _session_harness_overrides.get(session_id),
                 await _session_runtime_cwd(session_id),
                 _resolved_spec_workdir(entry),
+                workflows_enabled=await server_workflows_enabled(server_client),
             )
         except (OSError, OmnigentError, ValueError, RuntimeError):
             # A discovery failure must not cost the session its whole tool surface.
@@ -5325,7 +5334,11 @@ def create_runner_app(
                         extra={"session_id": session_id},
                     )
                     if bundle_dir is not None:
-                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                        _ensure_orchestrator_skills_in_bundle(
+                            bundle_dir,
+                            spec,
+                            workflows_enabled=await server_workflows_enabled(server_client),
+                        )
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -5386,7 +5399,11 @@ def create_runner_app(
                         bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
                         skills_filter = getattr(spec, "skills_filter", "all")
                     if bundle_dir is not None and spec is not None:
-                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                        _ensure_orchestrator_skills_in_bundle(
+                            bundle_dir,
+                            spec,
+                            workflows_enabled=await server_workflows_enabled(server_client),
+                        )
                     # Preserve the inline arm's use of the outer spec_entry (not the
                     # locally-resolved spec) as agent_spec.
                     return dataclasses.replace(
@@ -5736,9 +5753,7 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if harness_name in {"claude-sdk", "codex", "pi"} and _trailing_sdk_peer_item(
-                raw_history
-            ):
+            if _trailing_nonreplayable_item(raw_history, harness_name):
                 needs_turn = False
             if (
                 needs_turn
@@ -5790,10 +5805,7 @@ def create_runner_app(
                 not execution_seen
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
-                and not (
-                    harness_name in {"claude-sdk", "codex", "pi"}
-                    and _trailing_sdk_peer_item(raw_history)
-                )
+                and not _trailing_nonreplayable_item(raw_history, harness_name)
                 and await admit_recovery_turn()
             ):
                 recovery_turn = "recovery_prompt"
@@ -6387,6 +6399,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -6519,16 +6532,22 @@ def create_runner_app(
             return item_id if isinstance(item_id, str) and item_id else None
         return None
 
-    def _trailing_sdk_peer_item(items: list[_JsonObject]) -> bool:
-        """A persisted peer envelope alone cannot authorize an SDK recovery turn."""
+    def _trailing_nonreplayable_item(items: list[_JsonObject], harness_name: str | None) -> bool:
+        """Persisted peer inputs and workflow controls cannot start a recovery turn."""
         for item in reversed(items):
             if item.get("type") not in _HISTORY_INPUT_ITEM_TYPES:
                 continue
             return (
                 item.get("type") == "message"
                 and item.get("role", "user") == "user"
-                and isinstance(item.get("peer_message_id"), str)
-                and bool(item["peer_message_id"])
+                and (
+                    bool(item.get("workflow_run_id"))
+                    or (
+                        harness_name in {"claude-sdk", "codex", "pi"}
+                        and isinstance(item.get("peer_message_id"), str)
+                        and bool(item["peer_message_id"])
+                    )
+                )
             )
         return False
 
@@ -7659,7 +7678,10 @@ def create_runner_app(
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
         source = body or {}
         _admission_history_entries.pop(conv_id, None)
-        if history_entries is not None and source.get("input_admission_required") is True:
+        if history_entries is not None and (
+            source.get("input_admission_required") is True
+            or source.get("workflow_run_id") is not None
+        ):
             _admission_history_entries[conv_id] = history_entries
         identity = TurnIdentity.from_data(source).model_dump()
         if identity["turn_id"] is None:
@@ -8893,6 +8915,7 @@ def create_runner_app(
                 _is_native_harness(session_id)
                 or any(_is_sdk_compact_body(b) for b in buf)
                 or any(b.get("input_admission_required") is True for b in buf)
+                or any(b.get("workflow_run_id") is not None for b in buf)
             ):
                 drained = [buf.pop(0)]
                 if not buf:
@@ -9818,6 +9841,8 @@ def create_runner_app(
             start_tool_relay,
         )
 
+        workflows_enabled = await server_workflows_enabled(server_client)
+
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
         except OmnigentError:
@@ -9827,9 +9852,10 @@ def create_runner_app(
             # surface would withdraw spec-gated tools the agent does grant.
             # Keep it: once resolution recovers, the resolved spec differs
             # from the stored one and the relay rebuilds then.
-            if session_id in _session_comment_relays:
+            binding = _session_comment_relays.get(session_id)
+            if binding is not None and binding.workflows_enabled == workflows_enabled:
                 return
-            spec_entry = None
+            spec_entry = binding.spec_entry if binding is not None else None
 
         # The bridge dir, when the caller pinned it down or handed over the
         # labels it comes from. Deriving it any other way costs a server
@@ -9861,6 +9887,7 @@ def create_runner_app(
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
             and (current.pi_scope_relay is not None) == pi_scoped_relay
+            and current.workflows_enabled == workflows_enabled
             and known_bridge_dir is None
             and not (retry_mcp_discovery and current.mcp_discovery_failed)
         ):
@@ -9893,6 +9920,7 @@ def create_runner_app(
         if (
             current is not None
             and current.spec_entry is spec_entry
+            and current.workflows_enabled == workflows_enabled
             and current.bridge_dir == bridge_dir
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
@@ -9901,7 +9929,10 @@ def create_runner_app(
         ):
             return
 
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.runner.tool_dispatch import (
+            build_native_relay_tool_schemas,
+            filter_workflow_tool_schemas,
+        )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
@@ -9927,6 +9958,7 @@ def create_runner_app(
                         or {"type": "object", "properties": {}},
                     }
                 )
+        relay_schemas = filter_workflow_tool_schemas(relay_schemas, enabled=workflows_enabled)
         mcp_discovery_failed = False
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
@@ -9944,6 +9976,7 @@ def create_runner_app(
             if (
                 current is not None
                 and current.spec_entry is spec_entry
+                and current.workflows_enabled == workflows_enabled
                 and current.bridge_dir == bridge_dir
                 and current.peer_messaging_enabled == peer_for_relay
                 and current.session_open_enabled == open_for_relay
@@ -9965,6 +9998,7 @@ def create_runner_app(
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
+                reattach_client_factory=mcp_reattach_client_factory,
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -10190,6 +10224,7 @@ def create_runner_app(
             session_open_enabled=open_for_relay,
             pi_scope_relay=pi_scope_relay,
             mcp_discovery_failed=mcp_discovery_failed,
+            workflows_enabled=workflows_enabled,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -10850,6 +10885,7 @@ def create_runner_app(
                     conv,
                     server_client,
                     execution_registry=mcp_execution_registry,
+                    reattach_client_factory=mcp_reattach_client_factory,
                 )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
@@ -10878,7 +10914,12 @@ def create_runner_app(
                         extra={"session_id": conv},
                     )
 
-        _spec_tools = _session_tool_schemas.get(conv) or []
+        from omnigent.runner.tool_dispatch import filter_workflow_tool_schemas
+
+        _spec_tools = filter_workflow_tool_schemas(
+            _session_tool_schemas.get(conv) or [],
+            enabled=await server_workflows_enabled(server_client),
+        )
         # Request-driven harnesses should not advertise browser tools when no
         # renderer is subscribed. Native harnesses ignore this per-turn list
         # and keep their session-scoped relay surface; their calls still use
@@ -10987,6 +11028,7 @@ def create_runner_app(
                 harness_body,
                 conv,
                 dispatch=ctx,
+                workflow_run_id=msg_body.get("workflow_run_id"),
             )
         finally:
             _session_init_envelopes.pop(conv, None)
@@ -11117,6 +11159,8 @@ def create_runner_app(
         body: _JsonObject,
         conv_id: str,
         dispatch: TurnDispatch | None = None,
+        *,
+        workflow_run_id: object = None,
     ) -> Response:
         if not await _settle_abandoned_inputs(conv_id):
             return JSONResponse(status_code=409, content={"error": "input_acceptance_unresolved"})
@@ -11406,6 +11450,7 @@ def create_runner_app(
                 conv_id,
                 server_client,
                 execution_registry=mcp_execution_registry,
+                reattach_client_factory=mcp_reattach_client_factory,
             )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
@@ -11604,6 +11649,7 @@ def create_runner_app(
             if not _owns_live_turn():
                 return
             event_body = _wrap_as_message_event(_instr_body)
+            event_body.pop("workflow_run_id", None)
             usage_admission = body.get("usage_admission")
             if isinstance(usage_admission, dict) and harness_name in {
                 "codex",
@@ -11735,6 +11781,39 @@ def create_runner_app(
             try:
                 if not _owns_live_turn():
                     return
+                if workflow_run_id is not None:
+                    try:
+                        current = await workflow_run_is_current(
+                            server_client, conv_id, workflow_run_id
+                        )
+                    except asyncio.CancelledError:
+                        if _owns_live_turn() and conv_id in _active_turns:
+                            _on_proxy_stream_end(conv_id, cancelled=True, admission_refused=True)
+                        raise
+                    if not _owns_live_turn() or conv_id not in _active_turns:
+                        return
+                    if conv_id in _interrupted_sessions:
+                        _on_proxy_stream_end(conv_id, cancelled=True, admission_refused=True)
+                        return
+                    if not current:
+                        error = {
+                            "code": "workflow_run_unconfirmed",
+                            "message": (
+                                "Could not confirm this workflow run is still current. "
+                                "Refresh the runs and try again."
+                            ),
+                            "undelivered": True,
+                        }
+                        event = _response_failed_payload(error, input_identity=turn_input_identity)
+                        _publish_event(conv_id, event)
+                        _on_proxy_stream_end(
+                            conv_id,
+                            error=error,
+                            input_identity=turn_input_identity,
+                            admission_refused=True,
+                        )
+                        yield _encode_sse_event(event)
+                        return
                 _turn_dispatch_cancellers[conv_id] = _dispatch_owner
                 execution_key = (conv_id, str(event_body.get("input_id", "")))
                 execution = _input_execution_claims.get(execution_key)
@@ -12168,6 +12247,7 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            reattach_client_factory=mcp_reattach_client_factory,
                                         )
                                         _track_dispatch_task(
                                             _asyncio.create_task(
@@ -12592,10 +12672,23 @@ def create_runner_app(
         response.headers["X-Omnigent-Pending-Input-Claim"] = "1"
         return response
 
+    @app.post("/v1/sessions/{conversation_id}/workflow-control")
+    async def post_workflow_control(
+        conversation_id: str, request: Request, stream: bool = Query(default=False)
+    ) -> Response:
+        # An older runner has no route, so it cannot accept an unchecked control.
+        response = await _post_session_events(
+            conversation_id, request, stream, workflow_control=True
+        )
+        response.headers["X-Omnigent-Pending-Input-Claim"] = "1"
+        return response
+
     async def _post_session_events(
         conversation_id: str,
         request: Request,
         stream: bool,
+        *,
+        workflow_control: bool = False,
     ) -> Response:
         if process_manager is None:
             return JSONResponse(
@@ -12611,6 +12704,13 @@ def create_runner_app(
             )
 
         body = await request.json()
+        if workflow_control and (
+            not isinstance(body, dict)
+            or body.get("type") != "message"
+            or body.get("workflow_run_id") is None
+            or body.get("codex_side_thread_id") is not None
+        ):
+            return JSONResponse(status_code=422, content={"error": "invalid_workflow_control"})
         if isinstance(body, dict):
             from omnigent.harnesses.codex_native.shell_input import (
                 CODEX_SHELL_AUTHORIZED_HEADER,
@@ -12776,6 +12876,7 @@ def create_runner_app(
                                     "detail": "Interrupt thread does not belong to this session.",
                                 },
                             )
+                    assert isinstance(_side_turn_id, str)
                     await side_chat.interrupt_side_turn(
                         _side_client, str(_side_thread_id), _side_turn_id
                     )
@@ -13096,6 +13197,7 @@ def create_runner_app(
                     _can_forward = (
                         not _native
                         and not _awaiting_approval
+                        and message_body.get("workflow_run_id") is None
                         and conversation_id in _live_response_id
                     )
                     if _can_forward:
@@ -13285,7 +13387,9 @@ def create_runner_app(
                             _cli_runtime_lifecycle.mark_starting(conversation_id)
                             _cli_runtime_lifecycle.mark_live(conversation_id)
                             response = await _stream_message_to_harness(
-                                message_body, conversation_id
+                                message_body,
+                                conversation_id,
+                                workflow_run_id=message_body.get("workflow_run_id"),
                             )
                     except BaseException:
                         if (
@@ -14912,10 +15016,11 @@ def create_runner_app(
             return None
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
+        workflows_enabled = await server_workflows_enabled(server_client)
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            expires_at, cached_skills = cached
-            if time.monotonic() < expires_at:
+            expires_at, cached_skills, cached_workflows_enabled = cached
+            if time.monotonic() < expires_at and cached_workflows_enabled == workflows_enabled:
                 return cached_skills
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
@@ -14931,10 +15036,12 @@ def create_runner_app(
             _resolved_spec_workdir(entry),
             # Without a routed override the menu falls back to this spec's harness.
             harness=_session_harness_overrides.get(session_id),
+            workflows_enabled=workflows_enabled,
         )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
             skills,
+            workflows_enabled,
         )
         return skills
 
@@ -15479,6 +15586,7 @@ def create_runner_app(
 
     async def _catch_up_scan() -> None:
         global _server_accepts_inferred_status, _server_accepts_input_only_failures
+        invalidate_server_workflow_flag(server_client)
         # The new connection may reach an older server; it must accept inferred status
         # and input-only failures anew.
         _server_accepts_inferred_status = False
@@ -15570,9 +15678,8 @@ def create_runner_app(
                         not isinstance(replay_item_id, str)
                         or replay_item_id not in queued_item_ids
                     )
-                    and not (
-                        _session_harness_name(session_id) in {"claude-sdk", "codex", "pi"}
-                        and _trailing_sdk_peer_item(all_new)
+                    and not _trailing_nonreplayable_item(
+                        all_new, _session_harness_name(session_id)
                     )
                 ):
                     _begin_turn_slot(session_id)
@@ -16456,20 +16563,9 @@ def create_runner_app_from_env() -> FastAPI:
     server_url = os.environ.get("RUNNER_SERVER_URL", "").strip()
     if not server_url:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
-    from omnigent_client._http import is_loopback_url
+    from omnigent.cli_auth import open_server_client
 
-    from omnigent.server.permission_tiers import (
-        PERMISSION_PROTOCOL_HEADER,
-        PERMISSION_PROTOCOL_VERSION,
-    )
-
-    server_client = httpx.AsyncClient(
-        base_url=server_url,
-        headers={PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION},
-        timeout=httpx.Timeout(5.0, read=None),
-        # A proxy cannot reach a loopback server, so local targets bypass it.
-        trust_env=not is_loopback_url(server_url),
-    )
+    server_client = open_server_client(server_url, timeout=httpx.Timeout(5.0, read=None))
     return create_runner_app(server_client=server_client)
 
 

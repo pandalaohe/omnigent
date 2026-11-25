@@ -544,7 +544,7 @@ def register_open_routes(
             if body.speed is not None:
                 create_fields["labels"] = {"omnigent.speed_tier": body.speed}
             create_body = ProjectSessionCreateRequest(**create_fields)
-            created, conv = await _create_session_from_existing_agent(
+            created, conv, _resolved = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
                 runner_router,

@@ -81,6 +81,7 @@ import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/native
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
+import { WORKFLOW_QUESTION_PHASE } from "@/lib/sessionJournal";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type {
   AgyPermission,
@@ -123,7 +124,13 @@ const QUESTION_TITLES = [
   ["devin_", "Devin needs your input"],
 ] as const;
 
-function questionPromptTitle(policyName: string, phase: string, fallback: string): string {
+function questionPromptTitle(
+  policyName: string,
+  phase: string,
+  fallback: string,
+  message: string,
+): string {
+  if (phase === WORKFLOW_QUESTION_PHASE && message) return message;
   const match = QUESTION_TITLES.find(
     ([prefix]) => policyName.startsWith(prefix) || phase.startsWith(prefix),
   );
@@ -657,7 +664,12 @@ export function ApprovalCard({
   const askUserQuestionTitle =
     phase === "async_question"
       ? message.trim() || "Agent has questions"
-      : questionPromptTitle(policyName, phase, `${structuredQuestionAgentName} has questions`);
+      : questionPromptTitle(
+          policyName,
+          phase,
+          `${structuredQuestionAgentName} has questions`,
+          message,
+        );
 
   const fileEditDiff = useMemo(
     () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),

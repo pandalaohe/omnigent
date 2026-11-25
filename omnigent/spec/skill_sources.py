@@ -328,6 +328,40 @@ def session_skill_roots(cwd: Path | None, bundle_workdir: Path | None) -> tuple[
     return tuple(roots)
 
 
+# Skills Omnigent ships, each for agents that have the tool group it drives.
+FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
+_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
+
+
+def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
+    """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
+
+    Each lives in ``FRAMEWORK_SKILLS_DIR / name``. Without a spec, return every
+    framework name so reused bundles can remove disabled framework-owned links.
+    """
+    return [
+        name
+        for name, group in _FRAMEWORK_SKILL_GROUPS.items()
+        if spec is None or getattr(spec.tool_groups, group)
+    ]
+
+
+def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
+    """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
+
+    Like bundled skills, they ignore ``skills_filter``; an agent drops one by
+    turning its tool group off, e.g. ``tool_groups.journal: false``.
+    """
+    names = set(framework_skill_names(spec))
+    if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
+        return []
+    return [
+        skill
+        for skill in _discover_skills(FRAMEWORK_SKILLS_DIR, skipped=[])
+        if skill.name in names
+    ]
+
+
 def _session_skills(
     spec: AgentSpec,
     roots: tuple[Path, ...],
@@ -336,6 +370,7 @@ def _session_skills(
     *,
     invocable_only: bool,
     warnings: list[str] | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """One assembly shared by the menu and the loadable registry."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -377,6 +412,13 @@ def _session_skills(
         if resolved_dir is not None:
             seen_dirs.add(resolved_dir)
         merged.append(skill)
+    # Last, so an agent's or user's own skill of the same name wins.
+    if workflows_enabled:
+        merged.extend(
+            skill
+            for skill in framework_skills(spec)
+            if skill.name not in seen and (skill.user_invocable or not invocable_only)
+        )
     return merged
 
 
@@ -387,6 +429,7 @@ def resolve_session_skills(
     *,
     harness: str | None = None,
     warnings: list[str] | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation.
 
@@ -394,7 +437,13 @@ def resolve_session_skills(
         spec's declared harness.
     """
     return _session_skills(
-        spec, roots, bundle_dir, harness, invocable_only=True, warnings=warnings
+        spec,
+        roots,
+        bundle_dir,
+        harness,
+        invocable_only=True,
+        warnings=warnings,
+        workflows_enabled=workflows_enabled,
     )
 
 
@@ -404,6 +453,7 @@ def resolve_session_skill_registry(
     bundle_dir: Path | None,
     *,
     harness: str | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """What ``load_skill`` / ``read_skill_file`` may load for a session.
 
@@ -414,7 +464,9 @@ def resolve_session_skill_registry(
     :param harness: The harness whose sources to use; ``None`` means the
         spec's declared harness.
     """
-    return _session_skills(spec, roots, bundle_dir, harness, invocable_only=False)
+    return _session_skills(
+        spec, roots, bundle_dir, harness, invocable_only=False, workflows_enabled=workflows_enabled
+    )
 
 
 def _read_json(path: Path) -> dict[str, object] | None:

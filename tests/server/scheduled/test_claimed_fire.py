@@ -109,15 +109,21 @@ class _Claimed:
     clock: FakeClock
 
 
-def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
-    """Create a due task and claim its first occurrence, as the scheduler's poll would."""
+def _claim(
+    store: SqlAlchemyScheduledTaskStore, *, one_time: bool = False, **kwargs: Any
+) -> _Claimed:
+    """Create a due task and claim its first occurrence, as the scheduler's poll would.
+
+    *one_time* makes it a ``COUNT=1`` task, such as a reminder, whose claim is its
+    last occurrence and completes it.
+    """
     kwargs.setdefault("workspace", "/repo")
     kwargs.setdefault("host_id", _HOST_ID)
     created = store.create(
         uuid.uuid4().hex,
         "nightly",
         "do the thing",
-        "FREQ=HOURLY",
+        "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         None,
         _AGENT_ID,
         "UTC",
@@ -129,7 +135,7 @@ def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
     run = store.claim_scheduled_run(
         task,
         now=task.next_run_at,
-        next_run_at=task.next_run_at + 3600,
+        next_run_at=None if one_time else task.next_run_at + 3600,
         host_id=occurrence_host_id(task, scheduled_trigger_key(task.next_run_at)),
         lease_seconds=_LEASE_SECONDS,
     )
@@ -324,7 +330,7 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
     if native_refusal:
         persisted_failure.assert_awaited_once()
         assert not sent
-        assert not failed
+        assert len(failed) == int(session_mode == "continue")
         [refusal] = [
             r
             for r in caplog.records
@@ -333,9 +339,10 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         assert refusal.attributes["run_id"] == claimed.lease.run.id
         assert refusal.attributes["failure_stage"] == "prompt_send"
         assert refusal.attributes["outcome"] == "not_sent"
-        # A native refusal persists its own failure item; dispatch still returns normally.
+        # A new native session's failure item settles its own run. A continued
+        # fire settles here because the existing session never took the input.
         assert _runs(store, claimed.task)[0].status == (
-            "running" if session_mode == "new" else "succeeded"
+            "running" if session_mode == "new" else "failed"
         )
     started = [
         r
@@ -433,8 +440,14 @@ async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) ->
     assert _runs(store, claimed.task)[0].status == "running"
 
 
-async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
-    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+# A one-time task (a reminder) is already completed with no next run when its claimed
+# run continues the session; delivery and settlement must work the same.
+@pytest.mark.parametrize("one_time", [False, True])
+async def test_continued_session_fire_runs_on_the_claimed_run(store, one_time) -> None:
+    claimed = _claim(store, one_time=one_time, session_mode="continue", session_id=_CONV_ID)
+    if one_time:
+        settled = store.get(claimed.task.id)
+        assert (settled.state, settled.next_run_at) == ("completed", None)
     conversations = _ExistingConversationStore(
         _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
     )
@@ -461,6 +474,104 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
         None,
     )
     assert store.get(claimed.task.id).session_id == _CONV_ID
+    assert store.get(claimed.task.id).state == ("completed" if one_time else "active")
+
+
+async def test_a_continued_fire_names_its_run_on_the_session_before_sending(store) -> None:
+    """What the agent records about this firing goes to its run, on any replica.
+
+    The session names the claimed run before the prompt goes in. That label is
+    stored with the session, so a report that arrives after a restart, or on a
+    replica that never saw the fire, still lands on this run rather than on the
+    earlier run, which the session's run row does not name until delivery.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            host_id=_HOST_ID,
+            workspace="/repo",
+            labels={SCHEDULED_TASK_RUN_LABEL_KEY: "e" * 32},
+        )
+    )
+    at_dispatch: list[tuple[str | None, str | None]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        at_dispatch.append(
+            (
+                conversations.label_writes.get(_CONV_ID, {}).get(SCHEDULED_TASK_RUN_LABEL_KEY),
+                conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY),
+            )
+        )
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert at_dispatch == [(claimed.lease.run.id, claimed.lease.run.id)]
+
+
+@pytest.mark.parametrize("delivery", ["before_forward", "runner_refusal", "lost_reply"])
+async def test_continued_fire_settles_rejected_and_uncertain_attribution(
+    store, db_uri, monkeypatch, delivery
+) -> None:
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    prior = uuid.uuid4().hex
+    conv = conversations.create_conversation(
+        agent_id=_AGENT_ID, labels={SCHEDULED_TASK_RUN_LABEL_KEY: prior}
+    )
+    claimed = _claim(
+        store, session_mode="continue", session_id=conv.id, host_id=None, workspace=None
+    )
+    deps = _deps(store, conversation_store=conversations)
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+    if delivery == "before_forward":
+        send = AsyncMock(
+            return_value=sessions._SessionEventDispatchResult(
+                item_id="failure-item", pending_id=None, forwarded=False
+            ),
+        )
+        monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    else:
+        monkeypatch.setattr(
+            orchestration,
+            "_ensure_native_terminal_ready",
+            AsyncMock(return_value=orchestration._NativeTerminalEnsureOutcome(error=None)),
+        )
+
+    posted = []
+
+    def forward(request):
+        posted.append(request.url.path)
+        if delivery == "lost_reply":
+            raise httpx.ReadTimeout("acknowledgement lost", request=request)
+        return httpx.Response(409, json={"error": "session_archived"})
+
+    async def dispatch(target, task):
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(forward)
+        ) as runner:
+            await fire_mod._send_prompt(
+                deps, replace(target, harness_override="claude-native"), runner, task
+            )
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "launch_failed")
+    assert posted == ([] if delivery == "before_forward" else [f"/v1/sessions/{conv.id}/events"])
+    assert conversations.get_conversation(conv.id).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == (
+        run.id if delivery == "lost_reply" else prior
+    )
 
 
 async def test_archived_target_pauses_until_resumed_and_notifies_once_per_attempt(
@@ -1086,6 +1197,22 @@ async def test_owner_identity_failure_fails_before_creating_a_session(
     assert str(error) not in (run.error or "")
     assert conversations.created == []
     assert store.get(claimed.task.id).state == "active"
+
+
+async def test_owner_identity_failure_of_a_one_time_task_promises_no_retry(store) -> None:
+    claimed = _claim(store, one_time=True)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=_ConversationStore()),
+        fire_identity=_failing_identity(ConnectionError("token service unavailable")),
+        launch_dispatch=AsyncMock(),
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "owner_identity_unavailable")
+    assert "tries again" not in run.error
+    assert "no later run" in run.error
+    assert store.get(claimed.task.id).state == "completed"
 
 
 async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monkeypatch) -> None:

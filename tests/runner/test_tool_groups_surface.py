@@ -7,6 +7,7 @@ from both — not just from ``ToolManager``.
 
 from __future__ import annotations
 
+from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES
 from omnigent.runner.tool_dispatch import (
     _ungranted_tool_reason,
     build_native_relay_tool_schemas,
@@ -20,6 +21,7 @@ _ALL_OFF = ToolGroupsConfig(
     comments=False,
     policies=False,
     agent_discovery=False,
+    journal=False,
 )
 
 
@@ -34,10 +36,9 @@ def _registered(spec: AgentSpec) -> set[str]:
 
 
 def _gated() -> frozenset[str]:
-    """Tools the five groups control, derived from registration itself."""
+    """Tools the disabled groups control, derived from registration itself."""
     gated = frozenset(_registered(_spec(ToolGroupsConfig())) - _registered(_spec(_ALL_OFF)))
-    assert len(gated) == 17, sorted(gated)
-    assert "browser_fill_saved_login" in gated
+    assert {"browser_fill_saved_login", "sys_reminder_set", *JOURNAL_TOOL_NAMES} <= gated
     return gated
 
 
@@ -47,7 +48,7 @@ def _relay_names(spec: AgentSpec) -> set[str]:
 
 
 def test_native_relay_carries_every_group_by_default() -> None:
-    """Without a ``tool_groups:`` block the relay advertises all 17 gated tools."""
+    """Without a ``tool_groups:`` block the relay advertises the registered gated tools."""
     missing = _gated() - _relay_names(_spec(ToolGroupsConfig()))
     assert not missing, f"relay dropped {sorted(missing)} with every group on"
 

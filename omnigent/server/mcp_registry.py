@@ -475,7 +475,7 @@ class McpRegistry:
 
 
 def build_mcp_registry_from_env(db_uri: str) -> McpRegistry | None:
-    """Build the operator catalog named by ``OMNIGENT_MCP_REGISTRY``, or ``None`` when unset."""
+    """Build the configured catalog, requiring a cipher for token-backed services."""
     config = McpRegistryConfig.from_env()
     if config is None:
         return None

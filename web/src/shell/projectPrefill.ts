@@ -1,8 +1,37 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import type { ProjectHostRoots } from "@/lib/projectsApi";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import { sandboxRepoProblem } from "@/lib/sandboxRepositories";
 
 type ProjectPrefillPhase = "location" | "settled";
+
+/** A project's saved repository: a clone URL and an optional branch. */
+export interface ProjectRepository {
+  url: string;
+  branch?: string;
+}
+
+/**
+ * Read a stored project repository, or `undefined` when the value is not one.
+ *
+ * Project config is opaque client JSON, so a legacy bare string, a malformed
+ * object, or a URL or branch the picker would reject is ignored rather than
+ * seeded (a string would crash the composer's `url.trim()`).
+ *
+ * @param value The raw `config.repository` value, e.g. `{ url: "https://git.example.com/team/app.git" }`.
+ * @returns The repository, with a trimmed URL and an absent branch when blank.
+ */
+export function projectRepository(value: unknown): ProjectRepository | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const { url, branch } = value as { url?: unknown; branch?: unknown };
+  if (typeof url !== "string" || url.trim() === "") return undefined;
+  if (branch !== undefined && typeof branch !== "string") return undefined;
+  const trimmedUrl = url.trim();
+  const trimmedBranch = branch?.trim() ?? "";
+  if (sandboxRepoProblem(trimmedUrl, trimmedBranch) !== null) return undefined;
+  return trimmedBranch === "" ? { url: trimmedUrl } : { url: trimmedUrl, branch: trimmedBranch };
+}
 
 /** Project config supplies placement hints; host roots supply real-host placement. */
 export interface ProjectPrefillConfig {
@@ -10,6 +39,10 @@ export interface ProjectPrefillConfig {
   workspace?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
+  /** Sandbox provider a sandbox project runs on; seeded with the sandbox pick. */
+  sandboxProvider?: string;
+  /** Repository a project was created with; seeded into a sandbox pick. */
+  repository?: ProjectRepository;
 }
 
 export interface ProjectPrefillState {
@@ -54,6 +87,11 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  /** Provider to select with the sandbox; the composer falls back to its default
+   *  when the stored one is not offered. */
+  sandboxProvider?: string;
+  /** Repositories the sandbox clones, from the project's saved repository. */
+  sandboxRepos?: LastSandboxRepo[];
 }
 
 /**
@@ -88,9 +126,6 @@ function locationStep(
   if (state.phase !== "location") return null;
   const { hosts, selectedHostId, config, roots } = inputs;
 
-  if (roots === undefined) return null;
-  if (roots === null) return settled(state);
-
   // A stored sandbox default: select the sandbox (gated on the server still
   // offering it), unless the user already picked a host / the sandbox. The
   // sandbox sentinel is never a real host id, so it's handled before the
@@ -98,10 +133,18 @@ function locationStep(
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
+      if (config.sandboxProvider !== undefined) writes.sandboxProvider = config.sandboxProvider;
+      if (config.repository !== undefined) {
+        writes.sandboxRepos = [
+          { url: config.repository.url, branch: config.repository.branch ?? "" },
+        ];
+      }
     }
     return settled(state);
   }
 
+  if (roots === undefined) return null;
+  if (roots === null) return settled(state);
   if (hosts === undefined) return null;
   const reason = roots.default_host_reason;
   const defaultHostId = roots.default_host_id;

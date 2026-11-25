@@ -226,13 +226,12 @@ describe("SettingsSidebarBody", () => {
     { customAgents: true, harnessesOffered: true },
     { customAgents: true, harnessesOffered: false },
   ])(
-    "lists Harnesses only while the deployment offers one: %o",
+    "lists the combined Agents page while the deployment offers a harness: %o",
     ({ customAgents, harnessesOffered }) => {
-      mocks.customAgentsEnabled = customAgents;
       mocks.agentInstall = customAgents;
       renderBody({ harnessesOffered });
-      expect(!!screen.queryByTestId("settings-nav-harnesses")).toBe(harnessesOffered);
-      expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(customAgents);
+      expect(!!screen.queryByTestId("settings-nav-agents")).toBe(harnessesOffered);
+      expect(screen.queryByTestId("settings-nav-custom-agents")).toBeNull();
     },
   );
 
@@ -662,7 +661,6 @@ describe("custom agent settings availability", () => {
   it.each(["agent/space %2F?#é", "a%percent", "simple-id"])(
     "decodes the agent ID once: %s",
     (agentId) => {
-      mocks.customAgentsEnabled = true;
       mocks.agentInstall = true;
       expect(
         routeHook(`/ml/omnigent-embed/settings/custom-agents/${encodeURIComponent(agentId)}`),
@@ -675,7 +673,6 @@ describe("custom agent settings availability", () => {
   );
 
   it("falls back to the agent list for malformed URL escapes", () => {
-    mocks.customAgentsEnabled = true;
     mocks.agentInstall = true;
     expect(routeHook("/settings/custom-agents/%E0%A4%A")).toEqual({
       inSettings: true,
@@ -703,7 +700,6 @@ describe("custom agent settings availability", () => {
   });
 
   it("groups Harnesses and Custom agents under Customize and parses embedded detail routes", () => {
-    mocks.customAgentsEnabled = true;
     mocks.agentInstall = true;
     const groups = settingsNavGroups(false, true, false, false, false, true);
     expect(groups.map((group) => group.title)).toEqual([

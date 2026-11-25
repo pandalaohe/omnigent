@@ -40,7 +40,7 @@ from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRe
 
 # A session event sent to the runner: a user message, approval, or other input
 # that can start work there.
-_SESSION_EVENTS_PATH = re.compile(r"^/v1/sessions/[^/]+/events$")
+_SESSION_EVENTS_PATH = re.compile(r"^/v1/sessions/[^/]+/(?:events|workflow-control)$")
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):

@@ -58,6 +58,11 @@ vi.mock("@/components/StandingApprovalChip", () => ({
 vi.mock("@/components/AutoRotationChip", () => ({
   AutoRotationChip: () => <span data-testid="auto-rotation-chip-stub" />,
 }));
+
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => usePullRequestInfoMock(),
 }));

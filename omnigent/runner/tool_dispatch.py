@@ -35,6 +35,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.resource_registry import SessionResourceRegistry, ToolEnvironmentLease
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec, SkillSpec
     from omnigent.terminals.registry import TerminalRegistry
@@ -74,6 +75,12 @@ from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner import flows
 from omnigent.runner.flows import FLOW_TOOL_NAMES
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.journal_tools import (
+    JOURNAL_TOOL_NAMES,
+    execute_journal_tool,
+    server_workflows_enabled,
+)
+from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_AGENT,
@@ -106,6 +113,12 @@ from omnigent.tools.builtins.os_env import (
     SysOsWriteTool,
 )
 from omnigent.tools.builtins.panel import OpenInPanelTool
+from omnigent.tools.builtins.scheduled_tasks import (
+    reminder_name,
+    reminder_prompt,
+    reminder_rrule,
+    resolve_reminder_time,
+)
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_handover import SysSessionHandoverTool
 from omnigent.tools.builtins.session_message import (
@@ -581,14 +594,20 @@ _APPROVAL_ANSWER_TOOLS = frozenset({"sys_approval_answer"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
+# sys_reminder_set creates a one-time task that continues the calling session.
 _SCHEDULED_TASK_TOOLS = frozenset(
     {
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_reminder_set",
     }
 )
+
+# Priority 5l.2: The session journal — the runner proxies the server's
+# /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
+_JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
 
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
@@ -668,6 +687,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _STANDING_APPROVAL_TOOLS
     | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _JOURNAL_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -711,13 +731,26 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     :param schemas: Tool schemas in either supported shape.
     :returns: The same list minus any ``browser_*`` entries.
     """
+    return _strip_tool_schemas(schemas, _BROWSER_TOOLS)
+
+
+def filter_workflow_tool_schemas(
+    schemas: list[_JsonObject], *, enabled: bool
+) -> list[_JsonObject]:
+    """Hide journal and workflow tools unless the server enables workflows."""
+    return schemas if enabled else _strip_tool_schemas(schemas, _JOURNAL_TOOLS)
+
+
+def _strip_tool_schemas(
+    schemas: list[_JsonObject], names: set[str] | frozenset[str]
+) -> list[_JsonObject]:
     kept: list[_JsonObject] = []
     for schema in schemas:
         name: object = schema.get("name")
         if not isinstance(name, str):
             function = _string_object_dict(schema.get("function"))
             name = function.get("name") if function is not None else None
-        if isinstance(name, str) and name in _BROWSER_TOOLS:
+        if isinstance(name, str) and name in names:
             continue
         kept.append(schema)
     return kept
@@ -1206,6 +1239,7 @@ _ALL_LOCAL_TOOLS = (
     # Same for the async question tool: the runner owns the POST that parks
     # the elicitation, so the call must never be relayed upstream.
     | _ASK_USER_TOOLS
+    | _JOURNAL_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -4470,6 +4504,7 @@ async def _execute_subagent_tool(
         child_session_id = child_data.get("session_id") or child_data.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
             return "Error: server did not return child session_id"
+        remember_session_host(child_session_id, _optional_string(child_data.get("host_id")))
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
         # The create bound a runner on the member's host: the closest local
@@ -7067,6 +7102,8 @@ async def _execute_session_create_impl(
             return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
     progress.data = data
+    # A managed create is addressed to host_id; the session stays there, so cache it now.
+    remember_session_host(data["id"], _optional_string(data.get("host_id")) or host_id)
     if placement_mode != "child":
         handle: dict[str, object] = {
             "conversation_id": data["id"],
@@ -8879,6 +8916,189 @@ async def _project_id_for_name(
     return project_id
 
 
+def _reminder_may_exist(tool_name: str, problem: str, *, details: str | None = None) -> str:
+    """An error for a create that may have been saved, so a retry doesn't duplicate it."""
+    error: dict[str, str] = {
+        "error": f"{tool_name}: {problem}. It may still have been created: check "
+        "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
+    }
+    if details is not None:
+        error["details"] = details
+    return json.dumps(error)
+
+
+_REMINDER_SESSION_PARAMS = {
+    "include_items": "false",
+    "include_usage": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+}
+
+
+async def _reminder_schedule_mismatch(
+    server_client: httpx.AsyncClient, task: _JsonObject, when: datetime
+) -> str | None:
+    """
+    An error for a reminder the server scheduled at another time, or ``None``.
+
+    The server already refuses a mismatched ``first_run_at``; this guards against
+    one that ignored it. The wrong task is deleted, and its id is reported if the
+    delete fails, so a reminder never silently fires a year late.
+    """
+    raw_next = task.get("next_run_at")
+    try:
+        scheduled = datetime.fromisoformat(raw_next) if isinstance(raw_next, str) else None
+    except ValueError:
+        scheduled = None
+    if scheduled is not None and scheduled == when:
+        return None
+    task_id = task.get("id")
+    problem = (
+        f"sys_reminder_set: the server scheduled the reminder for {raw_next}, "
+        f"not {when.isoformat()}"
+    )
+    task_url = _scheduled_task_url(task_id)
+    if task_url is None:
+        return json.dumps({"error": f"{problem}; it returned no task id to delete"})
+    try:
+        deleted = await server_client.delete(task_url, timeout=30.0)
+        removed = deleted.status_code < 400
+    except Exception:  # noqa: BLE001
+        removed = False
+    if removed:
+        return json.dumps({"error": f"{problem}, so it was deleted; set it again"})
+    return json.dumps(
+        {
+            "error": f"{problem}, and deleting it failed; delete it with "
+            "sys_scheduled_task_delete",
+            "scheduled_task_id": task_id,
+        }
+    )
+
+
+async def _execute_reminder_set(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str:
+    """
+    Create a one-time scheduled task that sends a message into this session.
+
+    The task continues the calling session with the session's own agent, so the
+    reminder arrives as a new turn there. It needs a server whose scheduler counts
+    ``COUNT`` from creation, which ``/v1/info`` advertises as
+    ``scheduled_task_one_time``; elsewhere the call is refused before anything is
+    created.
+
+    :param args: Parsed ``sys_reminder_set`` arguments: ``message`` plus ``at`` or
+        ``delay_seconds``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session, e.g. ``"conv_abc123"``.
+    :returns: Tool output JSON with the new ``scheduled_task_id`` and fire time.
+    """
+    tool_name = "sys_reminder_set"
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session"})
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return json.dumps({"error": f"{tool_name}: message must be a non-empty string"})
+    when = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(when, str):
+        return json.dumps({"error": f"{tool_name}: {when}"})
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        if info.status_code >= 400 or info.json().get("scheduled_task_one_time") is not True:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this Omnigent server does not support one-time "
+                    "reminders; use sys_timer_set if it is enabled, or a recurring "
+                    "sys_scheduled_task_create task"
+                }
+            )
+        # Only the agent id is needed, so skip the transcript, usage and live probes.
+        session = await server_client.get(
+            _session_url(conversation_id), params=_REMINDER_SESSION_PARAMS, timeout=30.0
+        )
+        if session.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: could not read this session "
+                    f"(server returned {session.status_code})",
+                    "details": session.text[:1000],
+                }
+            )
+        snapshot = _string_object_dict(session.json()) or {}
+        agent_id = snapshot.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            return json.dumps({"error": f"{tool_name}: this session has no agent to remind"})
+        if snapshot.get("side_chat_parent_id"):
+            # A side chat runs on its source's runner, which a reminder can't wake
+            # once it has stopped, so the reminder could fail unseen.
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: reminders can't be set from a side chat; "
+                    "set it in the session the side chat belongs to"
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    try:
+        resp = await server_client.post(
+            "/v1/scheduled-tasks",
+            json={
+                "name": reminder_name(message),
+                "prompt": reminder_prompt(message, when),
+                "rrule": reminder_rrule(when),
+                "timezone": "UTC",
+                "agent_id": agent_id,
+                # A continued session keeps its own permission mode.
+                "permission_mode": None,
+                "session_mode": "continue",
+                "session_id": conversation_id,
+                "kind": "reminder",
+                # The server refuses the task unless its first run is this minute,
+                # so a request that arrives late can't move to next year's match.
+                "first_run_at": int(when.timestamp()),
+            },
+            timeout=30.0,
+            headers={
+                ORCHESTRATION_SOURCE_HEADER: conversation_id,
+                "x-omnigent-automation-source": "agent",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The server may have saved the reminder before its response was lost.
+        return _reminder_may_exist(tool_name, f"the request to create the reminder failed ({exc})")
+    if resp.status_code >= 500:
+        # A gateway can answer 502 or 504 after the server saved the task.
+        return _reminder_may_exist(
+            tool_name, f"the server returned {resp.status_code}", details=resp.text[:1000]
+        )
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
+        )
+    try:
+        task = _string_object_dict(resp.json()) or {}
+    except ValueError:
+        # Accepted, but the body can't be read: the reminder likely exists.
+        return _reminder_may_exist(tool_name, "the server's reply to the create was unreadable")
+    mismatch = await _reminder_schedule_mismatch(server_client, task, when)
+    if mismatch is not None:
+        return mismatch
+    return json.dumps(
+        {
+            "status": "scheduled",
+            "scheduled_task_id": task.get("id"),
+            "fire_at": when.isoformat(),
+            "next_run_at": task.get("next_run_at"),
+            "message": message,
+            "cancel_with": "sys_scheduled_task_delete",
+        }
+    )
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -8911,6 +9131,10 @@ async def _execute_scheduled_task_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     if not isinstance(args, dict):
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name == "sys_reminder_set":
+        return await _execute_reminder_set(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
         action = "create" if tool_name == "sys_scheduled_task_create" else "update"
         error = scheduled_task_review_error(args, action=action)
@@ -8943,7 +9167,11 @@ async def _execute_scheduled_task_tool(
                     }
                 )
         if tool_name == "sys_scheduled_task_list":
-            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+            # Includes reminders, which the list leaves out by default, so an agent
+            # can find one to cancel.
+            resp = await server_client.get(
+                "/v1/scheduled-tasks", params={"kind": "all"}, timeout=30.0
+            )
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             if conversation_id is not None:
@@ -12176,6 +12404,7 @@ async def execute_tool(
     effective_harness: str | None = None,
     skill_bundle_dir: Path | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    call_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -12210,6 +12439,8 @@ async def execute_tool(
     :param wake_on_async_result: Callback a ``sys_call_async`` background
         task invokes after queueing its completed or failed result, so the
         runner can wake a session that is no longer in a turn.
+    :param call_id: The harness's tool call ID, when the caller has one; the
+        journal tools key their writes on it.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -12521,6 +12752,7 @@ async def execute_tool(
                 runner_workspace=runner_workspace,
                 bundle_workdir=skill_bundle_dir,
                 effective_harness=effective_harness,
+                workflows_enabled=await server_workflows_enabled(server_client),
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -12576,6 +12808,15 @@ async def execute_tool(
                 arguments,
                 server_client=server_client,
                 conversation_id=conversation_id,
+            )
+        elif tool_name in _JOURNAL_TOOLS:
+            output = await execute_journal_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                publish_event=publish_event,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
@@ -12778,6 +13019,7 @@ async def dispatch_tool_locally(
         effective_harness=effective_harness,
         skill_bundle_dir=skill_bundle_dir,
         wake_on_async_result=wake_on_async_result,
+        call_id=call_id,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -13018,12 +13260,16 @@ async def _execute_os_env_tool(
         ``GET …/changes`` endpoint can surface them. ``sys_os_shell``
         is not tracked — shell side-effects cannot be attributed to a
         session.
+    :param resource_registry: Owner of the session's reusable environment;
+        without it (or a session id) each call starts its own helper.
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
     owns_environment = True
+    tool_lease: ToolEnvironmentLease | None = None
+    completed = False
     try:
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
@@ -13041,14 +13287,31 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            additional_read_roots = (
-                [resource_registry.codex_skills_dir(conversation_id)]
-                if resource_registry is not None and conversation_id is not None
-                else []
-            )
-            os_env = create_os_environment(
-                effective_spec, additional_read_roots=additional_read_roots
-            )
+            if (
+                resource_registry is not None
+                and conversation_id is not None
+                and not effective_spec.fork
+                and (
+                    effective_spec.sandbox is None
+                    or effective_spec.sandbox.credential_proxy is None
+                )
+            ):
+                # Reuse the session's warm helper; a busy one leaves this call its own.
+                tool_lease = await resource_registry.lease_tool_environment(
+                    conversation_id, effective_spec
+                )
+            if tool_lease is not None:
+                os_env = tool_lease.environment
+                owns_environment = False
+            else:
+                additional_read_roots = (
+                    [resource_registry.codex_skills_dir(conversation_id)]
+                    if resource_registry is not None and conversation_id is not None
+                    else []
+                )
+                os_env = create_os_environment(
+                    effective_spec, additional_read_roots=additional_read_roots
+                )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -13106,6 +13369,11 @@ async def _execute_os_env_tool(
             )
         else:
             return f"Error: {tool_name} not implemented"
+        # Shell descendants can outlive a successful command. Retire the whole
+        # tool helper until shell requests have their own complete lifetime boundary.
+        completed = tool_name != SysOsShellTool.name() and not (
+            isinstance(result, dict) and ("error" in result or result.get("timed_out"))
+        )
     except Exception as exc:
         _logger.exception(
             "runner OSEnvironment dispatch failed for %s",
@@ -13114,7 +13382,9 @@ async def _execute_os_env_tool(
         )
         return json_dumps_transport_safe({"error": str(exc)})
     finally:
-        if os_env is not None and owns_environment:
+        if tool_lease is not None:
+            await tool_lease.release(reusable=completed)
+        elif os_env is not None and owns_environment:
             await run_sync_cleanup(
                 os_env.close,
                 component="runner_os_env_tool",
@@ -14995,6 +15265,8 @@ def session_skill_registry(
     harness: str | None,
     cwd: Path | None,
     bundle_workdir: Path | None,
+    *,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """The session's full skill registry — what ``load_skill`` may load.
 
@@ -15003,7 +15275,8 @@ def session_skill_registry(
         spec's declared harness.
     :param cwd: The session's runtime cwd, or ``None``.
     :param bundle_workdir: The materialized bundle workdir, or ``None``.
-    :returns: Bundled skills plus the harness's host skills, deduped.
+    :param workflows_enabled: Whether the server enables workflow skills.
+    :returns: Bundled, host and enabled framework skills, deduped.
     """
     from omnigent.spec.skill_sources import (
         resolve_session_skill_registry,
@@ -15016,6 +15289,7 @@ def session_skill_registry(
         session_skill_roots(cwd, bundle_workdir),
         bundle_workdir,
         harness=harness,
+        workflows_enabled=workflows_enabled,
     )
 
 
@@ -15027,12 +15301,14 @@ def _execute_skill_tool(
     runner_workspace: Path | None,
     bundle_workdir: Path | None = None,
     effective_harness: str | None = None,
+    workflows_enabled: bool = False,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
     Both tools are built from one registry — with a spec, the session
-    registry for the effective harness; without one, the spec-less bundled
+    registry for the effective harness including enabled workflow skills;
+    without one, the spec-less bundled
     plus host-scope discovery — so anything ``load_skill`` can load,
     ``read_skill_file`` can read.
 
@@ -15046,6 +15322,7 @@ def _execute_skill_tool(
         second root), or ``None``.
     :param effective_harness: The harness the session actually runs, when
         the caller knows it; ``None`` falls back to the spec's declaration.
+    :param workflows_enabled: Whether the server enables workflow skills.
     :returns: Tool output string.
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
@@ -15071,6 +15348,7 @@ def _execute_skill_tool(
             _effective_harness_name(agent_spec, effective_harness),
             runner_workspace,
             bundle_workdir,
+            workflows_enabled=workflows_enabled,
         )
         load_tool = LoadSkillTool(registry, discover_host=False)
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)

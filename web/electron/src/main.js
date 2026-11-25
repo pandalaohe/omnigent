@@ -60,6 +60,7 @@ const { createBrowserPlaces } = require("./browserPlaces");
 const { registerBrowserPlacesIpc } = require("./browserPlacesIpc");
 const { registerBrowserSettingsIpc } = require("./browserSettingsIpc");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+const { attachSecurityKeyNotice } = require("./browserSecurityKeyNotice");
 const {
   normalizeUrl,
   normalizeRecentServers,
@@ -330,6 +331,11 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  * shell preload's IPC bridges. See popup_preload.js.
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
+
+/** Reports embedded-browser WebAuthn requests; Windows draws its own WebAuthn dialog. */
+const BROWSER_VIEW_PRELOAD =
+  process.platform === "win32" ? undefined : path.join(__dirname, "browser_view_preload.js");
+const browserSecurityKeyPreloads = new WeakSet();
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
@@ -4426,12 +4432,32 @@ function createBrowserRegistryForWindow(win) {
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
       extensionsForPartition(opts.webPreferences.partition);
+      if (BROWSER_VIEW_PRELOAD) {
+        const partitionSession = session.fromPartition(opts.webPreferences.partition);
+        if (!browserSecurityKeyPreloads.has(partitionSession)) {
+          partitionSession.registerPreloadScript({ type: "frame", filePath: BROWSER_VIEW_PRELOAD });
+          browserSecurityKeyPreloads.add(partitionSession);
+        }
+      }
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      if (BROWSER_VIEW_PRELOAD) {
+        attachSecurityKeyNotice(view.webContents, {
+          canPrompt,
+          showPrompt: (options) =>
+            browserPermissionPrompt.show({
+              parent: win,
+              getAnchorBounds: () => view.getBounds(),
+              ...options,
+            }),
+          openExternal: (url) => shell.openExternal(url),
+          cookieImport: process.platform === "darwin",
+        });
+      }
       guardAgentPartitionRequests(opts.webPreferences.partition);
       return view;
     },

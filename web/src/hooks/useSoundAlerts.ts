@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { useSessionErrorStates } from "@/hooks/useSessionErrors";
+import { useLatestSessionErrors } from "@/hooks/useSessionBadgeStates";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
 import { getConversationForegroundStatus } from "@/hooks/useSessionState";
@@ -111,7 +111,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
     () => (data?.pages.flatMap((page) => page.data) ?? []).filter((row) => !row.parent_session_id),
     [data],
   );
-  const latestErrors = useSessionErrorStates(topLevelRows);
+  const latestErrors = useLatestSessionErrors(topLevelRows);
   const latestErrorsRef = useRef(latestErrors);
   latestErrorsRef.current = latestErrors;
   const errorsKey = latestErrors.join("|");

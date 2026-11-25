@@ -160,6 +160,7 @@ from omnigent.server.host_load_queue import (
 )
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.instruction_layers import session_instructions_text
+from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
@@ -3009,6 +3010,7 @@ def register_core_routes(
             Depends(require_json_or_multipart_content_type),
             Depends(require_trusted_origin),
         ],
+        openapi_extra=SESSION_CREATE_OPENAPI_EXTRA,
     )
     async def create_session(
         request: Request,
@@ -3261,7 +3263,7 @@ def register_core_routes(
             host_id=body.host_id,
             orchestration_source=orchestration_source,
         ) as hold:
-            resp, conv = await _create_session_from_existing_agent(
+            resp, conv, resolved_body = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
                 runner_router,
@@ -3412,15 +3414,15 @@ def register_core_routes(
         # synchronously.
         launch_host_id = resp.host_id
         try:
-            if hold is None and body.host_type == "managed" and resp.runner_id is None:
+            if hold is None and resolved_body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
                     agent_id=conv.agent_id if conv is not None else None,
                     user_id=user_id,
-                    sandbox_provider=body.sandbox_provider,
-                    workspaces=body.managed_repo_workspaces(),
-                    requested_host_id=body.requested_host_id,
+                    sandbox_provider=resolved_body.sandbox_provider,
+                    workspaces=resolved_body.managed_repo_workspaces(),
+                    requested_host_id=resolved_body.requested_host_id,
                 )
         finally:
             # Push the new session to this user's other open tabs (see the
@@ -3609,6 +3611,7 @@ def register_core_routes(
         )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            server_sandbox_providers,
             session_creation_source_tier,
             validate_session_model_metadata,
         )
@@ -3676,6 +3679,7 @@ def register_core_routes(
             binding_store=getattr(request.app.state, "project_host_binding_store", None),
             feature_flags=getattr(request.app.state, "feature_flags", None),
             host_store=getattr(request.app.state, "host_store", None),
+            launchable_sandbox_providers=server_sandbox_providers(request),
         )
         parsed_metadata = project_resolution.body
         await _check_initial_input(request, parsed_metadata.initial_input)

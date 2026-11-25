@@ -109,6 +109,7 @@ import {
   UserRoundIcon,
   UsersIcon,
   WalletIcon,
+  WorkflowIcon,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -271,13 +272,8 @@ import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import {
-  getConversationForegroundStatus,
-  getSessionState,
-  type SessionState,
-} from "@/hooks/useSessionState";
-import { useSessionErrorStates } from "@/hooks/useSessionErrors";
-import type { LatestSessionError } from "@/lib/sessionError";
+import { getConversationForegroundStatus, type SessionState } from "@/hooks/useSessionState";
+import { useLatestSessionErrors, useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { rowMark } from "@/lib/rowMark";
 import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
 import { readSoundAlertPreferences, writeSoundAlertPreferences } from "@/lib/soundAlertPreferences";
@@ -290,8 +286,10 @@ import {
   markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -696,6 +694,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isWorkflowsPage: boolean;
   isUsagePage: boolean;
   isUsageBoardPage: boolean;
   isTaskBoardPage: boolean;
@@ -715,6 +714,9 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
+  const isWorkflowsPage =
+    !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   // The board's routes are `/usage/board`, `/usage/board/<id>` and its
   // settings; the "usage" segment one before the leaf tells them apart.
@@ -738,6 +740,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     isUsageBoardPage,
     isTaskBoardPage,
@@ -972,6 +975,7 @@ function SidebarImpl({
   // The board replaces the Usage row only when both are on: the deployment
   // allows the module and this user turned it on.
   const usageBoardOn = usageBoardAvailable(serverInfo) && usageBoardEnabledPref;
+  const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
@@ -1065,7 +1069,19 @@ function SidebarImpl({
         : availableTab === "shared"
           ? sidebarData.shared
           : sidebarData.all;
-  const inboxCount = sidebarData.inboxCount;
+  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  // Unread sessions as the Inbox lists them; like its row dot, the open session
+  // counts only when marked unread.
+  const unreadInboxCount = useReadStateSnapshot(
+    () =>
+      collectUnreadInboxItems(
+        sidebarData.inboxRows,
+        (id, updatedAt, status) =>
+          isConversationUnseen(id, updatedAt, status) &&
+          (id !== activeConversationId || isExplicitlyUnread(id)),
+      ).length,
+  );
+  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   // Fork feature — the unread set drives the "mark all seen" affordance. A
   // session already framed by an active goal marker is excluded: its row
   // advertises the goal instead, so counting it as unread double-signals.
@@ -1116,6 +1132,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     isUsageBoardPage,
     isTaskBoardPage,
@@ -1737,6 +1754,31 @@ function SidebarImpl({
                   </Link>
                 </Button>
               )}
+              {workflowsPageEnabled && (
+                <Button
+                  asChild
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isWorkflowsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  variant="ghost"
+                  data-testid="workflows-nav"
+                >
+                  <Link to="/workflows" onClick={onNavClick} componentId="sidebar.workflows">
+                    <WorkflowIcon
+                      className={cn(
+                        "ui-icon",
+                        isWorkflowsPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Workflows
+                  </Link>
+                </Button>
+              )}
               <Button
                 asChild
                 variant="ghost"
@@ -2159,8 +2201,7 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  // Rendered rows read their own badges; the folder only reuses those results.
-  const errors = useSessionErrorStates(conversations, { startReads: false });
+  const states = useSessionBadgeStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -2171,17 +2212,16 @@ function ProjectFolder({
   const isHidden = (_row: unknown, index: number) => index !== heldIndex;
   const marker = projectMarkerState(
     conversations.filter(isHidden),
-    errors.filter(isHidden),
+    states.filter(isHidden),
     startingConversationId,
     showGoalSessionMarkers,
   );
-  // "Show more" carries the badge of the rows it hides, as a collapsed header does,
-  // from cached reads only: hidden rows show an idle error once they have rendered.
+  // "Show more" carries the badge of the rows it hides, as a collapsed header does.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
       ? projectMarkerState(
           conversations.slice(visibleCount),
-          errors.slice(visibleCount),
+          states.slice(visibleCount),
           startingConversationId,
           showGoalSessionMarkers,
         )
@@ -4300,7 +4340,7 @@ function ConversationList({
     return canonical;
   }, [projection, expandedProjects]);
 
-  // Section markers reuse errors fetched by rendered rows.
+  // Section markers summarize errors from the session list or loaded transcripts.
   const sectionMembers = useMemo(() => {
     const members: Conversation[] = [];
     for (const { groups, flatSessions } of projection) {
@@ -4310,14 +4350,14 @@ function ConversationList({
     return dedupeConversationsById(members);
   }, [projection]);
 
-  const memberErrors = useSessionErrorStates(sectionMembers, { startReads: false });
-  const errorsById = useMemo(() => {
-    const map = new Map<string, LatestSessionError | null>();
+  const memberStates = useSessionBadgeStates(sectionMembers);
+  const statesById = useMemo(() => {
+    const map = new Map<string, SessionState | null>();
     sectionMembers.forEach((conversation, index) => {
-      map.set(conversation.id, memberErrors[index] ?? null);
+      map.set(conversation.id, memberStates[index] ?? null);
     });
     return map;
-  }, [sectionMembers, memberErrors]);
+  }, [sectionMembers, memberStates]);
 
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
@@ -4336,14 +4376,14 @@ function ConversationList({
         section.id,
         projectMarkerState(
           members,
-          members.map((conversation) => errorsById.get(conversation.id) ?? null),
+          members.map((conversation) => statesById.get(conversation.id) ?? null),
           startingConversationId,
           showGoalSessionMarkers,
         ),
       );
     }
     return markers;
-  }, [projection, errorsById, startingConversationId, showGoalSessionMarkers]);
+  }, [projection, statesById, startingConversationId, showGoalSessionMarkers]);
 
   // Whether any section will actually paint a header. An implicit favorites
   // with no pins paints nothing; if every section is one of those (or the
@@ -5469,6 +5509,7 @@ function ConversationList({
                                         <>
                                           <ProjectHeaderActions
                                             hostId={defaultProjectHostId}
+                                            hosts={hosts}
                                             hostsLoading={hostsLoading}
                                             onOrderChange={(manual) => {
                                               const ranks = new Map(
@@ -5961,7 +6002,7 @@ interface ProjectMarkerState {
 
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly (LatestSessionError | null)[],
+  states: readonly (SessionState | null)[],
   startingConversationId: string | null,
   showGoalSessionMarkers: boolean,
 ): ProjectMarkerState {
@@ -5975,7 +6016,7 @@ function projectMarkerState(
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
     backgroundActivityCount += c.background_activity_count ?? 0;
-    const state = getSessionState(c, errors[i]);
+    const state = states[i];
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
@@ -6507,6 +6548,7 @@ function SessionFilterMenu({
 
 function ProjectHeaderActions({
   hostId,
+  hosts,
   hostsLoading,
   onOrderChange,
   manualOrder,
@@ -6521,6 +6563,7 @@ function ProjectHeaderActions({
   onEnterSelectionMode,
 }: {
   hostId: string | null;
+  hosts: Host[];
   hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -6545,7 +6588,12 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
+      <NewProjectButton
+        onCreated={onProjectCreated}
+        hostId={hostId}
+        hosts={hosts}
+        hostsLoading={hostsLoading}
+      />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -8326,7 +8374,7 @@ function ConversationRowImpl({
   // unread signal) via `hasUnseenMessages` below. Failures join approvals
   // ahead of the dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestError] = useSessionErrorStates(errorConversations);
+  const [latestError] = useLatestSessionErrors(errorConversations);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a

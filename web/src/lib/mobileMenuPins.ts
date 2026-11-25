@@ -37,6 +37,7 @@ export const MOBILE_MENU_PIN_IDS = [
   "content-search",
   "pull-requests",
   "agents",
+  "tasks",
   "side-chats",
   "shells",
   "logs",

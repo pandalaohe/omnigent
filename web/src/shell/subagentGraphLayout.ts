@@ -1,3 +1,4 @@
+import type { AgentCost } from "@/hooks/useAgentCosts";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
 import { childStatus, type AgentActivity } from "./subagentStatus";
@@ -12,6 +13,8 @@ export interface AgentNodeData {
   sessionId: string;
   isActive: boolean;
   preview: string | null;
+  /** Display cost, when the session overview feature has loaded one. */
+  cost?: AgentCost;
   [key: string]: unknown;
 }
 

@@ -45,6 +45,10 @@ vi.mock("@/pages/usageBoard/UsageAccountPage", () => ({
 }));
 
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
+vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
+vi.mock("@/pages/WorkflowDetailPage", () => ({
+  WorkflowDetailPage: () => <div>workflow detail page</div>,
+}));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
@@ -310,6 +314,21 @@ describe("Task board route", () => {
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, JSON.stringify({ showTaskBoard: false }));
     renderRoute("/task-board", {}, { ...FALLBACK_SERVER_INFO, task_board_enabled: true });
     expect(await screen.findByRole("link", { name: "Turn it on in Settings" })).toBeTruthy();
+  });
+});
+
+describe("Workflow routes", () => {
+  it.each([
+    ["/workflows", "workflows page"],
+    ["/workflows/saved", "workflow detail page"],
+  ])("gates %s with the server workflows flag", async (path, page) => {
+    renderRoute(path);
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText(page)).toBeNull();
+    cleanup();
+
+    renderRoute(path, { workflows: true });
+    expect(await screen.findByText(page)).toBeInTheDocument();
   });
 });
 

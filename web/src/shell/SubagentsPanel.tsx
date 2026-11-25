@@ -67,6 +67,7 @@ import {
 import { useStopSession, type Conversation } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
+import { useAgentCosts, type AgentCost, type AgentCosts } from "@/hooks/useAgentCosts";
 import { useSession } from "@/hooks/useSession";
 import { hostColor, hostColorStyle, hostDisplayName } from "@/lib/hostColors";
 import {
@@ -89,6 +90,7 @@ import {
 } from "./subagentRailGroups";
 import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
+import { AgentCostTag } from "./AgentCostTag";
 import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { useForkDialog } from "./ForkDialogContext";
@@ -281,6 +283,7 @@ function isHarnessSubagent(child: ChildSessionInfo): boolean {
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const costs = useAgentCosts(rootSessionId).data ?? undefined;
   const { session: rootSession } = useSession(rootSessionId);
   const { data: hosts } = useHosts();
   const [addOpen, setAddOpen] = useState(false);
@@ -372,7 +375,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsGraphView
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            costs={costs}
+          />
         </Suspense>
       </div>
     );
@@ -395,7 +402,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         Add agent
       </button>
       <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+        <MainRow
+          rootSessionId={rootSessionId}
+          isActive={conversationId === rootSessionId}
+          cost={costs?.get(rootSessionId)}
+        />
         <li
           data-testid="subagent-active-zone"
           className="flex items-center gap-2 border-b bg-muted/40 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase"
@@ -429,6 +440,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             canStopChildren={rootSession != null && isOwnerLevel(rootSession.permissionLevel)}
             onRequestStop={(id, label) => setStopTarget({ id, label })}
             hostNameFor={hostNameFor}
+            costs={costs}
           />
         ))}
         {rootSubagents.length > 0 && (
@@ -475,6 +487,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
                   onRequestStop={(id, label) => setStopTarget({ id, label })}
                   hostNameFor={hostNameFor}
                   showHostBar={false}
+                  costs={costs}
                 />
               ))}
           </>
@@ -542,6 +555,7 @@ function HostGroupRows({
   canStopChildren,
   onRequestStop,
   hostNameFor,
+  costs,
 }: {
   group: ChildHostGroup;
   hostName: string;
@@ -555,6 +569,7 @@ function HostGroupRows({
   canStopChildren: boolean;
   onRequestStop: (id: string, label: string) => void;
   hostNameFor: (hostId: string | null | undefined) => string;
+  costs: AgentCosts | undefined;
 }) {
   const colorPreferences = useHostColorPreferences();
   const color = hostColor(group.hostId, hostName, colorPreferences);
@@ -623,6 +638,7 @@ function HostGroupRows({
                     onRequestStop={onRequestStop}
                     hostNameFor={hostNameFor}
                     showHostBar
+                    costs={costs}
                   />
                 ))}
             </Fragment>
@@ -933,7 +949,15 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+function MainRow({
+  rootSessionId,
+  isActive,
+  cost,
+}: {
+  rootSessionId: string;
+  isActive: boolean;
+  cost: AgentCost | undefined;
+}) {
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   const child = sessionLike(session, rootSessionId);
@@ -990,6 +1014,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
               <RailAgentBadge child={child} />
               <WorktreeStatusMark sessionId={rootSessionId} />
               <span className="min-w-0 truncate text-base font-semibold">{label}</span>
+              <AgentCostTag cost={cost} className="ml-auto" />
             </div>
             {preview && (
               <p
@@ -1034,6 +1059,7 @@ function SubagentRow({
   onRequestStop,
   hostNameFor,
   showHostBar,
+  costs,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -1049,6 +1075,7 @@ function SubagentRow({
   hostNameFor: (hostId: string | null | undefined) => string;
   /** Whether this row may draw the host-colour bar (ACTIVE zone, real rows). */
   showHostBar: boolean;
+  costs: AgentCosts | undefined;
 }) {
   const collapsed = collapsedRows[child.id] ?? true;
   const status = childStatus(child);
@@ -1204,6 +1231,7 @@ function SubagentRow({
                         {shortModelName(child.routed_model)}
                       </span>
                     ) : null}
+                    <AgentCostTag cost={costs?.get(child.id)} />
                     {!mirror && <WarmStatePill state={child.warm_state} />}
                   </div>
                   {secondary && (
@@ -1250,6 +1278,7 @@ function SubagentRow({
             onRequestStop={onRequestStop}
             hostNameFor={hostNameFor}
             showHostBar={showHostBar}
+            costs={costs}
           />
         ))}
     </>

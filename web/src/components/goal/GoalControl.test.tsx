@@ -48,7 +48,9 @@ function renderControl(conversationId: string | null = "conv") {
         conversationId={conversationId}
         readOnly={false}
         goal={GOAL}
+        goalRevision={1}
         onGoalChange={vi.fn()}
+        refreshGoal={vi.fn().mockResolvedValue(undefined)}
       />
     </TooltipProvider>,
   );
@@ -74,7 +76,14 @@ describe("GoalControl", () => {
   it("uses the outline state without a goal and keeps aria-pressed false", () => {
     render(
       <TooltipProvider>
-        <GoalControl conversationId="conv" readOnly={false} goal={null} onGoalChange={vi.fn()} />
+        <GoalControl
+          conversationId="conv"
+          readOnly={false}
+          goal={null}
+          goalRevision={0}
+          onGoalChange={vi.fn()}
+          refreshGoal={vi.fn().mockResolvedValue(undefined)}
+        />
       </TooltipProvider>,
     );
 

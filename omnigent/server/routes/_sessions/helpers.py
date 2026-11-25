@@ -118,6 +118,8 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -157,6 +159,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.journal_markers import record_todo_markers
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -354,7 +357,6 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
-from omnigent.session_todos import validate_session_todos
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -2695,10 +2697,10 @@ def _resolve_harness_impl(
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        loaded = agent_cache.load(
+        spec = agent_cache.load_spec(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
-        executor = loaded.spec.executor
+        executor = spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
         # not the bundle brain's — `harness` is this session's provider family
         # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
@@ -2706,13 +2708,11 @@ def _resolve_harness_impl(
         if conv.sub_agent_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
-            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            sub = _find_spec_by_name(spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
+            executor.config.get("harness") or spec.executor.config.get("harness") or executor.type
         )
         if preserve_acp_namespace and harness.startswith("acp:"):
             return harness
@@ -4395,6 +4395,9 @@ async def _handle_external_session_todos(
     )
     if not persisted:
         return
+    await record_todo_markers(
+        conversation_store, session_id, persisted.previous, validated, update_id=persisted.id
+    )
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,
@@ -6389,8 +6392,18 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
     if store is None:
         return
 
+    handoffs = session_live_state.handoff_count(session_id)
+
     def _fan_out() -> None:
         conv = store.get_conversation(session_id)
+        if store is not session_live_state.conversation_store():
+            return
+        session_live_state.record_child_status(
+            session_id,
+            conv.parent_conversation_id if conv else None,
+            _session_status_cache.get(session_id),
+            handoffs=handoffs,
+        )
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
@@ -6655,6 +6668,10 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _note_running_edge(session_id, previous_status, status)
     _session_status_cache[session_id] = status
+    if status not in ("running", "waiting"):
+        session_live_state.record_child_status(
+            session_id, None, status, handoffs=session_live_state.handoff_count(session_id)
+        )
     _set_blocked_on(session_id, blocked_on)
     # Only a ``waiting`` edge names background agents; any other edge ends that wait.
     if status != "waiting":
@@ -6698,7 +6715,9 @@ def _publish_status(
             error="runner disappeared before the turn reached a terminal state",
         )
     elif status == "idle":
-        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+        session_live_state.persist_scheduled_run_completion(
+            session_id, "succeeded", turn_completed=turn_completed
+        )
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
         # failed turn (runner disconnect mid-turn, setup/dispatch failure,
@@ -9969,7 +9988,9 @@ def _build_new_item(
         data = data.model_copy(update={"user_authored": True})
     if isinstance(data, MessageData):
         # Only accepted SDK receipt persistence owns the recovery-suppression marker.
-        data = data.model_copy(update={"peer_message_id": None})
+        data = data.model_copy(
+            update={"peer_message_id": None, "workflow_run_id": body.workflow_run_id}
+        )
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
@@ -13338,7 +13359,12 @@ def _derive_terminal_launch_args_from_spec(
       is the real boundary, matching claude-native's ``bypassPermissions``
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
-      -keep-prompting sub-agent. See issue #171.
+      -keep-prompting sub-agent. See issue #171. An
+      ``executor.config.permission_mode`` naming a codex-native mode in
+      :data:`~omnigent.native.permission_modes.PERMISSION_LAUNCH_ARGS`
+      (e.g. ``approve-for-me``) maps to that mode's args instead and takes
+      precedence over ``yolo`` and the headless default; ``default`` leaves
+      args unset. ``bypass`` is not mapped here; use ``yolo: true``.
     - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
       otherwise stall on cursor-agent's in-terminal approval prompts (also
       mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
@@ -13363,7 +13389,8 @@ def _derive_terminal_launch_args_from_spec(
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
     :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
-    value logs at debug and leaves args unset.
+    value logs at debug and leaves args unset, except codex-native, which
+    falls back to its ``yolo`` / headless default.
 
     Only those native harnesses are translated; for any other harness
     (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
@@ -13408,6 +13435,17 @@ def _derive_terminal_launch_args_from_spec(
         # approval/sandbox). Without the flag the thread is created at
         # codex's on-request + own-sandbox default and a headless worker
         # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
+        # An explicit permission_mode, the harness default included, wins.
+        mode = spec.executor.config.get("permission_mode")
+        codex_modes = PERMISSION_LAUNCH_ARGS[_CODEX_NATIVE_HARNESS]
+        if isinstance(mode, str) and mode in codex_modes and mode != "bypass":
+            return _validate_terminal_launch_args(list(codex_modes[mode]) or None)
+        if mode is not None:
+            _logger.debug(
+                "codex-native spec has unsupported permission_mode=%r; "
+                "falling back to the yolo / headless default.",
+                mode,
+            )
         if _spec_config_flag_explicitly_disabled(spec, "yolo"):
             return None
         if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
@@ -13697,7 +13735,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -13705,8 +13747,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT
+        )
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -15045,9 +15094,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :param inherited: Placement inherited from the parent chain, from
         :func:`_inherited_placement`. ``None`` means no ancestor
         placement is known; the session's own values still apply.

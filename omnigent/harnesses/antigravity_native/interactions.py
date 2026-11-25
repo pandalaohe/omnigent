@@ -330,6 +330,21 @@ def _waiting_step_at(
     return None
 
 
+async def _can_check_for_legacy_menu(get_steps: GetSteps, interaction: PendingInteraction) -> bool:
+    """Permit the pane check when no different prompt has replaced the answered one."""
+    try:
+        steps = await get_steps()
+    except Exception as exc:
+        _logger.warning(
+            "agy step %d state unreadable after RPC delivery; not typing into the pane: %r",
+            interaction["step_index"],
+            exc,
+        )
+        return False
+    waiting = [pending for step in steps if (pending := pending_interaction(step)) is not None]
+    return all(pending == interaction for pending in waiting)
+
+
 async def bridge_interaction(
     cascade_id: str,
     pending: PendingInteraction,
@@ -528,11 +543,10 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
-            # Older agy versions can leave the attended prompt open after RPC.
-            keys = to_tui_selection_keys(current["kind"], result, current["spec"])
-            if keys:
+            # Older builds leave a matching menu open even after the RPC marks it done.
+            if keys and await _can_check_for_legacy_menu(get_steps, fresh):
                 try:
-                    await inject_tui(keys, current)
+                    await inject_tui(keys, fresh)
                 except Exception as tui_exc:
                     # Best-effort TUI dismissal — the backend step is already
                     # answered, so never undo a delivered verdict over a flaky pane.
@@ -540,7 +554,7 @@ async def bridge_interaction(
                         "agy interaction delivered over RPC but TUI dismissal failed "
                         "(cascade=%s, kind=%s, step=%d, keys=%r): %r",
                         cascade_id,
-                        current["kind"],
+                        fresh["kind"],
                         fresh["step_index"],
                         keys,
                         tui_exc,

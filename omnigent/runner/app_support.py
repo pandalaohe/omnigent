@@ -151,6 +151,7 @@ class _CommentRelayBinding:
     session_open_enabled: bool = False
     pi_scope_relay: PiScopeRelay | None = dataclasses.field(default=None, repr=False)
     mcp_discovery_failed: bool = False
+    workflows_enabled: bool = False
 
 
 def _require_full_native_lock_coverage(

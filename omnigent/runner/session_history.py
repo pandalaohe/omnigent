@@ -293,6 +293,9 @@ def build_session_history(
             if item_type not in _HISTORY_INPUT_ITEM_TYPES:
                 _skipped_types.append(str(item_type))
             if item_type == "message":
+                if item.get("workflow_run_id") is not None:
+                    # Run controls are one-shot inputs, never replayed from disk.
+                    continue
                 result.append(
                     {
                         "type": "message",

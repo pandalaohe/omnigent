@@ -193,7 +193,7 @@ def _isolate_runtime_skill_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """Forwarding tests use spec skills; ambient CLI discovery is tested separately."""
     monkeypatch.setattr(
         "omnigent.runner.tool_dispatch.session_skill_registry",
-        lambda spec, *args: list(spec.skills),
+        lambda spec, *_args, workflows_enabled=False: list(spec.skills),
     )
 
 
@@ -762,8 +762,10 @@ async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("run_is_current", [None, True, False])
 async def test_native_buffered_messages_each_delivered_once_in_order(
     monkeypatch: pytest.MonkeyPatch,
+    run_is_current: bool | None,
 ) -> None:
     """claude-native: every buffered message is delivered once, in order.
 
@@ -803,17 +805,30 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
 
     gate = _aio.Event()
     app, _pm, hc = _build_native_app(gate)
+    plan_id = "a" * 32
+    checked_runs: list[str] = []
+    get = NullServerClient.get
 
-    async def _post(text: str) -> httpx.Response:
+    async def read_journal(client, url, **kwargs):
+        if "/journal/current-run/" in url:
+            checked_runs.append(url.rsplit("/", 1)[1])
+            return httpx.Response(204 if run_is_current else 409)
+        return await get(client, url, **kwargs)
+
+    monkeypatch.setattr(NullServerClient, "get", read_journal)
+
+    async def _post(text: str, **options: Any) -> httpx.Response:
         """POST one user message carrying an agent_id (drives spec resolve)."""
+        endpoint = "workflow-control" if "workflow_run_id" in options else "events"
         return await client.post(
-            "/v1/sessions/11b4a5755857531509b492c3f9a7a1a6/events",
+            f"/v1/sessions/11b4a5755857531509b492c3f9a7a1a6/{endpoint}",
             json={
                 "type": "message",
                 "role": "user",
                 "model": "test-agent",
                 "agent_id": "0c5de81a62eeb73d54466214cf37e5db",
                 "content": [{"type": "input_text", "text": text}],
+                **options,
             },
         )
 
@@ -830,17 +845,21 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
 
         # 2, 3, 4 arrive while turn 0 is active → buffered (native: no forward).
         for text in ("2", "3", "4"):
+            if text == "3" and run_is_current is not None:
+                control = await _post("Stop this workflow", workflow_run_id=plan_id)
+                assert (control.status_code, control.json()["status"]) == (202, "buffered")
             resp = await _post(text)
             assert resp.status_code == 202, f"{text!r}: {resp.status_code} {resp.text}"
             assert resp.json()["status"] == "buffered"
 
         # Release turn 0; the buffer drains one-at-a-time. Each continuation
         # turn completes immediately, re-entering the drain for the next.
+        assert not checked_runs
         gate.set()
-        for _ in range(300):
-            if len(hc.posted_bodies) >= 4:
-                break
-            await _aio.sleep(0.01)
+        await poll_until_async(
+            lambda: bool(hc.turn_latest_texts) and hc.turn_latest_texts[-1] == "4",
+            timeout_s=budget(5),
+        )
 
     # (a) No mid-turn forward for a native session — the forward is the
     # unreliable injection race we removed for native harnesses.
@@ -852,12 +871,76 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
     # turn_latest_texts). Collapse (the bug) would yield a single
     # continuation whose latest text is "4", dropping 2 and 3.
     continuation_latest = hc.turn_latest_texts[1:]
-    assert continuation_latest == ["2", "3", "4"], (
+    assert checked_runs == ([plan_id] if run_is_current is not None else [])
+    assert continuation_latest == (
+        ["2", "Stop this workflow", "3", "4"] if run_is_current else ["2", "3", "4"]
+    ), (
         f"expected one continuation turn per buffered message delivering "
         f"2, 3, 4 in order; got {continuation_latest}. A collapsed ['4'] "
         f"means intermediate messages were dropped from the terminal.\n"
         f"turn_latest_texts={hc.turn_latest_texts}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_workflow_confirmation_follows_harness_setup_and_observes_cancel(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    app, manager, harness = _build_lifecycle_app()
+    setup_started, finish_setup = asyncio.Event(), asyncio.Event()
+    check_started, finish_check = asyncio.Event(), asyncio.Event()
+    get_client = manager.get_client
+
+    async def delayed_setup(*args, **kwargs):
+        setup_started.set()
+        await finish_setup.wait()
+        return await get_client(*args, **kwargs)
+
+    get = NullServerClient.get
+
+    async def check_run(client, url, **kwargs):
+        if "/journal/current-run/" not in url:
+            return await get(client, url, **kwargs)
+        check_started.set()
+        await finish_check.wait()
+        return httpx.Response(204 if cancel else 409)
+
+    monkeypatch.setattr(manager, "get_client", delayed_setup)
+    monkeypatch.setattr(NullServerClient, "get", check_run)
+    session_path = f"/v1/sessions/workflow-control-test-{cancel}"
+
+    def message(text: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "agent_id": "ag_workflow_test",
+            "harness": "openai-agents",
+            "content": [{"type": "input_text", "text": text}],
+            **fields,
+        }
+
+    async with _runner_client(app) as client:
+        control = await client.post(
+            f"{session_path}/workflow-control",
+            json=message("Stop this workflow", workflow_run_id="a" * 32),
+        )
+        assert control.status_code == 202
+        await asyncio.wait_for(setup_started.wait(), timeout=budget(5))
+        assert not check_started.is_set()
+        finish_setup.set()
+        await asyncio.wait_for(check_started.wait(), timeout=budget(5))
+        if cancel:
+            interrupt = await client.post(f"{session_path}/events", json={"type": "interrupt"})
+            assert interrupt.status_code == 204
+        finish_check.set()
+        ordinary = await client.post(f"{session_path}/events", json=message("Keep going"))
+        assert ordinary.status_code == 202
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=budget(5))
+
+    assert len(harness.posted_bodies) == 1
+    assert _ordered_user_texts(harness.posted_bodies[0]) == ["Keep going"]
 
 
 @pytest.mark.asyncio
@@ -1659,7 +1742,10 @@ async def _fake_auto_create_codex_terminal(
 
 
 @pytest.mark.asyncio
-async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -> None:
+@pytest.mark.parametrize("workflow_control", [False, True])
+async def test_session_creation_auto_starts_turn_for_unanswered_user_message(
+    workflow_control: bool,
+) -> None:
     """POST /v1/sessions with history ending in a user message starts a recovery turn.
 
     Breakage this catches: if _run_turn_bg's incomplete-turn detection
@@ -1675,6 +1761,16 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
             "content": [{"type": "input_text", "text": "hello"}],
         },
     ]
+    if workflow_control:
+        history.append(
+            {
+                "id": "item_2",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Stop this workflow"}],
+                "workflow_run_id": "a" * 32,
+            }
+        )
     app, _pm, hc = _build_recovery_app(history)
 
     async with _runner_client(app) as client:
@@ -1686,6 +1782,10 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
             },
         )
         assert resp.status_code == 201
+        if workflow_control:
+            assert resp.json()["status"] == "idle"
+            assert not hc.posted_bodies
+            return
         # "running" proves the recovery turn was started during
         # session creation. "idle" would mean the incomplete-turn
         # detection didn't fire.

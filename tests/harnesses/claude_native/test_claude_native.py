@@ -5037,6 +5037,7 @@ async def test_is_terminal_resource_gone_reports_404_as_gone(
         does not recurse into the patched name when constructing
         the underlying client.
         """
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -5079,6 +5080,7 @@ async def test_is_terminal_resource_gone_reports_running_false_as_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -5113,6 +5115,7 @@ async def test_is_terminal_resource_gone_treats_transport_errors_as_not_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)

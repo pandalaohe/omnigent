@@ -29,6 +29,8 @@ import pytest
 import sqlalchemy
 from sqlalchemy.exc import OperationalError
 
+from tests._helpers.providers import isolate_provider_resolution
+
 _APP_MODULE = "deploy.databricks.src.app"
 
 # Env the module reads at import time — required vars, optional vars pinned to
@@ -72,13 +74,18 @@ _BOOT_STORE_CLASSES = (
 
 
 @pytest.fixture
-def boot_exit_codes(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
+def boot_exit_codes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[list[int]]:
     """Prepare an importable boot module and capture ``sys.exit`` calls.
 
     Yields the list receiving every exit code the boot path passes to
     ``sys.exit``; the capture raises ``SystemExit`` so module execution
     stops exactly like a real exit.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "providers")
+    config = tmp_path / "boot-config.yaml"
+    config.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
     for key, val in _BOOT_ENV.items():
         monkeypatch.setenv(key, val)
     # The module setdefault()s these into os.environ; registering them with
@@ -166,7 +173,7 @@ def _stub_downstream_boot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub everything the boot path runs after a successful migration."""
     import omnigent.runtime as runtime
 
-    monkeypatch.setattr(runtime, "init", lambda **kw: None)
+    monkeypatch.setattr(runtime, "init", MagicMock())
 
     import omnigent.runtime.telemetry as telemetry
 

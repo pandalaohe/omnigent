@@ -59,7 +59,7 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { PeerMessageView } from "@/components/blocks/PeerMessage";
-import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
+import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -72,6 +72,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import {
   readableSentText,
@@ -941,21 +942,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
 
 function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
   if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
+  return formatMessageTimestamp(epochSeconds);
 }
 
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
@@ -1004,7 +991,7 @@ export const BubbleView = memo(
       );
     }
     if (bubble.kind === "subagent_activity") {
-      return <SubagentActivityMessage data={bubble.data} />;
+      return <ActivityNotice data={bubble.data} />;
     }
     if (bubble.kind === "routing_decision") {
       return (
@@ -1828,7 +1815,7 @@ function AssistantBubble({
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (
-            <SubagentActivityMessage
+            <ActivityNotice
               key={notice.itemId ?? `subagent-activity-${index}`}
               data={notice.data}
             />

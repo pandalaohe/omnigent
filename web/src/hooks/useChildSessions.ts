@@ -160,6 +160,18 @@ interface ChildSessionsResponse {
   last_id?: string | null;
 }
 
+/** True when the next page's cursor is stale. */
+export async function isStaleCursorResponse(res: Response): Promise<boolean> {
+  if (res.status !== 400) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { error?: { code?: unknown } } | null;
+  return body?.error?.code === "stale_cursor";
+}
+
+class StaleChildSessionsCursor extends Error {}
+
 interface ChildSessionsPage {
   data: ChildSessionInfo[];
   has_more: boolean;
@@ -339,6 +351,9 @@ async function fetchChildSessionPage(
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?${query.toString()}`,
   );
+  if (params.after && (await isStaleCursorResponse(res))) {
+    throw new StaleChildSessionsCursor("Child-session list changed during pagination");
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
   // Children run on this session's runner: record the link so their
@@ -370,10 +385,21 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   const all: ChildSessionInfo[] = [];
   const requested = new Set<string>();
   let after: string | null = null;
+  let restarted = false;
   for (;;) {
     // Each page's cursor comes from the previous response — inherently serial.
-    // oxlint-disable-next-line no-await-in-loop
-    const page = await fetchChildSessionPage(sessionId, { zone: "active", limit: 100, after });
+    let page: ChildSessionsPage;
+    try {
+      // oxlint-disable-next-line no-await-in-loop
+      page = await fetchChildSessionPage(sessionId, { zone: "active", limit: 100, after });
+    } catch (error) {
+      if (restarted || !(error instanceof StaleChildSessionsCursor)) throw error;
+      restarted = true;
+      all.length = 0;
+      requested.clear();
+      after = null;
+      continue;
+    }
     all.push(...page.data);
     if (!page.has_more || page.last_id === null) return all;
     // A cursor the server already served would loop forever (A → B → A …).

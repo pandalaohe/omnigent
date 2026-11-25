@@ -7,6 +7,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import type * as UseAgentCostsModule from "@/hooks/useAgentCosts";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import {
   buildTree,
   childActivity,
@@ -30,6 +32,7 @@ vi.mock("./SubagentsGraphView", () => ({
       data-testid="subagents-graph-view"
       data-conversation-id={props.conversationId}
       data-root-session-id={props.rootSessionId}
+      data-costs={JSON.stringify([...((props.costs as Map<string, unknown> | undefined) ?? [])])}
     />
   ),
 }));
@@ -51,6 +54,12 @@ vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [] }),
 }));
 
+// The panel reads costs through this hook; tests set what it returns.
+const agentCosts = vi.hoisted(() => ({ current: undefined as AgentCosts | undefined }));
+vi.mock("@/hooks/useAgentCosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentCostsModule>()),
+  useAgentCosts: () => ({ data: agentCosts.current }),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
@@ -156,6 +165,7 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
+  agentCosts.current = undefined;
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue(defaultSession());
@@ -701,11 +711,12 @@ describe("SubagentsPanel view-mode toggle", () => {
     expect(screen.queryByTestId("subagents-graph-view")).toBeNull();
   });
 
-  it("passes conversationId and rootSessionId to the graph view", async () => {
+  it("passes conversationId, rootSessionId and costs to the graph view", async () => {
     mockChildTree({
       conv_root: [childInfo({ id: "c1", tool: "researcher" })],
     });
 
+    agentCosts.current = new Map([["c1", { costUsd: 0.4, estimated: false }]]);
     renderPanel({ conversationId: "conv_child", rootSessionId: "conv_root" });
 
     fireEvent.click(screen.getByTestId("view-mode-graph"));
@@ -713,6 +724,10 @@ describe("SubagentsPanel view-mode toggle", () => {
     const graph = await screen.findByTestId("subagents-graph-view");
     expect(graph).toHaveAttribute("data-conversation-id", "conv_child");
     expect(graph).toHaveAttribute("data-root-session-id", "conv_root");
+    expect(graph).toHaveAttribute(
+      "data-costs",
+      JSON.stringify([["c1", { costUsd: 0.4, estimated: false }]]),
+    );
   });
 
   it("preserves the toggle bar across both views", async () => {

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -459,6 +460,16 @@ async def resolve_create_calling_stores(
     return resolution
 
 
+def server_sandbox_providers(request: Any) -> tuple[str, ...]:
+    """The sandbox providers this server can launch, to check a saved provider against.
+
+    :param request: The create request, whose app carries ``sandbox_config``.
+    :returns: Launchable provider names; empty when managed sandboxes are off.
+    """
+    sandbox_config = getattr(request.app.state, "sandbox_config", None)
+    return sandbox_config.launchable_providers() if sandbox_config is not None else ()
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
@@ -475,6 +486,7 @@ async def resolve_project_session_create(
     parent_host_id: str | None = None,
     calling_path_label: str = "POST /v1/sessions",
     warnings: list[str] | None = None,
+    launchable_sandbox_providers: Collection[str] = (),
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
@@ -488,6 +500,8 @@ async def resolve_project_session_create(
     with no ``project_id`` uses *parent_project* for the chain and
     *parent_host_id* as its host when the request names none.
     Independent worker filing can skip the project layers of this chain.
+    A saved sandbox provider is inherited only when it is in
+    ``launchable_sandbox_providers``; an unconfigured one is ignored.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -515,9 +529,30 @@ async def resolve_project_session_create(
     entries: Any = []
     if project is not None:
         config = {} if getattr(body, "sibling_source_id", None) else project.config
+        managed_target = (
+            apply_project_calling_defaults
+            and getattr(body, "host_type", None) == "managed"
+            and getattr(body, "parent_session_id", None) is None
+        )
+        repository = _saved_managed_repository(config) if managed_target else None
+        if repository is not None and not {"workspace", "workspaces"} & fields_set:
+            updates["workspaces"] = [repository]
+        saved_provider = config.get("sandbox_provider")
+        if (
+            managed_target
+            and "sandbox_provider" not in fields_set
+            and isinstance(saved_provider, str)
+            and saved_provider in launchable_sandbox_providers
+        ):
+            updates["sandbox_provider"] = saved_provider
         # The legacy agent_id fill moved into the calling chain below; config
         # keeps supplying git, whose semantics have no chain.
-        if "git" not in fields_set and "git" in config and "git" in body.__class__.model_fields:
+        if (
+            repository is None
+            and "git" not in fields_set
+            and "git" in config
+            and "git" in body.__class__.model_fields
+        ):
             updates["git"] = config["git"]
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
@@ -555,7 +590,11 @@ async def resolve_project_session_create(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 updates["workspace"] = root.workspace
-            elif "workspace" in config and "workspace" in body.__class__.model_fields:
+            elif (
+                repository is None
+                and "workspace" in config
+                and "workspace" in body.__class__.model_fields
+            ):
                 updates["workspace"] = config["workspace"]
 
     speed = permission = None
@@ -771,6 +810,26 @@ def validate_session_permission_mode(permission_mode: str | None) -> str | None:
             code=ErrorCode.INVALID_INPUT,
         )
     return permission_mode
+
+
+def _saved_managed_repository(config: dict[str, Any]) -> str | None:
+    """The project's saved repository as a managed workspace, or ``None``.
+
+    A malformed saved value is ignored rather than failing the create, since
+    config is opaque client JSON.
+
+    :param config: The project's opaque config object.
+    :returns: ``url`` or ``url#branch``, e.g. ``"https://git.example.com/team/app.git#main"``.
+    """
+    from omnigent.server.managed_hosts import parse_project_repository
+
+    if "repository" not in config:
+        return None
+    try:
+        parsed = parse_project_repository(config["repository"])
+    except ValueError:
+        return None
+    return parsed.url if parsed.branch is None else f"{parsed.url}#{parsed.branch}"
 
 
 def validate_session_model_metadata(

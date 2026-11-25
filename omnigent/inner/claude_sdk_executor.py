@@ -61,7 +61,7 @@ from uuid import uuid4
 if TYPE_CHECKING:
     from claude_agent_sdk import SessionKey, SessionStoreEntry
 
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -114,6 +114,7 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
+from .claude_sdk_key_file import PrivateStaticKeyFile
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
     Executor,
@@ -1120,6 +1121,7 @@ class _ClaudeClientState:
     system_prompt: str | None = None
     effort: str | None = None
     permission_mode: str | None = None
+    static_key_file: PrivateStaticKeyFile | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     mcp_auth: dict[str, str] = field(default_factory=dict)
@@ -1347,10 +1349,15 @@ def _recording_consents(
 
 
 async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
-    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    """Release a gone CLI's auxiliary resources; relay shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
+    key_file, state.static_key_file = state.static_key_file, None
     state.mcp_relay = state.cli_launcher = None
-    await asyncio.to_thread(_release_client_cli, relay, launcher)
+    try:
+        if key_file is not None:
+            key_file.close()
+    finally:
+        await asyncio.to_thread(_release_client_cli, relay, launcher)
 
 
 def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
@@ -1788,7 +1795,9 @@ class _GatewayModelVocabulary(NamedTuple):
 _EMPTY_GATEWAY_VOCABULARY = _GatewayModelVocabulary(alias_pins={}, model_overrides={})
 
 
-def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _GatewayModelVocabulary:
+def _gateway_model_vocabulary(
+    base_url: str, auth_command: str | None, api_key: str | None = None
+) -> _GatewayModelVocabulary:
     """Read Claude Code's model vocabulary off a gateway's model listing.
 
     Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
@@ -1813,6 +1822,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
     :param auth_command: The gateway ``apiKeyHelper`` command; minted into the
         bearer the listing is fetched with.
+    :param api_key: Optional literal key from the Windows static-key helper.
+        When provided, gateway discovery uses it instead of the helper command.
     :returns: The pins and rewrites the listing supports. Empty — leaving
         today's behavior — when the gateway lists no Claude models or the
         listing cannot be fetched.
@@ -1823,7 +1834,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
         kind=GATEWAY_KIND,
         family=ANTHROPIC_FAMILY,
         base_url=base_url,
-        auth_command=auth_command,
+        api_key=api_key or None,
+        auth_command=None if api_key else auth_command,
         detail="claude-sdk gateway transport",
     )
     try:
@@ -1884,6 +1896,88 @@ def _claude_settings_payload(
     if fast_mode is not None:
         settings["fastMode"] = fast_mode
     return json.dumps(settings, separators=(",", ":"))
+
+
+# The helper carries only a path; the client owns the private credential file.
+_STATIC_API_KEY_HELPER_CODE = (
+    "import base64,pathlib,sys;sys.stdout.buffer.write("
+    "pathlib.Path(base64.b64decode(sys.argv[1]).decode()).read_bytes())"
+)
+
+# Characters that would be reinterpreted by cmd.exe (``%`` / ``!`` expansion)
+# or by POSIX sh (``$`` / backtick / backslash-escape) inside double quotes.
+_UNSAFE_HELPER_PATH_CHARS = frozenset('"%!$`\n\r')
+
+
+def _static_printf_secret(command: str | None) -> str | None:
+    """Return the literal key iff *command* is Omnigent's static-key helper form.
+
+    Only an exact ``printf %s <shlex.quote(key)>`` round-trip is recognized,
+    so a user-supplied command that merely *looks* similar (e.g.
+    ``printf %s "$TOKEN"``, which a shell would expand, or anything with
+    trailing shell syntax) is never treated as a static key.
+
+    :param command: An apiKeyHelper command, e.g. ``"printf %s sk-dummy"``.
+    :returns: The literal key, or ``None`` when *command* is not that form.
+    """
+    if not command or not command.startswith("printf %s "):
+        return None
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 3 or parts[0] != "printf" or parts[1] != "%s" or not parts[2]:
+        return None
+    secret = parts[2]
+    if command != f"printf %s {shlex.quote(secret)}":
+        return None
+    return secret
+
+
+def _windows_static_key_helper_command(
+    python_executable: str | None, key_path: pathlib.Path
+) -> str | None:
+    """Build a Windows helper whose only operand encodes the private file path.
+
+    :param python_executable: Interpreter path; shell-expanding paths are rejected.
+    :param key_path: Client-owned credential file, never the credential itself.
+    :returns: A command carrying only code and a path, or None for an unsafe interpreter.
+    """
+    if not python_executable:
+        return None
+    if any(ch in _UNSAFE_HELPER_PATH_CHARS for ch in python_executable):
+        return None
+    if "\\\\" in python_executable:
+        return None
+    encoded_path = base64.b64encode(str(key_path).encode("utf-8")).decode("ascii")
+    return f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" {encoded_path}'
+
+
+def _platform_safe_api_key_helper(
+    command: str | None,
+    *,
+    is_windows: bool | None = None,
+    python_executable: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Defer supported Windows static helpers until their client owns a key file.
+
+    :param command: Generated static helper or a dynamic command.
+    :param is_windows: Platform override for tests.
+    :param python_executable: Interpreter override for tests.
+    :returns: Unchanged command, or (None, static key) for deferred setup.
+    """
+    windows = IS_WINDOWS if is_windows is None else is_windows
+    if not windows or not command:
+        return command, None
+    secret = _static_printf_secret(command)
+    if secret is None:
+        return command, None
+    interpreter = sys.executable if python_executable is None else python_executable
+    if _windows_static_key_helper_command(interpreter, pathlib.Path("key")) is None:
+        raise RuntimeError(
+            "Claude SDK static API-key helper needs a safe Python interpreter path on Windows"
+        )
+    return None, secret
 
 
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
@@ -2691,6 +2785,7 @@ class ClaudeSDKExecutor(Executor):
         session_key: str,
         options: SdkOptions,
         model: str | None,
+        static_api_key: str | None = None,
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
@@ -2707,11 +2802,32 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
+            key_file = None
+            try:
+                if static_api_key is not None:
+                    interpreter = sys.executable
+                    if (
+                        _windows_static_key_helper_command(interpreter, pathlib.Path("key"))
+                        is None
+                    ):
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
+                    key_file = PrivateStaticKeyFile(static_api_key)
+                    settings = json.loads(getattr(options, "settings", None) or "{}")
+                    helper = _windows_static_key_helper_command(interpreter, key_file.path)
+                    if helper is None:
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
+                    settings["apiKeyHelper"] = helper
+                    options.settings = json.dumps(settings, separators=(",", ":"))
+                client = sdk.ClaudeSDKClient(options)
+            except BaseException:
+                options.stderr = original_stderr
+                if key_file is not None:
+                    key_file.close()
+                raise
             operation = ContextOperationV2(operation_id=uuid4().hex, action="create")
-            client = sdk.ClaudeSDKClient(options)
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
-            state = _ClaudeClientState(client=client, model=model)
+            state = _ClaudeClientState(client=client, model=model, static_key_file=key_file)
             state.system_prompt = (
                 original_prompt.get("append")
                 if isinstance(original_prompt, dict)
@@ -2769,16 +2885,22 @@ class ClaudeSDKExecutor(Executor):
                         }
                     env_stack.enter_context(_unset_env_var("CLAUDECODE"))
                     env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if static_api_key is not None:
+                        # Harness transport commands can contain the literal static key.
+                        for name in (
+                            "HARNESS_CLAUDE_SDK_API_KEY_HELPER",
+                            "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
+                        ):
+                            env_stack.enter_context(_unset_env_var(name))
                     if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
                         env_stack.enter_context(
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
-                    connected = True
+                connected = True
             except TimeoutError as exc:
                 self._resident_inventory_detached = True
                 state.context_lifecycle = "closing"
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.warning(
@@ -2799,7 +2921,6 @@ class ClaudeSDKExecutor(Executor):
                 # the error message is useful rather than just "Command failed
                 # with exit code 1; Check stderr output for details".
                 await asyncio.sleep(0.1)
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.error(
@@ -2823,6 +2944,13 @@ class ClaudeSDKExecutor(Executor):
                 if isinstance(original_prompt, str):
                     options.system_prompt = original_prompt
                     options.extra_args = original_extra_args
+                if not connected:
+                    try:
+                        await self._force_close_client(client)
+                    finally:
+                        if key_file is not None:
+                            state.static_key_file = None
+                            key_file.close()
             if session_key in self._clients:
                 self._resident_inventory_detached = True
                 self._retain_context(session_key, self._clients[session_key], "unknown")
@@ -3873,7 +4001,11 @@ class ClaudeSDKExecutor(Executor):
         return "default"
 
     async def _apply_gateway_model_vocabulary(
-        self, env: dict[str, str], auth_command: str | None
+        self,
+        env: dict[str, str],
+        auth_command: str | None,
+        *,
+        static_api_key: str | None = None,
     ) -> dict[str, str]:
         """
         Pin the family aliases in *env* and report Claude Code's id rewrites.
@@ -3892,6 +4024,8 @@ class ClaudeSDKExecutor(Executor):
         :param env: The child-process env dict, mutated in place with the pins.
         :param auth_command: The gateway ``apiKeyHelper`` command used to mint
             a bearer for the model listing.
+        :param static_api_key: Literal key when Windows rewrites a static
+            helper; gateway listing then does not execute the child-only helper.
         :returns: Canonical-to-served rewrites for the ``modelOverrides``
             setting. Empty off the gateway or when discovery found nothing.
         """
@@ -3900,7 +4034,7 @@ class ClaudeSDKExecutor(Executor):
             return {}
         if self._gateway_vocabulary is None:
             self._gateway_vocabulary = await run_sync_on_thread(
-                _gateway_model_vocabulary, base_url, auth_command
+                _gateway_model_vocabulary, base_url, auth_command, static_api_key
             )
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)
@@ -4668,11 +4802,15 @@ class ClaudeSDKExecutor(Executor):
         env = dict(self._extra_env)
         env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Windows uses a Python helper instead of POSIX printf.
+        api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
-        model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        model_overrides = await self._apply_gateway_model_vocabulary(
+            env, api_key_helper, static_api_key=static_api_key
+        )
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
@@ -5044,6 +5182,7 @@ class ClaudeSDKExecutor(Executor):
                 session_key=session_key,
                 options=options,
                 model=model,
+                **({"static_api_key": static_api_key} if static_api_key is not None else {}),
             )
         except BaseException:
             await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)

@@ -10,14 +10,12 @@ import type { ManagedAgent } from "@/hooks/useCustomAgents";
 import { expectSettingsPages } from "@/test/settingsPaging";
 
 const flags = vi.hoisted(() => ({
-  feature: true,
   install: true,
   detail: true as boolean | undefined,
   edit: true as boolean | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    features: { custom_agents_settings_ui: flags.feature },
     agent_install: flags.install,
     agent_detail: flags.detail,
     agent_config_edit: flags.edit,
@@ -97,7 +95,6 @@ function mount(path = "/settings/custom-agents") {
 }
 
 beforeEach(() => {
-  flags.feature = true;
   flags.install = true;
   flags.detail = true;
   flags.edit = true;
@@ -507,12 +504,8 @@ describe("Custom agents settings", () => {
     }
   });
 
-  it.each([
-    [false, true],
-    [true, false],
-  ])("does not fetch when feature=%s, install=%s", (feature, install) => {
-    flags.feature = feature;
-    flags.install = install;
+  it("does not fetch without the install capability", () => {
+    flags.install = false;
     mount();
     expect(screen.getByTestId("agent-library")).toBeInTheDocument();
     expect(authenticatedFetch).not.toHaveBeenCalled();

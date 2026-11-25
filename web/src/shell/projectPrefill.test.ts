@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import type { ProjectHostRoots } from "@/lib/projectsApi";
-import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
+import { initialPrefillState, projectPrefillStep, projectRepository } from "./projectPrefill";
 
 const hosts: Host[] = [
   { host_id: "host_1", name: "laptop", owner: "corey", status: "online" },
@@ -167,5 +167,76 @@ describe("projectPrefill location seeding", () => {
       }),
     );
     expect(writes.selectSandbox).toBeUndefined();
+  });
+});
+
+describe("projectRepository", () => {
+  const url = "https://git.example.com/team/app.git";
+
+  it.each<[string, unknown, ReturnType<typeof projectRepository>]>([
+    [
+      "keeps a url and branch, trimmed",
+      { url: ` ${url} `, branch: " main " },
+      { url, branch: "main" },
+    ],
+    ["drops a blank branch", { url, branch: "  " }, { url }],
+    ["keeps a url without a branch", { url }, { url }],
+    // A legacy bare string would crash the composer's `url.trim()` if seeded.
+    ["ignores a legacy bare string", url, undefined],
+    ["ignores null", null, undefined],
+    ["ignores an array", [url], undefined],
+    ["ignores a blank url", { url: "  " }, undefined],
+    ["ignores a non-string url", { url: 3 }, undefined],
+    ["ignores a non-string branch", { url, branch: 7 }, undefined],
+    ["ignores a url the picker rejects", { url: "not a url" }, undefined],
+    ["ignores a branch the picker rejects", { url, branch: "bad..branch" }, undefined],
+  ])("%s", (_label, value, expected) => {
+    expect(projectRepository(value)).toEqual(expected);
+  });
+});
+
+describe("projectPrefill sandbox project", () => {
+  const url = "https://git.example.com/team/app.git";
+
+  it("selects the stored provider and seeds the saved repository", () => {
+    const { writes } = runToDone(
+      inputs({
+        managedSandboxesEnabled: true,
+        config: {
+          hostId: SANDBOX_HOST_CHOICE,
+          sandboxProvider: "daytona",
+          repository: { url, branch: "dev" },
+        },
+      }),
+    );
+    expect(writes).toMatchObject({
+      selectSandbox: true,
+      sandboxProvider: "daytona",
+      sandboxRepos: [{ url, branch: "dev" }],
+    });
+  });
+
+  it("seeds an empty branch when the saved repository names none", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({
+        managedSandboxesEnabled: true,
+        config: { hostId: SANDBOX_HOST_CHOICE, repository: { url } },
+      }),
+    );
+    expect(step?.writes.sandboxRepos).toEqual([{ url, branch: "" }]);
+  });
+
+  it("does not reseed the repository once the sandbox is already selected", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({
+        managedSandboxesEnabled: true,
+        sandboxSelected: true,
+        config: { hostId: SANDBOX_HOST_CHOICE, repository: { url } },
+      }),
+    );
+    expect(step?.writes.sandboxRepos).toBeUndefined();
+    expect(step?.writes.selectSandbox).toBeUndefined();
   });
 });

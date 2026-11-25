@@ -305,7 +305,7 @@ def _patch_create(
         )
         if error is not None:
             raise error
-        return SimpleNamespace(id=sid, session_choice=None), conv
+        return SimpleNamespace(id=sid, session_choice=None), conv, body
 
     monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
     return captured
@@ -334,7 +334,7 @@ def _patch_create_gated(
             project_id=body.project_id,
             runner_id=token_bound_runner_id(secrets.token_hex(16)),
         )
-        return SimpleNamespace(id=sid, session_choice=None), conv
+        return SimpleNamespace(id=sid, session_choice=None), conv, body
 
     monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
     return gate, captured

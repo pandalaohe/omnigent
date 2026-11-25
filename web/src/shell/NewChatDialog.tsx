@@ -41,6 +41,14 @@ import {
   ComposerMenuTooltip,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { WorkflowDialog } from "@/components/composer/WorkflowDialog";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  filterWorkflowSkills,
+  offersWorkflow,
+  savedWorkflowMessage,
+  workflowMessage,
+} from "@/lib/workflow";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HarnessMenuNavigationLabel,
@@ -240,6 +248,7 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  projectRepository,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
@@ -248,7 +257,7 @@ import { recordCallingLast, callingDefaultHasModels } from "@/lib/callingDefault
 import { HelpTip } from "@/components/HelpTip";
 import { SessionPromptField } from "@/components/SessionPromptField";
 import { listCallingDefaultCatalogs, type CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
-import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
@@ -2356,6 +2365,8 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
+  /** Parked at prompt-link consumption: the composer keeps it in step with edits. */
+  fromLink?: boolean;
   mcpRegistryServices?: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2407,7 +2418,20 @@ interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
 }
-const landingDrafts = new Map<string | null, LandingDraftState>();
+const landingDrafts = new Map<string, LandingDraftState>();
+
+function landingDraftKey(
+  siblingSourceId: string | null,
+  server = getOmnigentServerIdentity(),
+  viewer = getCurrentUserId(),
+): string {
+  return JSON.stringify([server, viewer, siblingSourceId]);
+}
+
+function ownedLandingDraft(state: LandingDraftState | undefined): LandingDraft | null {
+  const draft = state?.draft ?? null;
+  return draft?.fromLink && getCurrentUserId() === null ? null : draft;
+}
 
 function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null): void {
   state.draft = draft;
@@ -2419,6 +2443,112 @@ function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null)
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
   landingDrafts.clear();
+  submittedKeptPromptIds.clear();
+}
+
+// An embedding host can remount or reload the page right after the composer
+// strips `?prompt=`, and a remount renders before the old composer parks its
+// draft, so the consumed prompt is parked at once and kept briefly here.
+const LINKED_PROMPT_TTL_MS = 60_000;
+
+// Kept prompts whose create is in flight in this document: another composer
+// must not restore them, but a failed create hands them back (and a reload
+// starts with an empty set, so recovery still works).
+const submittedKeptPromptIds = new Set<string>();
+
+interface KeptLinkedPrompt {
+  /** Identifies this consumption; `at` only drives expiry. */
+  id: string;
+  text: string;
+  at: number;
+}
+
+// Scoped to the server and composer; only the confirmed viewer may restore it.
+function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
+  const server = getOmnigentServerIdentity();
+  return server === null
+    ? null
+    : `omnigent:linked-prompt:${JSON.stringify([server, siblingSourceId])}`;
+}
+
+function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  const user = getCurrentUserId();
+  if (key === null || user === null) return null;
+  const kept = {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    text,
+    at: Date.now(),
+  };
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ ...kept, user }));
+  } catch {
+    // Nothing was kept for this prompt, and an older one must not outlive it.
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // Storage is unusable; only the reload case is lost.
+    }
+    return null;
+  }
+  return kept;
+}
+
+function parseKeptLinkedPrompt(raw: string | null): (KeptLinkedPrompt & { user?: unknown }) | null {
+  if (raw === null) return null;
+  const kept: unknown = JSON.parse(raw);
+  return typeof kept === "object" &&
+    kept !== null &&
+    "id" in kept &&
+    "text" in kept &&
+    "at" in kept &&
+    typeof kept.id === "string" &&
+    typeof kept.text === "string" &&
+    typeof kept.at === "number"
+    ? { id: kept.id, text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
+    : null;
+}
+
+function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  const viewer = getCurrentUserId();
+  if (key === null || viewer === null) return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw === null) return null;
+    const kept = parseKeptLinkedPrompt(raw);
+    if (
+      kept !== null &&
+      kept.text.trim() !== "" &&
+      Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
+      kept.user === viewer
+    ) {
+      if (submittedKeptPromptIds.has(kept.id)) return null;
+      return { id: kept.id, text: kept.text, at: kept.at };
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Unreadable storage means there is nothing to restore.
+  }
+  return null;
+}
+
+/** Forget the kept prompt; with `owned`, only if it is still that record. */
+function forgetKeptLinkedPrompt(
+  siblingSourceId: string | null,
+  owned: KeptLinkedPrompt | null,
+): void {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return;
+  try {
+    if (owned !== null) {
+      const stored = parseKeptLinkedPrompt(sessionStorage.getItem(key));
+      if (stored === null || stored.id !== owned.id) return;
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Nothing was kept.
+  }
 }
 
 function NewChatWorkspaceControls({
@@ -2477,7 +2607,7 @@ export function NewChatLandingScreen({
         <Button
           variant="outline"
           onClick={() => {
-            const draft = landingDrafts.get(siblingSourceId)?.draft;
+            const draft = ownedLandingDraft(landingDrafts.get(landingDraftKey(siblingSourceId)));
             navigate(draft ? newSessionLocation(draft.message, draft.files) : "/");
           }}
         >
@@ -2508,13 +2638,16 @@ function NewChatLandingContent({
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
 }) {
   const harnessCapabilities = useHarnessCapabilities();
+  const [draftServer] = useState(getOmnigentServerIdentity);
+  const [draftViewer] = useState(getCurrentUserId);
   const [draftState] = useState(() => {
     if (composerSeed) return { draft: null, revision: 0 };
-    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
-    landingDrafts.set(siblingSourceId, state);
+    const key = landingDraftKey(siblingSourceId, draftServer, draftViewer);
+    const state = landingDrafts.get(key) ?? { draft: null, revision: 0 };
+    landingDrafts.set(key, state);
     return state;
   });
-  const landingDraft = draftState.draft;
+  const [landingDraft] = useState(() => ownedLandingDraft(draftState));
   const navigate = useNavigate();
   const replaceSearchParams = useReplaceSearchParams();
   const [searchParams] = useSearchParams();
@@ -2606,6 +2739,8 @@ function NewChatLandingContent({
       hostId: c.host_id,
       workspace: c.workspace,
       useWorktree: c.use_worktree,
+      sandboxProvider: c.sandbox_provider,
+      repository: projectRepository(c.repository),
     };
   }, [
     projectParam,
@@ -2784,21 +2919,71 @@ function NewChatLandingContent({
   const modelTouchedRef = useRef(restoredDraft?.modelTouched ?? false);
   const effortTouchedRef = useRef(restoredDraft?.effortTouched ?? false);
 
+  // Restore from storage only without a parked draft. A parked draft with the
+  // same text takes over cleanup of the kept copy; a different one (e.g. a
+  // failed create's recovered text) supersedes it.
+  const [keptLinkedPrompt] = useState(() =>
+    !composerSeed && handoff === null && !linkedPrompt?.trim()
+      ? readKeptLinkedPrompt(siblingSourceId)
+      : null,
+  );
+  const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
+  const [ownsKeptLinkedPrompt] = useState(
+    () => restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text,
+  );
+  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
+    ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
+  );
+  const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
+  const delayedLinkRef = useRef<string | null>(null);
+  const mayRestoreAfterIdentityRef = useRef(
+    !composerSeed &&
+      handoff === null &&
+      !linkedPrompt?.trim() &&
+      landingDraft === null &&
+      cacheUser === null,
+  );
+  // A prompt restored from storage joins the same lifecycle as a consumed link.
+  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true || restoresKeptLinkedPrompt);
+  useEffect(() => {
+    if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
+      forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
+    }
+  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, siblingSourceId]);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
-  const restoresDraftText = !composerSeed && handoff === null && !linkedPrompt?.trim();
+  const restoresDraftText =
+    !composerSeed && handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
   const [message, setMessage] = useState<string>(() => {
     if (composerSeed) return composerSeed.prompt;
     if (handoff !== null) return handoff.text;
-    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+    if (linkedPrompt?.trim()) return linkedPrompt;
+    if (restoresKeptLinkedPrompt) return keptLinkedPrompt?.text ?? "";
+    return restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (composerSeed || (!searchParams.has("prompt") && handoffToken === null)) return;
     if (linkedPrompt?.trim()) {
+      mayRestoreAfterIdentityRef.current = false;
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
+      // The link's text is literal, so the parked copy carries none of the old tags.
+      writeLandingDraft(draftState, {
+        ...draftRef.current,
+        message: linkedPrompt,
+        mentions: undefined,
+        fromLink: true,
+      });
+      syncsParkedDraftRef.current = true;
+      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
+      delayedLinkRef.current = getCurrentUserId() === null ? linkedPrompt : null;
+    } else if (handoff !== null) {
+      // The handoff replaced the draft, so a prompt kept for this composer is stale.
+      keptLinkedRef.current = null;
+      delayedLinkRef.current = null;
+      forgetKeptLinkedPrompt(siblingSourceId, null);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2806,7 +2991,50 @@ function NewChatLandingContent({
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
     replaceSearchParams(remaining);
-  }, [composerSeed, linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
+  }, [
+    composerSeed,
+    linkedPrompt,
+    handoffToken,
+    handoff,
+    searchParams,
+    replaceSearchParams,
+    draftState,
+    siblingSourceId,
+  ]);
+  useEffect(() => {
+    if (cacheUser === null) {
+      if (message !== "") mayRestoreAfterIdentityRef.current = false;
+      return;
+    }
+    const delayed = delayedLinkRef.current;
+    delayedLinkRef.current = null;
+    if (delayed !== null && message === delayed && !submittedRef.current) {
+      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, delayed);
+    }
+    if (!mayRestoreAfterIdentityRef.current) return;
+    mayRestoreAfterIdentityRef.current = false;
+    if (message !== "") return;
+    const kept = readKeptLinkedPrompt(siblingSourceId);
+    if (kept === null) return;
+    keptLinkedRef.current = kept;
+    syncsParkedDraftRef.current = true;
+    setMessage(kept.text);
+  }, [cacheUser, message, siblingSourceId]);
+  // Once the user acts on the prompt, a reload must not bring the link's text
+  // back over their work. Any change to the text counts (typing, dictation,
+  // slash completion, clearing).
+  useEffect(() => {
+    const kept = keptLinkedRef.current;
+    if (kept === null || message === kept.text) return;
+    keptLinkedRef.current = null;
+    forgetKeptLinkedPrompt(siblingSourceId, kept);
+  }, [message, siblingSourceId]);
+  // A draft parked at link consumption is the only copy a same-commit remount can
+  // read, so it follows every edit; a submitted draft stays spent.
+  useEffect(() => {
+    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
+  }, [message, draftState]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -3284,6 +3512,7 @@ function NewChatLandingContent({
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    fromLink: syncsParkedDraftRef.current || undefined,
     mcpRegistryServices: mcpRegistryDraftSelection,
     project: projectParam,
     message,
@@ -3317,6 +3546,43 @@ function NewChatLandingContent({
     permissionTouched,
     workspaceFromConfig: workspaceFromConfigRef.current,
   };
+  useLayoutEffect(() => {
+    if (
+      composerSeed ||
+      draftViewer !== null ||
+      cacheUser === null ||
+      draftServer !== getOmnigentServerIdentity()
+    ) {
+      return;
+    }
+    const pendingKey = landingDraftKey(siblingSourceId, draftServer, null);
+    if (landingDrafts.get(pendingKey) !== draftState) return;
+    const confirmedKey = landingDraftKey(siblingSourceId, draftServer, cacheUser);
+    // A blank composer awaiting identity must not replace the account's draft.
+    if (
+      landingDrafts.get(confirmedKey)?.draft &&
+      !message &&
+      !sessionPrompt &&
+      files.length === 0 &&
+      !syncsParkedDraftRef.current
+    ) {
+      return;
+    }
+    // Keep the object (and its revision) so a pending create uses the same slot.
+    if (!submittedRef.current) writeLandingDraft(draftState, draftRef.current);
+    landingDrafts.set(confirmedKey, draftState);
+    landingDrafts.delete(pendingKey);
+  }, [
+    cacheUser,
+    composerSeed,
+    draftServer,
+    draftState,
+    draftViewer,
+    files,
+    message,
+    sessionPrompt,
+    siblingSourceId,
+  ]);
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
     // doesn't leave the screen marked gone.
@@ -6001,6 +6267,7 @@ function NewChatLandingContent({
   // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    if (prefillConfig?.hostId === SANDBOX_HOST_CHOICE && info === "loading") return;
     const step = projectPrefillStep(prefill, {
       hosts,
       sandboxSelected,
@@ -6013,7 +6280,16 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      // A stored provider the server no longer offers falls back to the default.
+      const storedProvider = writes.sandboxProvider;
+      setSandboxProvider(
+        storedProvider !== undefined && sandboxProviderRows.includes(storedProvider)
+          ? storedProvider
+          : defaultSandboxProvider(),
+      );
+    }
+    if (writes.sandboxRepos !== undefined) {
+      setSandboxRepoSelections(writes.sandboxRepos);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.workspace !== undefined) {
@@ -6030,11 +6306,13 @@ function NewChatLandingContent({
     hosts,
     sandboxSelected,
     managedSandboxesEnabled,
+    info,
     selectedHostId,
     prefillConfig,
     configProjectId,
     projectHostRoots,
     defaultSandboxProvider,
+    sandboxProviderRows,
   ]);
 
   // Calling-defaults seed (K8): once project + host are known, resolve the
@@ -6305,14 +6583,32 @@ function NewChatLandingContent({
     allowPending: true,
     starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const availableSkills = useMemo(
-    () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
-    [skillsStatus, hostSkills, selectedAgent?.skills],
+    () =>
+      filterWorkflowSkills(
+        skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? []),
+        workflowsEnabled,
+      ),
+    [skillsStatus, hostSkills, selectedAgent?.skills, workflowsEnabled],
   );
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
   const skillPrefix = skillInvocationPrefix(skillsHarness);
+  const canStartWorkflow = offersWorkflow(availableSkills);
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
+  // Run a workflow starts from the draft, or from text typed in the saved-workflow search.
+  const [workflowDialogDescription, setWorkflowDialogDescription] = useState<string | null>(null);
+  const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
+  const openWorkflowDialog = (description?: string, savedWorkflow: SavedWorkflow | null = null) => {
+    setWorkflowDialogDescription(description || null);
+    setSavedWorkflowToRun(savedWorkflow);
+    setWorkflowDialogOpen(true);
+  };
+  // A workflow from the dialog becomes the first message, then starts the session.
+  const [workflowToSend, setWorkflowToSend] = useState<string | null>(null);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
@@ -7054,6 +7350,10 @@ function NewChatLandingContent({
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
+    if (submittedLinkedPromptRef.current !== null) {
+      submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
+      submittedLinkedPromptRef.current = null;
+    }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource && onScreenRef.current) {
@@ -7091,6 +7391,9 @@ function NewChatLandingContent({
       setCreateError("Shorten the prompt for this chat to 16 KiB or less.");
       return;
     }
+    // Captured before any await: a newer prompt link can replace the kept record
+    // while an earlier submit is still waiting on a pre-create check.
+    const submittedLinkedPrompt = keptLinkedRef.current;
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -7183,8 +7486,12 @@ function NewChatLandingContent({
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
+      // A composer remounted in this commit would otherwise restore the submitted text.
+      if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      submittedLinkedPromptRef.current = submittedLinkedPrompt;
+      if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -7895,6 +8202,11 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
+      if (submittedLinkedPrompt !== null) {
+        if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
+        forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+        submittedKeptPromptIds.delete(submittedLinkedPrompt.id);
+      }
       if (!composerSeed && submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
@@ -7974,6 +8286,14 @@ function NewChatLandingContent({
       }
     }
   }
+
+  const handleCreateRef = useRef(handleCreate);
+  handleCreateRef.current = handleCreate;
+  useEffect(() => {
+    if (workflowToSend === null || message !== workflowToSend) return;
+    setWorkflowToSend(null);
+    void handleCreateRef.current();
+  }, [workflowToSend, message]);
 
   const placeholderText = siblingSourceId
     ? "What should this agent work on?"
@@ -8809,7 +9129,37 @@ function NewChatLandingContent({
                           navigate(`/?${params.toString()}`);
                           requestAnimationFrame(() => textareaRef.current?.focus());
                         }}
+                        onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
+                        savedWorkflows={savedWorkflows.workflows}
+                        workflowPagination={savedWorkflows.pagination}
+                        onRunSavedWorkflow={
+                          canStartWorkflow
+                            ? (workflow) => openWorkflowDialog(undefined, workflow)
+                            : undefined
+                        }
+                        onOpen={savedWorkflows.refresh}
                       />
+                      {canStartWorkflow && (
+                        <WorkflowDialog
+                          open={workflowDialogOpen}
+                          onOpenChange={setWorkflowDialogOpen}
+                          // The draft becomes the description, since the workflow replaces it.
+                          initialDescription={workflowDialogDescription ?? message}
+                          savedWorkflow={savedWorkflowToRun}
+                          onRunWorkflow={({ description, reviewPlanFirst, savedWorkflow }) => {
+                            const text = savedWorkflow
+                              ? savedWorkflowMessage(
+                                  skillPrefix,
+                                  savedWorkflow,
+                                  description,
+                                  reviewPlanFirst,
+                                )
+                              : workflowMessage(skillPrefix, description, reviewPlanFirst);
+                            setMessage(text);
+                            setWorkflowToSend(text);
+                          }}
+                        />
+                      )}
                     </div>
                     {/* Host chip */}
                     <MobileHeaderControlPortal sessionId={null}>

@@ -447,6 +447,7 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     # Peer inputs remain context after restart, never an executable recovery trigger.
     peer_message_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    workflow_run_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     auto_retry: AutoRetryMetadata | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

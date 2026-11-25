@@ -170,7 +170,9 @@ try:
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
     from omnigent.server.managed_hosts import parse_sandbox_config
-    from omnigent.server.server_config import load_server_config
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
+    from omnigent.server.server_config import config_str_list, load_server_config
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.databricks_volumes import (
@@ -216,6 +218,14 @@ try:
     logger.info("DB_URI: %s", DB_URI[:80])
     logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
 
+    cfg = load_server_config()
+    # Resolve boot telemetry before the migration engine and stores initialize.
+    telemetry_enabled_at_start = configure_server_boot_telemetry(cfg)
+    if telemetry_enabled_at_start:
+        from omnigent.debug_logging import attach_debug_log_sink
+
+        attach_debug_log_sink([logging.getLogger()], source="server", level=logging.INFO)
+
     # The app SP owns the tables — run any pending Alembic upgrades
     # before the stores boot, since the verify-schema check refuses
     # to start a stale DB. Idempotent: a no-op when the DB is at head.
@@ -237,17 +247,6 @@ try:
         backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
     )
 
-    server_cfg = load_server_config()
-    # Resolve server boot telemetry before constructing the first DB engine so
-    # stored opt-ins instrument SQLAlchemy and locked-off values beat legacy env.
-    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
-
-    telemetry_enabled_at_start = configure_server_boot_telemetry(server_cfg)
-    if telemetry_enabled_at_start:
-        from omnigent.debug_logging import attach_debug_log_sink
-
-        attach_debug_log_sink([logging.getLogger()], source="server", level=logging.INFO)
-
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)
     conversation_store = SqlAlchemyConversationStore(DB_URI)
@@ -267,9 +266,31 @@ try:
 
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
+    from omnigent.cli import (
+        _build_routing_backends,
+        _parse_native_hook_allow_cache_seconds,
+        parse_routing_settings,
+    )
+    from omnigent.spec import parse_default_policies, parse_server_llm
+
+    server_llm = parse_server_llm(cfg.get("llm"))
+    routing_settings = parse_routing_settings(cfg.get("routing"))
+    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
+    caps = RuntimeCaps(
+        execution_timeout=int(cfg.get("execution_timeout") or 7200),
+        default_policies=parse_default_policies(cfg.get("policies")),
+        llm=server_llm,
+        routing_client=routing_backends.any(),
+        routing_backends=routing_backends,
+        routing_settings=routing_settings,
+        native_hook_allow_cache_seconds=_parse_native_hook_allow_cache_seconds(
+            cfg.get("native_hook_allow_cache_seconds")
+        ),
+    )
+
     init_runtime(
         agent_cache=agent_cache,
-        caps=RuntimeCaps(),
+        caps=caps,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,
@@ -298,7 +319,7 @@ try:
     # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
     # stops startup here instead of 502-ing the first managed session.
     try:
-        sandbox_config = parse_sandbox_config(server_cfg.get("sandbox"))
+        sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
     except ValueError as exc:
         logger.error("Invalid 'sandbox' section in the server config: %s", exc)
         raise
@@ -345,11 +366,14 @@ try:
         scheduled_task_store=scheduled_task_store,
         user_preferences_store=user_preferences_store,
         auth_provider=auth_provider,
+        policy_modules=cfg.get("policy_modules"),
+        debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
+        server_config=cfg,
         sandbox_config=sandbox_config,
-        server_config=server_cfg,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         telemetry_enabled_at_start=telemetry_enabled_at_start,
+        mcp_registry=build_mcp_registry_from_env(DB_URI),
     )
 
     if __name__ == "__main__":

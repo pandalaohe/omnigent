@@ -162,7 +162,7 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     Changes (the two files surfaces — folder tree and changed-files list),
     Agents (unconditional — the panel lists at least the main agent,
     badge "1") and Shells (the agent declares no ``terminals:``, so it offers
-    the default shell), and must NOT list Tasks. The session's only terminal
+    the default shell), plus Tasks when the server supports journals. The session's only terminal
     is the auto-created embedded Omnigent REPL, which is plumbing for the
     Chat/Terminal pill, not inventory — listing it read as a phantom "main"
     terminal on agents that don't run a TUI, so ``inventoryTerminals``
@@ -181,8 +181,13 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     # Agents is always present; "1" = just the main agent. "0" means
     # the main agent was dropped from the count.
     expect(page.get_by_role("menuitem", name=re.compile(r"Agents\s*1"))).to_be_visible()
-    # No todos on a plain hello_world session.
-    expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
+    info = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    info.raise_for_status()
+    tasks = page.get_by_role("menuitem", name="Tasks", exact=True)
+    if info.json().get("session_journal") is True:
+        expect(tasks).to_be_visible()
+    else:
+        expect(tasks).to_have_count(0)
     # Shells is listed (the default user shell needs no declaration) and its
     # drawer offers only the create row: a "main" row means the embedded REPL
     # leaked into the shell inventory.

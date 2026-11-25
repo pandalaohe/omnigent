@@ -172,6 +172,9 @@ def test_conversation_store_names_create_and_get_queries(
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_duplicate_child_title",
+            # Read the parent's automation origin and run before inserting its child.
+            "omnigent.conversation_store.insert_conversation",
+            "omnigent.conversation_store.insert_conversation",
             "omnigent.conversation_store.insert_conversation",
         ]
 

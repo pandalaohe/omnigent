@@ -12,6 +12,7 @@ export type RightRailTab =
   | "files"
   | "changes"
   | "github"
+  | "tasks"
   | "subagents"
   | "archive"
   | "browser"
