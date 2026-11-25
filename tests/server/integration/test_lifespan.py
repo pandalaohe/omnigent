@@ -70,6 +70,7 @@ async def test_telemetry_setting_persists_across_server_restart(
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.telemetry import client as usage_telemetry_client
     from omnigent.telemetry.environment import CI_ENV_VARS
 
     for name in CI_ENV_VARS | {
@@ -89,6 +90,9 @@ async def test_telemetry_setting_persists_across_server_restart(
         monkeypatch.setattr(telemetry, f"_init_otel_{signal}", Mock())
     monkeypatch.setattr(telemetry, "_instrument_httpx", Mock())
     monkeypatch.setattr(telemetry, "instrument_fastapi_app", Mock())
+    urlopen = Mock(side_effect=AssertionError("unexpected outbound telemetry request"))
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr(usage_telemetry_client, "_fetch_remote_config", lambda: None)
 
     first_app = request.getfixturevalue("app")
     assert first_app.state.telemetry_enabled_at_start is False
@@ -101,6 +105,8 @@ async def test_telemetry_setting_persists_across_server_restart(
         updated = await client.put("/v1/system/telemetry", json={"telemetry_enabled": True})
         assert updated.status_code == 200
         assert updated.json() == {"enabled": True, "locked": False, "source": "setting"}
+
+    urlopen.assert_not_called()
 
     assert (tmp_path / "instance" / "telemetry_enabled").read_text(encoding="utf-8") == "on\n"
     monkeypatch.setattr(telemetry, "_initialized", False)

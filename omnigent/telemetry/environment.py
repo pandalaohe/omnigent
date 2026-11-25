@@ -23,6 +23,40 @@ CI_ENV_VARS = frozenset(
         "TEAMCITY_VERSION",
     }
 )
+TELEMETRY_OPT_OUT_ENV_VARS = frozenset(
+    {
+        DISABLE_TELEMETRY_ENV_VAR,
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "OMNIGENT_ANALYTICS",
+        *CI_ENV_VARS,
+    }
+)
+ZEROBUS_DESTINATION_ENV_VARS = frozenset(
+    {
+        "OMNIGENT_DEBUG_LOG_CLIENT_ID",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND",
+        "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
+        "OMNIGENT_DEBUG_LOG_ENDPOINT",
+    }
+)
+_TELEMETRY_CONFIG_ENV_VARS = frozenset(
+    {
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_CONFIG_HOME",
+        "OMNIGENT_ADMIN_CREDENTIALS_PATH",
+    }
+)
+
+
+def preserve_zerobus_opt_outs(env: dict[str, str], source_env: Mapping[str, str]) -> None:
+    """Carry deployment telemetry opt-outs whenever a ZeroBus destination passes."""
+    if not any(env.get(name) for name in ZEROBUS_DESTINATION_ENV_VARS):
+        return
+    for name in TELEMETRY_OPT_OUT_ENV_VARS | _TELEMETRY_CONFIG_ENV_VARS:
+        if name in source_env:
+            env[name] = source_env[name]
 
 
 def is_disabled_by_env(env: Mapping[str, str]) -> bool:

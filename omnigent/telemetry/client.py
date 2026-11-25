@@ -225,37 +225,55 @@ def _fetch_remote_config() -> TelemetryConfig | None:
         return None
 
 
+def config_disables_telemetry(config: Mapping[str, object]) -> bool:
+    """Return ``True`` when a parsed config mapping sets top-level ``telemetry`` to false."""
+    value = config.get("telemetry")
+    # Some config loaders preserve YAML scalars as strings.
+    return value is False or (isinstance(value, str) and value.strip().lower() == "false")
+
+
 def _config_file_disables_telemetry(config_path: Path) -> bool:
-    import re as _re
+    import yaml
 
     if not config_path.is_file():
         return False
-    # Read raw text and match `telemetry: false` directly to avoid
-    # PyYAML SafeLoader bool-resolver corruption: spec/parser.py's
-    # _ConfigYamlLoader subclass modifies the shared
-    # SafeLoader.yaml_implicit_resolvers class dict at import time,
-    # causing `false` to parse as a string rather than a boolean.
-    text = config_path.read_text(encoding="utf-8")
-    return bool(_re.search(r"^\s*telemetry\s*:\s*false\s*$", text, _re.IGNORECASE | _re.MULTILINE))
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    try:
+        data: object = yaml.safe_load(text)
+    except yaml.YAMLError:
+        # Preserve opt-out detection if a malformed YAML file still has a
+        # `telemetry: false` directive.
+        for line in text.splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            key, sep, val = stripped.partition(":")
+            if sep and key.strip().strip("'\"").lower() == "telemetry":
+                return val.strip().lower() == "false"
+        return False
+    return isinstance(data, Mapping) and config_disables_telemetry(data)
 
 
 def _config_telemetry_disabled() -> bool:
-    """Return ``True`` when ``telemetry: false`` is set in config.yaml.
+    """Return ``True`` when any active Omnigent config sets ``telemetry: false``.
 
-    Checks ``OMNIGENT_CONFIG`` when set, plus ``~/.omnigent/config.yaml``
-    (honouring ``OMNIGENT_CONFIG_HOME``). Returns ``False`` on any error so a
-    missing/malformed config never silently suppresses telemetry.
+    Uses the same config-path rules as ``omnigent.server.server_config``
+    (``OMNIGENT_CONFIG`` or ``<server_data_dir>/config.yaml``) and
+    ``omnigent.config`` (``OMNIGENT_CONFIG_HOME/config.yaml`` or
+    ``~/.omnigent/config.yaml``), parsed with ``yaml.safe_load``.
     """
     try:
+        from omnigent.config import global_config_path
+        from omnigent.server.server_config import resolve_config_path
+
         candidates: list[Path] = []
-        explicit_config = os.environ.get("OMNIGENT_CONFIG", "").strip()
-        if explicit_config:
-            candidates.append(Path(explicit_config))
-        config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-        if config_home:
-            candidates.append(Path(config_home) / "config.yaml")
-        else:
-            candidates.append(Path.home() / ".omnigent" / "config.yaml")
+        server_path = resolve_config_path()
+        if server_path is not None:
+            candidates.append(server_path)
+        user_path = global_config_path(default_path=Path.home() / ".omnigent" / "config.yaml")
+        if user_path not in candidates:
+            candidates.append(user_path)
         return any(_config_file_disables_telemetry(path) for path in candidates)
     except Exception:
         return False

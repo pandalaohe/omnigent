@@ -4055,6 +4055,9 @@ def _build_host_daemon_env(
     pin = _host_databricks_org_pin(server_url)
     if pin is not None:
         env[PINNED_DATABRICKS_ORG_ENV_VAR] = pin
+    from omnigent.telemetry.environment import preserve_zerobus_opt_outs
+
+    preserve_zerobus_opt_outs(env, os.environ)
     return env
 
 
@@ -4972,7 +4975,7 @@ def server(
     # so a stored opt-in instruments SQL queries and a lock-off blocks legacy env.
     from omnigent.server.telemetry_settings import configure_server_boot_telemetry
 
-    configure_server_boot_telemetry(title_server_config)
+    telemetry_enabled_at_start = configure_server_boot_telemetry(title_server_config)
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
@@ -5223,6 +5226,7 @@ def server(
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
     )
     server_log_path = configure_process_logging(
         "server",

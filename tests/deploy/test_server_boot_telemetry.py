@@ -42,8 +42,11 @@ def _clear_telemetry_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_AUTH_PROVIDER",
         "OMNIGENT_LOCAL_SINGLE_USER",
+        "OMNIGENT_WEB_UI_DIST",
     }:
-        monkeypatch.delenv(name, raising=False)
+        # Set-then-delete guarantees monkeypatch records undo even for vars absent at start.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", _COLLECTOR_URL)
@@ -91,21 +94,26 @@ class _StubZerobus(dl.DebugLogHandler):
         super().__init__(source, lambda _batch: None)
 
 
-def _cleanup_zerobus_sink(saved_root_handlers: list[logging.Handler]) -> None:
+def _snapshot_loggers() -> list[tuple[logging.Logger, list[logging.Handler], int, bool]]:
+    loggers = (logging.getLogger(), dl.sse_event_logger(), dl.audit_event_logger())
+    return [(lg, list(lg.handlers), lg.level, lg.propagate) for lg in loggers]
+
+
+def _restore_loggers(
+    saved_state: list[tuple[logging.Logger, list[logging.Handler], int, bool]],
+) -> None:
     sink = dl._active_sink
     if sink is not None:
         sink.shutdown()
         dl._active_sink = None
-    for lg, saved in (
-        (logging.getLogger(), saved_root_handlers),
-        (dl.sse_event_logger(), []),
-        (dl.audit_event_logger(), []),
-    ):
+    for lg, saved_handlers, saved_level, saved_propagate in saved_state:
         for handler in list(lg.handlers):
-            if handler not in saved:
+            if handler not in saved_handlers:
                 lg.removeHandler(handler)
                 if handler is not sink:
                     handler.close()
+        lg.setLevel(saved_level)
+        lg.propagate = saved_propagate
 
 
 @pytest.mark.parametrize(
@@ -142,7 +150,7 @@ def test_docker_entrypoint_resolves_telemetry_before_first_engine_and_gates_zero
     artifacts_dir.mkdir()
 
     sys.path.insert(0, str(_REPO_ROOT))
-    saved_root_handlers = list(logging.getLogger().handlers)
+    saved_loggers = _snapshot_loggers()
     try:
         entrypoint = importlib.import_module("deploy.docker.entrypoint")
         entrypoint.run_migrations(db_url)
@@ -169,7 +177,69 @@ def test_docker_entrypoint_resolves_telemetry_before_first_engine_and_gates_zero
                 assert active_span is INVALID_SPAN
     finally:
         sys.path.remove(str(_REPO_ROOT))
-        _cleanup_zerobus_sink(saved_root_handlers)
+        _restore_loggers(saved_loggers)
+        engine = db_utils._engine_cache.pop(db_utils.normalize_database_url(db_url), None)
+        if engine is not None:
+            engine.dispose()
+
+
+@pytest.mark.parametrize("initial_on", [False, True], ids=["off-then-on", "on-then-off"])
+def test_docker_entrypoint_uses_single_boot_telemetry_snapshot_across_mid_boot_flip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_on: bool,
+) -> None:
+    """Mid-boot setting flips cannot split OTel/ZeroBus/SQL/FastAPI decisions."""
+    _clear_telemetry_env(monkeypatch, tmp_path)
+    exporters, sql_inst, fastapi_inst = _reset_otel_and_zerobus(monkeypatch)
+    monkeypatch.setattr(dl, "ZerobusLogHandler", _StubZerobus)
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    setting_file = data_dir / "telemetry_enabled"
+    setting_file.write_text("on\n" if initial_on else "off\n", encoding="utf-8")
+
+    db_url = f"sqlite:///{tmp_path / 'docker-snapshot.db'}"
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    import omnigent.server.app as server_app
+
+    real_create_app = server_app.create_app
+
+    def flip_before_create_app(**kwargs: object) -> object:
+        # Simulate another replica flipping telemetry_enabled during store startup.
+        setting_file.write_text("off\n" if initial_on else "on\n", encoding="utf-8")
+        return real_create_app(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(server_app, "create_app", flip_before_create_app)
+
+    sys.path.insert(0, str(_REPO_ROOT))
+    saved_loggers = _snapshot_loggers()
+    try:
+        entrypoint = importlib.import_module("deploy.docker.entrypoint")
+        entrypoint.run_migrations(db_url)
+        resolved = entrypoint._ResolvedConfig(
+            cfg={},
+            database_url=db_url,
+            artifact_dir=artifacts_dir,
+            artifact_store_uri=None,
+            host="127.0.0.1",
+            port=8000,
+        )
+        built = entrypoint.build_app(resolved)
+
+        assert built.app.state.telemetry_enabled_at_start is initial_on
+        assert telemetry.telemetry_enabled() is initial_on
+        assert [exporter.called for exporter in exporters] == [initial_on] * 3
+        assert sql_inst.called is initial_on
+        assert fastapi_inst.called is initial_on
+        assert isinstance(dl._active_sink, _StubZerobus) is initial_on
+    finally:
+        sys.path.remove(str(_REPO_ROOT))
+        _restore_loggers(saved_loggers)
         engine = db_utils._engine_cache.pop(db_utils.normalize_database_url(db_url), None)
         if engine is not None:
             engine.dispose()
@@ -236,7 +306,7 @@ def test_databricks_app_resolves_telemetry_before_first_engine_and_gates_zerobus
 
     monkeypatch.setattr(server_app, "create_app", spy_create_app)
 
-    saved_root_handlers = list(logging.getLogger().handlers)
+    saved_loggers = _snapshot_loggers()
     try:
         mod = importlib.import_module(_APP_MODULE)
         assert exit_codes == []
@@ -250,5 +320,5 @@ def test_databricks_app_resolves_telemetry_before_first_engine_and_gates_zerobus
         assert fastapi_inst.called is expected_on
         assert isinstance(dl._active_sink, _StubZerobus) is expected_on
     finally:
-        _cleanup_zerobus_sink(saved_root_handlers)
+        _restore_loggers(saved_loggers)
         sys.modules.pop(_APP_MODULE, None)

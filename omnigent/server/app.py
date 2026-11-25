@@ -1798,6 +1798,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    telemetry_enabled_at_start: bool | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -2021,10 +2022,14 @@ def create_app(
     telemetry_settings = TelemetrySettings(resolved_server_config)
     from omnigent.runtime import telemetry
 
-    telemetry_enabled_at_start = telemetry_settings.enabled()
+    resolved_boot_telemetry = (
+        telemetry_settings.enabled()
+        if telemetry_enabled_at_start is None
+        else telemetry_enabled_at_start
+    )
     telemetry.init(
         os.environ.get("OTEL_SERVICE_NAME") or "omni-server",
-        server_opted_in=telemetry_enabled_at_start,
+        server_opted_in=resolved_boot_telemetry,
     )
     usage_telemetry = ServerUsageTelemetry(telemetry_settings.enabled)
     telemetry_write_lock = asyncio.Lock()
@@ -2974,8 +2979,8 @@ def create_app(
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     app.add_middleware(UsageTelemetryMiddleware, telemetry=usage_telemetry)
-    app.state.telemetry_enabled_at_start = telemetry_enabled_at_start
-    if telemetry_enabled_at_start:
+    app.state.telemetry_enabled_at_start = resolved_boot_telemetry
+    if resolved_boot_telemetry:
         telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
     # diagnostics can verify that the production app wires the route

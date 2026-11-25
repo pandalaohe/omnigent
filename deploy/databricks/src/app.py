@@ -349,6 +349,7 @@ try:
         server_config=server_cfg,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
     )
 
     if __name__ == "__main__":

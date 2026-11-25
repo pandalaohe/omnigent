@@ -551,6 +551,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        telemetry_enabled_at_start=telemetry_enabled_at_start,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)

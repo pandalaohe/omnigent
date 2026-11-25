@@ -1340,11 +1340,16 @@ def test_zerobus_attachment_honors_deployment_opt_out_across_processes(
 
     logger_name = f"omnigent.test.zerobus_opt_out.{process_kind}.{opt_out_kind}"
     test_logger = logging.getLogger(logger_name)
-    original_handlers = list(test_logger.handlers)
-    original_root_handlers = list(logging.getLogger().handlers)
-    original_startup_handlers = list(startup_events._logger.handlers)
     daemon_stop_logger = logging.getLogger("omnigent.host.daemon_stop")
-    original_daemon_stop_handlers = list(daemon_stop_logger.handlers)
+    tracked_loggers = (
+        test_logger,
+        logging.getLogger(),
+        startup_events._logger,
+        daemon_stop_logger,
+        dl.sse_event_logger(),
+        dl.audit_event_logger(),
+    )
+    saved_state = [(lg, list(lg.handlers), lg.level, lg.propagate) for lg in tracked_loggers]
 
     try:
         if process_kind in {"server", "host", "runner"}:
@@ -1381,16 +1386,191 @@ def test_zerobus_attachment_honors_deployment_opt_out_across_processes(
         assert dl._active_sink is None
         assert http_posts == []
     finally:
-        for lg, saved in (
-            (test_logger, original_handlers),
-            (logging.getLogger(), original_root_handlers),
-            (startup_events._logger, original_startup_handlers),
-            (daemon_stop_logger, original_daemon_stop_handlers),
-        ):
+        for lg, saved_handlers, saved_level, saved_propagate in saved_state:
             for handler in list(lg.handlers):
-                if handler not in saved:
+                if handler not in saved_handlers:
                     lg.removeHandler(handler)
                     handler.close()
+            lg.setLevel(saved_level)
+            lg.propagate = saved_propagate
+
+
+@pytest.mark.parametrize(
+    ("opt_out_name", "opt_out_value"),
+    [
+        pytest.param("OMNIGENT_DISABLE_TELEMETRY", "1", id="disable-env"),
+        pytest.param("DISABLE_TELEMETRY", "true", id="legacy-disable"),
+        pytest.param("DO_NOT_TRACK", "1", id="do-not-track"),
+        pytest.param("OMNIGENT_ANALYTICS", "0", id="analytics-zero"),
+        pytest.param("CI", "true", id="ci-marker"),
+        pytest.param("GITHUB_ACTIONS", "true", id="github-actions"),
+        pytest.param("OMNIGENT_CONFIG", "/opt/work/omnigent/config.yaml", id="config-path"),
+    ],
+)
+def test_host_and_runner_launch_env_preserve_opt_outs_with_zerobus_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opt_out_name: str,
+    opt_out_value: str,
+) -> None:
+    """Host and runner launch-env filters keep deployment opt-outs whenever ZeroBus passes."""
+    from unittest.mock import patch
+
+    from omnigent import cli as cli_module
+    from omnigent import debug_logging as dl
+    from omnigent.host.connect import _build_runner_env
+
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    monkeypatch.setattr("omnigent.onboarding.provider_config._load_config", dict)
+    monkeypatch.setattr("omnigent.models.model_source.model_source_env_names", lambda _c: set())
+
+    zerobus_env = {
+        dl.CLIENT_ID_ENV_VAR: "cid",
+        dl.CLIENT_SECRET_ENV_VAR: "secret",
+        dl.WORKSPACE_URL_ENV_VAR: "https://ws.example.test",
+        dl.ENDPOINT_ENV_VAR: (
+            "https://123456.zerobus.example.test/zerobus/v1/tables/cat.sch.logs/insert"
+        ),
+    }
+    source_env = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path / "home"),
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        **zerobus_env,
+        opt_out_name: opt_out_value,
+    }
+    if opt_out_name == "OMNIGENT_CONFIG":
+        cfg_file = tmp_path / "server-config.yaml"
+        cfg_file.write_text("telemetry: false  # opt out\n", encoding="utf-8")
+        opt_out_value = str(cfg_file)
+        source_env[opt_out_name] = opt_out_value
+
+    with patch.dict(os.environ, source_env, clear=True):
+        remote_daemon_env = cli_module._build_host_daemon_env(
+            server_url="https://remote.example.test"
+        )
+    assert remote_daemon_env[dl.ENDPOINT_ENV_VAR] == zerobus_env[dl.ENDPOINT_ENV_VAR]
+    assert remote_daemon_env[opt_out_name] == opt_out_value
+    assert remote_daemon_env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+
+    runner_env = _build_runner_env(
+        remote_daemon_env,
+        server_url="https://remote.example.test",
+        runner_id="runner-opt-out",
+        binding_token="binding-token",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+        session_env={opt_out_name: "0"},
+    )
+    assert runner_env[dl.ENDPOINT_ENV_VAR] == zerobus_env[dl.ENDPOINT_ENV_VAR]
+    assert runner_env[opt_out_name] == opt_out_value
+    assert runner_env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+
+    # A session_env-injected ZeroBus destination also inherits the host's deployment opt-out.
+    host_without_dest = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path / "home"),
+        opt_out_name: opt_out_value,
+    }
+    injected_runner_env = _build_runner_env(
+        host_without_dest,
+        server_url="https://remote.example.test",
+        runner_id="runner-injected",
+        binding_token="binding-token",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+        session_env=zerobus_env,
+    )
+    assert injected_runner_env[opt_out_name] == opt_out_value
+
+    # Under the resulting runner env, ZeroBus stays inert (no handler, no network).
+    monkeypatch.setattr(dl, "_active_sink", None)
+    with patch.dict(os.environ, runner_env, clear=True):
+        dl.attach_debug_log_sink([], source="runner", level=logging.INFO)
+        assert dl._active_sink is None
+
+
+@pytest.mark.parametrize(
+    ("config_text", "location"),
+    [
+        pytest.param(
+            "telemetry: false  # trailing comment\n", "config_home", id="trailing-comment"
+        ),
+        pytest.param('"telemetry": false\n', "config_home", id="double-quoted-key"),
+        pytest.param("'telemetry': false  # quoted\n", "config_home", id="single-quoted-key"),
+        pytest.param("telemetry: false  # explicit\n", "omnigent_config", id="omnigent-config"),
+        pytest.param("telemetry: false\n", "mounted_volume", id="mounted-volume-config"),
+    ],
+)
+def test_zerobus_yaml_config_opt_out_variants_block_upload_and_token_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+    location: str,
+) -> None:
+    """YAML comments, quoted keys, OMNIGENT_CONFIG, and mounted config.yaml opt out ZeroBus."""
+    from omnigent import debug_logging as dl
+    from omnigent.telemetry.environment import CI_ENV_VARS
+
+    for name in CI_ENV_VARS | {
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "OMNIGENT_ANALYTICS",
+        "OMNIGENT_ENABLE_TELEMETRY",
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_CONFIG_HOME",
+        "OMNIGENT_ADMIN_CREDENTIALS_PATH",
+    }:
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.example.test")
+    monkeypatch.setenv(
+        dl.ENDPOINT_ENV_VAR,
+        "https://123456.zerobus.example.test/zerobus/v1/tables/cat.sch.logs/insert",
+    )
+
+    if location == "config_home":
+        cfg_dir = tmp_path / "cfg-home"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(cfg_dir))
+    elif location == "omnigent_config":
+        cfg_file = tmp_path / "custom-server.yaml"
+        cfg_file.write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(cfg_file))
+    elif location == "mounted_volume":
+        vol_dir = tmp_path / "data"
+        vol_dir.mkdir()
+        (vol_dir / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(vol_dir / "admin-credentials"))
+
+    handler_calls: list[str] = []
+
+    def _recording_handler(config: dl.DebugLogConfig, source: str) -> dl.ZerobusLogHandler:
+        handler_calls.append(f"{source}:{config.insert_url}")
+        raise RuntimeError("ZeroBus handler must not be constructed when opted out")
+
+    monkeypatch.setattr(dl, "ZerobusLogHandler", _recording_handler)
+    monkeypatch.setattr(dl, "_active_sink", None)
+
+    target = logging.getLogger(f"omnigent.test.yaml_opt_out.{location}")
+    saved = (list(target.handlers), target.level, target.propagate)
+    try:
+        dl.attach_debug_log_sink([target], source="host", level=logging.INFO)
+        assert handler_calls == []
+        assert dl._active_sink is None
+        assert target.handlers == saved[0]
+    finally:
+        for handler in list(target.handlers):
+            if handler not in saved[0]:
+                target.removeHandler(handler)
+                handler.close()
+        target.setLevel(saved[1])
+        target.propagate = saved[2]
 
 
 @pytest.mark.parametrize(
@@ -1441,11 +1621,16 @@ def test_non_server_processes_keep_configured_zerobus_without_opt_out(
 
     logger_name = f"omnigent.test.zerobus_enabled.{process_kind}"
     test_logger = logging.getLogger(logger_name)
-    original_handlers = list(test_logger.handlers)
-    original_root_handlers = list(logging.getLogger().handlers)
-    original_startup_handlers = list(startup_events._logger.handlers)
     daemon_stop_logger = logging.getLogger("omnigent.host.daemon_stop")
-    original_daemon_stop_handlers = list(daemon_stop_logger.handlers)
+    tracked_loggers = (
+        test_logger,
+        logging.getLogger(),
+        startup_events._logger,
+        daemon_stop_logger,
+        dl.sse_event_logger(),
+        dl.audit_event_logger(),
+    )
+    saved_state = [(lg, list(lg.handlers), lg.level, lg.propagate) for lg in tracked_loggers]
 
     try:
         if process_kind in {"host", "runner"}:
@@ -1481,19 +1666,14 @@ def test_non_server_processes_keep_configured_zerobus_without_opt_out(
         if sink is not None:
             sink.shutdown()
             dl._active_sink = None
-        for lg, saved in (
-            (test_logger, original_handlers),
-            (logging.getLogger(), original_root_handlers),
-            (startup_events._logger, original_startup_handlers),
-            (daemon_stop_logger, original_daemon_stop_handlers),
-            (dl.sse_event_logger(), []),
-            (dl.audit_event_logger(), []),
-        ):
+        for lg, saved_handlers, saved_level, saved_propagate in saved_state:
             for handler in list(lg.handlers):
-                if handler not in saved:
+                if handler not in saved_handlers:
                     lg.removeHandler(handler)
                     if handler is not sink:
                         handler.close()
+            lg.setLevel(saved_level)
+            lg.propagate = saved_propagate
 
 
 def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:

@@ -1181,6 +1181,9 @@ def _build_runner_env(
     if session_env:
         env.update(session_env)
         env[RUNNER_SESSION_ENV_NAMES_ENV_VAR] = ",".join(sorted(session_env))
+    from omnigent.telemetry.environment import preserve_zerobus_opt_outs
+
+    preserve_zerobus_opt_outs(env, base_env)
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token

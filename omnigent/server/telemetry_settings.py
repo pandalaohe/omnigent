@@ -9,7 +9,11 @@ from pydantic import BaseModel, StrictBool
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.server.sharing_settings import read_telemetry_enabled_override
-from omnigent.telemetry.client import ServerUsageTelemetry, _config_telemetry_disabled
+from omnigent.telemetry.client import (
+    ServerUsageTelemetry,
+    _config_telemetry_disabled,
+    config_disables_telemetry,
+)
 from omnigent.telemetry.environment import telemetry_override
 
 
@@ -25,12 +29,8 @@ class TelemetrySettingsUpdate(BaseModel):
 
 class TelemetrySettings:
     def __init__(self, config: Mapping[str, object]) -> None:
-        value = config.get("telemetry")
-        # Some config loaders preserve YAML scalars as strings.
         self._disabled_by_config = (
-            value is False
-            or (isinstance(value, str) and value.strip().lower() == "false")
-            or _config_telemetry_disabled()
+            config_disables_telemetry(config) or _config_telemetry_disabled()
         )
 
     def status(self) -> TelemetryStatus:

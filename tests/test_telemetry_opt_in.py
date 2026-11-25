@@ -60,9 +60,30 @@ def test_every_env_opt_out_wins_over_the_opt_in(name: str, value: str) -> None:
     assert is_disabled_by_env({**opted_in, name: value}) is True
 
 
-def test_config_opt_out_wins_over_the_opt_in(tmp_path: Path) -> None:
-    (tmp_path / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
-    env = {ENABLE_TELEMETRY_ENV_VAR: "true", "OMNIGENT_CONFIG_HOME": str(tmp_path)}
+@pytest.mark.parametrize(
+    ("config_text", "env_key"),
+    [
+        pytest.param("telemetry: false\n", "OMNIGENT_CONFIG_HOME", id="bare"),
+        pytest.param(
+            "telemetry: false  # deployment opt-out\n", "OMNIGENT_CONFIG_HOME", id="comment"
+        ),
+        pytest.param('"telemetry": false\n', "OMNIGENT_CONFIG_HOME", id="double-quoted-key"),
+        pytest.param(
+            "'telemetry': false  # quoted\n", "OMNIGENT_CONFIG_HOME", id="quoted-comment"
+        ),
+        pytest.param("telemetry: false  # server file\n", "OMNIGENT_CONFIG", id="omnigent-config"),
+    ],
+)
+def test_config_opt_out_wins_over_the_opt_in(
+    tmp_path: Path, config_text: str, env_key: str
+) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(config_text, encoding="utf-8")
+    env = {
+        "HOME": str(tmp_path / "empty-home"),
+        ENABLE_TELEMETRY_ENV_VAR: "true",
+        env_key: str(cfg_file if env_key == "OMNIGENT_CONFIG" else tmp_path),
+    }
 
     with patch.dict("os.environ", env, clear=True):
         assert telemetry._compute_is_disabled() is True
