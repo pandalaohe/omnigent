@@ -1474,100 +1474,39 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByText("reviewer")).toBeInTheDocument();
   });
 
-  it("shows the launched model in the header and hides the chip when nothing differs", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["session", "conv-model-same"], {
-      id: "conv-model-same",
-      harness: "codex-native",
-      requested: "gpt-6.2-sol",
-      launched: "gpt-6.2-sol",
-      running: "gpt-6.2-sol",
-      labels: {},
-    } as unknown as Session);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv-model-same",
-      conversationTitle: "Model check",
-      queryClient,
-    });
+  it.each([false, true])(
+    "omits launched-model and model-resolution chips from the header on every breakpoint (mobile=%s)",
+    (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(["session", "conv-model-diff"], {
+        id: "conv-model-diff",
+        harness: "claude-native",
+        requested: "opus",
+        launched: "opus",
+        running: "claude-sonnet-5-5",
+        labels: {
+          "omnigent.model_resolution": JSON.stringify([
+            {
+              setting: "explicit",
+              saved: "old/x",
+              model: "new/x",
+              outcome: "renamed",
+              host: "host-a",
+            },
+          ]),
+        },
+      } as unknown as Session);
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv-model-diff",
+        conversationTitle: "Model diff",
+        queryClient,
+      });
 
-    expect(screen.getByTestId("session-header-model")).toHaveTextContent("gpt-6.2-sol");
-    expect(screen.queryByRole("button", { name: "Model resolution warning" })).toBeNull();
-  });
-
-  it("reuses the resolution chip when requested or running differ from launched", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["session", "conv-model-diff"], {
-      id: "conv-model-diff",
-      harness: "codex-native",
-      requested: "ccs-krill/gpt-6.2-sol",
-      launched: "krill/gpt-6.2-sol",
-      running: "gpt-6.2-sol",
-      labels: {},
-    } as unknown as Session);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv-model-diff",
-      conversationTitle: "Model diff",
-      queryClient,
-    });
-
-    expect(screen.getByTestId("session-header-model")).toHaveTextContent("krill/gpt-6.2-sol");
-    const chip = screen.getByRole("button", { name: "Model resolution warning" });
-    fireEvent.click(chip);
-    expect(screen.getByText("Requested")).toBeInTheDocument();
-    expect(screen.getByText("ccs-krill/gpt-6.2-sol")).toBeInTheDocument();
-    expect(screen.getByText("Launched")).toBeInTheDocument();
-    expect(screen.getByText("Running")).toBeInTheDocument();
-    expect(screen.getByText("gpt-6.2-sol")).toBeInTheDocument();
-  });
-
-  it("omits the launched model badge when launched is null and surfaces agy substitution in the chip", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["session", "conv-agy-sub"], {
-      id: "conv-agy-sub",
-      harness: "antigravity-native",
-      requested: "gemini-4-neon",
-      launched: null,
-      running: "Gemini 2.5 Flash",
-      labels: {},
-    } as unknown as Session);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv-agy-sub",
-      conversationTitle: "Agy sub",
-      queryClient,
-    });
-
-    expect(screen.queryByTestId("session-header-model")).toBeNull();
-    const chip = screen.getByRole("button", { name: "Model resolution warning" });
-    fireEvent.click(chip);
-    expect(screen.getByText("Requested")).toBeInTheDocument();
-    expect(screen.getByText("gemini-4-neon")).toBeInTheDocument();
-    expect(screen.getByText("Running")).toBeInTheDocument();
-    expect(screen.getByText("Gemini 2.5 Flash")).toBeInTheDocument();
-  });
-
-  it("hides the warning chip for equivalent Codex catalog and runtime spellings", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["session", "conv-codex-equiv"], {
-      id: "conv-codex-equiv",
-      harness: "codex-native",
-      requested: "databricks-gpt-5-6-luna",
-      launched: "databricks-gpt-5-6-luna",
-      running: "gpt-5.6-luna",
-      labels: {},
-    } as unknown as Session);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv-codex-equiv",
-      conversationTitle: "Codex equiv",
-      queryClient,
-    });
-
-    const badge = screen.getByTestId("session-header-model");
-    expect(badge).toHaveTextContent("databricks-gpt-5-6-luna");
-    expect(badge).not.toHaveClass("hidden");
-    expect(screen.queryByRole("button", { name: "Model resolution warning" })).toBeNull();
-  });
+      expect(screen.queryByTestId("session-header-model")).toBeNull();
+      expect(screen.queryByTestId("model-resolution-warning")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Model resolution warning" })).toBeNull();
+    },
+  );
 });
