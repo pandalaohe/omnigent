@@ -777,11 +777,19 @@ web app to apply changes to configured browser OpenTelemetry.
 Set `OMNIGENT_DISABLE_TELEMETRY` or `DISABLE_TELEMETRY` to `1`, `true`, or
 `yes` to lock telemetry off. `DO_NOT_TRACK=1`, `OMNIGENT_ANALYTICS=0`, CI
 markers, and `telemetry: false` in the server configuration also lock it off.
+A locked-off setting overrides legacy `OMNIGENT_TELEMETRY_ENABLED` on the
+server and blocks ZeroBus debug-log uploads and OAuth token requests across
+every Omnigent process (server, host, runner, harness runner, and CLI).
 Set `OMNIGENT_ENABLE_TELEMETRY` to `1`, `true`, or `yes` to lock it on
 when no opt-out is active. The setting shows which override applies.
 
 Host and runner OpenTelemetry still use `OMNIGENT_TELEMETRY_ENABLED` and
 exporter settings from their own process environment.
+Host, runner, harness runner, and CLI processes with an explicitly configured
+ZeroBus debug-log destination (`OMNIGENT_DEBUG_LOG_*`) keep using that
+destination unless one of the deployment opt-outs above is active.
+When the web UI is embedded in a host application, the host-provided analytics
+callback is an embedder boundary controlled by that host application.
 Vendor CLI telemetry is managed by each CLI.
 
 ---

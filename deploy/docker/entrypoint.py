@@ -359,6 +359,16 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     database_url = resolved_config.database_url
     artifact_dir = resolved_config.artifact_dir
 
+    # Resolve server boot telemetry before constructing the first DB engine so
+    # stored opt-ins instrument SQLAlchemy and locked-off values beat legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    telemetry_enabled_at_start = configure_server_boot_telemetry(cfg)
+    if telemetry_enabled_at_start:
+        from omnigent.debug_logging import attach_debug_log_sink
+
+        attach_debug_log_sink([logging.getLogger()], source="server", level=logging.INFO)
+
     # ── Stores ───────────────────────────────────────────────
 
     from omnigent.runtime import init as init_runtime

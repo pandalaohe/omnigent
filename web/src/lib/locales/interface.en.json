@@ -1,7 +1,7 @@
 {
   "settingsSystem": "System",
   "usageTelemetry": "Usage telemetry",
-  "usageTelemetryDescription": "Controls anonymous usage reports, OpenTelemetry, and debug-log uploads. Server export changes apply after a restart.",
+  "usageTelemetryDescription": "Controls server anonymous usage reports, server OpenTelemetry, server ZeroBus debug-log uploads, and standalone browser OpenTelemetry. Server export changes apply after a restart; reload the web app for browser changes. Host, runner, and CLI processes keep their own configured OpenTelemetry and ZeroBus destinations unless a deployment opt-out is set; embedded host analytics and vendor CLIs are governed separately.",
   "usageTelemetryLoading": "Loading telemetry setting…",
   "usageTelemetryUnavailable": "Could not load the telemetry setting.",
   "usageTelemetryOn": "On",

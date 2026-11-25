@@ -47,6 +47,15 @@ class TelemetrySettings:
         return self.status().enabled
 
 
+def configure_server_boot_telemetry(config: Mapping[str, object]) -> bool:
+    """Resolve boot telemetry on/off and pin server OTel before stores initialize."""
+    from omnigent.runtime import telemetry
+
+    enabled = TelemetrySettings(config).enabled()
+    telemetry.init(os.environ.get("OTEL_SERVICE_NAME") or "omni-server", server_opted_in=enabled)
+    return enabled
+
+
 class UsageTelemetryMiddleware:
     def __init__(self, app: ASGIApp, telemetry: ServerUsageTelemetry) -> None:
         self._app = app

@@ -1266,6 +1266,236 @@ def test_server_logging_respects_telemetry_setting(
     assert path.is_file()
 
 
+@pytest.mark.parametrize(
+    ("opt_out_kind", "opt_out_env"),
+    [
+        pytest.param("disable-env", {"OMNIGENT_DISABLE_TELEMETRY": "1"}, id="disable-env"),
+        pytest.param("do-not-track", {"DO_NOT_TRACK": "1"}, id="do-not-track"),
+        pytest.param("config-false", {}, id="config-false"),
+    ],
+)
+@pytest.mark.parametrize(
+    "process_kind",
+    ["server", "host", "runner", "harness", "startup_events", "daemon_stop"],
+)
+def test_zerobus_attachment_honors_deployment_opt_out_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opt_out_kind: str,
+    opt_out_env: dict[str, str],
+    process_kind: str,
+) -> None:
+    """Configured ZeroBus performs no upload or OAuth token request when opted out."""
+    from types import SimpleNamespace
+
+    from omnigent import _startup_events as startup_events
+    from omnigent import cli as cli_module
+    from omnigent import debug_logging as dl
+    from omnigent.runtime.harnesses import _runner as harness_runner
+    from omnigent.telemetry.environment import CI_ENV_VARS
+
+    for name in CI_ENV_VARS | {
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "OMNIGENT_ANALYTICS",
+        "OMNIGENT_ENABLE_TELEMETRY",
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_CONFIG_HOME",
+    }:
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.example.test")
+    monkeypatch.setenv(
+        dl.ENDPOINT_ENV_VAR,
+        "https://123456.zerobus.example.test/zerobus/v1/tables/cat.sch.logs/insert",
+    )
+    if opt_out_kind == "config-false":
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(cfg_dir))
+    for key, value in opt_out_env.items():
+        monkeypatch.setenv(key, value)
+
+    http_posts: list[str] = []
+
+    class _RecordingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def post(self, url: str, **_kwargs: object) -> object:
+            http_posts.append(url)
+            raise AssertionError(f"unexpected ZeroBus/OAuth request to {url}")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(dl.httpx, "Client", _RecordingClient)
+    monkeypatch.setattr(dl, "_active_sink", None)
+
+    logger_name = f"omnigent.test.zerobus_opt_out.{process_kind}.{opt_out_kind}"
+    test_logger = logging.getLogger(logger_name)
+    original_handlers = list(test_logger.handlers)
+    original_root_handlers = list(logging.getLogger().handlers)
+    original_startup_handlers = list(startup_events._logger.handlers)
+    daemon_stop_logger = logging.getLogger("omnigent.host.daemon_stop")
+    original_daemon_stop_handlers = list(daemon_stop_logger.handlers)
+
+    try:
+        if process_kind in {"server", "host", "runner"}:
+            log_path = configure_process_logging(
+                process_kind,
+                log_path=tmp_path / f"{process_kind}.log",
+                logger_names=(logger_name,),
+                root=False,
+                debug_log_enabled=True,
+            )
+            test_logger.info("opted-out diagnostic line")
+            assert log_path.is_file()
+        elif process_kind == "harness":
+            monkeypatch.setenv("OMNIGENT_PROCESS_LOG_FILE", str(tmp_path / "harness.log"))
+            harness_runner._configure_logging("claude", "conv_test")
+            logging.getLogger("omnigent").info("opted-out harness line")
+        elif process_kind == "startup_events":
+            with startup_events.native_startup_attempt(harness="codex-native"):
+                startup_events.record_startup_event("terminal_available")
+        elif process_kind == "daemon_stop":
+            monkeypatch.setattr(cli_module, "_pid_is_recorded_daemon", lambda _rec: True)
+            record = SimpleNamespace(
+                pid=99999,
+                mode="local",
+                target="http://127.0.0.1:6767",
+                started_at=0.0,
+            )
+            cli_module._record_daemon_stop_requested(
+                record,  # type: ignore[arg-type]
+                reason="host_stop",
+                force=False,
+            )
+
+        assert dl._active_sink is None
+        assert http_posts == []
+    finally:
+        for lg, saved in (
+            (test_logger, original_handlers),
+            (logging.getLogger(), original_root_handlers),
+            (startup_events._logger, original_startup_handlers),
+            (daemon_stop_logger, original_daemon_stop_handlers),
+        ):
+            for handler in list(lg.handlers):
+                if handler not in saved:
+                    lg.removeHandler(handler)
+                    handler.close()
+
+
+@pytest.mark.parametrize(
+    "process_kind", ["host", "runner", "harness", "startup_events", "daemon_stop"]
+)
+def test_non_server_processes_keep_configured_zerobus_without_opt_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_kind: str,
+) -> None:
+    """Host, runner, harness, and CLI keep explicitly configured ZeroBus when no opt-out is set."""
+    from types import SimpleNamespace
+
+    from omnigent import _startup_events as startup_events
+    from omnigent import cli as cli_module
+    from omnigent import debug_logging as dl
+    from omnigent.runtime.harnesses import _runner as harness_runner
+    from omnigent.telemetry.environment import CI_ENV_VARS
+
+    for name in CI_ENV_VARS | {
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "OMNIGENT_ANALYTICS",
+        "OMNIGENT_ENABLE_TELEMETRY",
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_CONFIG_HOME",
+    }:
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.example.test")
+    monkeypatch.setenv(
+        dl.ENDPOINT_ENV_VAR,
+        "https://123456.zerobus.example.test/zerobus/v1/tables/cat.sch.logs/insert",
+    )
+
+    class _StubZerobus(dl.DebugLogHandler):
+        def __init__(self, config: dl.DebugLogConfig, source: str) -> None:
+            self.config = config
+            super().__init__(source, lambda _batch: None)
+
+    monkeypatch.setattr(dl, "ZerobusLogHandler", _StubZerobus)
+    monkeypatch.setattr(dl, "_active_sink", None)
+
+    logger_name = f"omnigent.test.zerobus_enabled.{process_kind}"
+    test_logger = logging.getLogger(logger_name)
+    original_handlers = list(test_logger.handlers)
+    original_root_handlers = list(logging.getLogger().handlers)
+    original_startup_handlers = list(startup_events._logger.handlers)
+    daemon_stop_logger = logging.getLogger("omnigent.host.daemon_stop")
+    original_daemon_stop_handlers = list(daemon_stop_logger.handlers)
+
+    try:
+        if process_kind in {"host", "runner"}:
+            configure_process_logging(
+                process_kind,
+                log_path=tmp_path / f"{process_kind}.log",
+                logger_names=(logger_name,),
+                root=False,
+            )
+        elif process_kind == "harness":
+            monkeypatch.setenv("OMNIGENT_PROCESS_LOG_FILE", str(tmp_path / "harness.log"))
+            harness_runner._configure_logging("claude", "conv_test")
+        elif process_kind == "startup_events":
+            with startup_events.native_startup_attempt(harness="codex-native"):
+                startup_events.record_startup_event("terminal_available")
+        elif process_kind == "daemon_stop":
+            monkeypatch.setattr(cli_module, "_pid_is_recorded_daemon", lambda _rec: True)
+            record = SimpleNamespace(
+                pid=99999,
+                mode="local",
+                target="http://127.0.0.1:6767",
+                started_at=0.0,
+            )
+            cli_module._record_daemon_stop_requested(
+                record,  # type: ignore[arg-type]
+                reason="host_stop",
+                force=False,
+            )
+
+        assert isinstance(dl._active_sink, _StubZerobus)
+    finally:
+        sink = dl._active_sink
+        if sink is not None:
+            sink.shutdown()
+            dl._active_sink = None
+        for lg, saved in (
+            (test_logger, original_handlers),
+            (logging.getLogger(), original_root_handlers),
+            (startup_events._logger, original_startup_handlers),
+            (daemon_stop_logger, original_daemon_stop_handlers),
+            (dl.sse_event_logger(), []),
+            (dl.audit_event_logger(), []),
+        ):
+            for handler in list(lg.handlers):
+                if handler not in saved:
+                    lg.removeHandler(handler)
+                    if handler is not sink:
+                        handler.close()
+
+
 def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
     # cli_diagnostics sets our package loggers to propagate=False with their own
     # handlers, so records logged under them never reach root. The debug-log

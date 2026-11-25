@@ -843,9 +843,12 @@ def _restore_process_globals() -> Generator[None, None, None]:
     """Restore process-wide recursion limit, logger level, and OpenAI env vars after each test."""
     import logging
 
+    from omnigent.runtime import telemetry as runtime_telemetry
+
     recursion_limit = sys.getrecursionlimit()
     omnigent_logger = logging.getLogger("omnigent")
     omnigent_logger_level = omnigent_logger.level
+    server_telemetry_enabled = runtime_telemetry._server_telemetry_enabled
     openai_env = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL")}
     try:
         yield
@@ -854,6 +857,7 @@ def _restore_process_globals() -> Generator[None, None, None]:
             sys.setrecursionlimit(recursion_limit)
         if omnigent_logger.level != omnigent_logger_level:
             omnigent_logger.setLevel(omnigent_logger_level)
+        runtime_telemetry._server_telemetry_enabled = server_telemetry_enabled
         for key, value in openai_env.items():
             if value is None:
                 os.environ.pop(key, None)

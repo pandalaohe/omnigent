@@ -1,7 +1,7 @@
 {
   "settingsSystem": "系统",
   "usageTelemetry": "使用遥测",
-  "usageTelemetryDescription": "控制匿名用量上报、OpenTelemetry 和调试日志上传。服务端导出设置在重启后生效。",
+  "usageTelemetryDescription": "控制服务端匿名用量上报、服务端 OpenTelemetry、服务端 ZeroBus 调试日志上传和独立 Web 端 OpenTelemetry。服务端导出变更在重启后生效，Web 端变更需刷新页面。未设置部署级禁用项时，Host、Runner 和 CLI 进程沿用各自配置的 OpenTelemetry 与 ZeroBus；宿主嵌入分析回调与厂商 CLI 各自独立控制。",
   "usageTelemetryLoading": "正在读取遥测设置…",
   "usageTelemetryUnavailable": "无法读取遥测设置。",
   "usageTelemetryOn": "开启",

@@ -1521,6 +1521,15 @@ def audit_event_logger() -> logging.Logger:
     return logging.getLogger(AUDIT_LOGGER_NAME)
 
 
+def _deployment_telemetry_opted_out() -> bool:
+    """Return True when the shared telemetry resolver reports a deployment opt-out."""
+    from omnigent.telemetry.client import _config_telemetry_disabled
+    from omnigent.telemetry.environment import telemetry_override
+
+    override = telemetry_override(os.environ, disabled_by_config=_config_telemetry_disabled())
+    return override is not None and not override[0]
+
+
 def attach_debug_log_sink(
     loggers: list[logging.Logger],
     *,
@@ -1532,13 +1541,15 @@ def attach_debug_log_sink(
 
     ``send`` is an optional integration hook receiving each prepared batch on a
     daemon thread. When omitted, the sink uses ZeroBus and is a no-op unless the
-    ``OMNIGENT_DEBUG_LOG_*`` variables are set. Reuses one handler per process;
-    ``Logger.addHandler`` is idempotent for a given instance, so repeated calls
-    do not double-ship.
+    ``OMNIGENT_DEBUG_LOG_*`` variables are set and no deployment telemetry opt-out
+    is active. Reuses one handler per process; ``Logger.addHandler`` is
+    idempotent for a given instance, so repeated calls do not double-ship.
     """
     global _active_sink
     config: DebugLogConfig | None = None
     if send is None:
+        if _deployment_telemetry_opted_out():
+            return
         config = config_from_env()
         if config is None:
             return

@@ -152,6 +152,11 @@ def _config_url() -> str:
     return f"{_CONFIG_URL_PROD}/{VERSION}.json"
 
 
+_config_fetch_guard: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "telemetry_config_fetch_guard", default=None
+)
+
+
 def _fetch_remote_config() -> TelemetryConfig | None:
     """Fetch and validate the remote telemetry config.
 
@@ -164,6 +169,9 @@ def _fetch_remote_config() -> TelemetryConfig | None:
 
         url = _config_url()
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        may_send = _config_fetch_guard.get()
+        if may_send is not None and not may_send():
+            return None
         with urllib.request.urlopen(req, timeout=_CONFIG_FETCH_TIMEOUT_S) as resp:
             raw_config: object = json.loads(resp.read().decode("utf-8"))
 
@@ -217,32 +225,38 @@ def _fetch_remote_config() -> TelemetryConfig | None:
         return None
 
 
+def _config_file_disables_telemetry(config_path: Path) -> bool:
+    import re as _re
+
+    if not config_path.is_file():
+        return False
+    # Read raw text and match `telemetry: false` directly to avoid
+    # PyYAML SafeLoader bool-resolver corruption: spec/parser.py's
+    # _ConfigYamlLoader subclass modifies the shared
+    # SafeLoader.yaml_implicit_resolvers class dict at import time,
+    # causing `false` to parse as a string rather than a boolean.
+    text = config_path.read_text(encoding="utf-8")
+    return bool(_re.search(r"^\s*telemetry\s*:\s*false\s*$", text, _re.IGNORECASE | _re.MULTILINE))
+
+
 def _config_telemetry_disabled() -> bool:
     """Return ``True`` when ``telemetry: false`` is set in config.yaml.
 
-    Reads ``~/.omnigent/config.yaml`` (honouring ``OMNIGENT_CONFIG_HOME``).
-    Returns ``False`` on any error so a missing/malformed config never
-    silently suppresses telemetry.
+    Checks ``OMNIGENT_CONFIG`` when set, plus ``~/.omnigent/config.yaml``
+    (honouring ``OMNIGENT_CONFIG_HOME``). Returns ``False`` on any error so a
+    missing/malformed config never silently suppresses telemetry.
     """
     try:
-        import re as _re
-
+        candidates: list[Path] = []
+        explicit_config = os.environ.get("OMNIGENT_CONFIG", "").strip()
+        if explicit_config:
+            candidates.append(Path(explicit_config))
         config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
         if config_home:
-            config_path = Path(config_home) / "config.yaml"
+            candidates.append(Path(config_home) / "config.yaml")
         else:
-            config_path = Path.home() / ".omnigent" / "config.yaml"
-        if not config_path.exists():
-            return False
-        # Read raw text and match `telemetry: false` directly to avoid
-        # PyYAML SafeLoader bool-resolver corruption: spec/parser.py's
-        # _ConfigYamlLoader subclass modifies the shared
-        # SafeLoader.yaml_implicit_resolvers class dict at import time,
-        # causing `false` to parse as a string rather than a boolean.
-        text = config_path.read_text(encoding="utf-8")
-        return bool(
-            _re.search(r"^\s*telemetry\s*:\s*false\s*$", text, _re.IGNORECASE | _re.MULTILINE)
-        )
+            candidates.append(Path.home() / ".omnigent" / "config.yaml")
+        return any(_config_file_disables_telemetry(path) for path in candidates)
     except Exception:
         return False
 
@@ -474,7 +488,14 @@ class TelemetryClient:
             if self._enabled is not None and not self._may_send():
                 self.config_skipped = True
                 return
-            cfg = _fetch_remote_config()
+            token = _config_fetch_guard.set(self._may_send if self._enabled is not None else None)
+            try:
+                cfg = _fetch_remote_config()
+            finally:
+                _config_fetch_guard.reset(token)
+            if cfg is None and self._enabled is not None and not self._may_send():
+                self.config_skipped = True
+                return
             if cfg is None:
                 # Kill-switch or fetch failure — stop the client.
                 self._stopped = True

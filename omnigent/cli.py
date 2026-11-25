@@ -4968,6 +4968,12 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    # Resolve server OTel on/off before constructing the first SQLAlchemy engine
+    # so a stored opt-in instruments SQL queries and a lock-off blocks legacy env.
+    from omnigent.server.telemetry_settings import configure_server_boot_telemetry
+
+    configure_server_boot_telemetry(title_server_config)
+
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
         SqlAlchemyGlobalInstructionsStore,

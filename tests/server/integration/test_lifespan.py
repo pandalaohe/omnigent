@@ -37,18 +37,92 @@ async def test_server_otel_exporters_use_the_boot_setting(
     monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "1")
     monkeypatch.setattr(telemetry, "_initialized", False)
     monkeypatch.setattr(telemetry, "_capture_content", False)
-    monkeypatch.setattr(telemetry, "_server_opted_in", False)
+    if hasattr(telemetry, "_server_telemetry_enabled"):
+        monkeypatch.setattr(telemetry, "_server_telemetry_enabled", None)
+    if hasattr(telemetry, "_server_opted_in"):
+        monkeypatch.setattr(telemetry, "_server_opted_in", False)
     monkeypatch.setenv("OTEL_SERVICE_NAME", "test-server")
     exporters = [Mock() for _ in range(3)]
     for signal, exporter in zip(("traces", "metrics", "logs"), exporters, strict=True):
         monkeypatch.setattr(telemetry, f"_init_otel_{signal}", exporter)
     monkeypatch.setattr(telemetry, "_instrument_httpx", Mock())
-    monkeypatch.setattr(telemetry, "instrument_fastapi_app", Mock())
+    fastapi_instrument = Mock()
+    monkeypatch.setattr(telemetry, "instrument_fastapi_app", fastapi_instrument)
 
     request.getfixturevalue("app")
 
+    assert telemetry.telemetry_enabled() is enabled
     assert [exporter.called for exporter in exporters] == [enabled] * 3
-    assert telemetry.instrument_fastapi_app.called is enabled
+    assert fastapi_instrument.called is enabled
+
+
+async def test_telemetry_setting_persists_across_server_restart(
+    request: pytest.FixtureRequest,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runtime import telemetry
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.telemetry.environment import CI_ENV_VARS
+
+    for name in CI_ENV_VARS | {
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "OMNIGENT_ANALYTICS",
+        "OMNIGENT_ENABLE_TELEMETRY",
+        "OMNIGENT_ADMIN_CREDENTIALS_PATH",
+    }:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "instance"))
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_capture_content", False)
+    for signal in ("traces", "metrics", "logs"):
+        monkeypatch.setattr(telemetry, f"_init_otel_{signal}", Mock())
+    monkeypatch.setattr(telemetry, "_instrument_httpx", Mock())
+    monkeypatch.setattr(telemetry, "instrument_fastapi_app", Mock())
+
+    first_app = request.getfixturevalue("app")
+    assert first_app.state.telemetry_enabled_at_start is False
+    async with (
+        first_app.router.lifespan_context(first_app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app), base_url="http://test"
+        ) as client,
+    ):
+        updated = await client.put("/v1/system/telemetry", json={"telemetry_enabled": True})
+        assert updated.status_code == 200
+        assert updated.json() == {"enabled": True, "locked": False, "source": "setting"}
+
+    assert (tmp_path / "instance" / "telemetry_enabled").read_text(encoding="utf-8") == "on\n"
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    restarted_app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+    )
+    assert restarted_app.state.telemetry_enabled_at_start is True
+    assert telemetry.telemetry_enabled() is True
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=restarted_app), base_url="http://test"
+    ) as client:
+        assert (await client.get("/v1/info")).json()["telemetry"] == {
+            "enabled": True,
+            "locked": False,
+            "source": "setting",
+        }
 
 
 async def test_usage_telemetry_switch_controls_live_fetch_and_events(
@@ -68,7 +142,7 @@ async def test_usage_telemetry_switch_controls_live_fetch_and_events(
 
     def fetch_config() -> telemetry.TelemetryConfig:
         config_fetched.set()
-        return telemetry.TelemetryConfig(ingestion_url=url, disable_events=frozenset())
+        return telemetry.TelemetryConfig(ingestion_url=url, disable_events=set())
 
     def send(request, *, timeout):
         received.append(request.full_url)

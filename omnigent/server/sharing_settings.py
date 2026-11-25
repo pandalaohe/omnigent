@@ -347,10 +347,26 @@ def write_default_public_sessions_override(policy: DefaultPublicSessions) -> Non
     _write_override_text(resolve_default_public_sessions_path(), policy.value)
 
 
+def resolve_telemetry_enabled_path() -> Path:
+    """Resolve ``telemetry_enabled`` inside the instance data directory.
+
+    Honors ``OMNIGENT_ADMIN_CREDENTIALS_PATH``'s parent first (the Docker
+    volume anchor), then ``OMNIGENT_DATA_DIR`` for isolated local instances,
+    else :func:`resolve_data_dir`.
+    """
+    explicit_creds = os.environ.get("OMNIGENT_ADMIN_CREDENTIALS_PATH", "").strip()
+    if explicit_creds:
+        return Path(explicit_creds).parent / "telemetry_enabled"
+    explicit_data_dir = os.environ.get("OMNIGENT_DATA_DIR", "").strip()
+    if explicit_data_dir:
+        return Path(explicit_data_dir).expanduser() / "telemetry_enabled"
+    return resolve_data_dir() / "telemetry_enabled"
+
+
 def read_telemetry_enabled_override() -> bool | None:
     """Read the server setting fresh so a revoked opt-in cannot stay cached."""
     try:
-        raw = _read_override_text(resolve_data_dir() / "telemetry_enabled", use_cache=False)
+        raw = _read_override_text(resolve_telemetry_enabled_path(), use_cache=False)
     except UnicodeError:
         return None
     if raw in ("on", "off"):
@@ -359,7 +375,7 @@ def read_telemetry_enabled_override() -> bool | None:
 
 
 def write_telemetry_enabled_override(enabled: bool) -> None:
-    _write_override_text(resolve_data_dir() / "telemetry_enabled", "on" if enabled else "off")
+    _write_override_text(resolve_telemetry_enabled_path(), "on" if enabled else "off")
 
 
 def read_sibling_session_destinations_override() -> SiblingSessionDestinations | None:

@@ -2022,8 +2022,10 @@ def create_app(
     from omnigent.runtime import telemetry
 
     telemetry_enabled_at_start = telemetry_settings.enabled()
-    if telemetry_enabled_at_start:
-        telemetry.init(os.environ.get("OTEL_SERVICE_NAME") or "omni-server", server_opted_in=True)
+    telemetry.init(
+        os.environ.get("OTEL_SERVICE_NAME") or "omni-server",
+        server_opted_in=telemetry_enabled_at_start,
+    )
     usage_telemetry = ServerUsageTelemetry(telemetry_settings.enabled)
     telemetry_write_lock = asyncio.Lock()
     from omnigent.server.auth import UnifiedAuthProvider
