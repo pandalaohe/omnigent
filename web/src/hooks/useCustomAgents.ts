@@ -16,6 +16,7 @@ import {
 
 export interface ManagedAgent extends Agent {
   harness: string | null;
+  integration_mode?: string | null;
   version: number;
   created_at: number;
   updated_at: number | null;

@@ -1,6 +1,7 @@
 import { Segmented } from "@/components/ui/segmented";
 import { useEffect, useId, useState } from "react";
 
+import { AgentBadgeMark } from "@/components/AgentBadge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -39,6 +40,7 @@ export function AgentBadgeEditor({
 }: AgentBadgeEditorProps) {
   const labelId = useId();
   const errorId = `${labelId}-error`;
+  const colorId = `${labelId}-color`;
   const [showBadge, setShowBadge] = useState(value !== null);
   const [label, setLabel] = useState(value?.label ?? "");
   const [borderColor, setBorderColor] = useState(value?.borderColor ?? INITIAL_BORDER_COLOR);
@@ -130,10 +132,20 @@ export function AgentBadgeEditor({
           ) : null}
 
           <div className="grid gap-2">
-            <span className="text-sm">Outline presets</span>
+            <div className="flex items-center gap-2">
+              <span id={colorId} className="text-sm">
+                Badge color
+              </span>
+              {valid && (
+                <AgentBadgeMark
+                  badge={{ label: label.trim(), borderColor, textColor }}
+                  data-testid="agent-badge-preview"
+                />
+              )}
+            </div>
             <div
               role="group"
-              aria-label="Outline presets"
+              aria-labelledby={colorId}
               className="grid grid-cols-4 gap-2 sm:grid-cols-8"
             >
               {OUTLINE_COLORS.map((color) => (

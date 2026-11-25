@@ -7,7 +7,7 @@ import {
   type CallingDefaultsCatalogRow,
 } from "@/lib/callingDefaultsApi";
 import { ArrowRightIcon } from "lucide-react";
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
 import { LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
 import {
@@ -25,7 +25,6 @@ import {
 import { missingCellText } from "@/lib/layeredValues";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { Link } from "@/lib/routing";
-import { cn } from "@/lib/utils";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
 
 function instructionAgent(
@@ -133,45 +132,47 @@ function ContextTable({
   loading?: boolean;
   catalogs?: CallingDefaultsCatalogRow[];
 }) {
-  const dependent = (harness: string) =>
-    agentProductHarness(harness, capabilities) !== harness &&
-    harnesses.includes(agentProductHarness(harness, capabilities));
   return (
     <LayeredTable
       label={`${field === "prompt" ? "Prompt" : "Provider"} by agent and host`}
       cornerLabel="Agent"
       readOnly
-      rows={harnesses.map((harness) => ({
-        id: harness,
-        label: names[harness] ?? harness,
-        content: (
-          <span className={cn("block whitespace-normal", dependent(harness) && "pl-4")}>
-            <AgentNameTag
-              agentId={agentIds[harness] ?? null}
-              name={names[harness] ?? harness}
-              harness={harness}
-              className="max-w-full"
-            />
-          </span>
-        ),
-        action: (
-          <Link
-            to={agentSettingsPath(
-              harness,
-              agentSettingsHost(
+      rows={harnesses.map((harness) => {
+        const kind = nonNativeAgentKind(harness, capabilities[harness]?.integration_mode);
+        return {
+          id: harness,
+          label: names[harness] ?? harness,
+          content: (
+            <span className="block whitespace-normal">
+              <AgentNameTag
+                agentId={agentIds[harness] ?? null}
+                name={names[harness] ?? harness}
+                harness={harness}
+                kindTag={kind}
+                className="max-w-full"
+              />
+            </span>
+          ),
+          action: (
+            <Link
+              to={agentSettingsPath(
                 harness,
-                hosts,
-                visibleHostId ?? (hosts.length === 1 ? hosts[0].host_id : undefined),
-              ),
-            )}
-            aria-label={`${names[harness] ?? harness} details`}
-            componentId="settings.agents.detail"
-            className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ArrowRightIcon className="size-4" aria-hidden />
-          </Link>
-        ),
-      }))}
+                agentSettingsHost(
+                  harness,
+                  hosts,
+                  visibleHostId ?? (hosts.length === 1 ? hosts[0].host_id : undefined),
+                ),
+              )}
+              aria-label={`${names[harness] ?? harness} details`}
+              aria-description={kind ?? undefined}
+              componentId="settings.agents.detail"
+              className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ArrowRightIcon className="size-4" aria-hidden />
+            </Link>
+          ),
+        };
+      })}
       detailRows={detailRows}
       columns={hosts
         .filter((host) => !visibleHostId || host.host_id === visibleHostId)

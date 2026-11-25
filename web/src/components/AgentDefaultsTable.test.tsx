@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -130,8 +130,17 @@ describe("agent layered defaults", () => {
       "href",
       "/settings/agents/codex?host=desktop",
     );
+    expect(screen.getByRole("link", { name: "Codex SDK details" })).toHaveAccessibleDescription(
+      "SDK",
+    );
     const name = screen.getByText("Codex SDK");
     expect(name.closest(".sr-only")).toBeNull();
+    const sdkRow = name.closest("tr")!;
+    const nativeRow = sdkRow.previousElementSibling as HTMLElement;
+    expect(within(nativeRow).getByText("Codex")).toBeVisible();
+    expect(within(nativeRow).queryByTestId("agent-name-mark")).toBeNull();
+    expect(name.closest(".pl-4")).toBeNull();
+    expect(within(sdkRow).getByTestId("agent-name-mark")).toHaveTextContent("SDK");
     expect(screen.queryByTestId("agent-name-badge")?.textContent ?? null).toBe(
       enabled ? "XS" : null,
     );

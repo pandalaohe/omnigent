@@ -232,6 +232,49 @@ def test_settings_layout(
     browser_contract.json("/v1/mcp-registry/services", {"data": [], "next_cursor": None})
     browser_contract.json("/v1/policies", list_payload([]))
     browser_contract.json("/v1/policy-registry", list_payload([]))
+    if section == "agents":
+        browser_contract.json(
+            "/v1/agents",
+            list_payload(
+                [
+                    {
+                        "id": "agent-native",
+                        "name": "codex-native-ui",
+                        "harness": "codex-native",
+                        "product_of": "codex-native",
+                        "builtin": True,
+                    },
+                    {
+                        "id": "agent-sdk",
+                        "name": "codex-sdk",
+                        "harness": "codex",
+                        "product_of": "codex",
+                        "builtin": True,
+                    },
+                ]
+            ),
+        )
+        browser_contract.json(
+            "/v1/hosts",
+            {
+                "hosts": [
+                    {
+                        "host_id": "example-host",
+                        "name": "Example host",
+                        "owner": "example",
+                        "status": "online",
+                        "configured_harnesses": {"codex-native": True, "codex": True},
+                    }
+                ]
+            },
+        )
+        page.add_init_script("""
+            localStorage.setItem("omnigent:agent-badge-preferences", JSON.stringify({
+              version: 1,
+              enabled: true,
+              entries: {"agent-sdk": {label: "XS", borderColor: "#ca8a04", textColor: "theme"}},
+            }));
+        """)
     if section in {"browser", "cli", "updates"}:
         page.add_init_script(
             "window.omnigentDesktop = {kind: 'electron', browserOpenOrNavigate() {}}"
@@ -244,6 +287,22 @@ def test_settings_layout(
     main = page.get_by_role("main").filter(has=heading).last
     marker = _LONG_MEMBER if populated_members else ready_text
     expect(main.get_by_text(marker, exact=True)).to_be_visible(timeout=5_000)
+    if section == "agents":
+        table = main.get_by_role("table", name="Model defaults")
+        native = table.get_by_text("Codex", exact=True)
+        sdk = table.get_by_text("Codex SDK", exact=True)
+        sdk_row = table.get_by_role("row").filter(has=page.get_by_text("Codex SDK", exact=True))
+        native_row = table.get_by_role("row").filter(has=page.get_by_text("Codex", exact=True))
+        badge = sdk_row.get_by_test_id("agent-name-badge")
+        kind = sdk_row.get_by_test_id("agent-name-mark")
+        expect(badge).to_have_text("XS")
+        expect(kind).to_have_text("SDK")
+        expect(native_row.get_by_test_id("agent-name-mark")).to_have_count(0)
+        for target in (sdk, badge, kind, sdk_row.get_by_role("link", name="Codex SDK details")):
+            expect(target).to_be_in_viewport(ratio=1)
+        native_box, sdk_box = native.bounding_box(), sdk.bounding_box()
+        assert native_box is not None and sdk_box is not None
+        assert abs(native_box["x"] - sdk_box["x"]) < 1
     assert_layout(main, f"settings-{section}", Path(output_path))
     if populated_members:
         expect(main.get_by_role("button", name="Remove user")).to_be_in_viewport(

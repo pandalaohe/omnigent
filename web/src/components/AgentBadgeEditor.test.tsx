@@ -31,7 +31,7 @@ describe("AgentBadgeEditor", () => {
     });
   });
 
-  it("offers eight outline presets and can switch existing text colors to the theme", () => {
+  it("previews a badge color from the existing palette and retains its text color", () => {
     const onChange = vi.fn();
     render(
       <AgentBadgeEditor
@@ -40,9 +40,13 @@ describe("AgentBadgeEditor", () => {
       />,
     );
     expect(
-      screen.getByRole("group", { name: "Outline presets" }).querySelectorAll("button"),
+      screen.getByRole("group", { name: "Badge color" }).querySelectorAll("button"),
     ).toHaveLength(8);
     fireEvent.click(screen.getByRole("button", { name: "Blue outline" }));
+    expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({
+      borderColor: "#3b82f6",
+      color: "#eeeeee",
+    });
     expect(onChange).toHaveBeenLastCalledWith({
       label: "AI",
       borderColor: "#3b82f6",

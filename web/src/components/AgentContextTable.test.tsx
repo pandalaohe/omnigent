@@ -136,6 +136,10 @@ describe("agent context lenses", () => {
       "/settings/agents/codex-native?host=host%20%26%20one",
     );
     expect(screen.getByText("Codex SDK").closest(".sr-only")).toBeNull();
+    expect(screen.getByText("Codex SDK").closest(".pl-4")).toBeNull();
+    expect(
+      within(screen.getByText("Codex SDK").closest("tr")!).getByTestId("agent-name-mark"),
+    ).toHaveTextContent("SDK");
   });
 
   it("opens the same host and agent in Startup prompts with the composed size", () => {

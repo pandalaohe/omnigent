@@ -1,11 +1,10 @@
 import { useState, type ReactElement, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
 import { ClaudeFastModeHelp } from "@/components/SessionDefaultModeSelect";
 import { ArrowRightIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
-import { cn } from "@/lib/utils";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
 import { LayeredOwn, LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
@@ -41,7 +40,6 @@ import type { CallingDefaultsCatalogRow } from "@/lib/callingDefaultsApi";
 import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   agentPresentOnHost,
-  agentProductHarness,
   agentSettingsHost,
   agentSettingsPath,
   groupAgentHarnesses,
@@ -427,9 +425,6 @@ export function AgentDefaultsTable({
   const resolve = (row: string, col: string) =>
     resolveAgentMasterField(master, col, row, field, capabilities, layerOptions(col));
   const label = (row: string) => names?.[row] ?? callingHarnessLabel(row, capabilities);
-  const dependent = (row: string) =>
-    agentProductHarness(row, capabilities) !== row &&
-    harnesses.includes(agentProductHarness(row, capabilities));
   const hostLabel = (col: string) =>
     hostList.find((candidate) => candidate.host_id === col)?.name || col;
   const sourceLabel = (source: LayeredLevel | null) =>
@@ -665,38 +660,43 @@ export function AgentDefaultsTable({
           field === "permission" &&
           COLUMN_CONCEPTS.some((concept) => concept === master["*"]?.["*"]?.permission)
         }
-        rows={harnesses.map((row) => ({
-          id: row,
-          label: label(row),
-          content: (
-            <span className={cn("block whitespace-normal", dependent(row) && "pl-4")}>
-              <AgentNameTag
-                agentId={agentIds?.[row] ?? null}
-                name={label(row)}
-                harness={row}
-                className="max-w-full"
-              />
-            </span>
-          ),
-          action: linkToDetails ? (
-            <Link
-              to={agentSettingsPath(row, agentSettingsHost(row, hostList, visibleHostId))}
-              aria-label={`${label(row)} details`}
-              className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              componentId="settings.agents.detail"
-            >
-              <ArrowRightIcon className="size-4" aria-hidden />
-            </Link>
-          ) : undefined,
-          detail: master["*"]?.[row]?.[field]
-            ? displayValue(master["*"][row][field], row)
-            : undefined,
-          mark:
-            master["*"]?.[row]?.[field] !== undefined &&
-            layerOptions().canHold(row, field, master["*"][row][field]) &&
-            layerOptions().normalize(row, field, master["*"][row][field]) !==
-              inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
-        }))}
+        rows={harnesses.map((row) => {
+          const kind = nonNativeAgentKind(row, capabilities?.[row]?.integration_mode);
+          return {
+            id: row,
+            label: label(row),
+            content: (
+              <span className="block whitespace-normal">
+                <AgentNameTag
+                  agentId={agentIds?.[row] ?? null}
+                  name={label(row)}
+                  harness={row}
+                  kindTag={kind}
+                  className="max-w-full"
+                />
+              </span>
+            ),
+            action: linkToDetails ? (
+              <Link
+                to={agentSettingsPath(row, agentSettingsHost(row, hostList, visibleHostId))}
+                aria-label={`${label(row)} details`}
+                aria-description={kind ?? undefined}
+                className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                componentId="settings.agents.detail"
+              >
+                <ArrowRightIcon className="size-4" aria-hidden />
+              </Link>
+            ) : undefined,
+            detail: master["*"]?.[row]?.[field]
+              ? displayValue(master["*"][row][field], row)
+              : undefined,
+            mark:
+              master["*"]?.[row]?.[field] !== undefined &&
+              layerOptions().canHold(row, field, master["*"][row][field]) &&
+              layerOptions().normalize(row, field, master["*"][row][field]) !==
+                inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
+          };
+        })}
         detailRows={detailRows}
         columns={hostList
           .filter((host) => !visibleHostId || host.host_id === visibleHostId)

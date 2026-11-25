@@ -6,6 +6,7 @@ import {
   render as renderComponent,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CustomAgent } from "@/lib/customAgentsApi";
@@ -14,6 +15,7 @@ import type * as AgentLabels from "@/lib/agentLabels";
 import type * as CustomAgentsApi from "@/lib/customAgentsApi";
 import { Link, useLocation } from "@/lib/routing";
 import App from "@/App";
+import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 
 const mocks = vi.hoisted(() => ({
   hosts: [] as Record<string, unknown>[],
@@ -23,7 +25,7 @@ const mocks = vi.hoisted(() => ({
   sync: vi.fn(),
   queuePatch: vi.fn(),
   customAgents: [] as CustomAgent[],
-  installed: [] as { id: string; name: string; harness: string }[],
+  installed: [] as { id: string; name: string; harness: string; integration_mode?: string }[],
   installedNext: [] as { id: string; name: string; harness: string }[],
   agents: [
     {
@@ -188,15 +190,24 @@ describe("CallingDefaultsSection", () => {
       {
         id: "agent-custom",
         name: "Release assistant",
-        harness: "codex-native",
+        harness: "devin-acp",
+        integration_mode: "native-server",
       },
     ];
+    writeAgentBadgePreferences({
+      version: 1,
+      enabled: true,
+      entries: { "agent-custom": { label: "RA", borderColor: "#16a34a", textColor: "theme" } },
+    });
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     expect(screen.getByRole("link", { name: "Release assistant details" })).toHaveAttribute(
       "href",
       "/settings/agents/custom/agent-custom",
     );
+    const installed = within(screen.getByRole("link", { name: "Release assistant details" }));
+    expect(installed.getByTestId("agent-name-badge")).toHaveTextContent("RA");
+    expect(installed.queryByTestId("agent-name-mark")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
     expect(screen.queryByRole("button", { name: /Select Release assistant/ })).toBeNull();
   });

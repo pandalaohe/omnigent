@@ -8,7 +8,7 @@ import { ArrowRightIcon } from "lucide-react";
 
 import { AgentDefaultsTable, type AgentField } from "@/components/AgentDefaultsTable";
 import { AgentContextTable } from "@/components/AgentContextTable";
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
 import { SettingsPager } from "@/components/SettingsPager";
 import { Segmented } from "@/components/ui/segmented";
 import { HelpTip } from "@/components/HelpTip";
@@ -197,23 +197,31 @@ export function CallingDefaultsSection() {
           id: agent.id,
           name: agent.display_name,
           harness: agent.harness,
+          integration_mode: agent.integration_mode,
         })),
         ...(installedAgents.data?.data ?? []),
-      ].map(({ id, name, harness }) => ({
-        id,
-        content: (
-          <Link
-            to={customAgentSettingsPath(id)}
-            state={{ fromAgentsTable: true }}
-            aria-label={`${name} details`}
-            componentId="settings.agents.detail"
-            className="flex min-h-11 min-w-0 items-center justify-between gap-2 px-2.5 text-left hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-          >
-            <AgentNameTag agentId={id} name={name} harness={harness} />
-            <ArrowRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-          </Link>
-        ),
-      }))
+      ].map(({ id, name, harness, integration_mode }) => {
+        const kind = nonNativeAgentKind(
+          harness,
+          integration_mode ?? (harness ? capabilities[harness]?.integration_mode : undefined),
+        );
+        return {
+          id,
+          content: (
+            <Link
+              to={customAgentSettingsPath(id)}
+              state={{ fromAgentsTable: true }}
+              aria-label={`${name} details`}
+              aria-description={kind ?? undefined}
+              componentId="settings.agents.detail"
+              className="flex min-h-11 min-w-0 items-center justify-between gap-2 px-2.5 text-left hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            >
+              <AgentNameTag agentId={id} name={name} harness={harness} kindTag={kind} />
+              <ArrowRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            </Link>
+          ),
+        };
+      })
     : [];
   const fields = [
     { value: "model", label: "Model" },
