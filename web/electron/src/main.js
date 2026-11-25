@@ -43,7 +43,12 @@ const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
-const { omnigentBuild, productName, appId } = require("../package.json");
+const {
+  omnigentBuild,
+  productName,
+  appId,
+  omnigentExternalReleaseRepo,
+} = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
@@ -1715,6 +1720,11 @@ const updater = createDesktopUpdater({
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
   updatesEnabled: !app.isPackaged || !isDevBuild,
+  externalReleaseRepo:
+    !isDevBuild && process.platform === "darwin" && typeof omnigentExternalReleaseRepo === "string"
+      ? omnigentExternalReleaseRepo.trim() || null
+      : null,
+  openExternal: (url) => shell.openExternal(url),
 });
 
 /**

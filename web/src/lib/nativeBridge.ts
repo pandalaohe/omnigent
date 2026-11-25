@@ -645,6 +645,8 @@ export interface UpdateConfig {
 export type UpdateStatus = {
   /** Installed Electron app version; absent on older desktop shells. */
   currentVersion?: string;
+  /** True when the desktop build opens a release download link instead of self-updating. */
+  manualOnly?: boolean;
 } & (
   | {
       state: "idle" | "checking" | "none";
@@ -654,7 +656,7 @@ export type UpdateStatus = {
     }
   | {
       state: "available" | "downloaded";
-      info?: { version: string; releaseNotes?: string };
+      info?: { version: string; releaseNotes?: string; downloadUrl?: string };
       progress?: undefined;
       lastError?: string;
     }

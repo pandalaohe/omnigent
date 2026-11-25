@@ -21,6 +21,7 @@ function loadMainHarness({
   developerMode = false,
   desktopVersionOverride,
   runningWork = { hosts: 0, localServer: false },
+  packageMeta = null,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   after(() => fs.rmSync(userData, { recursive: true, force: true }));
@@ -52,6 +53,7 @@ function loadMainHarness({
     webContentsFocuses: 0,
     globalShortcuts: [],
     firstResponderActions: [],
+    openExternal: [],
   };
 
   const sender = {
@@ -179,7 +181,12 @@ function loadMainHarness({
         },
       },
     },
-    shell: {},
+    shell: {
+      openExternal: (url) => {
+        calls.openExternal.push(url);
+        return Promise.resolve();
+      },
+    },
     systemPreferences: {
       getUserDefault: (key, type) =>
         key === "DeveloperMode" && type === "boolean" ? developerMode : false,
@@ -283,6 +290,9 @@ function loadMainHarness({
     require: (specifier) => {
       if (specifier === "electron") return electron;
       if (specifier === "electron-updater") return { autoUpdater };
+      if (specifier === "../package.json" && packageMeta) {
+        return { ...mainRequire("../package.json"), ...packageMeta };
+      }
       if (specifier in localRequires) return localRequires[specifier];
       return mainRequire(specifier);
     },
@@ -1719,5 +1729,62 @@ describe("auto-update main-process wiring", () => {
         },
       },
     ]);
+  });
+
+  it("wires external release feed only for packaged macOS builds with omnigentExternalReleaseRepo", async (t) => {
+    const originalFetch = globalThis.fetch;
+    const fetchedUrls = [];
+    globalThis.fetch = async (url) => {
+      fetchedUrls.push(String(url));
+      return {
+        status: 200,
+        text: async () =>
+          `<feed xmlns="http://www.w3.org/2005/Atom">` +
+          `<entry><link href="https://github.com/pandalaohe/omnigent-wukong/releases/tag/v0.3.0-wukong.2"/></entry>` +
+          `</feed>`,
+      };
+    };
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    // Packaged macOS with omnigentExternalReleaseRepo -> external feed, never autoUpdater.
+    const macWukong = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      settings: { update_mode: "manual" },
+      packageMeta: { omnigentExternalReleaseRepo: "pandalaohe/omnigent-wukong" },
+    });
+    t.after(macWukong.cleanup);
+    macWukong.api.updater.init();
+    await macWukong.api.updater.checkForUpdates({ manual: true });
+    assert.equal(macWukong.calls.checkForUpdates, 0);
+    assert.deepEqual(fetchedUrls, ["https://github.com/pandalaohe/omnigent-wukong/releases.atom"]);
+
+    // Packaged Windows with the same metadata -> keeps autoUpdater, never hits external feed.
+    fetchedUrls.length = 0;
+    const winBuild = loadMainHarness({
+      isPackaged: true,
+      platform: "win32",
+      settings: { update_mode: "manual" },
+      packageMeta: { omnigentExternalReleaseRepo: "pandalaohe/omnigent-wukong" },
+    });
+    t.after(winBuild.cleanup);
+    winBuild.api.updater.init();
+    await winBuild.api.updater.checkForUpdates({ manual: true });
+    assert.equal(winBuild.calls.checkForUpdates, 1);
+    assert.deepEqual(fetchedUrls, []);
+
+    // Packaged untagged macOS (no omnigentExternalReleaseRepo) -> keeps autoUpdater.
+    const macUntagged = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      settings: { update_mode: "manual" },
+    });
+    t.after(macUntagged.cleanup);
+    macUntagged.api.updater.init();
+    await macUntagged.api.updater.checkForUpdates({ manual: true });
+    assert.equal(macUntagged.calls.checkForUpdates, 1);
+    assert.deepEqual(fetchedUrls, []);
   });
 });

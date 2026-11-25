@@ -44,16 +44,22 @@ function makeUpdater({
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
   getCurrentVersion,
+  externalReleaseRepo = null,
+  fetchFeed,
+  openExternal,
 } = {}) {
   let store = { ...settings };
   const calls = {
     sent: [],
     showMessageBox: [],
     appQuit: 0,
+    checkForUpdates: 0,
     downloadUpdate: 0,
     quitAndInstall: [],
     intervals: [],
     clearedIntervals: 0,
+    openedExternal: [],
+    fetchedUrls: [],
   };
 
   const win = {
@@ -114,6 +120,19 @@ function makeUpdater({
     forceDevUpdateConfig,
     updatesEnabled,
     getCurrentVersion,
+    externalReleaseRepo,
+    fetchFeed: fetchFeed
+      ? (url) => {
+          calls.fetchedUrls.push(url);
+          return fetchFeed(url);
+        }
+      : undefined,
+    openExternal:
+      openExternal ??
+      ((url) => {
+        calls.openedExternal.push(url);
+        return Promise.resolve();
+      }),
   };
 
   const updater = createDesktopUpdater(deps);
@@ -479,5 +498,128 @@ describe("desktop_updater — install handoff", () => {
     // Nothing pending → the before-quit handoff is a no-op.
     assert.equal(h.updater.quitAndInstallIfPending(), false);
     assert.deepEqual(h.calls.quitAndInstall, []);
+  });
+});
+
+function atomFeed(tags, repo = "example-org/omnigent-dist") {
+  const entries = tags
+    .map(
+      (tag) =>
+        `<entry><id>tag:github.com,2008:Repository/1/${tag}</id>` +
+        `<link rel="alternate" type="text/html" href="https://github.com/${repo}/releases/tag/${tag}"/>` +
+        `<title>omnigent-dist ${tag}</title></entry>`,
+    )
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">${entries}</feed>`;
+}
+
+describe("desktop_updater — external release feed mode (unsigned mac build)", () => {
+  it("parses and compares -wukong.N versions numerically and ignores foreign tags", () => {
+    const { isNewerDistributionVersion, parseReleasesAtom } = require("../src/desktop_updater");
+
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.10", "0.21.0-wukong.9"), true);
+    assert.equal(isNewerDistributionVersion("0.22.0-wukong.13", "0.21.0-wukong.12"), true);
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.12", "0.21.0-wukong.12"), false);
+    assert.equal(isNewerDistributionVersion("0.21.0-wukong.11", "0.21.0-wukong.12"), false);
+    assert.equal(isNewerDistributionVersion("0.99.0", "0.21.0-wukong.12"), false);
+
+    const parsed = parseReleasesAtom(
+      atomFeed(["v0.21.0-wukong.9", "v0.99.0", "v0.21.0-wukong.10", "v0.22.0-wukong.13"]),
+      "example-org/omnigent-dist",
+    );
+    assert.deepEqual(parsed, {
+      version: "0.22.0-wukong.13",
+      tag: "v0.22.0-wukong.13",
+      releaseUrl: "https://github.com/example-org/omnigent-dist/releases/tag/v0.22.0-wukong.13",
+    });
+  });
+
+  it("announces a newer release with a download URL and opens it without calling autoUpdater", async () => {
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => ({
+        status: 200,
+        text: atomFeed(["v0.21.0-wukong.12", "v0.21.0-wukong.13"]),
+      }),
+    });
+    h.updater.init();
+    await h.updater.checkForUpdates({ manual: true });
+
+    assert.deepEqual(h.calls.fetchedUrls, [
+      "https://github.com/example-org/omnigent-dist/releases.atom",
+    ]);
+    assert.equal(h.calls.checkForUpdates, 0);
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "available",
+      currentVersion: "0.21.0-wukong.12",
+      info: {
+        version: "0.21.0-wukong.13",
+        downloadUrl: "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+      },
+    });
+
+    await h.updater.downloadUpdate();
+    assert.equal(h.calls.downloadUpdate, 0);
+    assert.deepEqual(h.calls.openedExternal, [
+      "https://github.com/example-org/omnigent-dist/releases/tag/v0.21.0-wukong.13",
+    ]);
+    assert.equal(h.updater.installUpdateNow(), false);
+    assert.equal(h.updater.quitAndInstallIfPending(), false);
+    assert.deepEqual(h.calls.quitAndInstall, []);
+  });
+
+  it("stays silent on background up-to-date/empty/404 and reports up-to-date on manual check", async () => {
+    const cases = [
+      { status: 404, text: "Not Found" },
+      { status: 200, text: atomFeed([]) },
+      { status: 200, text: atomFeed(["v0.21.0-wukong.12"]) },
+    ];
+    await Promise.all(
+      cases.map(async (response) => {
+        const h = makeUpdater({
+          isPackaged: true,
+          settings: { update_mode: "manual" },
+          getCurrentVersion: () => "0.21.0-wukong.12",
+          externalReleaseRepo: "example-org/omnigent-dist",
+          fetchFeed: async () => response,
+        });
+        h.updater.init();
+
+        await h.updater.checkForUpdates({ manual: false });
+        assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+
+        await h.updater.checkForUpdates({ manual: true });
+        assert.deepEqual(plain(h.updater.getStatus()), { state: "none", manualOnly: true });
+        assert.equal(h.calls.showMessageBox.length, 0);
+      }),
+    );
+  });
+
+  it("stays silent on background network error and reports a plain message on manual check", async () => {
+    const h = makeUpdater({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.21.0-wukong.12",
+      externalReleaseRepo: "example-org/omnigent-dist",
+      fetchFeed: async () => {
+        throw new Error("ENOTFOUND github.com");
+      },
+    });
+    h.updater.init();
+
+    await h.updater.checkForUpdates({ manual: false });
+    assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+    assert.equal(h.calls.showMessageBox.length, 0);
+
+    await h.updater.checkForUpdates({ manual: true });
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "idle",
+      manualOnly: true,
+      lastError: "Couldn't check for updates.",
+    });
+    assert.equal(h.calls.showMessageBox.length, 0);
   });
 });

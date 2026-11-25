@@ -27,8 +27,103 @@
 /** Update modes persisted in settings.json under `update_mode`. */
 const UPDATE_MODES = new Set(["none", "manual", "start", "default"]);
 const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
+const EXTERNAL_CHECK_FAILED = "Couldn't check for updates.";
 /** Background re-check cadence for the "default" mode (every 6 hours). */
 const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const EXTERNAL_FEED_TIMEOUT_MS = 10_000;
+const EXTERNAL_REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const DISTRIBUTION_VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)-wukong\.(\d+)$/;
+const ATOM_ENTRY_RE = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
+const ATOM_LINK_TAG_RE = /<link\b[^>]*\bhref=["'][^"']*\/releases\/tag\/([^/"'?#]+)["'][^>]*>/i;
+const ATOM_ID_RE = /<id\b[^>]*>([\s\S]*?)<\/id>/i;
+
+/**
+ * Parse a stamped distribution version (`[v]X.Y.Z-wukong.N`) into a numeric
+ * tuple, or null when the string does not match.
+ *
+ * @param {unknown} value
+ * @returns {[number, number, number, number] | null}
+ */
+function parseDistributionVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = DISTRIBUTION_VERSION_RE.exec(value.trim());
+  if (!match) return null;
+  return [
+    Number.parseInt(match[1], 10),
+    Number.parseInt(match[2], 10),
+    Number.parseInt(match[3], 10),
+    Number.parseInt(match[4], 10),
+  ];
+}
+
+/**
+ * Strict numeric ordering for stamped distribution versions. Non-matching tags
+ * return false rather than falling back to string inequality.
+ *
+ * @param {string} latest
+ * @param {string} current
+ * @returns {boolean}
+ */
+function isNewerDistributionVersion(latest, current) {
+  const a = parseDistributionVersion(latest);
+  const b = parseDistributionVersion(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 4; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return false;
+}
+
+/**
+ * Extract the numerically highest `-wukong.N` release from a GitHub
+ * `releases.atom` XML document.
+ *
+ * @param {string} xmlText
+ * @param {string} repo `owner/repo`
+ * @returns {{ version: string, tag: string, releaseUrl: string } | null}
+ */
+function parseReleasesAtom(xmlText, repo) {
+  if (typeof xmlText !== "string" || !EXTERNAL_REPO_RE.test(repo)) return null;
+  let best = null;
+  ATOM_ENTRY_RE.lastIndex = 0;
+  let match = ATOM_ENTRY_RE.exec(xmlText);
+  while (match !== null) {
+    const entry = match[1];
+    let rawTag = ATOM_LINK_TAG_RE.exec(entry)?.[1] ?? null;
+    if (!rawTag) {
+      const idText = ATOM_ID_RE.exec(entry)?.[1]?.trim() ?? "";
+      rawTag = idText.split("/").pop() ?? null;
+    }
+    if (rawTag && parseDistributionVersion(rawTag)) {
+      const version = rawTag.startsWith("v") ? rawTag.slice(1) : rawTag;
+      const tag = rawTag.startsWith("v") ? rawTag : `v${rawTag}`;
+      if (!best || isNewerDistributionVersion(version, best.version)) {
+        best = {
+          version,
+          tag,
+          releaseUrl: `https://github.com/${repo}/releases/tag/${tag}`,
+        };
+      }
+    }
+    match = ATOM_ENTRY_RE.exec(xmlText);
+  }
+  return best;
+}
+
+/**
+ * Default HTTP getter for `releases.atom` using Node/Electron's built-in fetch.
+ *
+ * @param {string} url
+ * @returns {Promise<{ status: number, text: string }>}
+ */
+async function defaultFetchFeed(url) {
+  const resp = await fetch(url, {
+    headers: { Accept: "application/atom+xml, application/xml, text/xml" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(EXTERNAL_FEED_TIMEOUT_MS),
+  });
+  return { status: resp.status, text: await resp.text() };
+}
 
 /**
  * Normalize the raw settings object into the update config the renderer sees.
@@ -115,7 +210,15 @@ function createDesktopUpdater({
   updatesEnabled = true,
   getCurrentVersion = () => app.getVersion(),
   onInstallReadyChange = () => {},
+  externalReleaseRepo = null,
+  fetchFeed = defaultFetchFeed,
+  openExternal = null,
 }) {
+  const validExternalRepo =
+    typeof externalReleaseRepo === "string" && EXTERNAL_REPO_RE.test(externalReleaseRepo.trim())
+      ? externalReleaseRepo.trim()
+      : null;
+  const isExternalMode = validExternalRepo !== null;
   let updateCheckTimer = null;
   let currentUpdateStatus = { state: "idle" };
   let installPending = false;
@@ -165,6 +268,9 @@ function createDesktopUpdater({
   }
 
   function canUseFeed() {
+    if (isExternalMode) {
+      return updatesEnabled && (app.isPackaged || forceDevUpdateConfig === true);
+    }
     return updatesEnabled && (app.isPackaged || autoUpdater.forceDevUpdateConfig === true);
   }
 
@@ -181,8 +287,10 @@ function createDesktopUpdater({
       clearInterval(updateCheckTimer);
       updateCheckTimer = null;
     }
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = cfg.autoInstall;
+    if (!isExternalMode) {
+      autoUpdater.autoDownload = false;
+      autoUpdater.autoInstallOnAppQuit = cfg.autoInstall;
+    }
     // v1 is stable-only and rides electron-updater's default "latest" channel.
     if (!canUseFeed() || cfg.mode === "none") return;
     if (cfg.mode === "manual") return;
@@ -201,6 +309,10 @@ function createDesktopUpdater({
 
   function init() {
     const cfg = getConfig();
+    if (isExternalMode) {
+      applyConfig(cfg);
+      return;
+    }
     if (forceDevUpdateConfig) {
       autoUpdater.forceDevUpdateConfig = true;
     }
@@ -251,6 +363,47 @@ function createDesktopUpdater({
     applyConfig(cfg);
   }
 
+  async function checkExternalRelease({ manual = false } = {}) {
+    statusBeforeCheck = currentUpdateStatus;
+    if (manual) broadcast({ state: "checking" });
+    const feedUrl = `https://github.com/${validExternalRepo}/releases.atom`;
+    try {
+      const resp = await fetchFeed(feedUrl);
+      if (resp && resp.status === 404) {
+        broadcast(manual ? { state: "none", manualOnly: true } : { state: "idle" });
+        statusBeforeCheck = null;
+        return;
+      }
+      if (!resp || resp.status !== 200) {
+        throw new Error(`Unexpected status ${resp?.status ?? "unknown"}`);
+      }
+      const latest = parseReleasesAtom(resp.text, validExternalRepo);
+      const current = getCurrentVersion();
+      if (latest && isNewerDistributionVersion(latest.version, current)) {
+        broadcast({
+          state: "available",
+          currentVersion: current,
+          info: {
+            version: latest.version,
+            downloadUrl: latest.releaseUrl,
+          },
+        });
+      } else {
+        broadcast(manual ? { state: "none", manualOnly: true } : { state: "idle" });
+      }
+      statusBeforeCheck = null;
+    } catch (err) {
+      const msg = String(err?.message ?? err);
+      console.warn("[omnigent] update error:", msg);
+      if (manual) {
+        broadcast({ state: "idle", manualOnly: true, lastError: EXTERNAL_CHECK_FAILED });
+      } else {
+        broadcast(statusBeforeCheck ?? { state: "idle" });
+      }
+      statusBeforeCheck = null;
+    }
+  }
+
   function checkForUpdates({ manual = false } = {}) {
     if (currentUpdateStatus.state === "downloading" || currentUpdateStatus.state === "downloaded") {
       return Promise.resolve();
@@ -258,6 +411,9 @@ function createDesktopUpdater({
     if (!canUseFeed()) {
       if (manual) reportUnavailableInDev();
       return Promise.reject(unavailableInDevError());
+    }
+    if (isExternalMode) {
+      return checkExternalRelease({ manual });
     }
     statusBeforeCheck = currentUpdateStatus;
     if (manual) manualCheckInFlight = true;
@@ -285,6 +441,7 @@ function createDesktopUpdater({
   }
 
   function installUpdateNow() {
+    if (isExternalMode) return false;
     if (!canUseFeed()) {
       reportUnavailableInDev();
       return false;
@@ -306,6 +463,19 @@ function createDesktopUpdater({
     if (!canUseFeed()) {
       reportUnavailableInDev();
       return Promise.reject(unavailableInDevError());
+    }
+    if (isExternalMode) {
+      const releaseUrl = currentUpdateStatus.info?.downloadUrl;
+      const expectedPrefix = `https://github.com/${validExternalRepo}/releases/tag/`;
+      if (
+        currentUpdateStatus.state !== "available" ||
+        typeof releaseUrl !== "string" ||
+        !releaseUrl.startsWith(expectedPrefix) ||
+        typeof openExternal !== "function"
+      ) {
+        return Promise.reject(new Error("No release download link is available."));
+      }
+      return Promise.resolve(openExternal(releaseUrl)).then(() => undefined);
     }
     // Enter the progress state immediately instead of waiting for the first
     // provider event. Fast downloads and slow-loading About windows then still
@@ -458,7 +628,7 @@ function createDesktopUpdater({
    * @returns {boolean} Whether a pending install was handed off.
    */
   function quitAndInstallIfPending() {
-    if (!installPending) return false;
+    if (isExternalMode || !installPending) return false;
     autoUpdater.quitAndInstall(false, true);
     return true;
   }
@@ -483,6 +653,9 @@ module.exports = {
   createDesktopUpdater,
   normalizeUpdateConfig,
   isUpdateSecurityError,
+  parseDistributionVersion,
+  isNewerDistributionVersion,
+  parseReleasesAtom,
   UPDATE_MODES,
   UPDATES_UNAVAILABLE_IN_DEV,
 };
