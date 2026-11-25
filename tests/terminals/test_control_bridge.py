@@ -1768,6 +1768,106 @@ async def _wait_for(query: Callable[[], Awaitable[object]], expected: object) ->
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("other_client", ["none", "agent-commands", "transient-attach"])
+async def test_narrow_browser_attaches_to_detached_no_echo_prompt(
+    tmp_path: Path, other_client: str
+) -> None:
+    script = (
+        "printf '%67s' '' | tr ' ' x; "
+        "stty -echo; printf 'Input: '; "
+        "IFS= read -r typed; IFS= read -r pasted; "
+        'printf "\\nreceived <%s> <%s>\\n" "$typed" "$pasted"; '
+        "exec cat"
+    )
+    created = create_terminal_instance(
+        name="shell",
+        session_key="prompt",
+        spec=TerminalEnvSpec(
+            command="sh",
+            args=["-c", script],
+            os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
+        ),
+    )
+    instance = created.instance
+    sock, target = instance.socket_path, instance.tmux_target
+    task: asyncio.Task[None] | None = None
+    transient: asyncio.subprocess.Process | None = None
+
+    async def capture() -> str:
+        return await _tmux_output(sock, "capture-pane", "-p", "-t", target)
+
+    async def prompt_ready() -> bool:
+        return "Input:" in await capture()
+
+    try:
+        await instance.launch(cwd=created.cwd)
+        await _wait_for(prompt_ready, True)
+        assert await _window_width(sock, target) == 80
+        assert (
+            await _tmux_output(sock, "show-options", "-Awv", "-t", target, "window-size")
+            == "latest"
+        )
+        assert await _client_widths(sock) == []
+        ws = _LiveWebSocket(_resize_frame(63, 24))
+        if other_client == "transient-attach":
+            transient = await asyncio.create_subprocess_exec(
+                *instance._tmux_base_cmd(),
+                "-C",
+                "attach",
+                "-t",
+                target,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await _wait_for(lambda: _client_widths(sock), [80])
+        task = _start_bridge(ws, sock, target, browser_resize=True)
+        if other_client == "agent-commands":
+            await asyncio.gather(instance.read(), instance.send(text="a", keys=""))
+        if transient is not None:
+            await _wait_for(lambda: _client_widths(sock), [63, 80])
+            await asyncio.wait_for(transient.communicate(b"\n"), timeout=5)
+        width_at_attach = await _settled_window_width(sock, target)
+        cursor = await _tmux_output(
+            sock, "display-message", "-p", "-t", target, "#{cursor_y} #{cursor_x}"
+        )
+        expected_row, expected_col = (int(part) + 1 for part in cursor.split())
+        expected_cup = f"\x1b[{expected_row};{expected_col}H".encode()
+        seed = b"".join(ws.sent)
+
+        ws.frames.put_nowait(_input_frame(b"k"))
+        ws.frames.put_nowait(_input_frame(b"\r"))
+        ws.frames.put_nowait(_input_frame(b"paste with spaces"))
+        ws.frames.put_nowait(_input_frame(b"\r"))
+
+        async def received() -> bool:
+            typed = "ak" if other_client == "agent-commands" else "k"
+            return f"received <{typed}> <paste with spaces>" in await capture()
+
+        await _wait_for(received, True)
+        width_after_input = await _window_width(sock, target)
+        ws.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(task, timeout=5)
+        width_after_detach = await _window_width(sock, target)
+        print(
+            f"attached width={width_at_attach}; width after input={width_after_input}; "
+            f"width after detach={width_after_detach}; typed and pasted bytes reached prompt"
+        )
+        assert width_after_input == 63
+        assert seed.rsplit(b"\x1b[0m", 1)[-1].startswith(expected_cup), (
+            f"expected prompt cursor {expected_cup!r}, seed tail {seed[-60:]!r}"
+        )
+    finally:
+        if transient is not None and transient.returncode is None:
+            transient.kill()
+            await asyncio.wait_for(transient.wait(), timeout=5)
+        if task is not None:
+            await _kill_and_join(sock, task)
+        await instance.close()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_waiting_owner_takes_window_size_when_it_types(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

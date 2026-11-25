@@ -901,6 +901,9 @@ async def bridge_tmux_control_to_websocket(
     current_session_id: str | None = None
     size_recheck = asyncio.Event()
     attach_registered = asyncio.Event()
+    browser_layout_ready = asyncio.Event()
+    layout_size: str | None = None
+    pane_output_seen = False
     command_write_lock = asyncio.Lock()
     pending_commands: deque[asyncio.Future[bool]] = deque()
     active_command_reply: tuple[bytes, bytes] | None = None
@@ -914,6 +917,7 @@ async def bridge_tmux_control_to_websocket(
     clipboard_task: asyncio.Task[None] | None = None
     ws_task: asyncio.Task[None] | None = None
     size_task: asyncio.Task[None] | None = None
+    seed_task: asyncio.Task[None] | None = None
     # "Control side ended" == the reader finished (session gone / %exit /
     # window-close) — the signal the close-code logic keys on. The forwarder
     # finishing is downstream (it drains, then sees the EOF sentinel).
@@ -1100,6 +1104,26 @@ async def bridge_tmux_control_to_websocket(
                         _SIZE_RECHECK_MAX_RETRY_DELAY_S,
                     )
 
+    async def _refresh_quiet_attach_seed() -> None:
+        """Replay a quiet pane at the grid the browser actually established."""
+        await browser_layout_ready.wait()
+        target = registered_session_id
+        size = browser_size
+        if pane_output_seen or target is None or current_session_id != target:
+            return
+        resized_seed = await _run_tmux_capture(socket_path, target)
+        async with ws_send_lock:
+            if (
+                resized_seed is not None
+                and not pane_output_seen
+                and current_session_id == target
+                and size == browser_size == layout_size
+            ):
+                # The initial seed already replayed history. Replace it along
+                # with the visible grid so this replay doesn't duplicate it.
+                with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                    await websocket.send_bytes(b"\x1b[3J" + resized_seed)
+
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
 
@@ -1112,6 +1136,7 @@ async def bridge_tmux_control_to_websocket(
         :returns: ``True`` to continue reading, ``False`` to stop.
         """
         nonlocal size_lost, registered_session_id, current_session_id, active_command_reply
+        nonlocal layout_size, pane_output_seen
         if line.startswith(b"%begin "):
             parts = line.split(b" ")
             if len(parts) >= 4 and parts[3] == b"1":
@@ -1134,6 +1159,7 @@ async def bridge_tmux_control_to_websocket(
             # %output %<pane-id> <escaped-bytes>
             parts = line.split(b" ", 2)
             if len(parts) == 3:
+                pane_output_seen = True
                 output = window_name_filter.feed(unescape_control_output(parts[2]))
                 if output:
                     if not read_only and (waiting_to_size or size_lost):
@@ -1174,8 +1200,11 @@ async def bridge_tmux_control_to_websocket(
         if line.startswith(b"%client-detached "):
             size_recheck.set()
             return True
-        layout_size = _layout_change_size(line)
-        if layout_size is not None:
+        changed_size = _layout_change_size(line)
+        if changed_size is not None:
+            layout_size = changed_size
+            if browser_size == layout_size:
+                browser_layout_ready.set()
             if not read_only and not waiting_to_size and browser_size is not None:
                 if layout_size == browser_size:
                     pending_browser_sizes.clear()
@@ -1488,6 +1517,11 @@ async def bridge_tmux_control_to_websocket(
             forward_task.add_done_callback(lambda _task: forward_done.set())
         ws_task = asyncio.create_task(_ws_to_control(), name="tmux-ws-to-control")
         size_task = asyncio.create_task(_take_window_size_when_alone(), name="tmux-control-size")
+        seed_task = (
+            asyncio.create_task(_refresh_quiet_attach_seed(), name="tmux-control-seed")
+            if seed and browser_resize and not read_only
+            else None
+        )
 
         # The clipboard task is intentionally not a FIRST_COMPLETED trigger: it
         # may finish after the reader's EOF sentinel, but the reader itself is
@@ -1521,14 +1555,16 @@ async def bridge_tmux_control_to_websocket(
                 await asyncio.wait_for(
                     asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
                 )
-        for task in {*pending, clipboard_task, size_task}:
+        for task in {*pending, clipboard_task, size_task, seed_task}:
+            if task is None:
+                continue
             if task.done():
                 continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in {read_task, forward_task, clipboard_task, ws_task, size_task}:
-            if task.done() and not task.cancelled():
+        for task in {read_task, forward_task, clipboard_task, ws_task, size_task, seed_task}:
+            if task is not None and task.done() and not task.cancelled():
                 exc = task.exception()
                 if exc is not None:
                     _logger.warning("control-attach: bridge task crashed: %r", exc)
@@ -1537,7 +1573,7 @@ async def bridge_tmux_control_to_websocket(
         # Always stop and join every child task before detaching the tmux client.
         bridge_tasks = {
             task
-            for task in (read_task, forward_task, clipboard_task, ws_task, size_task)
+            for task in (read_task, forward_task, clipboard_task, ws_task, size_task, seed_task)
             if task is not None
         }
         for task in bridge_tasks:
