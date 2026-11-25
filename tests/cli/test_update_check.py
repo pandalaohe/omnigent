@@ -2771,6 +2771,125 @@ def test_refresh_update_cache_writes_throttle_entry_on_corrupt_or_oversized_feed
     assert not _is_stale(cached)
 
 
+def test_download_verified_distribution_wheels_verifies_sha256_and_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wheel downloader validates redirects, rejects duplicates/mismatches, and writes files."""
+    import hashlib
+
+    import httpx
+
+    from omnigent.update_check import (
+        DistributionWheelError,
+        download_verified_distribution_wheels,
+    )
+
+    repo = "example-org/omnigent-dist"
+    tag = "v0.21.0-wukong.13"
+    base = f"https://github.com/{repo}/releases/download/{tag}"
+    blobs = {
+        "omnigent-0.21.0.dev0-py3-none-any.whl": b"core-wheel-bytes",
+        "omnigent_client-0.21.0.dev0-py3-none-any.whl": b"client-wheel-bytes",
+        "omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl": b"ui-sdk-wheel-bytes",
+    }
+    shas = {name: hashlib.sha256(data).hexdigest() for name, data in blobs.items()}
+    manifest = (
+        f"# tag {tag}\n"
+        f"omnigent\tomnigent-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent-0.21.0.dev0-py3-none-any.whl']}\n"
+        f"omnigent-client\tomnigent_client-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent_client-0.21.0.dev0-py3-none-any.whl']}\n"
+        f"omnigent-ui-sdk\tomnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent_ui_sdk-0.21.0.dev0-py3-none-any.whl']}\n"
+    )
+
+    class _BytesResp:
+        def __init__(
+            self,
+            status_code: int = 200,
+            *,
+            content: bytes = b"",
+            headers: dict[str, str] | None = None,
+            url: str = "",
+        ) -> None:
+            self.status_code = status_code
+            self.content = content
+            self.text = content.decode("utf-8", errors="replace")
+            self.headers = headers or {}
+            self.url = url
+
+    # Happy path: GitHub release URL redirects to objects.githubusercontent.com CDN.
+    def _ok_get(url: str, **kw: object) -> _BytesResp:
+        assert kw.get("follow_redirects") is False
+        if url == f"{base}/wukong-wheels.txt":
+            return _BytesResp(
+                302,
+                headers={
+                    "location": "https://objects.githubusercontent.com/signed/manifest?sig=1"
+                },
+            )
+        if url == "https://objects.githubusercontent.com/signed/manifest?sig=1":
+            return _BytesResp(200, content=manifest.encode("utf-8"), url=url)
+        for name, data in blobs.items():
+            if url == f"{base}/{name}":
+                return _BytesResp(
+                    302,
+                    headers={
+                        "location": f"https://release-assets.githubusercontent.com/signed/{name}?t=1"
+                    },
+                )
+            if url == f"https://release-assets.githubusercontent.com/signed/{name}?t=1":
+                return _BytesResp(200, content=data, url=url)
+        return _BytesResp(404)
+
+    monkeypatch.setattr(httpx, "get", _ok_get)
+    out_dir = tmp_path / "ok"
+    out_dir.mkdir()
+    local = download_verified_distribution_wheels(repo, "0.21.0-wukong.13", out_dir)
+    assert set(local) == {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    for pkg, path in local.items():
+        assert path.is_file()
+        assert path.read_bytes() == blobs[path.name]
+
+    # Digest mismatch on any wheel is refused.
+    def _bad_digest_get(url: str, **kw: object) -> _BytesResp:
+        resp = _ok_get(url, **kw)
+        if url.endswith("omnigent-0.21.0.dev0-py3-none-any.whl?t=1"):
+            return _BytesResp(200, content=b"tampered-bytes", url=url)
+        return resp
+
+    monkeypatch.setattr(httpx, "get", _bad_digest_get)
+    with pytest.raises(DistributionWheelError, match="SHA-256"):
+        download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "bad-sha")
+
+    # Duplicate package row in manifest is refused.
+    dup_manifest = manifest + (
+        f"omnigent\tomnigent-0.21.0.dev0-py3-none-any.whl\t{shas['omnigent-0.21.0.dev0-py3-none-any.whl']}\n"
+    )
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **_k: _BytesResp(200, content=dup_manifest.encode("utf-8"), url=url),
+    )
+    with pytest.raises(DistributionWheelError, match="manifest"):
+        download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "dup")
+
+    # Disallowed redirect targets (foreign host, HTTP, credentials, port, wrong tag) refused.
+    for bad_location in (
+        "https://evil.example/wukong-wheels.txt",
+        "http://objects.githubusercontent.com/signed/manifest",
+        "https://user:pass@objects.githubusercontent.com/signed/manifest",
+        "https://objects.githubusercontent.com:8443/signed/manifest",
+        f"https://github.com/{repo}/releases/download/v0.21.0-wukong.12/wukong-wheels.txt",
+        f"https://github.com/foreign-org/foreign-repo/releases/download/{tag}/wukong-wheels.txt",
+    ):
+        monkeypatch.setattr(
+            httpx,
+            "get",
+            lambda _url, _loc=bad_location, **_k: _BytesResp(302, headers={"location": _loc}),
+        )
+        with pytest.raises(DistributionWheelError):
+            download_verified_distribution_wheels(repo, "0.21.0-wukong.13", tmp_path / "bad-redir")
+
+
 @pytest.mark.parametrize(
     ("status_code", "body"),
     [

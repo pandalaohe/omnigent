@@ -521,6 +521,132 @@ with open(sys.argv[1], "rb") as handle:
   fi
 }
 
+validate_release_url() {
+  url="$1"
+  repo="$2"
+  expected_asset="$3"
+  expected_tag="$4"
+
+  case "$url" in
+    https://*) ;;
+    *) return 1 ;;
+  esac
+  case "$url" in
+    *"#"* | *"\\"* | *"%2f"* | *"%2F"* | *"%5c"* | *"%5C"* | *" "* | *"	"*)
+      return 1
+      ;;
+  esac
+
+  without_scheme="${url#https://}"
+  case "$without_scheme" in
+    */*)
+      authority="${without_scheme%%/*}"
+      rest="/${without_scheme#*/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  case "$authority" in
+    "" | *@* | *:*) return 1 ;;
+  esac
+
+  path_only="${rest%%\?*}"
+  case "$path_only" in
+    */./* | */../* | */. | */..) return 1 ;;
+  esac
+
+  case "$authority" in
+    github.com)
+      case "$rest" in
+        *\?*) return 1 ;;
+      esac
+      if [ -n "$expected_tag" ]; then
+        [ "$rest" = "/${repo}/releases/download/${expected_tag}/${expected_asset}" ]
+        return
+      fi
+      if [ "$rest" = "/${repo}/releases/latest/download/${expected_asset}" ]; then
+        return 0
+      fi
+      prefix="/${repo}/releases/download/"
+      suffix="/${expected_asset}"
+      case "$rest" in
+        "${prefix}"*"${suffix}")
+          mid="${rest#"$prefix"}"
+          mid="${mid%"$suffix"}"
+          printf '%s\n' "$mid" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-wukong\.[0-9]+$'
+          return
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    objects.githubusercontent.com | release-assets.githubusercontent.com)
+      [ -n "$path_only" ] && [ "$path_only" != "/" ]
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+fetch_release_asset() {
+  cur_url="$1"
+  dest="$2"
+  repo="$3"
+  expected_asset="$4"
+  expected_tag="$5"
+
+  validate_release_url "$cur_url" "$repo" "$expected_asset" "$expected_tag" || return 1
+
+  hdr_file="${dest}.hdr"
+  hop=0
+  while [ "$hop" -le 5 ]; do
+    rm -f "$hdr_file" "$dest"
+    if ! curl -fsS --proto '=https' --proto-redir '=https' -D "$hdr_file" -o "$dest" "$cur_url"; then
+      rm -f "$hdr_file" "$dest"
+      return 1
+    fi
+    status="$(awk '{ sub(/\r$/, "") } /^HTTP\//{ print $2; exit }' "$hdr_file")"
+    case "$status" in
+      200 | 201 | 202 | 204 | 206)
+        rm -f "$hdr_file"
+        return 0
+        ;;
+      301 | 302 | 303 | 307 | 308)
+        location="$(awk '{ sub(/\r$/, "") } tolower($0) ~ /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$hdr_file")"
+        rm -f "$hdr_file" "$dest"
+        [ -n "$location" ] || return 1
+        case "$location" in
+          /*)
+            cur_without_scheme="${cur_url#https://}"
+            cur_authority="${cur_without_scheme%%/*}"
+            next_url="https://${cur_authority}${location}"
+            ;;
+          *)
+            next_url="$location"
+            ;;
+        esac
+        if ! validate_release_url "$next_url" "$repo" "$expected_asset" "$expected_tag"; then
+          warn "Refused redirect to disallowed host or path: $next_url"
+          return 1
+        fi
+        cur_url="$next_url"
+        hop=$((hop + 1))
+        ;;
+      *)
+        rm -f "$hdr_file" "$dest"
+        return 1
+        ;;
+    esac
+  done
+  rm -f "$hdr_file" "$dest"
+  return 1
+}
+
 install_from_wheel_release() (
   extras_suffix="$1"
   case "$WHEEL_RELEASE_REPO" in
@@ -532,11 +658,13 @@ install_from_wheel_release() (
     || fail "Invalid WHEEL_RELEASE_REPO: $WHEEL_RELEASE_REPO"
 
   requested_ver=
+  expected_manifest_tag=
   if [ -n "$VERSION" ]; then
     requested_ver="${VERSION#v}"
     printf '%s\n' "$requested_ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-wukong\.[0-9]+$' \
       || fail "Unsupported distribution version: $VERSION (expected X.Y.Z-wukong.N)."
-    manifest_url="https://github.com/${WHEEL_RELEASE_REPO}/releases/download/v${requested_ver}/wukong-wheels.txt"
+    expected_manifest_tag="v${requested_ver}"
+    manifest_url="https://github.com/${WHEEL_RELEASE_REPO}/releases/download/${expected_manifest_tag}/wukong-wheels.txt"
   else
     manifest_url="https://github.com/${WHEEL_RELEASE_REPO}/releases/latest/download/wukong-wheels.txt"
   fi
@@ -545,7 +673,7 @@ install_from_wheel_release() (
   trap 'rm -rf "$wheel_tmp"' 0
   trap 'exit 1' 1 2 15
 
-  if ! curl -fsSL "$manifest_url" -o "$wheel_tmp/wukong-wheels.txt"; then
+  if ! fetch_release_asset "$manifest_url" "$wheel_tmp/wukong-wheels.txt" "$WHEEL_RELEASE_REPO" "wukong-wheels.txt" "$expected_manifest_tag"; then
     fail "Could not download the prebuilt wheel manifest from https://github.com/${WHEEL_RELEASE_REPO}/releases. Check your connection, or pass --repo https://github.com/${WHEEL_RELEASE_REPO}.git to build from source."
   fi
 
@@ -564,6 +692,7 @@ install_from_wheel_release() (
     case "$col1" in
       "") continue ;;
       "# tag "*)
+        [ -z "$release_tag" ] || fail "Duplicate tag header in wheel manifest."
         release_tag="${col1#\# tag }"
         continue
         ;;
@@ -578,9 +707,18 @@ install_from_wheel_release() (
     printf '%s\n' "$col3" | grep -Eq '^[0-9a-f]{64}$' \
       || fail "Invalid wheel checksum in manifest for $col1"
     case "$col1" in
-      omnigent) core_whl="$col2"; core_sha="$col3" ;;
-      omnigent-client) client_whl="$col2"; client_sha="$col3" ;;
-      omnigent-ui-sdk) ui_sdk_whl="$col2"; ui_sdk_sha="$col3" ;;
+      omnigent)
+        [ -z "$core_whl" ] || fail "Duplicate package entry in wheel manifest: $col1"
+        core_whl="$col2"; core_sha="$col3"
+        ;;
+      omnigent-client)
+        [ -z "$client_whl" ] || fail "Duplicate package entry in wheel manifest: $col1"
+        client_whl="$col2"; client_sha="$col3"
+        ;;
+      omnigent-ui-sdk)
+        [ -z "$ui_sdk_whl" ] || fail "Duplicate package entry in wheel manifest: $col1"
+        ui_sdk_whl="$col2"; ui_sdk_sha="$col3"
+        ;;
       *) fail "Unexpected package in wheel manifest: $col1" ;;
     esac
   done <"$wheel_tmp/wukong-wheels.txt"
@@ -601,7 +739,7 @@ install_from_wheel_release() (
     "${ui_sdk_whl}:${ui_sdk_sha}"; do
     whl_name="${spec%%:*}"
     expected_sha="${spec#*:}"
-    if ! curl -fsSL "${release_base}/${whl_name}" -o "$wheel_tmp/$whl_name"; then
+    if ! fetch_release_asset "${release_base}/${whl_name}" "$wheel_tmp/$whl_name" "$WHEEL_RELEASE_REPO" "$whl_name" "$release_tag"; then
       fail "Failed to download ${whl_name} from ${release_base}."
     fi
     actual_sha="$(sha256_file "$wheel_tmp/$whl_name")"

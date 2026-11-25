@@ -6604,26 +6604,41 @@ def _upgrade_distribution_install(
     target_version: str | None,
     dry_run: bool,
 ) -> None:
-    """Upgrade a non-VCS stamped distribution install from its GitHub releases."""
+    """Upgrade a non-VCS stamped distribution install from verified local release wheels."""
+    import shlex
+    import tempfile
+
     from omnigent.distribution import DISTRIBUTION_NAME
     from omnigent.update_check import (
         _UPGRADE_INDEX_TIMEOUT_SECONDS,
         _UV_REINSTALL_PACKAGE,
-        _build_upgrade_suggestion,
+        DistributionWheelError,
+        _distribution_recovery_command,
         _extras_str,
         _is_newer_distribution_version,
+        _parse_distribution_version,
         _probe_distribution_version,
         _run_upgrade_command,
         _upgrade_failure_message,
         _UpgradeSuggestion,
         _uv_python_pin,
         _uv_tool_receipt_path,
-        fetch_distribution_wheel_urls,
+        download_verified_distribution_wheels,
+        fetch_distribution_wheel_manifest,
         fetch_latest_distribution_release,
     )
 
+    extras = sorted(set(info.extras) | set(extra_overrides))
+    recovery = _distribution_recovery_command(repo, extras)
+
     if target_version:
         target = target_version.removeprefix("v")
+        if _parse_distribution_version(target) is None:
+            raise click.ClickException(
+                f"Unsupported {DISTRIBUTION_NAME} version: {target_version!r} "
+                "(expected X.Y.Z-wukong.N).\n\n"
+                f"To reinstall {DISTRIBUTION_NAME}, run:\n\n    {recovery}"
+            )
         click.echo(f"Targeting {DISTRIBUTION_NAME} {target}.")
     else:
         status, latest = fetch_latest_distribution_release(
@@ -6632,7 +6647,8 @@ def _upgrade_distribution_install(
         if status == "error":
             raise click.ClickException(
                 f"Couldn't reach https://github.com/{repo}/releases.atom to check for a "
-                f"newer {DISTRIBUTION_NAME} release. Check your connection and try again."
+                f"newer {DISTRIBUTION_NAME} release. Check your connection and try again.\n\n"
+                f"Or reinstall manually:\n\n    {recovery}"
             )
         if status == "empty" or latest is None:
             click.echo(f"No published {DISTRIBUTION_NAME} releases found yet.")
@@ -6646,89 +6662,112 @@ def _upgrade_distribution_install(
     if check_only:
         raise SystemExit(1)
 
-    wheel_urls = fetch_distribution_wheel_urls(
-        repo, target, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
-    )
-    target_vcs_url = f"git+https://github.com/{repo}.git@v{target}"
     if info.detected_installer == "pip":
         click.echo(
             "omnigent was installed with pip, and pip does not record which extras "
             f"were requested. `{cli_invocation(name='omni')} upgrade` cannot preserve them "
-            "safely, so you should upgrade manually:\n\n"
-            f"    pip install --force-reinstall '{target_vcs_url}'\n"
-            "    # or, if you need extras:\n"
-            f"    pip install --force-reinstall '{target_vcs_url}#egg=omnigent[your,extras,here]'"
+            f"safely. Reinstall {DISTRIBUTION_NAME} with the official wheel installer:\n\n"
+            f"    {recovery}"
         )
         raise SystemExit(0)
     if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
-        manual_extras = f"{target_vcs_url}#egg=omnigent[your,extras,here]"
         click.echo(
             "omnigent was installed with `uv pip`, not `uv tool install`. "
             "`uv pip` does not record which extras were requested, so "
             f"`{cli_invocation(name='omni')} upgrade` cannot preserve them safely. "
-            "Upgrade manually:\n\n"
-            f"    uv pip install --force-reinstall '{target_vcs_url}'\n"
-            "    # or, if you need extras:\n"
-            f"    uv pip install --force-reinstall '{manual_extras}'"
+            f"Reinstall {DISTRIBUTION_NAME} with the official wheel installer:\n\n"
+            f"    {recovery}"
         )
         raise SystemExit(0)
+    if (info.detected_installer or info.installer) != "uv":
+        raise click.ClickException(
+            f"Automatic wheel upgrades for {DISTRIBUTION_NAME} require `uv tool install`. "
+            f"Reinstall with the official wheel installer:\n\n    {recovery}"
+        )
 
-    if wheel_urls is not None and (info.detected_installer or info.installer) == "uv":
-        extras = sorted(set(info.extras) | set(extra_overrides))
-        extras_suffix = _extras_str(extras)
-        suggestion = _UpgradeSuggestion(
+    extras_suffix = _extras_str(extras)
+    if dry_run:
+        try:
+            manifest = fetch_distribution_wheel_manifest(
+                repo, target, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
+            )
+        except DistributionWheelError as exc:
+            raise click.ClickException(
+                f"{exc}\n\nYour current install and running services were not touched. "
+                f"Recover with:\n\n    {recovery}"
+            ) from exc
+        client_name = manifest["omnigent-client"][0]
+        ui_sdk_name = manifest["omnigent-ui-sdk"][0]
+        core_name = manifest["omnigent"][0]
+        preview = _UpgradeSuggestion(
             command=(
                 f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
-                f"--with 'omnigent-client @ {wheel_urls['omnigent-client']}' "
-                f"--with 'omnigent-ui-sdk @ {wheel_urls['omnigent-ui-sdk']}' "
-                f"'omnigent{extras_suffix} @ {wheel_urls['omnigent']}'"
+                f"--with 'omnigent-client @ file://<verified-dir>/{client_name}' "
+                f"--with 'omnigent-ui-sdk @ file://<verified-dir>/{ui_sdk_name}' "
+                f"'omnigent{extras_suffix} @ file://<verified-dir>/{core_name}'"
             ),
             runnable=True,
         )
-    else:
-        suggestion = _build_upgrade_suggestion(
-            info,
-            extra_overrides=extra_overrides,
-            target_vcs_url=target_vcs_url,
-        )
-    if not suggestion.runnable:
-        raise click.ClickException(
-            f"No automatic upgrade command is known for this install. {suggestion.command}."
-        )
-
-    if dry_run:
-        _echo_upgrade_plan(info, suggestion, extra_overrides)
+        _echo_upgrade_plan(info, preview, extra_overrides)
         return
 
-    with _upgrade_host_service(force=force):
-        console = Console()
-        code = _run_upgrade_command(suggestion.command, console)
-        if code != 0:
+    with tempfile.TemporaryDirectory(prefix="omnigent-wheels-") as tmp_dir:
+        try:
+            wheel_paths = download_verified_distribution_wheels(
+                repo, target, Path(tmp_dir), timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS
+            )
+        except DistributionWheelError as exc:
             raise click.ClickException(
-                _upgrade_failure_message(
-                    code,
-                    set(info.extras) | set(extra_overrides),
-                    recovery_command=suggestion.command,
-                )
-            )
+                f"{exc}\n\nYour current install and running services were not touched. "
+                f"Recover with:\n\n    {recovery}"
+            ) from exc
 
-        new_dist = _probe_distribution_version()
-        if new_dist is None:
-            click.echo(
-                "Ran the upgrade command, but couldn't confirm the installed version. "
-                f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
-            )
-            return
-        if new_dist == target or _is_newer_distribution_version(new_dist, current):
-            click.echo(
-                f"✓ Upgraded to {DISTRIBUTION_NAME} {new_dist}. Re-run your command — the "
-                "local server will start on the new version."
-            )
-            return
-        raise click.ClickException(
-            f"The upgrade command ran but {DISTRIBUTION_NAME} is still {new_dist} "
-            f"(expected {target}). Try the command directly: {suggestion.command}"
+        client_spec = shlex.quote(
+            f"omnigent-client @ {wheel_paths['omnigent-client'].resolve().as_uri()}"
         )
+        ui_sdk_spec = shlex.quote(
+            f"omnigent-ui-sdk @ {wheel_paths['omnigent-ui-sdk'].resolve().as_uri()}"
+        )
+        core_spec = shlex.quote(
+            f"omnigent{extras_suffix} @ {wheel_paths['omnigent'].resolve().as_uri()}"
+        )
+        suggestion = _UpgradeSuggestion(
+            command=(
+                f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                f"--with {client_spec} --with {ui_sdk_spec} {core_spec}"
+            ),
+            runnable=True,
+        )
+
+        with _upgrade_host_service(force=force):
+            console = Console()
+            code = _run_upgrade_command(suggestion.command, console)
+            if code != 0:
+                raise click.ClickException(
+                    _upgrade_failure_message(
+                        code,
+                        extras,
+                        recovery_command=recovery,
+                    )
+                )
+
+            new_dist = _probe_distribution_version()
+            if new_dist is None:
+                click.echo(
+                    "Ran the upgrade command, but couldn't confirm the installed version. "
+                    f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
+                )
+                return
+            if new_dist == target or _is_newer_distribution_version(new_dist, current):
+                click.echo(
+                    f"✓ Upgraded to {DISTRIBUTION_NAME} {new_dist}. Re-run your command — the "
+                    "local server will start on the new version."
+                )
+                return
+            raise click.ClickException(
+                f"The upgrade command ran but {DISTRIBUTION_NAME} is still {new_dist} "
+                f"(expected {target}). Recover with:\n\n    {recovery}"
+            )
 
 
 @cli.command("upgrade")

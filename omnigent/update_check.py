@@ -542,76 +542,234 @@ def fetch_latest_distribution_release(
     return "ok", best
 
 
-_ALLOWED_RELEASE_ASSET_HOSTS = frozenset(
-    {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+_ALLOWED_RELEASE_ASSET_CDN_HOSTS = frozenset(
+    {"objects.githubusercontent.com", "release-assets.githubusercontent.com"}
 )
+_REQUIRED_WHEEL_PACKAGES = frozenset({"omnigent", "omnigent-client", "omnigent-ui-sdk"})
+_MAX_RELEASE_ASSET_REDIRECTS = 5
 
 
-def fetch_distribution_wheel_urls(
+class DistributionWheelError(ValueError):
+    """Raised when downloading, validating, or verifying distribution wheels fails."""
+
+
+def _distribution_recovery_command(repo: str, extras: Collection[str] = ()) -> str:
+    """Return the platform-appropriate Wukong wheel installer command for *repo*."""
+    if IS_WINDOWS:
+        sorted_extras = sorted(extras)
+        if sorted_extras:
+            joined = ",".join(sorted_extras)
+            return (
+                "& ([scriptblock]::Create("
+                f"(irm https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.ps1)"
+                f")) -Extra '{joined}'"
+            )
+        return f"irm https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.ps1 | iex"
+    extra_flags = "".join(f" --extra {extra}" for extra in sorted(extras))
+    extra_args = f" -s --{extra_flags}" if extra_flags else ""
+    return (
+        f"curl -fsSL https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.sh "
+        f"| sh{extra_args}"
+    )
+
+
+def _validate_release_asset_url(
+    raw_url: str,
     repo: str,
-    version: str,
+    expected_tag: str,
+    expected_asset: str,
+) -> str | None:
+    """Verify *raw_url* is an allowed HTTPS GitHub release or release-CDN asset URL."""
+    from urllib.parse import urlsplit
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or not isinstance(raw_url, str):
+        return None
+    if "\\" in raw_url or "%2f" in raw_url.lower() or "%5c" in raw_url.lower():
+        return None
+    parts = urlsplit(raw_url)
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment != ""
+        or not parts.hostname
+        or parts.netloc != parts.hostname
+    ):
+        return None
+    if any(segment in (".", "..") for segment in parts.path.split("/")):
+        return None
+    if parts.hostname == "github.com":
+        canonical = f"https://github.com/{normalized_repo}/releases/download/{expected_tag}/{expected_asset}"
+        if parts.query != "" or raw_url != canonical:
+            return None
+        return canonical
+    if parts.hostname in _ALLOWED_RELEASE_ASSET_CDN_HOSTS:
+        if not parts.path.startswith("/"):
+            return None
+        return raw_url
+    return None
+
+
+def _download_release_asset_bytes(
+    repo: str,
+    tag: str,
+    asset_name: str,
     *,
     timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
-) -> dict[str, str] | None:
-    """Fetch and validate prebuilt wheel URLs from a release's ``wukong-wheels.txt`` manifest."""
-    from urllib.parse import urljoin, urlsplit
+) -> bytes:
+    """Download one release asset with strict HTTPS GitHub/CDN redirect validation."""
+    from urllib.parse import urljoin
 
     import httpx
 
     normalized_repo = _normalize_distribution_repo(repo)
-    if normalized_repo is None or _parse_distribution_version(version) is None:
-        return None
-    tag = f"v{version.removeprefix('v')}"
-    current_url = f"https://github.com/{normalized_repo}/releases/download/{tag}/wukong-wheels.txt"
-    resp = None
-    for _ in range(4):
+    if normalized_repo is None or _parse_distribution_version(tag) is None:
+        raise DistributionWheelError(f"Invalid distribution release target: {repo!r} / {tag!r}.")
+    if "/" in asset_name or "\\" in asset_name or ".." in asset_name or not asset_name:
+        raise DistributionWheelError(f"Invalid release asset name: {asset_name!r}.")
+
+    current_url = f"https://github.com/{normalized_repo}/releases/download/{tag}/{asset_name}"
+    for _ in range(_MAX_RELEASE_ASSET_REDIRECTS + 1):
         try:
             resp = httpx.get(current_url, timeout=timeout, follow_redirects=False)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as exc:
+            raise DistributionWheelError(
+                f"Could not download {asset_name} from "
+                f"https://github.com/{normalized_repo}/releases: {exc}"
+            ) from exc
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("location")
             if not location:
-                return None
+                raise DistributionWheelError(
+                    f"Redirect without Location header while downloading {asset_name}."
+                )
             next_url = urljoin(current_url, location)
-            parts = urlsplit(next_url)
-            if parts.scheme != "https" or parts.hostname not in _ALLOWED_RELEASE_ASSET_HOSTS:
-                return None
-            if parts.hostname == "github.com" and not parts.path.startswith(
-                f"/{normalized_repo}/releases/"
-            ):
-                return None
-            current_url = next_url
+            validated = _validate_release_asset_url(next_url, normalized_repo, tag, asset_name)
+            if validated is None:
+                raise DistributionWheelError(
+                    f"Refused redirect to disallowed URL while downloading {asset_name}: "
+                    f"{next_url}"
+                )
+            current_url = validated
             continue
-        break
-    if resp is None or resp.status_code != 200:
-        return None
-    expected_tag: str | None = None
-    wheels: dict[str, str] = {}
-    for raw_line in resp.text.splitlines():
+        resp_url = getattr(resp, "url", None)
+        if resp_url is not None:
+            resp_url_str = str(resp_url)
+            if (
+                resp_url_str
+                and _validate_release_asset_url(resp_url_str, normalized_repo, tag, asset_name)
+                is None
+            ):
+                raise DistributionWheelError(
+                    f"Refused response from disallowed URL while downloading {asset_name}: "
+                    f"{resp_url_str}"
+                )
+        if resp.status_code != 200:
+            raise DistributionWheelError(
+                f"Could not download {asset_name} from "
+                f"https://github.com/{normalized_repo}/releases (HTTP {resp.status_code})."
+            )
+        return bytes(resp.content)
+    raise DistributionWheelError(f"Too many redirects while downloading {asset_name}.")
+
+
+def _parse_distribution_wheel_manifest(text: str, expected_tag: str) -> dict[str, tuple[str, str]]:
+    """Parse and validate ``wukong-wheels.txt``, rejecting duplicates and bad entries."""
+    manifest_tag: str | None = None
+    wheels: dict[str, tuple[str, str]] = {}
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("# tag "):
-            expected_tag = line.removeprefix("# tag ").strip()
+            if manifest_tag is not None:
+                raise DistributionWheelError("Duplicate tag header in wheel manifest.")
+            manifest_tag = line.removeprefix("# tag ").strip()
             continue
         if line.startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) != 3:
-            return None
+            raise DistributionWheelError("Malformed entry in wheel manifest.")
         pkg, filename, sha256 = parts
-        if (
-            pkg not in ("omnigent", "omnigent-client", "omnigent-ui-sdk")
-            or not _WHEEL_FILENAME_RE.match(filename)
-            or ".." in filename
-            or not _SHA256_HEX_RE.match(sha256)
-        ):
-            return None
-        wheels[pkg] = f"https://github.com/{normalized_repo}/releases/download/{tag}/{filename}"
-    if expected_tag != tag or set(wheels) != {"omnigent", "omnigent-client", "omnigent-ui-sdk"}:
-        return None
+        if pkg not in _REQUIRED_WHEEL_PACKAGES:
+            raise DistributionWheelError(f"Unexpected package in wheel manifest: {pkg!r}.")
+        if pkg in wheels:
+            raise DistributionWheelError(f"Duplicate package entry in wheel manifest: {pkg!r}.")
+        if not _WHEEL_FILENAME_RE.match(filename) or ".." in filename:
+            raise DistributionWheelError(
+                f"Invalid wheel filename in wheel manifest: {filename!r}."
+            )
+        if not _SHA256_HEX_RE.match(sha256):
+            raise DistributionWheelError(
+                f"Invalid SHA-256 checksum in wheel manifest for {pkg!r}."
+            )
+        wheels[pkg] = (filename, sha256)
+    if manifest_tag != expected_tag:
+        raise DistributionWheelError(
+            f"Wheel manifest tag {manifest_tag!r} does not match expected tag {expected_tag!r}."
+        )
+    if set(wheels) != _REQUIRED_WHEEL_PACKAGES:
+        raise DistributionWheelError("Incomplete wheel manifest: missing required packages.")
     return wheels
+
+
+def fetch_distribution_wheel_manifest(
+    repo: str,
+    version: str,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> dict[str, tuple[str, str]]:
+    """Download and validate ``wukong-wheels.txt`` for *version* in *repo*."""
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(version) is None:
+        raise DistributionWheelError(
+            f"Invalid distribution release target: {repo!r} / {version!r}."
+        )
+    tag = f"v{version.removeprefix('v')}"
+    raw_bytes = _download_release_asset_bytes(
+        normalized_repo, tag, "wukong-wheels.txt", timeout=timeout
+    )
+    try:
+        manifest_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DistributionWheelError("Wheel manifest is not valid UTF-8.") from exc
+    return _parse_distribution_wheel_manifest(manifest_text, tag)
+
+
+def download_verified_distribution_wheels(
+    repo: str,
+    version: str,
+    dest_dir: Path,
+    *,
+    timeout: float = _UPGRADE_INDEX_TIMEOUT_SECONDS,
+) -> dict[str, Path]:
+    """Download every wheel listed in ``wukong-wheels.txt``, verify SHA-256, and save locally."""
+    import hashlib
+
+    normalized_repo = _normalize_distribution_repo(repo)
+    if normalized_repo is None or _parse_distribution_version(version) is None:
+        raise DistributionWheelError(
+            f"Invalid distribution release target: {repo!r} / {version!r}."
+        )
+    tag = f"v{version.removeprefix('v')}"
+    manifest = fetch_distribution_wheel_manifest(normalized_repo, version, timeout=timeout)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    local_paths: dict[str, Path] = {}
+    for pkg in ("omnigent", "omnigent-client", "omnigent-ui-sdk"):
+        filename, expected_sha = manifest[pkg]
+        data = _download_release_asset_bytes(normalized_repo, tag, filename, timeout=timeout)
+        actual_sha = hashlib.sha256(data).hexdigest()
+        if actual_sha != expected_sha:
+            raise DistributionWheelError(
+                f"SHA-256 checksum mismatch for {filename} "
+                f"(expected {expected_sha}, got {actual_sha})."
+            )
+        target_path = dest_dir / filename
+        target_path.write_bytes(data)
+        local_paths[pkg] = target_path
+    return local_paths
 
 
 def _run_distribution_release_check(
@@ -2350,11 +2508,7 @@ def _upgrade_failure_message(
     dist_cfg = _distribution_release_config()
     if dist_cfg is not None:
         repo, _ = dist_cfg
-        extra_args = f" -s --{extra_flags}" if extra_flags else ""
-        reinstall_line = (
-            f"    curl -fsSL https://raw.githubusercontent.com/{repo}/main/scripts/install_oss.sh "
-            f"| sh{extra_args}\n"
-        )
+        reinstall_line = f"    {_distribution_recovery_command(repo, extras)}\n"
     else:
         reinstall_line = f"    curl -fsSL https://omnigent.ai/install.sh | sh -s --{extra_flags}\n"
     return (
