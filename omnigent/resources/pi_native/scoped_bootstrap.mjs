@@ -33,7 +33,7 @@ export async function installScopedSdkFromHandoff(sdk, locator, sdkIdentity) {
 }
 
 export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVersion, sdkEntry}) {
-  if(!["1.3.0", "1.5.0"].includes(sdkVersion) || !path.isAbsolute(sdkEntry || "")) {
+  if(!["1.3.0", "1.5.0", "1.6.0"].includes(sdkVersion) || !path.isAbsolute(sdkEntry || "")) {
     connection.close();
     throw new Error("Scoped Pi SDK identity unavailable");
   }

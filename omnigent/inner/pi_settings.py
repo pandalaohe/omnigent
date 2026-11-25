@@ -141,7 +141,7 @@ def ordered_pi_launch(
     if scoped_handoff is not None:
         try:
             sdk_version = json.loads((dist.parent / "package.json").read_text()).get("version")
-            if sdk_version not in ("1.3.0", "1.5.0"):
+            if sdk_version not in ("1.3.0", "1.5.0", "1.6.0"):
                 raise PiSdkLoaderUnavailableError
         except (OSError, ValueError, AttributeError):
             raise PiSdkLoaderUnavailableError from None
