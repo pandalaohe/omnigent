@@ -454,11 +454,11 @@ async def _patch_session(
         if updated.is_error:
             return "error", _refusal(updated), {}
         applied = updated.json() if read_settings else {}
+        if not isinstance(applied, dict):
+            raise ValueError("expected a session object")
     except (httpx.HTTPError, ValueError) as exc:
         detail = str(exc) or type(exc).__name__
         return "error", f"update could not be confirmed: PATCH {path}: {detail}", {}
-    if not isinstance(applied, dict):
-        return "error", "update could not be confirmed: invalid response", {}
     return "updated", None, applied
 
 
@@ -644,7 +644,10 @@ async def execute_session_update(
                 existing = await _find_project(client, name)
             except (httpx.HTTPError, ValueError) as exc:
                 return json.dumps(
-                    {"session_id": session_id, "error": f"sys_session_update: {exc}"}
+                    {
+                        "session_id": session_id,
+                        "error": f"sys_session_update: {str(exc) or type(exc).__name__}",
+                    }
                 )
             if existing is None:
                 return json.dumps(
@@ -662,9 +665,16 @@ async def execute_session_update(
                 project_id, created = await resolve_project_id(client, name, headers=headers)
             except (httpx.HTTPError, ValueError) as exc:
                 return json.dumps(
-                    {"session_id": session_id, "error": f"sys_session_update: {exc}"}
+                    {
+                        "session_id": session_id,
+                        "error": f"sys_session_update: {str(exc) or type(exc).__name__}",
+                    }
                 )
     payload = _session_changes(current, changes, project_id)
+    if settings and project_id is not None:
+        # Preserve explicit filing even when the preflight already shows that project.
+        payload["project_id"] = project_id
+        payload.setdefault("labels", {})[PROJECT_LABEL_KEY] = ""
     payload.update({_SESSION_SETTING_FIELDS[field]: value for field, value in settings.items()})
     if "archived" in payload:
         headers[AGENT_SESSION_HEADER] = source_id

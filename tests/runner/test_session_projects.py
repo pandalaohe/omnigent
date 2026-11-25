@@ -354,6 +354,29 @@ async def test_update_settings_reports_a_snapshot_failure_before_any_patch():
     assert result == {"session_id": SUB_AGENT, "error": "session could not be read: ReadTimeout"}
 
 
+async def test_update_settings_preserves_explicit_filing_and_reports_invalid_patch_reply():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=CHECKED_INFO)
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4})
+        assert json.loads(request.content) == {
+            "model_override": "host-model",
+            "project_id": "",
+            "labels": {session_projects.PROJECT_LABEL_KEY: ""},
+        }
+        return httpx.Response(200, json=[])
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SOURCE, "project": "", "model": "host-model"}, client, SOURCE
+            )
+        )
+    assert f"PATCH /v1/sessions/{SOURCE}" in result["error"]
+    assert "expected a session object" in result["error"]
+
+
 async def test_update_settings_stops_waiting_at_the_patch_deadline(monkeypatch):
     monkeypatch.setattr(session_projects, "_SETTINGS_PATCH_TIMEOUT_S", 0.01, raising=False)
     patches = []

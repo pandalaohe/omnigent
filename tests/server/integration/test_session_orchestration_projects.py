@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes import _session_create_validation
 from omnigent.server.routes import sessions as sessions_module
@@ -798,9 +800,10 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
     ids=["turn-ends", "undone", "turn-ends-dashed-path"],
 )
 async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
-    auth_client, peers, db_uri, monkeypatch, undone, via
+    auth_app, auth_client, peers, db_uri, monkeypatch, undone, via
 ):
     source, _, _ = peers
+    session_id = source["id"]
     store = SqlAlchemyConversationStore(db_uri)
     torn_down: list[str] = []
 
@@ -808,53 +811,51 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
         torn_down.append(session_id)
         return []
 
-    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
-    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
-    monkeypatch.setattr(sessions_module, "_best_effort_stop", record_teardown)
-    # The wait has seen the turn running twice, so it is looping rather than
-    # merely slow to start.
-    seen_running_twice = asyncio.Event()
-    running_reads = 0
-    real_status = orchestration._session_status_from_cache
+    wait_started = asyncio.Event()
+    wait_revisions: list[tuple[str, int]] = []
+    real_wait = orchestration._wait_for_archive_idle
 
-    def counted_status(session_id: str, *args):
-        nonlocal running_reads
-        status = real_status(session_id, *args)
-        if session_id == source["id"] and status == "running":
-            running_reads += 1
-            if running_reads >= 2:
-                seen_running_twice.set()
-        return status
+    async def record_wait(target: str, revision: int, conversation_store) -> None:
+        wait_revisions.append((target, revision))
+        wait_started.set()
+        await real_wait(target, revision, conversation_store)
 
-    monkeypatch.setattr(orchestration, "_session_status_from_cache", counted_status)
-    # The tool call happens mid-turn.
-    monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
-    if via == "tool":
-        result = await _project_tool(
-            auth_client, source, "sys_session_update", session_id=source["id"], archived=True
-        )
-        assert result["status"] == "updated" and result["archived"] is True, result
-    else:
-        # The path may spell the id with dashes; the wait and the pending stop
-        # still key it by the canonical id.
-        response = await auth_client.patch(
-            f"/v1/sessions/{uuid.UUID(source['id'])}",
-            headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
-            json={"archived": True},
-        )
-        assert response.status_code == 200, response.text
-    assert store.get_conversation(source["id"]).archived is True
-
-    await asyncio.wait_for(seen_running_twice.wait(), 5)
-    assert torn_down == [] and source["id"] in orchestration._pending_archive_stops
-    if undone:
-        # An Undo on another replica only clears the flag; the wait ends without
-        # the turn ending.
-        store.update_conversation(source["id"], archived=False)
-    else:
-        sessions_common._session_status_cache[source["id"]] = "idle"
-    await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
-    assert torn_down == ([] if undone else [source["id"]])
+    flags = auth_app.state.feature_flags.enabled_features
+    monkeypatch.setattr(
+        auth_app.state, "feature_flags", FeatureFlags(flags | {Feature.SESSION_PEER_MESSAGING})
+    )
+    monkeypatch.setitem(sessions_common._session_status_cache, session_id, "running")
+    with (
+        patch.object(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0),
+        patch.object(sessions_module, "_ARCHIVE_IDLE_POLL_S", 0.01),
+        patch.object(sessions_module, "_ARCHIVE_IDLE_SETTLE_S", 0.0),
+        patch.object(sessions_module, "_best_effort_stop", record_teardown),
+        patch.object(sessions_module, "_wait_for_archive_idle", record_wait),
+        patch.object(orchestration, "_wait_for_archive_idle", record_wait),
+    ):
+        if via == "tool":
+            result = await _project_tool(
+                auth_client, source, "sys_session_update", session_id=session_id, archived=True
+            )
+            assert result.get("status") == "updated" and result["archived"] is True, result
+        else:
+            response = await auth_client.patch(
+                f"/v1/sessions/{uuid.UUID(session_id)}",
+                headers={ORCHESTRATION_SOURCE_HEADER: session_id},
+                json={"archived": True},
+            )
+            assert response.status_code == 200, response.text
+        row = store.get_conversation(session_id)
+        assert row is not None and orchestration._archive_idle_deferred(row)
+        await asyncio.wait_for(wait_started.wait(), 5)
+        assert wait_revisions == [(session_id, row.archive_revision)]
+        assert torn_down == []
+        if undone:
+            store.update_conversation(session_id, archived=False)
+        else:
+            sessions_common._session_status_cache[session_id] = "idle"
+        await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
+        assert torn_down == ([] if undone else [session_id])
 
 
 @_ONE_ENVIRONMENT
