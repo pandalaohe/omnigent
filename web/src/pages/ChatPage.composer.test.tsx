@@ -7701,18 +7701,17 @@ describe("Composer file-attachment focus", () => {
     render(<Composer {...composerProps()} />);
     const input = textarea();
     let top = 12;
-    let width = 400;
     let contentHeight = 800;
     Object.defineProperties(input, {
       offsetTop: { get: () => top },
       offsetLeft: { value: 16 },
-      offsetWidth: { get: () => width },
       offsetHeight: { value: 180 },
       clientHeight: { value: 180 },
       scrollHeight: { get: () => contentHeight },
     });
     input.style.lineHeight = "20px";
     input.style.padding = "0";
+    input.style.width = "400px";
     const image = new File(["image"], "example.png", { type: "image/png" });
     fireEvent.change(fileInput(), { target: { files: [image] } });
     const overlay = screen.getByTestId("composer-highlight-overlay");
@@ -7734,7 +7733,7 @@ describe("Composer file-attachment focus", () => {
     expect.soft(overlay.style.top).toBe("18px");
     expect.soft(overlay.scrollTop).toBe(640);
 
-    width = 320;
+    input.style.width = "320px";
     contentHeight = 880;
     input.scrollTop = 700;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
@@ -7775,7 +7774,6 @@ describe("Composer file-attachment focus", () => {
     render(<Composer {...composerProps()} ref={ref} />);
     const input = textarea();
     let top = 12;
-    let width = 400;
     let contentHeight = 800;
     const currentBoxHeight = () => {
       const parsed = Number.parseFloat(input.style.height);
@@ -7784,13 +7782,13 @@ describe("Composer file-attachment focus", () => {
     Object.defineProperties(input, {
       offsetTop: { configurable: true, get: () => top },
       offsetLeft: { configurable: true, value: 16 },
-      offsetWidth: { configurable: true, get: () => width },
       offsetHeight: { configurable: true, get: currentBoxHeight },
       clientHeight: { configurable: true, get: currentBoxHeight },
       scrollHeight: { configurable: true, get: () => contentHeight },
     });
     input.style.lineHeight = "20px";
     input.style.padding = "0";
+    input.style.width = "400px";
 
     // Add a reply quote, then attach an image in the tail textarea so the
     // attachment backdrop is active before removing the quote toggles maxRows.
@@ -7818,7 +7816,7 @@ describe("Composer file-attachment focus", () => {
 
     // Resize that keeps the height capped while shrinking scrollHeight must clamp
     // textarea scrollTop before the mirror copies it.
-    width = 440;
+    input.style.width = "440px";
     contentHeight = 500;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
     expect.soft(input.style.height).toBe("200px");
@@ -7828,7 +7826,7 @@ describe("Composer file-attachment focus", () => {
     expect.soft(overlay.scrollTop).toBe(300);
 
     // Resize below the height cap must re-measure height before the mirror copies it.
-    width = 480;
+    input.style.width = "480px";
     contentHeight = 140;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
     expect(input.style.height).toBe("140px");
@@ -7846,7 +7844,6 @@ describe("Composer file-attachment focus", () => {
     Object.defineProperties(input, {
       offsetTop: { configurable: true, get: () => top },
       offsetLeft: { configurable: true, value: 16 },
-      offsetWidth: { configurable: true, value: 400 },
       offsetHeight: { configurable: true, value: 40 },
     });
 

@@ -120,6 +120,39 @@ describe("ComposerTokenBackdrop", () => {
     expect(node.className).not.toMatch(/\bpx-3\b|\bpt-3\b|\bpb-1\b/);
   });
 
+  it("keeps the textarea's fractional width so attachment text wraps at the same boundary", () => {
+    const value = "[image 1] 在最后一行输入opuslu";
+    const image = img();
+    assignLabels([image], []);
+    function AlignedBackdrop() {
+      const overlayRef = useRef<HTMLDivElement>(null);
+      const textareaRef = useRef<HTMLTextAreaElement>(null);
+      useComposerMirrorAlignment(overlayRef, textareaRef, true);
+      return (
+        <>
+          <ComposerTokenBackdrop
+            ref={overlayRef}
+            value={value}
+            files={[image]}
+            command={null}
+            activeIndex={null}
+          />
+          <textarea
+            ref={(node) => {
+              textareaRef.current = node;
+              if (node) Object.defineProperty(node, "offsetWidth", { value: 311 });
+            }}
+            defaultValue={value}
+            style={{ width: "310.5px" }}
+          />
+        </>
+      );
+    }
+
+    const { getByTestId } = render(<AlignedBackdrop />);
+    expect(getByTestId("composer-highlight-overlay").style.width).toBe("310.5px");
+  });
+
   it("aligns on oscillating anchor reads without triggering a React update loop", () => {
     const notifyResize = new Set<() => void>();
     vi.stubGlobal(
@@ -142,7 +175,7 @@ describe("ComposerTokenBackdrop", () => {
       vi.unstubAllGlobals();
     });
 
-    const widths = [300, 340];
+    const lefts = [10, 11];
     let reads = 0;
     let top = 20;
 
@@ -155,12 +188,11 @@ describe("ComposerTokenBackdrop", () => {
         if (!el) return;
         Object.defineProperties(el, {
           offsetTop: { configurable: true, get: () => top },
-          offsetLeft: { configurable: true, value: 10 },
-          offsetHeight: { configurable: true, value: 60 },
-          offsetWidth: {
+          offsetLeft: {
             configurable: true,
-            get: () => widths[reads++ % widths.length],
+            get: () => lefts[reads++ % lefts.length],
           },
+          offsetHeight: { configurable: true, value: 60 },
         });
       };
       // Mount backdrop before textarea, matching ChatComposer's DOM order.
@@ -187,11 +219,10 @@ describe("ComposerTokenBackdrop", () => {
       '[data-testid="composer-highlight-overlay"]',
     ) as HTMLElement;
     expect(node.style.top).toBe("20px");
-    expect(node.style.left).toBe("10px");
     expect(node.style.height).toBe("60px");
-    expect(["300px", "340px"]).toContain(node.style.width);
+    expect(["10px", "11px"]).toContain(node.style.left);
 
-    // Repeated rerenders and resize notifications with alternating widths must
+    // Repeated rerenders and resize notifications with alternating positions must
     // never loop or drop a synchronous position update.
     expect(() => {
       for (const value of ["a", "b", "c", "d", "e", "hello [file 1]"]) {
@@ -209,10 +240,10 @@ describe("ComposerTokenBackdrop", () => {
       </StrictMode>,
     );
     expect(node.style.top).toBe("48px");
-    expect(["300px", "340px"]).toContain(node.style.width);
+    expect(["10px", "11px"]).toContain(node.style.left);
 
-    const beforeResizeWidth = node.style.width;
+    const beforeResizeLeft = node.style.left;
     act(() => notifyResize.forEach((notify) => notify()));
-    expect(node.style.width).toBe(beforeResizeWidth === "300px" ? "340px" : "300px");
+    expect(node.style.left).toBe(beforeResizeLeft === "10px" ? "11px" : "10px");
   });
 });
