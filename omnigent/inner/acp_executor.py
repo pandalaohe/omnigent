@@ -51,6 +51,7 @@ import copy
 import json
 import logging
 import math
+import operator
 import os
 import secrets
 import shlex
@@ -161,7 +162,15 @@ _AGY_ACP_COMMAND_FIELDS = {
     "RunPersistent": bool,
     "RequestedTerminalID": str,
 }
-_AGY_ACP_WRITE_FIELDS = frozenset({"Path", "TargetFile", "Content", "Overwrite"})
+_AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
+_AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
+# toolSummary is display metadata shared by agy tools.
+_AGY_ACP_READ_CONFLICT_FIELDS = (
+    (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"})
+    | _AGY_ACP_WRITE_TARGETS
+    | _AGY_ACP_WRITE_FIELDS
+    | {"Cwd", "Edits", "Target", "Replacement"}
+)
 
 # session/update.update.sessionUpdate discriminator values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
@@ -328,6 +337,21 @@ class _AcpRequestError(Exception):
 class _AcpPermissionTrace:
     tier_verdict: str = "unreported"
     once_offer: str = "unchecked"
+
+
+def _same_json_value(left: object, right: object) -> bool:
+    """Compare ACP values without treating booleans and numbers as interchangeable."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_json_value(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _looks_like_missing_file(message: str) -> bool:
@@ -1393,10 +1417,13 @@ class AcpExecutor(Executor):
         pending = self._permission_calls.get(call_id)
         if pending is None:
             return
+        same_value = (
+            _same_json_value if is_antigravity_acp_command(self._config.command) else operator.eq
+        )
         changes = {
             key: update[key]
             for key in ("kind", "name", "title", "rawInput")
-            if update.get(key) is not None and update[key] != pending.get(key)
+            if update.get(key) is not None and not same_value(update[key], pending.get(key))
         }
         if changes:
             self._permission_calls[call_id] = {**pending, **copy.deepcopy(changes)}
@@ -1417,14 +1444,16 @@ class AcpExecutor(Executor):
         if observed is None or call_id in self._answered_permission_calls:
             return None
         self._answered_permission_calls.add(call_id)
+        is_agy = is_antigravity_acp_command(self._config.command)
+        same_value = _same_json_value if is_agy else operator.eq
         for key in ("kind", "name", "title", "rawInput"):
-            if call.get(key) is not None and call[key] != observed.get(key):
+            if call.get(key) is not None and not same_value(call[key], observed.get(key)):
                 return None
         arguments = observed.get("rawInput")
         if not isinstance(arguments, dict):
             return None
         kind = observed.get("kind")
-        if is_antigravity_acp_command(self._config.command):
+        if is_agy:
             agy_tool = self._validate_agy_permission_tool(kind, arguments)
             if agy_tool is None:
                 return None
@@ -1444,8 +1473,10 @@ class AcpExecutor(Executor):
     def _validate_agy_permission_tool(
         kind: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
-        """Bind only a complete agy argument shape before consulting policy."""
+        """Reject mixed and malformed known agy shapes before consulting policy."""
         keys = arguments.keys()
+        if (kind == "read" or "AbsolutePath" in keys) and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
+            return None
         if "CommandLine" in keys:
             command = arguments["CommandLine"]
             if (
@@ -1458,11 +1489,18 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "run_command", arguments
-        if keys & _AGY_ACP_WRITE_FIELDS:
+        write_targets = keys & _AGY_ACP_WRITE_TARGETS
+        if len(write_targets) > 1:
+            return None
+        if (
+            (kind == "edit" and "TargetFile" in keys)
+            or (write_targets and keys & _AGY_ACP_WRITE_FIELDS)
+            or keys >= _AGY_ACP_WRITE_FIELDS
+        ):
             target_field = "Path" if "Path" in keys else "TargetFile"
             target = arguments.get(target_field)
             if (
-                keys - {target_field, "Content", "Overwrite"}
+                keys - (_AGY_ACP_WRITE_FIELDS | {target_field})
                 or not isinstance(target, str)
                 or not target
                 or not isinstance(arguments.get("Content"), str)
@@ -1470,15 +1508,9 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "write_to_file", {**arguments, "TargetFile": target}
-        path = arguments.get("AbsolutePath")
-        if (
-            kind == "read"
-            and isinstance(path, str)
-            and path
-            and not keys & {"Cwd", "WaitMsBeforeAsync", "RunPersistent", "RequestedTerminalID"}
-        ):
+        if kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
             return "view_file", arguments
-        return None
+        return "unknown", arguments
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
         """Label the agent's options for a choice card, or ``None`` if unusable.

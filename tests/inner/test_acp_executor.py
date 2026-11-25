@@ -1416,7 +1416,7 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
         ("command", "other", "run_command", True),
         ("protected-write", "other", "write_to_file", False),
         ("workspace-write", "edit", "write_to_file", True),
-        ("unknown", "other", None, False),
+        ("unknown", "other", "unknown", False),
         ("ambiguous", "other", None, False),
         ("opencode", "other", "unknown", False),
     ],
@@ -1571,7 +1571,7 @@ async def test_managed_agy_permission_rejects_mixed_shapes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tier", ["auto", "ask", "accept-edits"])
+@pytest.mark.parametrize("tier", ["auto", "ask", "accept-edits", "plan"])
 @pytest.mark.parametrize(
     ("kind", "arguments"),
     [
@@ -1653,6 +1653,113 @@ async def test_managed_non_agy_permission_keeps_unknown_tool_ask(
     params = _pending_acp_permission(ex, {"Opaque": True}, "other")
     assert await ex._decide_permission(params) == (True, "once")
     ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {},
+        {"CommandLine": "omni --version"},
+        {"WaitMsBeforeAsync": 10000},
+        {"Path": "other.txt", "Content": "abc"},
+        {"TargetFile": "other.txt", "Overwrite": False},
+        {"Edits": []},
+        {"Target": "old", "Replacement": "new"},
+    ],
+    ids=[
+        "pure-read",
+        "command",
+        "wait",
+        "path-and-content",
+        "target-and-overwrite",
+        "edits",
+        "replace",
+    ],
+)
+async def test_managed_agy_permission_rejects_mixed_reads_in_plan(
+    extra_fields, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor("plan")
+    params = _pending_acp_permission(
+        ex, {"AbsolutePath": "note.txt", "toolSummary": "Read note", **extra_fields}, "read"
+    )
+    assert await ex._decide_permission(params) == (
+        (False, None) if extra_fields else (True, "once")
+    )
+    assert ex._policy_evaluator.await_count == (0 if extra_fields else 1)
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [{"Opaque": True}, {"Path": "note.txt", "Action": "list"}])
+@pytest.mark.parametrize(
+    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", False), ("plan", False)]
+)
+async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
+    tier, asks, arguments, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor(tier)
+    params = _pending_acp_permission(ex, arguments, "other")
+    assert await ex._decide_permission(params) == ((True, "once") if asks else (False, None))
+    policy_call = ex._policy_evaluator.await_args
+    assert policy_call is not None
+    assert policy_call.args[1]["name"] == "unknown"
+    assert ex._elicitation_handler.await_count == (1 if asks else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["permission-request", "pending-update"])
+@pytest.mark.parametrize(
+    ("kind", "pending", "changed"),
+    [
+        (
+            "execute",
+            {"CommandLine": "omni --version", "WaitMsBeforeAsync": 1},
+            {"CommandLine": "omni --version", "WaitMsBeforeAsync": True},
+        ),
+        (
+            "execute",
+            {"CommandLine": "omni --version", "WaitMsBeforeAsync": 1},
+            {"CommandLine": "omni --version", "WaitMsBeforeAsync": 1.0},
+        ),
+        (
+            "edit",
+            {"Path": "note.txt", "Content": "abc", "Overwrite": True},
+            {"Path": "note.txt", "Content": "abc", "Overwrite": 1},
+        ),
+        (
+            "read",
+            {"AbsolutePath": "note.txt", "Metadata": [{"offset": False}]},
+            {"AbsolutePath": "note.txt", "Metadata": [{"offset": 0.0}]},
+        ),
+    ],
+    ids=["int-to-bool", "int-to-float", "bool-to-int", "nested-bool-to-float"],
+)
+async def test_managed_agy_permission_rejects_type_only_input_changes(
+    source, kind, pending, changed, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor("auto")
+    params = _pending_acp_permission(ex, pending, kind)
+    if source == "permission-request":
+        call = params["toolCall"]
+        assert isinstance(call, dict)
+        params["toolCall"] = {**call, "rawInput": changed}
+    else:
+        evaluate = ex._policy_evaluator.side_effect
+
+        async def update_during_policy(phase, data):
+            ex._note_permission_update(
+                "s1",
+                {"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "rawInput": changed},
+            )
+            return await evaluate(phase, data)
+
+        ex._policy_evaluator.side_effect = update_during_policy
+
+    assert await ex._decide_permission(params) == (False, None)
+    assert ex._policy_evaluator.await_count == (1 if source == "pending-update" else 0)
+    ex._elicitation_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
