@@ -7678,6 +7678,78 @@ describe("Composer file-attachment focus", () => {
     expect(ta.getAttribute("data-has-draft")).toBe("true");
   });
 
+  it("keeps the attachment backdrop aligned on input and resize at the height cap", () => {
+    const notifyTextareaResize = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends ResizeObserver {
+        constructor(callback: ResizeObserverCallback) {
+          super(callback);
+          const notify = () => callback([], this);
+          this.observe = (element) => {
+            if (element instanceof HTMLTextAreaElement) notifyTextareaResize.add(notify);
+          };
+          this.disconnect = () => {
+            notifyTextareaResize.delete(notify);
+          };
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    render(<Composer {...composerProps()} />);
+    const input = textarea();
+    let top = 12;
+    let width = 400;
+    let contentHeight = 800;
+    Object.defineProperties(input, {
+      offsetTop: { get: () => top },
+      offsetLeft: { value: 16 },
+      offsetWidth: { get: () => width },
+      offsetHeight: { value: 180 },
+      clientHeight: { value: 180 },
+      scrollHeight: { get: () => contentHeight },
+    });
+    input.style.lineHeight = "20px";
+    input.style.padding = "0";
+    const image = new File(["image"], "example.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [image] } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.style.top).toBe("12px");
+    expect(overlay.style.left).toBe("16px");
+    expect(overlay.style.width).toBe("400px");
+    const draft = `${input.value}\n${"Draft line\n".repeat(38)}text`;
+    fireEvent.input(input, { target: { value: draft } });
+    input.scrollTop = 620;
+    fireEvent.scroll(input);
+    expect(overlay.scrollTop).toBe(620);
+
+    const value = `${draft}\nNext line`;
+    contentHeight = 820;
+    input.scrollTop = 640;
+    top = 18;
+    fireEvent.input(input, { target: { value } });
+    expect.soft(overlay.textContent).toBe(value);
+    expect.soft(overlay.style.top).toBe("18px");
+    expect.soft(overlay.scrollTop).toBe(640);
+
+    width = 320;
+    contentHeight = 880;
+    input.scrollTop = 700;
+    act(() => notifyTextareaResize.forEach((notify) => notify()));
+    expect(overlay.style.width).toBe("320px");
+    expect(overlay.style.height).toBe("180px");
+    expect(overlay.scrollTop).toBe(700);
+
+    fireEvent.compositionStart(input);
+    input.setSelectionRange(value.length, value.length);
+    input.scrollTop = 0;
+    fireEvent.compositionEnd(input, { data: "文" });
+    expect(input.scrollTop).toBe(700);
+    expect(overlay.scrollTop).toBe(700);
+  });
+
   it("does not focus the textarea when the attachment is rejected", () => {
     // A file over the limit is dropped by validateAttachments, so no file is
     // added — and with nothing attached there's no reason to yank focus back.

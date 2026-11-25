@@ -4039,8 +4039,7 @@ function ComposerImpl(
   // One mirror paints both the slash-command tint and inline mention pills.
   const mentionTokensShown =
     draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
-  const mirrorActive = composerIsCommand || mentionTokensShown;
-  useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
+  const backdropActive = composerIsCommand || mentionTokensShown || hasTint(draft.text, files);
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
   const showInterruptButton =
     isWorking &&
@@ -4626,6 +4625,7 @@ function ComposerImpl(
     onGrowthRef.current?.();
   }, []);
   useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
+  useComposerMirrorAlignment(backdropRef, tailTextareaRef, backdropActive);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -5161,7 +5161,6 @@ function ComposerImpl(
 
   const activeTokenIndex = tailCaret === null ? null : tokenAt(draft.text, tailCaret, files);
   const commandToken = splitSlashCommand(draft.text, slashCommandNames)?.token ?? null;
-  const backdropActive = composerIsCommand || mentionTokensShown || hasTint(draft.text, files);
 
   const focusToken = (index: number) => {
     const label = files[index] ? labelOf(files[index]!) : undefined;
@@ -5377,10 +5376,6 @@ function ComposerImpl(
             dismissMention();
           },
           onPaste,
-          onScroll: (e) => {
-            // Keep the overlay's scroll position locked to the textarea's.
-            if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-          },
           "aria-label": "Message the agent",
           "aria-keyshortcuts": nextFromSelected === null ? undefined : permissionCycleShortcut.aria,
           // Phones have no Esc key, so their placeholders drop the key hints.
@@ -5532,11 +5527,6 @@ function ComposerImpl(
                   <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
                 </div>
               )}
-              {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the command or skill token we hide the textarea's own glyphs
-            (text-transparent, caret kept visible) and render an aligned mirror
-            behind it, pinned to the textarea's box. Same typography so wrapping
-            matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
           inputBackdrop: backdropActive ? (
@@ -5547,7 +5537,6 @@ function ComposerImpl(
               files={files}
               command={commandToken}
               activeIndex={hoveredFileIndex ?? activeTokenIndex}
-              anchor={tailTextareaRef}
             />
           ) : undefined,
           attachments: (
