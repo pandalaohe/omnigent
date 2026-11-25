@@ -1409,6 +1409,95 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "kind", "expected_tool", "allowed"),
+    [
+        ("command", None, "run_command", True),
+        ("command", "other", "run_command", True),
+        ("protected-write", "other", "write_to_file", False),
+        ("workspace-write", "edit", "write_to_file", True),
+        ("unknown", "other", "unknown", False),
+        ("ambiguous", "other", "unknown", False),
+        ("opencode", "other", "unknown", False),
+    ],
+)
+async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
+    case: str, kind: str | None, expected_tool: str, allowed: bool
+) -> None:
+    from omnigent.permission_tiers import Verdict, adapt_tool_call, decide_tier, load_rules
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import windows_host
+
+    command = "omni --version"
+    command_args = {
+        "CommandLine": command,
+        "WaitMsBeforeAsync": 10000,
+        "toolSummary": "Show the installed version",
+    }
+    path = r"C:\Windows\System32\drivers\etc\hosts"
+    if case == "workspace-write":
+        path = r"C:\work\project\tmp\fixture.txt"
+    write_args = {"Path": path, "Content": "fixture\n", "Overwrite": True}
+    title, arguments = {
+        "command": (command, command_args),
+        "protected-write": (f"File {path}", write_args),
+        "workspace-write": ("File tmp/fixture.txt", write_args),
+        "unknown": (command, {"toolSummary": "Show the installed version"}),
+        "ambiguous": (command, {**command_args, **write_args}),
+        "opencode": (command, command_args),
+    }[case]
+    launch = "opencode acp" if case == "opencode" else "agy.exe acp --stdio"
+    ex = AcpExecutor(AcpAgentConfig(command=launch, host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock()
+    ex._send = AsyncMock()
+    decisions = []
+
+    async def evaluate(_phase, data):
+        intent = adapt_tool_call(data["name"], data["arguments"], windows_host())
+        decision = decide_tier("auto", intent, load_rules())
+        decisions.append((data["name"], decision))
+        if decision.action == Verdict.DENY:
+            return PolicyVerdictPayload(action="POLICY_ACTION_DENY")
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": decision.action.value.lower()},
+        )
+
+    ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+    call = {"toolCallId": "tool-1", "title": title, "rawInput": arguments}
+    if kind is not None:
+        call["kind"] = kind
+    ex._note_permission_update("s1", {"sessionUpdate": "tool_call", "status": "pending", **call})
+    await ex._respond_to_agent_request(
+        {
+            "id": 2,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": call,
+                "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+            },
+        }
+    )
+
+    sent = ex._send.await_args
+    assert sent is not None
+    reply = sent.args[0]
+    if allowed:
+        assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
+    else:
+        assert reply["error"]["code"] == -32000
+    ((tool_name, decision),) = decisions
+    assert tool_name == expected_tool
+    assert decision.action == (Verdict.ALLOW if allowed else Verdict.DENY)
+    if case == "protected-write":
+        assert decision.rule_id == "protected-path"
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_ask_defers_to_elicitation() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 

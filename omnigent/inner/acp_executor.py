@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.acp_cli_harnesses import is_antigravity_acp_command
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
@@ -1422,6 +1423,26 @@ class AcpExecutor(Executor):
         elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
+        elif is_antigravity_acp_command(self._config.command):
+            # agy can report a generic kind. Match its argument schemas only
+            # after binding the request to the pending event above.
+            if isinstance(arguments.get("CommandLine"), str) and arguments.keys() <= {
+                "CommandLine",
+                "Cwd",
+                "RequestedTerminalID",
+                "RunPersistent",
+                "WaitMsBeforeAsync",
+                "toolSummary",
+            }:
+                name = "run_command"
+            elif (
+                arguments.keys() <= {"Path", "Content", "Overwrite"}
+                and isinstance(arguments.get("Path"), str)
+                and isinstance(arguments.get("Content"), str)
+                and isinstance(arguments.get("Overwrite", False), bool)
+            ):
+                name = "write_to_file"
+                arguments = {**arguments, "TargetFile": arguments["Path"]}
         return {"call_id": call_id, "name": name, "arguments": arguments}
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
