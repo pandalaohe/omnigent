@@ -1589,6 +1589,8 @@ async def test_managed_agy_permission_rejects_mixed_shapes(
         (None, {"CommandLine": "omni --version", "toolSummary": []}),
         (None, {"CommandLine": "omni --version", "RunPersistent": 0}),
         (None, {"CommandLine": "omni --version", "RequestedTerminalID": False}),
+        (None, {"CommandLine": "omni --version", "IsDaemon": 0}),
+        (None, {"CommandLine": "omni --version", "NotificationTimeoutSeconds": False}),
         ("execute", {"CommandLine": "omni --version", "Cwd": r"C:\work\project"}),
         ("edit", {"TargetFile": False, "Content": "abc"}),
         (None, {"Path": 1, "Content": "abc"}),
@@ -1605,6 +1607,8 @@ async def test_managed_agy_permission_rejects_mixed_shapes(
         "list-summary",
         "number-persistent",
         "boolean-terminal-id",
+        "number-daemon",
+        "boolean-notification-timeout",
         "unrecognized-command-key",
         "boolean-target-file",
         "number-path",
@@ -1620,6 +1624,40 @@ async def test_managed_agy_permission_rejects_malformed_arguments_before_tier(
     params = _pending_acp_permission(ex, arguments, kind)
     assert await ex._decide_permission(params) == (False, None)
     ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier", "command", "is_daemon"),
+    [
+        pytest.param(
+            "auto", r"Remove-Item -LiteralPath:C:\Windows\report", False, id="protected-path"
+        ),
+        pytest.param("auto", "omni --version", True, id="daemon"),
+        pytest.param(
+            "ask", r"Set-Content C:\work\control\settings.json test", True, id="daemon-ask"
+        ),
+        pytest.param(
+            "accept-edits",
+            r"Set-Content C:\work\control\settings.json test",
+            True,
+            id="daemon-accept-edits",
+        ),
+    ],
+)
+async def test_managed_agy_shell_options_keep_permission_denials(
+    tier, command, is_daemon, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor(tier)
+    params = _pending_acp_permission(
+        ex,
+        {"CommandLine": command, "IsDaemon": is_daemon, "NotificationTimeoutSeconds": 700},
+        "execute",
+    )
+    assert await ex._decide_permission(params) == (False, None)
+    assert ex._permission_calls == {}
+    assert ex._policy_evaluator.await_count == (0 if is_daemon else 1)
     ex._elicitation_handler.assert_not_awaited()
 
 
@@ -1764,6 +1802,16 @@ async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
             {"CommandLine": "omni --version", "WaitMsBeforeAsync": 1.0},
         ),
         (
+            "execute",
+            {"CommandLine": "omni --version", "IsDaemon": False},
+            {"CommandLine": "omni --version", "IsDaemon": 0},
+        ),
+        (
+            "execute",
+            {"CommandLine": "omni --version", "NotificationTimeoutSeconds": 700},
+            {"CommandLine": "omni --version", "NotificationTimeoutSeconds": 700.0},
+        ),
+        (
             "edit",
             {"Path": "note.txt", "Content": "abc", "Overwrite": True},
             {"Path": "note.txt", "Content": "abc", "Overwrite": 1},
@@ -1774,7 +1822,14 @@ async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
             {"AbsolutePath": "note.txt", "Metadata": [{"offset": 0.0}]},
         ),
     ],
-    ids=["int-to-bool", "int-to-float", "bool-to-int", "nested-bool-to-float"],
+    ids=[
+        "int-to-bool",
+        "int-to-float",
+        "daemon-bool-to-int",
+        "notification-timeout-int-to-float",
+        "bool-to-int",
+        "nested-bool-to-float",
+    ],
 )
 async def test_managed_agy_permission_rejects_type_only_input_changes(
     source, kind, pending, changed, windows_acp_permission_executor
@@ -1816,16 +1871,18 @@ async def _observe_acp_update(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tier", "include_request_metadata"),
+    ("tier", "include_request_metadata", "long_command"),
     [
-        pytest.param("auto", True, id="auto"),
-        pytest.param("ask", True, id="ask"),
-        pytest.param("auto", False, id="without-request-kind-and-title"),
+        pytest.param("auto", True, False, id="auto"),
+        pytest.param("ask", True, False, id="ask"),
+        pytest.param("auto", False, False, id="without-request-kind-and-title"),
+        pytest.param("auto", True, True, id="long-command"),
     ],
 )
 async def test_managed_agy_permission_binds_pending_update_after_in_progress_start(
     tier,
     include_request_metadata,
+    long_command,
     windows_acp_permission_executor,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1835,15 +1892,25 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
     ex._send = AsyncMock()
     ex._elicitation_choice_handler = AsyncMock(return_value="Allow once")
 
-    raw_input: dict[str, object] = {
-        "CommandLine": "omni --version",
-        "WaitMsBeforeAsync": 5000,
-        "toolSummary": "Check tool version",
-    }
+    command = (
+        "Start-Sleep -Seconds 615; Write-Output 'OMNIGENT_LONG_TOOL_OK 615s'"
+        if long_command
+        else "omni --version"
+    )
+    raw_input: dict[str, object] = {"CommandLine": command}
+    if long_command:
+        raw_input.update(
+            IsDaemon=False,
+            NotificationTimeoutSeconds=700,
+            WaitMsBeforeAsync=10000,
+            toolSummary="Wait and print a marker",
+        )
+    else:
+        raw_input.update(WaitMsBeforeAsync=5000, toolSummary="Check tool version")
     base_call: dict[str, object] = {
         "toolCallId": "call-1",
         "kind": "execute",
-        "title": "omni --version",
+        "title": command,
         "rawInput": raw_input,
     }
     options = [
@@ -1887,7 +1954,7 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
     sent = ex._send.await_args
     assert sent is not None
     reply = sent.args[0]
-    assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "allow"}}
+    assert reply.get("result") == {"outcome": {"outcome": "selected", "optionId": "allow"}}, reply
     policy_call = ex._policy_evaluator.await_args
     assert policy_call is not None
     assert policy_call.args[1]["name"] == "run_command"
@@ -1907,7 +1974,7 @@ async def test_managed_agy_permission_binds_pending_update_after_in_progress_sta
     else:
         ex._elicitation_choice_handler.assert_awaited_once_with(
             "run_command",
-            {**raw_input, "command": "omni --version"},
+            {**raw_input, "command": command},
             ["Allow once", "Reject"],
             "Allow once",
             False,
