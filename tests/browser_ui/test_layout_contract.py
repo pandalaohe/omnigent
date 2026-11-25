@@ -41,6 +41,7 @@ _SETTINGS = {
     ),
     "sharing": ("Session sharing", "Sharing mode"),
     "shortcuts": ("Keyboard shortcuts", "Show key bar on this page"),
+    "system": ("System", "Usage telemetry"),
     "updates": ("Updates", "Update settings are unavailable."),
 }
 
@@ -170,6 +171,7 @@ def test_settings_layout(
             "enabled_connections": ["mcp", "github"],
             "api_keys_available": True,
             "sibling_sessions": True,
+            "telemetry": {"enabled": False, "locked": False, "source": "default"},
             "features": {},
         },
     )
