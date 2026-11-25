@@ -9,6 +9,7 @@ import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { writePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import * as filesApi from "@/lib/filesApi";
 import { ATTACHMENT_UPLOAD_FAILED } from "@/lib/blocks";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -140,6 +141,36 @@ describe("undelivered startup messages", () => {
       within(notice).getByRole("button", { name: "Copy message to new session" }),
     ).toBeEnabled();
   });
+});
+
+it("updates the grid chat when hiding messages from either session delivery path", () => {
+  const messages = [
+    "Human prompt",
+    "[Message from session s_src]\nLive delivery",
+    `[Peer message from session ${"a".repeat(32)} msg=${"b".repeat(32)} "Reviewer" (Codex) ref=review 2]\n\nPersisted delivery`,
+  ];
+  conversationRegistry.acquire(childId).setState({
+    sessionStatus: "idle",
+    blocks: itemsToBlocks(
+      messages.map((text, index) => ({
+        id: `sent-${index}`,
+        response_id: `turn-${index}`,
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text }],
+      })),
+    ),
+  });
+  writePeerSessionMessageDisplay("show");
+  renderPane(<SideChatPane childId={childId} fullSession readOnly />);
+  expect(screen.getByText("Live delivery")).toBeInTheDocument();
+  expect(screen.getByText("Persisted delivery")).toBeInTheDocument();
+
+  act(() => writePeerSessionMessageDisplay("hide"));
+  expect(screen.getByText("Human prompt")).toBeInTheDocument();
+  expect(screen.queryByText("Live delivery")).toBeNull();
+  expect(screen.queryByText("Persisted delivery")).toBeNull();
 });
 
 describe("editing a sent side-chat message", () => {

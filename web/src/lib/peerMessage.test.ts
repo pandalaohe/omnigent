@@ -33,8 +33,12 @@ function header(rest: string, tail = REV4_TAIL): string {
   );
 }
 
-function currentEnvelope(rest: string, body = "Can you check the deploy status?"): string {
-  return `[Peer message from session ${SENDER_ID} msg=${PEER_ID} ${rest} ref=${REF}]\n\n${body}`;
+function currentEnvelope(
+  rest: string,
+  body = "Can you check the deploy status?",
+  ref = REF,
+): string {
+  return `[Peer message from session ${SENDER_ID} msg=${PEER_ID} ${rest} ref=${ref}]\n\n${body}`;
 }
 
 describe("parsePeerMessage", () => {
@@ -75,6 +79,14 @@ describe("parsePeerMessage", () => {
     );
     expect(parsed?.body).toBe("First paragraph.\n\nSecond paragraph.");
   });
+
+  it.each(["review 2", " review 2 ", "review [2]\nfollow-up"])(
+    "keeps the current correlation ID %j intact",
+    (ref) => {
+      const parsed = parsePeerMessage(currentEnvelope('"Deploy review" (Claude)', "Report", ref));
+      expect(parsed).toMatchObject({ ref, body: "Report" });
+    },
+  );
 
   it("keeps a current body that itself starts with an envelope header", () => {
     const quoted =

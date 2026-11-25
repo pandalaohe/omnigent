@@ -1320,6 +1320,16 @@ class SysSessionCreateTool(Tool):
                                 "agent's default."
                             ),
                         },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "Optional permission mode for the new session, in its "
+                                "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
+                                "'approve-for-me' (agent_id only). Modes that skip "
+                                "approval, such as 'bypassPermissions' or 'full-access', "
+                                "are refused. Omit to use the agent's default."
+                            ),
+                        },
                         "speed": {
                             "type": "string",
                             "enum": ["standard", "fast"],

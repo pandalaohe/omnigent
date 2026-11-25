@@ -8,6 +8,7 @@ SQLite database.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1586,6 +1587,32 @@ def test_task_creation_rejects_archived_project(
     assert exc.value.code == ErrorCode.PROJECT_ARCHIVED
 
 
+@pytest.mark.parametrize(("status", "starting"), [("starting", True), ("running", False)])
+def test_has_starting_run_for_conversation_finds_only_its_unsettled_startup(
+    store: SqlAlchemyScheduledTaskStore, status: str, starting: bool
+) -> None:
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_startup"),
+            name="startup",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_startup"),
+            scheduled_task_id=_uid("task_startup"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_startup"),
+        )
+        assert store.has_starting_run_for_conversation(_uid("conv_startup")) is starting
+        assert store.has_starting_run_for_conversation(_uid("conv_other")) is False
+    assert store.has_starting_run_for_conversation(_uid("conv_startup")) is False
+
+
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
     store.configure_dispatch(True)
     task = store.create(
@@ -2572,6 +2599,36 @@ def test_release_session_clears_only_the_session_it_was_given(
     # A deleted task releases nothing.
     store.delete(task.id)
     assert store.release_session(task.id, _uid("c2")) is False
+
+
+@pytest.mark.parametrize("split_db", [False, True], ids=["single-db", "split-db"])
+@pytest.mark.parametrize("target_change", ["unchanged", "archived", "host-bound"])
+def test_release_failed_sandbox_revalidates_the_target_under_lock(
+    db_uri: str, tmp_path: Path, split_db: bool, target_change: str
+) -> None:
+    from omnigent.server.startup_inputs import STARTUP_LABEL
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    conversation_uri = f"sqlite:///{tmp_path}/conversations.db" if split_db else None
+    conversations = SqlAlchemyConversationStore(db_uri, conversation_uri)
+    store = SqlAlchemyScheduledTaskStore(db_uri, conversation_uri)
+    failed = conversations.create_conversation(kind="default")
+    conversations.set_labels(failed.id, {STARTUP_LABEL: "failed"})
+    task = _session_task(store, "st_sandbox_release", session_mode="continue")
+    assert store.adopt_session(task.id, failed.id, snapshot=task) == "adopted"
+
+    if target_change == "archived":
+        assert conversations.update_conversation(failed.id, archived=True).archived
+    elif target_change == "host-bound":
+        host_id = _uid("sandbox_host")
+        bound = conversations.set_host_id(failed.id, host_id, workspace="/opt/work/test")
+        assert bound.host_id == host_id
+    released = store.release_session(
+        task.id, failed.id, expected_archive_revision=failed.archive_revision
+    )
+
+    assert released == (target_change == "unchanged")
+    assert store.get(task.id).session_id == (None if released else failed.id)
 
 
 def test_archive_pause_requires_the_current_target_and_only_transitions_once(

@@ -168,6 +168,12 @@ export interface ServerInfo {
     }
   >;
   /**
+   * What each launchable provider's unattended runs need from their owner, e.g.
+   * ``{ agent_sandbox: "Keep your laptop signed in." }``. The automation form
+   * shows the run target's notice; a provider absent from the map has none.
+   */
+  sandbox_provider_automation_notices?: Record<string, string>;
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -276,6 +282,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``permission_mode``. Older servers ignore the field, so trigger templates
+   * write a worker mode only here. Fails to ``false``.
+   */
+  session_create_permission_modes?: boolean;
   /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
@@ -532,6 +544,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_provider: null,
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
+  sandbox_provider_automation_notices: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -552,6 +565,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
@@ -654,6 +668,15 @@ function parseSandboxProviderCapabilities(
   );
 }
 
+function parseProviderAutomationNotices(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== "",
+    ),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -708,6 +731,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
             data.sandbox_provider_capabilities,
           ),
+          sandbox_provider_automation_notices: parseProviderAutomationNotices(
+            data.sandbox_provider_automation_notices,
+          ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -738,6 +764,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           usage_board_enabled: data.usage_board_enabled === true,
           task_board_enabled: data.task_board_enabled === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:

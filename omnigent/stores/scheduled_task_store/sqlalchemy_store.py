@@ -21,6 +21,7 @@ from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
     SqlConversation,
     SqlConversationLabel,
+    SqlConversationMetadata,
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
@@ -295,6 +296,10 @@ _STALE_ARCHIVED_TARGET = "the automation target or state changed"
 _STALE_ARCHIVED_TARGET_CODE = "continued_session_archive_superseded"
 
 
+class _TargetNoLongerReplaceable(Exception):
+    """The first-launch snapshot changed before the old binding was released."""
+
+
 def retarget_continued_tasks_in_session(
     session: Session, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
 ) -> None:
@@ -387,6 +392,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         write: Callable[[Session], _WriteResult],
         *,
         reject_superseded: bool = True,
+        validate_target: Callable[[Session], None] | None = None,
     ) -> _WriteResult:
         if session_id is None:
             return run_write_transaction(self._session_immediate, name, write)
@@ -403,6 +409,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if reject_superseded:
                 _require_unsuperseded_target(session, session_id)
+            if validate_target is not None:
+                validate_target(session)
 
         if self._conversation_session_immediate is not None:
             # In split-DB mode hold the AP lock through the metadata commit.
@@ -938,23 +946,83 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "adopt_task_session", write)
 
-    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+    def release_session(
+        self,
+        scheduled_task_id: str,
+        session_id: str,
+        *,
+        expected_archive_revision: int | None = None,
+    ) -> bool:
         """Clear the task's session under the task lock, only if it is still *session_id*."""
 
         def write(session: Session) -> bool:
+            workspace_id = current_workspace_id()
+            if expected_archive_revision is not None:
+                metadata = session.get(
+                    SqlConversationMetadata, (workspace_id, session_id), with_for_update=True
+                )
+                if metadata is not None and metadata.host_id is not None:
+                    return False
             row = session.get(
-                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+                SqlScheduledTask, (workspace_id, scheduled_task_id), with_for_update=True
             )
             if (
                 row is None
                 or row.state == encode_scheduled_task_state("deleted")
                 or row.session_id != session_id
+                or (
+                    expected_archive_revision is not None
+                    and self._has_starting_run(session, session_id)
+                )
             ):
                 return False
             row.session_id = None
             return True
 
-        return run_write_transaction(self._session_immediate, "release_task_session", write)
+        if expected_archive_revision is None:
+            return run_write_transaction(self._session_immediate, "release_task_session", write)
+
+        def validate_target(session: Session) -> None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
+
+            workspace_id = current_workspace_id()
+            conversation = session.get(SqlConversation, (workspace_id, session_id))
+            if conversation is None:
+                return
+            if conversation.archived or conversation.archive_revision != expected_archive_revision:
+                raise _TargetNoLongerReplaceable
+            labels = dict(
+                session.execute(
+                    select(SqlConversationLabel.key, SqlConversationLabel.value)
+                    .where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == session_id,
+                        SqlConversationLabel.key.in_(
+                            [STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL, SUCCEEDED_BY_LABEL_KEY]
+                        ),
+                    )
+                    .with_for_update()
+                )
+                .tuples()
+                .all()
+            )
+            if (
+                labels.get(STARTUP_LABEL) != "failed"
+                or STARTUP_SETTLED_BY_LABEL in labels
+                or labels.get(SUCCEEDED_BY_LABEL_KEY)
+            ):
+                raise _TargetNoLongerReplaceable
+
+        try:
+            return self._write_with_target_lock(
+                "release_task_session",
+                session_id,
+                write,
+                reject_superseded=False,
+                validate_target=validate_target,
+            )
+        except _TargetNoLongerReplaceable:
+            return False
 
     def retarget_continued_sessions(
         self, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
@@ -1390,6 +1458,28 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
+
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """Whether a run that recorded this conversation is still ``starting``.
+
+        Overlapping continue runs can each record the same session, so only
+        existence is checked.
+        """
+        with self._session("select_starting_run_by_conversation") as session:
+            return self._has_starting_run(session, conversation_id)
+
+    @staticmethod
+    def _has_starting_run(session: Session, conversation_id: str) -> bool:
+        stmt = (
+            select(SqlScheduledTaskRun.id)
+            .where(
+                SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                SqlScheduledTaskRun.conversation_id == conversation_id,
+                SqlScheduledTaskRun.status == encode_scheduled_task_run_status("starting"),
+            )
+            .limit(1)
+        )
+        return session.execute(stmt).first() is not None
 
     def list_running_runs_for_tasks(
         self,

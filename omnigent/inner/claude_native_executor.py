@@ -65,6 +65,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
@@ -655,6 +656,7 @@ class ClaudeNativeExecutor(Executor):
             )
             yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
             while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+                yield ExecutorWait()
                 await asyncio.sleep(_HOST_DISK_POLL_S)
         from omnigent.runtime import telemetry
 

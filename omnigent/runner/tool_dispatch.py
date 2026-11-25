@@ -5718,6 +5718,7 @@ _SESSION_CREATE_FIELDS = (
     ("title", "title"),
     ("model", "model_override"),
     ("reasoning_effort", "reasoning_effort"),
+    ("permission_mode", "permission_mode"),
 )
 
 
@@ -5928,6 +5929,7 @@ def _build_session_create_body(
     placement: _CreatePlacement | None = None,
     speed: object = None,
     permission_tier: str | None = None,
+    permission_mode: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -5960,12 +5962,19 @@ def _build_session_create_body(
         written as ``reasoning_effort`` on the session.
     :param placement: Resolved placement; omitted fields are not sent.
     :param speed: Explicit session speed; the server validates the resolved harness.
+    :param permission_mode: Optional native permission mode, e.g.
+        ``"approve-for-me"``; the server maps it to the harness's launch args.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
         "parent_session_id": conversation_id,
         **_session_create_fields(
-            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+            {
+                "title": title,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "permission_mode": permission_mode,
+            }
         ),
     }
     if isinstance(agent_id, str) and agent_id:
@@ -6697,6 +6706,13 @@ async def _execute_session_create_impl(
     if placement_mode != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
+    permission_mode = args.get("permission_mode")
+    if permission_mode is not None:
+        if not isinstance(permission_mode, str) or not permission_mode.strip():
+            return json.dumps({"error": "permission_mode must be a nonempty string"})
+        if has_config_path:
+            # A new agent's own config sets its permission mode.
+            return json.dumps({"error": "permission_mode requires agent_id"})
     if has_config_path:
         # Placement is an agent_id-mode feature: the multipart create carries
         # only the config bundle and keeps the parent's runner, and its
@@ -6766,6 +6782,7 @@ async def _execute_session_create_impl(
         placement=placement,
         speed=args.get("speed"),
         permission_tier=cast(str | None, permission_tier),
+        permission_mode=permission_mode,
     )
     headers: dict[str, str] = dict(_AGENT_CREATE_HEADERS)
     from omnigent.server.permission_tiers import (
@@ -6807,10 +6824,26 @@ async def _execute_session_create_impl(
         endpoint = "/v1/sessions" if placement_mode == "child" else "/v1/sessions/orchestrated"
         host_id = None
         info_data: _JsonObject = {}
-        if placement_mode == "managed" or args.get("project_name") is not None:
+        if (
+            placement_mode == "managed"
+            or args.get("project_name") is not None
+            or permission_mode is not None
+        ):
             info = await server_client.get("/v1/info", timeout=_SESSION_CREATE_TIMEOUT)
             info.raise_for_status()
             info_data = info.json()
+        # An older server ignores the field, so the session would quietly start in
+        # its agent's default mode instead.
+        if (
+            permission_mode is not None
+            and info_data.get("session_create_permission_modes") is not True
+        ):
+            return json.dumps(
+                {
+                    "error": "This Omnigent server can't set a new session's permission_mode; "
+                    "no session was created. Omit permission_mode to use the agent's default."
+                }
+            )
         if placement_mode == "managed":
             if (
                 info_data.get("sibling_sessions") is True

@@ -4062,6 +4062,9 @@ async def _subscribe_until_ready(
     reconnects keep it so no live turn replaces the bridge's recovery cursor
     before the replay lands.
 
+    If Codex cannot list turns, retry without history so live notifications
+    can still be mirrored. Items preceding that subscription remain unreplayed.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -4104,6 +4107,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    history_unavailable = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     replay_owed = replay_from_turn_id is not None or shell_pending
     async with (
@@ -4113,7 +4117,9 @@ async def _subscribe_until_ready(
             async with _conversation_item_delivery_scope(session_id):
                 received_live_items = client.is_subscribed_to_thread(thread_id)
                 params: _JsonObject = {"threadId": thread_id}
-                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                if history_unavailable or (
+                    not saw_not_ready and replay_from_turn_id is None and not shell_pending
+                ):
                     params["excludeTurns"] = True
                 timed_out = False
                 try:
@@ -4128,6 +4134,19 @@ async def _subscribe_until_ready(
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
                 except Exception as exc:
+                    if (
+                        not params.get("excludeTurns")
+                        and isinstance(exc, CodexAppServerResponseError)
+                        and exc.code == -32601
+                        and exc.message == "list_turns is not supported yet"
+                    ):
+                        history_unavailable = True
+                        _logger.warning(
+                            "Codex cannot list turns for thread %s; subscribing without history. "
+                            "Items before this subscription cannot be replayed.",
+                            thread_id,
+                        )
+                        continue
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -4148,6 +4167,7 @@ async def _subscribe_until_ready(
                         forwarder_state=forwarder_state,
                         received_live_items=received_live_items,
                         replay_from_turn_id=replay_from_turn_id,
+                        replay_history=not history_unavailable,
                     )
                     return
             if timed_out:
@@ -4190,6 +4210,7 @@ async def _finish_subscription(
     forwarder_state: _CodexForwarderState | None,
     received_live_items: bool,
     replay_from_turn_id: str | None,
+    replay_history: bool,
 ) -> None:
     """
     Sync thread metadata from a successful resume and replay its snapshot.
@@ -4210,6 +4231,7 @@ async def _finish_subscription(
     :param received_live_items: Whether this connection was already
         subscribed (and so received live items) before the resume.
     :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :param replay_history: Whether Codex returned history for reconciliation.
     :returns: None.
     """
     if forwarder_state is not None:
@@ -4221,6 +4243,16 @@ async def _finish_subscription(
         _refresh_model_from_config(bridge_dir, forwarder_state)
         _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
         _refresh_effort_from_config(bridge_dir, forwarder_state)
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        thread_status = thread.get("status") if isinstance(thread, dict) else None
+        idle_recovery_turn = (
+            replay_from_turn_id
+            if not replay_history
+            and isinstance(thread_status, dict)
+            and thread_status.get("type") == "idle"
+            else None
+        )
         # Read app-server liveness before HTTP mirrors can stall on a slow server.
         await _resync_background_work(
             codex_client,
@@ -4229,6 +4261,7 @@ async def _finish_subscription(
             bridge_dir=bridge_dir,
             thread_id=thread_id,
             forwarder_state=forwarder_state,
+            idle_recovery_turn=idle_recovery_turn,
         )
         await _sync_model_change(ap_client, session_id=session_id, forwarder_state=forwarder_state)
         await _sync_service_tier_change(
@@ -4250,6 +4283,10 @@ async def _finish_subscription(
         await _sync_codex_approval_mode_change(
             ap_client, session_id=session_id, forwarder_state=forwarder_state
         )
+    # An excluded history is not evidence that a saved turn or shell finished.
+    # Keep its recovery cursor until an authoritative lifecycle event arrives.
+    if not replay_history:
+        return
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
     try:
@@ -5891,12 +5928,14 @@ async def _resync_background_work(
     bridge_dir: Path,
     thread_id: str,
     forwarder_state: _CodexForwarderState,
+    idle_recovery_turn: str | None = None,
 ) -> None:
     """
     Read the thread's goal and background terminals after a (re)subscription.
 
-    Posts the flag once. With a turn active, that turn's terminal event settles
-    the terminals, so only the goal is posted here.
+    A live turn's terminal event settles its terminals, so only the goal is
+    posted while a turn is active. An idle snapshot can leave a saved recovery
+    cursor without a live turn.
 
     :param codex_client: Connected Codex app-server client.
     :param ap_client: HTTP client for Omnigent event posts.
@@ -5904,10 +5943,11 @@ async def _resync_background_work(
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_123"``.
     :param forwarder_state: Mutable forwarder state for the connection.
+    :param idle_recovery_turn: The saved recovery cursor confirmed idle by Codex.
     :returns: None.
     """
     await _read_thread_goal(codex_client, thread_id=thread_id, forwarder_state=forwarder_state)
-    if _bridge_turn_is_active(bridge_dir):
+    if _bridge_turn_is_active(bridge_dir, idle_recovery_turn=idle_recovery_turn):
         await _sync_background_work_running(
             ap_client, session_id=session_id, forwarder_state=forwarder_state
         )
@@ -5919,6 +5959,7 @@ async def _resync_background_work(
         bridge_dir=bridge_dir,
         thread_id=thread_id,
         forwarder_state=forwarder_state,
+        idle_recovery_turn=idle_recovery_turn,
     )
 
 
@@ -6031,6 +6072,7 @@ async def _poll_background_terminals(
     bridge_dir: Path,
     thread_id: str,
     forwarder_state: _CodexForwarderState,
+    idle_recovery_turn: str | None = None,
 ) -> None:
     """
     Re-list background terminals until none is left or a turn starts.
@@ -6042,11 +6084,12 @@ async def _poll_background_terminals(
         the polling.
     :param thread_id: Codex thread id, e.g. ``"thread_123"``.
     :param forwarder_state: Mutable forwarder state for the connection.
+    :param idle_recovery_turn: The saved recovery cursor confirmed idle by Codex.
     :returns: None. Ends on its own, or when a turn start or shutdown cancels it.
     """
     while True:
         await _sleep(_BACKGROUND_TERMINAL_POLL_SECONDS)
-        if _bridge_turn_is_active(bridge_dir):
+        if _bridge_turn_is_active(bridge_dir, idle_recovery_turn=idle_recovery_turn):
             return
         if not await _refresh_background_terminals(
             ap_client,
@@ -6066,6 +6109,7 @@ async def _track_background_terminals(
     bridge_dir: Path,
     thread_id: str,
     forwarder_state: _CodexForwarderState,
+    idle_recovery_turn: str | None = None,
 ) -> None:
     """
     List background terminals now that a turn has settled, and keep listing while any run.
@@ -6078,6 +6122,7 @@ async def _track_background_terminals(
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_123"``.
     :param forwarder_state: Mutable forwarder state for the connection.
+    :param idle_recovery_turn: The saved recovery cursor confirmed idle by Codex.
     :returns: None.
     """
     forwarder_state.cancel_background_terminal_poll()
@@ -6099,6 +6144,7 @@ async def _track_background_terminals(
             bridge_dir=bridge_dir,
             thread_id=thread_id,
             forwarder_state=forwarder_state,
+            idle_recovery_turn=idle_recovery_turn,
         ),
         name="codex-native-background-terminals",
     )
@@ -7178,15 +7224,17 @@ def _is_thread_system_error_event(method: str, params: _JsonObject) -> bool:
     return isinstance(status, dict) and status.get("type") == "systemError"
 
 
-def _bridge_turn_is_active(bridge_dir: Path) -> bool:
+def _bridge_turn_is_active(bridge_dir: Path, *, idle_recovery_turn: str | None = None) -> bool:
     """
     Return whether the bridge records a turn that has not reached a terminal event.
 
     :param bridge_dir: Native Codex bridge directory.
+    :param idle_recovery_turn: An idle resume left this turn's cursor intact
+        because it could not replay history.
     :returns: ``True`` while the bridge holds an active turn id.
     """
     state = read_bridge_state(bridge_dir)
-    return state is not None and state.active_turn_id is not None
+    return state is not None and state.active_turn_id not in (None, idle_recovery_turn)
 
 
 async def _handle_thread_system_error(

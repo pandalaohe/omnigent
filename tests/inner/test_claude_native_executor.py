@@ -34,6 +34,7 @@ from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     TextChunk,
     TurnComplete,
@@ -475,6 +476,7 @@ async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     )
 
     assert isinstance(await turn.__anext__(), TextChunk)
+    assert isinstance(await turn.__anext__(), ExecutorWait)
     pending_next = asyncio.create_task(turn.__anext__())
     await asyncio.sleep(0)
     pending_next.cancel()

@@ -36,6 +36,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     ExecutorResidentInventory,
     ExecutorThreadInventorySnapshot,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     LiveMcpHarnessNotRunning,
     LiveMcpServerStatus,
@@ -1492,7 +1493,10 @@ class ExecutorAdapter(HarnessApp):
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, SessionModeChanged):
+        if isinstance(event, ExecutorWait):
+            if ctx._hold_idle_watchdog is not None:
+                ctx._hold_idle_watchdog()
+        elif isinstance(event, SessionModeChanged):
             ctx.emit(
                 SessionPermissionModeEvent(
                     type="session.permission_mode",

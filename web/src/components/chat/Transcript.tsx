@@ -65,6 +65,7 @@ import {
   computeIsWorking,
   extractUserText,
   isSystemBubble,
+  isSessionMessageBubble,
   keyboardActiveQuestionId,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
@@ -72,6 +73,7 @@ import {
   stripPendingElicitations,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
@@ -111,12 +113,20 @@ function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
   return parsed?.kind === "subagent_wake" && parsed.body === "";
 }
 
-/** Keep model-facing sub-agent wake messages out of the visible row geometry. */
-export function visibleTranscriptBubbles(bubbles: Bubble[]): Bubble[] {
+/**
+ * Keep model-facing sub-agent wake messages out of the visible row geometry.
+ *
+ * :param hideSessionMessages: Also drop messages other sessions sent, when the
+ *     reader chose to hide them.
+ */
+export function visibleTranscriptBubbles(bubbles: Bubble[], hideSessionMessages = false): Bubble[] {
   let visible: Bubble[] | null = null;
   for (let index = 0; index < bubbles.length; index += 1) {
     const bubble = bubbles[index]!;
-    if (isHiddenSubagentWakeBubble(bubble)) {
+    if (
+      isHiddenSubagentWakeBubble(bubble) ||
+      (hideSessionMessages && isSessionMessageBubble(bubble))
+    ) {
       visible ??= bubbles.slice(0, index);
     } else {
       visible?.push(bubble);
@@ -237,12 +247,14 @@ function TranscriptImpl({
     () => keyboardActiveQuestionId(pendingElicitations),
     [pendingElicitations],
   );
+  const hideSessionMessages = usePeerSessionMessageDisplay() === "hide";
   const streamBubbles = useMemo(
     () =>
       visibleTranscriptBubbles(
         pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
+        hideSessionMessages,
       ),
-    [bubbles, pendingElicitations.length],
+    [bubbles, pendingElicitations.length, hideSessionMessages],
   );
   const committedUserIds = useMemo(() => {
     const ids = new Set<string>();
@@ -339,14 +351,17 @@ function TranscriptImpl({
 
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
+  // Hidden messages from other sessions aren't turns the reader can reach either.
+  const isUserTurnBubble = useCallback(
+    (b: Bubble): b is Extract<Bubble, { kind: "user" }> =>
+      b.kind === "user" &&
+      !isSystemBubble(b) &&
+      !(hideSessionMessages && isSessionMessageBubble(b)),
+    [hideSessionMessages],
+  );
   const userMessageIds = useMemo(
-    () =>
-      display.bubbles
-        .filter(
-          (b): b is Extract<Bubble, { kind: "user" }> => b.kind === "user" && !isSystemBubble(b),
-        )
-        .map((b) => b.itemId),
-    [display.bubbles],
+    () => display.bubbles.filter(isUserTurnBubble).map((b) => b.itemId),
+    [display.bubbles, isUserTurnBubble],
   );
   const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
   // The bottom pin's growth check, run by the list when a mounted row grows.
@@ -363,11 +378,11 @@ function TranscriptImpl({
     const out: Turn[] = [];
     for (let i = 0; i < display.bubbles.length; i++) {
       const b = display.bubbles[i];
-      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      if (!isUserTurnBubble(b)) continue;
       let preview = "";
       for (let j = i + 1; j < display.bubbles.length; j++) {
         const next = display.bubbles[j];
-        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (isUserTurnBubble(next)) break;
         if (next.kind === "assistant") {
           const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
           if (textItem && textItem.kind === "text") {
@@ -383,7 +398,7 @@ function TranscriptImpl({
       });
     }
     return out;
-  }, [display.bubbles]);
+  }, [display.bubbles, isUserTurnBubble]);
 
   const lastAssistantIndex = useMemo(
     () => liveCandidateAssistantIndex(display.streamBubbles),

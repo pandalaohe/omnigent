@@ -16299,6 +16299,18 @@ async def _create_session_from_existing_agent_impl(
             _validated_harness_override, body.harness_override, agent
         )
 
+    from omnigent.server.permission_tiers import agent_originated_create
+
+    agent_create = agent_originated_create(request.headers)
+    delegated_permission_mode = body.permission_mode if agent_create else None
+    if delegated_permission_mode is not None and (
+        body.sub_agent_name or body.terminal_launch_args is not None
+    ):
+        raise OmnigentError(
+            "permission_mode can't be combined with terminal_launch_args or sub_agent_name",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     sdk_permission_labels: dict[str, str] = {}
     permission_host_id = body.host_id or parent_host_id
     explicit_permission_application = None
@@ -16311,7 +16323,7 @@ async def _create_session_from_existing_agent_impl(
         resolved_harness = await asyncio.to_thread(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
-        if body.permission_mode is not None:
+        if body.permission_mode is not None and delegated_permission_mode is None:
             from omnigent.server.routes._session_create_validation import (
                 cached_acp_permission_options,
                 require_acp_permission_mode,
@@ -16561,7 +16573,6 @@ async def _create_session_from_existing_agent_impl(
     )
     from omnigent.server.permission_tiers import (
         TIER_HARNESSES,
-        agent_originated_create,
         configured_acp_default_tier,
         is_acp_permission_harness,
         require_permission_protocol,
@@ -16594,6 +16605,17 @@ async def _create_session_from_existing_agent_impl(
         labels=body.labels,
         host_registry=getattr(request.app.state, "host_registry", None),
     )
+    # Checked before a worktree exists, so a refused mode leaves nothing behind.
+    permission_launch_args: list[str] | None = None
+    if delegated_permission_mode is not None:
+        from omnigent.native.permission_modes import created_session_launch_args
+
+        try:
+            permission_launch_args = created_session_launch_args(
+                selected_harness, delegated_permission_mode
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -16816,9 +16838,8 @@ async def _create_session_from_existing_agent_impl(
     # the validated body args (e.g. ``["--permission-mode",
     # "bypassPermissions"]`` from the web permission-mode selector). The
     # flat-list shape plus this bounds check is the security boundary;
-    # mirrors the multipart create + PATCH paths. When the body carries no
-    # args, the agent's own trusted spec seeds them below — explicit
-    # opt-ins only, never the headless worker default bypass.
+    # mirrors the multipart create + PATCH paths. A delegated permission mode
+    # supplies the harness args and overrides the configured launch defaults.
     if body.sub_agent_name:
         try:
             validated_launch_args = (
@@ -16829,6 +16850,8 @@ async def _create_session_from_existing_agent_impl(
                 f"invalid terminal_launch_args in sub-agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    elif delegated_permission_mode is not None:
+        validated_launch_args = permission_launch_args
     else:
         try:
             validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
@@ -16845,6 +16868,7 @@ async def _create_session_from_existing_agent_impl(
     needs_launch_args_from_spec = (
         not body.sub_agent_name
         and validated_launch_args is None
+        and delegated_permission_mode is None
         and not (explicit_permission_application and explicit_permission_application.args)
     )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
@@ -17075,7 +17099,6 @@ async def _create_session_from_existing_agent_impl(
         initial_labels.update(sdk_permission_labels)
 
     create_harness = selected_harness
-    agent_create = agent_originated_create(request.headers)
     permission_source = parent_conv
     permission_source_id = body.parent_session_id or created_by_session_id
     if agent_create and permission_source_id is not None:

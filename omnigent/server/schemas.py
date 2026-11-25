@@ -2032,6 +2032,12 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         non-native sessions. Mirrors the multipart create path
         (:class:`SessionCreateMetadata`). See
         designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    :param permission_mode: Optional native permission mode for the new
+        session's harness, e.g. ``"approve-for-me"`` for Codex, which the
+        server turns into launch args. Set by ``sys_session_create``. Modes
+        that skip approval are refused, and it can't be combined with
+        ``terminal_launch_args`` or ``sub_agent_name``. ``None`` keeps the
+        agent's default.
     :param model_override: Optional per-session LLM model override to
         persist at create time, e.g. ``"databricks-claude-sonnet-4-6"``.
         Set by ``sys_session_send``'s per-dispatch ``model`` arg so the
@@ -2126,7 +2132,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
-    permission_mode: str | None = None
+    permission_mode: str | None = Field(default=None, min_length=1, max_length=64)
     permission_tier: PermissionTierRequest | None = None
     approval_mode: str | None = None
     smart_routing_message: str | None = None

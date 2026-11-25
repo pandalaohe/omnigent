@@ -97,6 +97,27 @@ it("omits hidden sub-agent wakes from visible row geometry", () => {
   expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].count).toBe(3);
 });
 
+it("drops messages from other sessions only when they are hidden", () => {
+  const peer: Bubble = {
+    kind: "user",
+    itemId: "peer",
+    content: [{ type: "input_text", text: "[Message from session s_src]\nreport" }],
+  };
+  const persistedPeer: Bubble = {
+    kind: "user",
+    itemId: "persisted-peer",
+    content: [
+      {
+        type: "input_text",
+        text: `[Peer message from session ${"a".repeat(32)} msg=${"b".repeat(32)} "Reviewer" (Codex) ref=review 2]\n\nreport`,
+      },
+    ],
+  };
+  const bubbles = [bubble, peer, persistedPeer, assistantBubble];
+  expect(visibleTranscriptBubbles(bubbles)).toBe(bubbles);
+  expect(visibleTranscriptBubbles(bubbles, true)).toEqual([bubble, assistantBubble]);
+});
+
 function list(
   hasTasks: boolean,
   scrollEl: HTMLElement,

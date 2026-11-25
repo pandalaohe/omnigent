@@ -317,6 +317,26 @@ export const NEW_AUTOMATION_PERMISSION_MODES: Readonly<Record<string, string>> =
   "codex-native": "approve-for-me",
 };
 
+// Keep aligned with created_session_launch_args in omnigent/native/permission_modes.py.
+const DELEGATED_SESSION_PERMISSION_MODES: Readonly<Record<string, readonly string[]>> = {
+  "claude-native": ["default", "auto", "acceptEdits", "plan"],
+  "codex-native": ["default", "ask-for-approval", "approve-for-me", "read-only"],
+  "cursor-native": ["default", "auto-review", "plan", "ask"],
+  "antigravity-native": ["default"],
+  "devin-native": ["normal", "accept-edits", "smart"],
+};
+
+export function supportsDelegatedSessionPermission(
+  harness: string | null | undefined,
+  permission: string,
+): boolean {
+  return (
+    harness != null &&
+    Object.hasOwn(DELEGATED_SESSION_PERMISSION_MODES, harness) &&
+    DELEGATED_SESSION_PERMISSION_MODES[harness].includes(permission)
+  );
+}
+
 /** Create-time permission choices shared by New Chat and automations. */
 export function nativePermissionOptions(harness: string | null | undefined) {
   switch (harness) {

@@ -28,11 +28,13 @@ import {
   bubbleKey,
   computeIsWorking,
   computeIsTurnActive,
+  isSessionMessageBubble,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import {
   ChatComposer,
   ComposerFeedbackRow,
@@ -315,6 +317,7 @@ export function SideChatPane({
   }, [blocks, inherited, filterHistory, copiedIdPrefix, awaitingRule]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
+  const hideSessionMessages = usePeerSessionMessageDisplay() === "hide";
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
       reorderCommittedRequestElicitations(
@@ -329,12 +332,13 @@ export function SideChatPane({
       subagentRoutingOverride,
     );
     // A session opened in a grid shows its undelivered startup messages too.
-    return withUncommittedUserBubbles(
+    const all = withUncommittedUserBubbles(
       committed,
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
     );
+    return hideSessionMessages ? all.filter((bubble) => !isSessionMessageBubble(bubble)) : all;
   }, [
     visibleBlocks,
     activeResponse,
@@ -343,6 +347,7 @@ export function SideChatPane({
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
+    hideSessionMessages,
   ]);
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);

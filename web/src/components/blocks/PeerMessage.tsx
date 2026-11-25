@@ -7,6 +7,7 @@
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import type { ParsedPeerMessage } from "@/lib/peerMessage";
+import { ChevronUpIcon } from "lucide-react";
 
 const TITLE_TRUNCATE_LENGTH = 48;
 
@@ -16,9 +17,10 @@ function truncateTitle(title: string): string {
 
 interface PeerMessageViewProps {
   message: ParsedPeerMessage;
+  onCollapse?: () => void;
 }
 
-export function PeerMessageView({ message }: PeerMessageViewProps) {
+export function PeerMessageView({ message, onCollapse }: PeerMessageViewProps) {
   const badge = [truncateTitle(message.title), message.agent, message.projectId]
     .filter((part): part is string => Boolean(part))
     .join(" · ");
@@ -31,9 +33,21 @@ export function PeerMessageView({ message }: PeerMessageViewProps) {
       className="max-w-[640px]"
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        <span title={message.senderId} className="mb-1 mr-1 text-sm text-muted-foreground">
-          {label}
-        </span>
+        <div className="mb-1 mr-1 flex items-center gap-2 text-sm text-muted-foreground">
+          <span title={message.senderId}>{label}</span>
+          {onCollapse && (
+            <button
+              type="button"
+              aria-expanded
+              aria-label="Collapse message"
+              data-testid="collapse-session-message"
+              className="transition-colors hover:text-foreground"
+              onClick={onCollapse}
+            >
+              <ChevronUpIcon className="size-3" />
+            </button>
+          )}
+        </div>
         <MessageContent>
           <FilePathAwareMessageResponse breaks>{message.body}</FilePathAwareMessageResponse>
         </MessageContent>

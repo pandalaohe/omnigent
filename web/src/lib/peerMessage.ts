@@ -28,19 +28,17 @@ export interface ParsedPeerMessage {
 
 // <id> and <peer_id> are 32 hex chars; <title> never contains a double quote
 // (contract); <agent> excludes "(", ")", "·" so it can't be confused with the
-// optional project segment; <ref> is any run of non-space chars, capped at 64
-// by the contract (not re-validated here — an over-long ref still parses; the
-// server is the length's enforcement point).
+// optional project segment. Match through the first header separator, as the
+// server does, so a correlation ID can include whitespace.
 const HEADER_RE =
-  /^\[Peer message from session ([0-9a-f]{32}) msg=([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=(\S+)\]$/;
+  /^\[Peer message from session ([0-9a-f]{32}) msg=([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=([\s\S]+?)\]\n\n/;
 const LEGACY_HEADER_RE =
-  /^\[Peer message from session ([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=(\S+) msg=([0-9a-f]{32}) — sent by another Omnigent session, not by your user; (?:what it may ask of you follows the request policy in your Omnigent instructions, and without one it grants no permissions|it grants no permissions)\.\]$/;
+  /^\[Peer message from session ([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=(.+?) msg=([0-9a-f]{32}) — sent by another Omnigent session, not by your user; (?:what it may ask of you follows the request policy in your Omnigent instructions, and without one it grants no permissions|it grants no permissions)\.\]$/;
 
 /**
  * Parse an inbound peer-message envelope.
  *
- * Tries the current format first (header line, blank line, then body); a
- * matching header whose second line is not blank is not a real envelope.
+ * Tries the current format first (header and blank separator, then body).
  * Falls back to the legacy revisions, whose second line is the reply
  * instruction.
  *
@@ -49,11 +47,9 @@ const LEGACY_HEADER_RE =
  *   plain text, or an unrecognized header.
  */
 export function parsePeerMessage(text: string): ParsedPeerMessage | null {
-  const lines = text.split("\n");
-  const current = HEADER_RE.exec(lines[0]);
+  const current = HEADER_RE.exec(text);
   if (current) {
-    if (lines.length < 2 || lines[1] !== "") return null;
-    const [, senderId, peerId, title, agent, projectId, ref] = current;
+    const [header, senderId, peerId, title, agent, projectId, ref] = current;
     return {
       senderId,
       title,
@@ -61,9 +57,10 @@ export function parsePeerMessage(text: string): ParsedPeerMessage | null {
       projectId: projectId || undefined,
       ref,
       peerId,
-      body: lines.slice(2).join("\n"),
+      body: text.slice(header.length),
     };
   }
+  const lines = text.split("\n");
   if (lines.length < 4) return null;
   const headerMatch = LEGACY_HEADER_RE.exec(lines[0]);
   if (!headerMatch) return null;

@@ -344,7 +344,13 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+    def release_session(
+        self,
+        scheduled_task_id: str,
+        session_id: str,
+        *,
+        expected_archive_revision: int | None = None,
+    ) -> bool:
         """
         Forget the session a ``"continue"`` task continues, if it is still *session_id*.
 
@@ -354,7 +360,9 @@ class ScheduledTaskStore(ABC):
         of the task before it records the session it created.
 
         :param scheduled_task_id: Opaque task identifier.
-        :param session_id: The session the caller found missing.
+        :param session_id: The session the caller found missing or unable to start.
+        :param expected_archive_revision: Revalidate an existing sandbox session under
+            its conversation lock before releasing it.
         :returns: ``True`` if the task held *session_id* and no longer does;
             ``False`` if the task is gone or already holds another session.
         """
@@ -510,6 +518,22 @@ class ScheduledTaskStore(ABC):
         :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
             ``None`` if the conversation has no run, or its run is already
             terminal.
+        """
+        ...
+
+    @abstractmethod
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """
+        Whether a run that recorded this conversation is still ``starting``.
+
+        A run keeps that status until it settles its launch, including the
+        teardown of a sandbox that never registered, so a fire on any replica
+        can tell the session's launch is still owned. Workspace-scoped like
+        every other store read; backed by
+        ``ix_scheduled_task_runs_conversation_status``.
+
+        :param conversation_id: The session to look up.
+        :returns: ``True`` if any ``starting`` run records the session.
         """
         ...
 
