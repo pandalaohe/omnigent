@@ -66,6 +66,7 @@ interface ActiveKeyPress {
   key: RenderKey;
   pointerId: number;
   clipboardTarget?: HTMLButtonElement;
+  touchMenuTarget?: HTMLDivElement;
   startX: number;
   startY: number;
   moved: boolean;
@@ -79,6 +80,10 @@ interface PagerSwipeStart {
   row: "top" | "bottom";
   startX: number;
   startY: number;
+}
+
+function preventTouchContextMenu(event: MouseEvent): void {
+  if (!("pointerType" in event) || event.pointerType === "touch") event.preventDefault();
 }
 
 export function toggleTerminalKeyboard(
@@ -307,6 +312,7 @@ export function TerminalKeyRow({
   const stopPress = useCallback(() => {
     const active = pressRef.current;
     if (!active) return;
+    active.touchMenuTarget?.removeEventListener("contextmenu", preventTouchContextMenu);
     if (active.timeoutId !== null) window.clearTimeout(active.timeoutId);
     if (active.intervalId !== null) window.clearInterval(active.intervalId);
     pressRef.current = null;
@@ -434,6 +440,11 @@ export function TerminalKeyRow({
         press.consumed = true;
       }, TERMINAL_REPEAT_DELAY_MS);
     } else if (key.repeat && keySupportsRepeat(key)) {
+      if (event.pointerType === "touch") {
+        // Opening the browser's long-press menu can cancel the active pointer.
+        press.touchMenuTarget = event.currentTarget;
+        press.touchMenuTarget.addEventListener("contextmenu", preventTouchContextMenu);
+      }
       press.timeoutId = window.setTimeout(() => {
         if (pressRef.current !== press || press.moved) return;
         press.consumed = true;
@@ -578,6 +589,7 @@ export function TerminalKeyRow({
         className={cn(
           "flex min-w-0 items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-none",
           "active:bg-muted disabled:pointer-events-none disabled:opacity-45",
+          key.repeat && keySupportsRepeat(key) && "[-webkit-touch-callout:none]",
           isKeyboardAction && isActive && "border-primary/50 bg-primary/15 text-primary",
           modifierState !== "off" &&
             "border-primary-cta bg-primary-cta text-primary-cta-foreground",
