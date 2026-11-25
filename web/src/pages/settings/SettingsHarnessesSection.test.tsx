@@ -436,14 +436,14 @@ describe("Harness details", () => {
     fireEvent.click(screen.getByRole("link", { name: "Codex SDK details" }));
     fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
     expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#025677" });
-    fireEvent.click(screen.getByRole("button", { name: "Pink outline" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dark Pink outline" }));
     expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#db2777" });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(readAgentBadgePreferences().entries.ag_sdk).toEqual(savedBadge);
 
     fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
     expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#025677" });
-    fireEvent.click(screen.getByRole("button", { name: "Pink outline" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dark Pink outline" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(readAgentBadgePreferences().entries.ag_sdk).toEqual({
