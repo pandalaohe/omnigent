@@ -1416,13 +1416,13 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
         ("command", "other", "run_command", True),
         ("protected-write", "other", "write_to_file", False),
         ("workspace-write", "edit", "write_to_file", True),
-        ("unknown", "other", "unknown", False),
-        ("ambiguous", "other", "unknown", False),
+        ("unknown", "other", None, False),
+        ("ambiguous", "other", None, False),
         ("opencode", "other", "unknown", False),
     ],
 )
 async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
-    case: str, kind: str | None, expected_tool: str, allowed: bool
+    case: str, kind: str | None, expected_tool: str | None, allowed: bool
 ) -> None:
     from omnigent.permission_tiers import Verdict, adapt_tool_call, decide_tier, load_rules
     from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
@@ -1489,12 +1489,170 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
         assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
     else:
         assert reply["error"]["code"] == -32000
-    ((tool_name, decision),) = decisions
-    assert tool_name == expected_tool
-    assert decision.action == (Verdict.ALLOW if allowed else Verdict.DENY)
-    if case == "protected-write":
-        assert decision.rule_id == "protected-path"
+    if expected_tool is None:
+        assert decisions == []
+    else:
+        ((tool_name, decision),) = decisions
+        assert tool_name == expected_tool
+        assert decision.action == (Verdict.ALLOW if allowed else Verdict.DENY)
+        if case == "protected-write":
+            assert decision.rule_id == "protected-path"
     ex._elicitation_handler.assert_not_awaited()
+
+
+def _pending_acp_permission(
+    ex: AcpExecutor, arguments: dict[str, object], kind: str | None
+) -> dict[str, object]:
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    call: dict[str, object] = {"toolCallId": "tool-1", "rawInput": arguments}
+    if kind is not None:
+        call["kind"] = kind
+    ex._note_permission_update("s1", {"sessionUpdate": "tool_call", "status": "pending", **call})
+    return {
+        "sessionId": "s1",
+        "toolCall": call,
+        "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+    }
+
+
+@pytest.fixture
+def windows_acp_permission_executor():
+    from omnigent.permission_tiers import (
+        PermissionTier,
+        Verdict,
+        adapt_tool_call,
+        decide_tier,
+        load_rules,
+    )
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import windows_host
+
+    def executor(tier: PermissionTier, command: str = "agy.exe acp --stdio") -> AcpExecutor:
+        ex = AcpExecutor(AcpAgentConfig(command=command, host_permission_tier=True))
+
+        async def evaluate(_phase, data):
+            intent = adapt_tool_call(data["name"], data["arguments"], windows_host())
+            decision = decide_tier(tier, intent, load_rules())
+            if decision.action == Verdict.DENY:
+                return PolicyVerdictPayload(action="POLICY_ACTION_DENY")
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_UNSPECIFIED",
+                data={"_omnigent_acp_tier": decision.action.value.lower()},
+            )
+
+        ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+        ex._elicitation_handler = AsyncMock(return_value=True)
+        return ex
+
+    return executor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "arguments"),
+    [
+        ("execute", {"CommandLine": "omni --version", "Path": "note.txt", "Content": "abc"}),
+        ("edit", {"TargetFile": "note.txt", "Content": "abc", "AbsolutePath": "other.txt"}),
+        ("read", {"AbsolutePath": "note.txt", "CommandLine": "omni --version"}),
+        (None, {"AbsolutePath": "note.txt", "Path": "other.txt", "Content": "abc"}),
+        ("edit", {"Path": "note.txt", "TargetFile": "other.txt", "Content": "abc"}),
+    ],
+    ids=["execute", "edit", "read", "no-kind", "two-write-targets"],
+)
+async def test_managed_agy_permission_rejects_mixed_shapes(
+    kind, arguments, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor("auto")
+    params = _pending_acp_permission(ex, arguments, kind)
+    assert await ex._decide_permission(params) == (False, None)
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["auto", "ask", "accept-edits"])
+@pytest.mark.parametrize(
+    ("kind", "arguments"),
+    [
+        (None, {"CommandLine": ""}),
+        (None, {"CommandLine": " ", "WaitMsBeforeAsync": 10000}),
+        (None, {"CommandLine": 1}),
+        (None, {"CommandLine": "omni --version", "WaitMsBeforeAsync": "10000"}),
+        (None, {"CommandLine": "omni --version", "WaitMsBeforeAsync": True}),
+        (None, {"CommandLine": "omni --version", "toolSummary": []}),
+        (None, {"CommandLine": "omni --version", "RunPersistent": 0}),
+        (None, {"CommandLine": "omni --version", "RequestedTerminalID": False}),
+        ("execute", {"CommandLine": "omni --version", "Cwd": r"C:\work\project"}),
+        ("edit", {"TargetFile": False, "Content": "abc"}),
+        (None, {"Path": 1, "Content": "abc"}),
+        ("edit", {"TargetFile": "note.txt", "Content": []}),
+        (None, {"Path": "note.txt", "Content": "abc", "Overwrite": 1}),
+        ("edit", {"TargetFile": "note.txt", "Content": "abc", "Extra": True}),
+    ],
+    ids=[
+        "empty-command",
+        "blank-command",
+        "number-command",
+        "string-wait",
+        "boolean-wait",
+        "list-summary",
+        "number-persistent",
+        "boolean-terminal-id",
+        "unrecognized-command-key",
+        "boolean-target-file",
+        "number-path",
+        "list-content",
+        "number-overwrite",
+        "unrecognized-write-key",
+    ],
+)
+async def test_managed_agy_permission_rejects_malformed_arguments_before_tier(
+    tier, kind, arguments, windows_acp_permission_executor
+) -> None:
+    ex = windows_acp_permission_executor(tier)
+    params = _pending_acp_permission(ex, arguments, kind)
+    assert await ex._decide_permission(params) == (False, None)
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"tmp\note.txt", (True, "once")),
+        (r"\\server\share\note.txt", (True, "once")),
+        ("/c/work/project/tmp/note.txt", (False, None)),
+        (r"C:\work\project\tmp\note.txt:stream", (False, None)),
+        (r"C:\Windows\System32\drivers\etc\hosts", (False, None)),
+    ],
+    ids=["relative", "unc", "msys-root", "ads", "protected-path"],
+)
+async def test_managed_agy_permission_applies_equal_tier_verdicts_to_write_path_aliases(
+    path, expected, windows_acp_permission_executor
+) -> None:
+    for target_field in ("Path", "TargetFile"):
+        ex = windows_acp_permission_executor("auto")
+        params = _pending_acp_permission(
+            ex, {target_field: path, "Content": "abc", "Overwrite": True}, "other"
+        )
+        assert await ex._decide_permission(params) == expected
+        policy_call = ex._policy_evaluator.await_args
+        assert policy_call is not None
+        assert policy_call.args[1]["name"] == "write_to_file"
+        assert policy_call.args[1]["arguments"]["TargetFile"] == path
+        ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_non_agy_permission_keeps_unknown_tool_ask(
+    windows_acp_permission_executor,
+) -> None:
+    ex = windows_acp_permission_executor("ask", "opencode acp")
+    params = _pending_acp_permission(ex, {"Opaque": True}, "other")
+    assert await ex._decide_permission(params) == (True, "once")
+    ex._elicitation_handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio

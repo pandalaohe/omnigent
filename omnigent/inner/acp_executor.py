@@ -154,6 +154,15 @@ _CLIENT_NOTIFICATION_SESSION_CANCEL = "session/cancel"
 # Server-initiated request methods (agent → client).
 _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
 
+_AGY_ACP_COMMAND_FIELDS = {
+    "CommandLine": str,
+    "WaitMsBeforeAsync": int,
+    "toolSummary": str,
+    "RunPersistent": bool,
+    "RequestedTerminalID": str,
+}
+_AGY_ACP_WRITE_FIELDS = frozenset({"Path", "TargetFile", "Content", "Overwrite"})
+
 # session/update.update.sessionUpdate discriminator values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
 _UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
@@ -1415,35 +1424,61 @@ class AcpExecutor(Executor):
         if not isinstance(arguments, dict):
             return None
         kind = observed.get("kind")
-        name = "unknown"
-        if kind == "execute" and isinstance(arguments.get("CommandLine"), str):
+        if is_antigravity_acp_command(self._config.command):
+            agy_tool = self._validate_agy_permission_tool(kind, arguments)
+            if agy_tool is None:
+                return None
+            name, arguments = agy_tool
+        elif kind == "execute" and isinstance(arguments.get("CommandLine"), str):
             name = "run_command"
         elif kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
             name = "view_file"
         elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
-        elif is_antigravity_acp_command(self._config.command):
-            # agy can report a generic kind. Match its argument schemas only
-            # after binding the request to the pending event above.
-            if isinstance(arguments.get("CommandLine"), str) and arguments.keys() <= {
-                "CommandLine",
-                "Cwd",
-                "RequestedTerminalID",
-                "RunPersistent",
-                "WaitMsBeforeAsync",
-                "toolSummary",
-            }:
-                name = "run_command"
-            elif (
-                arguments.keys() <= {"Path", "Content", "Overwrite"}
-                and isinstance(arguments.get("Path"), str)
-                and isinstance(arguments.get("Content"), str)
-                and isinstance(arguments.get("Overwrite", False), bool)
-            ):
-                name = "write_to_file"
-                arguments = {**arguments, "TargetFile": arguments["Path"]}
+        else:
+            name = "unknown"
         return {"call_id": call_id, "name": name, "arguments": arguments}
+
+    @staticmethod
+    def _validate_agy_permission_tool(
+        kind: object, arguments: _AcpJsonObject
+    ) -> tuple[str, _AcpJsonObject] | None:
+        """Bind only a complete agy argument shape before consulting policy."""
+        keys = arguments.keys()
+        if "CommandLine" in keys:
+            command = arguments["CommandLine"]
+            if (
+                not isinstance(command, str)
+                or not command.strip()
+                or any(
+                    type(value) is not _AGY_ACP_COMMAND_FIELDS.get(key)
+                    for key, value in arguments.items()
+                )
+            ):
+                return None
+            return "run_command", arguments
+        if keys & _AGY_ACP_WRITE_FIELDS:
+            target_field = "Path" if "Path" in keys else "TargetFile"
+            target = arguments.get(target_field)
+            if (
+                keys - {target_field, "Content", "Overwrite"}
+                or not isinstance(target, str)
+                or not target
+                or not isinstance(arguments.get("Content"), str)
+                or not isinstance(arguments.get("Overwrite", False), bool)
+            ):
+                return None
+            return "write_to_file", {**arguments, "TargetFile": target}
+        path = arguments.get("AbsolutePath")
+        if (
+            kind == "read"
+            and isinstance(path, str)
+            and path
+            and not keys & {"Cwd", "WaitMsBeforeAsync", "RunPersistent", "RequestedTerminalID"}
+        ):
+            return "view_file", arguments
+        return None
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
         """Label the agent's options for a choice card, or ``None`` if unusable.
