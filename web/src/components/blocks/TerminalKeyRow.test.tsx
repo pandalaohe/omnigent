@@ -1,5 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { useRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import {
   DEFAULT_TERMINAL_KEY_ITEMS,
   EMPTY_STICKY_MODIFIERS,
@@ -735,5 +737,75 @@ describe("TerminalKeyRow", () => {
   it("keeps the original session typing surface for StickyModifiers", () => {
     const sticky: StickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
     expect(sticky.shift).toBe("off");
+  });
+
+  it("keeps rightward touch swipes on keys and the pager from opening the sidebar while page swipes still open it", () => {
+    const { sessionRef } = makeSessionMock();
+    const onDragProgress = vi.fn();
+    const onSettle = vi.fn();
+
+    function SidebarSwipeHarness() {
+      const drawerRef = useRef<HTMLElement>(null);
+      useSidebarSwipeToOpen({
+        enabled: true,
+        drawerRef,
+        surfaceSelector: ".surface",
+        holdMs: 250,
+        onDragProgress,
+        onSettle,
+      });
+      return (
+        <div className="surface">
+          <aside ref={drawerRef} data-testid="drawer" />
+          <main>
+            <p data-testid="page-content">terminal transcript</p>
+            <TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />
+          </main>
+        </div>
+      );
+    }
+
+    const view = render(<SidebarSwipeHarness />);
+    view.getByTestId("drawer").getBoundingClientRect = () => ({ width: 300 }) as DOMRect;
+
+    const dispatchTouch = (target: Element, type: string, x: number, y: number, time: number) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touches =
+        type === "touchend" || type === "touchcancel" ? [] : [{ clientX: x, clientY: y }];
+      Object.defineProperty(event, "touches", { value: touches });
+      Object.defineProperty(event, "timeStamp", { value: time });
+      target.dispatchEvent(event);
+      return event;
+    };
+
+    const swipeRight = (target: Element) => {
+      dispatchTouch(target, "touchstart", 60, 100, 0);
+      const moves: Event[] = [];
+      for (let step = 1; step <= 5; step++) {
+        moves.push(dispatchTouch(target, "touchmove", 60 + 30 * step, 100, step * 40));
+      }
+      const end = dispatchTouch(target, "touchend", 0, 0, 216);
+      return { moves, end };
+    };
+
+    const pinnedKey = screen.getByRole("button", { name: "Esc" });
+    const pagedKey = screen.getByRole("button", { name: "Tab" });
+    const pager = screen
+      .getByTestId("terminal-key-row-pager")
+      .querySelector("[data-pager]") as HTMLElement;
+
+    for (const target of [pinnedKey, pagedKey, pager]) {
+      const { moves, end } = swipeRight(target);
+      expect(onDragProgress).not.toHaveBeenCalled();
+      expect(onSettle).not.toHaveBeenCalled();
+      expect(moves.some((move) => move.defaultPrevented)).toBe(false);
+      expect(end.defaultPrevented).toBe(false);
+    }
+
+    // Control: a rightward swipe on ordinary page content still opens the drawer.
+    swipeRight(view.getByTestId("page-content"));
+    expect(onDragProgress).toHaveBeenCalledWith(150 / 300);
+    expect(onDragProgress).toHaveBeenLastCalledWith(null);
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(true);
   });
 });
