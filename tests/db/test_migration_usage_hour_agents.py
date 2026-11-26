@@ -8,6 +8,8 @@ import sqlalchemy as sa
 from omnigent.db.utils import get_or_create_engine
 from tests.db.test_migration_usage_hours import _alembic_command
 
+_USAGE_SPLIT_REVISION = "a72c20261117"
+
 
 def test_agent_migration_roundtrip(db_uri):
     engine = get_or_create_engine(db_uri)
@@ -59,7 +61,13 @@ def test_agent_migration_roundtrip(db_uri):
     ("target", "incompatible", "missing_allowance", "reason"),
     [
         ("a70c20261113", {"repeats": True}, False, "repeating"),
-        ("-2", {"repeats": True, "ends_on": "2026-11-03"}, False, "repeating"),
+        pytest.param(
+            f"{_USAGE_SPLIT_REVISION}-2",
+            {"repeats": True, "ends_on": "2026-11-03"},
+            False,
+            "repeating",
+            id="relative-fork",
+        ),
         ("base", {}, True, "without allowance"),
     ],
 )
@@ -112,7 +120,8 @@ def test_mysql_deep_downgrade_refuses_before_ddl_and_keeps_stamp(
             == before
         )
     try:
-        recovery = "-1" if target == "-2" else "a71c20261113"
+        # Resolve the relative case from the usage branch, not the merged head.
+        recovery = f"{_USAGE_SPLIT_REVISION}-1" if target.endswith("-2") else "a71c20261113"
         _alembic_command(db_uri, engine, "downgrade", recovery)
         assert "usage_hour_agents" not in sa.inspect(engine).get_table_names()
     finally:

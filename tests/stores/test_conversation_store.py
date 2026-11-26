@@ -238,14 +238,15 @@ class _CommitSerializationFailure(Exception):
 
 
 class _RetryOnceMaker:
-    """Wrap a real maker and inject one failure before its first commit."""
+    """Wrap a real maker and inject a failure before the first matching commit."""
 
-    def __init__(self, delegate: Any) -> None:
+    def __init__(self, delegate: Any, *, operation: str | None = None) -> None:
         """Create a CockroachDB-shaped maker around a real test session."""
         self.engine = MagicMock()
         self.engine.dialect.name = "cockroachdb"
         self.query_name_prefix = delegate.query_name_prefix
         self._delegate = delegate
+        self._operation = operation
         self.attempts = 0
 
     @contextmanager
@@ -253,6 +254,8 @@ class _RetryOnceMaker:
         """Roll back the first attempt, then allow the second to commit."""
         with self._delegate(query_name) as session:
             yield session
+            if self._operation is not None and query_name != self._operation:
+                return
             self.attempts += 1
             if self.attempts == 1:
                 raise DBAPIError("commit", {}, _CommitSerializationFailure(), False)
@@ -8685,9 +8688,15 @@ def test_fork_seeds_next_position_from_copied_items(
     assert _stored_positions(conversation_store, fork.id) == [0, 1, 2, 3]
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["reserve_fork_journal", "insert_fork_project_admission"],
+    ids=["reserve-journal", "publish-fork"],
+)
 def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     """Fork retries replay inserts without repeating preparation hooks."""
 
@@ -8728,7 +8737,7 @@ def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
         "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
         generate_id,
     )
-    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate)
+    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate, operation=operation)
     store._session_immediate = retrying_metadata_maker
 
     fork = store.fork_conversation(source.id)

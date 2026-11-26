@@ -1083,7 +1083,8 @@ def fork_journal_entry_id(fork_id: str, entry_id: str) -> str:
 
 def reserve_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> None:
     """Claim an unused journal before staging a fork or enabling failure cleanup."""
-    with sessions("reserve_fork_journal") as session:
+
+    def reserve(session: Session) -> None:
         if session.get(SqlConversationMetadata, (current_workspace_id(), fork_id)) or (
             session.execute(
                 _using(
@@ -1108,6 +1109,8 @@ def reserve_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> No
                 next_position=0,
             )
         )
+
+    run_write_transaction(sessions, "reserve_fork_journal", reserve)
 
 
 def copy_journal_for_fork(
