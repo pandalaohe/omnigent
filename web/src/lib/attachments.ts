@@ -166,7 +166,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".ipynb",
 ]);
 
-// Archives, Office documents, and databases require filesystem tools unless the
+// Archives, Office documents, databases, and MP4 videos require filesystem tools unless the
 // server reports its own policy. Mirrors DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
 // in omnigent/inner/native_attachments.py.
 const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
@@ -177,6 +177,7 @@ const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".db",
   ".sqlite",
   ".sqlite3",
+  ".mp4",
 ]);
 
 // Text/code extensions a browser may not map to a `text/*` type, which then
@@ -223,8 +224,8 @@ export function classifyAttachment(
 
   // Match the server even when a browser mislabels a ZIP as text/plain.
   if (filesystemExtensions.has(ext)) return "file";
-  // A default filesystem type the server leaves out is refused, not inlined.
-  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext) && !policy?.all_types) return null;
+  // The server's all-types policy also keeps default filesystem types out of inline delivery.
+  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return policy?.all_types ? "file" : null;
   if (type.startsWith("image/") || ext === ".gif") return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
@@ -245,7 +246,7 @@ function supportedAttachmentTypes(policy?: FilesystemAttachmentsInfo | null): st
     (extensions.length === DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.size &&
       extensions.every((ext) => DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)));
   if (isDefault) {
-    return "images, PDF, text/code, archives, office documents, and databases";
+    return "images, PDF, text/code, archives, office documents, databases, and MP4 videos";
   }
   if (extensions.length === 0) return "images, PDF, and text/code files";
   return `images, PDF, text/code, and ${extensions.join(", ")} files`;

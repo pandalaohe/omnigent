@@ -310,6 +310,8 @@ def search_indexed_paths(
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
     limit: int = 500,
+    kept_path: Callable[[str], bool] | None = None,
+    describe_link: Callable[[str, os.stat_result], FilesystemEntry] | None = None,
 ) -> list[FilesystemEntry]:
     """Match already-enumerated *paths* the way the directory walk would.
 
@@ -320,8 +322,9 @@ def search_indexed_paths(
     entries returned are stat'ed, and never through a symlink: parents are
     opened without following links and the leaf is ``lstat``-ed, so nothing
     outside *root* is ever described, even if a link is swapped mid-search.
-    A leaf that is itself a symlink is left out — the sandboxed walk, which
-    can follow links safely, describes those — and so is a path that no
+    A leaf that is itself a symlink is left out unless *describe_link* is
+    given — the sandboxed walk, which can follow links safely, describes
+    those — and so is a path that no
     longer exists (indexed but deleted from the working tree).
 
     :param root: Absolute directory the paths are relative to.
@@ -331,6 +334,9 @@ def search_indexed_paths(
     :param exclude: Pre-split exclude globs; an excluded directory takes its
         whole subtree with it, as the walk's pruning does.
     :param limit: Maximum number of entries to return.
+    :param kept_path: Returns False for a path, file or directory, to leave out.
+    :param describe_link: Describes a leaf that is a symlink, given its path and
+        own ``lstat``; without it, such leaves are left out.
     :returns: Matching entries sorted by path.
     """
     q = query.strip().lower()
@@ -343,6 +349,8 @@ def search_indexed_paths(
         parts = rel.split("/")
         ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
         if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        if kept_path is not None and not kept_path(rel):
             return False
         return not inc or any(r.match(rel) for r in inc)
 
@@ -370,7 +378,13 @@ def search_indexed_paths(
         if not kept(rel):
             continue
         st = _lstat_beneath(root, rel)
-        if st is None or stat.S_ISLNK(st.st_mode):
+        if st is None:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            if describe_link is not None and not candidates[rel]:
+                entries.append(describe_link(rel, st))
+                if len(entries) >= limit:
+                    break
             continue
         # A submodule is one index entry but a directory on disk.
         is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)

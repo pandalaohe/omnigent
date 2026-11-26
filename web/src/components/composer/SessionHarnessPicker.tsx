@@ -21,6 +21,10 @@ import {
   ComposerConfigSections,
   type ComposerConfigSection,
 } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerPaletteSettings,
+  MODEL_BUSY_REASON,
+} from "@/components/composer/composerSectionSettings";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
@@ -100,6 +104,7 @@ export function SessionHarnessPicker({
   disabled,
   openNonce = 0,
   modelPickerShortcutEnabled = false,
+  paletteSettingsSource,
 }: {
   appearance?: "composer" | "header";
   busy: boolean;
@@ -135,6 +140,8 @@ export function SessionHarnessPicker({
   modelPickerShortcutEnabled?: boolean;
   /** Read and change this session instead of the active conversation. */
   sessionId?: string;
+  /** Offer Model and Reasoning Effort in ⌘K under this; unset while quick_pick_palette is off. */
+  paletteSettingsSource?: string;
 }) {
   const modelPickerShortcut = useShortcutHint("openModelPicker");
   const isMobile = useIsMobileViewport();
@@ -726,7 +733,7 @@ export function SessionHarnessPicker({
       />
     </>
   );
-  return (
+  const picker = (
     <HarnessPicker
       contentClassName={isMobile && configOpen ? "w-[calc(100vw-1.5rem)]" : undefined}
       contentSide={appearance === "header" ? "bottom" : "top"}
@@ -821,6 +828,31 @@ export function SessionHarnessPicker({
         </HarnessPickerConfigRow>
       )}
     </HarnessPicker>
+  );
+  const routing = costRoutingEligible &&
+    showModels && {
+      active: routingOn,
+      unavailableReason: busy || pendingModelChange !== null ? MODEL_BUSY_REASON : undefined,
+      select: () => {
+        cancelCycle();
+        void apply(() => useChatStore.getState().setCostControlMode("on", ...target));
+      },
+    };
+  // The picker keeps its place as a source comes and goes, so it never remounts; without a
+  // source the ⌘K settings never mount and their hooks never run.
+  return (
+    <>
+      {paletteSettingsSource !== undefined && (
+        <ComposerPaletteSettings
+          source={paletteSettingsSource}
+          models={disabled ? undefined : modelSection}
+          efforts={disabled ? undefined : effortSection}
+          effortRouted={routingOn}
+          routing={routing || undefined}
+        />
+      )}
+      {picker}
+    </>
   );
 }
 

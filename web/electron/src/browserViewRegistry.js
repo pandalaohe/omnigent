@@ -19,6 +19,7 @@
  *    keep working); never emulate before the first commit — it SEGFAULTs.
  */
 
+const { randomUUID } = require("node:crypto");
 const {
   checkAgentNavigation,
   isExplicitlyAllowlisted,
@@ -32,6 +33,7 @@ const {
 const crypto = require("node:crypto");
 const path = require("node:path");
 const { createAgentNavigation } = require("./agentNavigation");
+const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
@@ -132,20 +134,29 @@ function createBrowserViewRegistry({
   const partitionFor = (viewId) =>
     partitionForView(viewId, () => agentPartition(partitionScope, viewId));
 
-  function beginAgentNavigation(conversationId) {
-    const generation = Symbol();
+  // A continuation consumes its original generation without superseding a newer navigation.
+  function beginAgentNavigation(conversationId, retryToken) {
+    if (
+      retryToken !== undefined &&
+      pendingNavigations.get(conversationId)?.generation !== retryToken
+    ) {
+      return null;
+    }
+    const generation = randomUUID();
     const partition = entries.get(conversationId)?.partition ?? partitionFor(conversationId);
     pendingNavigations.set(conversationId, { generation, partition });
-    return () => pendingNavigations.get(conversationId)?.generation === generation;
+    return Object.assign(() => pendingNavigations.get(conversationId)?.generation === generation, {
+      retryToken: generation,
+    });
   }
   const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
 
   function needsAgentViewRevocation(entry, nextContext) {
     const context = entry?.agentContext;
     return (
-      context?.hostIsThisMachine === true &&
+      hasHostLocalAccess(context) &&
       (context.revoked ||
-        !nextContext?.hostIsThisMachine ||
+        !hasHostLocalAccess(nextContext) ||
         nextContext.sourceHostId !== context.sourceHostId)
     );
   }
@@ -385,6 +396,7 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       try {
+        beginAgentNavigation(entry.conversationId);
         wc.loadURL(url);
       } catch {
         /* view destroyed mid-click */
@@ -451,7 +463,10 @@ function createBrowserViewRegistry({
         if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
-    wc.on("will-navigate", guard);
+    wc.on("will-navigate", (event, targetUrl) => {
+      beginAgentNavigation(conversationId);
+      guard(event, targetUrl);
+    });
     wc.on("will-redirect", guard);
     // Subframe navigations (iframes) can also reach an internal host; guard them
     // too. Older Electron may not emit this event — harmless if it never fires.

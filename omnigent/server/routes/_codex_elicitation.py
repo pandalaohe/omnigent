@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -22,6 +22,14 @@ _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 
 _CodexParamsBuilder = Callable[[Any, str, dict[str, Any]], ElicitationRequestParams]
 _CodexResponseBuilder = Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]]
+
+
+def is_session_private_question(params: Mapping[str, Any]) -> bool:
+    """Whether a structured question stays in its own session."""
+    return params.get("async_kind") == "question" or (
+        params.get("codex_method") == _CODEX_TOOL_REQUEST_USER_INPUT_METHOD
+        and params.get("is_blocking") is False
+    )
 
 
 @dataclass(frozen=True)
@@ -72,8 +80,9 @@ class CodexElicitationRequest:
     def is_nonblocking_question(self) -> bool:
         """Whether this card stays in its session and can close without interrupting."""
         extras = self.params.model_extra or {}
-        return self.method == _CODEX_TOOL_REQUEST_USER_INPUT_METHOD and (
-            extras.get("async_kind") == "question" or extras.get("is_blocking") is False
+        return (
+            self.method == _CODEX_TOOL_REQUEST_USER_INPUT_METHOD
+            and is_session_private_question(extras)
         )
 
 

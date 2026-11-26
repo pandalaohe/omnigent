@@ -480,6 +480,9 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
     assert loop_progressed == [True], f"{dependency} resolution blocked the runner's event loop"
 
 
+_FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
@@ -489,6 +492,8 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
         "cancel_launch",
         "use_envelope",
         "provider_profile",
+        "codex_args_only",
+        "app_server_version",
     ),
     [
         pytest.param(
@@ -498,6 +503,8 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
             cancel_launch,
             use_envelope,
             None,
+            False,
+            version if version is None else (0, 153, 1),
             id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
             f"{'envelope' if use_envelope else 'legacy'}",
         )
@@ -511,8 +518,30 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
     ]
     + [
         pytest.param(
-            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
-        )
+            (0, 154, 0),
+            [],
+            True,
+            False,
+            True,
+            "configured-workspace",
+            False,
+            (0, 153, 1),
+            id="configured-provider",
+        ),
+        pytest.param(
+            (0, 154, 0), [], True, False, True, None, True, (0, 154, 0), id="configured-codex-args"
+        ),
+        pytest.param(
+            (0, 153, 1),
+            ["--config", "approval_policy=on-request"],
+            False,
+            False,
+            True,
+            None,
+            False,
+            (0, 154, 0),
+            id="older-wrapper-newer-app-server",
+        ),
     ],
 )
 @pytest.mark.parametrize("peer_enabled", [False, True])
@@ -528,6 +557,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     use_envelope: bool,
     rotated: bool,
     provider_profile: str | None,
+    codex_args_only: bool,
+    app_server_version: tuple[int, int, int] | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -681,7 +712,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
-        codex_cli_version = version
+        # Known wrappers can differ; unknown versions retain the server's fallback.
+        codex_cli_version = app_server_version
         agent_pid: int | None = None
         workspace_profile = None
 
@@ -702,7 +734,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def start(self) -> None:
             """Observe MCP tools before Codex preloads the resumed thread."""
-            listed = relay_bridge._handle_mcp_request("tools/list", {}, {}, bridge_dir)
+            listed = relay_bridge._handle_mcp_request("tools/list", {}, bridge_dir)
             startup_tool_names.update(tool["name"] for tool in listed["tools"])
             assert list(self.codex_home.glob(f"sessions/**/rollout-*-{thread_id}.jsonl")), (
                 "Codex resume rollout must be synthesized in app-server CODEX_HOME "
@@ -902,16 +934,33 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         codex_app_mod, "apply_codex_thread_collaboration_mode", _fake_apply_collaboration_mode
     )
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+    configured_args = list(_FULL_ACCESS_ARGS) if codex_args_only else ["codex", "--"]
+    harness_override = (
+        {"args": configured_args} if codex_args_only else {"command": "codex-wrapper"}
+    )
     monkeypatch.setattr(
         startup_config_mod,
         "resolve_harness_config",
-        lambda _cfg: (None, {"codex-native": {"command": "codex-wrapper"}}),
+        lambda _cfg: (None, {"codex-native": harness_override}),
     )
     monkeypatch.setattr(
         startup_config_mod,
         "resolve_harness_args",
-        lambda _harness, args, *, cfg: ["codex", "--", *args],
+        lambda _harness, args, *, cfg: [*configured_args, *args],
     )
+    import omnigent.inner.codex_executor as codex_executor_mod
+
+    monkeypatch.setattr(codex_executor_mod, "_find_codex_cli", lambda: app_server.codex_path)
+    wrapper_probes: list[tuple[str, ...]] = []
+
+    async def _fake_codex_cli_version(*argv: str) -> tuple[int, int, int] | None:
+        if argv == (app_server.codex_path,):
+            return app_server.codex_cli_version
+        assert argv == ("codex-wrapper", "codex", "--"), f"unexpected version probe: {argv!r}"
+        wrapper_probes.append(argv)
+        return version
+
+    monkeypatch.setattr(codex_executor_mod, "_codex_cli_version", _fake_codex_cli_version)
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -1029,11 +1078,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     assert len(launched_specs) == 1
     launched = launched_specs[0]
-    assert launched.command == "codex-wrapper"
+    expected_command = app_server.codex_path if codex_args_only else "codex-wrapper"
+    assert launched.command == expected_command
+    assert wrapper_probes == ([] if codex_args_only else [("codex-wrapper", "codex", "--")])
     # Older TUIs still need permission flags; Codex 0.154+ rejects them.
     assert launched.args == [
-        "codex",
-        "--",
+        *([] if codex_args_only else ["codex", "--"]),
         "-c",
         "check_for_update_on_startup=false",
         "--dangerously-bypass-hook-trust",
@@ -1061,7 +1111,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     ]
     assert len(launch_events) == 1
     assert launch_events[0].session_id == session_id
-    assert launch_events[0].attributes["command"] == "codex-wrapper"
+    assert launch_events[0].attributes["command"] == expected_command
     assert launch_events[0].attributes["resume"] is True
     from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
 
@@ -1075,7 +1125,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         (
             app_server.listen_url,
             thread_id,
-            ["--config", "approval_policy=on-request"],
+            [
+                *(_FULL_ACCESS_ARGS if codex_args_only else []),
+                "--config",
+                "approval_policy=on-request",
+            ],
             "omnigent_databricks" if provider_profile else None,
         )
     ]
@@ -1124,8 +1178,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     # Resume state is published before the configured wrapper starts, so the
     # executor never needs a startup-timeout marker for this path.
     assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None
-    assert "bridge state is preloaded" in caplog.text
-    assert "no bridge-state wait extension is needed" in caplog.text
+    if not codex_args_only:
+        assert "bridge state is preloaded" in caplog.text
+        assert "no bridge-state wait extension is needed" in caplog.text
+        assert ("reported no Codex version" in caplog.text) is (version is None)
 
 
 @pytest.mark.asyncio
@@ -1457,7 +1513,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "fork-resume must not expose stale bridge state before preload"
         )
-        assert terminal_launch_args is None
+        assert terminal_launch_args == []
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -1769,7 +1825,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         codex_path: str | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
-        assert terminal_launch_args is None
+        assert terminal_launch_args == []
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -2499,7 +2555,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
         async def start(self) -> None:
             """Observe the first MCP tool listing while Codex starts."""
-            listed = relay_bridge._handle_mcp_request("tools/list", {}, {}, bridge_dir)
+            listed = relay_bridge._handle_mcp_request("tools/list", {}, bridge_dir)
             startup_tool_names.update(tool["name"] for tool in listed["tools"])
 
         async def close(self) -> None:

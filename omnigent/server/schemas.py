@@ -2818,6 +2818,12 @@ class SessionResponse(BaseModel):
         family instead of inferring it from the model string (which
         is wrong when the agent declares no model). ``None`` when
         the agent cannot be looked up.
+    :param permission_mode: The permission mode the session is in, in its
+        harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
+        names ``sys_session_create`` takes). Follows a switch made while it
+        runs to a mode that keeps approval; a mode that skips approval shows
+        only when the session's launch settings select it. ``None`` when the
+        harness has no permission modes or the mode cannot be told.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
@@ -2888,9 +2894,10 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Own cumulative token baseline for Pi and Codex
-        side chats, excluding descendants. Available even when display usage
-        aggregation is skipped; ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative usage baseline for Pi, Claude
+        native and Codex side chats, excluding descendants. Available even when
+        display usage aggregation is skipped; ``None`` for other harnesses or
+        older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -3080,6 +3087,7 @@ class SessionResponse(BaseModel):
     permission_tier_revision: int | None = None
     permission_tier_state: Literal["ready", "switching", "blocked"] | None = None
     permission_tiers_capability: bool = False
+    permission_mode: str | None = None
     model_override: str | None = None
     requested: str | None = None
     launched: str | None = None

@@ -45,6 +45,7 @@ import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
+import { notifyTerminalThemeChanged } from "./terminalThemePreferences";
 import {
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
@@ -231,6 +232,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyCodeBlockWordWrapChanged();
   notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();
+  notifyTerminalThemeChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

@@ -704,6 +704,15 @@ class TerminalFitAddon extends FitAddon {
 }
 
 /**
+ * The width the fit holds back for the scrollbar, as xterm's fit addon reckons it: none without
+ * scrollback, else the overview ruler's width or 14px.
+ */
+export function terminalFitReserveWidth(term: Pick<Terminal, "options">): number {
+  if (term.options.scrollback === 0) return 0;
+  return term.options.overviewRuler?.width || 14;
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -965,6 +974,7 @@ export class TerminalSession {
       (ev) => {
         this.touchSelection?.cancel();
         this.hostClipboard.close();
+        this.clearFittedSize();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1490,6 +1500,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.imeInput.dispose();
     this.imeAnchor?.detach();
+    this.clearFittedSize();
     this.dataDispose.dispose();
     this.stickyListeners.clear();
     this.osc52Dispose.dispose();
@@ -1561,6 +1572,13 @@ export class TerminalSession {
     return this.container.getClientRects().length > 0;
   }
 
+  /** A closed or disposed session has no fitted size to say. */
+  private clearFittedSize(): void {
+    delete this.container.dataset.terminalCols;
+    delete this.container.dataset.terminalRows;
+    delete this.container.dataset.terminalFitReserveWidth;
+  }
+
   private sendResize(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
     // Keep the last real size while hidden; the ResizeObserver re-fits once
@@ -1573,6 +1591,10 @@ export class TerminalSession {
       return;
     }
     const { cols, rows } = this.term;
+    // The container says its fitted size in cells, so a layout around it can measure in cells.
+    this.container.dataset.terminalCols = String(cols);
+    this.container.dataset.terminalRows = String(rows);
+    this.container.dataset.terminalFitReserveWidth = String(terminalFitReserveWidth(this.term));
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both
     // call this on mount, and a transient re-fit can land the same size. On
     // the control transport an unchanged size is a wasted round-trip (tmux

@@ -773,6 +773,8 @@ _ALL_TYPES = FilesystemAttachmentPolicy(all_types=True)
         ("photo.png", "image/png", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "inline"),
         ("data.csv", "application/vnd.ms-excel", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "inline"),
         ("bundle.zip", "text/plain", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "filesystem"),
+        ("clip.mp4", "text/plain", FilesystemAttachmentPolicy(frozenset(), True), "filesystem"),
+        ("clip.mp4", "text/plain", FilesystemAttachmentPolicy(frozenset()), None),
         ("trace.gz", "application/gzip", DEFAULT_FILESYSTEM_ATTACHMENT_POLICY, "filesystem"),
         # All types: whatever can't be inlined goes to disk, including untyped compressed text.
         ("notes.txt", "text/plain", _ALL_TYPES, "inline"),
@@ -1116,7 +1118,7 @@ def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: i
     ],
 )
 def test_attachment_upload_limit_rejects_unsupported_types(content_type: str) -> None:
-    """Office/binary/media types are not uploadable (None ⇒ caller 415s)."""
+    """Binary/media types cannot be inlined; supported extensions use filesystem delivery."""
     from omnigent.runtime.content_resolver import attachment_upload_limit
 
     assert attachment_upload_limit(content_type) is None

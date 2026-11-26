@@ -639,8 +639,8 @@ def attachment_delivery(
     Decide how an upload reaches the agent, or ``None`` when it is refused.
 
     Listed extensions are matched by name first, so a misleading MIME cannot
-    send one inline; a default filesystem extension the policy leaves out is
-    refused for the same reason. Everything else accepted inline stays inline;
+    send one inline. Default filesystem extensions follow the all-types policy
+    when not listed explicitly. Everything else accepted inline stays inline;
     with ``policy.all_types``, the remaining files are delivered as files.
 
     :param filename: The upload's filename, e.g. ``"trace.gz"``.
@@ -651,7 +651,7 @@ def attachment_delivery(
     if policy.matches(filename):
         return "filesystem"
     if requires_filesystem(filename):
-        return None
+        return "filesystem" if policy.all_types else None
     content_type = _resolve_content_type(declared_type, filename)
     if (
         attachment_upload_limit(content_type) is not None

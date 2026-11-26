@@ -99,6 +99,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    diagnose_content_policy_refusal,
     diagnose_model_unavailable,
     turn_error_display_message,
 )
@@ -253,6 +254,8 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _collect_descendant_conversation_ids_paged,
+    _delete_session_tree_files,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -2949,15 +2952,16 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # Set when this message sends a file outside the default extensions, which
+        # Set when this message sends a file outside the legacy extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
         if body.type in ("message", _SLASH_COMMAND_TYPE):
             from omnigent.inner.native_attachments import (
+                CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                 DELIVERY_KEY,
+                filesystem_attachment_capability,
                 inline_filesystem_attachment_name,
                 is_by_path,
-                requires_filesystem,
             )
             from omnigent.runtime.content_resolver import attachment_delivery
 
@@ -2991,7 +2995,10 @@ def register_events_routes(
                     if stored.filename is not None and is_by_path(
                         stored.filename, stored.source_metadata
                     ):
-                        if not requires_filesystem(stored.filename):
+                        if (
+                            filesystem_attachment_capability([stored.filename])
+                            == CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+                        ):
                             outgoing_needs_delivery_capability = True
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
@@ -4849,12 +4856,12 @@ def register_events_routes(
                 else:
                     error_code = "native_turn_error"
                 classified_code = classify_native_turn_error(error_code, output)
-                # The old-CLI refusal carries the versions, so the card can name the fix.
-                diagnosis = (
-                    diagnose_client_update_required(output)
-                    if classified_code == "client_update_required"
-                    else None
-                )
+                # Claude Code's refusal text identifies the cause, so the card can name the fix.
+                diagnosis = None
+                if classified_code == "client_update_required":
+                    diagnosis = diagnose_client_update_required(output)
+                elif classified_code == "content_policy_refusal":
+                    diagnosis = diagnose_content_policy_refusal(output)
                 if harness == "codex-native" and classified_code in {
                     "codex_turn_error",
                     "native_turn_error",
@@ -7522,9 +7529,7 @@ def register_events_routes(
                 "Worktree removal is unresolved; retry deletion after host confirmation",
                 code=ErrorCode.CONFLICT,
             )
-        descendant_ids = await delete_lease.run(
-            _best_effort_stop(session_id, conversation_store, runner_router)
-        )
+        await delete_lease.run(_best_effort_stop(session_id, conversation_store, runner_router))
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -7597,117 +7602,104 @@ def register_events_routes(
                         fail_if_unavailable=True,
                     )
                 )
-        # Session file cleanup. delete_all_for_session returns only the blob
-        # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
-        if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys = await delete_lease.to_thread(
-                file_store.delete_all_for_session, session_id
-            )
-            # Best-effort: a backend failure on one blob must not abort the
-            # delete after the file rows are already gone.
-            failed_blob_count = 0
-            for blob_key in orphaned_blob_keys:
-                try:
-                    await delete_lease.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:
-                    failed_blob_count += 1
-                    _logger.warning(
-                        "Failed to delete attachment blob %s for session %s: %s",
-                        blob_key,
-                        session_id,
-                        type(exc).__name__,
-                    )
-            if failed_blob_count:
-                _logger.warning(
-                    "Session %s deleted with %d of %d attachment blobs left behind",
-                    session_id,
-                    failed_blob_count,
-                    len(orphaned_blob_keys),
-                )
-        _interrupt_fenced_sessions.discard(session_id)
-        _intentional_stop_sessions.pop(session_id, None)
-        disarm_native_subagent_watchdogs(session_id)
-        deleted = await delete_lease.run(conversation_store.delete_conversation(session_id))
-        if not deleted:
-            raise _session_not_found()
-        # A relay still inside an offline runner's reconnect grace must not
-        # fail the deleted turns when that grace expires.
-        _cancel_runner_relays([session_id, *descendant_ids])
-        for deleted_id in (session_id, *descendant_ids):
-            forget_live_status(deleted_id)
-        # The session is gone, so is its launch-progress state. Failed
-        # launches are retained in the cache for reload visibility while
-        # the session exists; without this eviction every deleted
-        # failed-launch session would leak one entry for the process
-        # lifetime.
-        _session_sandbox_status_cache.pop(session_id, None)
-        # Same for MCP startup state: failed/cancelled maps are retained
-        # for reload visibility while the session exists, so a session
-        # whose MCP startup never settled clean would leak its entry.
-        _session_mcp_startup_cache.pop(session_id, None)
-        # Same for the extension-pushed model catalog: kept across reloads
-        # while the session exists (the extension only pushes on start), so a
-        # deleted session would otherwise leak its entry for the process life.
-        _pushed_model_options_cache.pop(session_id, None)
-        # The durable todo snapshot is deleted with the conversation, so its
-        # process-local fast path must go too.
-        # Background detail and the last live status are also retained across
-        # reloads while a session exists. Deletion makes those entries dead.
-        _session_background_task_count_cache.pop(session_id, None)
-        _session_background_tasks_cache.pop(session_id, None)
-        _session_status_cache.pop(session_id, None)
-        # Drop the deleted session's per-user read-state from every user's
-        # caches so they don't accumulate orphan entries for the process
-        # lifetime.
-        _prune_session_read_state(session_id)
-        # Same for the tracker's entry — a deleted session's launch can
-        # never be rendezvoused again (access checks 404 first), so a
-        # retained failure is dead weight. ``finish`` also settles a
-        # still-in-flight entry, releasing any parked message POST into
-        # its session re-read (which now correctly 404s); the background
-        # task's later ``fail`` on the popped entry is a no-op.
-        managed_launches_for_delete = getattr(state, "managed_launches", None)
-        if managed_launches_for_delete is not None:
-            managed_launches_for_delete.finish(session_id)
-        # Managed-host cleanup: terminate a server-provisioned sandbox and
-        # delete its host row (revoking its token) once no other session, such
-        # as a /clear continuation, uses it. Best-effort: the provider's
-        # lifetime cap reaps stragglers. Laptop hosts are never touched.
-        host_store_for_managed = getattr(state, "host_store", None)
-        if conv.host_id is not None and host_store_for_managed is not None:
-            from omnigent.server.managed_hosts import release_session_managed_host
 
-            await delete_lease.run(
-                release_session_managed_host(
+        async def finish_delete() -> None:
+            owners = await _collect_descendant_conversation_ids_paged(
+                conversation_store, session_id
+            )
+            try:
+                deleted = await conversation_store.delete_conversation(session_id)
+            except Exception:  # The store commits the conversation before cleaning metadata.
+                if await asyncio.to_thread(conversation_store.get_conversation, session_id):
+                    raise
+                _logger.exception(
+                    "Session %s deleted with incomplete metadata cleanup", session_id
+                )
+                deleted = True
+            if not deleted:
+                raise _session_not_found()
+            _interrupt_fenced_sessions.discard(session_id)
+            _intentional_stop_sessions.pop(session_id, None)
+            disarm_native_subagent_watchdogs(session_id)
+            # A relay still inside an offline runner's reconnect grace must not
+            # fail the deleted turns when that grace expires.
+            _cancel_runner_relays([session_id, *owners])
+            for deleted_id in (session_id, *owners):
+                forget_live_status(deleted_id)
+            if file_store is not None and artifact_store is not None:
+                await _delete_session_tree_files(file_store, artifact_store, session_id, owners)
+            # The session is gone, so is its launch-progress state. Failed
+            # launches are retained in the cache for reload visibility while
+            # the session exists; without this eviction every deleted
+            # failed-launch session would leak one entry for the process
+            # lifetime.
+            _session_sandbox_status_cache.pop(session_id, None)
+            # Same for MCP startup state: failed/cancelled maps are retained
+            # for reload visibility while the session exists, so a session
+            # whose MCP startup never settled clean would leak its entry.
+            _session_mcp_startup_cache.pop(session_id, None)
+            # Same for the extension-pushed model catalog: kept across reloads
+            # while the session exists (the extension only pushes on start), so a
+            # deleted session would otherwise leak its entry for the process life.
+            _pushed_model_options_cache.pop(session_id, None)
+            # The durable todo snapshot is deleted with the conversation, so its
+            # process-local fast path must go too.
+            # Background detail and the last live status are also retained across
+            # reloads while a session exists. Deletion makes those entries dead.
+            _session_background_task_count_cache.pop(session_id, None)
+            _session_background_tasks_cache.pop(session_id, None)
+            _session_status_cache.pop(session_id, None)
+            # Drop the deleted session's per-user read-state from every user's
+            # caches so they don't accumulate orphan entries for the process
+            # lifetime.
+            _prune_session_read_state(session_id)
+            # Same for the tracker's entry — a deleted session's launch can
+            # never be rendezvoused again (access checks 404 first), so a
+            # retained failure is dead weight. ``finish`` also settles a
+            # still-in-flight entry, releasing any parked message POST into
+            # its session re-read (which now correctly 404s); the background
+            # task's later ``fail`` on the popped entry is a no-op.
+            managed_launches_for_delete = getattr(state, "managed_launches", None)
+            if managed_launches_for_delete is not None:
+                managed_launches_for_delete.finish(session_id)
+            # Managed-host cleanup: terminate a server-provisioned sandbox and
+            # delete its host row (revoking its token) once no other session, such
+            # as a /clear continuation, uses it. Best-effort: the provider's
+            # lifetime cap reaps stragglers. Laptop hosts are never touched.
+            host_store_for_managed = getattr(state, "host_store", None)
+            if conv.host_id is not None and host_store_for_managed is not None:
+                from omnigent.server.managed_hosts import release_session_managed_host
+
+                await release_session_managed_host(
                     conv.host_id,
                     host_store_for_managed,
                     getattr(state, "sandbox_config", None),
                     capture_logs=capture_logs,
                 )
-            )
-        try:
-            import time as _time
+            try:
+                import time as _time
 
-            _srv_id = _get_installation_id()
-            _anon_d = _tel_anon_user_id(user_id, _srv_id)
-            _usage = conv.session_usage or {}
-            _duration: float | None = None
-            with contextlib.suppress(Exception):
-                _duration = _time.time() - conv.created_at
-            _tel_emit(
-                _TelSessionDeletedEvent(
-                    session_id=session_id,
-                    installation_id=_srv_id,
-                    anon_user_id=_anon_d,
-                    duration_seconds=_duration,
-                    input_tokens=_usage.get("input_tokens"),
-                    output_tokens=_usage.get("output_tokens"),
-                    total_cost_usd=_usage.get("total_cost_usd"),
+                _srv_id = _get_installation_id()
+                _anon_d = _tel_anon_user_id(user_id, _srv_id)
+                _usage = conv.session_usage or {}
+                _duration: float | None = None
+                with contextlib.suppress(Exception):
+                    _duration = _time.time() - conv.created_at
+                _tel_emit(
+                    _TelSessionDeletedEvent(
+                        session_id=session_id,
+                        installation_id=_srv_id,
+                        anon_user_id=_anon_d,
+                        duration_seconds=_duration,
+                        input_tokens=_usage.get("input_tokens"),
+                        output_tokens=_usage.get("output_tokens"),
+                        total_cost_usd=_usage.get("total_cost_usd"),
+                    )
                 )
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        await delete_lease.run(finish_delete())
         await delete_lease.release()
         return ConversationDeleted(id=session_id)
 

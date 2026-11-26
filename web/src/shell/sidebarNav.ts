@@ -122,6 +122,12 @@ export const COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY = "omnigent:collapsed-sid
 // when its name is present here.
 export const EXPANDED_PROJECT_SECTIONS_STORAGE_KEY = "omnigent:expanded-project-sections";
 
+// Ids of session families (a session and its nested agents) the user has
+// collapsed. Families default to expanded, so only collapsed ids are stored.
+export const COLLAPSED_SESSION_FAMILIES_STORAGE_KEY = "omnigent:collapsed-session-families";
+// A family deleted while collapsed never leaves the list, so keep only the newest ids.
+export const MAX_STORED_COLLAPSED_SESSION_FAMILIES = 500;
+
 // Default collapse state: every section starts expanded. Once the user toggles
 // any header, the stored array (even an empty one) becomes the preference and
 // persists across reloads.

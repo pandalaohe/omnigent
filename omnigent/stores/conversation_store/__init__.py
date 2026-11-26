@@ -30,6 +30,9 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
 MAX_PENDING_INPUTS = 100
+# Most sub-agents of one spawn tree read in a single bounded read; a bigger
+# tree is read in pages or not at all, depending on the reader.
+SPAWN_TREE_READ_CAP = 2000
 
 
 class ConversationSearchHit(ConversationItem):

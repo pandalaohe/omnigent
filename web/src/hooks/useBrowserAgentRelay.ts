@@ -11,18 +11,25 @@
 import { useEffect } from "react";
 import {
   emitBrowserActionClaimed,
+  emitBrowserActionSettled,
   onBrowserActionRequest,
   surfacesBrowserPane,
 } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
-  navigationHostOptions,
   SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
   supportsBrowser,
   type BrowserHostOptions,
+  type BrowserNavigationResult,
 } from "@/lib/nativeBridge";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { beginBrowserActivity } from "@/lib/browserActivity";
+import {
+  isLoopbackPreviewUrl,
+  previewHostOptions,
+  withPreviewHostRetry,
+} from "@/lib/previewHostOptions";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { loadOnce } from "@/lib/loadOnce";
@@ -62,7 +69,7 @@ interface BrowserDesktopBridge {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<BrowserNavigationResult>;
   browserScreenshot?: (
     conversationId: string,
     opts?: BrowserHostOptions,
@@ -77,6 +84,7 @@ interface BrowserDesktopBridge {
     exists: boolean;
     elsewhere?: boolean;
     hostIsThisMachine?: boolean;
+    sshPreviewHost?: boolean;
     url?: string;
     title?: string;
   }>;
@@ -86,20 +94,6 @@ interface BrowserDesktopBridge {
     args?: Record<string, unknown>,
     opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
-}
-
-function isLoopbackPreview(url: string): boolean {
-  try {
-    const { hostname } = new URL(url);
-    return (
-      hostname === "localhost" ||
-      hostname.endsWith(".localhost") ||
-      hostname === "127.0.0.1" ||
-      hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -286,16 +280,23 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
-        const r = await desktop.browserOpenOrNavigate(target.viewId, url, undefined, {
+        const options = {
           force: true,
           agent: true,
-          ...navigationHostOptions(sourceHostId),
+          ...(await previewHostOptions(sourceHostId, url)),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
-        });
+        };
+        const r = await withPreviewHostRetry(conversationId, sourceHostId, (retryOptions) =>
+          desktop.browserOpenOrNavigate!(target.viewId, url, undefined, {
+            ...options,
+            ...retryOptions,
+          }),
+        );
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (
-          isLoopbackPreview(url) &&
+          isLoopbackPreviewUrl(url) &&
+          r.sshPreviewHost !== true &&
           sourceHostId &&
           rememberedArcaHostId &&
           sourceHostId !== rememberedArcaHostId
@@ -544,7 +545,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       if (needsHostRevalidation && desktop.browserHasView) {
         try {
           const view = await desktop.browserHasView(target.viewId);
-          privilegedView = view.hostIsThisMachine === true;
+          privilegedView = view.hostIsThisMachine === true || view.sshPreviewHost === true;
         } catch {
           // A failed probe requires current host metadata before acting.
         }
@@ -555,7 +556,11 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           ? await fetchSessionHostId(sourceConversationId, { queryClient })
           : null;
       const readHostOptions = revalidateHost
-        ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+        ? {
+            sessionHostProtocol: SESSION_HOST_PROTOCOL,
+            sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+            sourceHostId,
+          }
         : undefined;
       if (cancelled) {
         await postResult(sourceConversationId, evt.actionId, claimToken, {
@@ -695,9 +700,11 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             ? { ok: false, error: "browser relay context changed" }
             : await agentDispatch(currentHostId, {
                 sessionHostProtocol: SESSION_HOST_PROTOCOL,
+                sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
                 sourceHostId: currentHostId,
               });
         }
+        emitBrowserActionSettled(evt, sourceConversationId, result);
         await postResult(sourceConversationId, evt.actionId, claimToken, result);
       } finally {
         finishActivity();

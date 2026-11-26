@@ -6,6 +6,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 
 interface SettingsLabelProps {
   label: string;
+  /** A short tag after the label, such as what kind of setting this is. */
+  labelBadge?: ReactNode;
   description?: ReactNode;
   note?: ReactNode | null;
   tooltipDescription?: ReactNode;
@@ -21,6 +23,7 @@ interface SettingsLabelProps {
 /** A short note stays visible; longer help keeps the existing tooltip gestures. */
 export function SettingsLabel({
   label,
+  labelBadge,
   description,
   note,
   tooltipDescription,
@@ -43,6 +46,7 @@ export function SettingsLabel({
         <span id={labelId} className={cn("text-ui font-normal md:font-medium", labelClassName)}>
           {label}
         </span>
+        {labelBadge}
         {help != null && (
           <TooltipProvider delayDuration={0}>
             <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>

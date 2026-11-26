@@ -512,6 +512,9 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_timer_cancel",
         "open_in_panel",
         "ask_user_async",
+        "sys_upload_file",
+        "sys_list_files",
+        "sys_download_file",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"

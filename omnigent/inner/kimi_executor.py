@@ -90,6 +90,8 @@ from omnigent.inner.executor import (
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
+from .sandbox import harness_sandbox_preparation, validate_harness_sandbox
+
 _logger = logging.getLogger(__name__)
 
 # Per-line cap for the stdout StreamReader. Kimi emits whole messages (not
@@ -483,7 +485,8 @@ class KimiExecutor(Executor):
         call can't touch paths outside the spec's read/write roots — the
         OS-level guarantee kimi's own approval flow can't give.
 
-        Falls back to the bare binary when the sandbox backend is unavailable.
+        Uses the bare binary only when no sandbox is requested. Sandbox setup
+        failures prevent startup.
 
         :param spawn_env_names: Env-var names we deliberately set on the
             subprocess ``env=``; baked into the policy so the launcher prunes
@@ -493,10 +496,12 @@ class KimiExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return self._binary_path
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return self._binary_path
-        try:
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "Kimi", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return self._binary_path
             from .sandbox import (
                 create_exec_launcher,
                 resolve_sandbox,
@@ -505,10 +510,9 @@ class KimiExecutor(Executor):
                 with_spawn_env_allowlist,
             )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                return self._binary_path
+                raise OSError("Kimi requires an active sandbox for the requested policy")
             # kimi is a curl-installed single binary: it must read its own
             # install dir and write its config dir ($KIMI_CODE_HOME, default
             # ~/.kimi-code), or it can't start inside the jail.
@@ -519,11 +523,7 @@ class KimiExecutor(Executor):
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
             sandbox = with_additional_write_roots(sandbox, [resolve_user_kimi_home()])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        except (OSError, ImportError, NotImplementedError) as exc:
-            _logger.warning("Could not apply sandbox for kimi; running unsandboxed: %s", exc)
-            return self._binary_path
-        else:
-            return create_exec_launcher(resolved_bin, sandbox)
+            return create_exec_launcher(resolved_bin, sandbox, cwd=str(cwd))
 
     def _build_argv(self, *, prompt_text: str) -> list[str]:
         """Assemble the kimi argv for one turn.

@@ -34,23 +34,25 @@ function controlChars(text) {
 }
 
 describe("buildCookieImportPrompt", () => {
-  it("describes the existing view's persistent server-shared login lifetime", () => {
-    const request = {
-      host: "example.com",
-      scope: "example.com",
-      profileName: "Work",
-      cookieCount: 3,
-    };
-    const saved = buildCookieImportPrompt({ ...request, persistent: true });
-    assert.match(saved.detail, /shared with embedded browser tabs on this server/);
-    assert.match(saved.detail, /including tabs agents control/);
-    assert.match(saved.detail, /remain after you quit Omnigent/);
-    assert.match(saved.detail, /until you clear saved browser login/);
-    const memory = buildCookieImportPrompt({ ...request, persistent: false });
-    assert.match(memory.detail, /this conversation's embedded browser tabs/);
-    assert.match(memory.detail, /until you quit Omnigent/);
-    assert.doesNotMatch(memory.detail, /saved on this device/);
-  });
+  for (const scope of ["example.com", "*"]) {
+    it(`describes the existing view's persistent server-shared login lifetime for ${scope}`, () => {
+      const request = {
+        host: "example.com",
+        scope,
+        profileName: "Work",
+        cookieCount: 3,
+      };
+      const saved = buildCookieImportPrompt({ ...request, persistent: true });
+      assert.match(saved.detail, /shared with embedded browser tabs on this server/);
+      assert.match(saved.detail, /including tabs agents control/);
+      assert.match(saved.detail, /remain after you quit Omnigent/);
+      assert.match(saved.detail, /expire or you clear saved browser login/);
+      const memory = buildCookieImportPrompt({ ...request, persistent: false });
+      assert.match(memory.detail, /this conversation's embedded browser tabs/);
+      assert.match(memory.detail, /until you quit Omnigent/);
+      assert.doesNotMatch(memory.detail, /saved on this device/);
+    });
+  }
   it("names the scope and the tab's host when an ancestor scope was picked", () => {
     const { message, detail } = buildCookieImportPrompt({
       host: "mail.example.com",
@@ -62,6 +64,21 @@ describe("buildCookieImportPrompt", () => {
     assert.match(detail, /From Chrome profile "Work" for example\.com and its subdomains/);
     // The picker can import an ancestor, so say which page receives the copy.
     assert.match(detail, /this tab is on mail\.example\.com\)/);
+  });
+
+  it("says the copy covers every website when that scope was picked", () => {
+    const { message, detail } = buildCookieImportPrompt({
+      host: "",
+      scope: "*",
+      profileName: 'Work"\n\nOnly example.com',
+      cookieCount: 1234,
+    });
+    assert.equal(message, "Import 1234 cookies for all websites into Omnigent?");
+    assert.match(detail, /From Chrome profile "Work' Only example\.com", for every website/);
+    assert.match(detail, /act as you on every site you are signed in to in that profile/);
+    // No site is named, and a crafted profile name still can't add paragraphs.
+    assert.doesNotMatch(detail, /and its subdomains/);
+    assert.equal(detail.split("\n").length, 3);
   });
 
   it("omits the tab host when the scope is the tab's own site", () => {

@@ -1,8 +1,10 @@
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import { isNewBrowserHotkey, useNewBrowserHotkey } from "./useNewBrowserHotkey";
-import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { KEYSTROKE_SURFACES, mountKeystrokeSurface } from "@/test/keystrokeSurfaces";
 
 afterEach(() => {
   cleanup();
@@ -65,15 +67,11 @@ describe("useNewBrowserHotkey", () => {
     renderHook(() => useNewBrowserHotkey(onOpen, true, false));
 
     press({ code: "KeyB", ctrlKey: true, altKey: true, repeat: true });
-    for (const className of ["monaco-editor", "xterm"]) {
-      const editor = document.createElement("div");
-      editor.className = className;
-      editor.tabIndex = 0;
-      document.body.appendChild(editor);
-      editor.focus();
-      const editorEvent = press({ code: "KeyB", ctrlKey: true, altKey: true }, editor);
+    for (const kind of KEYSTROKE_SURFACES) {
+      const { surface, input } = mountKeystrokeSurface(kind);
+      const editorEvent = press({ code: "KeyB", ctrlKey: true, altKey: true }, input);
       expect(editorEvent.defaultPrevented).toBe(false);
-      editor.remove();
+      surface.remove();
     }
 
     expect(onOpen).not.toHaveBeenCalled();
@@ -103,5 +101,28 @@ describe("useNewBrowserHotkey", () => {
     const rebound = press({ code: "KeyJ", ctrlKey: true, shiftKey: true });
     expect(onOpen).toHaveBeenCalledOnce();
     expect(rebound.defaultPrevented).toBe(true);
+  });
+});
+
+const browserCommand = () =>
+  registeredPaletteCommands().find((command) => command.id === "hotkey:browser.new");
+
+describe("useNewBrowserHotkey's command", () => {
+  it("opens a browser tab from ⌘K while the workspace offers Browser, and is hidden otherwise", () => {
+    const onOpen = vi.fn();
+    const { rerender, unmount } = renderHook(
+      (enabled: boolean) => useNewBrowserHotkey(onOpen, enabled, false),
+      { initialProps: true },
+    );
+    browserCommand()!.run();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    rerender(false);
+    expect(browserCommand()).toBeUndefined();
+    unmount();
+  });
+  it("runs after ⌘K closes and restores focus, so the new browser tab keeps it", () => {
+    const { unmount } = renderHook(() => useNewBrowserHotkey(vi.fn(), true, false));
+    expect(browserCommand()?.movesFocus).toBe(true);
+    unmount();
   });
 });

@@ -24,7 +24,7 @@ vi.mock("@/lib/sessionsApi", () => ({
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
-import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitBrowserActionRequest, onBrowserActionSettled } from "@/lib/browserActionBus";
 import { useBrowserActivity } from "@/lib/browserActivity";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId, useBrowserTabs } from "./useBrowserTabs";
@@ -243,6 +243,97 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const body = postedResult();
     expect(body.claim_token).toBe("tok_1");
     expect((body.result as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("tells this window how an action it ran ended, with the result it posts", async () => {
+    installBridge();
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+    const settled = vi.fn();
+    const stop = onBrowserActionSettled(settled);
+    const event = actionEvent("navigate", { url: "https://example.com" });
+
+    await runAction(event);
+    stop();
+
+    expect(settled).toHaveBeenCalledOnce();
+    expect(settled).toHaveBeenCalledWith(event, CONV, postedResult().result);
+  });
+
+  it("keeps the consent continuation token when a newer navigation finishes during host refresh", async () => {
+    let resolveFresh!: (session: unknown) => void;
+    const fresh = new Promise((resolve) => {
+      resolveFresh = resolve;
+    });
+    const session = { id: CONV, hostId: "host-a", parentSessionId: null };
+    getSessionSlim.mockResolvedValueOnce(session).mockReturnValue(fresh);
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValue(jsonResponse({}));
+    let first = true;
+    let currentToken = "consent-a";
+    let loaded = "";
+    const bridge = installBridge({
+      browserOpenOrNavigate: vi.fn(
+        async (
+          _viewId: string,
+          url: string,
+          _bounds?: unknown,
+          opts?: NativeBridge.BrowserHostOptions,
+        ) => {
+          if (first) {
+            first = false;
+            return { ok: false, retryWithFreshHost: true, navigationRetryToken: currentToken };
+          }
+          if (opts?.navigationRetryToken && opts.navigationRetryToken !== currentToken) {
+            return { ok: false, error: "navigation superseded or closed" };
+          }
+          currentToken = "newer";
+          loaded = url;
+          return { ok: true };
+        },
+      ),
+    });
+    const pending = runAction(actionEvent("navigate", { url: "http://localhost:5173" }));
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledTimes(2));
+    await bridge.browserOpenOrNavigate(CONV, "https://example.com/newer", undefined, {});
+    resolveFresh(session);
+    await pending;
+    expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      expect.objectContaining({ navigationRetryToken: "consent-a" }),
+    );
+    expect(postedResult().result).toEqual({ ok: false, error: "navigation superseded or closed" });
+    expect(loaded).toBe("https://example.com/newer");
+  });
+
+  it("tells this window when an action it ran failed, with the error it posts", async () => {
+    installBridge({
+      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: false, error: "blocked host" }),
+    });
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+    const settled = vi.fn();
+    const stop = onBrowserActionSettled(settled);
+    const event = actionEvent("navigate", { url: "https://example.com" });
+
+    await runAction(event);
+    stop();
+
+    const posted = postedResult().result as { ok: boolean; error?: string };
+    expect(posted).toMatchObject({ ok: false });
+    expect(settled).toHaveBeenCalledOnce();
+    expect(settled).toHaveBeenCalledWith(event, CONV, posted);
+  });
+
+  it("says nothing of an action another window claimed", async () => {
+    installBridge();
+    authenticatedFetch.mockResolvedValueOnce(jsonResponse({ claimed: false }));
+    const settled = vi.fn();
+    const stop = onBrowserActionSettled(settled);
+
+    await runAction(actionEvent("screenshot"), { expectResult: false });
+    stop();
+
+    expect(settled).not.toHaveBeenCalled();
   });
 
   it("routes claim, dispatch, and result to the delivering conversation, not the mounted one", async () => {
@@ -1008,8 +1099,10 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
   });
 
-  it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
-    const bridge = installBridge();
+  it.each([false, true])("isolates SSH identity: %s", async (ssh) => {
+    const bridge = installBridge({
+      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, sshPreviewHost: ssh }),
+    });
     const client = new QueryClient();
     client.setQueryData(
       ["hosts", { includeSandbox: false }],
@@ -1030,6 +1123,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       parentSessionId: null,
     });
 
+    const preferencesBeforeNavigation = { ...localStorage };
     await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
       client,
       source: "conv_background_A",
@@ -1048,6 +1142,10 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         sourceIsArcaHost: true,
       },
     );
+    if (ssh) {
+      expect({ ...localStorage }).toMatchObject(preferencesBeforeNavigation);
+      return;
+    }
     expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 
@@ -1630,12 +1728,17 @@ describe("saved login relay", () => {
 describe("useBrowserAgentRelay — privileged reads", () => {
   beforeEach(() => authenticatedFetch.mockResolvedValue(WON));
 
-  it.each(["screenshot", "snapshot", "click", "type"])(
-    "fetches a fresh host for %s after a privileged navigation",
-    async (action) => {
+  it.each(
+    ["screenshot", "snapshot", "click", "type"].flatMap((action) => [
+      { action, privilege: { hostIsThisMachine: true } },
+      { action, privilege: { hostIsThisMachine: false, sshPreviewHost: true } },
+    ]),
+  )(
+    "fetches a fresh host for $action after a privileged navigation ($privilege)",
+    async ({ action, privilege }) => {
       const bridge = installBridge({
-        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, hostIsThisMachine: true }),
-        browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: true }),
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, ...privilege }),
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, ...privilege }),
         browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "{}" }),
       });
       const client = new QueryClient();
@@ -1654,7 +1757,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
       getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
       emitBrowserActionRequest(actionEvent(action, { ref: "e1", text: "hello" }, "read"), CONV);
-      const opts = { sessionHostProtocol: 1, sourceHostId: "remote-host" };
+      const opts = { sessionHostProtocol: 1, sshPreviewProtocol: 1, sourceHostId: "remote-host" };
       await vi.waitFor(() => {
         if (action === "screenshot")
           expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, opts);
@@ -1689,6 +1792,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
       sourceHostId: "remote-host",
     });
   });
@@ -1733,6 +1837,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       );
       expect(call.mock.calls[1].at(-1)).toEqual({
         sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
         sourceHostId: "fresh-host",
       });
       expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
@@ -1841,6 +1946,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     await runAction(actionEvent("screenshot"));
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
       sourceHostId: null,
     });
   });
@@ -1860,6 +1966,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
       sourceHostId: "remote-host",
     });
   });

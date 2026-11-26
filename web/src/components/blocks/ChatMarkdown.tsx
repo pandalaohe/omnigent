@@ -13,7 +13,7 @@
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
 import {
   BotIcon,
   CopyIcon,
@@ -28,6 +28,12 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  parsePullRequestRefHref,
+  pullRequestRefUrl,
+  remarkPullRequestRefs,
+  type PullRequestRef,
+} from "@/components/ai-elements/pullRequestRefs";
+import {
   sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
@@ -35,6 +41,7 @@ import {
   WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
@@ -67,6 +74,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { parentDirectoryOf } from "@/hooks/useSelectionFileMatch";
 import { useQueryClient } from "@tanstack/react-query";
+import { usePullRequestInfoSnapshot } from "@/hooks/usePullRequests";
 import { showToast } from "@/components/ui/toast";
 
 // Streamdown hands each component override the source hast node alongside the
@@ -468,6 +476,19 @@ function WorkspaceFileLink({
   const { root, home } = useWorkspacePaths();
 
   if (!path) {
+    const pullRequestRef = parsePullRequestRefHref(href);
+    if (pullRequestRef) {
+      return (
+        <PullRequestRefLink
+          pullRequestRef={pullRequestRef}
+          className={className}
+          title={title}
+          {...props}
+        >
+          {children}
+        </PullRequestRefLink>
+      );
+    }
     if (typeof href === "string" && isRemoteVideoUrl(href)) {
       return (
         <VideoPlayer
@@ -622,6 +643,39 @@ function WorkspaceFileLink({
   );
 }
 
+/** Resolve a parked PR reference once session repo data arrives; text until then. */
+function PullRequestRefLink({
+  pullRequestRef,
+  children,
+  className,
+  title,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { pullRequestRef: PullRequestRef }) {
+  // Side chats resolve against their own session but open links in the parent viewer.
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const fileViewerConversationId = useFileViewerConversationId();
+  const { data } = usePullRequestInfoSnapshot(scopedConversationId ?? fileViewerConversationId);
+  const url = data ? pullRequestRefUrl(pullRequestRef, data) : null;
+  if (!url) return <span className={className}>{children}</span>;
+  return (
+    <a
+      {...props}
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cn(STREAMDOWN_LINK_CLASS, className)}
+      title={title ?? url}
+      data-streamdown="link"
+      onClick={(event) => {
+        props.onClick?.(event);
+        followLinkWithPopupFallback(event, url, fileViewerConversationId);
+      }}
+    >
+      <PullRequestLinkLabel>{children}</PullRequestLinkLabel>
+    </a>
+  );
+}
+
 /** Right-click menu that copies the path a file link names. */
 function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
   const copyPath = () =>
@@ -739,6 +793,8 @@ interface SessionMentionPillProps {
   id: string;
   isSubagent: boolean;
   children: React.ReactNode;
+  /** Extra pill classes, e.g. ``"min-w-0"`` so a long title truncates in a flex row. */
+  className?: string;
 }
 
 /** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
@@ -753,12 +809,17 @@ export function SessionMentionPill(props: SessionMentionPillProps) {
 
 // The routing seam's Link rebases the href under an embed's mount, routes plain
 // clicks in-app and leaves modified clicks (new tab) to the browser.
-function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+function RoutedSessionMentionPill({
+  id,
+  isSubagent,
+  children,
+  className,
+}: SessionMentionPillProps) {
   return (
     <Link
       to={`/c/${encodeURIComponent(id)}`}
       data-testid="mention-pill"
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -767,12 +828,12 @@ function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPi
   );
 }
 
-function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+function SessionPillLink({ id, isSubagent, children, className }: SessionMentionPillProps) {
   return (
     <a
       data-testid="mention-pill"
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -941,6 +1002,9 @@ function remarkHtmlAsText() {
  * When `literalHtml` is set, raw HTML shows as written instead of rendering,
  * so markup or comments in a tool's text can't hide part of it.
  *
+ * When `linkPullRequestRefs` is set, `#1234` and `owner/repo#12` link to the
+ * PR in the session's repo. Opt-in because tool output often contains non-PR `#N`.
+ *
  * `leadingCommand` tints that token where it opens the text, without changing
  * how the rest parses. Only for text whose raw HTML renders as text.
  */
@@ -950,10 +1014,12 @@ export function FilePathAwareMessageResponse({
   literalHtml = false,
   leadingCommand,
   isStreaming = false,
+  linkPullRequestRefs = false,
   ...props
 }: React.ComponentProps<typeof MessageResponse> & {
   breaks?: boolean;
   literalHtml?: boolean;
+  linkPullRequestRefs?: boolean;
   leadingCommand?: string;
 }) {
   const components =
@@ -963,9 +1029,12 @@ export function FilePathAwareMessageResponse({
   // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml || leadingCommand !== undefined
+      breaks || literalHtml || linkPullRequestRefs || leadingCommand !== undefined
         ? [
             ...Object.values(defaultRemarkPlugins),
+            // Before the leading command split: PR splitting rebuilds text nodes, which
+            // would drop its `kbd` tag, and its new nodes have no source position.
+            ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
             ...(literalHtml ? [remarkHtmlAsText] : []),
             ...(leadingCommand !== undefined
               ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
@@ -973,7 +1042,7 @@ export function FilePathAwareMessageResponse({
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml, leadingCommand],
+    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few

@@ -784,7 +784,7 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
-    effective model, parent
+    effective model, current permission mode, parent
     linkage, workspace / git branch, project, persisted last-activity time,
     outstanding approval prompts, cost, context usage, last error, archive
     state / reason, keep-warm state, and a last-message excerpt.
@@ -826,7 +826,8 @@ class SysSessionGetInfoTool(Tool):
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model "
             "(plus requested, launched, and running when reliable for the harness), "
-            "parent session, workspace, project_id, project_name, persisted last-activity time, "
+            "current permission mode, parent session, workspace, project_id, project_name, "
+            "persisted last-activity time, "
             "outstanding approval prompts, cost, context usage "
             "(compact_used_fraction is occupancy against the harness's "
             "auto-compaction window when it reports one), last error, "
@@ -1364,7 +1365,10 @@ class SysSessionCreateTool(Tool):
                                 "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
-                                "are refused. Omit to use the agent's default."
+                                "are refused. Omit to start it in your current mode when both "
+                                "run Claude Code or Codex and its agent sets none (a mode that "
+                                "skips approval only on your own host), else in the agent's "
+                                "default."
                             ),
                         },
                         "speed": {

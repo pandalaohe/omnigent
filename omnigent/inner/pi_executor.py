@@ -168,6 +168,7 @@ from .executor import (
     pending_interruption_marker,
 )
 from .model_credential import _authoritative_expiry
+from .sandbox import harness_sandbox_preparation, validate_harness_sandbox
 
 logger = logging.getLogger(__name__)
 _DEFAULT_PI_CLI_ARGV = pi_cli_argv
@@ -3087,12 +3088,12 @@ def _try_sandbox_pi(
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-    if sandbox_spec.type == "none":
-        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    try:
-        import pathlib
-
+    with harness_sandbox_preparation():
+        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        validate_harness_sandbox(os_env, "Pi", cwd=resolved_cwd)
+        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
         from .sandbox import (
             create_exec_launcher,
             resolve_sandbox,
@@ -3101,10 +3102,9 @@ def _try_sandbox_pi(
             with_spawn_env_allowlist,
         )
 
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
         sandbox = resolve_sandbox(os_env, resolved_cwd)
         if not sandbox.active:
-            return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+            raise OSError("Pi requires an active sandbox for the requested policy")
         # Bundled and legacy CLIs both need their sibling npm dependencies.
         executable = pathlib.Path(pi_path).resolve()
         resource_path = pathlib.Path(resource_executable or pi_path).resolve()
@@ -3122,13 +3122,9 @@ def _try_sandbox_pi(
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-    except (OSError, ImportError, NotImplementedError) as exc:
-        logger.warning("Could not apply sandbox for Pi: %s", exc)
-        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    else:
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
         command = pi_cli_argv(str(executable))
-        launcher = create_exec_launcher(command[0], sandbox)
+        launcher = create_exec_launcher(command[0], sandbox, cwd=str(resolved_cwd))
         return SandboxedPiCli(
             launch_path=launcher, sandboxed=True, launcher_args=tuple(command[1:])
         )
@@ -3611,6 +3607,27 @@ class PiExecutor(Executor):
         # does exponential backoff + Retry-After honoring; we just set
         # the budget.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._databricks_host = self._gateway_host_override or ""
+        self._databricks_token = ""
+        if gateway:
+            if self._gateway_host_override is not None and gateway_auth_command is None:
+                raise OSError(
+                    "PiExecutor(gateway=True) with a gateway workspace host "
+                    "requires a gateway auth command."
+                )
+            if self._gateway_host_override is None and base_url_override:
+                parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Profile-derived gateways use the Databricks default model; explicit
+        # gateways receive their concrete model from the producer.
+        self._gateway_uses_databricks_profile = bool(
+            gateway and self._gateway_host_override is None and base_url_override is None
+        )
+        self._gateway_workspace_url = (
+            self._gateway_model_service_workspace_url() if gateway else None
+        )
+
         # Allowlisted base env for the Pi subprocess — never the full
         # host environ. The spec's os_env.sandbox.env_passthrough is the
         # opt-in for anything beyond the base set (e.g. a provider API
@@ -3618,6 +3635,27 @@ class PiExecutor(Executor):
         self._env: dict[str, str] = _clean_pi_env(
             os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
         )
+        bundle_args = [
+            *_resolve_pi_skill_args(skills_filter, bundle_dir),
+            *_resolve_pi_bundle_extension_args(bundle_dir),
+        ]
+        # Confine every Pi invocation, including the initial version probe.
+        # PI_CODING_AGENT_DIR joins the filtered environment per RPC spawn.
+        sandboxed = _try_sandbox_pi(
+            self._pi_path,
+            os_env,
+            cwd,
+            spawn_env_names=[
+                *self._env,
+                "TMPDIR",
+                "PI_CODING_AGENT_DIR",
+                "OMNIGENT_PI_EXTENSION_UI",
+            ],
+            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, bundle_args),
+        )
+        self._pi_launch_path = sandboxed.launch_path
+        self._pi_launcher_args = sandboxed.launcher_args
+        self._sandboxed = sandboxed.sandboxed
         # ``--no-tools`` in pi 0.68.x disables BOTH built-ins AND extension
         # tools by default; we re-enable just the bridged tool names per
         # turn via ``--tools <comma-list>`` in :meth:`_build_env_and_dir`.
@@ -3631,7 +3669,9 @@ class PiExecutor(Executor):
             pi_version,
         )
 
-        self._pi_version = pi_version(self._pi_path)
+        self._pi_version = pi_version(
+            self._pi_launch_path, *self._pi_launcher_args, env=self._env, cwd=self._cwd
+        )
         # Pi >= 0.80.4 reports ``agent_settled`` once a prompt's run is fully
         # finished; older builds only emit ``agent_end`` per run.
         self._settled_turn_boundary = (
@@ -3662,8 +3702,7 @@ class PiExecutor(Executor):
         # change across turns within a session). Each turn's
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
-        self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
-        self._extra_args.extend(_resolve_pi_bundle_extension_args(bundle_dir))
+        self._extra_args.extend(bundle_args)
         # The bundle-root context file is an automatic context file like the
         # workspace ones Pi discovers, so ``context_files=False`` drops it too.
         self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
@@ -3673,45 +3712,6 @@ class PiExecutor(Executor):
             Callable[[ElicitationRequestParams], Awaitable[ElicitationResult | None]] | None
         ) = None
         self._form_elicitation_handler: FormElicitationHandler | None = None
-
-        self._databricks_host = self._gateway_host_override or ""
-        self._databricks_token = ""
-        if gateway:
-            if self._gateway_host_override is not None and gateway_auth_command is None:
-                raise OSError(
-                    "PiExecutor(gateway=True) with a gateway workspace host "
-                    "requires a gateway auth command."
-                )
-            if self._gateway_host_override is None and base_url_override:
-                parsed = _urlparse(base_url_override)
-                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
-
-        # True when the gateway transport was derived from a ~/.databrickscfg
-        # profile (no gateway host or base URL supplied directly). Gates the
-        # Databricks default model in :meth:`_resolve_model`; on the ucode /
-        # generic-provider paths the producer resolves a concrete model.
-        self._gateway_uses_databricks_profile = bool(
-            gateway and self._gateway_host_override is None and base_url_override is None
-        )
-        self._gateway_workspace_url = (
-            self._gateway_model_service_workspace_url() if gateway else None
-        )
-
-        # Apply sandbox.
-        # ``PI_CODING_AGENT_DIR`` is added per-spawn by
-        # ``_build_env_and_dir`` on the gateway path, so it must be in
-        # the launcher's prune allowlist even though it's not in
-        # ``self._env`` yet.
-        sandboxed = _try_sandbox_pi(
-            self._pi_path,
-            os_env,
-            cwd,
-            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR", "OMNIGENT_PI_EXTENSION_UI"],
-            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, self._extra_args),
-        )
-        self._pi_launch_path = sandboxed.launch_path
-        self._pi_launcher_args = sandboxed.launcher_args
-        self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
         # A retired state can still have a pending spawn; successors share its lock.

@@ -36,7 +36,6 @@ import {
   ListIcon,
   NetworkIcon,
   PauseIcon,
-  PlusIcon,
   ScanSearchIcon,
   SearchIcon,
   UnplugIcon,
@@ -89,7 +88,6 @@ import {
   type ChildSessionLike,
 } from "./subagentRailGroups";
 import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
-import { AddAgentDialog } from "./AddAgentDialog";
 import { AgentCostTag } from "./AgentCostTag";
 import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
@@ -286,7 +284,6 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const costs = useAgentCosts(rootSessionId).data ?? undefined;
   const { session: rootSession } = useSession(rootSessionId);
   const { data: hosts } = useHosts();
-  const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
   const [collapsedHosts, setCollapsedHosts] = useState<Record<string, boolean>>({});
@@ -392,15 +389,6 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         onViewModeChange={setViewMode}
         recheckButton={recheckButton}
       />
-      <button
-        type="button"
-        data-testid="add-agent-button"
-        onClick={() => setAddOpen(true)}
-        className="hidden"
-      >
-        <PlusIcon className="size-3.5 shrink-0" />
-        Add agent
-      </button>
       <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
         <MainRow
           rootSessionId={rootSessionId}
@@ -532,11 +520,6 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
           </>
         )}
       </ul>
-      {/* Mounted only while open so a closed rail issues no /v1/agents
-          fetch and carries none of the dialog's query dependencies. */}
-      {addOpen && (
-        <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
-      )}
       {stopTarget && <SubagentStopDialog target={stopTarget} onClose={() => setStopTarget(null)} />}
     </div>
   );

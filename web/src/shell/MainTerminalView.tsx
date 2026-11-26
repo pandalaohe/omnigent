@@ -15,7 +15,16 @@ import { TERMINAL_KEY_SURFACE } from "@/lib/terminalKeys";
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -47,6 +56,8 @@ import { TerminalAgentAccess } from "./TerminalAgentAccess";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
+
+type ShownTerminalKeysListener = (keys: readonly string[]) => void;
 
 interface MainTerminalViewProps {
   conversationId: string;
@@ -98,6 +109,11 @@ interface MainTerminalViewProps {
   onSurfaceElement?: (element: HTMLElement | null) => void;
   /** Render the session's saved split panes (the main view only, not grid cells). */
   splittable?: boolean;
+  /**
+   * Told the keys of the terminals this view renders, as each render commits and `[]` once it
+   * unmounts, so a view beside it never attaches the same terminal too.
+   */
+  onShownTerminalKeys?: ShownTerminalKeysListener;
 }
 
 export function MainTerminalView({
@@ -113,6 +129,7 @@ export function MainTerminalView({
   sandboxOffline = false,
   onSurfaceElement,
   splittable = false,
+  onShownTerminalKeys,
 }: MainTerminalViewProps) {
   const [resumeState, setResumeState] = useState<{
     conversationId: string;
@@ -360,6 +377,33 @@ export function MainTerminalView({
   const geometry = terminalLayoutGeometry(splitLayout ?? singlePaneKey);
   // Saved panes keep rendering while the agent terminal is missing but shells are live.
   const showPanes = activeTerminal !== null || (split !== undefined && terminals.length > 0);
+  // The panes below render a terminal for each listed key; reported before paint.
+  const shownTerminalKeys = showPanes
+    ? geometry.panes
+        .map((pane) => pane.key)
+        .filter((key) => terminals.some((t) => terminalTabKey(t) === key))
+        .join("\n")
+    : "";
+  // What the current listener last heard: a new listener hears the keys, and the one it replaces
+  // hears [], so each ends on what it's told last.
+  const reported = useRef<{ listener: ShownTerminalKeysListener; keys: string } | null>(null);
+  useLayoutEffect(() => {
+    const previous = reported.current;
+    if (previous === null && !onShownTerminalKeys) return;
+    if (previous?.listener === onShownTerminalKeys && previous?.keys === shownTerminalKeys) return;
+    if (previous && previous.listener !== onShownTerminalKeys) previous.listener([]);
+    reported.current = onShownTerminalKeys
+      ? { listener: onShownTerminalKeys, keys: shownTerminalKeys }
+      : null;
+    onShownTerminalKeys?.(shownTerminalKeys ? shownTerminalKeys.split("\n") : []);
+  }, [onShownTerminalKeys, shownTerminalKeys]);
+  useLayoutEffect(
+    () => () => {
+      reported.current?.listener([]);
+      reported.current = null;
+    },
+    [],
+  );
   const reconnecting = !isShellView && (resumePending || autoResumeAvailable);
   const showResumeError = resumeError !== null && resumeAvailable && !isShellView;
   const showLoading =

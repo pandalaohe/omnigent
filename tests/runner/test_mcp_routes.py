@@ -158,6 +158,9 @@ class Harness:
                 else Path("/tmp/runner-workspace")
             )
 
+        async def _explicit_workspace(session_id: str) -> Path | None:
+            return Path("/tmp/session-workspace")
+
         mcp_routes.register_mcp_routes(
             self.app,
             _publish_event=lambda sid, payload: self.published.append((sid, payload)),
@@ -170,6 +173,7 @@ class Harness:
             _session_harness_name=lambda sid: harness,
             _session_inboxes=self.inboxes,
             _session_runtime_cwd=_runtime_cwd,
+            _session_explicit_workspace=_explicit_workspace,
             _session_spec_cache=self.spec_cache,
             filesystem_registry=None,
             mcp_execution_registry=self.registry,
@@ -392,6 +396,7 @@ async def test_builtin_tool_dispatch_passes_session_context(
     assert seen["local_tool_workdir"] == Path("/tmp/bundle")
     assert seen["runner_workspace"] == Path("/tmp/runtime-cwd")
     assert await seen["session_runtime_cwd"]("child_runtime") == Path("/tmp/runner-workspace")
+    assert seen["session_workspace"] == Path("/tmp/session-workspace")
     assert seen["conversation_id"] == seen["task_id"] == SESSION
     assert seen["agent_id"] == "ag_1"
     assert seen["effective_harness"] == "claude-sdk"

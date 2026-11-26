@@ -11526,7 +11526,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
       "too large",
     );
@@ -11560,9 +11560,9 @@ describe("NewChatLandingScreen attachments", () => {
     });
     fireEvent.drop(composer, { dataTransfer: fileDrag([ok, clip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText(clip.name)).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "clip.mp4",
+      clip.name,
     );
     // Removing the accepted chip clears the stale rejection notice too.
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
@@ -11684,7 +11684,7 @@ describe("NewChatLandingScreen attachments", () => {
     await waitFor(() => expect(screen.getByTestId("new-chat-landing-error")).toBeTruthy());
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
   });
 });
 
@@ -16433,7 +16433,7 @@ describe("NewChatLandingScreen picker curation", () => {
 });
 
 describe("NewChatLandingScreen composer highlight", () => {
-  const ROOT = "/Users/corey/repo";
+  const ROOT = "/opt/work/repo";
   beforeEach(() => {
     setupLandingMocks();
     setPendingInitialPromptMock.mockReset();

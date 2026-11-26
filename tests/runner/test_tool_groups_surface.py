@@ -24,7 +24,9 @@ _ALL_OFF = ToolGroupsConfig(
     agent_discovery=False,
     journal=False,
     memory=False,
+    files=False,
 )
+_FILE_TOOL_NAMES = frozenset({"sys_upload_file", "sys_list_files", "sys_download_file"})
 
 
 def _spec(groups: ToolGroupsConfig) -> AgentSpec:
@@ -43,6 +45,7 @@ def _gated() -> frozenset[str]:
     assert {
         "browser_fill_saved_login",
         "sys_reminder_set",
+        *_FILE_TOOL_NAMES,
         *JOURNAL_TOOL_NAMES,
         *MEMORY_TOOL_NAMES,
         *ADVANCED_BROWSER_TOOL_NAMES,
@@ -57,6 +60,7 @@ def _relay_names(spec: AgentSpec) -> set[str]:
 
 def test_native_relay_carries_every_group_by_default() -> None:
     """Without a ``tool_groups:`` block the relay advertises the registered gated tools."""
+    assert _gated() >= MEMORY_TOOL_NAMES | _FILE_TOOL_NAMES
     missing = _gated() - _relay_names(_spec(ToolGroupsConfig()))
     assert not missing, f"relay dropped {sorted(missing)} with every group on"
 

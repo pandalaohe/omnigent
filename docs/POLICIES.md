@@ -96,6 +96,10 @@ and runner must support delivery and restoration. Files are stored without
 extraction outside the working checkout. See
 [attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
 
+Supported agents are Claude Code, Codex, Pi, Cursor, Kiro, Goose, Antigravity,
+Qwen Code, Kimi, Hermes, and Devin. OpenCode and API/SDK harnesses do not support
+filesystem attachments. Forking sent file history requires Claude Code or Codex.
+
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
 | `attachment_max_upload_bytes` | `2147483648` (2 GiB) | Encoded bytes per upload request, any type |
@@ -144,17 +148,23 @@ a name-only chip. The last sweep's summary is written to
   labels it as text.
 - `[]`, which turns filesystem attachments off.
 - `"*"` (or a list containing `"*"`), which keeps the defaults and also delivers
-  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or video.
+  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or
+  other video formats.
   Images, PDFs, and text/code files stay inline, except for extensions listed
   beside `"*"`: `["*", ".log"]` also delivers `.log` files as files.
 
 The server reads this key at startup. Each upload records how it is delivered,
-so changing the setting does not change files a session already holds. Types
-outside the default extensions need a host and runner that advertise
+so changing the setting does not change files a session already holds. MP4
+videos and formats beyond the original archive, Office, and database extensions
+need a host and runner that advertise
 `filesystem_attachment_delivery`; older builds refuse them with an update
 message. `GET /v1/info` reports the effective setting as
 `filesystem_attachments`, which the web composer uses to accept files before
 uploading them.
+
+MP4 videos are delivered as files, without decoding or frame extraction. The
+agent can inspect them with local tools such as `ffmpeg`; Claude Code's `Read`
+tool cannot read the video directly.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser

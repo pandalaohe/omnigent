@@ -16,7 +16,7 @@ import click
 import httpx
 import yaml
 
-from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import PI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -180,7 +180,12 @@ PI_APPROVE_MIN_VERSION = (0, 79, 0)
 PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
 
 
-def pi_version(executable: str) -> tuple[int, int, int] | None:
+def pi_version(
+    executable: str,
+    *leading_args: str,
+    env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[int, int, int] | None:
     """Return the Pi CLI version as ``(major, minor, patch)``, or ``None``.
 
     Runs ``pi --version`` synchronously with a short timeout. Returns
@@ -189,31 +194,36 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
     passing flags the installed Pi may not recognise.
 
     :param executable: Resolved path to the Pi CLI.
+    :param leading_args: Arguments required by the launcher before the version flag.
+    :param env: Explicit subprocess environment; defaults to inheritance.
+    :param cwd: Working directory for the version probe.
     :returns: Parsed version tuple, e.g. ``(0, 79, 10)``, or ``None``.
     """
     import re
-    import subprocess
 
     from omnigent._windows_launcher import merge_shim_env
     from omnigent.harnesses.pi_cli import pi_cli_argv as default_pi_cli_argv
     from omnigent.harnesses.pi_cli import pi_cli_launch
+    from omnigent.inner._proc import run_isolated
 
     try:
         if pi_cli_argv is default_pi_cli_argv:
             cmd_argv, shim_env = pi_cli_launch(executable)
         else:
             cmd_argv, shim_env = pi_cli_argv(executable), {}
-        probe_env = merge_shim_env(None, shim_env)
-        result = subprocess.run(
-            [*cmd_argv, "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5.0,
-            env=probe_env,
-            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if IS_WINDOWS else 0,
-        )
+        # The parent owns scratch cleanup even if the sandbox launcher is killed.
+        with TemporaryDirectory(prefix="omnigent-pi-probe-") as probe_tmpdir:
+            probe_env = {**(os.environ if env is None else env), "TMPDIR": probe_tmpdir}
+            result = run_isolated(
+                [*cmd_argv, *leading_args, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+                env=merge_shim_env(probe_env, shim_env),
+                cwd=cwd,
+            )
     except Exception:  # noqa: BLE001
         return None
     if result.returncode != 0:
@@ -221,8 +231,14 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
     # Older Pi (mariozechner package) prints the version to stderr via
     # console.error; newer Pi (earendil-works) prints to stdout via
     # console.log. Check both so the probe works across all versions.
-    combined = result.stdout + result.stderr
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", combined)
+    # Only accept version lines; launcher diagnostics can contain versioned paths.
+    combined = result.stdout + "\n" + result.stderr
+    match = re.search(
+        r"^\s*(?:(?:pi|@[\w.-]+/pi-coding-agent)\s+(?:version\s+)?)?"
+        r"v?(\d+)\.(\d+)\.(\d+)(?:[-+]\S+)?\s*$",
+        combined,
+        re.MULTILINE | re.IGNORECASE,
+    )
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))

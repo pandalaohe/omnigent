@@ -3997,10 +3997,12 @@ async def test_codex_async_question_decline_skips_the_interrupt(
     assert forwarded == []
 
 
+@pytest.mark.parametrize("blocking_flag_only", [False, True])
 async def test_codex_async_question_is_not_mirrored_to_ancestors(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    blocking_flag_only: bool,
 ) -> None:
     """
     A Codex async question is scoped to its own session.
@@ -4031,17 +4033,24 @@ async def test_codex_async_question_is_not_mirrored_to_ancestors(
 
     parent_collector = await start_session_stream_collector(parent_id)
     try:
+        payload = _codex_async_question_payload()
+        if blocking_flag_only:
+            payload["params"].pop("omnigentAsyncQuestion")
+            payload["params"]["isBlocking"] = False
         drain_task = asyncio.create_task(_drain_until_elicitation(child.id))
         await asyncio.sleep(0.05)
         hook_task = asyncio.create_task(
             client.post(
                 f"/v1/sessions/{child.id}/hooks/codex-elicitation-request",
-                json=_codex_async_question_payload(),
+                json=payload,
             )
         )
 
         event = await drain_task
-        assert event["params"]["async_kind"] == "question"
+        if blocking_flag_only:
+            assert event["params"]["is_blocking"] is False
+        else:
+            assert event["params"]["async_kind"] == "question"
 
         await parent_collector.assert_no_event(0.2)
         snapshot = await client.get(f"/v1/sessions/{parent_id}")

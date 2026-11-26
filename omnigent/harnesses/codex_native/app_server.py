@@ -2467,11 +2467,14 @@ async def prepare_codex_provider_config(
     source_home: Path | None = None,
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
+    allow_discovery: bool = True,
 ) -> list[str]:
     """Materialize provider config, attributing gateway providers Codex inherits.
 
     Credentials are materialized first so they stay out of process arguments. Codex
     resolves inherited providers itself only when Omnigent didn't pick the provider.
+
+    :param allow_discovery: Whether the prepared worker permits the loopback probe.
     """
     overrides = materialize_codex_provider_config(
         codex_home,
@@ -2481,6 +2484,9 @@ async def prepare_codex_provider_config(
         client_surface=client_surface,
     )
     if not _codex_may_inherit_provider(overrides, app_server_command):
+        return overrides
+    if not allow_discovery:
+        _logger.info("Codex provider attribution skipped: discovery requires loopback access")
         return overrides
     executable, *launch_args = app_server_command or (codex_path,)
     try:
@@ -6749,6 +6755,7 @@ def build_codex_remote_args(
     agent_pid: int | None = None,
     session_id: str | None = None,
     cwd: Path | None = None,
+    configured_codex_args: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -6793,7 +6800,7 @@ def build_codex_remote_args(
         ``('model="databricks-gpt-5-5"', 'model_provider="omnigent_databricks"')``.
         Each is emitted as a ``-c <value>`` global flag. Empty for a
         plain Codex-login launch that needs no provider routing.
-    :param codex_cli_version: Probed app-server CLI version. Before 0.154,
+    :param codex_cli_version: Probed CLI version of the Codex the TUI runs. Before 0.154,
         preserve permission flags because a remote TUI can reapply its own
         defaults on attach. ``None`` uses the 0.154+ compatible arguments.
     :param bypass_sandbox: When ``True`` for a fresh thread or a pre-0.154
@@ -6818,6 +6825,9 @@ def build_codex_remote_args(
         tools, or ``None``. The TUI forwards its own ``-c`` overrides in
         the thread calls it sends, so the key travels with the attach.
     :param cwd: Launch directory used to retain automatic worktree roots after CLI overrides.
+    :param configured_codex_args: Codex args from the harness config that
+        lead the argv verbatim, e.g. ``("--sandbox", "danger-full-access")``.
+        A resume that omits permission args strips them from these too.
     :returns: Codex argv tail after the executable.
     """
     # The runner owns the app-server and the TUI ``--remote`` attach it appends
@@ -6898,6 +6908,7 @@ def build_codex_remote_args(
                         ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"]
                     )
         return [
+            *without_codex_add_dirs(configured_codex_args),
             *override_args,
             *without_codex_add_dirs(passthrough),
             *agent_pid_args,
@@ -6907,6 +6918,7 @@ def build_codex_remote_args(
         ]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
         return [
+            *configured_codex_args,
             *override_args,
             *passthrough,
             *agent_pid_args,
@@ -6919,7 +6931,7 @@ def build_codex_remote_args(
     # when they match the app-server policy. config_overrides went to server
     # startup; codex_args went to preload's thread/resume call.
     resume_args = _strip_codex_resume_permission_args(
-        (*override_args, *passthrough, *agent_pid_args)
+        (*configured_codex_args, *override_args, *passthrough, *agent_pid_args)
     )
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 

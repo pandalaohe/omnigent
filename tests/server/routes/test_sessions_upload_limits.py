@@ -25,6 +25,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     FilesystemAttachmentPolicy,
 )
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -266,24 +267,38 @@ def test_animated_gif_obeys_filesystem_cap_count_and_host_capability(
 
 
 @pytest.mark.parametrize(
-    "filename,content_type",
+    "filename,content_type,delivery",
     [
-        ("notes.txt", "text/plain"),
-        ("archive.zip", "application/zip"),
-        ("deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-        ("app.db", "application/octet-stream"),
-        ("report.docx", "application/zip"),
-        ("data.csv", "application/vnd.ms-excel"),
+        ("notes.txt", "text/plain", None),
+        ("archive.zip", "application/zip", "filesystem"),
+        (
+            "deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "filesystem",
+        ),
+        ("app.db", "application/octet-stream", "filesystem"),
+        ("report.docx", "application/zip", "filesystem"),
+        ("data.csv", "application/vnd.ms-excel", None),
+        ("clip.mp4", "video/mp4", "filesystem"),
+        ("clip.MP4", "application/octet-stream", "filesystem"),
+        ("clip.mp4", "text/plain", "filesystem"),
     ],
 )
 def test_upload_supported_types(
-    upload_client: tuple[TestClient, str], filename: str, content_type: str
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    filename: str,
+    content_type: str,
+    delivery: str | None,
 ) -> None:
     """Supported extensions remain usable even with common browser MIME mismatches."""
     client, session_id = upload_client
     response = _upload(client, session_id, filename, content_type=content_type)
     assert response.status_code == 201, response.text
     assert response.json()["name"] == filename
+    stored = SqlAlchemyFileStore(db_uri).get(response.json()["id"])
+    assert stored is not None
+    assert (stored.source_metadata or {}).get("delivery") == delivery
 
 
 def test_upload_stores_unknown_type_by_path(upload_client: tuple[TestClient, str]) -> None:
@@ -294,6 +309,27 @@ def test_upload_stores_unknown_type_by_path(upload_client: tuple[TestClient, str
     body = resp.json()
     assert body["name"] == "clip.mp4"
     assert body["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+
+
+@pytest.mark.parametrize(
+    "key", ["pi", "cursor", "kiro", "goose", "antigravity", "qwen", "kimi", "hermes", "devin"]
+)
+@pytest.mark.parametrize("filename", ["archive.zip", "clip.mp4"])
+def test_native_harness_uploads_files(
+    upload_client: tuple[TestClient, str], db_uri: str, key: str, filename: str
+) -> None:
+    """Other local-file native adapters admit recorded binary uploads, including MP4."""
+    client, session_id = upload_client
+    native = native_coding_agent_for_harness(f"{key}-native")
+    assert native is not None
+    SqlAlchemyConversationStore(db_uri).set_labels(session_id, native.presentation_labels)
+    response = _upload(
+        client, session_id, filename, b"synthetic binary", "application/octet-stream"
+    )
+    assert response.status_code == 201, response.text
+    stored = SqlAlchemyFileStore(db_uri).get(response.json()["id"])
+    assert stored is not None
+    assert stored.source_metadata["delivery"] == "filesystem"
 
 
 def test_upload_accepts_filesystem_types_for_an_sdk_harness(
@@ -333,6 +369,11 @@ def test_upload_accepts_filesystem_types_for_an_sdk_harness(
             "filename": "payload.zip",
             "file_data": "data:application/zip;base64,UEs=",
         },
+        {
+            "type": "input_file",
+            "filename": "payload.mp4",
+            "file_data": "data:video/mp4;base64,AAAA",
+        },
     ],
 )
 def test_message_cannot_inline_a_filesystem_attachment(
@@ -345,7 +386,7 @@ def test_message_cannot_inline_a_filesystem_attachment(
         json={"type": "message", "data": {"role": "user", "content": [block]}},
     )
     assert resp.status_code == 400, resp.text
-    assert "payload.zip" in resp.text
+    assert block["filename"] in resp.text
 
 
 @pytest.mark.parametrize(
@@ -359,6 +400,8 @@ def test_message_cannot_inline_a_filesystem_attachment(
         ("archive.zip", "codex-native", "message", "input_file"),
         ("notes.txt", "openai-agents", "message", "input_file"),
         ("clip.mp4", "openai-agents", "message", "input_file"),
+        ("archive.zip", "pi-native", "message", "input_file"),
+        ("archive.zip", "opencode-native", "message", "input_file"),
     ],
 )
 def test_send_admits_stored_upload_for_any_harness(
@@ -386,7 +429,11 @@ def test_send_admits_stored_upload_for_any_harness(
         )
 
     monkeypatch.setattr(sessions, "get_agent_cache", lambda: SimpleNamespace(load=load))
-    changed = client.post(f"/v1/sessions/{source_id}/fork", json={"agent_id": target.id})
+    changed = client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"agent_id": target.id},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
+    )
     assert changed.status_code == 201, changed.text
     session_id = changed.json()["id"]
     files = SqlAlchemyFileStore(db_uri).list(session_id).data
@@ -418,18 +465,20 @@ def test_send_admits_stored_upload_for_any_harness(
     assert conversations.list_items(session_id).data == before
 
 
+@pytest.mark.parametrize("filename", ["huge.zip", "huge.mp4"])
 def test_upload_rejects_oversized_filesystem_file(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
 ) -> None:
-    """A zip over the configured per-file cap is rejected with 413."""
+    """A file over the configured per-file cap is rejected with 413."""
     monkeypatch.setattr(
         "omnigent.server.server_config.load_server_config",
         lambda: {"filesystem_attachment_max_bytes": 1024},
     )
     client, session_id = upload_client
     oversized = b"\x00" * 1025
-    resp = _upload(client, session_id, "huge.zip", oversized, "application/zip")
+    resp = _upload(client, session_id, filename, oversized)
     assert resp.status_code == 413, resp.status_code
 
 

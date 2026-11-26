@@ -34,7 +34,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -191,6 +191,11 @@ from .model_signer import (
     SignerReadiness,
     SignerStartError,
     SubprocessModelSigner,
+)
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
 )
 
 logger = logging.getLogger(__name__)
@@ -693,7 +698,7 @@ def _find_codex_cli() -> str | None:
 
 
 async def _codex_cli_version_text(
-    codex_path: str, *, env: Mapping[str, str] | None = None
+    codex_path: str, *leading_args: str, env: Mapping[str, str] | None = None
 ) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
     codex_argv, shim_env = windows_launch_spec(codex_path)
@@ -701,6 +706,7 @@ async def _codex_cli_version_text(
     try:
         proc = await _create_subprocess_exec(
             *codex_argv,
+            *leading_args,
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -713,12 +719,16 @@ async def _codex_cli_version_text(
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except TimeoutError:
-        with suppress(ProcessLookupError):
-            proc.kill()
-        with suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=1)
-        close_subprocess_transport(proc)
+    except (TimeoutError, asyncio.CancelledError) as error:
+        try:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=1)
+        finally:
+            close_subprocess_transport(proc)
+        if isinstance(error, asyncio.CancelledError):
+            raise
         return None
     match = re.fullmatch(
         r"\s*codex-cli\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
@@ -728,7 +738,7 @@ async def _codex_cli_version_text(
 
 
 async def _codex_cli_version(
-    codex_path: str, *, env: Mapping[str, str] | None = None
+    codex_path: str, *leading_args: str, env: Mapping[str, str] | None = None
 ) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
@@ -740,15 +750,17 @@ async def _codex_cli_version(
 
     :param codex_path: Path to the codex CLI, e.g.
         ``"/usr/local/bin/codex"``.
+    :param leading_args: Args placed before ``--version``, such as a
+        configured wrapper's prefix, e.g. ``("codex", "--")``.
     :returns: The parsed version, e.g. ``(0, 136, 0)``, or ``None`` if
         the command cannot be run, times out, or its output has no
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
     raw = (
-        await _codex_cli_version_text(codex_path)
+        await _codex_cli_version_text(codex_path, *leading_args)
         if env is None
-        else await _codex_cli_version_text(codex_path, env=env)
+        else await _codex_cli_version_text(codex_path, *leading_args, env=env)
     )
     if raw is None:
         return None
@@ -3993,6 +4005,11 @@ class _CodexAppServerSession:
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
+        sandbox_requested = self._os_env_spec is not None and (
+            self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
+        )
+        with harness_sandbox_preparation() if sandbox_requested else nullcontext():
+            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.
@@ -4012,33 +4029,20 @@ class _CodexAppServerSession:
             required_brokered_probe=(
                 (
                     self._codex_path,
-                    Path(self._cwd or os.getcwd()).resolve(strict=False),
+                    process_cwd,
                     self._os_env_spec,
                 )
                 if (self._signer is not None or brokered_gateway) and self._os_env_spec is not None
                 else None
             ),
         )
-        if self._signer is None and not brokered_gateway:
-            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
-
-            self._codex_config_overrides = await prepare_codex_provider_config(
-                self._codex_home_dir,
-                self._codex_config_overrides,
-                codex_path=self._codex_path,
-                cwd=Path(self._cwd or os.getcwd()),
-                env=self._env,
-                retry_policy=self._retry_policy,
-                client_surface=harness_client_surface(),
-            )
-        else:
+        if self._signer is not None or brokered_gateway:
             # The signer replaces gateway attribution from its own launch metadata.
             self._codex_config_overrides = materialize_codex_provider_config(
                 self._codex_home_dir,
                 self._codex_config_overrides,
                 retry_policy=self._retry_policy,
             )
-        if self._signer is not None or brokered_gateway:
             self._codex_config_overrides.extend(
                 [
                     f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
@@ -4101,7 +4105,6 @@ class _CodexAppServerSession:
             for name in ("TMPDIR", "TMP", "TEMP"):
                 proc_env[name] = str(self._codex_home_dir)
         try:
-            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             # Active egress rules start a parent-side proxy and wait for its
             # thread readiness. Keep that bounded synchronous setup off the
             # shared executor loop, just like CODEX_HOME population above.
@@ -4126,6 +4129,21 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
+            if self._signer is None and not brokered_gateway:
+                from omnigent.harnesses.codex_native.app_server import (
+                    prepare_codex_provider_config,
+                )
+
+                self._codex_config_overrides = await prepare_codex_provider_config(
+                    self._codex_home_dir,
+                    self._codex_config_overrides,
+                    codex_path=worker_launch.launch_path,
+                    cwd=process_cwd,
+                    env=proc_env,
+                    retry_policy=self._retry_policy,
+                    client_surface=harness_client_surface(),
+                    allow_discovery=worker_launch.allow_network,
+                )
             from omnigent.mcp_disabled_servers import (
                 RELAUNCH_WITHOUT_OVERRIDES_EVENT,
                 plan_codex_launch,
@@ -7582,8 +7600,6 @@ class CodexExecutor(Executor):
             effective_cwd=effective_cwd,
         )
         sandbox_mode = _sandbox_mode(self._os_env_spec)
-        if tools and sandbox_mode == "read-only":
-            sandbox_mode = "workspace-write"
 
         try:
             async for event in app_session.run_turn(
@@ -7598,7 +7614,12 @@ class CodexExecutor(Executor):
                 service_tier=cfg.service_tier,
             ):
                 yield event
-        except (HarnessTransportClosedError, ProviderAuthRequired):
+        except (
+            HarnessTransportClosedError,
+            ProviderAuthRequired,
+            HarnessSandboxPreparationError,
+            HarnessSandboxValidationError,
+        ):
             raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

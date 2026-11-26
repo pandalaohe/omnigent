@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 import type { Host } from "@/hooks/useHosts";
-import { sandboxHostChoice } from "@/lib/hostPreferences";
 import { NewProjectButton } from "./NewProjectButton";
 
 const mocks = vi.hoisted(() => ({
@@ -314,8 +313,9 @@ describe("NewProjectButton", () => {
 });
 
 describe("NewProjectButton project repositories", () => {
-  function selectRunOn(value: string) {
-    fireEvent.change(screen.getByLabelText("Run on"), { target: { value } });
+  function selectRunOn(name: string) {
+    fireEvent.click(screen.getByRole("combobox", { name: "Run on" }));
+    fireEvent.click(screen.getByRole("option", { name }));
   }
 
   function typeRepository(url: string, branch?: string) {
@@ -460,7 +460,7 @@ describe("NewProjectButton project repositories", () => {
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     await waitFor(() => expect(mocks.createDirectory).toHaveBeenCalledTimes(1));
 
-    selectRunOn("host_2");
+    selectRunOn("Desktop");
     await act(async () => resolveDirectory?.("/Users/me/Garden"));
 
     expect(mocks.createProject).not.toHaveBeenCalled();
@@ -601,7 +601,7 @@ describe("NewProjectButton project repositories", () => {
     renderButton([laptop]);
 
     nameProject("Garden");
-    selectRunOn(sandboxHostChoice("modal"));
+    selectRunOn("Modal Sandbox");
     expect(screen.queryByRole("radio", { name: "Folder" })).toBeNull();
     typeRepository(repoUrl, "dev");
     fireEvent.click(screen.getByTestId("new-project-confirm"));
@@ -625,7 +625,7 @@ describe("NewProjectButton project repositories", () => {
     mocks.serverInfo = projectServerInfo;
     renderButton([laptop, desktop]);
 
-    selectRunOn("host_2");
+    selectRunOn("Desktop");
     nameProject("Garden");
     fireEvent.click(screen.getByTestId("new-project-confirm"));
 
@@ -654,7 +654,7 @@ describe("NewProjectButton project repositories", () => {
     mocks.serverInfo = projectServerInfo;
     renderButton([laptop, desktop]);
 
-    selectRunOn("host_2");
+    selectRunOn("Desktop");
     chooseRepositorySource();
     nameProject("Garden");
     fireEvent.click(screen.getByTestId("new-project-confirm"));

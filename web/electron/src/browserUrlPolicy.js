@@ -350,7 +350,7 @@ function internalHostError(hostname) {
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
  * @param {string} url
- * @returns {{ ok: true } | { ok: false, error: string }}
+ * @returns {{ ok: true } | { ok: false, error: string, localhostBlocked?: true }}
  */
 function policyDecision(parsed, addresses, options = {}) {
   const {
@@ -400,7 +400,7 @@ function policyDecision(parsed, addresses, options = {}) {
   if (addresses.length === 0 && !isIpLiteral(host) && addressAllowance) return { ok: true };
   const level = access.level ?? "all";
   return internal && level !== "none" && !(level === "agent" && userNavigation)
-    ? fail(true)
+    ? { ...fail(true), ...(isLoopbackName(host) ? { localhostBlocked: true } : {}) }
     : { ok: true };
 }
 
@@ -439,7 +439,7 @@ async function lookupHostAddresses(hostname) {
  *
  * @param {string} url
  * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ * @returns {Promise<{ ok: true } | { ok: false, error: string, localhostBlocked?: true }>}
  */
 async function checkAgentNavigation(url, options = {}) {
   // Resolve names before deciding list precedence: an IP block must beat a host allowance.

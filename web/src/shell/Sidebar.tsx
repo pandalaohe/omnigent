@@ -374,11 +374,13 @@ import { SettingsSidebar } from "./settingsSearch/SettingsSidebar";
 import {
   type ActiveChatOverride,
   clearLegacyPinnedConversationIds,
+  COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   groupConversations,
+  MAX_STORED_COLLAPSED_SESSION_FAMILIES,
   moveCustomOrder,
   orderByPinnedTimestamp,
   appendPinWrites,
@@ -1961,7 +1963,7 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <GridSidebar onNavigate={onNavClick} />
+                <GridSidebar onNavigate={onNavClick} onOpenSidebar={open ? undefined : onOpen} />
                 {sidebarData.identityReady ? (
                   <ConversationList
                     conversationsQuery={displayQuery}
@@ -2928,7 +2930,15 @@ function ConversationList({
   const grids = useGridSessions();
   const nestedDrafts = useNestedSessionDrafts();
   const draftQueryClient = useQueryClient();
-  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(
+    () => new Set(readStoredStringList(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY)),
+  );
+  useEffect(() => {
+    writeStoredStringList(
+      COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
+      [...collapsedFamilies].slice(-MAX_STORED_COLLAPSED_SESSION_FAMILIES),
+    );
+  }, [collapsedFamilies]);
   const toggleFamily = useCallback((familyId: string) => {
     setCollapsedFamilies((previous) => {
       const next = new Set(previous);
@@ -2966,6 +2976,7 @@ function ConversationList({
     pinsIncludeShared,
     pinned: pinnedQuery,
     sharedActive,
+    splitShared,
   } = useSidebarData();
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
@@ -3455,7 +3466,6 @@ function ConversationList({
     };
     // Grouped views fold Shared into the groups too, so the first group takes
     // the Projects header's place.
-    const splitShared = groupingUi && !grouped;
     const shared = splitShared ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
@@ -3530,7 +3540,7 @@ function ConversationList({
     includeSharedRuns,
     mineSharedRuns,
     viewerId,
-    groupingUi,
+    splitShared,
     grouped,
     groupOrder,
     harnessLabel,
@@ -9758,8 +9768,8 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
  * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
+ * Uses a Cursor-style placement (right / top-aligned) and the muted,
+ * small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
@@ -11214,11 +11224,19 @@ export function isMobileViewport(): boolean {
 // Project folders default to collapsed, so the persisted set is the EXPANDED
 // names (empty by default = every project starts collapsed).
 function readExpandedProjectSections(): string[] {
+  return readStoredStringList(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY);
+}
+
+function writeExpandedProjectSections(names: string[]) {
+  writeStoredStringList(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, names);
+}
+
+// Same contract as pins: corrupt storage means "back to defaults", never a
+// broken sidebar.
+function readStoredStringList(storageKey: string): string[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
     if (!Array.isArray(parsed)) return [];
     return parsed.filter((value): value is string => typeof value === "string");
   } catch {
@@ -11226,11 +11244,11 @@ function readExpandedProjectSections(): string[] {
   }
 }
 
-function writeExpandedProjectSections(names: string[]) {
+function writeStoredStringList(storageKey: string, values: readonly string[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(names));
+    window.localStorage.setItem(storageKey, JSON.stringify(values));
   } catch {
-    // Same as collapse state — a lost local preference is harmless.
+    // Collapse state is a local navigation preference; losing it is fine.
   }
 }
