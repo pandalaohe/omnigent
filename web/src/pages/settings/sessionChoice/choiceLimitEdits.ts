@@ -41,7 +41,27 @@ export function limitRuleErrors(document: SessionChoiceDocument): string[] {
   const errors: string[] = [];
   for (const [index, rule] of (document.limitRules ?? []).entries()) {
     const prefix = `Rule ${index + 1}`;
-    if (!rule.agent.trim()) errors.push(`${prefix}: choose an agent.`);
+    if (Array.isArray(rule.members)) {
+      if (rule.members.length === 0) {
+        errors.push(`${prefix}: add at least one member.`);
+      } else {
+        rule.members.forEach((member, memberIndex) => {
+          if (!member.agent.trim())
+            errors.push(`${prefix}, member ${memberIndex + 1}: choose an agent.`);
+          if ([member.agent, member.host, member.model].some((value) => value === "*"))
+            errors.push(
+              `${prefix}, member ${memberIndex + 1}: selectors must be exact identities.`,
+            );
+        });
+      }
+      if (
+        rule.members.length > 1 &&
+        (rule.reserve !== undefined || rule.reserveExempt !== undefined)
+      )
+        errors.push(`${prefix}: reserve and exemptions are not allowed on multi-member rules.`);
+    } else if (!(rule.agent ?? "").trim()) {
+      errors.push(`${prefix}: choose an agent.`);
+    }
     if (rule.maxRunning != null && (!Number.isSafeInteger(rule.maxRunning) || rule.maxRunning < 1))
       errors.push(`${prefix}: max running must be a positive integer.`);
     for (const key of ["pct", "stopPct"] as const) {

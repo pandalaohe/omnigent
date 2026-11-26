@@ -20,10 +20,12 @@ from omnigent.server.session_choice import (
     _filter_link,
     active_on,
     candidate_lines,
+    evaluate_binding_caps,
     ordered_links,
     parse_session_choice,
     pool_limits,
     pool_of,
+    resolve_binding_caps,
     resolve_work_type,
     rule_limits,
 )
@@ -43,6 +45,27 @@ def read_preview_settings(store, owner, *, draft=None):
     ), saved
 
 
+def _reserved_count(ids, sessions, now):
+    if ids is None:
+        return None
+    if not ids:
+        return 0
+    if sessions is None:
+        return None
+    reserved = 0
+    for sid in ids:
+        session = sessions.get(sid)
+        if session is None:
+            return None
+        marker = session.labels.get(SLOT_LABEL, "")
+        if marker.startswith(("admitted@", "releasing@")):
+            with suppress(ValueError):
+                reserved += (now if now is not None else time.time()) - float(
+                    marker.rsplit("@", 1)[-1]
+                ) < 120
+    return reserved
+
+
 def explain_limits(
     settings,
     link,
@@ -58,37 +81,68 @@ def explain_limits(
         settings, link.agent_id, context.host, link.model, context.provider_groups
     )
     result = {name: field.payload() for name, field in fields.items()}
+    caps = resolve_binding_caps(
+        settings.limit_rules,
+        agent=link.agent_id,
+        host=context.host,
+        model=link.model,
+        groups=context.provider_groups,
+    )
+    evaluated = evaluate_binding_caps(caps, running, context.provider_groups)
+    if evaluated:
+        all_ids = sorted(
+            {sid for item in evaluated if item.running_ids is not None for sid in item.running_ids}
+        )
+        if all_ids and sessions is None and load_sessions is not None:
+            sessions = load_sessions(all_ids)
+        binding_rules = []
+        for item in evaluated:
+            ids = item.running_ids
+            entry: dict[str, Any] = {
+                "ruleId": item.cap.rule_id,
+                "maxRunning": item.cap.max_running,
+                "members": [scope.model_dump(exclude_none=True) for scope in item.cap.scopes],
+                "runningCount": len(ids) if ids is not None else None,
+                "reservedCount": _reserved_count(ids, sessions, now),
+                "countState": "known" if ids is not None else "unknown",
+            }
+            if include_running:
+                entry["runningSessionIds"] = list(ids) if ids is not None else None
+            binding_rules.append(entry)
+        tightest = evaluated[0]
+        top = binding_rules[0]
+        result["maxRunning"] = {
+            "defined": True,
+            "value": tightest.cap.max_running,
+            "sourceRuleId": tightest.cap.rule_id,
+            "specificity": tightest.cap.specificity,
+            "scope": None if tightest.cap.is_members_rule else top["members"][0],
+            **({"members": top["members"]} if tightest.cap.is_members_rule else {}),
+            "runningCount": top["runningCount"],
+            "reservedCount": top["reservedCount"],
+            "countState": top["countState"],
+            **({"runningSessionIds": top["runningSessionIds"]} if include_running else {}),
+            "bindingRules": binding_rules,
+        }
+        return result
     source = fields["maxRunning"]
     ids = (
         running.scoped(source.scope, context.provider_groups)
         if source.scope is not None and isinstance(running, RunningSnapshot)
         else None
     )
+    if ids is not None and sessions is None and load_sessions is not None:
+        sessions = load_sessions(list(ids))
     result["maxRunning"].update(
         runningCount=len(ids) if ids is not None else None,
-        reservedCount=None,
+        reservedCount=_reserved_count(ids, sessions, now),
         countState="known"
         if ids is not None
         else "unknown"
         if source.defined
         else "not_applicable",
+        bindingRules=[],
     )
-    if ids is not None and sessions is None and load_sessions is not None:
-        sessions = load_sessions(list(ids))
-    if ids is not None and sessions is not None:
-        reserved = 0
-        for sid in ids:
-            session = sessions.get(sid)
-            if session is None:
-                break
-            marker = session.labels.get(SLOT_LABEL, "")
-            if marker.startswith(("admitted@", "releasing@")):
-                with suppress(ValueError):
-                    reserved += (now if now is not None else time.time()) - float(
-                        marker.rsplit("@", 1)[-1]
-                    ) < 120
-        else:
-            result["maxRunning"]["reservedCount"] = reserved
     if include_running:
         result["maxRunning"]["runningSessionIds"] = list(ids) if ids is not None else None
     return result
@@ -102,7 +156,9 @@ async def validate_known_windows(app, owner, settings):
     if hosts is None:
         return
     known = await asyncio.to_thread(hosts.list_hosts, owner)
-    agents = tuple(dict.fromkeys(rule.agent for rule in settings.limit_rules))
+    agents = tuple(
+        dict.fromkeys(scope.agent for rule in settings.limit_rules for scope in rule.scopes)
+    )
     from omnigent.server.agent_quota import QuotaContext
 
     service = getattr(app.state, "agent_quota_service", None)
@@ -125,7 +181,12 @@ async def validate_known_windows(app, owner, settings):
             models = {
                 None,
                 *context.models.get(agent, ()),
-                *(rule.model for rule in settings.limit_rules if rule.agent == agent),
+                *(
+                    scope.model
+                    for rule in settings.limit_rules
+                    for scope in rule.scopes
+                    if scope.agent == agent
+                ),
                 *(link.model for link in ordered_links(settings) if link.agent_id == agent),
             }
             for model in models:
@@ -253,14 +314,28 @@ async def candidate_preview(
         and link._model_resolution.outcome in {"missing", "unverified"}
     )
     _, fields = rule_limits(settings, agent_id, host, resolved, context.provider_groups)
-    scope = fields["maxRunning"].scope
-    scoped_ids = (
-        running.scoped(scope, context.provider_groups)
-        if isinstance(running, RunningSnapshot) and scope is not None
-        else None
+    caps = resolve_binding_caps(
+        settings.limit_rules,
+        agent=agent_id,
+        host=host,
+        model=resolved,
+        groups=context.provider_groups,
     )
+    scoped_ids: set[str] | None = None
+    if isinstance(running, RunningSnapshot):
+        if caps:
+            collected: set[str] = set()
+            for item in evaluate_binding_caps(caps, running, context.provider_groups):
+                if item.running_ids is not None:
+                    collected.update(item.running_ids)
+            if collected:
+                scoped_ids = collected
+        elif (scope := fields["maxRunning"].scope) is not None:
+            matched = running.scoped(scope, context.provider_groups)
+            if matched is not None:
+                scoped_ids = set(matched)
     sessions = (
-        await asyncio.to_thread(app.state.conversation_store.get_conversations, list(scoped_ids))
+        await asyncio.to_thread(app.state.conversation_store.get_conversations, sorted(scoped_ids))
         if scoped_ids is not None
         else None
     )

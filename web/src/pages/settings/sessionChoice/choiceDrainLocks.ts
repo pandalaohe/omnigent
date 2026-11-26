@@ -10,13 +10,14 @@ export interface ChoiceDrainTag {
 const utf8 = new TextEncoder();
 
 // Match the server's sorted-key JSON for saved links, omitting nulls and fallbackMode.
-function linkIdentity({ agent, effort, maxRunning, meter, model }: ChoiceLink) {
+function linkIdentity({ agent, effort, maxRunning, meter, model, permissionTier }: ChoiceLink) {
   return JSON.stringify({
     agent,
     effort: effort ?? undefined,
     maxRunning: maxRunning ?? undefined,
     meter: meter ?? undefined,
     model: model ?? undefined,
+    permissionTier: permissionTier ?? undefined,
   });
 }
 

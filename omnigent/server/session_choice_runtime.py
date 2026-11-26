@@ -29,6 +29,7 @@ from omnigent.server.session_choice import (
     ChoiceRequest,
     DrainLock,
     Link,
+    PermissionTierSource,
     ProviderAttempt,
     RunningIdentity,
     RunningSnapshot,
@@ -236,12 +237,12 @@ def session_lines(app, session, settings, readings, products, floors, now):
         return None, ()
     identity = session_identity(app, session, settings)
     if any(
-        rule.agent == identity.agent
-        and (rule.host is None or identity.host is None or rule.host == identity.host)
+        scope.agent == identity.agent
+        and (scope.host is None or identity.host is None or scope.host == identity.host)
         and (
-            rule.model is None
+            scope.model is None
             or identity.model is None
-            or canonical_model(rule.model, groups) == canonical_model(identity.model, groups)
+            or canonical_model(scope.model, groups) == canonical_model(identity.model, groups)
         )
         and (
             (
@@ -251,10 +252,11 @@ def session_lines(app, session, settings, readings, products, floors, now):
             or (rule.reserve is None and "reserve" in rule.model_fields_set)
         )
         and (
-            (identity.host is None and rule.host is not None)
-            or (identity.model is None and rule.model is not None)
+            (identity.host is None and scope.host is not None)
+            or (identity.model is None and scope.model is not None)
         )
         for rule in settings.limit_rules
+        for scope in rule.scopes
     ):
         _logger.warning("Session choice stop identity unavailable for %s", session.id)
         settings = settings.model_copy(update={"limit_rules": ()})
@@ -1366,6 +1368,7 @@ class CreateChoice:
     pool_route: str
     drain_lock: DrainLock | None = None
     committed_drain: bool = False
+    permission_tier_source: PermissionTierSource = "host_default"
 
     async def persisted(self, app: Any, session: Conversation) -> None:
         if app.state.permission_store is not None:
@@ -1718,7 +1721,21 @@ async def admit_create(
                 409,
                 {"code": "session_choice_ask", "reason": "Choose a model for this Codex route"},
             )
-        choice = replace(choice, link=link)
+        if body.permission_tier is not None or body.permission_mode is not None:
+            tier_source: PermissionTierSource = "explicit"
+            selected_permission_tier = body.permission_tier
+        elif body.parent_session_id is not None and link.permission_tier is not None:
+            tier_source = "link"
+            selected_permission_tier = link.permission_tier
+        else:
+            tier_source = "host_default"
+            selected_permission_tier = None
+        choice = replace(
+            choice,
+            link=link,
+            permission_tier=selected_permission_tier,
+            permission_tier_source=tier_source,
+        )
         receipt = await asyncio.to_thread(
             limit_receipt, app, settings, revision, link, request, running, now
         )
@@ -1728,13 +1745,14 @@ async def admit_create(
             effective_limits=receipt["effectiveLimits"],
             legacy_checks=receipt["legacyChecks"],
         )
-        updated = body.model_copy(
-            update={
-                "agent_id": link.agent_id,
-                "model_override": link.model,
-                "reasoning_effort": link.effort,
-            }
-        )
+        update_fields: dict[str, Any] = {
+            "agent_id": link.agent_id,
+            "model_override": link.model,
+            "reasoning_effort": link.effort,
+        }
+        if tier_source == "link":
+            update_fields["permission_tier"] = selected_permission_tier
+        updated = body.model_copy(update=update_fields)
         yield CreateChoice(
             updated,
             choice,
@@ -1751,6 +1769,7 @@ async def admit_create(
                 groups=request.provider_groups,
             ),
             plan.lock if not named else None,
+            permission_tier_source=tier_source,
         )
 
 
@@ -1781,13 +1800,14 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
         except HTTPException:
             _logger.warning("Session choice release configuration unavailable for %s", session.id)
             return False
-        link = Link.model_validate(
-            {
-                key: record[key]
-                for key in ("agent", "model", "effort", "meter", "maxRunning")
-                if key in record
-            }
-        )
+        link_fields = {
+            key: record[key]
+            for key in ("agent", "model", "effort", "meter", "maxRunning")
+            if key in record
+        }
+        if record.get("permissionTier") in {"ask", "plan", "accept-edits", "auto"}:
+            link_fields["permissionTier"] = record["permissionTier"]
+        link = Link.model_validate(link_fields)
         # The label's pool owns the queued session even after a meter edit.
         link = link.model_copy(
             update={"meter": record.get("pool") if record.get("meter") else None}

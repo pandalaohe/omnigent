@@ -3355,3 +3355,363 @@ async def test_billing_refusal_stops_usage_lines_and_selection_without_reset(quo
     choice = second.json()["session_choice"]
     assert choice["pool"] == "pool-1"
     assert choice["skipped"][0]["why"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_multi_member_cap_refuses_fourth_launch_across_hosts_and_reports_effective_limits(
+    choice_env,
+):
+    env = choice_env
+    host_b = "2" * 32
+    env.app.state.host_store.upsert_on_connect(host_b, "second-host", RESERVED_USER_LOCAL)
+    parent_b = env.store.create_conversation(
+        agent_id=env.agents[1]["id"], host_id=host_b, workspace="/opt/work/project"
+    )
+    link_a = {"agent": env.agents[0]["id"], "model": "claude-opus-5-5"}
+    link_b = {"agent": env.agents[1]["id"], "model": "claude-opus-5-5"}
+    settings = {
+        "schemaVersion": 2,
+        "enabled": True,
+        "workTypes": [{"id": "work", "label": "Work", "ifFull": "ask"}],
+        "presets": [
+            {"id": "pa", "name": "Host A Opus", "links": [link_a]},
+            {"id": "pb", "name": "Host B Opus", "links": [link_b]},
+        ],
+        "hosts": {
+            HOST: {"work": [[{"preset": "pa", "links": [link_a], "weight": 1}]]},
+            host_b: {"work": [[{"preset": "pb", "links": [link_b], "weight": 1}]]},
+        },
+        "limits": {},
+        "limitRules": [
+            {"id": "host-a-cap", "agent": env.agents[0]["id"], "maxRunning": 5},
+            {
+                "id": "opus-shared",
+                "members": [
+                    {"agent": env.agents[0]["id"], "host": HOST, "model": "claude-opus-5-5"},
+                    {"agent": env.agents[1]["id"], "host": host_b, "model": "claude-opus-5-5"},
+                ],
+                "maxRunning": 3,
+            },
+        ],
+    }
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+
+    first = await create(env)
+    assert first.status_code == 201, first.text
+    first_cap = first.json()["session_choice"]["effectiveLimits"]["maxRunning"]
+    assert first_cap["sourceRuleId"] == "opus-shared"
+    assert first_cap["runningCount"] == 0
+    assert {row["ruleId"]: row["runningCount"] for row in first_cap["bindingRules"]} == {
+        "opus-shared": 0,
+        "host-a-cap": 0,
+    }
+
+    second = await create(env)
+    assert second.status_code == 201, second.text
+    third = await env.client.post(
+        "/v1/sessions",
+        headers=HEADERS,
+        json={"parent_session_id": parent_b.id, "work_type": "work"},
+    )
+    assert third.status_code == 201, third.text
+    third_cap = third.json()["session_choice"]["effectiveLimits"]["maxRunning"]
+    assert third_cap["sourceRuleId"] == "opus-shared"
+    assert third_cap["runningCount"] == 2
+
+    fourth_a = await create(env)
+    assert fourth_a.status_code == 409, fourth_a.text
+    detail_a = fourth_a.json()["detail"]
+    assert detail_a["code"] == "session_choice_ask"
+    skipped = detail_a["skipped"][0]
+    assert skipped["why"] == "busy"
+    assert skipped["ruleId"] == "opus-shared"
+    assert skipped["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "opus-shared"
+    assert skipped["effectiveLimits"]["maxRunning"]["runningCount"] == 3
+    assert {
+        row["ruleId"]: (row["runningCount"], row["maxRunning"])
+        for row in skipped["effectiveLimits"]["maxRunning"]["bindingRules"]
+    } == {
+        "opus-shared": (3, 3),
+        "host-a-cap": (2, 5),
+    }
+
+    fourth_b = await env.client.post(
+        "/v1/sessions",
+        headers=HEADERS,
+        json={
+            "parent_session_id": parent_b.id,
+            "work_type": "work",
+            "agent_id": env.agents[1]["id"],
+            "choice_reason": "need host b",
+        },
+    )
+    assert fourth_b.status_code == 409, fourth_b.text
+    detail_b = fourth_b.json()["detail"]
+    assert detail_b["code"] == "agent_busy"
+    assert detail_b["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "opus-shared"
+    assert detail_b["effectiveLimits"]["maxRunning"]["runningCount"] == 3
+
+
+@pytest.mark.asyncio
+async def test_link_permission_tier_create_source_precedence_and_validation(
+    choice_env,
+):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+        ConfirmedPermissionState,
+    )
+
+    env = choice_env
+    pi_agent = await create_test_agent(
+        env.client,
+        name="choice-pi",
+        include_llm=False,
+        executor={"type": "omnigent", "config": {"harness": "pi-native"}},
+    )
+    codex_agent = await create_test_agent(
+        env.client,
+        name="choice-codex",
+        include_llm=False,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    headers = {**HEADERS, PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION}
+
+    def save_link_settings(work_links: dict[str, dict]):
+        work_types = [{"id": key, "label": key.title()} for key in work_links]
+        presets = [
+            {"id": f"p-{key}", "name": key.title(), "links": [link]}
+            for key, link in work_links.items()
+        ]
+        hosts = {
+            HOST: {
+                key: [[{"preset": f"p-{key}", "links": [link], "weight": 1}]]
+                for key, link in work_links.items()
+            }
+        }
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            {
+                "enabled": True,
+                "workTypes": work_types,
+                "presets": presets,
+                "hosts": hosts,
+                "limits": {},
+            },
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
+
+    save_link_settings(
+        {
+            "tiered": {
+                "agent": pi_agent["id"],
+                "model": "test-model",
+                "permissionTier": "accept-edits",
+            },
+            "default": {"agent": pi_agent["id"], "model": "test-model"},
+            "invalid": {
+                "agent": codex_agent["id"],
+                "model": "test-model",
+                "permissionTier": "accept-edits",
+            },
+            "escalated": {
+                "agent": pi_agent["id"],
+                "model": "test-model",
+                "permissionTier": "auto",
+            },
+        }
+    )
+
+    # 1. Link permissionTier is used when caller omits permission_tier.
+    from_link = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": env.parent.id, "work_type": "tiered"},
+    )
+    assert from_link.status_code == 201, from_link.text
+    body_link = from_link.json()
+    assert body_link["permission_tier"] == "accept-edits"
+    assert body_link["permission_tier_source"] == "link"
+    assert body_link["session_choice"]["permissionTier"] == "accept-edits"
+    assert body_link["session_choice"]["permissionTierSource"] == "link"
+
+    # 2. Explicit permission_tier wins over link permissionTier.
+    from_explicit = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={
+            "parent_session_id": env.parent.id,
+            "work_type": "tiered",
+            "permission_tier": "plan",
+        },
+    )
+    assert from_explicit.status_code == 201, from_explicit.text
+    body_explicit = from_explicit.json()
+    assert body_explicit["permission_tier"] == "plan"
+    assert body_explicit["permission_tier_source"] == "explicit"
+    assert body_explicit["session_choice"]["permissionTier"] == "plan"
+    assert body_explicit["session_choice"]["permissionTierSource"] == "explicit"
+
+    # 3. Absent link tier uses host default.
+    from_default = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": env.parent.id, "work_type": "default"},
+    )
+    assert from_default.status_code == 201, from_default.text
+    body_default = from_default.json()
+    assert body_default["permission_tier"] == "auto"
+    assert body_default["permission_tier_source"] == "host_default"
+    assert body_default["session_choice"]["permissionTier"] == "auto"
+    assert body_default["session_choice"]["permissionTierSource"] == "host_default"
+
+    # 4. Link permissionTier is refused on harnesses that cannot take permission_tier.
+    refused_harness = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": env.parent.id, "work_type": "invalid"},
+    )
+    assert refused_harness.status_code == 400, refused_harness.text
+    assert "permission_tier" in refused_harness.text
+
+    # 5. Link permissionTier cannot exceed creator's permission tier ceiling.
+    plan_parent = env.store.create_conversation(
+        agent_id=pi_agent["id"],
+        host_id=HOST,
+        workspace="/opt/work/project",
+        labels={
+            **ConfirmedPermissionState("plan", 1, "ready").labels("pi-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    refused_ceiling = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": plan_parent.id, "work_type": "escalated"},
+    )
+    assert refused_ceiling.status_code == 403, refused_ceiling.text
+    assert "exceed" in refused_ceiling.text
+
+    # 6. Runner sys_session_create handle forwards permission_tier and permission_tier_source.
+    from omnigent.runner.tool_dispatch import _CreatePlacement, _finalize_created_session
+
+    handle = json.loads(
+        await _finalize_created_session(
+            body_link,
+            server_client=env.client,
+            conversation_id=env.parent.id,
+            agent_id=body_link["agent_id"],
+            title=None,
+            message=None,
+            publish_event=None,
+            placement=_CreatePlacement(caller_host_id=HOST),
+            inherited_host_id=HOST,
+        )
+    )
+    assert handle["permission_tier"] == "accept-edits"
+    assert handle["permission_tier_source"] == "link"
+    assert handle["session_choice"]["permissionTierSource"] == "link"
+
+    # 7. ACP host capability check refuses link and explicit permission_tier when host lacks
+    #    delegated ACP tier support, and accepts + requires protocol header once supported.
+    acp_agent = await create_test_agent(
+        env.client,
+        name="choice-acp",
+        include_llm=False,
+        executor={"type": "omnigent", "config": {"harness": "acp:ag"}},
+    )
+    save_link_settings(
+        {
+            "acp-tiered": {
+                "agent": acp_agent["id"],
+                "model": "test-model",
+                "permissionTier": "accept-edits",
+            },
+            "pi-tiered": {
+                "agent": pi_agent["id"],
+                "model": "test-model",
+                "permissionTier": "accept-edits",
+            },
+        }
+    )
+    refused_acp_link = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": env.parent.id, "work_type": "acp-tiered"},
+    )
+    assert refused_acp_link.status_code == 400, refused_acp_link.text
+    assert "ACP" in refused_acp_link.text
+
+    refused_acp_explicit = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={
+            "parent_session_id": env.parent.id,
+            "work_type": "acp-tiered",
+            "permission_tier": "plan",
+        },
+    )
+    assert refused_acp_explicit.status_code == 400, refused_acp_explicit.text
+    assert "ACP" in refused_acp_explicit.text
+
+    from omnigent.host.frames import HostHelloFrame
+
+    class _AcpHostRegistry:
+        def __init__(self, caps: list[str]):
+            self._conn = SimpleNamespace(
+                hello=HostHelloFrame(
+                    version="test",
+                    frame_protocol_version=1,
+                    name="sample-host",
+                    configured_harnesses={"acp": True, "acp:ag": True, "pi-native": True},
+                    capabilities=caps,
+                    acp_permission_tiers={},
+                )
+            )
+
+        def get(self, host_id: str):
+            return self._conn if host_id == HOST else None
+
+    env.app.state.host_registry = _AcpHostRegistry(["agy_acp_permissions:acp:ag"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env.app), base_url="http://test"
+    ) as legacy_client:
+        acp_no_header = await legacy_client.post(
+            "/v1/sessions",
+            headers=HEADERS,
+            json={"parent_session_id": env.parent.id, "work_type": "acp-tiered"},
+        )
+    assert acp_no_header.status_code == 426, acp_no_header.text
+
+    acp_ok = await env.client.post(
+        "/v1/sessions",
+        headers=headers,
+        json={"parent_session_id": env.parent.id, "work_type": "acp-tiered"},
+    )
+    assert acp_ok.status_code == 201, acp_ok.text
+    assert acp_ok.json()["permission_tier"] == "accept-edits"
+    assert acp_ok.json()["permission_tier_source"] == "link"
+
+    # 8. Independent (same_host / sys_session_open / non-child) admission selects the link
+    #    without applying link permissionTier, matching explicit permission_tier placement rules.
+    from omnigent.server.schemas import ProjectSessionCreateRequest
+    from omnigent.server.session_choice_runtime import admit_create
+
+    independent_body = ProjectSessionCreateRequest(
+        host_id=HOST, workspace="/opt/work/project", work_type="pi-tiered"
+    )
+    async with admit_create(
+        env.app, independent_body, env.parent, RESERVED_USER_LOCAL
+    ) as selection:
+        assert selection is not None
+        assert selection.body.agent_id == pi_agent["id"]
+        assert selection.body.permission_tier is None
+        assert selection.permission_tier_source == "host_default"
+        assert selection.choice.permission_tier is None
+        assert selection.choice.permission_tier_source == "host_default"

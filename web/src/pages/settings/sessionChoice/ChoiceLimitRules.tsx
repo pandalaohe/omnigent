@@ -16,7 +16,258 @@ import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 import { CHOICE_SELECT } from "./ChoiceLinkEditor";
 import { ChoiceCandidateCheck } from "./ChoiceCandidateCheck";
 import { limitRuleErrors, moveLimitRule, replaceLimitRules } from "./choiceLimitEdits";
-import type { ChoiceLimitRule, SessionChoiceDocument } from "./sessionChoiceData";
+import type { ChoiceLimitRule, ChoiceLimitScope, SessionChoiceDocument } from "./sessionChoiceData";
+
+function isGroupRule(rule: ChoiceLimitRule): boolean {
+  return Array.isArray(rule.members);
+}
+
+function ScopeFields({
+  scope,
+  catalogs,
+  labelPrefix = "Rule",
+  onChange,
+}: {
+  scope: ChoiceLimitScope;
+  catalogs: CallingDefaultsCatalogRow[];
+  labelPrefix?: string;
+  onChange: (scope: ChoiceLimitScope) => void;
+}) {
+  const listId = useId();
+  const agents = useAvailableAgents();
+  const hosts = useHosts();
+  const agent = agents.data?.find((item) => item.id === scope.agent);
+  const agentOptions = agents.data ?? [];
+  const hostOptions = hosts.data ?? [];
+  const models = [
+    ...new Set(
+      catalogs
+        .filter(
+          (row) =>
+            (!scope.host || row.host_id === scope.host) &&
+            agent?.harness &&
+            canonicalNativeHarness(row.harness.replaceAll("_", "-")) ===
+              canonicalNativeHarness(agent.harness.replaceAll("_", "-")),
+        )
+        .flatMap((row) => row.models.map((model) => model.id)),
+    ),
+  ];
+  return (
+    <div className="grid gap-3 sm:grid-cols-3">
+      <label className="grid min-w-0 gap-1 text-sm">
+        Agent
+        {agentOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <Combobox
+            mode="select"
+            options={[
+              ...(scope.agent && !agent
+                ? [{ key: scope.agent, label: `${scope.agent} (unavailable)` }]
+                : []),
+              ...agentOptions.map((item) => ({
+                key: item.id,
+                label: item.display_name,
+                description: item.name,
+              })),
+            ]}
+            value={scope.agent}
+            onValueChange={(value) => onChange({ ...scope, agent: value })}
+            placeholder="Choose an agent"
+            aria-label={`${labelPrefix} agent`}
+            className="h-auto w-full rounded-none! bg-transparent p-0"
+          />
+        ) : (
+          <select
+            aria-label={`${labelPrefix} agent`}
+            className={CHOICE_SELECT}
+            value={scope.agent}
+            onChange={(e) => onChange({ ...scope, agent: e.target.value })}
+          >
+            <option value="" disabled>
+              Choose an agent
+            </option>
+            {scope.agent && !agent && (
+              <option value={scope.agent}>{scope.agent} (unavailable)</option>
+            )}
+            {agentOptions.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.display_name}
+              </option>
+            ))}
+          </select>
+        )}
+        <span className="break-words text-muted-foreground">
+          {agent?.display_name ?? scope.agent}
+        </span>
+      </label>
+      <label className="grid min-w-0 gap-1 text-sm">
+        Host
+        {hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <Combobox
+            mode="select"
+            options={[
+              { key: "__all__", label: "All hosts" },
+              ...(scope.host && !hostOptions.some((item) => item.host_id === scope.host)
+                ? [{ key: scope.host, label: `${scope.host} (unavailable)` }]
+                : []),
+              ...hostOptions.map((item) => ({
+                key: item.host_id,
+                label: item.name,
+                description: item.status === "online" ? undefined : "Offline",
+              })),
+            ]}
+            value={scope.host ?? "__all__"}
+            onValueChange={(value) => {
+              const next = { ...scope };
+              if (value !== "__all__") next.host = value;
+              else Reflect.deleteProperty(next, "host");
+              onChange(next);
+            }}
+            aria-label={`${labelPrefix} host`}
+            className="h-auto w-full rounded-none! bg-transparent p-0"
+          />
+        ) : (
+          <select
+            aria-label={`${labelPrefix} host`}
+            className={CHOICE_SELECT}
+            value={scope.host ?? ""}
+            onChange={(e) => {
+              const next = { ...scope };
+              if (e.target.value) next.host = e.target.value;
+              else Reflect.deleteProperty(next, "host");
+              onChange(next);
+            }}
+          >
+            <option value="">All hosts</option>
+            {scope.host && !hostOptions.some((item) => item.host_id === scope.host) && (
+              <option value={scope.host}>{scope.host} (unavailable)</option>
+            )}
+            {hostOptions.map((item) => (
+              <option key={item.host_id} value={item.host_id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        )}
+        <span className="break-words text-muted-foreground">
+          {hosts.data?.find((item) => item.host_id === scope.host)?.name ??
+            scope.host ??
+            "All hosts"}
+        </span>
+      </label>
+      <label className="grid min-w-0 gap-1 text-sm">
+        Model
+        <Input
+          aria-label={`${labelPrefix} model`}
+          list={listId}
+          placeholder="All models"
+          value={scope.model ?? ""}
+          onChange={(e) => {
+            const next = { ...scope };
+            if (e.target.value) next.model = e.target.value;
+            else Reflect.deleteProperty(next, "model");
+            onChange(next);
+          }}
+        />
+        <datalist id={listId}>
+          {models.map((model) => (
+            <option key={model} value={model} />
+          ))}
+        </datalist>
+        <span className="break-words text-muted-foreground">{scope.model ?? "All models"}</span>
+      </label>
+    </div>
+  );
+}
+
+function GroupRuleFields({
+  rule,
+  catalogs,
+  onChange,
+}: {
+  rule: ChoiceLimitRule;
+  catalogs: CallingDefaultsCatalogRow[];
+  onChange: (rule: ChoiceLimitRule) => void;
+}) {
+  const agents = useAvailableAgents();
+  const members = rule.members ?? [];
+  const hasReserveFields = rule.reserve !== undefined || rule.reserveExempt !== undefined;
+  function updateMembers(nextMembers: ChoiceLimitScope[]) {
+    onChange({ ...rule, members: nextMembers });
+  }
+  function clearReserveFields() {
+    const next = { ...rule };
+    Reflect.deleteProperty(next, "reserve");
+    Reflect.deleteProperty(next, "reserveExempt");
+    onChange(next);
+  }
+  return (
+    <div className="space-y-4 pt-3">
+      {hasReserveFields && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-2 text-xs text-muted-foreground">
+          <span>Clear reserve fields before adding another member.</span>
+          <Button size="sm" variant="outline" onClick={clearReserveFields}>
+            Clear reserve fields
+          </Button>
+        </div>
+      )}
+      <div className="space-y-3">
+        {members.map((member, memberIndex) => (
+          // eslint-disable-next-line react/no-array-index-key -- Member rows are ordered slots in a small controlled list.
+          <div key={`member:${memberIndex}`} className="space-y-2 rounded border border-border p-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground">
+                Member {memberIndex + 1}
+              </span>
+              {members.length > 1 && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => updateMembers(members.filter((_, idx) => idx !== memberIndex))}
+                >
+                  Remove member {memberIndex + 1}
+                </Button>
+              )}
+            </div>
+            <ScopeFields
+              scope={member}
+              catalogs={catalogs}
+              labelPrefix={`Member ${memberIndex + 1}`}
+              onChange={(nextMember) =>
+                updateMembers(members.map((item, idx) => (idx === memberIndex ? nextMember : item)))
+              }
+            />
+          </div>
+        ))}
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={hasReserveFields}
+          onClick={() => updateMembers([...members, { agent: agents.data?.[0]?.id ?? "" }])}
+        >
+          + Add member
+        </Button>
+      </div>
+      <label className="flex flex-wrap items-center gap-2 text-sm">
+        Max running
+        <Input
+          aria-label="Group max running"
+          type="number"
+          className="h-9 w-28"
+          min={1}
+          step={1}
+          value={Number.isNaN(rule.maxRunning) ? "" : (rule.maxRunning ?? "")}
+          onChange={(event) => {
+            const next = { ...rule };
+            if (event.target.value === "") Reflect.deleteProperty(next, "maxRunning");
+            else next.maxRunning = Number(event.target.value);
+            onChange(next);
+          }}
+        />
+        sessions
+      </label>
+    </div>
+  );
+}
 
 function NumberPatch({
   label,
@@ -88,25 +339,9 @@ function RuleFields({
   catalogs: CallingDefaultsCatalogRow[];
   onChange: (rule: ChoiceLimitRule) => void;
 }) {
-  const listId = useId();
-  const agents = useAvailableAgents();
-  const hosts = useHosts();
-  const agent = agents.data?.find((item) => item.id === rule.agent);
-  const agentOptions = agents.data ?? [];
-  const hostOptions = hosts.data ?? [];
-  const models = [
-    ...new Set(
-      catalogs
-        .filter(
-          (row) =>
-            (!rule.host || row.host_id === rule.host) &&
-            agent?.harness &&
-            canonicalNativeHarness(row.harness.replaceAll("_", "-")) ===
-              canonicalNativeHarness(agent.harness.replaceAll("_", "-")),
-        )
-        .flatMap((row) => row.models.map((model) => model.id)),
-    ),
-  ];
+  if (isGroupRule(rule)) {
+    return <GroupRuleFields rule={rule} catalogs={catalogs} onChange={onChange} />;
+  }
   function field(
     name: "maxRunning" | "reserveExempt",
     value: number | string[] | null | undefined,
@@ -126,126 +361,18 @@ function RuleFields({
   }
   return (
     <div className="space-y-4 pt-3">
-      <div className="grid gap-3 sm:grid-cols-3">
-        <label className="grid min-w-0 gap-1 text-sm">
-          Agent
-          {agentOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
-            <Combobox
-              mode="select"
-              options={[
-                ...(rule.agent && !agent
-                  ? [{ key: rule.agent, label: `${rule.agent} (unavailable)` }]
-                  : []),
-                ...agentOptions.map((item) => ({
-                  key: item.id,
-                  label: item.display_name,
-                  description: item.name,
-                })),
-              ]}
-              value={rule.agent}
-              onValueChange={(value) => onChange({ ...rule, agent: value })}
-              placeholder="Choose an agent"
-              aria-label="Rule agent"
-              className="h-auto w-full rounded-none! bg-transparent p-0"
-            />
-          ) : (
-            <select
-              className={CHOICE_SELECT}
-              value={rule.agent}
-              onChange={(e) => onChange({ ...rule, agent: e.target.value })}
-            >
-              <option value="" disabled>
-                Choose an agent
-              </option>
-              {rule.agent && !agent && (
-                <option value={rule.agent}>{rule.agent} (unavailable)</option>
-              )}
-              {agentOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.display_name}
-                </option>
-              ))}
-            </select>
-          )}
-          <span className="break-words text-muted-foreground">
-            {agent?.display_name ?? rule.agent}
-          </span>
-        </label>
-        <label className="grid min-w-0 gap-1 text-sm">
-          Host
-          {hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
-            <Combobox
-              mode="select"
-              options={[
-                { key: "__all__", label: "All hosts" },
-                ...(rule.host && !hostOptions.some((item) => item.host_id === rule.host)
-                  ? [{ key: rule.host, label: `${rule.host} (unavailable)` }]
-                  : []),
-                ...hostOptions.map((item) => ({
-                  key: item.host_id,
-                  label: item.name,
-                  description: item.status === "online" ? undefined : "Offline",
-                })),
-              ]}
-              value={rule.host ?? "__all__"}
-              onValueChange={(value) => {
-                const next = { ...rule };
-                if (value !== "__all__") next.host = value;
-                else Reflect.deleteProperty(next, "host");
-                onChange(next);
-              }}
-              aria-label="Rule host"
-              className="h-auto w-full rounded-none! bg-transparent p-0"
-            />
-          ) : (
-            <select
-              className={CHOICE_SELECT}
-              value={rule.host ?? ""}
-              onChange={(e) => {
-                const next = { ...rule };
-                if (e.target.value) next.host = e.target.value;
-                else Reflect.deleteProperty(next, "host");
-                onChange(next);
-              }}
-            >
-              <option value="">All hosts</option>
-              {rule.host && !hostOptions.some((item) => item.host_id === rule.host) && (
-                <option value={rule.host}>{rule.host} (unavailable)</option>
-              )}
-              {hostOptions.map((item) => (
-                <option key={item.host_id} value={item.host_id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          )}
-          <span className="break-words text-muted-foreground">
-            {hosts.data?.find((item) => item.host_id === rule.host)?.name ??
-              rule.host ??
-              "All hosts"}
-          </span>
-        </label>
-        <label className="grid min-w-0 gap-1 text-sm">
-          Model
-          <Input
-            list={listId}
-            placeholder="All models"
-            value={rule.model ?? ""}
-            onChange={(e) => {
-              const next = { ...rule };
-              if (e.target.value) next.model = e.target.value;
-              else Reflect.deleteProperty(next, "model");
-              onChange(next);
-            }}
-          />
-          <datalist id={listId}>
-            {models.map((model) => (
-              <option key={model} value={model} />
-            ))}
-          </datalist>
-          <span className="break-words text-muted-foreground">{rule.model ?? "All models"}</span>
-        </label>
-      </div>
+      <ScopeFields
+        scope={{ agent: rule.agent ?? "", host: rule.host, model: rule.model }}
+        catalogs={catalogs}
+        onChange={(scope) => {
+          const next = { ...rule, agent: scope.agent };
+          if (scope.host !== undefined) next.host = scope.host;
+          else Reflect.deleteProperty(next, "host");
+          if (scope.model !== undefined) next.model = scope.model;
+          else Reflect.deleteProperty(next, "model");
+          onChange(next);
+        }}
+      />
       <div className="grid gap-4 md:grid-cols-3">
         <NumberPatch
           label="Max running"
@@ -362,7 +489,8 @@ export function ChoiceLimitRules({
       <summary className="cursor-pointer text-sm font-medium">Limits</summary>
       <div className="mt-3 space-y-3">
         <p className="text-sm text-muted-foreground">
-          More specific rules win per field. Ties use list order. Unset fields inherit.
+          Single-scope rules: more specific wins per field. Group caps sum across their members;
+          every matching cap applies and the tightest decides.
         </p>
         {!canEdit && (
           <p className="text-sm text-muted-foreground">
@@ -389,21 +517,47 @@ export function ChoiceLimitRules({
           }}
         >
           <fieldset disabled={!canEdit} className="min-w-0 space-y-3">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                onChange(
-                  replaceLimitRules(document, [
-                    ...rules,
-                    { id: crypto.randomUUID(), agent: agents.data?.[0]?.id ?? "" },
-                  ]),
-                );
-                setStatus("Added rule. Not saved yet.");
-              }}
-            >
-              Add rule
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  onChange(
+                    replaceLimitRules(document, [
+                      ...rules,
+                      {
+                        id: crypto.randomUUID().replaceAll("-", ""),
+                        agent: agents.data?.[0]?.id ?? "",
+                      },
+                    ]),
+                  );
+                  setStatus("Added rule. Not saved yet.");
+                }}
+              >
+                Add rule
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const id = crypto.randomUUID().replaceAll("-", "");
+                  onChange(
+                    replaceLimitRules(document, [
+                      ...rules,
+                      {
+                        id,
+                        members: [{ agent: agents.data?.[0]?.id ?? "" }],
+                        maxRunning: 1,
+                      },
+                    ]),
+                  );
+                  setEditing(id);
+                  setStatus("Added group cap. Not saved yet.");
+                }}
+              >
+                Add group cap
+              </Button>
+            </div>
             {!rules.length && (
               <p className="text-sm text-muted-foreground">
                 No scoped rules. No additional restriction from this policy; remaining legacy limits
@@ -431,8 +585,11 @@ export function ChoiceLimitRules({
                         aria-expanded={editing === rule.id}
                         onClick={() => setEditing(rule.id)}
                       >
-                        Rule {index + 1} · Specificity{" "}
-                        {1 + Number(Boolean(rule.host)) + Number(Boolean(rule.model))}
+                        {isGroupRule(rule)
+                          ? rule.members!.length === 1
+                            ? `Rule ${index + 1} · Group cap (1 member)`
+                            : `Rule ${index + 1} · Group cap (${rule.members!.length} members)`
+                          : `Rule ${index + 1} · Specificity ${1 + Number(Boolean(rule.host)) + Number(Boolean(rule.model))}`}
                       </button>
                       {([-1, 1] as const).map((offset) => (
                         <Button
@@ -468,29 +625,48 @@ export function ChoiceLimitRules({
                       </Button>
                     </div>
                     <p className="mt-1 break-words text-sm text-muted-foreground">
-                      {agents.data?.find((item) => item.id === rule.agent)?.display_name ??
-                        rule.agent}{" "}
-                      / {rule.host ?? "All hosts"} / {rule.model ?? "All models"}
+                      {isGroupRule(rule)
+                        ? rule
+                            .members!.map((member) => {
+                              const agentName =
+                                agents.data?.find((item) => item.id === member.agent)
+                                  ?.display_name ?? member.agent;
+                              const hostName =
+                                hosts.data?.find((item) => item.host_id === member.host)?.name ??
+                                member.host ??
+                                "All hosts";
+                              return `${agentName} / ${hostName} / ${member.model ?? "All models"}`;
+                            })
+                            .join(" + ")
+                        : `${agents.data?.find((item) => item.id === rule.agent)?.display_name ?? rule.agent} / ${hosts.data?.find((item) => item.host_id === rule.host)?.name ?? rule.host ?? "All hosts"} / ${rule.model ?? "All models"}`}
                     </p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Max running:{" "}
-                      {rule.maxRunning === undefined
-                        ? "Inherit"
-                        : rule.maxRunning === null
-                          ? "Unlimited"
-                          : rule.maxRunning}{" "}
-                      · Warning:{" "}
-                      {rule.reserve === null || rule.reserve?.pct === null
-                        ? "No threshold"
-                        : rule.reserve?.pct === undefined
-                          ? "Inherit"
-                          : `${rule.reserve.pct}%`}{" "}
-                      · Stop:{" "}
-                      {rule.reserve === null || rule.reserve?.stopPct === null
-                        ? "No threshold"
-                        : rule.reserve?.stopPct === undefined
-                          ? "Inherit"
-                          : `${rule.reserve.stopPct}%`}
+                      {isGroupRule(rule) ? (
+                        <>
+                          Max running: {rule.maxRunning ?? "Unlimited"} · Every matching cap applies
+                        </>
+                      ) : (
+                        <>
+                          Max running:{" "}
+                          {rule.maxRunning === undefined
+                            ? "Inherit"
+                            : rule.maxRunning === null
+                              ? "Unlimited"
+                              : rule.maxRunning}{" "}
+                          · Warning:{" "}
+                          {rule.reserve === null || rule.reserve?.pct === null
+                            ? "No threshold"
+                            : rule.reserve?.pct === undefined
+                              ? "Inherit"
+                              : `${rule.reserve.pct}%`}{" "}
+                          · Stop:{" "}
+                          {rule.reserve === null || rule.reserve?.stopPct === null
+                            ? "No threshold"
+                            : rule.reserve?.stopPct === undefined
+                              ? "Inherit"
+                              : `${rule.reserve.stopPct}%`}
+                        </>
+                      )}
                     </p>
                     <details open={editing === rule.id}>
                       <summary

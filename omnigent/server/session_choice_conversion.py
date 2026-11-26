@@ -133,9 +133,10 @@ def conversion_preview(app: Any, owner: str, settings: SessionChoice) -> dict[st
                 elif any(item["harness"] is None for item in catalog):
                     reason = "catalog_identity_unavailable"
                 elif any(
-                    rule.agent == row["agent"]
-                    and (rule.model is None or rule.model == row["model"])
+                    scope.agent == row["agent"]
+                    and (scope.model is None or scope.model == row["model"])
                     for rule in settings.limit_rules
+                    for scope in rule.scopes
                 ):
                     reason = "existing_scoped_rule_overlap"
                 elif running is None or not running.available:

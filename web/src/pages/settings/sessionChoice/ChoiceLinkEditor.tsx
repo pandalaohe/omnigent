@@ -7,7 +7,12 @@ import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
-import type { ChoiceFallbackMode, ChoiceLink, ChoiceLimit } from "./sessionChoiceData";
+import type {
+  ChoiceFallbackMode,
+  ChoiceLink,
+  ChoiceLimit,
+  ChoicePermissionTier,
+} from "./sessionChoiceData";
 import type { ChoiceDrainTag } from "./choiceDrainLocks";
 import { guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
@@ -182,6 +187,26 @@ export function ChoiceLinkEditor({
           </datalist>
         </label>
       </div>
+      <label className="flex min-w-0 flex-col gap-1 text-xs">
+        Permission tier
+        <select
+          aria-label="Link permission tier"
+          className={CHOICE_SELECT}
+          value={link.permissionTier ?? ""}
+          onChange={(e) => {
+            const next = { ...link };
+            if (e.target.value) next.permissionTier = e.target.value as ChoicePermissionTier;
+            else delete next.permissionTier;
+            onChange(next);
+          }}
+        >
+          <option value="">Host default</option>
+          <option value="ask">Ask</option>
+          <option value="plan">Plan</option>
+          <option value="accept-edits">Accept edits</option>
+          <option value="auto">Auto</option>
+        </select>
+      </label>
       {variants.length > 1 && (
         <label className="flex min-w-0 flex-col gap-1 text-xs">
           Provider

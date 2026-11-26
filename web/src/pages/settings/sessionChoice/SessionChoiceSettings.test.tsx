@@ -541,9 +541,87 @@ it("adds and removes explicit rules without deleting old pool constraints", asyn
   const body = JSON.parse(mocks.request.mock.calls[0][1].body);
   expect(body.settings.limitRules).toHaveLength(2);
   expect(body.settings.limitRules[0].id).toBe("model");
+  expect(body.settings.limitRules[1].id.length).toBeGreaterThan(0);
+  expect(body.settings.limitRules[1].id.length).toBeLessThanOrEqual(32);
   expect(body.settings.limitRules[1]).toMatchObject({ agent: "agent-a" });
   expect(body.settings.limitRules[1]).not.toHaveProperty("maxRunning");
   expect(body.settings.limits).toEqual(settings.limits);
+});
+
+it("adds, edits, and saves a multi-member group cap rule", async () => {
+  const settings = scopedFixture();
+  mocks.request.mockImplementation(async (_path: string, init?: { body?: string }) => ({
+    settings: init?.body ? JSON.parse(init.body).settings : settings,
+    revision: "scoped-b",
+  }));
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Add group cap" }));
+  const rule = screen.getByRole("article", { name: "Rule 3" });
+  expect(rule).toHaveTextContent("Group cap (1 member)");
+  fireEvent.click(within(rule).getByRole("button", { name: "+ Add member" }));
+  expect(rule).toHaveTextContent("Group cap (2 members)");
+  fireEvent.change(within(rule).getByLabelText("Member 1 model"), {
+    target: { value: "opus-5" },
+  });
+  fireEvent.change(within(rule).getByLabelText("Member 2 model"), {
+    target: { value: "opus-5" },
+  });
+  fireEvent.change(within(rule).getByRole("spinbutton", { name: "Group max running" }), {
+    target: { value: "3" },
+  });
+  expect(within(rule).queryByLabelText("Warning setting")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+  await waitFor(() => expect(mocks.request).toHaveBeenCalled());
+  const body = JSON.parse(mocks.request.mock.calls[0][1].body);
+  const created = body.settings.limitRules[2];
+  expect(created.id).toMatch(/^[a-f0-9]{1,32}$/i);
+  expect(created.id.length).toBeLessThanOrEqual(32);
+  expect(created).toMatchObject({
+    members: [
+      { agent: "agent-a", model: "opus-5" },
+      { agent: "agent-a", model: "opus-5" },
+    ],
+    maxRunning: 3,
+  });
+  expect(created).not.toHaveProperty("agent");
+  expect(created).not.toHaveProperty("reserve");
+  expect(await screen.findByRole("article", { name: "Rule 3" })).toHaveTextContent(
+    "Group cap (2 members)",
+  );
+});
+
+it("requires clearing reserve fields on a one-member group rule before adding a second member", async () => {
+  const settings: SessionChoiceDocument = {
+    ...scopedFixture(),
+    limitRules: [
+      {
+        id: "one-member",
+        members: [{ agent: "agent-a", model: "opus-5" }],
+        maxRunning: 2,
+        reserve: { mode: "total", window: "7d", pct: 10 },
+        reserveExempt: ["work"],
+      },
+    ],
+  };
+  (mocks.document.current as { data: ChoiceEnvelope }).data.settings = settings;
+  mocks.request.mockImplementation(async (_path: string, init?: { body?: string }) => ({
+    settings: init?.body ? JSON.parse(init.body).settings : settings,
+    revision: "scoped-c",
+  }));
+  mount();
+  const rule = await screen.findByRole("article", { name: "Rule 1" });
+  fireEvent.click(within(rule).getByRole("button", { name: /Rule 1 · Group cap \(1 member\)/ }));
+  expect(within(rule).getByRole("button", { name: "+ Add member" })).toBeDisabled();
+  fireEvent.click(within(rule).getByRole("button", { name: "Clear reserve fields" }));
+  const addButton = within(rule).getByRole("button", { name: "+ Add member" });
+  expect(addButton).not.toBeDisabled();
+  fireEvent.click(addButton);
+  fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+  await waitFor(() => expect(mocks.request).toHaveBeenCalled());
+  const body = JSON.parse(mocks.request.mock.calls[0][1].body);
+  expect(body.settings.limitRules[0].members).toHaveLength(2);
+  expect(body.settings.limitRules[0]).not.toHaveProperty("reserve");
+  expect(body.settings.limitRules[0]).not.toHaveProperty("reserveExempt");
 });
 
 function previewFixture() {

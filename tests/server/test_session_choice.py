@@ -2434,3 +2434,337 @@ def test_warning_follows_the_picked_candidates_deciding_window():
     assert pick(settings, readings=quotas, request=request).warnings == (
         "pool-0 may not last until its reset",
     )
+
+
+def test_multi_member_rule_parsing_roundtrip_and_refusals():
+    raw = {
+        "schemaVersion": 2,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "limitRules": [
+            {
+                "id": "opus-group",
+                "members": [
+                    {"agent": "agent-a", "host": "host-a", "model": "opus-5"},
+                    {"agent": "agent-b", "host": "host-b", "model": "opus-5"},
+                ],
+                "maxRunning": 3,
+            },
+            {
+                "id": "single-member-form",
+                "members": [{"agent": "agent-c"}],
+                "maxRunning": 2,
+            },
+        ],
+    }
+    parsed = parse_session_choice(raw)
+    saved = choice_document(parsed)
+    assert saved["limitRules"] == raw["limitRules"]
+    assert choice_document(parse_session_choice(saved)) == saved
+
+    invalid_rules = [
+        {"id": "empty-members", "members": [], "maxRunning": 2},
+        {"id": "missing-selector", "maxRunning": 2},
+        {
+            "id": "both-forms",
+            "agent": "agent-a",
+            "members": [{"agent": "agent-a"}],
+            "maxRunning": 2,
+        },
+        {
+            "id": "host-and-members",
+            "host": "host-a",
+            "members": [{"agent": "agent-a"}],
+            "maxRunning": 2,
+        },
+        {
+            "id": "wildcard-member",
+            "members": [{"agent": "agent-a", "model": "*"}],
+            "maxRunning": 2,
+        },
+        {
+            "id": "multi-reserve",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-b"}],
+            "maxRunning": 3,
+            "reserve": {"mode": "total", "window": "weekly", "pct": 10},
+        },
+        {
+            "id": "multi-reserve-null",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-b"}],
+            "maxRunning": 3,
+            "reserve": None,
+        },
+        {
+            "id": "multi-exempt",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-b"}],
+            "maxRunning": 3,
+            "reserveExempt": ["work"],
+        },
+        {
+            "id": "multi-exempt-empty",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-b"}],
+            "maxRunning": 3,
+            "reserveExempt": [],
+        },
+    ]
+    for bad in invalid_rules:
+        with pytest.raises(ValidationError):
+            parse_session_choice(
+                {
+                    "schemaVersion": 2,
+                    "workTypes": [{"id": "work", "label": "Work"}],
+                    "limitRules": [bad],
+                }
+            )
+
+
+def test_multi_member_sum_across_two_agents_and_deduplicates_overlap():
+    from omnigent.server.session_choice import (
+        RunningIdentity,
+        RunningSnapshot,
+        check_candidate_limits,
+    )
+
+    settings = parse_session_choice(
+        {
+            "schemaVersion": 2,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limitRules": [
+                {
+                    "id": "opus-group",
+                    "members": [
+                        {"agent": "agent-a", "host": "host-a", "model": "opus-5"},
+                        {"agent": "agent-b", "host": "host-b", "model": "opus-5"},
+                    ],
+                    "maxRunning": 3,
+                }
+            ],
+        }
+    )
+    work = settings.work_types[0]
+    link_a = Link(agent="agent-a", model="opus-5")
+    link_b = Link(agent="agent-b", model="opus-5")
+    req_a = ChoiceRequest(OWNER, "host-a")
+    req_b = ChoiceRequest(OWNER, "host-b")
+
+    two_running = RunningSnapshot(
+        identities=(
+            RunningIdentity("s1", "agent-a", "host-a", "opus-5"),
+            RunningIdentity("s2", "agent-b", "host-b", "opus-5"),
+            RunningIdentity("s-other", "agent-a", "host-a", "sonnet-5"),
+        )
+    )
+    assert check_candidate_limits(settings, work, link_a, req_a, {}, two_running, {}, NOW) is None
+    assert check_candidate_limits(settings, work, link_b, req_b, {}, two_running, {}, NOW) is None
+
+    three_running = RunningSnapshot(
+        identities=(
+            *two_running.identities,
+            RunningIdentity("s3", "agent-a", "host-a", "opus-5"),
+        )
+    )
+    refused_a = check_candidate_limits(settings, work, link_a, req_a, {}, three_running, {}, NOW)
+    refused_b = check_candidate_limits(settings, work, link_b, req_b, {}, three_running, {}, NOW)
+    assert refused_a is not None and refused_a.why == "busy" and refused_a.rule_id == "opus-group"
+    assert set(refused_a.running) == {"s1", "s2", "s3"}
+    assert refused_b is not None and refused_b.why == "busy" and refused_b.rule_id == "opus-group"
+    assert set(refused_b.running) == {"s1", "s2", "s3"}
+
+    # Overlapping members in the same rule never double-count one session.
+    overlap = parse_session_choice(
+        {
+            "schemaVersion": 2,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limitRules": [
+                {
+                    "id": "overlap",
+                    "members": [
+                        {"agent": "agent-a"},
+                        {"agent": "agent-a", "model": "opus-5"},
+                    ],
+                    "maxRunning": 2,
+                }
+            ],
+        }
+    )
+    one_running = RunningSnapshot(
+        identities=(RunningIdentity("s1", "agent-a", "host-a", "opus-5"),)
+    )
+    assert check_candidate_limits(overlap, work, link_a, req_a, {}, one_running, {}, NOW) is None
+
+    # A definite broad member match counts once even when a narrower member's model is unknown.
+    unresolved_narrow = RunningSnapshot(
+        identities=(RunningIdentity("s1", "agent-a", "host-a", None),)
+    )
+    assert (
+        check_candidate_limits(overlap, work, link_a, req_a, {}, unresolved_narrow, {}, NOW)
+        is None
+    )
+    two_broad = RunningSnapshot(
+        identities=(
+            RunningIdentity("s1", "agent-a", "host-a", None),
+            RunningIdentity("s2", "agent-a", "host-a", "opus-5"),
+        )
+    )
+    busy_broad = check_candidate_limits(overlap, work, link_a, req_a, {}, two_broad, {}, NOW)
+    assert busy_broad is not None and busy_broad.why == "busy"
+    assert set(busy_broad.running) == {"s1", "s2"}
+
+    # A candidate with missing model still resolves against a rule whose broad member matches it.
+    assert (
+        check_candidate_limits(
+            overlap, work, Link(agent="agent-a"), req_a, {}, one_running, {}, NOW
+        )
+        is None
+    )
+
+    # Unknown owner still fails closed even when agent matches a broad member.
+    unknown_owner = RunningSnapshot(
+        identities=(RunningIdentity("s1", "agent-a", "host-a", "opus-5", owner_known=False),)
+    )
+    unowned = check_candidate_limits(overlap, work, link_a, req_a, {}, unknown_owner, {}, NOW)
+    assert unowned is not None and unowned.why == "count_unavailable"
+
+    # Unknown member identity fails closed when no broader member definitely matches.
+    unknown_model = RunningSnapshot(identities=(RunningIdentity("s1", "agent-b", "host-b", None),))
+    unavailable = check_candidate_limits(settings, work, link_a, req_a, {}, unknown_model, {}, NOW)
+    assert unavailable is not None and unavailable.why == "count_unavailable"
+
+    # Candidate without resolved model fails closed against a model-scoped multi-member rule.
+    no_model = check_candidate_limits(
+        settings, work, Link(agent="agent-a"), req_a, {}, two_running, {}, NOW
+    )
+    assert no_model is not None and no_model.why == "identity_unavailable"
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_every_matching_cap_holds_and_tightest_wins_independent_of_order(reverse_order):
+    from omnigent.server.session_choice import (
+        RunningIdentity,
+        RunningSnapshot,
+        check_candidate_limits,
+        evaluate_binding_caps,
+        resolve_binding_caps,
+    )
+
+    rules = [
+        {"id": "single-wide", "agent": "agent-a", "maxRunning": 4},
+        {
+            "id": "group-tight",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-b"}],
+            "maxRunning": 2,
+        },
+        {
+            "id": "group-wide",
+            "members": [{"agent": "agent-a"}, {"agent": "agent-c"}],
+            "maxRunning": 5,
+        },
+    ]
+    if reverse_order:
+        rules = list(reversed(rules))
+    settings = parse_session_choice(
+        {
+            "schemaVersion": 2,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limitRules": rules,
+        }
+    )
+    work = settings.work_types[0]
+    link = Link(agent="agent-a", model="opus-5")
+    request = ChoiceRequest(OWNER, "host-a")
+
+    # 1 running on agent-a + 1 on agent-b fills group-tight (2/2), while single-wide (1/4) and
+    # group-wide (1/5) still have room. Tightest blocked cap wins regardless of list order.
+    running = RunningSnapshot(
+        identities=(
+            RunningIdentity("s1", "agent-a", "host-a", "opus-5"),
+            RunningIdentity("s2", "agent-b", "host-b", "opus-5"),
+        )
+    )
+    caps = resolve_binding_caps(
+        settings.limit_rules, agent="agent-a", host="host-a", model="opus-5"
+    )
+    evaluated = evaluate_binding_caps(caps, running)
+    assert [item.cap.rule_id for item in evaluated] == ["group-tight", "single-wide", "group-wide"]
+    refused = check_candidate_limits(settings, work, link, request, {}, running, {}, NOW)
+    assert refused is not None and refused.why == "busy" and refused.rule_id == "group-tight"
+
+    # Even if group-wide is numerically looser (5), once 4 sessions run on agent-c + 1 on agent-a
+    # (5/5), group-wide blocks regardless of order.
+    wide_full = RunningSnapshot(
+        identities=(
+            RunningIdentity("s1", "agent-a", "host-a", "opus-5"),
+            RunningIdentity("c1", "agent-c", "host-c", "opus-5"),
+            RunningIdentity("c2", "agent-c", "host-c", "opus-5"),
+            RunningIdentity("c3", "agent-c", "host-c", "opus-5"),
+            RunningIdentity("c4", "agent-c", "host-c", "opus-5"),
+        )
+    )
+    refused_wide = check_candidate_limits(settings, work, link, request, {}, wide_full, {}, NOW)
+    assert refused_wide is not None and refused_wide.why == "busy"
+    assert refused_wide.rule_id == "group-wide"
+
+    # Mixed compatibility boundary: overlapping single-scope rules keep specificity resolution
+    # while every matching members-form rule stays additive in both orders.
+    mixed_rules = [
+        {"id": "legacy-broad", "agent": "agent-a", "maxRunning": 2},
+        {"id": "legacy-specific", "agent": "agent-a", "model": "opus-5", "maxRunning": 4},
+        {
+            "id": "group-cap",
+            "members": [{"agent": "agent-a", "model": "opus-5"}, {"agent": "agent-b"}],
+            "maxRunning": 3,
+        },
+    ]
+    if reverse_order:
+        mixed_rules = list(reversed(mixed_rules))
+    mixed = parse_session_choice(
+        {
+            "schemaVersion": 2,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limitRules": mixed_rules,
+        }
+    )
+    mixed_caps = resolve_binding_caps(
+        mixed.limit_rules, agent="agent-a", host="host-a", model="opus-5"
+    )
+    assert {cap.rule_id: cap.max_running for cap in mixed_caps} == {
+        "legacy-specific": 4,
+        "group-cap": 3,
+    }
+
+
+def test_link_permission_tier_schema_roundtrip_and_tool_docs():
+    from omnigent.tools.builtins.session_choice import SysSessionChoiceUpdateTool
+
+    for tier in ("ask", "plan", "accept-edits", "auto"):
+        doc = parse_session_choice(
+            {
+                "workTypes": [{"id": "work", "label": "Work"}],
+                "presets": [
+                    {
+                        "id": "p1",
+                        "name": "P1",
+                        "links": [{"agent": "agent-a", "permissionTier": tier}],
+                    }
+                ],
+            }
+        )
+        saved = choice_document(doc)
+        assert saved["presets"][0]["links"][0]["permissionTier"] == tier
+
+    omitted = choice_document(
+        parse_session_choice(
+            {
+                "workTypes": [{"id": "work", "label": "Work"}],
+                "presets": [{"id": "p1", "name": "P1", "links": [{"agent": "agent-a"}]}],
+            }
+        )
+    )
+    assert "permissionTier" not in omitted["presets"][0]["links"][0]
+
+    for bad in ("full", "", "unknown", 123):
+        with pytest.raises(ValidationError):
+            Link.model_validate({"agent": "agent-a", "permissionTier": bad})
+
+    schema = SysSessionChoiceUpdateTool().get_schema()["function"]
+    assert "members" in schema["description"]
+    assert "permissionTier" in schema["description"]

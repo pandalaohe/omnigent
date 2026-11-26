@@ -536,6 +536,7 @@ export function ChoicePolicyEditor({
                                       {agents.find((a) => a.id === first?.agent)?.display_name ??
                                         first?.agent}
                                       {first?.model ? ` · ${first.model}` : " · default"}
+                                      {first?.permissionTier ? ` · ${first.permissionTier}` : ""}
                                     </span>
                                     {row.links.length > 1 && (
                                       <span className="text-xs text-muted-foreground">

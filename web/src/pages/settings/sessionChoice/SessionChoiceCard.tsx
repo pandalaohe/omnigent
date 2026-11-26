@@ -4,6 +4,8 @@ interface ChoiceRecord {
   agent: string;
   model?: string;
   effort?: string;
+  permissionTier?: string;
+  permissionTierSource?: string;
   tier?: number | null;
   pool?: string | null;
   meter?: string | null;
@@ -117,6 +119,17 @@ export function SessionChoiceCard({
             <>
               <dt className="text-muted-foreground">Effort</dt>
               <dd>{record.effort}</dd>
+            </>
+          )}
+          {(record.permissionTier || record.permissionTierSource) && (
+            <>
+              <dt className="text-muted-foreground">Permission tier</dt>
+              <dd>
+                {record.permissionTier ?? "Host default"}
+                {record.permissionTierSource
+                  ? ` (${record.permissionTierSource.replaceAll("_", " ")})`
+                  : ""}
+              </dd>
             </>
           )}
           <dt className="text-muted-foreground">Meter</dt>

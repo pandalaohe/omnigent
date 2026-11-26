@@ -6597,6 +6597,16 @@ async def _complete_created_session(
             **({"initial_message": initial_message} if initial_message is not None else {}),
             **({"host_load": data["host_load"]} if "host_load" in data else {}),
             **({"startup": data["startup"]} if "startup" in data else {}),
+            **(
+                {"permission_tier": data["permission_tier"]}
+                if data.get("permission_tier") is not None
+                else {}
+            ),
+            **(
+                {"permission_tier_source": data["permission_tier_source"]}
+                if data.get("permission_tier_source") is not None
+                else {}
+            ),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
             **({"notes": data["notes"]} if data.get("notes") else {}),
@@ -7292,6 +7302,16 @@ async def _execute_session_create_impl(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            **(
+                {"permission_tier": data["permission_tier"]}
+                if data.get("permission_tier") is not None
+                else {}
+            ),
+            **(
+                {"permission_tier_source": data["permission_tier_source"]}
+                if data.get("permission_tier_source") is not None
+                else {}
+            ),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
             **({"notes": data["notes"]} if data.get("notes") else {}),

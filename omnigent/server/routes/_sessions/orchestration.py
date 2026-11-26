@@ -18385,14 +18385,6 @@ async def _create_session_from_existing_agent_impl(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
-    if choice_admission is not None:
-        choice_admission.choice = replace(
-            choice_admission.choice,
-            warnings=(*choice_admission.choice.warnings, *calling_warnings),
-        )
-        initial_labels.update(
-            choice_admission.labels(time.time(), host_load_held=host_load_hold is not None)
-        )
     if host_load_hold:
         initial_labels["omnigent.startup.host_load"] = f"queued@{host_load_hold.host_id}"
     client_surface = resolve_session_surface(
@@ -18501,17 +18493,21 @@ async def _create_session_from_existing_agent_impl(
         default_tier = configured_acp_default_tier(host_registry, permission_host_id, acp_harness)
         if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
             raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
+        acp_supported = default_tier is not None or supports_delegated_acp_tier(
+            host_registry, permission_host_id, acp_harness, effective_spec
+        )
+        if body.permission_tier is not None and not acp_supported:
+            raise OmnigentError(
+                "Target ACP host or harness does not support permission_tier",
+                code=ErrorCode.INVALID_INPUT,
+            )
         acp_tier_enabled = (
             body.permission_tier is not None
             or default_tier is not None
-            or (
-                agent_create
-                and supports_delegated_acp_tier(
-                    host_registry, permission_host_id, acp_harness, effective_spec
-                )
-            )
+            or (agent_create and acp_supported)
         )
     require_permission_protocol(request, harness=create_harness, required=acp_tier_enabled)
+    resolved_permission_tier: str | None = None
     if create_harness in TIER_HARNESSES or acp_tier_enabled:
         assert create_harness is not None
         from omnigent.server.permission_tiers import (
@@ -18539,11 +18535,38 @@ async def _create_session_from_existing_agent_impl(
             inherited=inherited_tier,
             ceiling=inherited_tier if agent_create else None,
         )
+        resolved_permission_tier = tier
         initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))
         if create_harness == "antigravity-native":
             validated_launch_args = _stamp_antigravity_permission_tier(
                 initial_labels, validated_launch_args, tier=tier
             )
+    resolved_permission_tier_source: Literal["explicit", "link", "host_default"] | None = None
+    if choice_admission is not None:
+        if (
+            choice_admission.permission_tier_source == "explicit"
+            or explicit_permission_application is not None
+        ):
+            resolved_permission_tier_source = "explicit"
+        elif choice_admission.permission_tier_source == "link":
+            resolved_permission_tier_source = "link"
+        else:
+            resolved_permission_tier_source = "host_default"
+        choice_admission.choice = replace(
+            choice_admission.choice,
+            warnings=(*choice_admission.choice.warnings, *calling_warnings),
+            permission_tier=resolved_permission_tier,
+            permission_tier_source=resolved_permission_tier_source,
+        )
+        initial_labels.update(
+            choice_admission.labels(time.time(), host_load_held=host_load_hold is not None)
+        )
+    elif resolved_permission_tier is not None:
+        resolved_permission_tier_source = (
+            "explicit"
+            if body.permission_tier is not None or explicit_permission_application is not None
+            else "host_default"
+        )
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
@@ -18925,6 +18948,8 @@ async def _create_session_from_existing_agent_impl(
     )
     response.warnings.extend(calling_warnings)
     response.notes = notes_from_labels(conv.labels)
+    if resolved_permission_tier_source is not None:
+        response.permission_tier_source = resolved_permission_tier_source
     if choice_admission is not None and choice_admission.committed_drain:
         assert response.session_choice is not None
         response.session_choice["reason"] = choice_admission.choice.reason

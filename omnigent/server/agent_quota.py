@@ -2678,7 +2678,7 @@ class AgentQuotaService:
                     )
                 )
                 if model is None and any(
-                    rule.agent == conversation.agent_id and rule.model is not None
+                    rule.unresolved_for_missing_model(conversation.agent_id, context.host_id)
                     for rule in settings.limit_rules
                 ):
                     parts.append("Scoped limits unavailable: model identity unresolved.")
