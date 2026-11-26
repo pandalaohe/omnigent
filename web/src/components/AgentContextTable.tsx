@@ -47,9 +47,15 @@ function startupPromptsPath(agentKey: string, hostId: string) {
   return `/settings/instructions?${new URLSearchParams({ view: "route", agent: agentKey, host: hostId })}`;
 }
 
-const UNSET_PROVIDERS = new Set(["Not reported", "Not signed in"]);
-
-function providerValue(harness: string, host: Host, capabilities: HarnessCapabilityMap) {
+function ProviderValue({
+  harness,
+  host,
+  capabilities,
+}: {
+  harness: string;
+  host: Host;
+  capabilities: HarnessCapabilityMap;
+}) {
   if (host.gateway_inference?.[harness] === true) return "Unity Gateway";
   const account =
     host.harness_accounts?.[harnessAccountKey(agentProductHarness(harness, capabilities))];
@@ -59,6 +65,15 @@ function providerValue(harness: string, host: Host, capabilities: HarnessCapabil
   if (account.kind === "api_key") return "API key";
   if (account.kind === "chatgpt" || account.kind === "subscription") return "Personal subscription";
   return account.kind === "none" ? "Not signed in" : "Not reported";
+}
+
+/** A gateway, a labelled provider, an API key or a subscription counts as a set provider. */
+function providerReported(harness: string, host: Host, capabilities: HarnessCapabilityMap) {
+  if (host.gateway_inference?.[harness] === true) return true;
+  const account =
+    host.harness_accounts?.[harnessAccountKey(agentProductHarness(harness, capabilities))];
+  if (account?.kind === "providers") return !!account.providers?.some((provider) => provider.label);
+  return ["api_key", "chatgpt", "subscription"].includes(account?.kind ?? "");
 }
 
 export function AgentContextTable({
@@ -170,7 +185,7 @@ function ContextTable({
         };
       })}
       detailRows={detailRows}
-      foldUnconfigured={foldUnconfigured}
+      foldUnconfiguredBy={foldUnconfigured ? hosts.map((host) => host.host_id) : undefined}
       columns={hosts
         .filter((host) => !visibleHostId || host.host_id === visibleHostId)
         .map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
@@ -183,10 +198,11 @@ function ContextTable({
         const host = hosts.find((candidate) => candidate.host_id === hostId)!;
         if (!agentPresentOnHost(harness, host))
           return { content: null, unavailable: missingCellText(harness, host.platform) };
-        if (field === "provider") {
-          const provider = providerValue(harness, host, capabilities);
-          return { content: provider, configured: !UNSET_PROVIDERS.has(provider) };
-        }
+        if (field === "provider")
+          return {
+            content: <ProviderValue harness={harness} host={host} capabilities={capabilities} />,
+            configured: providerReported(harness, host, capabilities),
+          };
         if (
           catalogs?.some(
             (row) =>

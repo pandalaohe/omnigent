@@ -64,8 +64,8 @@ export interface LayeredTableProps {
   className?: string;
   testId?: string;
   readOnly?: boolean;
-  /** Moves rows with no marked, clashing or configured cell into one collapsed group at the bottom. */
-  foldUnconfigured?: boolean;
+  /** Column ids, shown or not, that decide folding: a row with no marked, clashing or configured cell among them joins one collapsed group at the bottom. */
+  foldUnconfiguredBy?: readonly string[];
 }
 
 function selectionKey(row: string, col: string): string {
@@ -207,25 +207,26 @@ export function LayeredTable({
   className,
   testId,
   readOnly = false,
-  foldUnconfigured = false,
+  foldUnconfiguredBy,
 }: LayeredTableProps) {
   const firstColumn = cn(FIRST_COLUMN, rows.some((row) => row.action) && "min-w-50 max-w-50");
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [unfolded, setUnfolded] = useState(false);
-  const topRows = foldUnconfigured
-    ? rows.filter(
-        (row) =>
-          row.mark ||
-          columns.some((col) => {
-            const cell = renderCell(row.id, col.id);
-            return cell.mark || cell.configured || !!cell.clash;
-          }),
-      )
-    : rows;
-  const foldedRows = rows.filter((row) => !topRows.includes(row));
-  const foldedCount = foldUnconfigured ? foldedRows.length + (detailRows?.length ?? 0) : 0;
-  const foldOpen = !foldUnconfigured || unfolded;
+  const topRows: LayeredTableRow[] = [];
+  const foldedRows: LayeredTableRow[] = [];
+  for (const row of rows) {
+    const set =
+      !foldUnconfiguredBy ||
+      row.mark ||
+      foldUnconfiguredBy.some((col) => {
+        const cell = renderCell(row.id, col);
+        return cell.mark || cell.configured || !!cell.clash;
+      });
+    (set ? topRows : foldedRows).push(row);
+  }
+  const foldedCount = foldUnconfiguredBy ? foldedRows.length + (detailRows?.length ?? 0) : 0;
+  const foldOpen = !foldUnconfiguredBy || unfolded;
   // Folded rows stay out of header and corner selection while they are hidden.
   const shownRows = foldOpen ? [...topRows, ...foldedRows] : topRows;
   const availableLevels: LayeredCellLevel[] = shownRows.flatMap((row) =>
@@ -481,35 +482,34 @@ export function LayeredTable({
             </tr>
           </thead>
           <tbody>
-            {topRows.map(renderRow)}
-            {foldedCount > 0 && (
-              <tr className="[&:last-child>*]:border-b-0">
-                <th
-                  scope="rowgroup"
-                  colSpan={columns.length + 1}
-                  className={cn(LEVEL_CELL, "bg-muted/40")}
-                >
-                  <button
-                    type="button"
-                    aria-expanded={unfolded}
-                    data-testid="layered-fold-toggle"
-                    className="sticky left-0 flex min-h-11 w-fit items-center gap-1.5 px-2.5 text-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                    onClick={() => setUnfolded((current) => !current)}
-                  >
-                    <ChevronRightIcon
-                      aria-hidden
-                      className={cn(
-                        "size-4 shrink-0 transition-transform",
-                        unfolded && "rotate-90",
-                      )}
-                    />
-                    <span>Not configured ({foldedCount})</span>
-                  </button>
-                </th>
-              </tr>
-            )}
-            {foldOpen && foldedRows.map(renderRow)}
-            {foldOpen && detailRows?.map(renderDetailRow)}
+            {/* One keyed list, so a row keeps its controls when it moves between groups. */}
+            {[
+              ...topRows.map(renderRow),
+              foldedCount > 0 && (
+                <tr key="layered-fold" className="[&:last-child>*]:border-b-0">
+                  <td colSpan={columns.length + 1} className={cn(LEVEL_CELL, "bg-muted/40")}>
+                    <button
+                      type="button"
+                      aria-expanded={unfolded}
+                      data-testid="layered-fold-toggle"
+                      className="sticky left-0 flex min-h-11 w-fit items-center gap-1.5 px-2.5 text-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                      onClick={() => setUnfolded((current) => !current)}
+                    >
+                      <ChevronRightIcon
+                        aria-hidden
+                        className={cn(
+                          "size-4 shrink-0 transition-transform",
+                          unfolded && "rotate-90",
+                        )}
+                      />
+                      <span>Not configured ({foldedCount})</span>
+                    </button>
+                  </td>
+                </tr>
+              ),
+              ...(foldOpen ? foldedRows.map(renderRow) : []),
+              ...(foldOpen ? (detailRows?.map(renderDetailRow) ?? []) : []),
+            ]}
           </tbody>
         </table>
       </div>

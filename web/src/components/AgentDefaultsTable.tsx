@@ -653,6 +653,7 @@ export function AgentDefaultsTable({
         </HelpTip>
       </div>
       <LayeredTable
+        key={field}
         label={`${FIELDS.find((item) => item.value === field)?.label} defaults`}
         cornerLabel={field === "permission" ? "All agents" : "Agent"}
         cornerDetail={
@@ -700,7 +701,7 @@ export function AgentDefaultsTable({
           };
         })}
         detailRows={detailRows}
-        foldUnconfigured={foldUnconfigured}
+        foldUnconfiguredBy={foldUnconfigured ? hostList.map((host) => host.host_id) : undefined}
         columns={hostList
           .filter((host) => !visibleHostId || host.host_id === visibleHostId)
           .map((host) => ({

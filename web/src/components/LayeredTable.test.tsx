@@ -81,11 +81,12 @@ function sourceName(source: LayeredLevel | null): string {
 
 function rowOrder() {
   return screen
-    .getAllByRole("rowheader")
+    .getAllByRole("row")
+    .slice(1)
     .map(
-      (cell) =>
-        cell.querySelector("[data-testid^='layered-row-']")?.getAttribute("data-testid") ??
-        cell.textContent,
+      (row) =>
+        row.querySelector("[data-testid^='layered-row-']")?.getAttribute("data-testid") ??
+        row.textContent,
     );
 }
 
@@ -145,7 +146,7 @@ function StatefulTable({
     <LayeredTable
       label="Keep-warm test layers"
       cornerLabel="All agents on all hosts"
-      foldUnconfigured={foldUnconfigured}
+      foldUnconfiguredBy={foldUnconfigured ? ["desktop"] : undefined}
       rows={[
         {
           id: "codex",
@@ -433,41 +434,60 @@ describe("LayeredTable and LayeredEditor", () => {
       "layered-row-native",
       "layered-row-acp",
     ]);
-    await user.click(toggle);
+    const moved = screen.getByTestId("layered-cell-native-desktop");
+    await user.click(moved);
+    await user.click(screen.getByRole("button", { name: "Set On" }));
+    await user.keyboard("{Escape}");
+    expect(screen.getByTestId("layered-cell-native-desktop")).toBe(moved);
+    expect(rowOrder().slice(0, 3)).toEqual([
+      "layered-row-codex",
+      "layered-row-native",
+      "Not configured (1)",
+    ]);
+    await user.click(moved);
+    await user.click(screen.getByRole("button", { name: "Use Off from Desktop" }));
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Not configured (2)" }));
     await user.click(screen.getByTestId("layered-cell-codex-desktop"));
     await user.click(screen.getByRole("button", { name: "Set Off" }));
     expect(screen.getByRole("button", { name: "Not configured (3)" })).toBeVisible();
     expect(screen.queryByTestId("layered-row-codex")).toBeNull();
   });
 
-  it("keeps a marked row or configured cell on top and folds detail rows", async () => {
+  it("keeps a marked row or a configured cell on any listed host on top and folds detail rows", async () => {
     const user = userEvent.setup();
     render(
       <LayeredTable
         label="Read-only layers"
         cornerLabel="Agent"
         readOnly
-        foldUnconfigured
+        foldUnconfiguredBy={["desktop", "laptop"]}
         rows={[
           { id: "plain", label: "Plain" },
           { id: "marked", label: "Marked", mark: true },
           { id: "reported", label: "Reported" },
+          { id: "remote", label: "Remote" },
         ]}
         detailRows={[{ id: "custom", content: <span>Custom agent</span> }]}
         columns={[{ id: "desktop", label: "Desktop" }]}
-        renderCell={(row) => ({ content: row, configured: row === "reported" })}
+        renderCell={(row, col) => ({
+          content: row,
+          configured: row === "reported" || (row === "remote" && col === "laptop"),
+        })}
         renderEditor={(_at, trigger) => trigger}
       />,
     );
     expect(rowOrder()).toEqual([
       "layered-row-marked",
       "layered-row-reported",
+      "layered-row-remote",
       "Not configured (2)",
     ]);
     await user.click(screen.getByRole("button", { name: "Not configured (2)" }));
     expect(rowOrder()).toEqual([
       "layered-row-marked",
       "layered-row-reported",
+      "layered-row-remote",
       "Not configured (2)",
       "layered-row-plain",
       "Custom agent",
