@@ -7746,6 +7746,8 @@ async def test_acp_windows_close_reaps_survivors_after_prompt_launcher_exit_and_
     def fake_kill(target: object) -> None:
         assert target is proc
         calls.append("kill")
+        if calls.count("kill") >= 2:
+            unresolved[0] = False
 
     def fake_has_unresolved(target: object) -> bool:
         assert target is proc
@@ -7763,7 +7765,6 @@ async def test_acp_windows_close_reaps_survivors_after_prompt_launcher_exit_and_
     # Unresolved identities retain self._proc for a retry close().
     assert ex._proc is proc
 
-    unresolved[0] = False
     await ex.close()
     assert calls == ["terminate", "kill", "kill"]
     assert ex._proc is None
