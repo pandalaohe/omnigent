@@ -17,11 +17,11 @@ describe("SystemMessageView", () => {
       expect(screen.getByText(body, { exact: true })).toHaveClass("wrap-anywhere", "max-w-full");
     }
   });
-  it("hides sub-agent wake notices instead of rendering a centered System row", () => {
+  it.each(["subagent_wake", "session_resumed"] as const)("hides %s control notices", (kind) => {
     const { container } = render(
       <SystemMessageView
         message={{
-          kind: "subagent_wake",
+          kind,
           label: "Sub-agent result ready",
           body: "",
         }}

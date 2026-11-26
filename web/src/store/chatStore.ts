@@ -208,6 +208,7 @@ import {
   legacyComposerParts,
   type ComposerDraftPart,
 } from "@/lib/composerContent";
+import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl, supportsSdkEffortReset } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
@@ -1325,6 +1326,11 @@ export interface SideChatComposerDraft {
  *  fresh object per render would re-render every subscriber). */
 export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
 
+/** The composer entry a grid cell edits; a sub-agent tab of the same session has its own. */
+export function gridCellComposerKey(sessionId: string): string {
+  return `grid:${sessionId}`;
+}
+
 export interface AppChatState {
   /** Native-only readback cache, keyed by session so background streams cannot cross contexts. */
   codexPermissionReadbacks: Readonly<Record<string, CodexPermissionCachedReport>>;
@@ -1614,8 +1620,8 @@ export interface ChatActions {
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
-   *  successful `launchRunner` for the open session. */
-  markRunnerLaunched: () => void;
+   *  successful `launchRunner`, for `sessionId` or the open session when omitted. */
+  markRunnerLaunched: (sessionId?: string) => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -4238,7 +4244,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
+  markRunnerLaunched: (sessionId) =>
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -9383,47 +9390,6 @@ function retractDeliveredSendDraft(
 }
 
 /**
- * Whether a session snapshot records the runner refusing the send `stableId`.
- *
- * An attributed rejection names its item and holds whatever the session is
- * doing now; the unattributed record of a server predating the item id stands
- * for any send, but only while the session is still `failed` by it.
- *
- * @param session - A session snapshot.
- * @param stableId - The send's stable id (its persisted item id).
- * @returns `true` when the snapshot's `runner_rejected_event` applies to it.
- */
-function snapshotRefusesSend(session: Session, stableId: string): boolean {
-  const rejection = session.lastTaskError;
-  if (rejection?.code !== "runner_rejected_event") return false;
-  if (rejection.item_id !== undefined) return rejection.item_id === stableId;
-  return session.status === "failed";
-}
-
-/**
- * Ask the server what became of a send whose POST got no answer.
- *
- * The server records a runner rejection before it answers the POST, so a
- * snapshot fetched after the failure is conclusive where one merged during the
- * send may not be.
- *
- * @param sessionId - The session the send was posted to.
- * @param stableId - The send's stable id.
- * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
- */
-async function sendVerdictFromServer(
-  sessionId: string,
-  stableId: string,
-): Promise<"refused" | "delivered" | null> {
-  try {
-    const session = await getSessionSlim(sessionId);
-    return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
-  } catch {
-    return null;
-  }
-}
-
-/**
  * The send a previous page of this tab left unanswered, as a failed-send draft.
  *
  * `send` records each message's text before its POST and drops it once the
@@ -10880,10 +10846,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           if (settled !== null) patch.blocks = settled;
         }
-        // A `runner_disconnected` card is an observation ("can't reach the
-        // runner"), not a turn result: any live status edge from the runner
-        // proves it is reachable again, so the stale card goes.
-        if (event.status !== "failed") {
+        // A live runner makes its disconnect card stale. Automatic resume
+        // failure supersedes it too, including its manual resume action.
+        if (event.status !== "failed" || statusError?.code === "session_recovery_failed") {
           const current = patch.blocks ?? s.blocks;
           const reachable = current.filter(
             (b) => !(b.type === "error" && b.code === "runner_disconnected"),

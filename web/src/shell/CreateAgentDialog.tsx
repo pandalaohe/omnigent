@@ -22,6 +22,12 @@ import { useNewChatHostId } from "@/hooks/useHosts";
 import { registryHarnessOptions, useAgentRegistry } from "@/hooks/useAgentRegistry";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
+import type { CUSTOM_AGENT_CREATE_ENTRY } from "@/pages/settings/search/catalog/customAgents";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "@/pages/settings/search/settingsOwnership";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
 /**
@@ -261,17 +267,34 @@ export function CreateAgentDialog({
   );
 }
 
+/**
+ * The Settings row a create form renders in, which names its top-level fields and buttons. The
+ * shell's dialog passes none and keeps its own names.
+ */
+type CreateAgentSettingsEntry = typeof CUSTOM_AGENT_CREATE_ENTRY;
+
+type CreateAgentFieldPart = keyof CreateAgentSettingsEntry["parts"];
+
+function settingsFieldProps(
+  entry: CreateAgentSettingsEntry | undefined,
+  part: CreateAgentFieldPart,
+) {
+  return entry ? settingsControlProps(entry, part) : {};
+}
+
 /** Settings saves persist the agent and keep the draft available on failure. */
 export function CreateAgentForm({
   onCreate,
   onCancel,
   notice,
   submitLabel = "Create",
+  settingsEntry,
 }: {
   onCreate: (input: AgentBundleInput) => void | Promise<void>;
   onCancel: () => void;
   notice?: string;
   submitLabel?: string;
+  settingsEntry?: CreateAgentSettingsEntry;
 }) {
   const fields = useAgentFormFields();
   const [pending, setPending] = useState(false);
@@ -296,7 +319,7 @@ export function CreateAgentForm({
       {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
       <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
         <fieldset disabled={pending} className="contents">
-          <AgentFormFields {...fields} />
+          <AgentFormFields {...fields} settingsEntry={settingsEntry} />
         </fieldset>
       </div>
       {error && (
@@ -305,10 +328,17 @@ export function CreateAgentForm({
         </p>
       )}
       <DialogFooter>
-        <Button type="button" variant="ghost" onClick={onCancel} disabled={pending}>
+        <Button
+          {...settingsFieldProps(settingsEntry, "cancel")}
+          type="button"
+          variant="ghost"
+          onClick={onCancel}
+          disabled={pending}
+        >
           Cancel
         </Button>
         <Button
+          {...settingsFieldProps(settingsEntry, "submit")}
           type="submit"
           data-testid="create-agent-submit"
           loading={pending}
@@ -435,7 +465,11 @@ function AgentFormFields({
   updateMCPEntry,
   nameInvalid,
   disabled = false,
-}: ReturnType<typeof useAgentFormFields> & { disabled?: boolean }) {
+  settingsEntry,
+}: ReturnType<typeof useAgentFormFields> & {
+  disabled?: boolean;
+  settingsEntry?: CreateAgentSettingsEntry;
+}) {
   return (
     <>
       {/* Name */}
@@ -444,6 +478,7 @@ function AgentFormFields({
           Name <span className="text-destructive">*</span>
         </label>
         <Input
+          {...settingsFieldProps(settingsEntry, "name")}
           id="create-agent-name"
           data-testid="create-agent-name"
           value={name}
@@ -473,6 +508,7 @@ function AgentFormFields({
           Description
         </label>
         <Input
+          {...settingsFieldProps(settingsEntry, "description")}
           id="create-agent-description"
           data-testid="create-agent-description"
           value={description}
@@ -506,6 +542,15 @@ function AgentFormFields({
             setSpeed(next.speed ?? null);
           }}
           disabled={disabled}
+          settingsIdentity={
+            settingsEntry
+              ? {
+                  trigger: settingsControlProps(settingsEntry, "harness"),
+                  content: settingsOverlayProps(settingsEntry, "harness"),
+                  harnessChoice: settingsRuntimeChoiceProps(settingsEntry, "harness"),
+                }
+              : undefined
+          }
         />
         {model === null && (
           <p className="text-xs text-muted-foreground">
@@ -523,6 +568,7 @@ function AgentFormFields({
           System instructions
         </label>
         <Textarea
+          {...settingsFieldProps(settingsEntry, "instructions")}
           id="create-agent-instructions"
           data-testid="create-agent-instructions"
           value={instructions}
@@ -538,6 +584,7 @@ function AgentFormFields({
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
           <Button
+            {...settingsFieldProps(settingsEntry, "addServer")}
             type="button"
             variant="ghost"
             size="sm"

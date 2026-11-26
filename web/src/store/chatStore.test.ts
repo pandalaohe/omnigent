@@ -1577,6 +1577,22 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
+  it("stamps a background session's runner launch without touching the open conversation", async () => {
+    seedSession("conv_cell", []);
+    seedSession("conv_open", []);
+    await useChatStore.getState().switchTo("conv_cell");
+    await useChatStore.getState().switchTo("conv_open");
+
+    useChatStore.getState().markRunnerLaunched("conv_cell");
+
+    expect(conversationRegistry.peek("conv_cell")!.getState().runnerLaunchedAt).toEqual(
+      expect.any(Number),
+    );
+    expect(conversationRegistry.peek("conv_open")!.getState().runnerLaunchedAt).toBeNull();
+    expect(useChatStore.getState().conversationId).toBe("conv_open");
+    expect(useChatStore.getState().runnerLaunchedAt).toBeNull();
+  });
+
   it("scopes the background-task pill state to the active conversation", async () => {
     seedSession("conv_with_task", []);
     seedSession("conv_empty", []);
@@ -7539,6 +7555,30 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({ code: "executor_error", message: "boom" });
   });
+
+  it.each(["session_recovery_failed", "executor_error"])(
+    "supersedes the disconnect only for automatic resume exhaustion, received %s",
+    (code) => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        sessionStatus: "running",
+        blocks: [],
+      });
+      for (const errorCode of ["runner_disconnected", code]) {
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "resp_interrupted",
+          error: { code: errorCode, message: errorCode },
+        });
+      }
+      const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
+      expect(errors.map((block) => block.code)).toEqual(
+        code === "session_recovery_failed" ? [code] : ["runner_disconnected", code],
+      );
+    },
+  );
 
   it("stops reporting a status-only relaunch failure as the latest error after a resume", () => {
     // A failed resume, then a successful one that adds no items.

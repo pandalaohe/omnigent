@@ -1,6 +1,7 @@
 import type { Comment } from "@/hooks/useComments";
 import {
   expandMentionTokens,
+  stripTrailingSessionMentionHint,
   withSessionMentionHint,
   type InlineMention,
 } from "@/lib/composerMentions";
@@ -54,18 +55,24 @@ export function buildOutgoingMessage(
       ? formatLocalReviewComments(reviewComments, { includeInstruction: !hasAuthoredText })
       : "";
   const tagsSessions = mentions.some((mention) => mention.marker.startsWith("[Session: "));
+  const prepareText = (text: string) => {
+    if (!tagsSessions) return text;
+    return reviewContext
+      ? (stripTrailingSessionMentionHint(text) ?? text)
+      : withSessionMentionHint(text, true);
+  };
   const plan = planComposerSend(
-    { ...draft, text: withSessionMentionHint(draft.text, tagsSessions) },
+    { ...draft, text: prepareText(draft.text) },
     files,
     "",
-    withSessionMentionHint(plainText, tagsSessions),
+    prepareText(plainText),
     { transformText: (text) => expandMentionTokens(text, mentions) },
   );
   if (!reviewContext) return plan;
   // Generated review text cannot claim an authored attachment token.
   const outgoing = appendReplyDraft(restoreReplyDraft(plan.text, plan.replyDraft), {
     quotes: [],
-    text: reviewContext,
+    text: withSessionMentionHint(reviewContext, tagsSessions),
   });
   const text = serializeReplyDraft(outgoing);
   return {

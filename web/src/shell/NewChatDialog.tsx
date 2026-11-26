@@ -29,6 +29,7 @@ import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/rout
 import { HostTerminalLink } from "@/components/HostTerminalLink";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
+import { projectHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
@@ -232,7 +233,6 @@ import {
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
@@ -2564,7 +2564,7 @@ function NewChatWorkspaceControls({
   return (
     <fieldset
       disabled={disabled}
-      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px]"
+      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
     >
       <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
@@ -2572,10 +2572,18 @@ function NewChatWorkspaceControls({
   );
 }
 
+/**
+ * `projectName` scopes the composer to a project, as `?project=` does, for the
+ * project home's floating composer; `onSessionStarted` hides it after a start.
+ */
 export function NewChatLandingScreen({
   seed: composerSeed,
   onCreatingChange,
+  projectName,
+  onSessionStarted,
 }: {
+  projectName?: string;
+  onSessionStarted?: () => void;
   seed?: { project: string; prompt: string };
   onCreatingChange?: (creating: boolean) => void;
 } = {}) {
@@ -2623,6 +2631,8 @@ export function NewChatLandingScreen({
       onCreatingChange={onCreatingChange}
       siblingSourceId={siblingSourceId}
       siblingSource={source.data}
+      projectHomeName={projectName}
+      onSessionStarted={onSessionStarted}
     />
   );
 }
@@ -2632,11 +2642,15 @@ function NewChatLandingContent({
   onCreatingChange,
   siblingSourceId,
   siblingSource,
+  projectHomeName,
+  onSessionStarted,
 }: {
   composerSeed?: { project: string; prompt: string };
   onCreatingChange?: (creating: boolean) => void;
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
+  projectHomeName?: string;
+  onSessionStarted?: () => void;
 }) {
   const harnessCapabilities = useHarnessCapabilities();
   const [draftServer] = useState(getOmnigentServerIdentity);
@@ -2659,8 +2673,7 @@ function NewChatLandingContent({
   const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
@@ -2673,7 +2686,10 @@ function NewChatLandingContent({
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const [embeddedProject, setEmbeddedProject] = useState(composerSeed?.project ?? "");
-  const projectParam = composerSeed ? embeddedProject : (searchParams.get("project") ?? "");
+  const projectParam = composerSeed
+    ? embeddedProject
+    : (projectHomeName ?? searchParams.get("project") ?? "");
+  const onProjectHome = projectHomeName !== undefined;
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -7847,7 +7863,8 @@ function NewChatLandingContent({
               // shows them where the user put them rather than in a trailing row.
               submittedFiles.length > 0 ? orderedPromptParts : undefined,
             );
-            if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
+            if (localConv !== null && !onProjectHome)
+              navigate(sessionLocation(localConv.tempConvId));
           } catch {
             /* non-fatal: the response still opens the server session */
           }
@@ -8261,10 +8278,16 @@ function NewChatLandingContent({
             composerParts: orderedPromptParts,
           });
         }
-        if (onScreenRef.current && window.location.href === createLocation) {
+        // Only the full chat delivers a pending prompt, so the project home hands off to it.
+        if (
+          (!onProjectHome || !serverOwnsInitialInput) &&
+          onScreenRef.current &&
+          window.location.href === createLocation
+        ) {
           navigate(sessionLocation(data.id));
         }
       }
+      if (onProjectHome && onScreenRef.current) onSessionStarted?.();
     } catch {
       if (siblingSource && createdSessionId) {
         const stillViewing = localConv
@@ -8811,69 +8834,83 @@ function NewChatLandingContent({
   );
 
   return (
-    // Desktop keeps the centered composition; mobile docks the composer.
+    // Desktop keeps the centered composition; mobile docks the composer. The
+    // project home floats just the composer over its board.
     <div
       ref={setLandingSurface}
-      className="relative flex min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24"
+      className={cn(
+        "relative flex",
+        !onProjectHome && "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
+      )}
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 800px cap, so the composer surface reaches
           its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
-      <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
-        {/* On phones the heading yields its height first, so a long draft cannot
-            push Send below the keyboard. */}
-        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
-          {siblingSourceId ? (
-            <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
-              <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
-                <PlusIcon className="size-6 text-brand-accent" />
-              </span>
-            </div>
-          ) : selectedProject ? (
-            // Landing inside a project: swap Otto's eyes for the project's
-            // icon — the default pink folder, or a chosen emoji — and name the
-            // project. Sized to Otto's h-16 box so the centered composer doesn't
-            // shift when toggling between the two landings.
-            <ProjectLandingIcon
-              projectId={configProjectId}
-              projectName={selectedProject}
-              config={storedProjectConfig}
-              // Gate editing until the config resolves: the PATCH replaces the
-              // whole blob, so a write before the name→id and config have loaded
-              // would wipe the project's other defaults. A label-only folder
-              // (`configProjectId === null`) has no first-class config to lose.
-              configReady={
-                !projectListLoading &&
-                (configProjectId === null || storedProjectConfig !== undefined)
-              }
-            />
-          ) : (
-            <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
-          )}
-          {siblingSourceId || isMobileViewport || selectedProject || heading ? (
-            <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {siblingSourceId
-                ? "Add nested agent"
-                : isMobileViewport
-                  ? "Start a new session in"
-                  : selectedProject || heading}
-            </h1>
-          ) : null}
-          {siblingSourceId && (
-            <p
-              className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
-              data-testid="sibling-composer-context"
-            >
-              A new conversation alongside{" "}
-              <span className="font-medium text-foreground">
-                {siblingSource?.title?.trim() || "Untitled"}
-              </span>
-            </p>
-          )}
-          {isMobileViewport && workspaceControls}
-        </div>
+      <div
+        className={cn(
+          "flex min-h-0 w-full flex-col md:select-none",
+          !onProjectHome &&
+            "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
+        )}
+      >
+        {onProjectHome ? (
+          isMobileViewport && workspaceControls
+        ) : (
+          /* On phones the heading yields its height first, so a long draft cannot
+            push Send below the keyboard. */
+          <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
+            {siblingSourceId ? (
+              <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
+                <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
+                  <PlusIcon className="size-6 text-brand-accent" />
+                </span>
+              </div>
+            ) : selectedProject ? (
+              // Landing inside a project: swap Otto's eyes for the project's
+              // icon — the default pink folder, or a chosen emoji — and name the
+              // project. Sized to Otto's h-16 box so the centered composer doesn't
+              // shift when toggling between the two landings.
+              <ProjectLandingIcon
+                projectId={configProjectId}
+                projectName={selectedProject}
+                config={storedProjectConfig}
+                // Gate editing until the config resolves: the PATCH replaces the
+                // whole blob, so a write before the name→id and config have loaded
+                // would wipe the project's other defaults. A label-only folder
+                // (`configProjectId === null`) has no first-class config to lose.
+                configReady={
+                  !projectListLoading &&
+                  (configProjectId === null || storedProjectConfig !== undefined)
+                }
+              />
+            ) : (
+              <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
+            )}
+            {siblingSourceId || isMobileViewport || selectedProject || heading ? (
+              <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+                {siblingSourceId
+                  ? "Add nested agent"
+                  : isMobileViewport
+                    ? "Start a new session in"
+                    : selectedProject || heading}
+              </h1>
+            ) : null}
+            {siblingSourceId && (
+              <p
+                className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+                data-testid="sibling-composer-context"
+              >
+                A new conversation alongside{" "}
+                <span className="font-medium text-foreground">
+                  {siblingSource?.title?.trim() || "Untitled"}
+                </span>
+              </p>
+            )}
+            {isMobileViewport && workspaceControls}
+          </div>
+        )}
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
@@ -9138,9 +9175,13 @@ function NewChatLandingContent({
                             requestAnimationFrame(() => textareaRef.current?.focus());
                             return;
                           }
-                          const params = new URLSearchParams(searchParams);
-                          params.set("project", name);
-                          navigate(`/?${params.toString()}`);
+                          if (projectHomeName !== undefined) {
+                            navigate(projectHomePath(name));
+                          } else {
+                            const params = new URLSearchParams(searchParams);
+                            params.set("project", name);
+                            navigate(`/?${params.toString()}`);
+                          }
                           requestAnimationFrame(() => textareaRef.current?.focus());
                         }}
                         onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}

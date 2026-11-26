@@ -44,6 +44,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -111,6 +112,76 @@ import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { ProactiveAgentSettingControl } from "@/components/ProactiveAgentSettingControl";
+import { LOCAL_CLI_ENTRY } from "@/pages/settings/search/catalog/cli";
+import {
+  CHECK_FOR_UPDATES_ENTRY,
+  INSTALL_UPDATES_ON_QUIT_ENTRY,
+  UPDATE_MODE_ENTRY,
+  UPDATE_MODE_LABELS,
+} from "@/pages/settings/search/catalog/updates";
+import {
+  SettingsEntryLabel,
+  SettingsItem,
+  useSettingsNavigationClock,
+} from "@/pages/settings/search/SettingsItem";
+import {
+  type SettingsControlProps,
+  parseSettingsHash,
+  settingsControlId,
+  settingsControlProps,
+  settingsFileInputProps,
+  settingsDescriptionId,
+  settingsLabelId,
+} from "@/pages/settings/search/settingsControl";
+import {
+  ARCHIVED_RETENTION_OPTIONS,
+  ARCHIVED_SESSIONS_ENTRY,
+} from "@/pages/settings/search/catalog/archived";
+import {
+  SettingsDataRegion,
+  SettingsOwner,
+  settingsOverlayProps,
+  settingsRowOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
+import {
+  ALWAYS_STEER_ENTRY,
+  BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  SUBMIT_WITH_MOD_ENTER_ENTRY,
+} from "@/pages/settings/search/catalog/general";
+import {
+  APPEARANCE_DATA_ENTRY,
+  CODE_FONT_FAMILY_ENTRY,
+  CODE_FONT_SIZE_ENTRY,
+  CODE_FONT_WEIGHT_ENTRY,
+  COLOR_THEME_ENTRY,
+  PEER_SESSION_MESSAGES_ENTRY,
+  SHOW_FINAL_ANSWER_ENTRY,
+  TERMINAL_THEME_ENTRY,
+  THEME_MODE_ENTRY,
+  TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+  DEFAULT_WORKSPACE_TAB_ENTRY,
+  PROJECT_FOLDER_PAGINATION_ENTRY,
+  SESSION_ROW_QUICK_ACTIONS_ENTRY,
+  UI_FONT_FAMILY_ENTRY,
+  UI_FONT_SIZE_ENTRY,
+  WORKSPACE_PANEL_DEFAULT_ENTRY,
+  WORKSPACE_TABS_ENTRY,
+} from "@/pages/settings/search/catalog/appearance";
+import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
+import {
+  ACCOUNT_PASSWORD_ENTRY,
+  ACCOUNT_SIGN_OUT_ENTRY,
+} from "@/pages/settings/search/catalog/account";
+import {
+  ALWAYS_USE_WORKTREE_ENTRY,
+  DEFAULT_BASE_BRANCH_ENTRY,
+  DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
+} from "@/pages/settings/search/catalog/git";
+import {
+  DATABRICKS_CONNECTION_ENTRY,
+  GITHUB_CONNECTION_ENTRY,
+} from "@/pages/settings/search/catalog/integrations";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { ModelProvidersSection } from "@/pages/settings/ModelProvidersSection";
 import { VoiceInputSettings } from "@/components/VoiceInputSettings";
@@ -262,6 +333,11 @@ import {
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  DEFAULT_CODE_BLOCK_WORD_WRAP,
+  writeCodeBlockWordWrap,
+} from "@/lib/codeWrapPreferences";
+import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
@@ -335,6 +411,10 @@ import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
 } from "@/lib/subagentPanelPreferences";
+import {
+  useProjectKanbanBoardPreference,
+  writeProjectKanbanBoard,
+} from "@/lib/projectKanbanPreferences";
 import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -442,6 +522,7 @@ const AdminGeneralPage = lazy(() =>
 export function SettingsPage() {
   const info = useServerInfo();
   const location = useLocation();
+  useSettingsNavigationClock();
   const navigate = useNavigate();
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
@@ -533,17 +614,19 @@ export function SettingsPage() {
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "mcp" && (
-        <Section title="MCP">
-          {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
-            <McpRegistryConnections />
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {info === "loading"
-                ? "Loading MCP services…"
-                : "MCP services are not configured on this server."}
-            </p>
-          )}
-        </Section>
+        <SettingsItem entry={MCP_SERVICES_ENTRY}>
+          <Section title="MCP">
+            {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
+              <McpRegistryConnections />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {info === "loading"
+                  ? "Loading MCP services…"
+                  : "MCP services are not configured on this server."}
+              </p>
+            )}
+          </Section>
+        </SettingsItem>
       )}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
@@ -569,7 +652,7 @@ function Section({
 }) {
   return (
     <section>
-      <h1 className="settings-page-title text-2xl font-medium">{title}</h1>
+      <h1 className="text-2xl font-medium">{title}</h1>
       {description && (
         <p className="mt-1 text-sm text-muted-foreground max-md:hidden">{description}</p>
       )}
@@ -667,6 +750,18 @@ const workspaceTabCards: {
   { value: "tasks", label: "Tasks", icon: ListChecksIcon },
 ];
 
+/** Each tab's pin control, named on the Sidebar tabs row. */
+const WORKSPACE_TAB_PIN_PARTS: Record<
+  DefaultWorkspaceTab,
+  "pinFiles" | "pinChanges" | "pinPullRequests" | "pinAgents" | "pinTasks"
+> = {
+  files: "pinFiles",
+  changes: "pinChanges",
+  github: "pinPullRequests",
+  subagents: "pinAgents",
+  tasks: "pinTasks",
+};
+
 /** Inline icon and label for compact settings choices. */
 function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
@@ -680,18 +775,26 @@ function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: stri
 /** A labeled Appearance subsection: heading + one-line helper + its control. */
 function ThemeSubsection({
   labelId,
+  descriptionId,
   title,
   helper,
   children,
 }: {
   labelId: string;
+  descriptionId?: string;
   title: string;
   helper: string;
   children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <SettingsLabel label={title} labelId={labelId} note={null} description={helper} />
+      <SettingsLabel
+        label={title}
+        labelId={labelId}
+        descriptionId={descriptionId}
+        note={null}
+        description={helper}
+      />
       {children}
     </div>
   );
@@ -703,21 +806,16 @@ function ModeControl() {
   const mode = normalizeThemeMode(theme);
   const followsHost = useHostTheme() !== undefined;
   const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
-  const labelId = useId();
   return (
-    <div className="flex items-center justify-between gap-4">
+    <SettingsItem entry={THEME_MODE_ENTRY} className="flex items-center justify-between gap-4">
       <div className="flex-1">
-        <SettingsLabel
-          label="Mode"
-          labelId={labelId}
-          description={
-            followsHost
-              ? "Follow Databricks, or force light or dark."
-              : "Follow your system, or force light or dark."
-          }
+        <SettingsEntryLabel
+          entry={THEME_MODE_ENTRY}
+          description={followsHost ? "Follow Databricks, or force light or dark." : undefined}
         />
         {themeSettingsUrl && (
           <a
+            {...settingsControlProps(THEME_MODE_ENTRY, "databricksSettings")}
             href={themeSettingsUrl}
             target="_blank"
             rel="noreferrer"
@@ -727,83 +825,84 @@ function ModeControl() {
           </a>
         )}
       </div>
-      <IconSegmentedControl<ThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={(next) => setTheme(next)}
-        componentId="settings.appearance.theme_mode"
-        items={themeCards.map((card) => ({
-          value: card.mode,
-          testId: `theme-${card.mode}`,
-          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+      <SettingsOwner entry={THEME_MODE_ENTRY}>
+        <IconSegmentedControl<ThemeMode>
+          labelledBy={settingsLabelId(THEME_MODE_ENTRY)}
+          value={mode}
+          onSelect={(next) => setTheme(next)}
+          componentId="settings.appearance.theme_mode"
+          items={themeCards.map((card) => ({
+            value: card.mode,
+            testId: `theme-${card.mode}`,
+            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
   const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const labelId = useId();
   const choose = useCallback((next: TerminalThemeMode) => {
     setMode(next);
     writeTerminalThemeMode(next);
   }, []);
   return (
-    <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Terminal theme"
-        note={null}
-        labelId={labelId}
-        description="Use a light or dark terminal, or match the app."
-        className="flex-1"
-      />
-      <IconSegmentedControl<TerminalThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={choose}
-        componentId="settings.appearance.terminal_theme"
-        items={terminalThemeCards.map((card) => ({
-          value: card.mode,
-          testId: `terminal-theme-${card.mode}`,
-          label: card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+    <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" note={null} />
+      <SettingsOwner entry={TERMINAL_THEME_ENTRY}>
+        <IconSegmentedControl<TerminalThemeMode>
+          labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
+          value={mode}
+          onSelect={choose}
+          componentId="settings.appearance.terminal_theme"
+          items={terminalThemeCards.map((card) => ({
+            value: card.mode,
+            testId: `terminal-theme-${card.mode}`,
+            label: card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
 /** Default surface for terminal-first transcripts without a per-tab choice. */
 function TranscriptViewDefaultControl() {
   const [value, setValue] = useState(() => readTranscriptViewDefault());
-  const labelId = useId();
   const choose = useCallback((next: TranscriptViewDefault) => {
     setValue(next);
     writeTranscriptViewDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Default transcript view"
-      helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
-    >
-      <CardRadioGroup<TranscriptViewDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.transcript_view"
-        className="flex flex-wrap gap-2"
-        items={transcriptViewCards.map((card) => ({
-          value: card.value,
-          testId: `transcript-view-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        title="Default transcript view"
+        helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
+      >
+        <SettingsOwner entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+          <CardRadioGroup<TranscriptViewDefault>
+            compact
+            labelledBy={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.transcript_view"
+            className="flex flex-wrap gap-2"
+            items={transcriptViewCards.map((card) => ({
+              value: card.value,
+              testId: `transcript-view-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -814,31 +913,35 @@ function TranscriptViewDefaultControl() {
  */
 function WorkspacePanelDefaultControl() {
   const [value, setValue] = useState(() => readWorkspacePanelDefault());
-  const labelId = useId();
   const choose = useCallback((next: WorkspacePanelDefault) => {
     setValue(next);
     writeWorkspacePanelDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Workspace panel"
-      helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
-    >
-      <CardRadioGroup<WorkspacePanelDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.workspace_panel"
-        className="flex flex-wrap gap-2"
-        items={workspacePanelCards.map((card) => ({
-          value: card.value,
-          testId: `workspace-panel-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        title="Workspace panel"
+        helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
+      >
+        <SettingsOwner entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+          <CardRadioGroup<WorkspacePanelDefault>
+            compact
+            labelledBy={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.workspace_panel"
+            className="flex flex-wrap gap-2"
+            items={workspacePanelCards.map((card) => ({
+              value: card.value,
+              testId: `workspace-panel-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -846,8 +949,8 @@ function WorkspacePanelDefaultControl() {
 function WorkspaceTabsControl() {
   const [value, setValue] = useState(() => readDefaultWorkspaceTab());
   const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
-  const labelId = useId();
-  const pinnedLabelId = useId();
+  const labelId = settingsLabelId(DEFAULT_WORKSPACE_TAB_ENTRY);
+  const pinnedLabelId = settingsLabelId(WORKSPACE_TABS_ENTRY);
   const pinnedCards = workspaceTabCards.filter((card) => pinned.includes(card.value));
   const firstTab = pinnedCards.find((card) => card.value === value) ?? pinnedCards[0];
   const previewTabs = firstTab
@@ -866,91 +969,97 @@ function WorkspaceTabsControl() {
   };
   return (
     <div className="flex flex-col gap-4">
-      <ThemeSubsection
-        labelId={pinnedLabelId}
-        title="Sidebar tabs"
-        helper="Pin the pages you use most. Everything else stays in the + menu."
-      >
-        <div
-          role="img"
-          aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
-          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+      <SettingsItem entry={WORKSPACE_TABS_ENTRY}>
+        <ThemeSubsection
+          labelId={pinnedLabelId}
+          descriptionId={settingsDescriptionId(WORKSPACE_TABS_ENTRY)}
+          title="Sidebar tabs"
+          helper="Pin the pages you use most. Everything else stays in the + menu."
         >
-          <span className="text-sm text-muted-foreground">Sidebar preview</span>
-          <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
-            {previewTabs.map(({ value: tab, icon: Icon }) => (
-              <span
-                key={tab}
-                className={cn(
-                  "flex size-7 items-center justify-center rounded-md text-muted-foreground",
-                  tab === firstTab?.value && "bg-background text-foreground shadow-xs",
-                )}
-              >
-                <Icon className="size-4" />
+          <div
+            role="img"
+            aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
+            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+          >
+            <span className="text-sm text-muted-foreground">Sidebar preview</span>
+            <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
+              {previewTabs.map(({ value: tab, icon: Icon }) => (
+                <span
+                  key={tab}
+                  className={cn(
+                    "flex size-7 items-center justify-center rounded-md text-muted-foreground",
+                    tab === firstTab?.value && "bg-background text-foreground shadow-xs",
+                  )}
+                >
+                  <Icon className="size-4" />
+                </span>
+              ))}
+              {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
+              <span className="flex size-7 items-center justify-center text-muted-foreground">
+                <PlusIcon className="size-4" />
               </span>
-            ))}
-            {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
-            <span className="flex size-7 items-center justify-center text-muted-foreground">
-              <PlusIcon className="size-4" />
-            </span>
+            </div>
           </div>
-        </div>
-        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
-          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
-            const isPinned = pinned.includes(tab);
-            return (
-              <div key={tab} className="flex items-center gap-3 py-2.5">
-                <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-                <span className="flex-1 text-ui">{label}</span>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={`Pin ${label}`}
-                      aria-pressed={isPinned}
-                      onClick={() => togglePin(tab, !isPinned)}
-                      className={cn(
-                        isPinned
-                          ? "bg-primary/8 text-primary hover:bg-primary/12"
-                          : "text-muted-foreground",
-                      )}
-                      componentId={`settings.appearance.pin_workspace_${tab}`}
-                    >
-                      <PinIcon
-                        aria-hidden="true"
-                        className={cn("size-3.5", isPinned && "fill-current")}
-                      />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>{`${isPinned ? "Unpin" : "Pin"} ${label}`}</TooltipContent>
-                </Tooltip>
-              </div>
-            );
-          })}
-        </div>
-      </ThemeSubsection>
+          <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+            {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
+              const isPinned = pinned.includes(tab);
+              return (
+                <div key={tab} className="flex items-center gap-3 py-2.5">
+                  <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="flex-1 text-ui">{label}</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    {...settingsControlProps(WORKSPACE_TABS_ENTRY, WORKSPACE_TAB_PIN_PARTS[tab])}
+                    aria-pressed={isPinned}
+                    title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
+                    onClick={() => togglePin(tab, !isPinned)}
+                    className={cn(
+                      "min-w-24",
+                      isPinned
+                        ? "bg-primary/8 text-primary hover:bg-primary/12"
+                        : "text-muted-foreground",
+                    )}
+                    componentId={`settings.appearance.pin_workspace_${tab}`}
+                  >
+                    <PinIcon
+                      aria-hidden="true"
+                      className={cn("size-3.5", isPinned && "fill-current")}
+                    />
+                    {isPinned ? "Pinned" : "Pin"}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        </ThemeSubsection>
+      </SettingsItem>
       {firstTab && (
         <div className="border-t border-border pt-4">
-          <ThemeSubsection
-            labelId={labelId}
-            title="Default Workspace tab"
-            helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
-          >
-            <CardRadioGroup<DefaultWorkspaceTab>
-              compact
-              labelledBy={labelId}
-              value={firstTab.value}
-              onSelect={choose}
-              className="flex flex-wrap gap-2"
-              items={pinnedCards.map((card) => ({
-                value: card.value,
-                testId: `workspace-tab-default-${card.value}`,
-                body: iconButtonBody(card.icon, card.label),
-              }))}
-            />
-          </ThemeSubsection>
+          <SettingsItem entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+            <ThemeSubsection
+              labelId={labelId}
+              descriptionId={settingsDescriptionId(DEFAULT_WORKSPACE_TAB_ENTRY)}
+              title="Default Workspace tab"
+              helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
+            >
+              <SettingsOwner entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+                <CardRadioGroup<DefaultWorkspaceTab>
+                  compact
+                  labelledBy={labelId}
+                  value={firstTab.value}
+                  onSelect={choose}
+                  className="flex flex-wrap gap-2"
+                  items={pinnedCards.map((card) => ({
+                    value: card.value,
+                    testId: `workspace-tab-default-${card.value}`,
+                    body: iconButtonBody(card.icon, card.label),
+                  }))}
+                />
+              </SettingsOwner>
+            </ThemeSubsection>
+          </SettingsItem>
         </div>
       )}
     </div>
@@ -1010,7 +1119,6 @@ function ColorThemeControl() {
   const isDark = useResolvedThemeMode() === "dark";
   const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
-  const labelId = useId();
 
   const choose = useCallback(
     (next: ThemeSelection) => {
@@ -1064,122 +1172,131 @@ function ColorThemeControl() {
       : selectedPalette?.blurb;
 
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Color theme"
-      helper="Choose a preset, then tune it across light and dark mode."
-    >
-      <div
-        data-testid="color-theme-editor"
-        className="overflow-hidden rounded-xl border bg-transparent"
+    <SettingsItem entry={COLOR_THEME_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(COLOR_THEME_ENTRY)}
+        descriptionId={settingsDescriptionId(COLOR_THEME_ENTRY)}
+        title="Color theme"
+        helper="Choose a preset, then tune it across light and dark mode."
       >
-        <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
-              <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
-            </div>
-            <SettingsLabel
-              label="Theme palette"
-              note={null}
-              description={paletteDescription}
-              descriptionClassName="truncate"
-            />
-          </div>
-          <Select
-            value={selection}
-            onValueChange={(next) => {
-              if (isThemeSelection(next)) choose(next);
-            }}
-            componentId="settings.appearance.color_theme"
-            valueHasNoPii
-          >
-            <SelectTrigger
-              aria-labelledby={labelId}
-              data-testid="color-theme-select"
-              className="w-full gap-2 sm:w-48"
-            >
-              <SelectValue>
-                <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-                <span>{selected.label}</span>
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {PALETTES.map((palette) => (
-                <SelectItem
-                  key={palette.id}
-                  value={palette.id}
-                  data-testid={`palette-${palette.id}`}
-                >
-                  <PaletteChip swatch={isDark ? palette.dark : palette.light} />
-                  <span>{palette.label}</span>
-                </SelectItem>
-              ))}
-              <SelectItem value="custom" data-testid="palette-custom">
-                <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
-                <span>Custom</span>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="px-4">
-          <ThemeColorPicker
-            label="Accent"
-            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
-            testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
-          />
-          <ThemeColorPicker
-            label="Background tint"
-            value={isDark ? editableTheme.darkTint : editableTheme.tint}
-            testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
-          />
-          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border/70 py-4">
-            <SettingsLabel
-              label="Contrast"
-              note={null}
-              description="Separates text, borders, and surfaces."
-            />
-            <div className="flex w-52 max-w-full shrink-0 items-center gap-3">
-              <input
-                id="custom-theme-contrast"
-                type="range"
-                min="0"
-                max="100"
-                value={editableTheme.contrast}
-                aria-label="Theme contrast"
-                data-testid="custom-theme-contrast"
-                onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
-                className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
-                style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+        <div
+          data-testid="color-theme-editor"
+          className="overflow-hidden rounded-xl border bg-transparent"
+        >
+          <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
+                <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
+              </div>
+              <SettingsLabel
+                label="Theme palette"
+                note={null}
+                description={paletteDescription}
+                descriptionClassName="truncate"
               />
-              <output
-                htmlFor="custom-theme-contrast"
-                data-testid="custom-theme-contrast-value"
-                className="w-12 text-right text-sm font-medium tabular-nums"
+            </div>
+            <Select
+              value={selection}
+              onValueChange={(next) => {
+                if (isThemeSelection(next)) choose(next);
+              }}
+              componentId="settings.appearance.color_theme"
+              valueHasNoPii
+            >
+              <SelectTrigger
+                {...settingsControlProps(COLOR_THEME_ENTRY)}
+                data-testid="color-theme-select"
+                className="w-full gap-2 sm:w-48"
               >
-                {editableTheme.contrast}%
-              </output>
+                <SelectValue>
+                  <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+                  <span>{selected.label}</span>
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent {...settingsOverlayProps(COLOR_THEME_ENTRY)}>
+                {PALETTES.map((palette) => (
+                  <SelectItem
+                    key={palette.id}
+                    value={palette.id}
+                    data-testid={`palette-${palette.id}`}
+                  >
+                    <PaletteChip swatch={isDark ? palette.dark : palette.light} />
+                    <span>{palette.label}</span>
+                  </SelectItem>
+                ))}
+                <SelectItem value="custom" data-testid="palette-custom">
+                  <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
+                  <span>Custom</span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="px-4">
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="accent">
+              <ThemeColorPicker
+                label="Accent"
+                value={isDark ? editableTheme.darkAccent : editableTheme.accent}
+                testId="custom-theme-accent"
+                onChange={(accent) =>
+                  updateCustomTheme(isDark ? { darkAccent: accent } : { accent })
+                }
+              />
+            </SettingsOwner>
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="tint">
+              <ThemeColorPicker
+                label="Background tint"
+                value={isDark ? editableTheme.darkTint : editableTheme.tint}
+                testId="custom-theme-tint"
+                onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
+              />
+            </SettingsOwner>
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border/70 py-4">
+              <SettingsLabel
+                label="Contrast"
+                note={null}
+                description="Separates text, borders, and surfaces."
+              />
+              <div className="flex w-52 max-w-full shrink-0 items-center gap-3">
+                <input
+                  id="custom-theme-contrast"
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={editableTheme.contrast}
+                  {...settingsControlProps(COLOR_THEME_ENTRY, "contrast")}
+                  data-testid="custom-theme-contrast"
+                  onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
+                  className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
+                  style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+                />
+                <output
+                  htmlFor="custom-theme-contrast"
+                  data-testid="custom-theme-contrast-value"
+                  className="w-12 text-right text-sm font-medium tabular-nums"
+                >
+                  {editableTheme.contrast}
+                </output>
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-4 py-4">
+              <SettingsLabel
+                label="Translucent sidebars"
+                note={null}
+                description="Lets the canvas show through the conversation and workspace rails."
+              />
+              <Switch
+                {...settingsControlProps(COLOR_THEME_ENTRY, "translucentSidebars")}
+                checked={editableTheme.translucentSidebar}
+                onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
+                data-testid="custom-theme-translucent-sidebar"
+                componentId="settings.appearance.translucent_sidebar"
+              />
             </div>
           </div>
-          <div className="flex items-center justify-between gap-4 py-4">
-            <SettingsLabel
-              label="Translucent sidebars"
-              note={null}
-              description="Lets the canvas show through the conversation and workspace rails."
-            />
-            <Switch
-              aria-label="Translucent sidebars"
-              checked={editableTheme.translucentSidebar}
-              onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
-              data-testid="custom-theme-translucent-sidebar"
-              componentId="settings.appearance.translucent_sidebar"
-            />
-          </div>
         </div>
-      </div>
-    </ThemeSubsection>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -1217,51 +1334,52 @@ function CompactProgressIndicatorControl() {
 /** How messages other sessions send appear in a chat, e.g. a supervisor's. */
 function PeerSessionMessageDisplayControl() {
   const value = usePeerSessionMessageDisplay();
-  const labelId = useId();
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Messages from other sessions"
-      helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
-    >
-      <CardRadioGroup<PeerSessionMessageDisplay>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={writePeerSessionMessageDisplay}
-        componentId="settings.appearance.peer_session_messages"
-        className="flex flex-wrap gap-2"
-        items={peerSessionMessageCards.map((card) => ({
-          value: card.value,
-          testId: `peer-session-messages-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={PEER_SESSION_MESSAGES_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+        descriptionId={settingsDescriptionId(PEER_SESSION_MESSAGES_ENTRY)}
+        title="Messages from other sessions"
+        helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
+      >
+        <SettingsOwner entry={PEER_SESSION_MESSAGES_ENTRY}>
+          <CardRadioGroup<PeerSessionMessageDisplay>
+            compact
+            labelledBy={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+            value={value}
+            onSelect={writePeerSessionMessageDisplay}
+            componentId="settings.appearance.peer_session_messages"
+            className="flex flex-wrap gap-2"
+            items={peerSessionMessageCards.map((card) => ({
+              value: card.value,
+              testId: `peer-session-messages-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
 /** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show only the final answer"
-        note={null}
-        labelId={labelId}
-        description="Fold other agents' progress into the Worked row, keeping each turn's last message visible. Codex already folds completed turns."
-      />
+    <SettingsItem
+      entry={SHOW_FINAL_ANSWER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SHOW_FINAL_ANSWER_ENTRY} note={null} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SHOW_FINAL_ANSWER_ENTRY)}
         checked={enabled}
         onCheckedChange={writeFoldAssistantNarration}
         data-testid="fold-assistant-narration-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.fold_assistant_narration"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1271,18 +1389,12 @@ function ProjectFolderPaginationControl() {
   const pageSize = useProjectFolderPageSize();
   // The text being typed; null shows the saved size, so a bad entry reverts on blur.
   const [draft, setDraft] = useState<string | null>(null);
-  const collapseLabelId = useId();
-  const pageSizeLabelId = useId();
   return (
-    <>
+    <SettingsItem entry={PROJECT_FOLDER_PAGINATION_ENTRY}>
       <div className="flex items-start justify-between gap-6">
-        <SettingsLabel
-          label='Collapse project sessions behind "Show more"'
-          labelId={collapseLabelId}
-          description="An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll."
-        />
+        <SettingsEntryLabel entry={PROJECT_FOLDER_PAGINATION_ENTRY} />
         <Switch
-          aria-labelledby={collapseLabelId}
+          {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY)}
           checked={collapse}
           onCheckedChange={writeProjectFolderCollapse}
           data-testid="project-folder-collapse-toggle"
@@ -1294,7 +1406,6 @@ function ProjectFolderPaginationControl() {
         <div className="mt-4 flex items-center justify-between gap-6 border-t border-border pt-4">
           <SettingsLabel
             label='Sessions to show before "Show more"'
-            labelId={pageSizeLabelId}
             description={`Each Show more click reveals this many more. Use a whole number from ${PROJECT_FOLDER_PAGE_SIZE_MIN} to ${PROJECT_FOLDER_PAGE_SIZE_MAX}.`}
           />
           <Input
@@ -1303,7 +1414,7 @@ function ProjectFolderPaginationControl() {
             min={PROJECT_FOLDER_PAGE_SIZE_MIN}
             max={PROJECT_FOLDER_PAGE_SIZE_MAX}
             step={1}
-            aria-labelledby={pageSizeLabelId}
+            {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY, "pageSize")}
             data-testid="project-folder-page-size-input"
             className="h-9 w-20 shrink-0 tabular-nums"
             value={draft ?? String(pageSize)}
@@ -1319,30 +1430,28 @@ function ProjectFolderPaginationControl() {
           />
         </div>
       )}
-    </>
+    </SettingsItem>
   );
 }
 
 /** On by default: sidebar rows show hover Pin and Archive buttons beside the "…" menu. */
 function SessionRowQuickActionsControl() {
   const shown = useSessionRowQuickActions();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show Pin and Archive buttons on session rows"
-        labelId={labelId}
-        description={`Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`}
-      />
+    <SettingsItem
+      entry={SESSION_ROW_QUICK_ACTIONS_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SESSION_ROW_QUICK_ACTIONS_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SESSION_ROW_QUICK_ACTIONS_ENTRY)}
         checked={shown}
         onCheckedChange={writeSessionRowQuickActions}
         data-testid="session-row-quick-actions-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.session_row_quick_actions"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1395,6 +1504,7 @@ function AppearanceSection() {
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
     writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
+    writeCodeBlockWordWrap(DEFAULT_CODE_BLOCK_WORD_WRAP);
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -1408,6 +1518,7 @@ function AppearanceSection() {
           "omnigent:code-font-size",
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
+          CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
@@ -1571,10 +1682,14 @@ function AppearanceSection() {
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">
-          <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end">
+          <SettingsItem
+            entry={APPEARANCE_DATA_ENTRY}
+            className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end"
+          >
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "export")}
               data-testid="export-settings-button"
               onClick={exportSettings}
             >
@@ -1584,6 +1699,7 @@ function AppearanceSection() {
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "import")}
               data-testid="import-settings-button"
               onClick={() => {
                 setImportError(null);
@@ -1598,13 +1714,14 @@ function AppearanceSection() {
                 <Button
                   variant="outline"
                   size="sm"
+                  {...settingsControlProps(APPEARANCE_DATA_ENTRY, "reset")}
                   data-testid="reset-appearance-button"
                   componentId="settings.appearance.open_reset_dialog"
                 >
                   Reset theme, layout &amp; fonts
                 </Button>
               </DialogTrigger>
-              <DialogContent>
+              <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "reset")}>
                 <DialogHeader>
                   <DialogTitle>Reset theme, layout and fonts?</DialogTitle>
                   <DialogDescription>
@@ -1618,6 +1735,7 @@ function AppearanceSection() {
                   <Button
                     variant="default"
                     onClick={confirmResetAppearance}
+                    {...settingsControlProps(APPEARANCE_DATA_ENTRY, "confirmReset")}
                     data-testid="reset-appearance-confirm"
                     componentId="settings.appearance.reset"
                   >
@@ -1626,7 +1744,7 @@ function AppearanceSection() {
                 </DialogFooter>
               </DialogContent>
             </Dialog>
-          </div>
+          </SettingsItem>
         </SettingsGroup>
       </div>
 
@@ -1635,6 +1753,7 @@ function AppearanceSection() {
         type="file"
         accept=".json"
         className="hidden"
+        {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
         data-testid="import-settings-file-input"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -1643,7 +1762,7 @@ function AppearanceSection() {
         }}
       />
       <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "import")}>
           <DialogHeader>
             <DialogTitle>Import settings</DialogTitle>
             <DialogDescription>
@@ -1665,6 +1784,7 @@ function AppearanceSection() {
             </DialogClose>
             <Button
               variant="default"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1793,15 +1913,19 @@ function GithubIntegrationControl() {
 
   const returnTo = `${window.location.pathname}${window.location.search}`;
 
-  if (status === "loading") {
-    return <p className="text-sm text-muted-foreground">Checking…</p>;
-  }
-  if (status === null) {
-    return <p className="text-sm text-muted-foreground">GitHub status is unavailable.</p>;
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={GITHUB_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={GITHUB_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "GitHub status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <SettingsItem entry={GITHUB_CONNECTION_ENTRY} className="flex flex-col gap-4">
       {notice === "connected" && (
         <div
           role="status"
@@ -1820,14 +1944,14 @@ function GithubIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <SettingsLabel
-          label="GitHub"
+        <SettingsEntryLabel
+          entry={GITHUB_CONNECTION_ENTRY}
           note={status.connected && status.login ? `Connected as ${status.login}.` : null}
           className="flex-1"
           description={
             status.connected && status.login
               ? `Connected as ${status.login}. New sandboxes use your gh and git credentials and add your public SSH keys for SSH access.`
-              : "Connect GitHub to use your gh and git credentials and add your public SSH keys in new sandboxes."
+              : GITHUB_CONNECTION_ENTRY.description
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1836,6 +1960,7 @@ function GithubIntegrationControl() {
               variant="ghost"
               size="sm"
               className="h-9"
+              {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "disconnect")}
               disabled={busy}
               data-testid="github-disconnect"
               onClick={() => void onDisconnect()}
@@ -1846,6 +1971,7 @@ function GithubIntegrationControl() {
             <Button
               size="sm"
               className="h-9 gap-2"
+              {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "connect")}
               disabled={busy}
               data-testid="github-connect"
               onClick={() => beginGithubConnect(returnTo)}
@@ -1861,6 +1987,7 @@ function GithubIntegrationControl() {
         <p className="text-xs text-muted-foreground">
           The app may need to be installed on your repositories.{" "}
           <a
+            {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "manageInstallation")}
             href={status.install_url}
             target="_blank"
             rel="noreferrer"
@@ -1871,7 +1998,7 @@ function GithubIntegrationControl() {
           .
         </p>
       )}
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1887,26 +2014,24 @@ function AlwaysUseWorktreeControl() {
     writeAlwaysUseWorktree(next);
   }, []);
   return (
-    <SettingRow
-      label="Always use a random worktree"
-      hint={
-        <>
-          Sessions opened from New Chat start in a separate Git checkout with a random branch name.
-          A project can override this default. Sessions opened by agents or tools keep following
-          their parent&apos;s folder unless a folder or worktree is specified. This preference is
-          saved for your account across devices.
-        </>
-      }
+    <SettingsItem
+      entry={ALWAYS_USE_WORKTREE_ENTRY}
+      className="flex items-start justify-between gap-6"
     >
+      <SettingsEntryLabel
+        entry={ALWAYS_USE_WORKTREE_ENTRY}
+        className="flex-1"
+        description="Sessions opened from New Chat start in a separate Git checkout with a random branch name. A project can override this. Agents and tools keep using the parent’s folder unless they specify another folder or worktree. This preference is saved to your account."
+      />
       <Switch
-        aria-label="Always use a random worktree"
+        {...settingsControlProps(ALWAYS_USE_WORKTREE_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="settings-always-use-worktree-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
       />
-    </SettingRow>
+    </SettingsItem>
   );
 }
 
@@ -1930,96 +2055,101 @@ function DeleteWorktreesOnArchiveControl() {
     .filter(Boolean);
   const pathsChanged = current && pathsDraft !== current.rebuildable_paths.join("\n");
   return (
-    <fieldset
-      disabled={disabled}
-      aria-describedby={`${labelId}-help`}
-      className="min-w-0 space-y-4"
-    >
-      <legend className="text-ui font-normal md:font-medium">Worktrees on archive</legend>
-      <p id={`${labelId}-help`} className="text-sm text-muted-foreground">
-        Source changes and Git branches are kept.
-      </p>
-      <ArchiveWorktreeTierChoices
-        name={labelId}
-        mode={current?.mode ?? "never"}
-        onChange={(mode) => {
-          if (current) save.mutate({ ...current, mode });
-        }}
+    <SettingsItem entry={DELETE_WORKTREES_ON_ARCHIVE_ENTRY}>
+      <fieldset
         disabled={disabled}
-      />
-      {current?.mode === "yellow_too" && (
-        <p className="text-sm text-destructive" role="note">
-          Ignored local files outside the rebuildable list can be lost when a worktree is removed.
+        aria-describedby={`${labelId}-help`}
+        className="min-w-0 space-y-4"
+      >
+        <legend className="text-ui font-normal md:font-medium">Worktrees on archive</legend>
+        <p id={`${labelId}-help`} className="text-sm text-muted-foreground">
+          Source changes and Git branches are kept.
         </p>
-      )}
-      <div className="flex items-start justify-between gap-4">
-        <label htmlFor={`${labelId}-ask`} className="text-ui font-normal md:font-medium">
-          Ask before archiving
-        </label>
-        <Switch
-          id={`${labelId}-ask`}
-          checked={current?.ask_before_archive ?? false}
-          onCheckedChange={(ask_before_archive) => {
-            if (current) save.mutate({ ...current, ask_before_archive });
+        <ArchiveWorktreeTierChoices
+          name={labelId}
+          mode={current?.mode ?? "never"}
+          onChange={(mode) => {
+            if (current) save.mutate({ ...current, mode });
           }}
           disabled={disabled}
-          data-testid="settings-archive-worktree-ask"
-          componentId="settings.git.archive_worktree_ask"
         />
-      </div>
-      {current?.mode !== "never" && (
-        <details className="space-y-2">
-          <summary className="cursor-pointer text-ui font-normal md:font-medium">
-            Rebuildable ignored directories
-          </summary>
-          <label htmlFor={`${labelId}-paths`} className="sr-only">
-            Rebuildable ignored directories
-          </label>
-          <p className="text-sm text-muted-foreground">
-            One entry per line. Plain names match ignored directories at any depth; paths with
-            slashes are relative to the worktree root. Untracked source files never qualify.
+        {current?.mode === "yellow_too" && (
+          <p className="text-sm text-destructive" role="note">
+            Ignored local files outside the rebuildable list can be lost when a worktree is removed.
           </p>
-          <Textarea
-            id={`${labelId}-paths`}
-            className="min-h-32 w-full min-w-0 font-mono text-sm"
-            value={pathsDraft}
-            onChange={(event) => setPathsDraft(event.target.value)}
+        )}
+        <div className="flex items-start justify-between gap-4">
+          <label htmlFor={`${labelId}-ask`} className="text-ui font-normal md:font-medium">
+            Ask before archiving
+          </label>
+          <Switch
+            id={`${labelId}-ask`}
+            checked={current?.ask_before_archive ?? false}
+            onCheckedChange={(ask_before_archive) => {
+              if (current) save.mutate({ ...current, ask_before_archive });
+            }}
             disabled={disabled}
-            spellCheck={false}
-            data-testid="settings-archive-worktree-paths"
+            {...settingsControlProps(DELETE_WORKTREES_ON_ARCHIVE_ENTRY, "ask")}
+            data-testid="settings-archive-worktree-ask"
+            componentId="settings.git.archive_worktree_ask"
           />
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              size="sm"
-              disabled={disabled || !pathsChanged}
-              onClick={() => {
-                if (current) save.mutate({ ...current, rebuildable_paths: parsedPaths });
-              }}
-              data-testid="settings-archive-worktree-paths-save"
-            >
-              Save directories
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
+        </div>
+        {current?.mode !== "never" && (
+          <details className="space-y-2">
+            <summary className="cursor-pointer text-ui font-normal md:font-medium">
+              Rebuildable ignored directories
+            </summary>
+            <label htmlFor={`${labelId}-paths`} className="sr-only">
+              Rebuildable ignored directories
+            </label>
+            <p className="text-sm text-muted-foreground">
+              One entry per line. Plain names match ignored directories at any depth; paths with
+              slashes are relative to the worktree root. Untracked source files never qualify.
+            </p>
+            <Textarea
+              id={`${labelId}-paths`}
+              className="min-h-32 w-full min-w-0 font-mono text-sm"
+              value={pathsDraft}
+              onChange={(event) => setPathsDraft(event.target.value)}
               disabled={disabled}
-              onClick={() => {
-                setPathsDraft(DEFAULT_REBUILDABLE_PATHS.join("\n"));
-              }}
-            >
-              Restore defaults
-            </Button>
-          </div>
-        </details>
-      )}
-      {(preference.error || save.error) && (
-        <p role="alert" className="text-sm text-destructive">
-          {(preference.error || save.error)?.message}
-        </p>
-      )}
-    </fieldset>
+              spellCheck={false}
+              {...settingsControlProps(DELETE_WORKTREES_ON_ARCHIVE_ENTRY, "paths")}
+              data-testid="settings-archive-worktree-paths"
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                size="sm"
+                disabled={disabled || !pathsChanged}
+                onClick={() => {
+                  if (current) save.mutate({ ...current, rebuildable_paths: parsedPaths });
+                }}
+                {...settingsControlProps(DELETE_WORKTREES_ON_ARCHIVE_ENTRY, "savePaths")}
+                data-testid="settings-archive-worktree-paths-save"
+              >
+                Save directories
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={disabled}
+                onClick={() => {
+                  setPathsDraft(DEFAULT_REBUILDABLE_PATHS.join("\n"));
+                }}
+              >
+                Restore defaults
+              </Button>
+            </div>
+          </details>
+        )}
+        {(preference.error || save.error) && (
+          <p role="alert" className="text-sm text-destructive">
+            {(preference.error || save.error)?.message}
+          </p>
+        )}
+      </fieldset>
+    </SettingsItem>
   );
 }
 
@@ -2073,15 +2203,19 @@ function DatabricksIntegrationControl() {
   if (status !== "loading" && status !== null && !status.enabled) {
     return null;
   }
-  if (status === "loading") {
-    return <p className="text-sm text-muted-foreground">Checking…</p>;
-  }
-  if (status === null) {
-    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={DATABRICKS_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={DATABRICKS_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "Databricks status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <SettingsItem entry={DATABRICKS_CONNECTION_ENTRY} className="flex flex-col gap-4">
       {notice === "connected" && (
         <div
           role="status"
@@ -2100,8 +2234,8 @@ function DatabricksIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <SettingsLabel
-          label="Databricks"
+        <SettingsEntryLabel
+          entry={DATABRICKS_CONNECTION_ENTRY}
           note={
             status.connected && status.workspace_host
               ? `Connected to ${status.workspace_host}.`
@@ -2111,7 +2245,7 @@ function DatabricksIntegrationControl() {
           description={
             status.connected && status.workspace_host
               ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes access Unity Gateway (MCP and model serving) as you.`
-              : "Connect a Databricks workspace to access Unity Gateway (MCP and model serving) as you in new sandboxes."
+              : DATABRICKS_CONNECTION_ENTRY.description
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -2120,6 +2254,7 @@ function DatabricksIntegrationControl() {
               variant="ghost"
               size="sm"
               className="h-9"
+              {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "disconnect")}
               disabled={busy}
               data-testid="databricks-disconnect"
               onClick={() => void onDisconnect()}
@@ -2129,6 +2264,7 @@ function DatabricksIntegrationControl() {
           ) : (
             <>
               <Input
+                {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "workspace")}
                 type="text"
                 inputMode="url"
                 placeholder="workspace-host.cloud.databricks.com"
@@ -2140,6 +2276,7 @@ function DatabricksIntegrationControl() {
               <Button
                 size="sm"
                 className="h-9"
+                {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "connect")}
                 disabled={busy || workspace.trim() === ""}
                 data-testid="databricks-connect"
                 onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
@@ -2150,7 +2287,7 @@ function DatabricksIntegrationControl() {
           )}
         </div>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2159,52 +2296,44 @@ function DatabricksIntegrationControl() {
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeAlwaysSteer(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Always steer"
-        note={null}
-        labelId={labelId}
-        className="flex-1"
-        description="Send follow-ups into the running turn. Harnesses without steering support use them on the next turn."
-      />
+    <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
+      <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" note={null} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 function ComposerSendShortcutControl() {
   const [enabled, setEnabled] = useState(() => readSubmitWithModEnter());
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
     writeSubmitWithModEnter(next);
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label={`Submit with ${MOD_KEY} + Enter on desktop`}
+    <SettingsItem
+      entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel
+        entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
         note={
           enabled
             ? `${MOD_KEY}+Enter sends; Enter adds a line.`
             : "Enter sends; Shift+Enter adds a line."
         }
-        labelId={labelId}
-        descriptionId={descriptionId}
         className="flex-1"
         description={
           <>
@@ -2214,13 +2343,39 @@ function ComposerSendShortcutControl() {
         }
       />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(SUBMIT_WITH_MOD_ENTER_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="composer-submit-with-mod-enter-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.submit_with_mod_enter"
+      />
+    </SettingsItem>
+  );
+}
+
+/** On by default: clicking a project opens its sessions board. */
+function ProjectKanbanBoardControl() {
+  const enabled = useProjectKanbanBoardPreference();
+  const labelId = useId();
+  const descriptionId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Kanban board views"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Monitor a project's agents in one view and respond the moment one needs you."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={writeProjectKanbanBoard}
+        data-testid="project-kanban-board-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.project_kanban_board"
       />
     </div>
   );
@@ -2228,8 +2383,6 @@ function ComposerSendShortcutControl() {
 
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
@@ -2237,25 +2390,24 @@ function BackgroundSessionTitlesControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Automatically name new sessions"
-        note="Name sessions after the first message."
-        labelId={labelId}
-        descriptionId={descriptionId}
+    <SettingsItem
+      entry={BACKGROUND_SESSION_TITLES_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel
+        entry={BACKGROUND_SESSION_TITLES_ENTRY}
         className="flex-1"
-        description="Name sessions after the first message. Turn off to keep default names."
+        note="Name sessions after the first message."
       />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(BACKGROUND_SESSION_TITLES_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.background_session_titles"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2269,19 +2421,24 @@ function OpenSubagentsInPanelControl() {
   }, []);
 
   return (
-    <SettingRow
-      label="Open sub-agents in the Workspace panel"
-      note="On: opens beside the main chat. Off: replaces the chat."
-      hint="Applies to a plain click on a sub-agent, in this browser only. Phones always open it full screen."
+    <SettingsItem
+      entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY}
+      className="flex items-start justify-between gap-6"
     >
+      <SettingsEntryLabel
+        entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY}
+        className="flex-1"
+        note="On: opens beside the main chat. Off: replaces the chat."
+        description="Applies to a plain click on a sub-agent, in this browser only. Phones always open it full screen."
+      />
       <Switch
-        aria-label="Open sub-agents in the Workspace panel"
+        {...settingsControlProps(OPEN_SUBAGENTS_IN_PANEL_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-subagents-in-panel-toggle"
         componentId="settings.general.open_subagents_in_panel"
       />
-    </SettingRow>
+    </SettingsItem>
   );
 }
 
@@ -2447,6 +2604,11 @@ function GeneralSection() {
             <AlwaysSteerControl />
           </div>
         </SettingsGroup>
+        {isFeatureEnabled(info, "project_kanban") && (
+          <SettingsGroup title="Projects" testId="settings-group-projects">
+            <ProjectKanbanBoardControl />
+          </SettingsGroup>
+        )}
         <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
           <ApprovalTimeoutSettings />
         </SettingsGroup>
@@ -2497,7 +2659,11 @@ function GeneralSection() {
           </ExpandableSettings>
           <ExpandableSettings
             id="child-sessions"
-            aliases={["#child-idle"]}
+            aliases={[
+              "#child-idle",
+              `#${OPEN_SUBAGENTS_IN_PANEL_ENTRY.id}`,
+              `#${OPEN_SUBAGENTS_IN_PANEL_ENTRY.id}:`,
+            ]}
             title="Child sessions"
             className="mt-4 border-t border-border pt-4"
           >
@@ -2571,16 +2737,19 @@ function DefaultBaseBranchControl() {
   }, []);
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <SettingsLabel
-        label="Default base branch"
-        note={null}
+    <SettingsItem
+      entry={DEFAULT_BASE_BRANCH_ENTRY}
+      className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3"
+    >
+      <SettingsEntryLabel
+        entry={DEFAULT_BASE_BRANCH_ENTRY}
         className="min-w-min flex-1"
+        note={null}
         description="Starting branch for a new worktree. Leave blank to choose when creating one."
       />
       <Input
+        {...settingsControlProps(DEFAULT_BASE_BRANCH_ENTRY)}
         type="text"
-        aria-label="Default base branch"
         data-testid="settings-default-base-branch-input"
         placeholder="e.g. main"
         spellCheck={false}
@@ -2591,7 +2760,7 @@ function DefaultBaseBranchControl() {
         onChange={(e) => update(e.target.value)}
         componentId="settings.git.default_branch"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2860,13 +3029,8 @@ function UiFontSizeControl() {
   const atMax = px >= UI_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        className="flex-1"
-        note={null}
-        label="Interface font size"
-        description="Sets interface and conversation text. Icons and spacing stay fixed."
-      />
+    <SettingsItem entry={UI_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={UI_FONT_SIZE_ENTRY} className="flex-1" note={null} />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
@@ -2878,7 +3042,7 @@ function UiFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "decrease")}
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
@@ -2893,7 +3057,7 @@ function UiFontSizeControl() {
             min={UI_FONT_SIZE_MIN}
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
-            aria-label="Interface font size in pixels"
+            {...settingsControlProps(UI_FONT_SIZE_ENTRY, "field")}
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -2905,7 +3069,7 @@ function UiFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "increase")}
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}
@@ -2914,7 +3078,7 @@ function UiFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2938,13 +3102,14 @@ function UiFontFamilyControl() {
   const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={UI_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Font family"
+      <SettingsEntryLabel
+        entry={UI_FONT_FAMILY_ENTRY}
         note={null}
         className="flex-1"
         description="Use any font installed on this device. Leave blank for the system default."
@@ -2957,6 +3122,7 @@ function UiFontFamilyControl() {
           type="button"
           variant="ghost"
           size="sm"
+          {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "reset")}
           data-testid="ui-font-family-reset"
           disabled={isDefault}
           className={cn("h-9", isDefault && "invisible")}
@@ -2967,7 +3133,7 @@ function UiFontFamilyControl() {
         </Button>
         <Input
           type="text"
-          aria-label="UI font family"
+          {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "field")}
           data-testid="ui-font-family-input"
           placeholder="System default"
           spellCheck={false}
@@ -2978,7 +3144,7 @@ function UiFontFamilyControl() {
           onChange={(e) => update(e.target.value)}
         />
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -3028,12 +3194,8 @@ function UiCodeFontSizeControl() {
   const atMax = px >= CODE_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        label="Code font size"
-        note={null}
-        description="Size of code in the editor and terminal."
-      />
+    <SettingsItem entry={CODE_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={CODE_FONT_SIZE_ENTRY} className="flex-1" note={null} />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
           font-size control. */}
       <div
@@ -3045,7 +3207,7 @@ function UiCodeFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "decrease")}
           testId="code-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
@@ -3060,7 +3222,7 @@ function UiCodeFontSizeControl() {
             min={CODE_FONT_SIZE_MIN}
             max={CODE_FONT_SIZE_MAX}
             step={CODE_FONT_SIZE_STEP}
-            aria-label="Code font size in pixels"
+            {...settingsControlProps(CODE_FONT_SIZE_ENTRY, "field")}
             data-testid="code-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -3073,7 +3235,7 @@ function UiCodeFontSizeControl() {
           <span className="ml-1 text-sm text-muted-foreground">px</span>
         </div>
         <StepperButton
-          label="Increase code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "increase")}
           testId="code-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
@@ -3082,7 +3244,7 @@ function UiCodeFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -3103,13 +3265,14 @@ function UiCodeFontFamilyControl() {
   const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={CODE_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Code font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Code font family"
+      <SettingsEntryLabel
+        entry={CODE_FONT_FAMILY_ENTRY}
         note={null}
         className="flex-1"
         description="Font for the code editor and terminal. Leave blank for the default."
@@ -3122,6 +3285,7 @@ function UiCodeFontFamilyControl() {
           type="button"
           variant="ghost"
           size="sm"
+          {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "reset")}
           data-testid="code-font-family-reset"
           disabled={isDefault}
           className={cn("h-9", isDefault && "invisible")}
@@ -3132,7 +3296,7 @@ function UiCodeFontFamilyControl() {
         </Button>
         <Input
           type="text"
-          aria-label="Code font family"
+          {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "field")}
           data-testid="code-font-family-input"
           placeholder="Editor default"
           spellCheck={false}
@@ -3143,7 +3307,7 @@ function UiCodeFontFamilyControl() {
           onChange={(e) => update(e.target.value)}
         />
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -3157,35 +3321,34 @@ function UiCodeFontWeightControl() {
   };
 
   return (
-    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
-      <SettingsLabel
-        label="Heavier code font"
-        note={null}
-        className="flex-1"
-        description="Use heavier text in the editor and terminal."
-      />
+    <SettingsItem
+      entry={CODE_FONT_WEIGHT_ENTRY}
+      className="flex items-center justify-between gap-6"
+      data-testid="code-font-weight-control"
+    >
+      <SettingsEntryLabel entry={CODE_FONT_WEIGHT_ENTRY} className="flex-1" note={null} />
       <Switch
-        aria-label="Use heavier code text"
+        {...settingsControlProps(CODE_FONT_WEIGHT_ENTRY, "toggle")}
         checked={heavier}
         onCheckedChange={toggle}
         data-testid="heavier-code-text-toggle"
         className="shrink-0"
         componentId="settings.appearance.heavier_code_text"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
-  label,
+  control,
   testId,
   disabled,
   onClick,
   componentId,
   children,
 }: {
-  label: string;
+  control: SettingsControlProps;
   testId: string;
   disabled: boolean;
   onClick: () => void;
@@ -3196,7 +3359,7 @@ function StepperButton({
   return (
     <button
       type="button"
-      aria-label={label}
+      {...control}
       data-testid={testId}
       disabled={disabled}
       onClick={() => {
@@ -3274,7 +3437,7 @@ function LocalCliSection() {
         {status === null ? (
           <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
         ) : (
-          <div className="flex flex-col gap-4">
+          <SettingsItem entry={LOCAL_CLI_ENTRY} className="flex flex-col gap-4">
             <div className="flex items-center gap-2 text-ui">
               <span
                 aria-hidden
@@ -3326,6 +3489,7 @@ function LocalCliSection() {
                 {status.source === "configured" && (
                   <div>
                     <Button
+                      {...settingsControlProps(LOCAL_CLI_ENTRY, "reset")}
                       variant="ghost"
                       size="sm"
                       disabled={busy}
@@ -3337,19 +3501,12 @@ function LocalCliSection() {
                 )}
               </>
             )}
-          </div>
+          </SettingsItem>
         )}
       </SettingsGroup>
     </Section>
   );
 }
-
-const UPDATE_MODE_LABELS: Record<UpdateMode, string> = {
-  default: "Automatic (check periodically, ask before installing)",
-  start: "Check when Omnigent starts",
-  manual: "Manual only",
-  none: "Off",
-};
 
 function UpdatesSection() {
   const bridge = updateBridge();
@@ -3446,8 +3603,12 @@ function UpdatesSection() {
       ) : (
         <div className="flex max-w-2xl flex-col gap-6">
           <SettingsGroup title="Actions" testId="settings-group-update-actions">
-            <div className="flex flex-wrap items-center gap-3">
+            <SettingsItem
+              entry={CHECK_FOR_UPDATES_ENTRY}
+              className="flex flex-wrap items-center gap-3"
+            >
               <Button
+                {...settingsControlProps(CHECK_FOR_UPDATES_ENTRY, "check")}
                 onClick={() => void onCheck()}
                 loading={checking}
                 componentId="settings.updates.check_now"
@@ -3460,46 +3621,71 @@ function UpdatesSection() {
                   {lastCheckNote}
                 </span>
               )}
-            </div>
+            </SettingsItem>
           </SettingsGroup>
 
           <SettingsGroup title="Preferences" testId="settings-group-update-preferences">
-            <label className="flex flex-col gap-2">
-              <span className="text-ui font-normal md:font-medium">Update mode</span>
-              <Select
-                value={config.mode}
-                onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
-                disabled={saving}
-                componentId="settings.updates.mode"
-                valueHasNoPii
-              >
-                <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
-                    <SelectItem key={mode} value={mode}>
-                      {UPDATE_MODE_LABELS[mode]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </label>
+            <SettingsItem entry={UPDATE_MODE_ENTRY}>
+              <div className="flex flex-col gap-2">
+                <label className="flex flex-col gap-2">
+                  <span
+                    id={settingsLabelId(UPDATE_MODE_ENTRY)}
+                    className="text-ui font-normal md:font-medium"
+                  >
+                    {UPDATE_MODE_ENTRY.label}
+                  </span>
+                  <Select
+                    value={config.mode}
+                    onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
+                    disabled={saving}
+                    componentId="settings.updates.mode"
+                    valueHasNoPii
+                  >
+                    <SelectTrigger
+                      {...settingsControlProps(UPDATE_MODE_ENTRY)}
+                      className="w-full max-w-md"
+                      data-testid="update-mode-select"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent {...settingsOverlayProps(UPDATE_MODE_ENTRY)}>
+                      {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
+                        <SelectItem key={mode} value={mode}>
+                          {UPDATE_MODE_LABELS[mode]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </label>
+                <span
+                  id={settingsDescriptionId(UPDATE_MODE_ENTRY)}
+                  className="text-sm text-muted-foreground"
+                >
+                  {UPDATE_MODE_ENTRY.description}
+                </span>
+              </div>
+            </SettingsItem>
 
             {config.deliveryMode !== "manual-download" && (
-              <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-                <SettingsLabel
-                  label="Install downloaded updates on next quit"
-                  note={null}
-                  description="Applies only after you choose to download an update."
-                />
-                <Switch
-                  checked={config.autoInstall}
-                  onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
-                  disabled={saving}
-                  aria-label="Install downloaded updates on next quit"
-                  componentId="settings.updates.auto_install"
-                />
+              <div className="mt-4 border-t border-border pt-4">
+                <SettingsItem
+                  entry={INSTALL_UPDATES_ON_QUIT_ENTRY}
+                  className="flex items-center justify-between gap-4"
+                >
+                  <SettingsLabel
+                    label={INSTALL_UPDATES_ON_QUIT_ENTRY.label}
+                    labelId={settingsLabelId(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                    descriptionId={settingsDescriptionId(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                    description={INSTALL_UPDATES_ON_QUIT_ENTRY.description}
+                  />
+                  <Switch
+                    {...settingsControlProps(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                    checked={config.autoInstall}
+                    onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+                    disabled={saving}
+                    componentId="settings.updates.auto_install"
+                  />
+                </SettingsItem>
               </div>
             )}
           </SettingsGroup>
@@ -3612,26 +3798,32 @@ function AccountSection() {
           {/* Change password is accounts-only — an OIDC identity's password
               lives with the IdP, so there's nothing to change here. */}
           {accountsEnabled && (
+            <SettingsItem entry={ACCOUNT_PASSWORD_ENTRY}>
+              <Button
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "change")}
+                variant="ghost"
+                className="w-full justify-start gap-2"
+                onClick={() => {
+                  resetPwForm();
+                  setPwOpen(true);
+                }}
+                componentId="settings.account.change_password"
+              >
+                <KeyRoundIcon className="size-4" /> Change password
+              </Button>
+            </SettingsItem>
+          )}
+          <SettingsItem entry={ACCOUNT_SIGN_OUT_ENTRY}>
             <Button
+              {...settingsControlProps(ACCOUNT_SIGN_OUT_ENTRY, "signOut")}
               variant="ghost"
               className="w-full justify-start gap-2"
-              onClick={() => {
-                resetPwForm();
-                setPwOpen(true);
-              }}
-              componentId="settings.account.change_password"
+              onClick={() => void onSignOut()}
+              componentId="settings.account.sign_out"
             >
-              <KeyRoundIcon className="size-4" /> Change password
+              <LogOutIcon className="size-4" /> Sign out
             </Button>
-          )}
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-2"
-            onClick={() => void onSignOut()}
-            componentId="settings.account.sign_out"
-          >
-            <LogOutIcon className="size-4" /> Sign out
-          </Button>
+          </SettingsItem>
         </div>
       </div>
 
@@ -3642,7 +3834,7 @@ function AccountSection() {
           if (!open) resetPwForm();
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(ACCOUNT_PASSWORD_ENTRY, "change")}>
           <DialogHeader>
             <DialogTitle>Change password</DialogTitle>
             <DialogDescription>
@@ -3661,6 +3853,7 @@ function AccountSection() {
               }}
             >
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "currentPassword")}
                 type="password"
                 autoComplete="current-password"
                 placeholder="Current password"
@@ -3670,6 +3863,7 @@ function AccountSection() {
                 required
               />
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "newPassword")}
                 type="password"
                 autoComplete="new-password"
                 placeholder="New password"
@@ -3679,6 +3873,7 @@ function AccountSection() {
                 required
               />
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "confirmPassword")}
                 type="password"
                 autoComplete="new-password"
                 placeholder="Confirm new password"
@@ -3697,6 +3892,11 @@ function AccountSection() {
               )}
               <DialogFooter>
                 <Button
+                  {...settingsControlProps(
+                    ACCOUNT_PASSWORD_ENTRY,
+                    "submit",
+                    pwBusy ? { alternative: "busy" } : undefined,
+                  )}
                   type="submit"
                   disabled={
                     pwBusy || oldPw.length === 0 || newPw.length === 0 || confirmPw.length === 0
@@ -3711,7 +3911,12 @@ function AccountSection() {
 
           {pwDone && (
             <DialogFooter>
-              <Button onClick={() => setPwOpen(false)}>Done</Button>
+              <Button
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "done")}
+                onClick={() => setPwOpen(false)}
+              >
+                Done
+              </Button>
             </DialogFooter>
           )}
         </DialogContent>
@@ -3798,14 +4003,6 @@ function archivedTimestamp(
   if (field === "created_at") return conversation.created_at;
   return conversation.archived_at ?? archivedAtSeconds(conversation);
 }
-
-const RETENTION_OPTIONS: { label: string; value: string; days: number | null }[] = [
-  { label: "Never", value: "never", days: null },
-  { label: "After 7 days", value: "7", days: 7 },
-  { label: "After 30 days", value: "30", days: 30 },
-  { label: "After 60 days", value: "60", days: 60 },
-  { label: "After 90 days", value: "90", days: 90 },
-];
 
 function retentionDaysToSelectValue(days: number | null): string {
   return days === null ? "never" : String(days);
@@ -4116,6 +4313,19 @@ function ArchivedListPane({
   autoSelectFirst: boolean;
   onSelectConversation: (conversation: Conversation | null) => void;
 }) {
+  const location = useLocation();
+  const expiryControls = useRef<HTMLDetailsElement>(null);
+  useLayoutEffect(() => {
+    const target = parseSettingsHash(location.hash);
+    const part = target?.part ?? ARCHIVED_SESSIONS_ENTRY.focus;
+    if (
+      target?.id === ARCHIVED_SESSIONS_ENTRY.id &&
+      (part === "retention" || part === "deleteExpired" || part === "expiredConfirm") &&
+      expiryControls.current
+    ) {
+      expiryControls.current.open = true;
+    }
+  }, [location]);
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(view.searchQuery ?? "");
   const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
@@ -4303,198 +4513,215 @@ function ArchivedListPane({
   }, [listQuery.data]);
 
   return (
-    <section ref={paginationAnchorRef} className="scroll-mt-16" aria-label="Archived sessions">
-      <div className="flex min-h-11 flex-wrap items-center gap-2 border-b px-2 py-1.5">
-        <h1 className="mr-auto text-sm font-semibold">Archived sessions</h1>
-        {archived.length > 0 &&
-          (selectionMode ? (
-            <>
-              <Button type="button" variant="ghost" size="sm" onClick={selectAll}>
-                <CheckIcon className="size-3.5" /> Select visible
-              </Button>
+    <SettingsItem entry={ARCHIVED_SESSIONS_ENTRY}>
+      <section ref={paginationAnchorRef} className="scroll-mt-16" aria-label="Archived sessions">
+        <div className="flex min-h-11 flex-wrap items-center gap-2 border-b px-2 py-1.5">
+          <h1 className="mr-auto text-sm font-semibold">Archived sessions</h1>
+          {archived.length > 0 &&
+            (selectionMode ? (
+              <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "selectAll")}
+                  onClick={selectAll}
+                >
+                  <CheckIcon className="size-3.5" /> Select visible
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "exitSelection")}
+                  data-testid="archived-exit-selection"
+                  onClick={exitSelectionMode}
+                >
+                  Exit selection
+                </Button>
+              </>
+            ) : (
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                data-testid="archived-exit-selection"
-                onClick={exitSelectionMode}
+                {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "select")}
+                data-testid="archived-toggle-selection"
+                onClick={() => setSelectionMode(true)}
               >
-                Exit selection
+                Select
               </Button>
-            </>
-          ) : (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              data-testid="archived-toggle-selection"
-              onClick={() => setSelectionMode(true)}
-            >
-              Select
-            </Button>
-          ))}
-      </div>
-
-      <ArchiveLibraryToolbar
-        value={view}
-        ageReferenceSeconds={queryView.ageReferenceSeconds}
-        projectOptions={projectOptions}
-        hostOptions={hostOptions}
-        agentOptions={agentOptions}
-        onChange={updateView}
-      />
-
-      {selectionMode && (
-        <div className="px-2 pt-2">
-          <ArchivedBulkActionBar
-            selectedIds={selectedIds}
-            allArchived={archived}
-            onDeselectAll={deselectAll}
-          />
-        </div>
-      )}
-
-      {listQuery.isLoading ? (
-        <p className="px-3 py-4 text-ui text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
-        <p className="px-3 py-4 text-ui text-muted-foreground">No archived sessions match.</p>
-      ) : (
-        <>
-          <ul className="flex flex-col p-1">
-            {archived.map((conv) => (
-              <ArchivedRow
-                key={conv.id}
-                conversation={conv}
-                projectName={
-                  (conv.project_id ? projectNames.get(conv.project_id) : undefined) ??
-                  conv.labels?.omni_project
-                }
-                archivedProject={(allProjectsQuery.data ?? []).find(
-                  (project) =>
-                    !!project.archived_at &&
-                    (project.id === conv.project_id ||
-                      (!conv.project_id && project.name === conv.labels?.omni_project)),
-                )}
-                activeProjects={(allProjectsQuery.data ?? []).filter(
-                  (project) => !project.archived_at,
-                )}
-                hostName={hostNames.get(conv.host_id ?? "")}
-                cutoff={retentionCutoff}
-                selectionMode={selectionMode}
-                isSelected={selectedIds.has(conv.id)}
-                onToggleSelected={toggleSelected}
-                isActive={selectedConversationId === conv.id}
-                onOpen={onSelectConversation}
-              />
             ))}
-          </ul>
-          <SettingsPager
-            label="Archived session pages"
-            page={pageNumber - 1}
-            hasNext={Boolean(listQuery.data?.has_more)}
-            busy={listQuery.isFetching}
-            testIdPrefix="archived-page"
-            onPrevious={goToPreviousPage}
-            onNext={goToNextPage}
-          />
-        </>
-      )}
-      <details className="border-t px-2 py-3">
-        <summary className="cursor-pointer text-sm font-medium">Expiry &amp; deletion</summary>
-        <div className="flex min-h-10 flex-wrap items-center gap-2 border-b px-2 py-1.5 text-xs text-muted-foreground">
-          <label htmlFor="archived-retention">Mark as expired after</label>
-          <Select
-            value={retentionDaysToSelectValue(retentionDays)}
-            onValueChange={(value) => {
-              const days = selectValueToRetentionDays(value);
-              setRetentionDays(days);
-              writeRetentionDays(days);
-            }}
-          >
-            <SelectTrigger
-              id="archived-retention"
-              aria-label="Mark archived sessions as expired after"
-              data-testid="archived-retention"
-              className="h-8 w-32 text-xs"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              {RETENTION_OPTIONS.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {expiredSessions.length > 0 && (
-            <span className="ml-auto flex items-center gap-1 text-destructive">
-              <ClockIcon className="size-3.5" />
-              {expiredSessions.length} expired on this page
-            </span>
-          )}
-          {deletableExpiredSessions.length > 0 && (
-            <Button
-              type="button"
-              variant="destructive"
-              size="sm"
-              data-testid="delete-expired"
-              disabled={bulkDelete.isPending}
-              onClick={() => setDeleteExpiredOpen(true)}
-            >
-              Delete expired
-            </Button>
-          )}
         </div>
-      </details>
 
-      <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete expired sessions?</DialogTitle>
-            <DialogDescription>
-              {deletableExpiredSessions.length === 1
-                ? "1 owned archived session"
-                : deletableExpiredSessions.length + " owned archived sessions"}{" "}
-              older than {retentionDays} days on this page will be permanently deleted. Locked and
-              shared sessions are skipped. This cannot be undone.
-              {listQuery.data?.has_more && (
-                <span className="mt-2 block text-sm">
-                  More matching archived sessions exist on later pages; review those pages
-                  separately.
-                </span>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteExpiredOpen(false)}
-              disabled={bulkDelete.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={bulkDelete.isPending}
-              onClick={() => {
-                bulkDelete.mutate({
-                  ids: deletableExpiredSessions.map((conversation) => conversation.id),
-                });
-                setDeleteExpiredOpen(false);
+        <ArchiveLibraryToolbar
+          value={view}
+          ageReferenceSeconds={queryView.ageReferenceSeconds}
+          projectOptions={projectOptions}
+          hostOptions={hostOptions}
+          agentOptions={agentOptions}
+          onChange={updateView}
+        />
+
+        {selectionMode && (
+          <div className="px-2 pt-2">
+            <ArchivedBulkActionBar
+              selectedIds={selectedIds}
+              allArchived={archived}
+              onDeselectAll={deselectAll}
+            />
+          </div>
+        )}
+
+        {listQuery.isLoading ? (
+          <p className="px-3 py-4 text-ui text-muted-foreground">Loading…</p>
+        ) : archived.length === 0 ? (
+          <p className="px-3 py-4 text-ui text-muted-foreground">No archived sessions match.</p>
+        ) : (
+          <>
+            <SettingsDataRegion entry={ARCHIVED_SESSIONS_ENTRY} region="sessions">
+              <ul className="flex flex-col p-1">
+                {archived.map((conv) => (
+                  <ArchivedRow
+                    key={conv.id}
+                    conversation={conv}
+                    projectName={
+                      (conv.project_id ? projectNames.get(conv.project_id) : undefined) ??
+                      conv.labels?.omni_project
+                    }
+                    archivedProject={(allProjectsQuery.data ?? []).find(
+                      (project) =>
+                        !!project.archived_at &&
+                        (project.id === conv.project_id ||
+                          (!conv.project_id && project.name === conv.labels?.omni_project)),
+                    )}
+                    activeProjects={(allProjectsQuery.data ?? []).filter(
+                      (project) => !project.archived_at,
+                    )}
+                    hostName={hostNames.get(conv.host_id ?? "")}
+                    cutoff={retentionCutoff}
+                    selectionMode={selectionMode}
+                    isSelected={selectedIds.has(conv.id)}
+                    onToggleSelected={toggleSelected}
+                    isActive={selectedConversationId === conv.id}
+                    onOpen={onSelectConversation}
+                  />
+                ))}
+              </ul>
+            </SettingsDataRegion>
+            <SettingsPager
+              label="Archived session pages"
+              page={pageNumber - 1}
+              hasNext={Boolean(listQuery.data?.has_more)}
+              busy={listQuery.isFetching}
+              testIdPrefix="archived-page"
+              onPrevious={goToPreviousPage}
+              onNext={goToNextPage}
+            />
+          </>
+        )}
+        <details ref={expiryControls} className="border-t px-2 py-3">
+          <summary className="cursor-pointer text-sm font-medium">Expiry &amp; deletion</summary>
+          <div className="flex min-h-10 flex-wrap items-center gap-2 border-b px-2 py-1.5 text-xs text-muted-foreground">
+            <label htmlFor="archived-retention">Mark as expired after</label>
+            <Select
+              value={retentionDaysToSelectValue(retentionDays)}
+              onValueChange={(value) => {
+                const days = selectValueToRetentionDays(value);
+                setRetentionDays(days);
+                writeRetentionDays(days);
               }}
             >
-              Delete{" "}
-              {deletableExpiredSessions.length === 1
-                ? "1 session"
-                : deletableExpiredSessions.length + " sessions"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </section>
+              <SelectTrigger
+                id="archived-retention"
+                {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "retention")}
+                data-testid="archived-retention"
+                className="h-8 w-32 text-xs"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent
+                {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "retention")}
+                position="popper"
+                align="start"
+              >
+                {ARCHIVED_RETENTION_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {expiredSessions.length > 0 && (
+              <span className="ml-auto flex items-center gap-1 text-destructive">
+                <ClockIcon className="size-3.5" />
+                {expiredSessions.length} expired on this page
+              </span>
+            )}
+            {deletableExpiredSessions.length > 0 && (
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "deleteExpired")}
+                data-testid="delete-expired"
+                disabled={bulkDelete.isPending}
+                onClick={() => setDeleteExpiredOpen(true)}
+              >
+                Delete expired
+              </Button>
+            )}
+          </div>
+        </details>
+
+        <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete expired sessions?</DialogTitle>
+              <DialogDescription>
+                {deletableExpiredSessions.length === 1
+                  ? "1 owned archived session"
+                  : deletableExpiredSessions.length + " owned archived sessions"}{" "}
+                older than {retentionDays} days on this page will be permanently deleted. Locked and
+                shared sessions are skipped. This cannot be undone.
+                {listQuery.data?.has_more && (
+                  <span className="mt-2 block text-sm">
+                    More matching archived sessions exist on later pages; review those pages
+                    separately.
+                  </span>
+                )}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setDeleteExpiredOpen(false)}
+                disabled={bulkDelete.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={bulkDelete.isPending}
+                onClick={() => {
+                  bulkDelete.mutate({
+                    ids: deletableExpiredSessions.map((conversation) => conversation.id),
+                  });
+                  setDeleteExpiredOpen(false);
+                }}
+              >
+                Delete{" "}
+                {deletableExpiredSessions.length === 1
+                  ? "1 session"
+                  : deletableExpiredSessions.length + " sessions"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </section>
+    </SettingsItem>
   );
 }
 
@@ -4590,6 +4817,7 @@ function ArchivedBulkActionBar({
               aria-label={`Unarchive ${ownedSelected.length} selected session${ownedSelected.length === 1 ? "" : "s"}`}
               disabled={isBusy || ownedSelected.length === 0}
               onClick={() => setConfirmAction("unarchive")}
+              data-settings-control={settingsControlId(ARCHIVED_SESSIONS_ENTRY, "bulkUnarchive")}
               data-testid="archived-bulk-unarchive"
             >
               {bulkArchive.isPending ? (
@@ -4611,6 +4839,7 @@ function ArchivedBulkActionBar({
               aria-label="Delete selected sessions"
               disabled={isBusy || deletableSelected.length === 0}
               onClick={() => setConfirmAction("delete")}
+              data-settings-control={settingsControlId(ARCHIVED_SESSIONS_ENTRY, "bulkDelete")}
               data-testid="archived-bulk-delete"
             >
               {bulkDelete.isPending ? (
@@ -4637,7 +4866,11 @@ function ArchivedBulkActionBar({
         open={confirmAction !== null}
         onOpenChange={(open) => !open && setConfirmAction(null)}
       >
-        <DialogContent>
+        <DialogContent
+          {...(confirmAction === "delete"
+            ? settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "bulkDelete")
+            : {})}
+        >
           <DialogHeader>
             <DialogTitle>{dialogTitle}</DialogTitle>
             <DialogDescription>
@@ -4655,6 +4888,7 @@ function ArchivedBulkActionBar({
           )}
           <DialogFooter>
             <Button
+              data-settings-dialog-action="Cancel"
               type="button"
               variant="ghost"
               onClick={() => setConfirmAction(null)}
@@ -4663,6 +4897,9 @@ function ArchivedBulkActionBar({
               Cancel
             </Button>
             <Button
+              {...(confirmAction === "delete"
+                ? settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "bulkConfirm")
+                : {})}
               type="button"
               variant={confirmAction === "delete" ? "destructive" : "default"}
               onClick={applyConfirmedAction}
@@ -4766,6 +5003,7 @@ function ArchivedRow({
   return (
     <li
       data-testid="archived-row"
+      data-settings-region-row
       data-active={isActive || undefined}
       className={cn(
         "group relative flex items-center gap-2 rounded-md border border-transparent hover:border-border hover:bg-muted/60 max-md:flex-wrap max-md:border-border/60 max-md:bg-muted/20",
@@ -4890,6 +5128,7 @@ function ArchivedRow({
                   size="icon-sm"
                   className="max-md:size-11"
                   aria-label="Delete session"
+                  data-settings-row-action="delete"
                   data-testid="delete-archived"
                   disabled={busy || locked}
                   onClick={() => setDeleteOpen(true)}
@@ -4951,6 +5190,7 @@ function ArchivedRow({
                   size="icon-sm"
                   className="dark:bg-secondary dark:hover:bg-secondary/80 max-md:size-11"
                   aria-label="Unarchive session"
+                  data-settings-row-action="unarchive"
                   data-testid="unarchive-conversation"
                   disabled={busy}
                   onClick={() =>
@@ -4975,7 +5215,7 @@ function ArchivedRow({
       )}
 
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(ARCHIVED_SESSIONS_ENTRY, "sessions", "delete")}>
           <DialogHeader>
             <DialogTitle>Delete session?</DialogTitle>
             <DialogDescription>
@@ -4987,10 +5227,16 @@ function ArchivedRow({
             <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
           )}
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setDeleteOpen(false)} disabled={del.isPending}>
+            <Button
+              data-settings-row-action="cancel"
+              variant="ghost"
+              onClick={() => setDeleteOpen(false)}
+              disabled={del.isPending}
+            >
               Cancel
             </Button>
             <Button
+              data-settings-row-action="delete"
               variant="destructive"
               disabled={del.isPending}
               onClick={() => {

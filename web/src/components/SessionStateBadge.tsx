@@ -15,6 +15,8 @@ import { CircleAlertIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
+  /** In the sidebar, the tag takes the row highlight's color instead of clashing with it. */
+  inSidebar?: boolean;
   /**
    * Render the cold keep-warm treatment (blue dot / blue framed tag) for the
    * unseen and awaiting states. Other states are unaffected.
@@ -53,7 +55,7 @@ function awaitingTooltip(count: number, terminalReason: string | undefined): str
   return count === 1 ? "1 approval prompt waiting" : `${count} approval prompts waiting`;
 }
 
-function describe(state: SessionState, cold: boolean): Visual {
+function describe(state: SessionState, cold: boolean, inSidebar: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
       const tooltip = awaitingTooltip(state.count, state.terminalReason);
@@ -70,7 +72,9 @@ function describe(state: SessionState, cold: boolean): Visual {
             className={cn(
               cold
                 ? "border-keep-cold bg-keep-cold/15 text-keep-cold"
-                : "border-transparent bg-brand-accent/15 text-brand-accent",
+                : inSidebar
+                  ? "border-transparent bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]"
+                  : "border-transparent bg-brand-accent/15 text-brand-accent",
             )}
           >
             {label}
@@ -141,8 +145,9 @@ export function SessionStateBadge({
   state,
   cold = false,
   keepWarm = null,
+  inSidebar = false,
 }: SessionStateBadgeProps) {
-  const visual = describe(state, cold);
+  const visual = describe(state, cold, inSidebar);
   const coldLine = visual.cold ? keepWarmTooltipLine(keepWarm) : null;
   return (
     <Tooltip>

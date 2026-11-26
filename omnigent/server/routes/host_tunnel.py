@@ -22,7 +22,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -74,6 +74,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostPostBindHookResultFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostResourceSnapshotFrame,
@@ -201,6 +202,8 @@ def create_host_tunnel_router(
     on_resource_snapshot: (
         Callable[[HostConnection, HostResourceSnapshotFrame], None] | None
     ) = None,
+    on_session_recovery: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]]
+    | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     conversation_store: ConversationStore | None = None,
@@ -580,6 +583,7 @@ def create_host_tunnel_router(
                         conversation_store,
                         startup_store,
                         agent_quota_service,
+                        on_session_recovery,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -626,6 +630,8 @@ def create_host_tunnel_router(
                     # stalled dependency hold shutdown indefinitely.
                     try:
                         cleanup_tasks = [sender_task, ping_task, receive_task, heartbeat_task]
+                        if conn.recovery_task is not None:
+                            cleanup_tasks.append(conn.recovery_task)
                         if account_probe_task is not None:
                             cleanup_tasks.append(account_probe_task)
                         for task in cleanup_tasks:
@@ -930,6 +936,17 @@ async def _mark_runner_log_runaway_sessions(
         await asyncio.to_thread(conversation_store.set_labels, session.id, labels)
 
 
+async def _recover_sessions(
+    callback: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]],
+    connection: HostConnection,
+    runners: list[str],
+) -> None:
+    try:
+        await callback(connection, runners)
+    except Exception:
+        _logger.exception("Session recovery request failed for host %s", connection.host_id)
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -944,6 +961,8 @@ async def _receive_loop(
     conversation_store: ConversationStore | None,
     startup_store: SessionStartupStore | None = None,
     agent_quota_service: AgentQuotaService | None = None,
+    on_session_recovery: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]]
+    | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -1023,6 +1042,19 @@ async def _receive_loop(
                 host_id,
                 type(runner_frame).__name__,
             )
+            continue
+
+        if isinstance(frame, HostRecoverSessionsFrame):
+            if (
+                on_session_recovery is not None
+                and conn.hello.recover_interrupted_sessions
+                and host_registry.get(host_id) is conn
+                and (conn.recovery_task is None or conn.recovery_task.done())
+            ):
+                conn.recovery_task = asyncio.create_task(
+                    _recover_sessions(on_session_recovery, conn, frame.runners),
+                    name=f"host-recovery:{host_id}",
+                )
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):

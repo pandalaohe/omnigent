@@ -67,6 +67,7 @@ from omnigent.host.frames import (
     HostPostBindHookResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -1002,7 +1003,8 @@ def test_hello_frame_omitted_filesystem_roots_is_legacy_false() -> None:
 
 
 @pytest.mark.parametrize("retained", [None, [], ["runner_shared"]])
-def test_launch_runner_frame_round_trip(retained: list[str] | None) -> None:
+@pytest.mark.parametrize("recovery", [False, True])
+def test_launch_runner_frame_round_trip(retained: list[str] | None, recovery: bool) -> None:
     """
     Verify HostLaunchRunnerFrame survives encode → decode.
 
@@ -1014,6 +1016,7 @@ def test_launch_runner_frame_round_trip(retained: list[str] | None) -> None:
         binding_token="secret_token_xyz",
         workspace="/opt/work/app",
         session_id="conv_abc123",
+        recovery=recovery,
     )
     if retained is not None:
         original.retain_runner_ids = retained
@@ -1023,6 +1026,7 @@ def test_launch_runner_frame_round_trip(retained: list[str] | None) -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/opt/work/app"
     assert decoded.session_id == "conv_abc123"
+    assert decoded.recovery is recovery
     assert getattr(decoded, "retain_runner_ids", None) == retained
 
 
@@ -3884,3 +3888,22 @@ def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
     assert decode_host_frame(encode_host_frame(call)) == call
     assert decode_host_frame(encode_host_frame(reply)) == reply
     assert decode_host_frame(encode_host_frame(end)) == end
+
+
+def test_recovery_request_round_trip_and_legacy_hello_default() -> None:
+    frame = HostRecoverSessionsFrame(runners=["alive-runner"])
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    hello = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "test",
+                "frame_protocol_version": 1,
+                "name": "sandbox",
+            }
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.recover_interrupted_sessions is False
+    hello.recover_interrupted_sessions = True
+    assert decode_host_frame(encode_host_frame(hello)).recover_interrupted_sessions is True

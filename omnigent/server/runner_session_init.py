@@ -147,6 +147,7 @@ _SessionInitKey = tuple[
     str | None,
     str | None,
     tuple[tuple[str, str], ...],
+    str | None,
 ]
 _BODY_SNIPPET_MAX = 500
 
@@ -441,7 +442,7 @@ class RunnerSessionInitializer:
             if (
                 key[:5] != session_key
                 or current_archive not in key[5]
-                or key[7:]
+                or key[7:-1]
                 != (
                     conversation.labels.get(PERMISSION_STATE_LABEL_KEY),
                     conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
@@ -480,6 +481,8 @@ class RunnerSessionInitializer:
         suppress_recovery_turn: bool = False,
         archive_states: list[RunnerArchiveState] | None = None,
         resume_interrupted_turn: bool = False,
+        recovery_id: str | None = None,
+        recovery_prompt: str | None = None,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
         trigger: str = "unspecified",
@@ -504,6 +507,7 @@ class RunnerSessionInitializer:
         if RECOVERY_INPUT_LABEL in conversation.labels:
             suppress_recovery_turn = True
             resume_interrupted_turn = False
+            recovery_id = None
         startup_control = self._startup_control(conversation)
         async with store_slots or nullcontext():
             peer = await self.resolve_peer_messaging(conversation)
@@ -552,6 +556,7 @@ class RunnerSessionInitializer:
                     if key.startswith(MEMBER_LABEL_PREFIX)
                 )
             ),
+            recovery_id,
         )
         task = self._tasks.get(key)
         if (
@@ -609,6 +614,8 @@ class RunnerSessionInitializer:
                 generation=generation,
                 store_slots=store_slots,
                 trigger=trigger,
+                recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
             )
         self.log_decision(
             conversation,
@@ -656,6 +663,8 @@ class RunnerSessionInitializer:
                 generation=generation,
                 store_slots=store_slots,
                 trigger=trigger,
+                recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
             )
         elif current is not None and self._pending_peer.get(pkey) == (current, peer):
             retry = current
@@ -818,10 +827,12 @@ class RunnerSessionInitializer:
         generation: int,
         store_slots: asyncio.Semaphore | None,
         trigger: str,
+        recovery_id: str | None,
+        recovery_prompt: str | None,
     ) -> asyncio.Task[httpx.Response]:
         """Start one init post, tracking its carried value while in flight."""
         init_attempt_id = uuid4().hex
-        recovery_id = (
+        recovery_id = recovery_id or (
             self._recovery_ids.setdefault(key, uuid4().hex) if resume_interrupted_turn else None
         )
 
@@ -850,6 +861,8 @@ class RunnerSessionInitializer:
                 project_code=project_code,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
+                require_recovery_admission=trigger == "host_recovery",
             )
             if self._conversation_store is not None and self._file_store is not None:
                 from omnigent.server.routes._sessions.helpers import (
@@ -904,6 +917,8 @@ class RunnerSessionInitializer:
                     project_code=project_code,
                     resume_interrupted_turn=resume_interrupted_turn,
                     recovery_id=recovery_id,
+                    recovery_prompt=recovery_prompt,
+                    require_recovery_admission=trigger == "host_recovery",
                 )
                 response = await self._post_initialize(
                     runner_client,

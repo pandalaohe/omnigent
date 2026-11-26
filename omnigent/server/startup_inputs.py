@@ -68,6 +68,15 @@ _WITHDRAWN_INPUT_NOTE = (
 _FAILED_INPUT_NOTE = (
     "The message could not be delivered: the sandbox it was waiting for failed to launch."
 )
+# How long a submitted native input waits for its transcript echo before it stops
+# holding back the messages behind it. The CLI can take a message without ever
+# recording it (e.g. a slash command Claude Code answers only in its TUI), and then
+# no echo comes. Matches the in-memory pending-input TTL.
+_RECEIPT_TIMEOUT_S = 600.0
+_UNCONFIRMED_INPUT_NOTE = (
+    "The agent never confirmed it received this message. Check the terminal; "
+    "if the agent didn't act on it, send it again."
+)
 
 
 def _settled_startup(conv: Conversation) -> str | None:
@@ -118,10 +127,11 @@ def input_content(item: ConversationItem) -> list[dict[str, Any]]:
 
 async def restore_pending_inputs(
     store: ConversationStore, session_id: str, *, annotation_only: bool = False
-) -> None:
-    """Restore native receipt matching after an AP restart, without submitting again."""
+) -> list[list[dict[str, Any]]]:
+    """Restore receipt matching and the text of still-unresolved expired sends."""
     if annotation_only and not isinstance(store, SqlAlchemyConversationStore):
-        return
+        return []
+    expired = []
     for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
         if annotation_only and (
             not isinstance(store, SqlAlchemyConversationStore)
@@ -129,15 +139,21 @@ async def restore_pending_inputs(
             is None
         ):
             continue
+        options = (
+            item.data.startup_options
+            if isinstance(item.data, (MessageData, SlashCommandData))
+            else None
+        )
+        if (
+            item.status == "failed"
+            and options is not None
+            and options.receipt_deadline is not None
+        ):
+            expired.append(input_content(item))
         if (
             item.status == "incomplete"
             and pending_inputs.pending_id_for_stable_id(session_id, item.id) is None
         ):
-            options = (
-                item.data.startup_options
-                if isinstance(item.data, (MessageData, SlashCommandData))
-                else None
-            )
             pending_id = pending_inputs.record(
                 session_id,
                 input_content(item),
@@ -149,6 +165,7 @@ async def restore_pending_inputs(
             conv = await asyncio.to_thread(store.get_conversation, session_id)
             if conv is not None and conv.labels.get(STARTUP_LABEL) == "cancelled":
                 pending_inputs.mark_interrupted(session_id, [pending_id])
+    return expired
 
 
 async def reconcile_accepted_startup_input(
@@ -232,11 +249,14 @@ class StartupInputContext:
     startup: StartupAttemptRef | None = None
     recovery_id: str | None = None
     recovery_deadline: float | None = None
+    receipt_deadline: float | None = None
 
     async def is_disconnected(self) -> bool:
         return False
 
-    async def claim(self, store: ConversationStore, session_id: str) -> bool:
+    async def claim(
+        self, store: ConversationStore, session_id: str, *, wait_for_receipt: bool = False
+    ) -> bool:
         # Leave the row queued throughout launch, authorization and policy checks.
         # A submitted native input is never replayed without its transcript receipt.
         if self.startup is not None:
@@ -303,13 +323,16 @@ class StartupInputContext:
                 {RECOVERY_DEADLINE_LABEL: str(self.recovery_deadline)},
             )
         start_fire_stage("input_claim", session_id=session_id)
+        if wait_for_receipt and self.recovery_id is None:
+            self.receipt_deadline = time.time() + _RECEIPT_TIMEOUT_S
         self.submitted = await asyncio.to_thread(
             store.transition_pending_input,
             session_id,
             self.input_id,
             expected="in_progress",
             status="incomplete",
-            **({"expected_labels": expected_labels} if expected_labels is not None else {}),
+            receipt_deadline=self.receipt_deadline,
+            expected_labels=expected_labels,
         )
         if self.submitted:
             start_fire_stage("prompt_send", session_id=session_id)
@@ -348,6 +371,7 @@ class ManagedStartupInputs:
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._receipt_watches: set[asyncio.Task[None]] = set()
         self._session_barriers: weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -901,6 +925,9 @@ class ManagedStartupInputs:
 
                     task.add_done_callback(clear_annotation_delivery)
                 return False
+        if head is not None and head.status == "incomplete":
+            if await self._recover_receipt(conv, head):
+                return True
         current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
         released = current is not None and current.release_receipt is not None
         if (
@@ -1123,6 +1150,13 @@ class ManagedStartupInputs:
                         saved,
                         cleared_pending_id=pending_inputs.make_pending_id(session_id, item.id),
                     )
+                elif response.get("pending_id") and context.receipt_deadline is not None:
+                    watch = asyncio.create_task(
+                        self._expire_unconfirmed(session_id, item.id, context.receipt_deadline),
+                        name=f"startup-input-receipt-{session_id}",
+                    )
+                    self._receipt_watches.add(watch)
+                    watch.add_done_callback(self._receipt_watches.discard)
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
@@ -1239,6 +1273,9 @@ class ManagedStartupInputs:
             if head is None:
                 return delivered
             if head.status != "in_progress":
+                conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+                if conv is not None and await self._recover_receipt(conv, head):
+                    continue
                 raise TimeoutError("Saved input is still waiting for its runtime receipt")
             outcome = await self._deliver(app, session_id, head)
             if outcome != "submitted":
@@ -1263,6 +1300,65 @@ class ManagedStartupInputs:
         ):
             return False
         _logger.info("Saved message for session %s waits for /clear to finish", session_id)
+        return True
+
+    async def _recover_receipt(self, conv: Conversation, item: ConversationItem) -> bool:
+        """Settle an overdue native receipt, including after a server restart."""
+        options = (
+            item.data.startup_options
+            if isinstance(item.data, (MessageData, SlashCommandData))
+            else None
+        )
+        if options is not None and options.recovery_id is not None:
+            return False
+        deadline = options.receipt_deadline if options is not None else None
+        if deadline is None:
+            # Old rows have no claim timestamp. Give them a full grace period
+            # once, starting when the live native session is next reconciled.
+            from omnigent.server.routes.sessions import _is_native_terminal_session
+
+            if await asyncio.to_thread(_is_native_terminal_session, conv):
+                await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    conv.id,
+                    item.id,
+                    expected="incomplete",
+                    status="incomplete",
+                    receipt_deadline=time.time() + _RECEIPT_TIMEOUT_S,
+                    expected_receipt_deadline="unset",
+                )
+            return False
+        return deadline <= time.time() and await self._settle_unconfirmed(
+            conv.id, item.id, deadline
+        )
+
+    async def _expire_unconfirmed(self, session_id: str, item_id: str, deadline: float) -> None:
+        await asyncio.sleep(max(0, deadline - time.time()))
+        await self._settle_unconfirmed(session_id, item_id, deadline)
+
+    async def _settle_unconfirmed(self, session_id: str, item_id: str, deadline: float) -> bool:
+        """Fail a submitted input whose transcript echo never came, freeing the ones behind it."""
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None or conv.archived or conv.labels.get(STARTUP_LABEL) == "cancelled":
+            return False
+        # The echo replaces the row, so only an input still awaiting it changes here.
+        if not await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item_id,
+            expected="incomplete",
+            status="failed",
+            expected_labels={STARTUP_LABEL: conv.labels.get(STARTUP_LABEL)},
+            expected_receipt_deadline=deadline,
+        ):
+            return False
+        # Its queued bubble now renders from the failed row instead.
+        pending_inputs.resolve(session_id, pending_inputs.make_pending_id(session_id, item_id))
+        await self._report_failure(
+            session_id, f"unconfirmed_{item_id}", _UNCONFIRMED_INPUT_NOTE, publish_status=False
+        )
+        if conv.host_id is not None:
+            wake_startup_worker(conv.host_id)
         return True
 
     async def retry(self, session_id: str) -> bool:
@@ -1365,7 +1461,11 @@ class ManagedStartupInputs:
             _publish_status(session_id, "failed", failure_origin="startup_input_failed")
 
     async def shutdown(self) -> None:
-        tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())
+        tasks = [
+            *(task for _, task, _ in self._workers.values()),
+            *self._deliveries.values(),
+            *self._receipt_watches,
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

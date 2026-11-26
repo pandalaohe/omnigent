@@ -19,7 +19,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import httpx
 from fastapi import (
@@ -468,7 +468,12 @@ from omnigent.server.runner_session_init import (
     RunnerSessionInitializer,
     runner_archive_states_for_conversation,
 )
-from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
+from omnigent.server.sandbox_profile_launch import (
+    default_profile_for_unrecorded_host,
+    prepare_profile,
+    record_profile,
+    saved_profile,
+)
 from omnigent.server.schemas import (
     AgentCost,
     BackgroundTaskInfo,
@@ -522,6 +527,7 @@ from omnigent.session_default_modes import (
     valid_speed_tier,
 )
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+from omnigent.session_recovery import is_native_recovery_echo
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -573,6 +579,9 @@ from omnigent.util.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
+
+if TYPE_CHECKING:
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -2061,6 +2070,7 @@ async def _stop_host_runner_intentionally(
     conversation_store: ConversationStore,
     *,
     attempt: _HostRunnerStopAttempt | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -2124,6 +2134,12 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
+        if host_session_recoverer is not None:
+            for related_id in stop_targets:
+                related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
+                if related is not None and related.runner_id == runner_id:
+                    await asyncio.to_thread(host_session_recoverer.stop_recovery, related)
+
         acknowledged = False
         attempt = attempt or _HostRunnerStopAttempt()
         try:
@@ -2184,6 +2200,7 @@ async def _archive_stop(
     project_host_binding_store: Any = None,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -2378,6 +2395,7 @@ async def _archive_stop(
                 conv.runner_id,
                 host_registry,
                 conversation_store,
+                host_session_recoverer=host_session_recoverer,
             )
         except Exception:  # noqa: BLE001
             _logger.debug(
@@ -2497,6 +2515,7 @@ def _spawn_archive_stop(
     project_host_binding_store: Any = None,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -2604,6 +2623,7 @@ def _spawn_archive_stop(
                 project_host_binding_store=project_host_binding_store,
                 host_store=host_store,
                 sandbox_config=sandbox_config,
+                host_session_recoverer=host_session_recoverer,
             )
         finally:
             _archive_close_intents.discard(session_id)
@@ -5609,6 +5629,7 @@ async def _persist_external_conversation_item(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str | None, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -5633,6 +5654,7 @@ async def _persist_external_conversation_item(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
     )
     try:
@@ -5694,6 +5716,7 @@ async def _persist_external_conversation_item_serialized(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str | None, bool]:
     """
     Run :func:`_persist_external_conversation_item_unlocked` under the mirror lock.
@@ -5709,6 +5732,7 @@ async def _persist_external_conversation_item_serialized(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
 
 
@@ -5720,6 +5744,7 @@ async def _persist_external_conversation_item_unlocked(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str | None, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -5733,6 +5758,10 @@ async def _persist_external_conversation_item_unlocked(
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
     :param conversation_store: Store used to append the item.
+    :param on_direct_input: Called once a newly persisted input landed that no
+        queued message accounts for: a person typing in the native terminal, not
+        a web or automation message's echo or a replayed item. Its failure is
+        logged and never fails the persist.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -5825,8 +5854,15 @@ async def _persist_external_conversation_item_unlocked(
         and item.data.role == "user"
         and item.data.content == [{"type": "input_text", "text": PEER_MESSAGE_WAKE_TEXT}]
     )
-    # Bridge-generated peer labels have no queued input; literal user text still does.
-    drains_pending_inputs = _drains_pending_inputs(item) and not is_peer_wake_marker
+    is_recovery_echo = False
+    if isinstance(item.data, MessageData) and is_native_recovery_echo(item.data):
+        recovery = await asyncio.to_thread(conversation_store.get_session_recovery, session_id)
+        is_recovery_echo = recovery is not None and recovery.accepts_native_echo
+        item = item.model_copy(update={"recovery_prompt_echo": is_recovery_echo})
+    # System prompts have no queued input. Preserve the same decision through the append.
+    drains_pending_inputs = _drains_pending_inputs(item) and not (
+        is_peer_wake_marker or is_recovery_echo
+    )
     if is_peer_wake_marker and isinstance(item.data, MessageData):
         # The wire marker is hidden so older servers also preserve pending uploads.
         item = item.model_copy(update={"data": item.data.model_copy(update={"is_meta": False})})
@@ -5838,12 +5874,15 @@ async def _persist_external_conversation_item_unlocked(
         # retries are absorbed by the idempotent append below.
         if existing is not None:
             return existing.id, True
-    if drains_pending_inputs:
+    expired_receipts = (
         await restore_pending_inputs(
             conversation_store,
             session_id,
             annotation_only=STARTUP_LABEL not in conv.labels,
         )
+        if drains_pending_inputs
+        else []
+    )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
     # blocks (image / file) into the item BEFORE persisting. The transcript
@@ -5894,6 +5933,7 @@ async def _persist_external_conversation_item_unlocked(
                 hold=True,
                 claude_commands=native_agent is not None
                 and native_agent.harness == "claude-native",
+                expired_receipts=expired_receipts,
             )
         drained = matched.matched
         match_method = matched.match_method
@@ -5924,7 +5964,8 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
-                and match_method not in ("attachment_attempt", "unattributed_claim")
+                and match_method
+                not in ("attachment_attempt", "unattributed_claim", "expired_receipt")
                 and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
@@ -6054,7 +6095,11 @@ async def _persist_external_conversation_item_unlocked(
         )
         for command_line in command_lines:
             matched = pending_inputs.resolve_matching_text(
-                session_id, command_line, hold=True, echo_spellings=command_lines
+                session_id,
+                command_line,
+                hold=True,
+                echo_spellings=command_lines,
+                expired_receipts=expired_receipts,
             )
             if matched.matched is not None:
                 break
@@ -6104,7 +6149,9 @@ async def _persist_external_conversation_item_unlocked(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=SessionEventInput(type=item.type, data=item.data.model_dump()),
-            enabled=enabled and (drained is None or drained.background_titles_enabled),
+            enabled=enabled
+            and not is_recovery_echo
+            and (drained is None or drained.background_titles_enabled),
         )
         persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     except Exception as exc:
@@ -6137,6 +6184,29 @@ async def _persist_external_conversation_item_unlocked(
             ),
         )
     _restore_drained_inputs(session_id, held_older, None)
+    internal_input = (
+        isinstance(persisted.data, MessageData)
+        and persisted.data.is_meta
+        and not persisted.data.user_authored
+    )
+    # Only a newly persisted human input can end the automation's attribution.
+    if (
+        on_direct_input is not None
+        and _drains_pending_inputs(item)
+        and not is_peer_wake_marker
+        and not internal_input
+        and match_method != "expired_receipt"
+        and drained is None
+        and body.data.get("agent_message_candidate") is not True
+    ):
+        try:
+            await on_direct_input()
+        except Exception:  # noqa: BLE001 — a follow-up must not fail the mirror
+            _logger.warning(
+                "Direct native input follow-up failed",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
@@ -6201,8 +6271,9 @@ async def _persist_external_conversation_item_unlocked(
             matched_pending_id=cleared_pending_id,
             match_method=match_method,
         )
-    await _seed_missing_title_from_user_message(conv, item, conversation_store)
-    if pending_background_title is not None:
+    if not internal_input:
+        await _seed_missing_title_from_user_message(conv, item, conversation_store)
+    if pending_background_title is not None and not internal_input:
         pending_background_title.schedule(expected_seed_title=conv.title)
     _publish_persisted_external_item(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
@@ -7541,6 +7612,8 @@ async def _mark_runner_sessions_offline_impl(
     *,
     fail_idle_top_level: bool = False,
     disconnect_evidence: Mapping[str, str] | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -7589,6 +7662,8 @@ async def _mark_runner_sessions_offline_impl(
             conversation_store,
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
             swept_at=swept_at,
         )
         if not pending:
@@ -7632,6 +7707,8 @@ async def _mark_runner_sessions_offline_once(
     fail_idle_top_level: bool,
     disconnect_evidence: Mapping[str, str] | None = None,
     swept_at: int,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -7704,6 +7781,15 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
+        recovery = None
+        if host_session_recoverer is not None:
+            await asyncio.to_thread(
+                host_session_recoverer.record_interruption, conv, interrupted_at=interrupted_at
+            )
+            if await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, conv.id
+                )
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
         try:
@@ -7740,6 +7826,13 @@ async def _mark_runner_sessions_offline_once(
                 conv.runner_id,
                 conv.id,
             )
+            continue
+        if (
+            recovery is not None
+            and recovery.host_id == conv.host_id
+            and recovery.runner_id == conv.runner_id
+            and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+        ):
             continue
         _publish_status(
             conv.id,
@@ -7942,6 +8035,7 @@ async def _run_managed_launch(
     host_id: str | None = None,
     sandbox_profiles: Any = None,
     held_runner_id: str | None = None,
+    adopt_default_profile: bool = False,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -8010,6 +8104,9 @@ async def _run_managed_launch(
     :param held_runner_id: The claim a move holds on the session's runner
         while it provisions, or ``None``. The sandbox binds only while that
         claim stands, and any failure releases it.
+    :param adopt_default_profile: Whether a relaunch whose host has no
+        recorded profile takes the provider's default, as a scheduled
+        fire's session reset does.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -8019,13 +8116,23 @@ async def _run_managed_launch(
     )
 
     try:
-        profile = await saved_profile(
-            sandbox_profiles,
-            session_id,
-            user_id=owner,
-            host_id=relaunch_host.host_id if relaunch_host is not None else None,
-            bind_host=False,
-        )
+        profile = None
+        if adopt_default_profile and relaunch_host is not None:
+            profile = await default_profile_for_unrecorded_host(
+                sandbox_profiles,
+                session_id,
+                relaunch_host.host_id,
+                relaunch_host.sandbox_provider,
+                user_id=owner,
+            )
+        if profile is None:
+            profile = await saved_profile(
+                sandbox_profiles,
+                session_id,
+                user_id=owner,
+                host_id=relaunch_host.host_id if relaunch_host is not None else None,
+                bind_host=False,
+            )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
@@ -12505,7 +12612,7 @@ async def _dispatch_session_event_to_runner_impl(
                         forwarded=body.data.get("workflow_answer") is not True,
                     )
             if startup_input is not None and not await startup_input.claim(
-                conversation_store, session_id
+                conversation_store, session_id, wait_for_receipt=queues_message
             ):
                 return _SessionEventDispatchResult(item_id=None, pending_id=None, forwarded=False)
             pending_id: str | None = (
@@ -12908,6 +13015,7 @@ async def _settle_orphaned_running_rows(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
     host_store: HostStore | None,
     may_settle: Callable[[Conversation], bool],
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Settle rows whose persisted ``running`` outlived their runner, before a read.
@@ -12966,6 +13074,7 @@ async def _settle_orphaned_running_rows(
             conv.id,
             conversation_store,
             now - RUNNER_LIVENESS_TTL_S,
+            host_session_recoverer=host_session_recoverer,
         )
 
 
@@ -13890,6 +13999,29 @@ async def _relay_runner_stream_once(
                             and evt_type not in _FENCE_EXEMPT_EVENT_TYPES
                         ):
                             continue
+
+                    turn_response = event.get("response")
+                    turn_response_id = (
+                        turn_response.get("id")
+                        if isinstance(turn_response, dict)
+                        else event.get("response_id")
+                    )
+                    terminal_turn = evt_type in _TERMINAL_RESPONSE_EVENT_TYPES
+                    status = event.get("status")
+                    blocked_turn = evt_type == "session.status" and (
+                        status in {"failed", "waiting"}
+                        or bool(event.get("blocked_on"))
+                        or (status == "idle" and event.get("turn_completed") is True)
+                    )
+                    if terminal_turn or blocked_turn or evt_type == "response.in_progress":
+                        await asyncio.to_thread(
+                            session_live_state.record_recovery_turn,
+                            conversation_store,
+                            session_id,
+                            runner_id,
+                            turn_response_id if isinstance(turn_response_id, str) else None,
+                            finished=terminal_turn or blocked_turn,
+                        )
 
                     if evt_type == "session.status":
                         status = event.get("status", "")

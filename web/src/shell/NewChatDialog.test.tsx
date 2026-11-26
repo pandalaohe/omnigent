@@ -1825,6 +1825,7 @@ describe("prompt URL handoff", () => {
   });
 
   it("overrides an old draft with a new link, then restores subsequent edits", () => {
+    getCurrentUserIdMock.mockReturnValue("viewer@example.test");
     const first = renderLanding();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "Old draft" },
@@ -3811,6 +3812,8 @@ describe("desktop Arclet credential preflight", () => {
   it.each([false, true])(
     "locks the draft while checking capabilities and supports Skip (skip=%s)",
     async (skip) => {
+      getCurrentUserIdMock.mockReturnValue("viewer@example.test");
+      setOmnigentHostConfig({ serverIdentity: "composer-test-server" });
       let finishFeatures!: (features: Awaited<ReturnType<typeof getDesktopFeatures>>) => void;
       const pendingFeatures = new Promise<Awaited<ReturnType<typeof getDesktopFeatures>>>(
         (resolve) => {
@@ -4813,14 +4816,15 @@ describe("NewChatLandingScreen", () => {
     expect(tooltip).not.toHaveTextContent("Status:");
   });
 
-  it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
+  it("uses one hover and focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "composer-reference-surface",
       "border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "hover:shadow-[var(--composer-shadow)]",
+      "has-[textarea:focus]:shadow-[var(--composer-shadow)]",
     );
     expect(composer).not.toHaveClass("bg-card", "dark:bg-card-solid");
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
@@ -8257,8 +8261,7 @@ describe("NewChatLandingScreen", () => {
 
   it("leaves plain Enter as a newline on a phone viewport", async () => {
     // Touch keyboards own the create action (the on-screen button), so plain
-    // Enter never creates — same rule as the in-session composer on a coarse
-    // pointer.
+    // Enter never creates — same rule as the in-session composer.
     const restoreViewport = forceMobileViewport();
     try {
       renderLanding();
@@ -11450,7 +11453,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
-    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]");
+    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow)]");
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });

@@ -21,7 +21,7 @@ the header menu), and each place is a separate entry point.
   replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
-- `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
+- `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
@@ -208,6 +208,11 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because the
   host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `host-recovery`: individually opted-in hosts request continuation after their
+  local state is ready. Lost runners resume witnessed interrupted root tasks with
+  a hidden system-tagged prompt; Stop, newer input, approvals, and archive win.
+  Completed turns stay stopped. Automatic launch retries are bounded and survive
+  a server restart. Embedded deployments stay off until their deployment gate allows it.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -299,12 +304,16 @@ the header menu), and each place is a separate entry point.
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
 - `session-overview`: behind the `session_overview` release flag (off by
-  default), the desktop chat header shows the session cost as a `$x.xx` chip.
-  Clicking it shows or hides a **Session overview** card with the session cost
-  and per-model token usage, which then leave the desktop Agent info popover.
-  Windows at least 1280px wide with the workspace collapsed and chat in view
-  dock the card open beside chat; other layouts open it over chat. Mobile keeps
-  cost in Agent info.
+  default), the desktop chat header shows the session cost as a `$x.xx` chip
+  beside the right-panel toggle, styled as selected while the card shows.
+  Clicking it shows or hides a **Session overview** card
+  with the session cost, each model's cost and the total tokens, which then
+  leave the desktop Agent info popover. Windows at least 1280px wide with the
+  workspace collapsed and chat in view dock the card open beneath the chip;
+  closed there by hand, it stays closed on that device, including after a
+  reload, until the chip opens it again. Other layouts open it as a popover
+  from the chip. Mobile keeps cost in Agent
+  info.
   When the session has sub-agents, a **Sub-agents** list names each direct one
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
@@ -319,13 +328,13 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
-**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
 transcript and composer, whose action row shows the session's host, permission mode and
-harness; terminal-capable sessions have a Chat/Terminal switch in
+model/effort picker; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
 screen; drafts and terminal connections survive view changes. A managed session
@@ -786,8 +795,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
-  `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  `web/src/grid/gridLayout.test.ts`. For a real-server drive, the
+  isolated server enables `grid_sessions_display_ui` by default. Also check a collapsed sidebar manually.
   Per-view render recovery, preserved neighboring drafts, usable cell controls
   and independent chat/terminal retry have component coverage in
   `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
@@ -1194,6 +1203,20 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/hooks/useSandboxAutoWake.test.ts` and
   `web/src/hooks/useSessionReconnect.test.ts`. None
   of them resume a live sandbox.
+- **`host-recovery`, host request, store ordering, and runner initialization:**
+  `tests/server/test_host_session_recovery.py`,
+  `tests/server/integration/test_host_tunnel_route.py::test_host_requests_recovery_without_blocking_tunnel`,
+  `tests/stores/test_conversation_store_split_db.py::test_recovery_state_shares_input_transaction_and_workspace_scope`,
+  `tests/host/test_connect.py::test_recovery_launch_requires_restored_workspace`,
+  `tests/runner/test_suppress_recovery_turn.py`.
+  Run with plain `uv run pytest`. The UI marker is covered by
+  `web/src/components/blocks/SystemMessage.test.tsx`.
+  Live proof uses an ordinary host or provider host with restored files and the
+  host opt-in enabled: restart it during an active task, then confirm completion
+  in the same chat without another message. Completed and stopped sessions must
+  receive neither a launch nor a continuation. Repeat with opt-in disabled.
+  Keep native harness and provider lifecycle evidence separate from these tests.
+
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

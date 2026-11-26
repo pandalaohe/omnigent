@@ -1256,6 +1256,7 @@ def resolve_matching_text(
     shell_command: bool = False,
     claude_commands: bool = False,
     echo_spellings: tuple[str, ...] = (),
+    expired_receipts: list[list[dict[str, Any]]] | None = None,
 ) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
@@ -1282,6 +1283,7 @@ def resolve_matching_text(
         when a later match jumps over them; see :func:`_is_command_entry`.
     :param echo_spellings: Equivalent command lines to check for late-claim
         ambiguity before settling a match for ``text``.
+    :param expired_receipts: Durable content of submissions whose receipts expired.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -1300,12 +1302,26 @@ def resolve_matching_text(
     attachment_delivery = (
         attachment_delivery_identity(text) if claude_commands and not shell_command else None
     )
+    bare_needle = exact_needle if shell_command else _bare_text(text)
+    late_claim_needles = [(exact_needle, bare_needle)]
+    late_claim_needles.extend(
+        (_collapse_whitespace(spelling), _bare_text(spelling))
+        for spelling in echo_spellings
+        if spelling != text
+    )
+    expired_echo = any(
+        _matches_late_content(content, exact, bare)
+        for content in (expired_receipts or ())
+        for exact, bare in late_claim_needles
+    )
     with _lock:
         now = _now()
         _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
-            return MatchedDrain(matched=None, skipped=[])
+            return MatchedDrain(
+                matched=None, skipped=[], match_method="expired_receipt" if expired_echo else None
+            )
         if attachment_delivery is not None:
             attempt_id, count = attachment_delivery
             for pending_id, entry in entries.items():
@@ -1334,13 +1350,10 @@ def resolve_matching_text(
                         skipped=[],
                         match_method="attachment_attempt",
                     )
-        bare_needle = exact_needle if shell_command else _bare_text(text)
-        late_claim_needles = [(exact_needle, bare_needle)]
-        late_claim_needles.extend(
-            (_collapse_whitespace(spelling), _bare_text(spelling))
-            for spelling in echo_spellings
-            if spelling != text
-        )
+        # This echo may belong to the expired submission. Only the linked
+        # attachment receipt above can prove it belongs to a newer one.
+        if expired_echo:
+            return MatchedDrain(matched=None, skipped=[], match_method="expired_receipt")
         # A late claim can explain the echo. Only a current claim can settle
         # from that text because it has already been admitted to paste.
         late_claim_echo = (
@@ -1609,14 +1622,21 @@ def _content_text(content: list[dict[str, Any]]) -> str:
 
 
 def _matches_late_claim_text(entry: _Entry, exact_needle: str, bare_needle: str) -> bool:
+    return _matches_late_content(
+        entry.content, exact_needle, bare_needle
+    ) or _matches_injected_prefix(entry, exact_needle)
+
+
+def _matches_late_content(
+    content: list[dict[str, Any]], exact_needle: str, bare_needle: str
+) -> bool:
     """Check the raw text when an echo consists entirely of attachment markers."""
-    queued_text = _content_text(entry.content)
-    matches_text = (
+    queued_text = _content_text(content)
+    return (
         _bare_text(queued_text) == bare_needle
         if bare_needle
         else _collapse_whitespace(queued_text) == exact_needle
     )
-    return matches_text or _matches_injected_prefix(entry, exact_needle)
 
 
 def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:

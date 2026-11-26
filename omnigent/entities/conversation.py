@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
@@ -355,6 +356,8 @@ class Conversation:
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    # Store snapshot used to fence recovery against concurrently accepted input.
+    next_position: int | None = None
     background_work_running: bool | None = None
     blocked_on: str | None = None
     project_id: str | None = None
@@ -381,6 +384,8 @@ class StartupInputOptions(BaseModel):
     recovery_id: str | None = None
     managed_move_attempt: str | None = None
     scheduled_run: ScheduledRunLogContext | None = None
+    # Set by the store when it claims a native send; never exposed as request options.
+    receipt_deadline: SkipJsonSchema[float | None] = Field(default=None, exclude=True)
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
@@ -1037,6 +1042,8 @@ class NewConversationItem(BaseModel):
     # Ordered cold-transcript recovery; None is the beginning of history.
     native_recovery: bool = Field(default=False, exclude=True)
     recovery_after: str | None = Field(default=None, exclude=True)
+    # A routed mirror uses the same durable attempt snapshot for queue matching and storage.
+    recovery_prompt_echo: SkipJsonSchema[bool | None] = Field(default=None, exclude=True)
     status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
     replaces_pending_id: str | None = Field(default=None, exclude=True)
     # The caller saw a runner acceptance or a native transcript echo.
@@ -1051,6 +1058,7 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
+        self.recovery_prompt_echo = None
         # Only the server can establish this link, after matching pending input.
         if isinstance(self.data, MessageData) and self.data.web_stable_id is not None:
             self.data = self.data.model_copy(update={"web_stable_id": None})

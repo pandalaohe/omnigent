@@ -1778,6 +1778,7 @@ class ExecutorAdapter(HarnessApp):
                 ctx.provider_usage = event.usage
             if event.input_received:
                 ctx.input_received = True
+            ctx.native_acceptance = event.native_acceptance
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

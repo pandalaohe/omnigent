@@ -56,6 +56,7 @@ export function AgentMemberTrigger({
   hosts,
   onChange,
   disabled = false,
+  settingsIdentity,
 }: {
   harness: string;
   model: string | null;
@@ -71,6 +72,11 @@ export function AgentMemberTrigger({
   hosts?: readonly Host[];
   onChange: (next: AgentMemberValue) => void;
   disabled?: boolean;
+  settingsIdentity?: {
+    trigger: { "aria-label"?: string; "data-settings-control": string };
+    content: { "data-settings-overlay-owner": string };
+    harnessChoice: { "data-settings-runtime-choice": string };
+  };
 }) {
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<Section | null>(null);
@@ -257,6 +263,7 @@ export function AgentMemberTrigger({
                     checked: option.id === harness,
                     onSelect: () => selectHarness(option.id),
                     testId: `agent-member-harness-${option.id}`,
+                    data: settingsIdentity?.harnessChoice,
                   })),
               }))
             : [
@@ -280,6 +287,7 @@ export function AgentMemberTrigger({
                     checked: option.id === harness,
                     onSelect: () => selectHarness(option.id),
                     testId: `agent-member-harness-${option.id}`,
+                    data: settingsIdentity?.harnessChoice,
                   })),
                 },
               ]
@@ -448,7 +456,9 @@ export function AgentMemberTrigger({
         testIdPrefix: "agent-member",
         disabled,
         "data-testid": "agent-member-trigger",
+        ...settingsIdentity?.trigger,
       }}
+      contentIdentity={settingsIdentity?.content}
       contentAlign="start"
       contentSide="bottom"
       contentClassName={isMobile && section !== null ? "w-[calc(100vw-1.5rem)]" : undefined}

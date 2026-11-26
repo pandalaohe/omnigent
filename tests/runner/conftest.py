@@ -217,6 +217,9 @@ def _clean_subagent_registry() -> Iterator[None]:
         {k: list(v) for k, v in subagent_work._peer_copies.items()},
         dict(subagent_work._peer_copy_dropped),
         {k: dict(v) for k, v in subagent_work._peer_copy_seen.items()},
+        dict(subagent_work._children_reporting_start),
+        dict(subagent_work._children_accepted_turns),
+        {k: set(v) for k, v in subagent_work._pending_child_acceptances.items()},
     )
     subagent_work._subagent_work_by_child.clear()
     subagent_work._subagent_work_by_parent.clear()
@@ -229,6 +232,9 @@ def _clean_subagent_registry() -> Iterator[None]:
     subagent_work._peer_copies.clear()
     subagent_work._peer_copy_dropped.clear()
     subagent_work._peer_copy_seen.clear()
+    subagent_work._children_reporting_start.clear()
+    subagent_work._children_accepted_turns.clear()
+    subagent_work._pending_child_acceptances.clear()
     try:
         yield
     finally:
@@ -256,6 +262,12 @@ def _clean_subagent_registry() -> Iterator[None]:
         subagent_work._peer_copy_dropped.update(saved[9])
         subagent_work._peer_copy_seen.clear()
         subagent_work._peer_copy_seen.update(saved[10])
+        subagent_work._children_reporting_start.clear()
+        subagent_work._children_reporting_start.update(saved[11])
+        subagent_work._children_accepted_turns.clear()
+        subagent_work._children_accepted_turns.update(saved[12])
+        subagent_work._pending_child_acceptances.clear()
+        subagent_work._pending_child_acceptances.update(saved[13])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

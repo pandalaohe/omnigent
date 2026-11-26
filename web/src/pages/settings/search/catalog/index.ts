@@ -3,29 +3,43 @@
 
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
+import { ACCOUNT_SETTINGS } from "./account";
+import { APPEARANCE_SETTINGS, HIDE_UNCONFIGURED_HARNESSES_ENTRY } from "./appearance";
+import { ARCHIVED_SETTINGS } from "./archived";
+import { CLI_SETTINGS } from "./cli";
+import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
+import { GENERAL_SETTINGS } from "./general";
+import { GIT_SETTINGS } from "./git";
+import { HARNESS_SETTINGS } from "./harnesses";
 import { IMPORT_SETTINGS } from "./import";
+import { INTEGRATION_SETTINGS } from "./integrations";
+import { MCP_SETTINGS } from "./mcp";
+import { MEMBERS_SETTINGS } from "./members";
+import { POLICIES_SETTINGS } from "./policies";
+import { SHARING_SETTINGS } from "./sharing";
 import type { SettingsEntry } from "./types";
+import { UPDATES_SETTINGS } from "./updates";
 
 export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
-  appearance: [],
-  agents: [],
-  general: [],
+  appearance: APPEARANCE_SETTINGS,
+  agents: [...HARNESS_SETTINGS, ...CUSTOM_AGENTS_SETTINGS, HIDE_UNCONFIGURED_HARNESSES_ENTRY],
+  general: GENERAL_SETTINGS,
   system: [],
-  git: [],
-  integrations: [],
-  mcp: [],
+  git: GIT_SETTINGS,
+  integrations: INTEGRATION_SETTINGS,
+  mcp: MCP_SETTINGS,
   shortcuts: [],
   import: IMPORT_SETTINGS,
   "api-keys": [],
-  account: [],
+  account: ACCOUNT_SETTINGS,
   admin: [],
-  members: [],
-  policies: [],
+  members: MEMBERS_SETTINGS,
+  policies: POLICIES_SETTINGS,
+  sharing: SHARING_SETTINGS,
+  archived: ARCHIVED_SETTINGS,
+  cli: CLI_SETTINGS,
+  updates: UPDATES_SETTINGS,
   instructions: [],
-  sharing: [],
-  archived: [],
-  cli: [],
-  updates: [],
   "model-providers": [],
   browser: [],
 };

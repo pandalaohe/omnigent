@@ -5094,3 +5094,49 @@ async def test_agy_unreachable_parent_has_bounded_summary_and_retries(
     else:
         assert summary["stop"] is True
         assert len(sends) == 1
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "outcome", ["unfinished", "idle", "completed", "failed", "cancelled", "waiting"]
+)
+@pytest.mark.asyncio
+async def test_relay_persists_recoverable_turn_and_terminal_fence(
+    db_uri: str, outcome: str, configured: bool, native: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server import session_live_state
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    recoverer = HostSessionRecoverer(
+        store, Mock(), Mock(), Mock(), Mock(), deployment_gate=lambda: False
+    )
+    monkeypatch.setattr(
+        session_live_state, "_host_session_recoverer", recoverer if configured else None
+    )
+    conv = store.create_conversation(
+        host_id="a" * 32,
+        runner_id="runner",
+        workspace="/workspace",
+        labels={"omnigent.wrapper": "codex-native-ui"} if native else None,
+    )
+    release = asyncio.Event()
+    release.set()
+    events = [{"type": "response.in_progress", "response": {"id": "turn"}}]
+    if outcome in {"idle", "waiting"}:
+        events.append({"type": "session.status", "status": outcome, "response_id": "turn"})
+    elif outcome != "unfinished":
+        events.append({"type": f"response.{outcome}", "response": {"id": "turn"}})
+    await _relay_runner_stream_once(
+        conv.id, _ScriptedRunnerClient(release, events), store, runner_id="runner"
+    )
+    state = store.get_session_recovery(conv.id)
+    if not configured or native:
+        assert state is None
+        return
+    assert state.response_id == "turn"
+    assert state.phase == ("active" if outcome in {"unfinished", "idle"} else "stopped")

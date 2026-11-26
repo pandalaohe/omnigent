@@ -333,6 +333,25 @@ export function presentMentions<T extends InlineMention>(
   return mentions.filter((m) => found.has(m.token));
 }
 
+/**
+ * The tags whose token still appears in ``texts``; a tag whose token was deleted
+ * drops out, so retyping that text later stays literal.
+ */
+export function presentTaggedMentions(
+  mentions: TaggedMentions | undefined,
+  texts: readonly string[],
+): TaggedMentions | undefined {
+  if (!mentions) return undefined;
+  const inline = composerInlineMentions(mentions.files, mentions.sessions, null);
+  const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
+  const fileCount = mentions.files.length;
+  const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
+  const sessions = mentions.sessions.filter((_, index) =>
+    present.has(inline[fileCount + index]!.token),
+  );
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
+}
+
 /** Replace each token in ``text`` with its marker, in place. */
 export function expandMentionTokens(text: string, mentions: readonly InlineMention[]): string {
   const markerFor = new Map(mentions.map((m) => [m.token, m.marker]));
@@ -349,7 +368,7 @@ export function expandMentionTokens(text: string, mentions: readonly InlineMenti
  */
 export function withSessionMentionHint(text: string, tagsSessions: boolean): string {
   if (!tagsSessions) return text;
-  return `${stripTrailingHint(text) ?? text.trimEnd()}\n\n${SESSION_MENTION_HINT}`;
+  return `${stripTrailingSessionMentionHint(text) ?? text.trimEnd()}\n\n${SESSION_MENTION_HINT}`;
 }
 
 /** A mention found in a sent message. */
@@ -371,7 +390,7 @@ const SENT_ATTACHED_RE = /\[Attached(?: file)?:([^\][]*)\]([ \t]*(?:\r?\n)*)/g;
 const SENT_HINT_PREFIX = "[Tagged sessions:";
 
 /** ``text`` without its trailing tool hint, or ``null`` when it has none. */
-function stripTrailingHint(text: string): string | null {
+export function stripTrailingSessionMentionHint(text: string): string | null {
   // The hint is only ever appended at the very end; elsewhere it is user text.
   const end = text.trimEnd();
   const start = end.lastIndexOf(SENT_HINT_PREFIX);
@@ -390,7 +409,7 @@ export function replaceSentMentions(
 ): string {
   // The composer always ends a message that tags a session with the hint, so a
   // session marker in a message without it is text the user typed, not a tag.
-  const withoutHint = stripTrailingHint(text);
+  const withoutHint = stripTrailingSessionMentionHint(text);
   const withSessions =
     withoutHint === null
       ? text
@@ -418,7 +437,7 @@ export function recallSessionMentions(
   main: string,
   others: readonly string[] = [],
 ): { main: string; others: string[]; sessions: SessionMention[] } {
-  const withoutHint = stripTrailingHint(main);
+  const withoutHint = stripTrailingSessionMentionHint(main);
   if (withoutHint === null) return { main, others: [...others], sessions: [] };
   const sessions: SessionMention[] = [];
   const toToken = (_m: string, title: string, id: string, sub: string) => {

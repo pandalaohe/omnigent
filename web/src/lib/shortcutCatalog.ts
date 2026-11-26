@@ -1,347 +1,189 @@
-// Shared catalog for the live configurable keyboard shortcut reference.
-
+// Apply configurable Omnigent bindings to the shared shortcut page.
 import {
   composerNewLineAlternateKeys,
-  ADDRESS_BAR_KEYS,
-  ARCHIVE_SESSION_KEYS,
-  CLOSE_KEYS,
-  CLOSE_WINDOW_KEYS,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
-  ESC_KEY,
-  MOD_KEY,
-  ALT_KEY,
-  FORK_SESSION_KEYS,
-  shortcutKeys,
   newSessionShortcutKeys,
-  NEXT_TAB_KEYS,
-  PIN_SESSION_KEYS,
-  PREVIOUS_TAB_KEYS,
-  QUIT_KEYS,
-  RELOAD_KEYS,
-  REOPEN_TAB_KEYS,
   settingsShortcutKeys,
+  shortcutKeys,
 } from "@/components/KeyboardShortcut";
 import {
-  currentShortcutPlatform,
+  hasCustomShortcutBindings,
   isShortcutActionEnabled,
   resolveShortcutBindings,
   shortcutBindingLabels,
   type ShortcutActionId,
 } from "@/lib/keyboardShortcutPreferences";
-/** What the current runtime supports, which decides the rows that apply. */
-export interface ShortcutCatalogContext {
-  /** A native shell, where chords a browser reserves (⌘-digit, ⌘B) are free. */
-  native: boolean;
-  electron: boolean;
-  /** The shell hosts browser tabs in the workspace rail. */
-  browser: boolean;
-  /** The composer sends on ⌘/Ctrl+Enter instead of Enter. */
-  submitWithModEnter: boolean;
-  /** Touch or narrow layout, where Enter inserts a newline instead of sending. */
-  preventsKeyboardSubmit: boolean;
-  // Server features that add rows.
-  contentSearch: boolean;
-  grids: boolean;
-  splitTerminal: boolean;
-  siblingSessions: boolean;
-  /** The shell's menus hand desktop commands (Close, Pin, Quit) to the page. */
-  desktopCommands: boolean;
+import {
+  shortcutPageGroups,
+  type ShortcutPageContext,
+  type ShortcutPageGroup,
+  type ShortcutPageRow,
+} from "@/lib/shortcuts/shortcutPage";
+
+export type ShortcutCatalogContext = ShortcutPageContext;
+type ShortcutRow = ShortcutPageRow & { lastKeySeparator?: string };
+type ShortcutGroup = Omit<ShortcutPageGroup, "items"> & { items: ShortcutRow[] };
+
+const configurableActions: Partial<Record<string, ShortcutActionId>> = {
+  "Open command palette": "commandPalette",
+  "Find a session by name": "findSession",
+  "Show keyboard shortcuts": "showShortcuts",
+  "Rename current session": "renameSession",
+  "Recall previous prompt": "recallPreviousPrompt",
+  "Recall next prompt": "recallNextPrompt",
+  "Accept approval prompt": "approvePrompt",
+  "Open model picker": "openModelPicker",
+  "Focus chat input": "focusComposer",
+  "Toggle voice dictation": "voiceDictation",
+  "Stop response": "stopResponse",
+  "Cycle model": "cycleModel",
+  "Cycle reasoning effort": "cycleEffort",
+  "Cycle permission mode (in session)": "cyclePermissionMode",
+  "Switch recent sessions": "recentSessions",
+  "Toggle Chat / Terminal view": "toggleViewMode",
+  "Toggle conversations sidebar": "toggleConversationsSidebar",
+  "Toggle workspace sidebar": "toggleWorkspaceSidebar",
+  "Search workspace contents": "searchWorkspaceContents",
+  "Open a new browser tab": "newBrowserTab",
+  "Open a new shell": "newShell",
+  "Focus previous pane": "previousPane",
+  "Focus next pane": "nextPane",
+  "Split terminal right": "splitTerminalColumns",
+  "Split terminal down": "splitTerminalRows",
+  "Apply highlighted command": "applySuggestion",
+  "Dismiss menu": "dismissSuggestions",
+};
+
+function configurableRow(row: ShortcutPageRow, context: ShortcutCatalogContext): ShortcutRow[] {
+  const { label } = row;
+  switch (label) {
+    case "Start a new session":
+      return [
+        {
+          ...row,
+          keys:
+            !isShortcutActionEnabled("newSession") || hasCustomShortcutBindings("newSession")
+              ? shortcutKeys("newSession")
+              : newSessionShortcutKeys(context.native),
+        },
+      ];
+    case "Open Settings":
+      return [
+        {
+          ...row,
+          keys:
+            !isShortcutActionEnabled("openSettings") || hasCustomShortcutBindings("openSettings")
+              ? shortcutKeys("openSettings")
+              : settingsShortcutKeys(context.desktopCommands),
+        },
+      ];
+    case "Send message":
+      return [{ ...row, keys: composerSendShortcutKeys(context.submitWithModEnter) }];
+    case "Send now, with all queued messages":
+      return [{ ...row, keys: composerSteerAllShortcutKeys(context.submitWithModEnter) }];
+    case "New line in message":
+      return [
+        {
+          ...row,
+          keys: composerNewLineShortcutKeys(context.submitWithModEnter),
+          alternateKeys: composerNewLineAlternateKeys(context.submitWithModEnter),
+        },
+      ];
+    // These keys are listed in the Question cards group with their real scope.
+    case "Next question, or submit all answers":
+    case "Pick a question option by number":
+    case "Cancel pending question":
+      return [];
+    case "Jump to a sidebar session (1–10)":
+      return [
+        {
+          label: "Jump to pinned session (1–10)",
+          keys: isShortcutActionEnabled("pinnedSession")
+            ? resolveShortcutBindings("pinnedSession", undefined, {
+                nativeShell: context.native,
+              }).flatMap((binding) => shortcutBindingLabels(binding))
+            : [],
+        },
+      ];
+    case "Go back":
+    case "Go forward": {
+      // Session stepping claims these chords when it uses the same binding.
+      const sessionAction = label === "Go back" ? "previousSession" : "nextSession";
+      return row.keys.join("+") === shortcutKeys(sessionAction).join("+") ? [] : [row];
+    }
+    case "Select a workspace tab":
+      return [
+        {
+          ...row,
+          keys: [...shortcutKeys("toggleWorkspaceSidebar"), context.contentSearch ? "1…5" : "1…4"],
+          lastKeySeparator: "+",
+        },
+      ];
+    case "Navigate suggestions":
+      return [
+        {
+          ...row,
+          keys: [...shortcutKeys("previousSuggestion"), ...shortcutKeys("nextSuggestion")],
+        },
+      ];
+    default: {
+      const action = configurableActions[label];
+      return [
+        {
+          ...row,
+          label: label === "Toggle workspace sidebar" ? "Focus or close workspace sidebar" : label,
+          keys: action ? shortcutKeys(action) : row.keys,
+        },
+      ];
+    }
+  }
 }
 
-// Same glyph constants the control tooltips use, so the dialog and tooltips match.
-
-export interface Shortcut {
-  label: string;
-  /** Keys rendered left→right as chips. A chord (held together) or, for the
-   *  arrow-pairs, the two interchangeable keys for that action. */
-  keys: string[];
-  lastKeySeparator?: string;
-  /** When set, keys come from the live shortcut layer instead of `keys`. */
-  actionId?: ShortcutActionId;
-  /** Another chord for the same action, shown after "or". */
-  alternateKeys?: string[];
-  /** Hidden on touch and narrow layouts, where Enter inserts a newline instead of submitting. */
-  desktopOnly?: boolean;
-}
-
-export interface ShortcutGroup {
-  title: string;
-  /** Optional qualifier shown next to the group title. */
-  note?: string;
-  items: Shortcut[];
-}
-
-// ONLY shortcuts that exist today (see file header). Keep in sync with the
-// composer's `handleKeyDown` and the global hotkey hooks.
-const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    title: "General",
-    items: [
-      { label: "Open command palette", keys: [], actionId: "commandPalette" },
-      { label: "Find a session by name", keys: [], actionId: "findSession" },
-      { label: "Open Settings", keys: [], actionId: "openSettings" },
-      { label: "Show keyboard shortcuts", keys: [], actionId: "showShortcuts" },
-      { label: "Rename current session", keys: [], actionId: "renameSession" },
-    ],
-  },
-  {
-    title: "In chats",
-    items: [
-      { label: "Recall previous prompt", keys: [], actionId: "recallPreviousPrompt" },
-      { label: "Recall next prompt", keys: [], actionId: "recallNextPrompt" },
-      { label: "Accept approval prompt", keys: [], actionId: "approvePrompt" },
-      { label: "Open model picker", keys: [], actionId: "openModelPicker" },
-      { label: "Focus chat input", keys: [], actionId: "focusComposer" },
-      { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
-      { label: "Stop response", keys: [], actionId: "stopResponse" },
-      { label: "Cycle model", keys: [], actionId: "cycleModel" },
-      { label: "Cycle reasoning effort", keys: [], actionId: "cycleEffort" },
-      { label: "Cycle permission mode (in session)", keys: [], actionId: "cyclePermissionMode" },
-      { label: "Decline approval prompt", keys: [ESC_KEY] },
-    ],
-  },
-  {
-    title: "Navigation",
-    items: [
-      { label: "Previous session", keys: [], actionId: "previousSession" },
-      { label: "Next session", keys: [], actionId: "nextSession" },
-    ],
-  },
-  {
-    title: "View",
-    items: [
-      { label: "Toggle Chat / Terminal view", keys: [], actionId: "toggleViewMode" },
-      { label: "Toggle conversations sidebar", keys: [], actionId: "toggleConversationsSidebar" },
-      { label: "Focus or close workspace sidebar", keys: [], actionId: "toggleWorkspaceSidebar" },
-      { label: "Toggle annotation mode", keys: [], actionId: "toggleAnnotationMode" },
-      { label: "Search workspace contents", keys: [], actionId: "searchWorkspaceContents" },
-      {
-        label: "Select a workspace tab",
-        keys: [],
-        lastKeySeparator: "+",
-      },
-      { label: "Open a new browser tab", keys: [], actionId: "newBrowserTab" },
-      { label: "Open a new shell", keys: [], actionId: "newShell" },
-    ],
-  },
-  {
-    title: "Panes",
-    note: "in grids and split terminals",
-    items: [
-      { label: "Focus previous pane", keys: [], actionId: "previousPane" },
-      { label: "Focus next pane", keys: [], actionId: "nextPane" },
-    ],
-  },
-  {
-    title: "Slash commands",
-    note: "while the suggestions menu is open",
-    items: [
-      { label: "Navigate suggestions", keys: [] },
-      { label: "Apply highlighted command", keys: [], actionId: "applySuggestion" },
-      { label: "Dismiss menu", keys: [], actionId: "dismissSuggestions" },
-    ],
-  },
-  {
+export function shortcutGroupsFor(context: ShortcutCatalogContext): ShortcutGroup[] {
+  const groups: ShortcutGroup[] = shortcutPageGroups(context).map((group) => {
+    const items = group.items.flatMap((row) => configurableRow(row, context));
+    if (group.title === "Navigation") {
+      items.splice(
+        items.findIndex((row) => row.label === "Jump to pinned session (1–10)"),
+        0,
+        { label: "Previous session", keys: shortcutKeys("previousSession") },
+        { label: "Next session", keys: shortcutKeys("nextSession") },
+      );
+    }
+    if (group.title === "View") {
+      items.push({ label: "Toggle annotation mode", keys: shortcutKeys("toggleAnnotationMode") });
+    }
+    return { ...group, items };
+  });
+  groups.push({
     title: "Question cards",
     note: "while a question card has focus",
     items: [
-      { label: "Focus question card", keys: [], actionId: "focusQuestionCard" },
-      { label: "Move between options", keys: [] },
-      { label: "Select option", keys: [], actionId: "questionCardSelectOption" },
-      { label: "Next question / submit", keys: [], actionId: "questionCardNextOrSubmit" },
-      { label: "Previous / next question", keys: [] },
-      { label: "Leave card", keys: [], actionId: "questionCardLeave" },
-      { label: "Cancel question", keys: [], actionId: "questionCardCancel" },
-      { label: "Cancel & interrupt", keys: [], actionId: "questionCardCancelAndInterrupt" },
+      { label: "Focus question card", keys: shortcutKeys("focusQuestionCard") },
+      {
+        label: "Move between options",
+        keys: [
+          ...shortcutKeys("questionCardPreviousOption"),
+          ...shortcutKeys("questionCardNextOption"),
+        ],
+      },
+      { label: "Select option", keys: shortcutKeys("questionCardSelectOption") },
+      { label: "Next question / submit", keys: shortcutKeys("questionCardNextOrSubmit") },
+      {
+        label: "Previous / next question",
+        keys: [
+          ...shortcutKeys("questionCardPreviousQuestion"),
+          ...shortcutKeys("questionCardNextQuestion"),
+        ],
+      },
+      { label: "Leave card", keys: shortcutKeys("questionCardLeave") },
+      { label: "Cancel question", keys: shortcutKeys("questionCardCancel") },
+      { label: "Cancel & interrupt", keys: shortcutKeys("questionCardCancelAndInterrupt") },
     ],
-  },
-];
-
-// Desktop menu commands (File → Close, Session → Pin/Archive, Quit), present
-// only when the shell hands them to the page.
-const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
-  { label: "Close tab, or leave the session", keys: [...CLOSE_KEYS] },
-  { label: "Close window", keys: [...CLOSE_WINDOW_KEYS] },
-  { label: "Pin or unpin current session", keys: [...PIN_SESSION_KEYS] },
-  { label: "Archive current session", keys: [...ARCHIVE_SESSION_KEYS] },
-  { label: "Fork current session", keys: [...FORK_SESSION_KEYS] },
-  { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
-];
-
-// Desktop menu chords for the workspace rail's tabs.
-const DESKTOP_TAB_SHORTCUTS: Shortcut[] = [
-  { label: "Show the previous workspace tab", keys: [...PREVIOUS_TAB_KEYS] },
-  { label: "Show the next workspace tab", keys: [...NEXT_TAB_KEYS] },
-  { label: "Reopen the last closed tab", keys: [...REOPEN_TAB_KEYS] },
-];
-
-// Desktop menu chords that act on the browser tab in the workspace rail.
-const DESKTOP_BROWSER_SHORTCUTS: Shortcut[] = [
-  { label: "Reload the browser tab", keys: [...RELOAD_KEYS] },
-  { label: "Focus the browser address bar", keys: [...ADDRESS_BAR_KEYS] },
-];
-
-// Numbered sidebar-session jump. The chord is platform-aware (see
-// useSessionNumberHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
-// Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
-// native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
-  if (!isShortcutActionEnabled("pinnedSession")) {
-    return { label: "Jump to pinned session (1–10)", keys: [] };
-  }
-  const bindings = resolveShortcutBindings("pinnedSession", currentShortcutPlatform(), {
-    nativeShell: native,
   });
-  return {
-    label: "Jump to pinned session (1–10)",
-    keys: bindings.flatMap((binding) => shortcutBindingLabels(binding)),
-  };
-}
-
-/** Shortcut groups for the current runtime and composer preference. */
-export function shortcutGroupsFor({
-  native,
-  electron,
-  browser,
-  submitWithModEnter,
-  preventsKeyboardSubmit,
-  contentSearch,
-  grids,
-  splitTerminal,
-  desktopCommands,
-  siblingSessions,
-}: ShortcutCatalogContext): ShortcutGroup[] {
-  const groups = SHORTCUT_GROUPS.map((group) => {
-    if (group.title === "General") {
-      return {
-        ...group,
-        items: [
-          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
-          ...(siblingSessions
-            ? [{ label: "Add nested agent", keys: [MOD_KEY, ALT_KEY, "A"] }]
-            : []),
-          // The desktop menu's Settings item owns ⌘, there.
-          ...group.items.map((item) =>
-            item.label === "Open Settings"
-              ? { ...item, keys: settingsShortcutKeys(desktopCommands) }
-              : item,
-          ),
-          ...(desktopCommands ? DESKTOP_COMMAND_SHORTCUTS : []),
-        ],
-      };
-    }
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
-      return {
-        ...group,
-        items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
-          {
-            label: "Send now, with all queued messages",
-            keys: composerSteerAllShortcutKeys(submitWithModEnter),
-          },
-          {
-            label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
-            alternateKeys: composerNewLineAlternateKeys(submitWithModEnter),
-          },
-          ...group.items,
-        ],
-      };
-    }
-    if (group.title === "Navigation") {
-      return {
-        ...group,
-        items: [
-          ...(electron
-            ? [{ label: "Switch recent sessions", keys: [], actionId: "recentSessions" as const }]
-            : []),
-          ...group.items,
-          pinnedSessionShortcut(native),
-        ],
-      };
-    }
-    if (group.title === "Slash commands") {
-      return {
-        ...group,
-        items: group.items.map((item) =>
-          item.label === "Navigate suggestions"
-            ? {
-                ...item,
-                keys: [...shortcutKeys("previousSuggestion"), ...shortcutKeys("nextSuggestion")],
-              }
-            : item,
-        ),
-      };
-    }
-    if (group.title === "Question cards") {
-      return {
-        ...group,
-        items: group.items.map((item) =>
-          item.label === "Move between options"
-            ? {
-                ...item,
-                keys: [
-                  ...shortcutKeys("questionCardPreviousOption"),
-                  ...shortcutKeys("questionCardNextOption"),
-                ],
-              }
-            : item.label === "Previous / next question"
-              ? {
-                  ...item,
-                  keys: [
-                    ...shortcutKeys("questionCardPreviousQuestion"),
-                    ...shortcutKeys("questionCardNextQuestion"),
-                  ],
-                }
-              : item,
-        ),
-      };
-    }
-    if (group.title === "View") {
-      return {
-        ...group,
-        items: group.items
-          .filter(
-            (item) =>
-              // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
-              ((browser && desktopCommands) || item.label !== "Open a new browser tab") &&
-              (contentSearch || item.label !== "Search workspace contents"),
-          )
-          .map((item) =>
-            item.label === "Select a workspace tab"
-              ? {
-                  ...item,
-                  keys: [...shortcutKeys("toggleWorkspaceSidebar"), contentSearch ? "1…5" : "1…4"],
-                }
-              : item,
-          )
-          .concat(
-            desktopCommands ? DESKTOP_TAB_SHORTCUTS : [],
-            desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : [],
-          ),
-      };
-    }
-    if (group.title === "Panes") {
-      return {
-        ...group,
-        items: [
-          ...(grids || splitTerminal ? group.items : []),
-          ...(splitTerminal
-            ? [
-                {
-                  label: "Split terminal right",
-                  keys: [],
-                  actionId: "splitTerminalColumns" as const,
-                },
-                { label: "Split terminal down", keys: [], actionId: "splitTerminalRows" as const },
-              ]
-            : []),
-        ],
-      };
-    }
-    return group;
-  });
-  return groups.filter((group) => group.items.length > 0);
+  return groups
+    .map((group) => ({ ...group, items: group.items.filter((row) => row.keys.length > 0) }))
+    .filter((group) => group.items.length > 0);
 }

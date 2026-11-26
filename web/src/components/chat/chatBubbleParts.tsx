@@ -1164,7 +1164,7 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
       : isMobile
         ? // Hidden actions take no room on phones; a tap on the message reveals them.
           "hidden"
-        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
   };
 }
 
@@ -1510,7 +1510,7 @@ function UserBubble({
               <MessageAction
                 tooltip={isLinkCopied ? "Copied!" : "Copy link"}
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
+                className="max-md:size-8"
                 data-testid="copy-message-link"
                 disabled={bubble.pending}
                 onClick={handleCopyLink}
@@ -1521,7 +1521,7 @@ function UserBubble({
                 <MessageAction
                   tooltip="Edit and resend"
                   size="icon-xxs"
-                  className="[@media(pointer:coarse)]:size-8"
+                  className="max-md:size-8"
                   onClick={() =>
                     editSentMessage({
                       text: isShellCommand ? text : userMessageBody(bubble.content),
@@ -1763,7 +1763,7 @@ function AssistantBubble({
                   <MessageAction
                     tooltip="Copy"
                     size="icon-xxs"
-                    className="[@media(pointer:coarse)]:size-8"
+                    className="max-md:size-8"
                     onClick={handleCopy}
                     componentId="chat.message.copy_assistant"
                   >

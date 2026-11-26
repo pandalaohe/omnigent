@@ -76,6 +76,7 @@ import {
 } from "@/lib/codexApprovalMode";
 import { parseSseStream } from "@/lib/sse";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
+import { MOBILE_BREAKPOINT_PX } from "@/hooks/useIsMobileViewport";
 import { TerminalFirstContextProvider } from "@/shell/TerminalFirstContext";
 
 vi.mock("@/lib/voiceInputApi", async (original) => {
@@ -395,10 +396,10 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
-function forceDesktopCoarsePointer(): () => void {
+function forceMobileViewport(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: query.includes("pointer: coarse"),
+    matches: query.includes("max-width"),
     media: query,
     onchange: null,
     addListener: () => {},
@@ -624,11 +625,12 @@ describe("Composer Escape interrupt", () => {
     "drops the Esc hint from the queued placeholder on phones (mobile=%s)",
     (mobile) => {
       if (mobile) {
-        const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+        const mobileQuery = `(max-width: ${MOBILE_BREAKPOINT_PX - 0.02}px)`;
+        const mediaQuery = window.matchMedia(mobileQuery);
         const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
           ...mediaQuery,
           media: query,
-          matches: query === "(max-width: 767.98px)",
+          matches: query === mobileQuery,
         }));
         onTestFinished(() => matchMedia.mockRestore());
       }
@@ -650,6 +652,35 @@ describe("Composer Escape interrupt", () => {
     expect(activeRow()).toBeNull();
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes slash-command output before interrupting", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText(/\/help — Show available slash commands/)).toBeVisible();
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes slash-command output on Escape with focus outside the composer", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    // Page-wide Escape shortcuts (approval decline, question reject) defer to escape owners.
+    const help = screen.getByText(/\/help — Show available slash commands/);
+    expect(help.closest("[data-escape-owner]")).not.toBeNull();
+
+    textarea().blur();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
   });
 
   it("leaves Escape to active IME composition", () => {
@@ -1015,11 +1046,11 @@ describe("Composer growth layout", () => {
   });
 
   it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     let height = 48;
     const getRect = HTMLElement.prototype.getBoundingClientRect;
@@ -1229,8 +1260,8 @@ describe("Composer send shortcut", () => {
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
-  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
-    const restorePointer = forceDesktopCoarsePointer();
+  it("keeps Enter native and hides its hint in the mobile layout", () => {
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       render(<Composer {...composerProps({ onSend })} />);
@@ -1242,15 +1273,14 @@ describe("Composer send shortcut", () => {
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
       expect(screen.queryByRole("tooltip")).toBeNull();
     } finally {
-      restorePointer();
+      restoreViewport();
     }
   });
 
-  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
-    // Touch keyboards own the send action (the on-screen button), so Enter on
-    // a coarse pointer must stay a plain newline — same rule the landing
-    // composer follows on a phone viewport.
-    const restorePointer = forceDesktopCoarsePointer();
+  it("leaves plain Enter as a newline in the mobile layout, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter in
+    // the mobile layout must stay a plain newline, as in the landing composer.
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       const user = userEvent.setup();
@@ -1259,7 +1289,7 @@ describe("Composer send shortcut", () => {
       expect(textarea().value).toBe("first\nsecond");
       expect(onSend).not.toHaveBeenCalled();
     } finally {
-      restorePointer();
+      restoreViewport();
     }
   });
 
@@ -5004,11 +5034,11 @@ describe("Composer background tasks", () => {
   it.each([false, true])(
     "keeps a running monitor reachable after foreground work ends (mobile=%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
       const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
+        matches: mobile && query === "(max-width: 1180.98px)",
       }));
       onTestFinished(() => matchMedia.mockRestore());
       useChatStore.setState({
@@ -8232,7 +8262,106 @@ describe("Composer side-chat entry points", () => {
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    setOmnigentHostConfig({});
     vi.restoreAllMocks();
+  });
+
+  it.each(["success", "failure"])(
+    "ignores repeated /side submissions until creation settles (%s)",
+    async (outcome) => {
+      const analytics = vi.fn();
+      setOmnigentHostConfig({ analytics });
+      let finishCreation!: () => void;
+      const creation = new Promise<{ childSessionId: string }>((resolve, reject) => {
+        finishCreation = () => {
+          if (outcome === "success") resolve({ childSessionId: "conv_side" });
+          else reject(new Error("offline"));
+        };
+      });
+      const createSideChat = vi
+        .spyOn(sessionsApi, "createSideChat")
+        .mockReturnValueOnce(creation)
+        .mockResolvedValue({ childSessionId: "conv_next" });
+      const error = vi.spyOn(toast, "error");
+      renderWithTooltips(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "/side question" } });
+
+      act(() => {
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      });
+
+      expect(createSideChat).toHaveBeenCalledExactlyOnceWith("conv_test");
+      expect(
+        analytics.mock.calls.filter(([event]) => event.componentId === "chat.composer.send"),
+      ).toHaveLength(1);
+      expect(textarea()).toHaveValue("/side question");
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      await act(async () => finishCreation());
+
+      if (outcome === "success") {
+        expect(textarea()).toHaveValue("");
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_side",
+          parentId: "conv_test",
+        });
+        fireEvent.change(textarea(), { target: { value: "/side another question" } });
+      } else {
+        expect(textarea()).toHaveValue("/side question");
+        expect(useChatStore.getState().sideChatToOpen).toBeNull();
+        expect(error).toHaveBeenCalledWith("Couldn't start a side chat for this session.");
+      }
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await waitFor(() =>
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_next",
+          parentId: "conv_test",
+        }),
+      );
+      expect(createSideChat).toHaveBeenCalledTimes(2);
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("keeps pending /side creations independent across conversation switches", async () => {
+    clearSessionDrafts();
+    const finishCreation = new Map<string, () => void>();
+    const createSideChat = vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+      (sourceId) =>
+        new Promise((resolve) => {
+          finishCreation.set(sourceId, () => resolve({ childSessionId: `side_${sourceId}` }));
+        }),
+    );
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/side first question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    fireEvent.change(textarea(), { target: { value: "/side second question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat.mock.calls.map(([sourceId]) => sourceId)).toEqual([
+      "conv_test",
+      "conv_other",
+    ]);
+
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(textarea()).toHaveValue("/side first question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_test")!());
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveValue("/side second question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_other")!());
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().sideChatToOpen).toEqual({
+      childId: "side_conv_other",
+      parentId: "conv_other",
+    });
   });
 
   // An admin has owner level, but only the root session's owner starts side chats.

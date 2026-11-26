@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import TypeAdapter, ValidationError
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
@@ -96,6 +97,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.harnesses.codex_native.side_chat import side_chat_text_from_content
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.member_snapshot import (
     member_entries_from_labels,
@@ -264,12 +266,15 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _succeeded_parents,
     _truncate_child_preview,
+    arm_subagent_child_start_timeout,
     entry_owes_parent_wake,
     get_subagent_work,
     latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_start_reported,
+    note_subagent_child_turn_settled,
     register_child_session,
     unregister_child_session,
     unregister_subagent_work_for_session,
@@ -2481,6 +2486,7 @@ def create_runner_app(
     # Dropping the server's forward of an item a replay turn already started is
     # what keeps one posted message from running twice.
     _replay_started_item_ids: dict[str, str] = {}
+    _recovery_blocked_sessions: set[str] = set()
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -5675,6 +5681,9 @@ def create_runner_app(
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
         recovery_usage_admission = None
+        needs_recovery_admission = bool(
+            init_context.envelope is not None and init_context.envelope.require_recovery_admission
+        )
 
         async def admit_recovery_turn() -> bool:
             nonlocal recovery_usage_admission
@@ -5703,6 +5712,7 @@ def create_runner_app(
             # Revalidate before either recovery branch binds a turn slot.
             current = (
                 not initially_active
+                and (not needs_recovery_admission or session_id not in _recovery_blocked_sessions)
                 and session_id not in _active_turns
                 and _turn_bind_epoch.get(session_id) == initial_turn_epoch
                 and _ingest_next_seq.get(session_id, 0) == _ingest_now_serving.get(session_id, 0)
@@ -5747,12 +5757,16 @@ def create_runner_app(
         forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
             session_id, 0
         )
-        execution_seen = (
-            initially_active
-            or forward_in_flight
-            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
-            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
-        )
+
+        def execution_observed() -> bool:
+            return (
+                initially_active
+                or _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(session_id, 0)
+                or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+                or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+            )
+
+        execution_seen = execution_observed()
         recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
@@ -5812,13 +5826,31 @@ def create_runner_app(
                     if _replay_item_id is not None:
                         _replay_started_item_ids[session_id] = _replay_item_id
 
+        recovery_prompt = (
+            init_context.envelope.recovery_prompt if init_context.envelope is not None else None
+        )
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
+            admitted = True
+            if needs_recovery_admission:
+                admission = await server_client.post(
+                    f"/v1/sessions/{session_id}/recovery/admit",
+                    params={"recovery_id": recovery_id},
+                    timeout=10.0,
+                )
+                admission.raise_for_status()
+                admitted = admission.json().get("admitted") is True
+                execution_seen = execution_observed()
+                forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
+                    session_id, 0
+                )
             # Active execution, including a newer message, takes precedence over
             # automatic continuation. Initialization alone cannot consume it.
             if (
-                not execution_seen
+                admitted
+                and not execution_seen
+                and (session_id not in _recovery_blocked_sessions or not needs_recovery_admission)
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
                 and not _trailing_nonreplayable_item(raw_history, harness_name)
@@ -5840,17 +5872,25 @@ def create_runner_app(
                         {
                             "type": "input_text",
                             "text": (
-                                "Your runner was interrupted while this task was active. "
+                                recovery_prompt
+                                or "Your runner was interrupted while this task was active. "
                                 "Continue the existing task from its current state. "
                                 "Check any interrupted operation's outcome before repeating it."
                             ),
                         }
                     ],
                 }
+                if recovery_prompt is not None:
+                    recovery_body["stable_id"] = recovery_id
                 if not is_native_harness(harness_name):
-                    _session_histories.setdefault(session_id, []).append(
-                        {"type": "message", "role": "user", "content": recovery_body["content"]}
-                    )
+                    recovery_item: _JsonObject = {
+                        "type": "message",
+                        "role": "user",
+                        "content": recovery_body["content"],
+                    }
+                    if recovery_prompt is not None:
+                        recovery_item["is_meta"] = True
+                    _session_histories.setdefault(session_id, []).append(recovery_item)
                 _begin_turn_slot(session_id, recovery_body)
                 recovery_task = asyncio.create_task(
                     _run_turn_bg(
@@ -5909,6 +5949,7 @@ def create_runner_app(
                 "id": session_id,
                 "agent_id": agent_id,
                 "status": status,
+                "recovery_turn": recovery_turn,
                 "created_at": int(_session_start_cache[session_id]),
                 "title": None,
                 "labels": {},
@@ -6388,6 +6429,7 @@ def create_runner_app(
         _turn_identities.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
         _replay_started_item_ids.pop(session_id, None)
+        _recovery_blocked_sessions.discard(session_id)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
@@ -8120,6 +8162,8 @@ def create_runner_app(
         cancelled: bool = False,
         input_identity: Mapping[str, object] | None = None,
         admission_refused: bool = False,
+        native_acceptance: NativeTurnAcceptance | None = None,
+        acceptance_request: _subagent_work._ChildAcceptanceRequest | None = None,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -8295,6 +8339,11 @@ def create_runner_app(
             # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
+            if _session_harness_name(conv_id) == _CODEX_NATIVE_HARNESS:
+                # Codex reports every turn start it begins; bound a child that never does.
+                arm_subagent_child_start_timeout(
+                    conv_id, acceptance=native_acceptance, request=acceptance_request
+                )
         # A joint-agent lead's turn end: nudge once for roles the user named
         # that never ran, and notice them if a later turn still finds them unmet.
         # A native lead's turn end is its idle edge (handled on the
@@ -11632,6 +11681,7 @@ def create_runner_app(
                 with contextlib.suppress(ValueError):
                     startup_ref = StartupAttemptRef.model_validate(body["startup_attempt"])
             turn_input_identity = _input_identity(body)
+            _native_acceptance: NativeTurnAcceptance | None = None
 
             def _owns_live_turn() -> bool:
                 return _turn_bind_epoch.get(conv_id, 0) == stream_turn_epoch and (
@@ -11871,9 +11921,16 @@ def create_runner_app(
                     cancelled=cancelled,
                     input_identity=turn_input_identity,
                     admission_refused=admission_refused,
+                    native_acceptance=_native_acceptance,
+                    acceptance_request=acceptance_request,
                 )
                 return lifecycle_event
 
+            acceptance_request = (
+                _subagent_work.begin_subagent_child_acceptance(conv_id)
+                if _session_harness_name(conv_id) == _CODEX_NATIVE_HARNESS
+                else None
+            )
             try:
                 if not _owns_live_turn():
                     return
@@ -12048,10 +12105,16 @@ def create_runner_app(
 
                             _defer_publish = False
                             if event is not None:
+                                has_native_acceptance = "native_acceptance" in event
+                                raw_native_acceptance = event.pop("native_acceptance", None)
+                                if has_native_acceptance and data_index is not None:
+                                    frame_lines[data_index] = f"data: {_json.dumps(event)}"
+                                    raw_sse_bytes = ("\n".join(frame_lines) + "\n\n").encode()
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
                                     _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
+                                    _native_acceptance = None
                                     _terminal_response_type = None
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
@@ -12124,6 +12187,7 @@ def create_runner_app(
                                     "response.failed",
                                     "response.cancelled",
                                 }:
+                                    _native_acceptance = None
                                     terminal_response = event.get("response")
                                     _terminal_response_type = (
                                         _evt_type
@@ -12135,6 +12199,13 @@ def create_runner_app(
                                         == _evt_type.split(".")[1]
                                         else None
                                     )
+                                    if _terminal_response_type == "response.completed":
+                                        try:
+                                            _native_acceptance = TypeAdapter(
+                                                NativeTurnAcceptance
+                                            ).validate_python(raw_native_acceptance)
+                                        except ValidationError:
+                                            _native_acceptance = None
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -12727,6 +12798,8 @@ def create_runner_app(
                 raise
 
             finally:
+                if acceptance_request is not None:
+                    _subagent_work.finish_subagent_child_acceptance(acceptance_request)
                 if _response_id is not None:
                     # Every end of this turn drops its refusal markers, terminal or not.
                     _refused_turn_inputs.difference_update(
@@ -13605,6 +13678,8 @@ def create_runner_app(
             # Fork mod: read before the cancel pops it; the Claude idle guard
             # must not treat a pane parked on a question as an idle composer.
             _prompt_pending = conversation_id in _claude_prompt_waiters
+            # Stop fences even recovery initialization that has not arrived yet.
+            _recovery_blocked_sessions.add(conversation_id)
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
@@ -13741,6 +13816,20 @@ def create_runner_app(
                 # them here too: GET/rebind serve them without emitting a second
                 # completion edge, and the idle watchdog reads them for native turns.
                 _record_native_pane_status(conversation_id, status)
+                if status in ("running", "waiting"):
+                    note_subagent_child_start_reported(
+                        conversation_id,
+                        response_id=data.get("response_id")
+                        if isinstance(data, dict) and isinstance(data.get("response_id"), str)
+                        else None,
+                    )
+                elif status in ("idle", "failed"):
+                    note_subagent_child_turn_settled(
+                        conversation_id,
+                        response_id=data.get("response_id")
+                        if isinstance(data, dict) and isinstance(data.get("response_id"), str)
+                        else None,
+                    )
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
                 )
@@ -14017,6 +14106,7 @@ def create_runner_app(
         if body_type == "stop_session":
             if startup_admission.required(conversation_id):
                 startup_admission.register(conversation_id, None)
+            _recovery_blocked_sessions.add(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)

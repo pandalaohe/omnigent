@@ -101,6 +101,7 @@ import {
   triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   type TriggerConfig,
   type TriggerFields,
@@ -173,6 +174,8 @@ import type { Session } from "@/lib/types";
 
 const PROVIDER_DEFAULT = "provider-default";
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
+const AUTOMATION_COST_LIMIT_HELP =
+  "Each run gets a fresh budget, including when continuing an existing session: its recorded spend at the start of the run plus this amount. Reaching that threshold blocks further model requests and tool calls, but an in-progress response can overshoot it. Leave blank for no automation cost limit. Changes apply to future runs.";
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
   "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
@@ -380,6 +383,7 @@ export function CreateScheduledTaskDialog({
   const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
+  const [costLimit, setCostLimit] = useState("");
 
   // Empty overrides use the agent's configured defaults when a run starts.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
@@ -720,6 +724,7 @@ export function CreateScheduledTaskDialog({
       setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
+      setCostLimit(editingTask?.maxCostUsd == null ? "" : String(editingTask.maxCostUsd));
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
@@ -912,7 +917,8 @@ export function CreateScheduledTaskDialog({
       setSwitchedWorkerSettings(settings);
       return;
     }
-    const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+    // Edit the authored prompt, so a later revert of the target restores its placement.
+    const updated = updateTriggerWorkerSettings(syncedFreeTextPrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
     // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
@@ -928,13 +934,23 @@ export function CreateScheduledTaskDialog({
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
   }
-  let workerPlacement: WorkerPlacement | null = null;
+  // Moving the poller between a sandbox and a connected host moves its workers with it.
+  const targetWorkerPlacement: WorkerPlacement | null =
+    editingTask !== null && executionTarget !== editingTask.executionTarget
+      ? sandboxMode
+        ? "managed"
+        : "same_host"
+      : null;
+  // The placement as saved or edited; state keeps it, and only the target override changes it.
+  let authoredWorkerPlacement: WorkerPlacement | null = null;
   if (editingWorkerSettings) {
-    workerPlacement =
+    authoredWorkerPlacement =
       trigger !== null
         ? switchedWorkerPlacement
         : readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt));
   }
+  const workerPlacement =
+    authoredWorkerPlacement === null ? null : (targetWorkerPlacement ?? authoredWorkerPlacement);
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) =>
@@ -1201,10 +1217,14 @@ export function CreateScheduledTaskDialog({
     workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
   // inside its saved template text, whose creation call follows the workflow they run.
-  const freeTextPrompt = syncTriggerWorkflowId(
+  const syncedFreeTextPrompt = syncTriggerWorkflowId(
     combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
     workflowIdSupported,
   );
+  const freeTextPrompt =
+    targetWorkerPlacement === null
+      ? syncedFreeTextPrompt
+      : updateTriggerWorkerPlacement(syncedFreeTextPrompt, targetWorkerPlacement);
   const triggerComplete =
     trigger !== null &&
     triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars);
@@ -1567,6 +1587,8 @@ export function CreateScheduledTaskDialog({
             );
           },
         };
+  const maxCostUsd = costLimit.trim() === "" ? null : Number(costLimit);
+  const costLimitInvalid = maxCostUsd !== null && (!Number.isFinite(maxCostUsd) || maxCostUsd <= 0);
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -1580,6 +1602,7 @@ export function CreateScheduledTaskDialog({
     !sandboxAgentConflict &&
     !sourceAgentConflict &&
     !scheduleInvalid &&
+    !costLimitInvalid &&
     !workflowKeepsTaskSession &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
@@ -1595,6 +1618,7 @@ export function CreateScheduledTaskDialog({
         ((isEdit || fromSession !== null) &&
           (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler)))) ||
       workspaceWithoutHost ||
+      costLimitInvalid ||
       Boolean(pollingBlockedReason) ||
       (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
       (!isEdit && agents !== undefined && effectiveAgentId === null) ||
@@ -1684,7 +1708,9 @@ export function CreateScheduledTaskDialog({
     }
     // Fall back to the saved workers if the prompt editor's creation call no longer parses.
     setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
-    setSwitchedWorkerPlacement(workerSettings !== null ? workerPlacement : savedWorkerPlacement);
+    setSwitchedWorkerPlacement(
+      workerSettings !== null ? authoredWorkerPlacement : savedWorkerPlacement,
+    );
     if (next === editingTriggerSource) {
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
@@ -1751,6 +1777,7 @@ export function CreateScheduledTaskDialog({
         prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
         rrule: buildRRule(schedule),
         timezone,
+        ...(maxCostUsd !== (editingTask?.maxCostUsd ?? null) ? { maxCostUsd } : {}),
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
           ? { baseBranch }
@@ -2846,6 +2873,34 @@ export function CreateScheduledTaskDialog({
                               </DropdownMenu>
                             </div>
                           )}
+                          <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                            <label
+                              htmlFor="task-cost-limit"
+                              className="text-ui text-muted-foreground"
+                            >
+                              Cost limit per run (USD)
+                            </label>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Input
+                                  id="task-cost-limit"
+                                  inputMode="decimal"
+                                  placeholder="No limit"
+                                  className="h-9! min-h-9! w-32 border-transparent py-2 pr-8 pl-2.5 text-right text-ui leading-5 font-normal shadow-none hover:bg-muted focus-visible:border-transparent focus-visible:bg-muted focus-visible:ring-0"
+                                  value={costLimit}
+                                  onChange={(event) => setCostLimit(event.target.value)}
+                                  aria-invalid={costLimitInvalid}
+                                  aria-describedby="task-cost-limit-help"
+                                />
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-xs">
+                                {AUTOMATION_COST_LIMIT_HELP}
+                              </TooltipContent>
+                            </Tooltip>
+                            <span id="task-cost-limit-help" className="sr-only">
+                              {AUTOMATION_COST_LIMIT_HELP}
+                            </span>
+                          </div>
                         </div>
 
                         <WorkspacePickerDialog
@@ -2860,6 +2915,11 @@ export function CreateScheduledTaskDialog({
                         />
 
                         <div className="mt-3 space-y-2">
+                          {costLimitInvalid && (
+                            <p role="alert" className="text-sm text-destructive">
+                              Enter a cost limit greater than zero, or leave it blank.
+                            </p>
+                          )}
                           {!sandboxMode && selectedHost?.status === "offline" && (
                             <p className="text-sm text-muted-foreground">
                               This host is offline. Runs fail until it reconnects.

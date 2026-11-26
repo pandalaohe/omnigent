@@ -20,10 +20,10 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -45,6 +45,7 @@ from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatc
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
+from omnigent.server.host_session_recovery import HostSessionRecoverer
 from omnigent.server.routes._sessions.helpers import (
     _merge_codex_permission_launch_args,
     _NativeTerminalEnsureOutcome,
@@ -52,6 +53,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -297,7 +299,7 @@ async def test_compaction_source_id_makes_a_repeated_post_a_no_op(
 @pytest.mark.parametrize("fallback_source", ["hook_fallback", "transcript_degraded"])
 @pytest.mark.parametrize("fallback_summary", ["", "fallback summary"])
 async def test_compaction_authoritative_snapshot_upgrades_fallback(
-    client: httpx.AsyncClient, fallback_source: str, fallback_summary: str, db_uri: str
+    client: httpx.AsyncClient, fallback_source: str, fallback_summary: str
 ) -> None:
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -335,10 +337,12 @@ async def test_compaction_authoritative_snapshot_upgrades_fallback(
     assert upgraded["snapshot_source"] == "transcript"
     assert upgraded["summary"] == "authoritative summary"
     assert upgraded["compacted_messages"] == authoritative["compacted_messages"]
-    matches = SqlAlchemyConversationStore(db_uri).search(
-        "authoritative", conversation_id=session["id"]
+    matches = await client.get(
+        f"/v1/sessions/{session['id']}/items/search",
+        params={"search_query": "authoritative"},
     )
-    assert [item.id for item in matches] == [boundary["id"]]
+    assert matches.status_code == 200, matches.text
+    assert [item["id"] for item in matches.json()["data"]] == [boundary["id"]]
 
 
 async def test_compaction_without_source_id_keeps_appending(client: httpx.AsyncClient) -> None:
@@ -357,6 +361,101 @@ async def test_compaction_without_source_id_keeps_appending(client: httpx.AsyncC
 
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert len([item for item in items if item["type"] == "compaction"]) == 2
+
+
+@pytest.mark.parametrize("interrupt_before_append", [False, True])
+async def test_native_recovery_echo_keeps_queued_input_and_run_attribution(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_before_append: bool,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.session_pull_request_store import (
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    pull_requests = SessionPullRequestStore(db_uri)
+    run_id = uuid.uuid4().hex
+    store.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
+    store.set_host_id(session_id, "a" * 32, "/workspace")
+    store.set_runner_id(session_id, "current-runner")
+    recovery = SessionRecovery(
+        "a" * 32, "current-runner", 100, phase="submitted", attempt_id="recovery-attempt"
+    )
+    assert store.replace_session_recovery(session_id, None, recovery)
+    if interrupt_before_append:
+        append = SqlAlchemyConversationStore.append
+
+        def interrupt_recovery(self, conversation_id, items, **kwargs):
+            if conversation_id == session_id and any(
+                isinstance(item.data, MessageData)
+                and item.data.content == [{"type": "input_text", "text": RECOVERY_PROMPT}]
+                for item in items
+            ):
+                assert self.replace_session_recovery(
+                    session_id, recovery, replace(recovery, phase="pending", attempt_id=None)
+                )
+            return append(self, conversation_id, items, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "append", interrupt_recovery)
+    stable_id = uuid.uuid4().hex
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "An unrelated queued input"}],
+        stable_id=stable_id,
+    )
+
+    async def mirror(source: str, text: str) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "source_id": source,
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                },
+            },
+        )
+
+    def report(number: int) -> PullRequestReport:
+        return PullRequestReport(
+            url=f"https://github.com/example/repo/pull/{number}",
+            provider="github",
+            host="github.com",
+            repository="example/repo",
+            number=number,
+            relationship="worked_on",
+            first_seen_at=100.0,
+            last_seen_at=100.0,
+        )
+
+    try:
+        response = await mirror("recovery-echo", RECOVERY_PROMPT)
+        assert response.status_code == 202, response.text
+        item = store.get_item(session_id, response.json()["item_id"])
+        assert item is not None and isinstance(item.data, MessageData) and item.data.is_meta
+        assert pending_inputs.pending_id_for_stable_id(session_id, stable_id) == pending_id
+        pull_requests.apply_report(session_id, [report(1)])
+    finally:
+        pending_inputs.resolve(session_id, pending_id)
+
+    direct = await mirror("user-message", "A new message sent from the terminal")
+    assert direct.status_code == 202, direct.text
+    pull_requests.apply_report(session_id, [report(2)])
+    attribution = pull_requests.read(session_id)
+    assert attribution is not None
+    assert {entry.number: entry.run_id for entry in attribution.entries} == {1: run_id, 2: None}
 
 
 @pytest.mark.parametrize("source_id", ["", "   ", "x" * 257])
@@ -3492,6 +3591,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     monkeypatch: pytest.MonkeyPatch,
     metadata_rows: list[dict[str, object]],
     runner_status: int,
+    db_uri: str,
 ) -> None:
     """
     Structured skill slash commands persist two durable records.
@@ -3531,6 +3631,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
                 json={"meta_text": format_skill_meta_text(skill, payload.get("arguments", ""))},
             )
         if request.method == "POST" and request.url.path.endswith("/events"):
+            assert not store.admit_session_recovery(session["id"], intent)
             forwarded.append(json.loads(request.content))
         return httpx.Response(runner_status, json={"queued": True})
 
@@ -3553,6 +3654,20 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         session = await _create_session(client, agent["id"])
 
+        store = SqlAlchemyConversationStore(db_uri)
+        store.set_host_id(session["id"], "a" * 32, workspace="/restored")
+        conv = store.get_conversation(session["id"])
+        intent = SessionRecovery(
+            conv.host_id,
+            conv.runner_id,
+            100,
+            phase="dispatching",
+            attempt_id="attempt",
+            launch_runner_id=conv.runner_id,
+        )
+        assert store.replace_session_recovery(session["id"], None, intent)
+        assert store.admit_session_recovery(session["id"], intent)
+
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={
@@ -3565,6 +3680,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             },
         )
         assert resp.status_code == 202, resp.text
+        assert store.get_session_recovery(session["id"]) is None
 
     _assert_activity_metadata(metadata_rows, session["id"], "slash_command")
     assert resp.json()["queued"] is True
@@ -7866,8 +7982,14 @@ async def test_malformed_native_failure_context_does_not_reject_status(
     )
 
 
+@pytest.mark.parametrize("recovery_configured", [False, True])
+@pytest.mark.parametrize("wrapper", [None, "claude-code-native-ui", "codex-native-ui"])
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    recovery_configured: bool,
+    wrapper: str | None,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -7883,6 +8005,20 @@ async def test_post_external_session_status_carries_response_id(
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session["id"], "a" * 32, workspace="/workspace")
+    store.set_runner_id(session["id"], "turn-runner")
+    if wrapper is not None:
+        store.set_labels(session["id"], {"omnigent.wrapper": wrapper})
+        store.update_conversation_with_changes(
+            session["id"],
+            harness_override="codex-native" if wrapper == "codex-native-ui" else "claude-native",
+        )
+    assert app.state.host_session_recoverer is None
+    if recovery_configured:
+        app.state.host_session_recoverer = HostSessionRecoverer(
+            store, Mock(), Mock(), Mock(), Mock(), deployment_gate=lambda: False
+        )
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -7900,6 +8036,29 @@ async def test_post_external_session_status_carries_response_id(
     assert event["conversation_id"] == session["id"]
     assert event["status"] == "running"
     assert event["response_id"] == "codex_turn_123"
+
+    state = store.get_session_recovery(session["id"])
+    assert (state.phase if state else None) == ("active" if recovery_configured else None)
+    for completed in (False, True):
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": "codex_turn_123",
+                    "turn_completed": completed,
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        state = store.get_session_recovery(session["id"])
+        expected = (
+            ("stopped" if completed or wrapper == "codex-native-ui" else "active")
+            if recovery_configured
+            else None
+        )
+        assert (state.phase if state else None) == expected
 
 
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
@@ -8457,6 +8616,8 @@ async def test_publish_status_tracks_in_flight_response_id(
 @pytest.mark.parametrize("child_lookup_fails", [False, True])
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     child_lookup_fails: bool,
 ) -> None:
@@ -8561,6 +8722,15 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     sid = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = "a" * 32, "runner_recovery"
+    store.set_host_id(sid, host_id, workspace="/workspace")
+    store.set_runner_id(sid, runner_id)
+    recovery = SessionRecovery(host_id, runner_id, 100)
+    assert store.replace_session_recovery(sid, None, recovery)
+    recoverer = HostSessionRecoverer(store, Mock(), Mock(), Mock(), Mock())
+    monkeypatch.setattr(recoverer, "enabled", lambda _: True)
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
     # The monkeypatched runner client can see setup work during session
     # creation. This test targets the later PATCH rebind path only.
     runner_client.posts.clear()
@@ -8596,6 +8766,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         sessions_module._session_status_cache.pop(sid, None)
 
     assert resp.status_code == (500 if child_lookup_fails else 200), resp.text
+    assert store.get_session_recovery(sid).phase == "stopped"
     assert len(runner_client.posts) == 1
     init_post = runner_client.posts[0]
     assert init_post["url"] == "/v1/sessions"
@@ -14417,6 +14588,7 @@ async def test_stop_session_no_runner_settles_stale_child_and_parent_badge(
 
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     client: httpx.AsyncClient,
+    app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     metadata_rows: list[dict[str, object]],
 ) -> None:
@@ -14432,6 +14604,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     get_runner = AsyncMock(return_value=runner_client)
     monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
+    recoverer = Mock()
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -14439,6 +14613,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     )
 
     assert response.status_code == 202, response.text
+    recoverer.stop_recovery.assert_called_once()
+    assert recoverer.stop_recovery.call_args.kwargs == {"only_pending": True}
     _assert_activity_metadata(metadata_rows, session["id"], "retry_session")
     initialize.assert_awaited_once()
     assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
@@ -14669,10 +14845,14 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
 
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retry fails loud when no runner can reconnect, without adding history."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    recoverer = Mock()
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -14680,6 +14860,7 @@ async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     )
 
     assert response.status_code == 503, response.text
+    recoverer.stop_recovery.assert_not_called()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["items"] == []
 
@@ -18759,10 +18940,22 @@ async def test_patch_reasoning_effort_swallows_runner_failure(
 
 async def test_session_event_tools_malformed_returns_400(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A malformed ``tools`` entry fails fast at the route boundary."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = "a" * 32, "runner_recovery"
+    store.set_host_id(session["id"], host_id, workspace="/workspace")
+    store.set_runner_id(session["id"], runner_id)
+    recovery = SessionRecovery(host_id, runner_id, 100)
+    assert store.replace_session_recovery(session["id"], None, recovery)
+    recoverer = HostSessionRecoverer(store, Mock(), Mock(), Mock(), Mock())
+    monkeypatch.setattr(recoverer, "enabled", lambda _: True)
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     # Missing function.name is the canonical malformed case.
     resp = await client.post(
@@ -18779,6 +18972,7 @@ async def test_session_event_tools_malformed_returns_400(
     assert resp.status_code == 400, (
         f"Expected 400 for malformed tools; got {resp.status_code}: {resp.text[:200]}"
     )
+    assert store.get_session_recovery(session["id"]) == recovery
 
 
 # ── POST /v1/sessions/{id}/events external_codex_subagent_start ──────────────

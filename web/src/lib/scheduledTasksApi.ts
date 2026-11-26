@@ -9,6 +9,7 @@
 // omit both and the server resolves the owner's connected host + its home dir
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
+import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
@@ -63,6 +64,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** Per-run cost limit in USD; null/absent adds no automation-specific cap. */
+  maxCostUsd?: number | null;
   /** MCP services every session the automation creates starts with. */
   mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
@@ -183,6 +186,8 @@ export interface CreateScheduledTaskInput {
   speed?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** Optional per-run cost limit in USD; omit for no automation-specific cap. */
+  maxCostUsd?: number | null;
   /** MCP services every run starts with; omit for none. */
   mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
@@ -230,6 +235,8 @@ export interface UpdateScheduledTaskInput {
   reasoningEffort?: string | null;
   speed?: string | null;
   permissionMode?: string | null;
+  /** Omit to preserve the cost limit; null removes it for future runs. */
+  maxCostUsd?: number | null;
   /** Replaces the MCP services; `[]` clears them. */
   mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
@@ -265,6 +272,7 @@ interface ScheduledTaskWire {
   reasoning_effort: string | null;
   speed?: string | null;
   permission_mode: string | null;
+  max_cost_usd?: number | null;
   mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
@@ -359,6 +367,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     reasoningEffort: wire.reasoning_effort,
     speed: wire.speed ?? null,
     permissionMode: wire.permission_mode,
+    maxCostUsd: wire.max_cost_usd ?? null,
     mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
@@ -504,6 +513,65 @@ export async function listScheduledTaskRunSteps(
   }));
 }
 
+/** One PR a run created or worked on, as the server stores it. */
+export interface ScheduledTaskRunPullRequest {
+  url: string;
+  /** Git provider id, e.g. "github". */
+  provider: string;
+  provider_display?: GitProviderDisplay | null;
+  /** Base repository, e.g. "owner/repo". */
+  repository: string;
+  number: number;
+  title?: string | null;
+  relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it did. */
+  state?: string | null;
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
+}
+
+/** The PRs one run created or worked on, with the state each host last fetched. */
+export interface ScheduledTaskRunPullRequests {
+  runId: string;
+  pullRequests: ScheduledTaskRunPullRequest[];
+}
+
+/** One page of runs' PRs. */
+export interface ScheduledTaskRunPullRequestsPage {
+  runs: ScheduledTaskRunPullRequests[];
+  /** The server started refreshing a session on the page, so a later read may show more. */
+  refreshPending: boolean;
+}
+
+/**
+ * The PRs of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs without PRs are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunPullRequests(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunPullRequestsPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-pull-requests?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: { run_id: string; pull_requests?: ScheduledTaskRunPullRequest[] }[];
+    refresh_pending?: boolean;
+  }>(res);
+  return {
+    runs: (body.runs ?? []).map((run) => ({
+      runId: run.run_id,
+      pullRequests: run.pull_requests ?? [],
+    })),
+    refreshPending: body.refresh_pending === true,
+  };
+}
+
 /**
  * Create a scheduled task. Only the fields the user actually set are sent, so
  * the server applies its own defaults (`timezone` → UTC) and the optional
@@ -522,6 +590,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.speed != null) body.speed = input.speed;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.maxCostUsd != null) body.max_cost_usd = input.maxCostUsd;
   if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
@@ -572,6 +641,7 @@ export async function updateScheduledTask(
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.speed !== undefined) body.speed = input.speed;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.maxCostUsd !== undefined) body.max_cost_usd = input.maxCostUsd;
   if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;

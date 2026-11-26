@@ -160,6 +160,13 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# The gap allowed while the child's turn is still open (a tool runs or the model
+# is responding), so a long step doesn't flip it idle and back. Matches Claude's
+# longest Bash timeout, so a child that stops mid-tool still settles.
+_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S = 600.0
+# Claude's tool that hands a sub-agent's report back and ends its turn.
+_SUBAGENT_HANDBACK_TOOL = "SubagentHandback"
+_SUBAGENT_INTERRUPT_PREFIX = "[Request interrupted by user"
 
 # Structured task notifications are the authoritative sub-agent terminal
 # signal. This longer window is only a compatibility fallback for Claude runs
@@ -730,6 +737,9 @@ class SubagentEntry:
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
     :param resume_observed_at: Latest accepted user prompt's record timestamp.
+    :param mid_turn: Whether the forwarded items leave the child's turn open
+        (see :func:`_leaves_turn_open`), so inactivity waits for
+        ``_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S``.
     """
 
     subagent_id: str
@@ -754,6 +764,7 @@ class SubagentEntry:
     parent_recovery_watermark: int | None = None
     recovery_after: str | None = None
     recovery_seen_source_ids: tuple[str, ...] = ()
+    mid_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -2280,6 +2291,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             parent_recovery_watermark=entry_parent_recovery_watermark,
             recovery_after=recovery_after,
             recovery_seen_source_ids=tuple(recovery_seen_source_ids),
+            mid_turn=row.get("mid_turn") is True,
         )
     aliases = raw.get("pending_terminal_tool_use_ids", {})
     aliases = (
@@ -2343,6 +2355,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "parent_recovery_watermark": entry.parent_recovery_watermark,
                 "recovery_after": entry.recovery_after,
                 "recovery_seen_source_ids": list(entry.recovery_seen_source_ids),
+                "mid_turn": entry.mid_turn,
             }
             for entry in state.subagents.values()
         },
@@ -2759,6 +2772,31 @@ def _partition_subagent_batches(
     return batches
 
 
+def _leaves_turn_open(item: ClaudeTranscriptItem, *, open_before: bool) -> bool:
+    """Whether a child's turn is still open after this item.
+
+    Assistant text, a handback, and an interrupt end it; a tool result keeps
+    the state its call set.
+    """
+    if item.item_type == "function_call_output":
+        return open_before
+    if item.item_type == "function_call":
+        return item.data.get("name") != _SUBAGENT_HANDBACK_TOOL
+    if item.item_type != "message":
+        return True
+    if item.data.get("role") == "assistant":
+        return False
+    content = item.data.get("content")
+    return not (
+        isinstance(content, list)
+        and any(
+            isinstance(block, dict)
+            and str(block.get("text", "")).startswith(_SUBAGENT_INTERRUPT_PREFIX)
+            for block in content
+        )
+    )
+
+
 def _pending_items_from_records(
     result: TranscriptReadResult,
     seen: set[str],
@@ -3123,6 +3161,9 @@ async def _forward_one_subagent(
             source_id = pending_item.item.source_id
             seen.add(source_id)
             seen_source_ids.append(source_id)
+        mid_turn = new_entry.mid_turn
+        for pending_item in completed_items:
+            mid_turn = _leaves_turn_open(pending_item.item, open_before=mid_turn)
         completed_offsets = [
             pending_item.checkpoint_after
             for pending_item in completed_items
@@ -3146,6 +3187,7 @@ async def _forward_one_subagent(
             status_reconcile_pending=(
                 new_entry.status_reconcile_pending or (delivered and new_entry.activity_unverified)
             ),
+            mid_turn=mid_turn,
         )
         await checkpoint.put(new_entry)
         if stop_after_batch:
@@ -3764,6 +3806,9 @@ async def _publish_subagent_status(
     if entry.terminal_evidence_pending:
         return
     original_entry = entry
+    idle_threshold_s = (
+        _SUBAGENT_MID_TURN_IDLE_THRESHOLD_S if entry.mid_turn else _SUBAGENT_IDLE_THRESHOLD_S
+    )
     desired_status: str | None = None
     desired_output: str | None = None
     desired_replayed = False
@@ -3793,7 +3838,7 @@ async def _publish_subagent_status(
     elif (
         not delivery_pending
         and entry.last_activity_ts is not None
-        and time.time() - entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
+        and time.time() - entry.last_activity_ts > idle_threshold_s
     ):
         # A transcript lull is an idle observation, not an authoritative
         # completion: the child may still be in a long-running tool call.

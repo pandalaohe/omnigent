@@ -2541,7 +2541,7 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="flex w-[calc(100%-1rem)] max-w-[calc(100%-1rem)] flex-col gap-0 overflow-hidden rounded-2xl p-0 max-h-[85vh] sm:max-w-[45rem] sm:rounded-[30px]"
+        className="flex w-[calc(100%-1rem)] max-w-[calc(100%-1rem)] flex-col gap-0 overflow-hidden rounded-2xl p-0 max-h-[85dvh] sm:max-w-[45rem] sm:rounded-[30px]"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.

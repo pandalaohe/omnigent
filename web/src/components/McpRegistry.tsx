@@ -15,6 +15,8 @@ import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
+import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
+import { SettingsDataRegion } from "@/pages/settings/search/settingsOwnership";
 
 const MCP_PAGE_CURSOR_PARAM = "mcp_page_after";
 
@@ -71,11 +73,8 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
   return (
     <div className="space-y-4">
       <div>
-        <h3 className="text-sm font-medium">Managed MCP services</h3>
-        <p className="text-sm text-muted-foreground">
-          Connect once, then add these tools to any session. Your accounts are reused across
-          sessions on local machines, remote hosts, and sandboxes in this workspace.
-        </p>
+        <h3 className="text-sm font-medium">{MCP_SERVICES_ENTRY.label}</h3>
+        <p className="text-sm text-muted-foreground">{MCP_SERVICES_ENTRY.description}</p>
       </div>
       {callbackFailed && (
         <p role="alert" className="text-sm text-destructive">
@@ -90,16 +89,18 @@ function McpRegistryConnectionsPage({ scope, enabled }: { scope: string; enabled
           </Button>
         </p>
       )}
-      {services.map((service) => (
-        <ServiceConnection
-          key={service.id}
-          service={service}
-          returnTo={returnTo}
-          onChanged={async () => {
-            await refetch();
-          }}
-        />
-      ))}
+      <SettingsDataRegion entry={MCP_SERVICES_ENTRY} region="services" className="space-y-4">
+        {services.map((service) => (
+          <ServiceConnection
+            key={service.id}
+            service={service}
+            returnTo={returnTo}
+            onChanged={async () => {
+              await refetch();
+            }}
+          />
+        ))}
+      </SettingsDataRegion>
       {isPending && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
       {!isPending && page === 0 && !services.length && !error && (
         <p className="text-sm text-muted-foreground">
@@ -164,13 +165,20 @@ function ServiceConnection({
       <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
       <div className="flex flex-wrap gap-2">
         {service.auth === "bearer" && (
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(!editing)}>
+          <Button
+            data-settings-row-action={service.connected ? "updateToken" : "connect"}
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => setEditing(!editing)}
+          >
             {service.connected ? "Update token" : "Connect"}
           </Button>
         )}
         {service.auth === "oauth" && service.connect_provider !== null && (
           <Button asChild size="sm" variant="outline" disabled={busy}>
             <a
+              data-settings-row-action={service.connected ? "reconnect" : "connect"}
               aria-disabled={busy || undefined}
               href={
                 busy
@@ -187,13 +195,18 @@ function ServiceConnection({
         {(service.auth === "github" || service.auth === "databricks") && (
           <p className="text-sm text-muted-foreground">
             Uses your shared {service.auth === "github" ? "GitHub" : "Databricks"} connection.{" "}
-            <a className="underline" href={withBasePath("/settings/integrations")}>
+            <a
+              className="underline"
+              data-settings-row-action="manageAccount"
+              href={withBasePath("/settings/integrations")}
+            >
               Manage account in Sandbox Integrations
             </a>
           </p>
         )}
         {service.connected && (
           <Button
+            data-settings-row-action="test"
             size="sm"
             variant="outline"
             disabled={busy}
@@ -213,6 +226,7 @@ function ServiceConnection({
         )}
         {service.connected && (service.auth === "bearer" || service.auth === "oauth") && (
           <Button
+            data-settings-row-action="disconnect"
             size="sm"
             variant="ghost"
             disabled={busy}
@@ -247,6 +261,7 @@ function ServiceConnection({
           }}
         >
           <Input
+            data-settings-row-field="token"
             type="password"
             aria-label={`Token for ${service.title}`}
             autoComplete="off"
@@ -254,7 +269,12 @@ function ServiceConnection({
             onChange={(e) => setToken(e.target.value)}
             placeholder="Personal access token"
           />
-          <Button size="sm" disabled={busy || !token.trim()} type="submit">
+          <Button
+            data-settings-row-action="saveToken"
+            size="sm"
+            disabled={busy || !token.trim()}
+            type="submit"
+          >
             Save token
           </Button>
         </form>

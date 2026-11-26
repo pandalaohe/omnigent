@@ -183,6 +183,7 @@ export function HarnessPicker({
   tooltipTestId,
   tooltipVariant = "default",
   contentClassName,
+  contentIdentity,
   contentAlign = "end",
   contentSide = "top",
   contentSideOffset,
@@ -202,6 +203,7 @@ export function HarnessPicker({
   tooltipTestId?: string;
   tooltipVariant?: "default" | "session-info";
   contentClassName?: string;
+  contentIdentity?: { "data-settings-overlay-owner": string };
   contentAlign?: "start" | "center" | "end";
   contentSide?: "top" | "bottom";
   contentSideOffset?: number;
@@ -321,6 +323,7 @@ export function HarnessPicker({
           avoidCollisions
           className={cn(HARNESS_MENU_CLASS_NAME, COMPOSER_HARNESS_MENU_SIZE, contentClassName)}
           data-testid={testId}
+          {...contentIdentity}
           onPointerDownOutside={interaction.onPointerInteraction}
           onInitialSelectionFocus={previewOnly ? undefined : onInitialSelectionFocus}
           onOpenAutoFocus={(event) => {

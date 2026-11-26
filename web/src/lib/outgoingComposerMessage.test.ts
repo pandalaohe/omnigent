@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { composerPartsToText } from "@/lib/composerContent";
+import { assignLabels } from "@/lib/composerTokens";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { serializeReplyDraft } from "@/lib/replyDraft";
 import { buildOutgoingMessage, carriesMessageContext } from "./outgoingComposerMessage";
 
 const file = { token: "@a.ts", marker: "[Attached: a.ts]" };
@@ -26,7 +29,7 @@ describe("buildOutgoingMessage", () => {
     );
     expect(text).toBe(
       `Ask ${session.marker} about ${file.marker}\n\n` +
-        `${SESSION_MENTION_HINT}\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
+        `${formatLocalReviewComments([comment], { includeInstruction: false })}\n\n${SESSION_MENTION_HINT}`,
     );
   });
 
@@ -41,21 +44,29 @@ describe("buildOutgoingMessage", () => {
   });
 
   it("expands tags in quote preambles and keeps the quote structure", () => {
+    const photo = new File([new Uint8Array(1)], "sample.png", { type: "image/png" });
+    assignLabels([photo], []);
     const draft = {
       text: "then @a.ts",
-      quotes: [{ id: "q", before: "per @auth", text: "quoted" }],
+      quotes: [{ id: "q", before: "per @auth [image 1]", text: "quoted" }],
     };
     const outgoing = buildOutgoingMessage(
       draft,
       "ignored with quotes",
-      { mentions: [file, session], reviewComments: [] },
-      [],
+      { mentions: [file, session], reviewComments: [comment] },
+      [photo],
     );
     expect(outgoing.replyDraft).toEqual({
       version: 1,
-      quotes: [{ before: `per ${session.marker}`, text: "quoted" }],
-      text: `then ${file.marker}\n\n${SESSION_MENTION_HINT}`,
+      quotes: [{ before: `per ${session.marker} `, text: "quoted" }],
+      text:
+        `then ${file.marker}\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}\n\n` +
+        SESSION_MENTION_HINT,
     });
+    expect(outgoing.parts?.[0]).toEqual({ type: "text", text: `per ${session.marker} ` });
+    expect(outgoing.parts?.[1]).toEqual({ type: "attachment", file: photo });
+    expect(composerPartsToText(outgoing.parts!)).toBe(outgoing.text);
+    expect(serializeReplyDraft(outgoing.replyDraft!)).toBe(outgoing.text);
     expect(outgoing.text).toContain("> quoted");
   });
 });

@@ -5288,6 +5288,7 @@ def server(
     from omnigent.process_logging import configure_process_logging
 
     app = create_app(
+        host_session_recovery=True,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,

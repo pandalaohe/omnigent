@@ -285,6 +285,7 @@ def classify_launch_refusal(
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
+    RECOVER_SESSIONS = "host.recover_sessions"
     HELLO = "host.hello"
     HOST_RESTART = "host_restart"
     HOST_RESTART_RESULT = "host_restart_result"
@@ -455,6 +456,14 @@ class HostHelloFrame:
     acp_permission_tiers: dict[str, str] = field(default_factory=dict)
     workspace_socket: str | None = None
     workspace_token_key: str | None = field(default=None, repr=False)
+    recover_interrupted_sessions: bool = False
+
+
+@dataclass
+class HostRecoverSessionsFrame:
+    """Host requests reconciliation after its provider has restored local state."""
+
+    runners: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -577,6 +586,7 @@ class HostLaunchRunnerFrame:
     scheduled_run: ScheduledRunLogContext | None = None
     mcp_disabled_servers_active_harnesses: list[str] | None = None
     session_env_handoff_id: str | None = None
+    recovery: bool = False
     purpose: Literal["host_terminals"] | None = None
 
 
@@ -2208,7 +2218,8 @@ class HostPostBindHookResultFrame:
 
 
 HostFrame = (
-    HostHelloFrame
+    HostRecoverSessionsFrame
+    | HostHelloFrame
     | HostRestartFrame
     | HostRestartResultFrame
     | HostConnectionErrorFrame
@@ -2366,6 +2377,13 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    if isinstance(frame, HostRecoverSessionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RECOVER_SESSIONS.value,
+                "runners": list(frame.runners),
+            }
+        )
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -2394,6 +2412,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "connection_id": frame.connection_id,
                 "workspace_socket": frame.workspace_socket,
                 "workspace_token_key": frame.workspace_token_key,
+                "recover_interrupted_sessions": frame.recover_interrupted_sessions,
                 **(
                     {"terminal_runner_id": frame.terminal_runner_id}
                     if frame.terminal_runner_id is not None
@@ -2466,6 +2485,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
+        if frame.recovery:
+            payload["recovery"] = True
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -3702,6 +3723,10 @@ def _decode_known_host_frame(
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
     match kind:
+        case HostFrameKind.RECOVER_SESSIONS:
+            return HostRecoverSessionsFrame(
+                runners=_optional_str_list(msg, "runners"),
+            )
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
         case HostFrameKind.HOST_RESTART:
@@ -4119,6 +4144,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         terminal_runner_id=_optional_nullable_str(msg, "terminal_runner_id"),
         workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
         workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
+        recover_interrupted_sessions=_optional_bool(msg, "recover_interrupted_sessions"),
     )
 
 
@@ -4160,6 +4186,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
+        recovery=_optional_bool(msg, "recovery"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),

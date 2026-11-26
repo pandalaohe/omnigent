@@ -37,6 +37,7 @@ from omnigent.entities.subagent_terminal import (
 from omnigent.entities.subagent_terminal import (
     SUBAGENT_RESULT_ITEM_LABEL_KEY as SUBAGENT_RESULT_ITEM_LABEL_KEY,
 )
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
@@ -210,6 +211,14 @@ class _SubagentWorkEntry:
     :param recovered: Whether recovery rebuilt this entry for a turn the
         parent did not dispatch. Such an entry never reads as a parent
         dispatch, so a peer turn it is parented to is still kept as a copy.
+    :param child_start_reported: Whether the child itself reported a
+        running/waiting edge for this dispatch, or the dispatch joined a turn
+        already in flight.
+    :param child_start_response_id: Identity of a reported native start; ``None``
+        preserves unidentified or restart-recovered start evidence.
+    :param awaiting_child_start_since: Unix timestamp when runner delivery
+        finalization first recorded a validated native receipt, or ``None``
+        when no turn-start report is awaited.
     """
 
     parent_session_id: str
@@ -245,6 +254,10 @@ class _SubagentWorkEntry:
     retry_chain_id: str | None = None
     retry_owner: InboxOwnerFence | None = None
     retry_final: RetryFinal | None = None
+    child_start_reported: bool = False
+    child_start_response_id: str | None = None
+    awaiting_child_start_since: float | None = None
+    native_acceptance: NativeTurnAcceptance | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -271,6 +284,26 @@ class _SubagentDeliveryAck:
     pending: asyncio.Task[_SubagentDeliveryAck] | None = None
 
 
+@dataclasses.dataclass(eq=False)
+class _ChildAcceptanceRequest:
+    """Identity evidence retained only while one delivery stream can still finalize."""
+
+    child_session_id: str
+    parent_session_id: str | None
+    settled_response_ids: set[str] = dataclasses.field(default_factory=set)
+    started_response_ids: set[str] = dataclasses.field(default_factory=set)
+    unidentified_settlement: bool = False
+    unidentified_settlement_work_ids: set[str | None] = dataclasses.field(default_factory=set)
+    finished: bool = False
+
+
+@dataclasses.dataclass
+class _AcceptedChildTurn:
+    acceptance: NativeTurnAcceptance
+    accepted_at: float
+    start_reported: bool = False
+
+
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 # Old session id → its successor, seen by this runner. A work entry registered
@@ -295,6 +328,13 @@ _subagent_work_origins: dict[str, str] = {}
 # per-child entries through this owner map.
 _subagent_retained_state_parents: dict[str, str] = {}
 
+# Turn evidence survives dispatch draining or replacement until the matching settlement.
+# Applying acceptance evidence does not consume the unresolved turn's original timestamp.
+_children_reporting_start: dict[str, str | None] = {}
+_children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
+# Pending request evidence survives settlement until delivery finalization or deletion.
+_pending_child_acceptances: dict[str, set[_ChildAcceptanceRequest]] = {}
+# Drained optimistic cancellations stay available to correct under the same dispatch.
 _provisional_cancelled_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
@@ -681,6 +721,204 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     return entry
 
 
+def begin_subagent_child_acceptance(child_session_id: str) -> _ChildAcceptanceRequest:
+    """Retain native status identities until this delivery stream's finalizer exits."""
+    entry = get_subagent_work(child_session_id)
+    meta = _child_session_parents.get(child_session_id)
+    request = _ChildAcceptanceRequest(
+        child_session_id=child_session_id,
+        parent_session_id=entry.parent_session_id
+        if entry is not None
+        else meta.parent_id
+        if meta
+        else None,
+    )
+    _pending_child_acceptances.setdefault(child_session_id, set()).add(request)
+    return request
+
+
+def finish_subagent_child_acceptance(request: _ChildAcceptanceRequest) -> None:
+    """Release a delivery request and every settled identity retained for it."""
+    requests = _pending_child_acceptances.get(request.child_session_id)
+    if requests is not None:
+        requests.discard(request)
+        if not requests:
+            _pending_child_acceptances.pop(request.child_session_id, None)
+    request.finished = True
+    request.settled_response_ids.clear()
+    request.started_response_ids.clear()
+    request.unidentified_settlement = False
+    request.unidentified_settlement_work_ids.clear()
+
+
+def note_subagent_child_start_reported(
+    child_session_id: str, *, response_id: str | None = None
+) -> None:
+    """Record real native start evidence, retaining its existing response identity."""
+    if not response_id or not response_id.startswith("codex_") or response_id == "codex_":
+        response_id = None
+    _children_reporting_start[child_session_id] = response_id
+    for request in _pending_child_acceptances.get(child_session_id, ()):
+        if response_id is not None:
+            request.started_response_ids.add(response_id)
+    accepted = _children_accepted_turns.get(child_session_id)
+    if accepted is not None and (
+        response_id is None or accepted.acceptance.response_id == response_id
+    ):
+        accepted.start_reported = True
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is not None and (
+        response_id is None
+        or entry.native_acceptance is None
+        or entry.native_acceptance.response_id == response_id
+    ):
+        if entry.child_start_reported and entry.child_start_response_id != response_id:
+            entry.child_start_response_id = None
+        else:
+            entry.child_start_response_id = response_id
+        entry.child_start_reported = True
+        entry.awaiting_child_start_since = None
+
+
+def note_subagent_child_turn_settled(
+    child_session_id: str, *, response_id: str | None = None
+) -> None:
+    """Settle only matching evidence; stale receipts live no longer than pending requests."""
+    if not response_id or not response_id.startswith("codex_") or response_id == "codex_":
+        response_id = None
+    entry = _subagent_work_by_child.get(child_session_id)
+    for request in _pending_child_acceptances.get(child_session_id, ()):
+        if response_id is None:
+            request.unidentified_settlement = True
+            request.unidentified_settlement_work_ids.add(entry.work_id if entry else None)
+        else:
+            request.settled_response_ids.add(response_id)
+            request.started_response_ids.discard(response_id)
+    if response_id is None or _children_reporting_start.get(child_session_id) == response_id:
+        _children_reporting_start.pop(child_session_id, None)
+    accepted = _children_accepted_turns.get(child_session_id)
+    if response_id is None or (
+        accepted is not None and accepted.acceptance.response_id == response_id
+    ):
+        _children_accepted_turns.pop(child_session_id, None)
+    if (
+        entry is not None
+        and response_id is not None
+        and entry.child_start_response_id == response_id
+    ):
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
+    if entry is not None and (
+        response_id is None
+        or (
+            entry.native_acceptance is not None
+            and entry.native_acceptance.response_id == response_id
+        )
+    ):
+        entry.awaiting_child_start_since = None
+        entry.native_acceptance = None
+
+
+def apply_child_start_evidence(entry: _SubagentWorkEntry) -> None:
+    """Apply retained acceptance/start evidence to one newly registered dispatch."""
+    child_id = entry.child_session_id
+    accepted = _children_accepted_turns.get(child_id)
+    reported = child_id in _children_reporting_start and (
+        accepted is None
+        or _children_reporting_start[child_id] is None
+        or _children_reporting_start[child_id] == accepted.acceptance.response_id
+    )
+    if accepted is not None:
+        entry.native_acceptance = accepted.acceptance
+        entry.child_start_reported = accepted.start_reported or reported
+        if entry.child_start_reported:
+            entry.child_start_response_id = (
+                _children_reporting_start[child_id] if reported else None
+            )
+        entry.awaiting_child_start_since = (
+            None if entry.child_start_reported else accepted.accepted_at
+        )
+    elif reported:
+        entry.child_start_reported = True
+        entry.child_start_response_id = _children_reporting_start[child_id]
+        entry.awaiting_child_start_since = None
+
+
+def arm_subagent_child_start_timeout(
+    child_session_id: str,
+    *,
+    acceptance: NativeTurnAcceptance | None = None,
+    request: _ChildAcceptanceRequest | None = None,
+    now: float | None = None,
+) -> None:
+    """Bound an authoritative accepted native turn, never a settled or unidentified receipt.
+
+    The clock starts when runner delivery finalization records a validated receipt.
+    Repeated receipts for the same unresolved turn retain its first recorded time.
+    Missing identity cannot arm a deadline or erase unresolved evidence. The generic
+    response ID remains the request-ownership guard, independently of native identity.
+    """
+    if (
+        request is None
+        or request.finished
+        or request not in _pending_child_acceptances.get(child_session_id, ())
+    ):
+        return
+    entry = _subagent_work_by_child.get(child_session_id)
+    # An unidentified edge settles the tracked work, not an identified replacement.
+    # Without a tracked work boundary, retain the conservative exemption.
+    if request.unidentified_settlement and (
+        entry is None
+        or None in request.unidentified_settlement_work_ids
+        or entry.work_id in request.unidentified_settlement_work_ids
+    ):
+        _children_accepted_turns.pop(child_session_id, None)
+        if entry is not None:
+            entry.awaiting_child_start_since = None
+            entry.native_acceptance = None
+        return
+    if (
+        acceptance is None
+        or acceptance.session_id != child_session_id
+        or not acceptance.thread_id
+        or not acceptance.response_id.startswith("codex_")
+        or acceptance.response_id == "codex_"
+    ):
+        return
+    if acceptance.response_id in request.settled_response_ids:
+        return
+    reported = acceptance.response_id in request.started_response_ids or (
+        child_session_id in _children_reporting_start
+        and _children_reporting_start[child_session_id] in (None, acceptance.response_id)
+    )
+    stamp = time.time() if now is None else now
+    accepted = _children_accepted_turns.get(child_session_id)
+    if accepted is not None and accepted.acceptance == acceptance:
+        accepted.start_reported |= reported
+    else:
+        accepted = _AcceptedChildTurn(acceptance, stamp, reported)
+        _children_accepted_turns[child_session_id] = accepted
+    if entry is None or entry.status != "running":
+        return
+    if entry.child_start_reported:
+        if entry.child_start_response_id in (None, acceptance.response_id):
+            accepted.start_reported = True
+            return
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
+    if accepted.start_reported:
+        entry.child_start_reported = True
+        entry.child_start_response_id = (
+            acceptance.response_id
+            if _children_reporting_start.get(child_session_id) == acceptance.response_id
+            else None
+        )
+        entry.awaiting_child_start_since = None
+    else:
+        entry.awaiting_child_start_since = accepted.accepted_at
+    entry.native_acceptance = acceptance
+
+
 def unregister_subagent_work(
     child_session_id: str,
     *,
@@ -752,6 +990,21 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     _drained_delivered_subagent_results.pop(session_id, None)
     _subagent_work_origins.pop(session_id, None)
     _subagent_retained_state_parents.pop(session_id, None)
+    children_to_forget = {session_id} | _subagent_work_by_parent.get(session_id, set())
+    children_to_forget.update(
+        child_id
+        for child_id, meta in _child_session_parents.items()
+        if meta.parent_id == session_id
+    )
+    children_to_forget.update(
+        child_id
+        for child_id, requests in _pending_child_acceptances.items()
+        if any(request.parent_session_id == session_id for request in requests)
+    )
+    for child_id in children_to_forget:
+        for request in list(_pending_child_acceptances.get(child_id, ())):
+            finish_subagent_child_acceptance(request)
+        note_subagent_child_turn_settled(child_id)
     _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
@@ -1246,6 +1499,7 @@ async def _recover_subagent_results_from_server(
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
+            entry.child_start_reported = True
             continue
         ack = mark_subagent_work_terminal(
             child_id,
@@ -1396,6 +1650,15 @@ def mark_subagent_work_terminal(
             delivered=False,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
+        )
+    if (
+        entry.launch_timed_out
+        and status == "cancelled"
+        and only_if_work_id is not None
+        and not confirms_cancellation
+    ):
+        return _SubagentDeliveryAck(
+            entry=entry, delivered=True, delivered_now=False, reason="launch_unconfirmed"
         )
     new_terminal_identity = identity_key is not None and (
         entry.terminal is None or entry.terminal.identity_key != identity_key
@@ -1718,11 +1981,28 @@ def report_subagent_launch_unconfirmed(child_session_id: str) -> _SubagentDelive
             "title": entry.title,
             "status": "launch_unconfirmed",
             "output": (
-                "Launch is unconfirmed. Keep checking this child; do not create a replacement."
+                "Launch is unconfirmed. "
+                + (
+                    "Codex accepted the input but reported no turn start. "
+                    if entry.awaiting_child_start_since is not None
+                    else ""
+                )
+                + "Keep checking this child; do not create a replacement."
             ),
         }
     )
     return _SubagentDeliveryAck(entry, True, True, "launch_unconfirmed")
+
+
+def _pending_launch_age(entry: _SubagentWorkEntry, now: float) -> float | None:
+    if entry.awaiting_child_start_since is not None and entry.status in {
+        "running",
+        "launch_unconfirmed",
+    }:
+        return now - entry.awaiting_child_start_since
+    if entry.status in {"launching", "launch_unconfirmed"}:
+        return now - entry.created_at
+    return None
 
 
 def reap_stalled_subagent_launches(
@@ -1736,6 +2016,7 @@ def reap_stalled_subagent_launches(
 
     Unknown children remain tracked and are checked on subsequent sweeps.
     Real terminal statuses are left to normal result delivery.
+    A validated native receipt starts a separate deadline for the observed turn-start edge.
     """
     budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
     if budget <= 0:
@@ -1743,12 +2024,16 @@ def reap_stalled_subagent_launches(
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
-        if entry.status not in {"launching", "launch_unconfirmed"}:
+        waited = _pending_launch_age(entry, current)
+        if waited is None:
             continue
-        if current - entry.created_at < budget:
+        if waited < budget:
             continue
         status = child_statuses.get(entry.child_session_id) if child_statuses else None
-        if status in {"running", "in_progress", "waiting"}:
+        if (
+            status in {"running", "in_progress", "waiting"}
+            and entry.awaiting_child_start_since is None
+        ):
             mark_subagent_work_started(entry.child_session_id)
             continue
         if status in _SUBAGENT_TERMINAL_STATUSES:
@@ -1757,7 +2042,7 @@ def reap_stalled_subagent_launches(
             continue
         _logger.warning(
             "Sub-agent launch unconfirmed after %.0fs: parent=%s child=%s",
-            current - entry.created_at,
+            waited,
             entry.parent_session_id,
             entry.child_session_id,
         )
@@ -1780,7 +2065,7 @@ async def run_subagent_launch_reaper(
     check_remote_members: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+    Periodically report stalled sub-agent dispatches via :func:`reap_stalled_subagent_launches`.
 
     Runs until cancelled; started by the runner entrypoint alongside the
     process manager. Sweep errors are logged and never end the loop.
@@ -1803,10 +2088,8 @@ async def run_subagent_launch_reaper(
             statuses: dict[str, str | None] = {}
             if child_status is not None and budget > 0:
                 for entry in list(_subagent_work_by_child.values()):
-                    if (
-                        entry.status in {"launching", "launch_unconfirmed"}
-                        and now - entry.created_at >= budget
-                    ):
+                    waited = _pending_launch_age(entry, now)
+                    if waited is not None and waited >= budget:
                         statuses[entry.child_session_id] = await child_status(
                             entry.child_session_id
                         )

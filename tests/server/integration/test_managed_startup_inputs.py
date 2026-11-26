@@ -9,6 +9,7 @@ import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -1836,6 +1837,146 @@ async def test_native_receipt_wakes_the_host_worker(
     assert env.conv_store.list_pending_inputs(session_id) == []
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and woken == [conv.host_id]
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["live-watch", "restarted-worker"])
+async def test_unconfirmed_native_submission_stops_holding_later_inputs(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, restart: bool
+) -> None:
+    """A submitted input the CLI never echoes is failed, so later messages are not held."""
+    env = startup_env
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "omnigent.server.startup_inputs.time", SimpleNamespace(time=lambda: clock[0])
+    )
+    timeout = 600.0 if restart else 0.0
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", timeout)
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": _TEXT}], stable_id=entry.id
+    )
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id, wait_for_receipt=True)
+        return {"queued": True, "pending_id": pending_id}
+
+    startup.dispatch = dispatch
+    woken: list[str] = []
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", woken.append)
+    await startup._deliver(env.app, session_id, entry)
+    if restart:
+        [submitted] = env.conv_store.list_pending_inputs(session_id)
+        assert submitted.status == "incomplete"
+        assert submitted.data.startup_options.receipt_deadline == clock[0] + timeout
+        await startup.shutdown()
+        pending_inputs.reset_for_tests()
+        clock[0] += timeout + 1
+        restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+        host = env.conv_store.get_conversation(session_id)
+        assert host is not None
+        assert await restarted._recover_session(
+            env.app, session_id, SimpleNamespace(host_id=host.host_id)
+        )
+    else:
+        await asyncio.gather(*startup._receipt_watches)
+
+    [failed] = env.conv_store.list_pending_inputs(session_id)
+    assert failed.id == entry.id and failed.status == "failed"
+    assert not await startup.has_undelivered(session_id)
+    assert pending_inputs.pending_id_for_stable_id(session_id, entry.id) is None
+    [notice] = env.conv_store.list_items(session_id).data
+    assert isinstance(notice.data, ErrorData) and notice.data.code == "startup_input_failed"
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and woken == [conv.host_id]
+
+
+async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
+    startup_env: _Env,
+) -> None:
+    env = startup_env
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id, wait_for_receipt=True)
+        return {"queued": True, "pending_id": "pending"}
+
+    startup.dispatch = dispatch
+    await startup._deliver(env.app, session_id, entry)
+    [submitted] = env.conv_store.list_pending_inputs(session_id)
+    deadline = submitted.data.startup_options.receipt_deadline
+    assert deadline is not None
+    pending_inputs.reset_for_tests()
+    await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+    assert env.conv_store.list_pending_inputs(session_id) == []
+
+    assert not await startup._settle_unconfirmed(session_id, entry.id, deadline)
+    assert not [
+        item
+        for item in env.conv_store.list_items(session_id).data
+        if isinstance(item.data, ErrorData)
+    ]
+
+
+async def test_late_receipt_after_restart_preserves_the_next_saved_input(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "omnigent.server.startup_inputs.time", SimpleNamespace(time=lambda: clock[0])
+    )
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    first = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id, wait_for_receipt=True)
+        return {
+            "queued": True,
+            "pending_id": pending_inputs.make_pending_id(session_id, context.input_id),
+        }
+
+    startup.dispatch = dispatch
+    await startup._deliver(env.app, session_id, first)
+    await startup.shutdown()
+    pending_inputs.reset_for_tests()
+    clock[0] += 601.0
+
+    restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+    restarted.dispatch = dispatch
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert await restarted._recover_session(
+        env.app, session_id, SimpleNamespace(host_id=conv.host_id)
+    )
+    next_text = "The message submitted after restart"
+    next_item = await restarted.enqueue(
+        session_id,
+        SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": next_text}]},
+        ),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    try:
+        await restarted._deliver(env.app, session_id, next_item)
+        await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+        assert {
+            item.id: item.status for item in env.conv_store.list_pending_inputs(session_id)
+        } == {
+            first.id: "failed",
+            next_item.id: "incomplete",
+        }
+        await _simulate_transcript_forwarder_echo(env.client, session_id, next_text)
+        assert [item.id for item in env.conv_store.list_pending_inputs(session_id)] == [first.id]
+    finally:
+        await restarted.shutdown()
 
 
 async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:

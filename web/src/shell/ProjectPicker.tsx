@@ -4,6 +4,7 @@ import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useProjects } from "@/hooks/useConversations";
 import { TablerRowIcon, parseProjectIcon } from "@/lib/tablerIcon";
 import { cn } from "@/lib/utils";
+import { canCreateProject, projectsMatching } from "./projectChoices";
 
 /**
  * Leading visual for a project row: the project's emoji icon when set,
@@ -61,13 +62,9 @@ export function ProjectPicker({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
   const trimmed = search.trim();
-  const filtered = trimmed
-    ? projects.filter((project) => project.name.toLowerCase().includes(trimmed.toLowerCase()))
-    : projects;
+  const filtered = projectsMatching(projects, search);
   // Offer create only when the typed name isn't already an exact project.
-  const canCreate =
-    trimmed.length > 0 &&
-    !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
+  const canCreate = canCreateProject(projects, search);
   const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
 
   return (

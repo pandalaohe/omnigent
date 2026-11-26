@@ -39,6 +39,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     InjectionDeliveryAmbiguous,
+    NativeTurnAcceptance,
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
@@ -1342,6 +1343,12 @@ async def test_native_refusal_recovers_with_real_client(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_accepted"
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        response_id="codex_turn_accepted",
+    )
 
 
 @pytest.mark.parametrize("active_turn_id", [None, "turn_existing"])
@@ -1405,10 +1412,16 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert state.active_turn_id == attrs["native_turn_id"]
         assert state.input_id == identity["input_stable_id"]
         assert state.input_turn_id == attrs["native_turn_id"]
+        assert events[0].native_acceptance == NativeTurnAcceptance(
+            session_id=state.session_id,
+            thread_id=state.thread_id,
+            response_id=f"codex_{attrs['native_turn_id']}",
+        )
     else:
         assert attrs["native_turn_id"] is None
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id
+        assert events[0].native_acceptance is None
     assert "private prompt" not in json.dumps(attrs)
 
 
@@ -1647,7 +1660,8 @@ def test_goal_draining_refusal_retains_restart_remediation(
     assert failure.code == CODEX_APP_SERVER_STOPPED.code
     assert failure.remediation == CODEX_APP_SERVER_STOPPED.remediation
     assert failure.undelivered is True
-    assert failure.preserve_session is (active_turn_id is not None)
+    # A refused goal has no acknowledged turn owned by this executor.
+    assert failure.preserve_session is True
     assert _GoalDrainingClient.requests == [
         ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish tests"})
     ]
@@ -3116,6 +3130,12 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
     ]
     assert outcomes[1]["requested_native_turn_id"] is None
     assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        response_id="codex_turn_1",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3558,6 +3578,9 @@ def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
     events = _collect_turn_events(executor, "follow up")
 
     assert [type(event) for event in events] == [TurnComplete]
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id="conv_123", thread_id="thread_123", response_id="codex_turn_a"
+    )
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None

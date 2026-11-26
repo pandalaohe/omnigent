@@ -3,6 +3,11 @@ import { DicesIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { isHexColor } from "@/lib/customTheme";
 import { cn } from "@/lib/utils";
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOwnership,
+} from "@/pages/settings/search/settingsOwnership";
+
 import { ColorSpectrum, hsvToHex } from "./ColorSpectrum";
 
 function randomColor(): string {
@@ -25,6 +30,8 @@ export function ThemeColorPicker({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  // Under a Settings owner the trigger is that part, named by its value; the popover is its overlay.
+  const owned = useSettingsOwnership();
   const [draft, setDraft] = useState(value.toUpperCase());
 
   useEffect(() => setDraft(value.toUpperCase()), [value]);
@@ -45,7 +52,11 @@ export function ThemeColorPicker({
         <PopoverTrigger asChild>
           <button
             type="button"
-            aria-label={`${label}: ${value.toUpperCase()}`}
+            {...owned.control({
+              name: { runtime: value.toUpperCase() },
+              ...SETTINGS_NO_TOOLTIP,
+              outside: { "aria-label": `${label}: ${value.toUpperCase()}` },
+            })}
             data-testid={`${testId}-trigger`}
             className={cn(
               "group flex h-10 w-44 items-center gap-2 rounded-xl border border-input bg-background p-1.5 text-left shadow-xs outline-none transition-[border-color,box-shadow,transform] dark:bg-input",
@@ -64,6 +75,7 @@ export function ThemeColorPicker({
           </button>
         </PopoverTrigger>
         <PopoverContent
+          {...owned.overlay()}
           align="end"
           sideOffset={8}
           className="w-72 gap-0 overflow-hidden rounded-2xl border border-border/70 bg-popover p-0 shadow-xl ring-1 ring-black/5"

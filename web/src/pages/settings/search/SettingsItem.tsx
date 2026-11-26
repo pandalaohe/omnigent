@@ -17,7 +17,7 @@ import {
 } from "./settingsReveal";
 
 interface SettingsItemProps extends Omit<ComponentProps<"div">, "children"> {
-  entry: SettingsEntry;
+  entry: SettingsEntry | undefined;
   children: ReactNode;
 }
 
@@ -28,8 +28,8 @@ export function SettingsItem({ entry, children, className, ...rest }: SettingsIt
   return (
     <div
       ref={rowRef}
-      data-settings-item={entry.id}
-      className={cn(SETTINGS_HIGHLIGHT_CLASS, className)}
+      data-settings-item={entry?.id}
+      className={cn(entry && SETTINGS_HIGHLIGHT_CLASS, className)}
       {...rest}
     >
       {children}
@@ -46,15 +46,18 @@ export function useSettingsNavigationClock() {
 }
 
 /** Reveals the row in `rowRef` when the URL names `entry`; a newer navigation cancels it. */
-function useSettingsRowReveal(entry: SettingsEntry, rowRef: RefObject<HTMLElement | null>) {
+function useSettingsRowReveal(
+  entry: SettingsEntry | undefined,
+  rowRef: RefObject<HTMLElement | null>,
+) {
   // A new location object per navigation, so the same hash chosen again, or reached by Back,
   // reveals again.
   const location = useLocation();
-  useEffect(() => registerSettingsAnchor(entry.id), [entry.id]);
+  useEffect(() => (entry ? registerSettingsAnchor(entry.id) : undefined), [entry]);
   useEffect(() => {
     const target = parseSettingsHash(location.hash);
     const row = rowRef.current;
-    if (!target || !row) return;
+    if (!target || !row || !entry) return;
     const controller = new AbortController();
     revealSettingsRow({ row, entry, target, location, signal: controller.signal });
     return () => controller.abort();

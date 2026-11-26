@@ -14,7 +14,7 @@ import { cn } from "@/lib/utils";
 import type { ParsedSystemMessage, SystemMessageKind } from "@/lib/systemMessage";
 
 const KIND_ICON: Record<
-  Exclude<SystemMessageKind, "subagent_wake" | "question_answer">,
+  Exclude<SystemMessageKind, "subagent_wake" | "question_answer" | "session_resumed">,
   LucideIcon
 > = {
   task_completed: CheckCircle2Icon,
@@ -43,7 +43,7 @@ interface SystemMessageViewProps {
  */
 export function SystemMessageView({ message }: SystemMessageViewProps) {
   const [open, setOpen] = useState(false);
-  if (message.kind === "subagent_wake") return null;
+  if (message.kind === "subagent_wake" || message.kind === "session_resumed") return null;
   if (message.kind === "question_answer") {
     return (
       <div

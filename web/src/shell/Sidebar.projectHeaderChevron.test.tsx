@@ -1,5 +1,6 @@
 import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -97,16 +98,15 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("highlights the project row instead of global New session for a project-scoped composer", () => {
+  it("lists a highlighted ghost row under the project for a project-scoped composer", () => {
     renderSidebar("/?project=My%20Project");
 
     const header = headerButton("Use My Project for new sessions");
     expect(header).toHaveAttribute("aria-pressed", "true");
-    expect(header).toHaveClass(
+    const ghost = within(header.closest("section")!).getByRole("link", { name: /^New session$/ });
+    expect(ghost).toHaveAttribute("href", "/?project=My%20Project");
+    expect(ghost).toHaveClass(
       "bg-[var(--sidebar-active)]",
-      "text-[var(--sidebar-active-foreground)]",
-    );
-    expect(header.querySelector(".lucide-folder")).toHaveClass(
       "text-[var(--sidebar-active-foreground)]",
     );
 
@@ -183,6 +183,46 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(chevron)).not.toMatch(/md:hidden/);
     expect(classOf(chevron)).toMatch(/md:group-hover:opacity-100/);
   });
+});
+
+it("opens the project home from the row and expands or collapses it only from the chevron", () => {
+  localStorage.clear();
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("Open My Project board");
+  const chevron = headerButton("My Project");
+  expect(chevron).toHaveAttribute("aria-expanded", "false");
+
+  fireEvent.click(header);
+  expect(chevron).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+  expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+
+  fireEvent.click(chevron);
+  expect(chevron).toHaveAttribute("aria-expanded", "true");
+  expect(
+    within(header.closest("section")!).queryByRole("link", { name: /^New session$/ }),
+  ).toBeNull();
+  fireEvent.click(header);
+  expect(chevron).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(chevron);
+  expect(chevron).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+});
+
+it("keeps the project target and its collapse toggle when the board is turned off in Settings", () => {
+  localStorage.clear();
+  localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, "false");
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("Use My Project for new sessions");
+  const chevron = headerButton("My Project");
+
+  fireEvent.click(header);
+  expect(header).toHaveAttribute("aria-pressed", "true");
+  expect(header).not.toHaveAttribute("aria-current");
+  expect(chevron).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(chevron);
+  expect(chevron).toHaveAttribute("aria-expanded", "true");
+  localStorage.clear();
 });
 
 it("opens New project without toggling the Projects header", () => {

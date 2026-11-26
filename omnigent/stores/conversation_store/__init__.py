@@ -20,6 +20,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -1005,9 +1006,40 @@ class ConversationStore(ABC):
         expected: str,
         status: str | None,
         expected_labels: Mapping[str, str | None] | None = None,
+        receipt_deadline: float | None = None,
+        expected_receipt_deadline: float | Literal["unset"] | None = None,
     ) -> bool:
-        """Change delivery state, optionally fencing it by live labels and archive status."""
+        """Change delivery state, optionally fencing it by labels or a receipt deadline."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery, expected_conversation
+        return False
 
     def list_host_conversation_ids(
         self,
@@ -3151,6 +3183,10 @@ class ConversationStore(ABC):
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
         """Read host metadata and canonical profile labels by their complete unique keys."""
+        raise NotImplementedError
+
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
         raise NotImplementedError
 
     def bind_profiled_host(

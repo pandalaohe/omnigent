@@ -493,7 +493,7 @@ def test_long_model_and_permission_remain_single_row(
     label = page.get_by_test_id("composer-agent-config-value")
     expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
-    if width < 768:
+    if width < 1181:
         page.get_by_label("Message the agent").focus()
     expect(permission).to_be_visible()
     if width == 3200:
@@ -542,7 +542,7 @@ def test_prompt_history_preserves_drafts_during_real_arrow_navigation(
     page.add_init_script(
         f"localStorage.setItem({json.dumps(history_key)}, {json.dumps(json.dumps(history))})"
     )
-    page.set_viewport_size({"width": 1100, "height": 900})
+    page.set_viewport_size({"width": 1200, "height": 900})
     page.goto(chat.url)
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()

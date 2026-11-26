@@ -40,7 +40,7 @@ from tests.runner.conftest import (
 )
 
 # Reuse the proven runner-turn stubs from the sessions-native suite.
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"
@@ -3592,6 +3592,42 @@ async def test_drain_inbox_malformed_peer_copy_uses_empty_strings(payload: dict[
         'messaged your sub-agent : (): "". Its turn ended : "". '
         "Full text: sys_session_get_history .]"
     )
+
+
+@pytest.mark.parametrize("settle_reported_start", [False, True])
+async def test_recovered_child_steered_after_restart_is_not_start_bounded(
+    _clean_subagent_registry: None,
+    settle_reported_start: bool,
+) -> None:
+    """A steer into a turn that survived the restart reports no new start, so it is not bounded."""
+    server = _RecoveryServerClient([_child_summary(current_task_status="in_progress")])
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None and entry.status == "waiting"
+    if settle_reported_start:
+        subagent_work.note_subagent_child_start_reported(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
+        subagent_work.note_subagent_child_turn_settled(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
+
+    # What a codex-native steer's clean delivery end does to the reused entry.
+    subagent_work.mark_subagent_work_started(CHILD_SESSION_ID)
+    accept_subagent_turn(
+        CHILD_SESSION_ID,
+        thread_id="thread_recovered",
+        response_id="codex_recovered",
+        now=entry.created_at,
+    )
+
+    assert (
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 900, timeout_s=180)
+        == []
+    )
+    assert entry.status == "running"
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
 
 
 def _wake_candidate(
