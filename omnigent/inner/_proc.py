@@ -20,14 +20,17 @@ package.
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import ntpath
 import os
 import signal
 import subprocess
 import sys
 import time
 import weakref
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Protocol, TypedDict
 
@@ -92,6 +95,8 @@ _owned_process_identities: weakref.WeakKeyDictionary[object, dict[int, float]] =
 )
 _CENSUS_MAX_ITERATIONS = 3
 _CENSUS_MAX_SECONDS = 0.05
+_WINDOWS_REAP_SETTLE_SECONDS = 0.05
+_WINDOWS_TASKKILL_BUDGET_SECONDS = 5.0
 
 
 class SpawnKwargs(TypedDict, total=False):
@@ -119,22 +124,38 @@ class _ProcessLike(Protocol):
         pass
 
 
+def windows_no_window_flags() -> int:
+    """Return ``CREATE_NO_WINDOW`` on Windows, or ``0`` on POSIX."""
+    if IS_POSIX:
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def no_window_kwargs() -> SpawnKwargs:
+    """Keyword args suppressing a Windows console window without changing process grouping."""
+    flags = windows_no_window_flags()
+    if not flags:
+        return {}
+    return {"creationflags": flags}
+
+
 def spawn_kwargs() -> SpawnKwargs:
     """
     Keyword args that isolate a child process into its own group/session.
 
     On POSIX returns ``{"start_new_session": True}`` (new session, so the child
     becomes a process-group leader and ``os.killpg(pid, ...)`` reaps the whole
-    tree). On Windows returns ``{"creationflags": CREATE_NEW_PROCESS_GROUP}``
-    so the child is in its own Ctrl-C group and can be torn down independently
-    of the parent console.
+    tree). On Windows returns
+    ``{"creationflags": CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW}`` so the
+    child is in its own Ctrl-C group, opens no console window, and can be torn
+    down independently of the parent console.
 
     Pass via ``**spawn_kwargs()`` to :class:`subprocess.Popen` or
     :func:`asyncio.create_subprocess_exec`.
     """
     if IS_POSIX:
         return {"start_new_session": True}
-    return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+    return {"creationflags": _CREATE_NEW_PROCESS_GROUP | windows_no_window_flags()}
 
 
 def pipe_supervised_command(command: str, *args: str) -> tuple[str, ...]:
@@ -183,6 +204,14 @@ def refresh_process_tree(process: _ProcessLike | None) -> None:
     if expected_root is not None and current.get(pid) != expected_root:
         return
     _remember_identities(process, current)
+
+
+def has_unresolved_identities(process: _ProcessLike) -> bool:
+    """Whether teardown retained unconfirmed descendant identities for retry."""
+    try:
+        return bool(_owned_process_identities.get(process))
+    except TypeError:
+        return False
 
 
 def _owned_process_group(process: _ProcessLike, *, remove: bool = False) -> int | None:
@@ -234,10 +263,10 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     """Return the process plus all live descendants, innermost-last is not guaranteed."""
     try:
         root = psutil.Process(pid)
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return []
     procs = [root]
-    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+    with suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         procs.extend(root.children(recursive=True))
     return procs
 
@@ -308,7 +337,7 @@ def _snapshot_identities(pid: int) -> dict[int, float]:
     for proc in _walk_descendants(pid):
         if proc.pid <= 1 or proc.pid == os.getpid():
             continue
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             identities[proc.pid] = _process_start_stamp(proc)
     return identities
 
@@ -345,7 +374,7 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
                 proc.kill()
             else:
                 proc.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
 
@@ -541,6 +570,167 @@ def kill_tree(process: _ProcessLike | None) -> None:
     if not group_signaled and not identities:
         with suppress(Exception):
             process.kill()
+    if not IS_POSIX:
+        unresolved = _reap_windows_survivors(pid, identities)
+        if unresolved:
+            _remember_identities(process, unresolved)
+
+
+def _is_windows_drive_absolute(path: str) -> bool:
+    """Whether ``path`` is a local Windows drive-rooted path like ``C:\\Windows``."""
+    return (
+        len(path) >= 3
+        and path[0].isascii()
+        and path[0].isalpha()
+        and path[1] == ":"
+        and path[2] in ("\\", "/")
+    )
+
+
+def _windows_system_directory() -> str | None:
+    """Return the OS-reported Windows system directory, or ``None`` if unavailable."""
+    windll = getattr(ctypes, "windll", None)
+    kernel32 = getattr(windll, "kernel32", None)
+    get_system_dir = getattr(kernel32, "GetSystemDirectoryW", None)
+    if not callable(get_system_dir):
+        return None
+    buf = ctypes.create_unicode_buffer(260)
+    raw_length = get_system_dir(buf, len(buf))
+    if not isinstance(raw_length, int):
+        return None
+    length = raw_length
+    if length >= len(buf):
+        buf = ctypes.create_unicode_buffer(length + 1)
+        raw_length = get_system_dir(buf, len(buf))
+        if not isinstance(raw_length, int):
+            return None
+        length = raw_length
+    if length <= 0:
+        return None
+    system_dir = buf.value.strip()
+    if not _is_windows_drive_absolute(system_dir):
+        return None
+    return system_dir
+
+
+def _windows_taskkill_path() -> str | None:
+    """Return the absolute path to Windows ``taskkill.exe``, or ``None`` if unresolvable."""
+    system_dir = _windows_system_directory()
+    if system_dir is not None:
+        return ntpath.join(system_dir, "taskkill.exe")
+    system_root = (os.environ.get("SYSTEMROOT") or "").strip()
+    if not _is_windows_drive_absolute(system_root):
+        return None
+    return ntpath.join(system_root, "System32", "taskkill.exe")
+
+
+@contextmanager
+def _pin_windows_process(pid: int) -> Iterator[bool]:
+    """Hold a Windows process handle so the kernel cannot recycle ``pid`` mid-kill."""
+    windll = getattr(ctypes, "windll", None)
+    kernel32 = getattr(windll, "kernel32", None)
+    open_process = getattr(kernel32, "OpenProcess", None)
+    close_handle = getattr(kernel32, "CloseHandle", None)
+    if not callable(open_process) or not callable(close_handle):
+        yield True
+        return
+    # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) keeps the PID reserved while open.
+    handle = open_process(0x1000, False, pid)
+    if not handle:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        with suppress(Exception):
+            close_handle(handle)
+
+
+def _safe_surviving_snapshot(identities: dict[int, float]) -> dict[int, float]:
+    """Best-effort survivor snapshot that preserves identities on OS/psutil errors."""
+    try:
+        return surviving_process_snapshot(identities)
+    except (OSError, psutil.Error):
+        return dict(identities)
+
+
+def _verified_windows_survivors(identities: dict[int, float]) -> dict[int, float]:
+    """Return only live survivors whose PID and start stamp still match."""
+    verified: dict[int, float] = {}
+    for pid, stamp in identities.items():
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) == stamp and proc.status() != psutil.STATUS_ZOMBIE:
+                verified[pid] = stamp
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return verified
+
+
+def _run_windows_taskkill(taskkill_path: str, pid: int, *, timeout: float) -> None:
+    """Best-effort forced whole-tree kill via absolute-path ``taskkill.exe``."""
+    if pid <= 1 or pid == os.getpid() or timeout <= 0:
+        return
+    with suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            [taskkill_path, "/T", "/F", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout,
+            **no_window_kwargs(),
+        )
+
+
+def _wait_briefly_for_exit(identities: dict[int, float], timeout: float) -> dict[int, float]:
+    """Wait briefly for signaled processes to clear before escalating to taskkill."""
+    survivors = _verified_windows_survivors(identities)
+    if not survivors or timeout <= 0:
+        return survivors
+    deadline = time.monotonic() + timeout
+    for pid, stamp in list(survivors.items()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired, OSError):
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) == stamp:
+                proc.wait(timeout=remaining)
+    return _verified_windows_survivors(identities)
+
+
+def _reap_windows_survivors(
+    root_pid: int,
+    identities: dict[int, float],
+) -> dict[int, float]:
+    """Fall back to ``taskkill.exe /T /F`` on Windows for verified survivors only."""
+    if IS_POSIX or not identities:
+        return {}
+    survivors = _wait_briefly_for_exit(identities, _WINDOWS_REAP_SETTLE_SECONDS)
+    if not survivors:
+        return _safe_surviving_snapshot(identities)
+    taskkill_path = _windows_taskkill_path()
+    if taskkill_path is None:
+        return _safe_surviving_snapshot(identities)
+    deadline = time.monotonic() + _WINDOWS_TASKKILL_BUDGET_SECONDS
+    ordered_pids = [root_pid] if root_pid in survivors else []
+    ordered_pids.extend(pid for pid in survivors if pid != root_pid)
+    for target_pid in ordered_pids:
+        if deadline - time.monotonic() <= 0:
+            break
+        with _pin_windows_process(target_pid) as pinned:
+            if not pinned:
+                continue
+            if not _verified_windows_survivors({target_pid: survivors[target_pid]}):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _run_windows_taskkill(taskkill_path, target_pid, timeout=remaining)
+    return _safe_surviving_snapshot(identities)
 
 
 def _wait_gone(pid: int, timeout: float) -> None:

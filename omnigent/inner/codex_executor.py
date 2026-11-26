@@ -695,6 +695,7 @@ async def _codex_cli_version_text(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
+            **_proc.no_window_kwargs(),
         )
     except OSError:
         return None
@@ -2553,6 +2554,7 @@ def _probe_codex_model_catalog(
             timeout=timeout,
             env={**os.environ, "CODEX_HOME": str(source_home)},
             check=False,
+            **_proc.no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("could not read the codex model catalog (%s)", exc)
@@ -2770,6 +2772,7 @@ def write_required_brokered_model_catalog(
             timeout=timeout,
             env=env,
             check=False,
+            **_proc.no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc

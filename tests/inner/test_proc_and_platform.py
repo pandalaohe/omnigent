@@ -420,9 +420,395 @@ def test_resolve_repo_symlink_leaves_real_specs_untouched(tmp_path: Path) -> Non
 def test_spawn_kwargs_shape_matches_platform() -> None:
     kw = _proc.spawn_kwargs()
     if os.name == "nt":
-        assert kw == {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        assert kw == {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        }
     else:
         assert kw == {"start_new_session": True}
+
+
+def test_windows_spawn_and_no_window_kwargs_with_platform_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    no_window = 0x08000000
+    new_group = 0x00000200
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    assert _proc.windows_no_window_flags() == 0
+    assert _proc.no_window_kwargs() == {}
+    assert _proc.spawn_kwargs() == {"start_new_session": True}
+
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    assert _proc.windows_no_window_flags() == no_window
+    assert _proc.no_window_kwargs() == {"creationflags": no_window}
+    assert _proc.spawn_kwargs() == {"creationflags": new_group | no_window}
+
+
+def test_windows_taskkill_path_requires_absolute_system_dir_or_systemroot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: r"D:\WinOS\System32")
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Ignored")
+    assert _proc._windows_taskkill_path() == r"D:\WinOS\System32\taskkill.exe"
+
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: None)
+    monkeypatch.setenv("SYSTEMROOT", r"D:\WinOS")
+    assert _proc._windows_taskkill_path() == r"D:\WinOS\System32\taskkill.exe"
+
+    for invalid in (
+        "Windows",
+        r"\Windows",
+        r"D:Windows",
+        r"\\host\share\Windows",
+        r"\\?\UNC\host\share\Windows",
+        r"9:\Windows",
+        "",
+        "   ",
+    ):
+        monkeypatch.setenv("SYSTEMROOT", invalid)
+        assert _proc._windows_taskkill_path() is None
+
+    monkeypatch.delenv("SYSTEMROOT", raising=False)
+    assert _proc._windows_taskkill_path() is None
+
+
+def test_kill_tree_windows_skips_taskkill_when_psutil_reaps_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeProc:
+        def __init__(self, pid: int, create_time: float) -> None:
+            self.pid = pid
+            self._create_time = create_time
+            self.alive = True
+
+        def create_time(self) -> float:
+            return self._create_time
+
+        def status(self) -> str:
+            if not self.alive:
+                raise psutil.NoSuchProcess(self.pid)
+            return psutil.STATUS_RUNNING
+
+        def children(self, *, recursive: bool = False) -> list[_FakeProc]:
+            return []
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    fake_root = _FakeProc(50100, 10.0)
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: fake_root)
+    run_mock = Mock()
+    monkeypatch.setattr(_proc.subprocess, "run", run_mock)
+
+    handle = Mock(pid=50100, returncode=None)
+    _proc.kill_tree(handle)
+
+    assert not fake_root.alive
+    run_mock.assert_not_called()
+
+
+def test_kill_tree_windows_falls_back_to_taskkill_for_surviving_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _StubbornProc:
+        def __init__(
+            self,
+            pid: int,
+            create_time: float,
+            children: list[_StubbornProc] | None = None,
+        ) -> None:
+            self.pid = pid
+            self._create_time = create_time
+            self._children = children or []
+            self.alive = True
+
+        def create_time(self) -> float:
+            return self._create_time
+
+        def status(self) -> str:
+            if not self.alive:
+                raise psutil.NoSuchProcess(self.pid)
+            return psutil.STATUS_RUNNING
+
+        def children(self, *, recursive: bool = False) -> list[_StubbornProc]:
+            return list(self._children)
+
+        def kill(self) -> None:
+            # Simulate a process that psutil fails to terminate cleanly.
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise psutil.TimeoutExpired(timeout or 0.0, self.pid)
+
+    child = _StubbornProc(50202, 20.0)
+    root = _StubbornProc(50201, 10.0, children=[child])
+    table = {root.pid: root, child.pid: child}
+
+    def _lookup(pid: int) -> _StubbornProc:
+        proc = table[pid]
+        if not proc.alive:
+            raise psutil.NoSuchProcess(pid)
+        return proc
+
+    taskkill_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        taskkill_calls.append((argv, kwargs))
+        # /T on the root clears both root and child, so child needs no second call.
+        if argv[-1] == str(root.pid):
+            root.alive = False
+            child.alive = False
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_WINDOWS_REAP_SETTLE_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: None)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setattr(_proc.psutil, "Process", _lookup)
+    monkeypatch.setattr(_proc.subprocess, "run", _fake_run)
+
+    handle = Mock(pid=root.pid, returncode=None)
+    _proc.kill_tree(handle)
+
+    assert len(taskkill_calls) == 1
+    argv, kwargs = taskkill_calls[0]
+    assert argv == [r"C:\Windows\System32\taskkill.exe", "/T", "/F", "/PID", "50201"]
+    assert kwargs["creationflags"] == 0x08000000
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.DEVNULL
+
+
+def test_kill_tree_windows_taskkills_surviving_descendant_after_root_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Node:
+        def __init__(
+            self,
+            pid: int,
+            create_time: float,
+            *,
+            dies_on_kill: bool,
+            children: list[_Node] | None = None,
+        ) -> None:
+            self.pid = pid
+            self._create_time = create_time
+            self._dies_on_kill = dies_on_kill
+            self._children = children or []
+            self.alive = True
+
+        def create_time(self) -> float:
+            return self._create_time
+
+        def status(self) -> str:
+            if not self.alive:
+                raise psutil.NoSuchProcess(self.pid)
+            return psutil.STATUS_RUNNING
+
+        def children(self, *, recursive: bool = False) -> list[_Node]:
+            return list(self._children)
+
+        def kill(self) -> None:
+            if self._dies_on_kill:
+                self.alive = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.alive:
+                raise psutil.TimeoutExpired(timeout or 0.0, self.pid)
+            return 0
+
+    survivor = _Node(50302, 22.0, dies_on_kill=False)
+    root = _Node(50301, 11.0, dies_on_kill=True, children=[survivor])
+    table = {root.pid: root, survivor.pid: survivor}
+
+    def _lookup(pid: int) -> _Node:
+        proc = table[pid]
+        if not proc.alive:
+            raise psutil.NoSuchProcess(pid)
+        return proc
+
+    taskkill_pids: list[str] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        taskkill_pids.append(argv[-1])
+        survivor.alive = False
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_WINDOWS_REAP_SETTLE_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: None)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setattr(_proc.psutil, "Process", _lookup)
+    monkeypatch.setattr(_proc.subprocess, "run", _fake_run)
+
+    _proc.kill_tree(Mock(pid=root.pid, returncode=None))
+
+    assert taskkill_pids == ["50302"]
+
+
+def test_kill_tree_windows_skips_taskkill_on_access_denied_and_retains_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unreadable root must never trigger a raw-PID taskkill.
+    def _deny(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    run_mock = Mock()
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_WINDOWS_REAP_SETTLE_SECONDS", 0.001)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setattr(_proc.psutil, "Process", _deny)
+    monkeypatch.setattr(_proc.subprocess, "run", run_mock)
+
+    denied_root = Mock(pid=50401, returncode=None)
+    _proc.kill_tree(denied_root)
+    denied_root.kill.assert_called_once_with()
+    run_mock.assert_not_called()
+
+    # A previously observed descendant that becomes AccessDenied is skipped by
+    # taskkill and retained in _owned_process_identities for later retry.
+    handle = Mock(pid=50402, returncode=0)
+    _proc._owned_process_identities[handle] = {50403: 55.0}
+    _proc.kill_tree(handle)
+    run_mock.assert_not_called()
+    assert _proc.has_unresolved_identities(handle)
+    assert _proc._owned_process_identities.get(handle) == {50403: 55.0}
+
+    # An OSError during final survivor inspection is swallowed and retains identities.
+    handle_err = Mock(pid=50404, returncode=0)
+    _proc._owned_process_identities[handle_err] = {50405: 66.0}
+    monkeypatch.setattr(_proc.psutil, "Process", Mock(side_effect=OSError("probe failed")))
+    _proc.kill_tree(handle_err)
+    run_mock.assert_not_called()
+    assert _proc._owned_process_identities.get(handle_err) == {50405: 66.0}
+
+
+def test_kill_tree_windows_skips_unpinned_target_and_enforces_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @contextlib.contextmanager
+    def _unpinned(_pid: int):
+        yield False
+
+    survivor = Mock(pid=50421)
+    survivor.create_time.return_value = 33.0
+    survivor.status.return_value = psutil.STATUS_RUNNING
+    survivor.children.return_value = []
+    survivor.wait.side_effect = psutil.TimeoutExpired(0.001, 50421)
+
+    run_mock = Mock()
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_WINDOWS_REAP_SETTLE_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: None)
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: survivor)
+    monkeypatch.setattr(_proc.subprocess, "run", run_mock)
+    monkeypatch.setattr(_proc, "_pin_windows_process", _unpinned)
+
+    handle = Mock(pid=50421, returncode=None)
+    _proc.kill_tree(handle)
+    run_mock.assert_not_called()
+    assert _proc.has_unresolved_identities(handle)
+
+
+def test_kill_tree_windows_skips_pid_reused_during_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Node:
+        def __init__(
+            self,
+            pid: int,
+            create_time: float,
+            children: list[_Node] | None = None,
+        ) -> None:
+            self.pid = pid
+            self._create_time = create_time
+            self._children = children or []
+            self.alive = True
+
+        def create_time(self) -> float:
+            return self._create_time
+
+        def status(self) -> str:
+            if not self.alive:
+                raise psutil.NoSuchProcess(self.pid)
+            return psutil.STATUS_RUNNING
+
+        def children(self, *, recursive: bool = False) -> list[_Node]:
+            return list(self._children)
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise psutil.TimeoutExpired(timeout or 0.0, self.pid)
+
+    child = _Node(50412, 20.0)
+    root = _Node(50411, 10.0, children=[child])
+    table = {root.pid: root, child.pid: child}
+
+    def _lookup(pid: int) -> _Node:
+        proc = table[pid]
+        if not proc.alive:
+            raise psutil.NoSuchProcess(pid)
+        return proc
+
+    taskkill_pids: list[str] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        taskkill_pids.append(argv[-1])
+        root.alive = False
+        # Simulate child exiting and its PID being recycled before its own turn.
+        child._create_time = 999.0
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_WINDOWS_REAP_SETTLE_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "_windows_system_directory", lambda: None)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setattr(_proc.psutil, "Process", _lookup)
+    monkeypatch.setattr(_proc.subprocess, "run", _fake_run)
+
+    _proc.kill_tree(Mock(pid=root.pid, returncode=None))
+
+    assert taskkill_pids == ["50411"]
+
+
+def test_kill_tree_windows_never_taskkills_reused_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Reaped:
+        pid = 50501
+        returncode = 0
+
+        def kill(self) -> None:
+            raise AssertionError("must not kill a reused PID")
+
+    reused = Mock(pid=50501)
+    reused.create_time.return_value = 999.0
+    reused.status.return_value = psutil.STATUS_RUNNING
+    reused.children.return_value = []
+    process = _Reaped()
+    _proc._owned_process_identities[process] = {50501: 100.0}
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
+    run_mock = Mock()
+    monkeypatch.setattr(_proc.subprocess, "run", run_mock)
+
+    _proc.kill_tree(process)
+
+    run_mock.assert_not_called()
+    reused.kill.assert_not_called()
 
 
 def test_process_alive_is_a_nondestructive_probe() -> None:

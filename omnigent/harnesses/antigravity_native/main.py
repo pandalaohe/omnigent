@@ -143,6 +143,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner import _proc
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_bridge_common import clear_agent_instructions_preamble
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
@@ -254,6 +255,7 @@ def list_agy_model_options(*, timeout_s: float = 15.0) -> list[dict[str, object]
         text=True,
         check=False,
         timeout=timeout_s,
+        **_proc.no_window_kwargs(),
     )
     if completed.returncode != 0:
         raise RuntimeError(f"agy models failed (exit {completed.returncode})")
