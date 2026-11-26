@@ -164,17 +164,28 @@ function ServiceConnection({
       </div>
       <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
       <div className="flex flex-wrap gap-2">
-        {service.auth === "bearer" && (
-          <Button
-            data-settings-row-action={service.connected ? "updateToken" : "connect"}
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => setEditing(!editing)}
-          >
-            {service.connected ? "Update token" : "Connect"}
-          </Button>
-        )}
+        {service.auth === "bearer" &&
+          (service.connected ? (
+            <Button
+              data-settings-row-action="updateToken"
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setEditing(!editing)}
+            >
+              Update token
+            </Button>
+          ) : (
+            <Button
+              data-settings-row-action="connect"
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setEditing(!editing)}
+            >
+              Connect
+            </Button>
+          ))}
         {service.auth === "oauth" && service.connect_provider !== null && (
           <Button asChild size="sm" variant="outline" disabled={busy}>
             <a
