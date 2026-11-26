@@ -268,14 +268,17 @@ async def test_create_claude_session_persists_terminal_launch_args() -> None:
     present bridge-id label would split the bridge dir between the
     harness and the terminal.
     """
-    captured: dict[str, bytes] = {}
+    captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """Capture the multipart create body."""
+        """Capture the JSON create body."""
         if request.method == "POST" and request.url.path == "/v1/sessions":
-            captured["body"] = request.content
-            return httpx.Response(201, json={"session_id": "conv_new"})
+            captured["content_type"] = request.headers.get("content-type", "")
+            captured["json"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(201, json={"id": "conv_new"})
         return httpx.Response(404, json={})
+
+    from omnigent.db.utils import builtin_agent_id
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://e.com"
@@ -288,11 +291,38 @@ async def test_create_claude_session_persists_terminal_launch_args() -> None:
         )
 
     assert session_id == "conv_new"
-    body = captured["body"]
-    assert b'"terminal_launch_args"' in body
-    assert b"--dangerously-skip-permissions" in body
+    assert captured["content_type"].startswith("application/json")
+    payload = captured["json"]
+    assert payload["agent_id"] == builtin_agent_id("claude-native-ui")
+    assert payload["terminal_launch_args"] == ["--dangerously-skip-permissions"]
     # bridge_id=None → the bridge-id label must NOT be written.
-    assert BRIDGE_ID_LABEL_KEY.encode() not in body
+    assert BRIDGE_ID_LABEL_KEY not in payload["labels"]
+
+
+async def test_create_claude_session_falls_back_to_bundle_on_404() -> None:
+    """When an unseeded server rejects the built-in agent id with 404, upload the bundle."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content_type = request.headers.get("content-type", "")
+        requests.append(content_type)
+        if content_type.startswith("application/json"):
+            return httpx.Response(404, json={"detail": "agent not found"})
+        return httpx.Response(201, json={"session_id": "conv_fallback"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        session_id = await claude_native._create_claude_session(
+            client,
+            b"bundle-bytes",
+            bridge_id=None,
+        )
+
+    assert session_id == "conv_fallback"
+    assert len(requests) == 2
+    assert requests[0].startswith("application/json")
+    assert requests[1].startswith("multipart/form-data")
 
 
 async def test_create_claude_session_stamps_passed_effort_over_settings(
@@ -302,12 +332,12 @@ async def test_create_claude_session_stamps_passed_effort_over_settings(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
-    captured: dict[str, bytes] = {}
+    captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """Capture the multipart create body."""
-        captured["body"] = request.content
-        return httpx.Response(201, json={"session_id": "conv_new"})
+        """Capture the JSON create body."""
+        captured["json"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(201, json={"id": "conv_new"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://e.com"
@@ -319,7 +349,7 @@ async def test_create_claude_session_stamps_passed_effort_over_settings(
             claude_args=("--model", "opus", "--effort", "xhigh"),
         )
 
-    assert b'"reasoning_effort": "xhigh"' in captured["body"]
+    assert captured["json"]["reasoning_effort"] == "xhigh"
 
 
 def _install_daemon_seam_mocks(

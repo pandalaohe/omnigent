@@ -192,9 +192,11 @@ def mode_values(
     context: ModeContext,
     acp_options: Sequence[Mapping[str, str]] | None = None,
 ) -> frozenset[str]:
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
     if context not in {"default", "create"}:
         raise ValueError(f"unknown mode context: {context!r}")
-    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+    if field == "permission" and is_acp_harness(harness):
         return frozenset(row["value"] for row in (acp_options or []) if row.get("value"))
     declared = mode_set(harness, field)
     if declared is None or declared.options == "per-model":
@@ -208,7 +210,9 @@ def mode_for_concept(
     acp_options: Sequence[Mapping[str, str]] | None = None,
 ) -> str | None:
     """Find the first declared permission mode with this meaning."""
-    if acp_options is not None and (harness == "acp" or harness.startswith("acp:")):
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
+    if acp_options is not None and is_acp_harness(harness):
         return next(
             (
                 row["value"]
@@ -230,12 +234,14 @@ def valid_mode(
     context: ModeContext,
     acp_options: Sequence[Mapping[str, str]] | None = None,
 ) -> bool:
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
     if context not in {"default", "create"}:
         raise ValueError(f"unknown mode context: {context!r}")
     if not isinstance(value, str):
         return False
     value = _normalized_mode(value, harness, field)
-    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+    if field == "permission" and is_acp_harness(harness):
         return value in mode_values(harness, field, context, acp_options)
     declared = mode_set(harness, field)
     if declared is None:
@@ -273,9 +279,11 @@ def apply_mode(
     acp_options: Sequence[Mapping[str, str]] | None = None,
 ) -> ModeApplication:
     """Validate a declared value, then dispatch only its registered handler."""
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
     if not valid_mode(value, harness, field, context, acp_options):
         raise ValueError(f"unsupported {field} mode {value!r} for {harness!r}")
-    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+    if field == "permission" and is_acp_harness(harness):
         return ModeApplication(
             labels={
                 ACP_SESSION_MODE_LABEL_KEY: value,

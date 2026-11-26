@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Host } from "@/hooks/useHosts";
-import { agentPresentOnHost, agentSettingsPath, groupAgentHarnesses } from "./agentSettings";
+import {
+  agentPresentOnHost,
+  agentSettingsPath,
+  groupAgentHarnesses,
+  harnessSettingsBadgeId,
+} from "./agentSettings";
 
 const host: Host = {
   host_id: "desktop",
@@ -41,11 +46,45 @@ describe("agent settings rows", () => {
         pi: { calling_defaults: { model_options: true, inherits_from: "pi-native" } },
       }),
     ).toEqual(["pi-native", "pi"]);
+    expect(groupAgentHarnesses(["ag-acp", "codex-native", "antigravity-native"])).toEqual([
+      "antigravity-native",
+      "ag-acp",
+      "codex-native",
+    ]);
   });
 
   it("encodes a configured agent and the chosen host once", () => {
     expect(agentSettingsPath("acp:research/one", "host & two")).toBe(
       "/settings/agents/acp%3Aresearch%2Fone?host=host%20%26%20two",
+    );
+  });
+
+  it("resolves deterministic badge ids for ag-acp and remote acp:<slug> built-ins", () => {
+    const products = {
+      "58137a60fc3308392a40de7d8dbc55d8": {
+        key: "58137a60fc3308392a40de7d8dbc55d8",
+        label: "AG ACP",
+        name: "ag-acp",
+        section: "acp" as const,
+        harness: "ag-acp",
+        description: null,
+        source: "builtin" as const,
+        deployed: true,
+      },
+      "8001677c98097148edfa65fb5c334189": {
+        key: "8001677c98097148edfa65fb5c334189",
+        label: "Hermes-fn",
+        name: "hermes-fn",
+        section: "acp" as const,
+        harness: "acp:hermes-fn",
+        description: null,
+        source: "builtin" as const,
+        deployed: true,
+      },
+    };
+    expect(harnessSettingsBadgeId("ag-acp", products)).toBe("58137a60fc3308392a40de7d8dbc55d8");
+    expect(harnessSettingsBadgeId("acp:hermes-fn", products)).toBe(
+      "8001677c98097148edfa65fb5c334189",
     );
   });
 });

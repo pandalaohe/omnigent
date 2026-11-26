@@ -10,7 +10,7 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
@@ -36,7 +36,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
-from omnigent.db.db_models import InvalidUuidError, current_workspace_id
+from omnigent.db.db_models import InvalidUuidError, current_workspace_id, workspace_scope
 from omnigent.debug_logging import (
     add_audit_attrs,
     audit_event_logger,
@@ -1646,7 +1646,7 @@ _ACP_AGENT_PROMPT = (
 )
 
 
-def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+def _build_acp_bundle(*, harness: str, name: str, spawn: bool = False) -> bytes:
     """
     Materialize a one-file ACP picker agent and tar it.
 
@@ -1659,6 +1659,7 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
     :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
     :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
         slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :param spawn: Whether the built-in agent spec opts into ``spawn: true``.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import tempfile
@@ -1667,13 +1668,15 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
 
     from omnigent.spec import materialize_bundle
 
-    raw = {
+    raw: dict[str, Any] = {
         "spec_version": 1,
         "name": name,
         "prompt": _ACP_AGENT_PROMPT,
         "executor": {"type": "omnigent", "config": {"harness": harness}},
         "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
     }
+    if spawn:
+        raw["spawn"] = True
     with tempfile.TemporaryDirectory() as tmpdir:
         source = Path(tmpdir) / "src"
         source.mkdir()
@@ -1766,7 +1769,7 @@ def _ensure_default_acp_agents(
     # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
     # (already a valid slug), not the display label. A row a configured agent already
     # claims is skipped: both seed the same ``builtin_agent_id``.
-    for key in ACP_CLI_HARNESSES:
+    for key, row in ACP_CLI_HARNESSES.items():
         if key in shadowed:
             continue
         owned.add(key)
@@ -1777,9 +1780,93 @@ def _ensure_default_acp_agents(
             artifact_store,
             agent_cache,
             name=key,
-            bundle_bytes=_build_acp_bundle(harness=key, name=key),
+            bundle_bytes=_build_acp_bundle(harness=key, name=key, spawn=row.spawn),
         )
     return frozenset(owned)
+
+
+_REMOTE_ACP_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _ensure_remote_acp_agents(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+    configured_harnesses: Mapping[str, Any] | None,
+) -> list[str]:
+    """Create-only deterministic built-ins for remote host-reported ``acp:<slug>`` entries.
+
+    Remote hosts advertise their configured ``acp:<slug>`` commands in
+    ``configured_harnesses``, while the launch command itself remains in each
+    host's config. Creating a matching built-in row on the server gives those
+    remote ACP entries a stable :func:`builtin_agent_id` for badges, pickers,
+    and session creation. Any pre-existing template or built-in row (including
+    operator-authored ACP bundles) is left untouched; concurrent insert
+    conflicts are ignored as a no-op.
+
+    :returns: Slugs created or already confirmed as matching built-ins.
+    """
+    if not configured_harnesses:
+        return []
+    import hashlib
+
+    from sqlalchemy.exc import IntegrityError
+
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.db.utils import builtin_agent_id
+
+    seeded: list[str] = []
+    for harness, ready in configured_harnesses.items():
+        if not isinstance(harness, str) or not harness.startswith("acp:") or ready is False:
+            continue
+        slug = harness[4:]
+        if not _REMOTE_ACP_SLUG_RE.fullmatch(slug) or slug in ACP_CLI_HARNESSES:
+            continue
+        expected_id = builtin_agent_id(slug)
+        existing = agent_store.get_by_name(slug)
+        if existing is not None:
+            if existing.id != expected_id:
+                _logger.debug(
+                    "Skipping remote ACP seed for %r: template %s owns the name",
+                    slug,
+                    existing.id,
+                )
+                continue
+            try:
+                loaded = agent_cache.load(
+                    existing.id, existing.bundle_location, expand_env=existing.operator_authored
+                )
+                if loaded.spec.executor.harness_kind == harness:
+                    seeded.append(slug)
+                else:
+                    _logger.debug(
+                        "Skipping remote ACP seed for %r: built-in uses harness %r",
+                        slug,
+                        loaded.spec.executor.harness_kind,
+                    )
+            except Exception:
+                _logger.debug(
+                    "Skipping remote ACP seed for %r: existing built-in spec unreadable",
+                    slug,
+                    exc_info=True,
+                )
+            continue
+        bundle_bytes = _build_acp_bundle(harness=harness, name=slug)
+        bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
+        bundle_key = f"{expected_id}/{bundle_hash}"
+        artifact_store.put(bundle_key, bundle_bytes)
+        try:
+            agent_store.create(expected_id, slug, bundle_key)
+        except IntegrityError:
+            _logger.debug(
+                "Skipping remote ACP seed for %r: concurrent insert already created the row",
+                slug,
+            )
+            continue
+        agent_cache.evict(expected_id)
+        _logger.info("Registered remote ACP built-in %s agent as %s", slug, expected_id)
+        seeded.append(slug)
+    return seeded
 
 
 def _build_codex_sdk_bundle() -> bytes:
@@ -7301,9 +7388,44 @@ def create_app(
             tags=["hosts"],
         )
 
+        remote_acp_seeded: set[tuple[int, str]] = set()
+
         async def _on_hosts_changed(host_id: str, owner: str | None) -> None:
-            announce_hosts_changed(owner)
             conn = host_registry.get(host_id)
+            if conn is not None and conn.hello.configured_harnesses:
+                pending_acp = {
+                    harness: ready
+                    for harness, ready in conn.hello.configured_harnesses.items()
+                    if isinstance(harness, str)
+                    and harness.startswith("acp:")
+                    and ready is not False
+                    and (conn.workspace_id, harness[4:]) not in remote_acp_seeded
+                }
+                if pending_acp:
+
+                    def _seed_remote_acp(
+                        ws_id: int = conn.workspace_id,
+                        harnesses: Mapping[str, Any] = pending_acp,
+                    ) -> list[str]:
+                        with workspace_scope(ws_id):
+                            return _ensure_remote_acp_agents(
+                                agent_store,
+                                artifact_store,
+                                agent_cache,
+                                harnesses,
+                            )
+
+                    try:
+                        seeded_slugs = await asyncio.to_thread(_seed_remote_acp)
+                        for slug in seeded_slugs:
+                            remote_acp_seeded.add((conn.workspace_id, slug))
+                    except Exception:
+                        _logger.warning(
+                            "Remote ACP built-in seeding failed for host %s",
+                            host_id,
+                            exc_info=True,
+                        )
+            announce_hosts_changed(owner)
             if conn is None:
                 system_status.host_changed(
                     host_id=host_id,

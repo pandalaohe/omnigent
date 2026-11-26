@@ -676,6 +676,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
           void queryClient.invalidateQueries({ queryKey: ["session-agent"] });
+          void queryClient.invalidateQueries({ queryKey: ["available-agents-catalog"] });
           return;
         case "projects_changed":
           // Another client created/renamed/deleted a project (or changed its

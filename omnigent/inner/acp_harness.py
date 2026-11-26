@@ -160,7 +160,7 @@ class _CatalogProbeExecutor(AcpExecutor):
 
 
 async def probe_acp_model_options(
-    entry: AcpAgentEntry, *, timeout_s: float = 60.0
+    entry: AcpAgentEntry, *, timeout_s: float | None = None
 ) -> AcpProbeResult:
     """Ask only initialize/session-new in a disposable cwd, then stop the process."""
     models: list[dict[str, Any]] = []
@@ -170,10 +170,11 @@ async def probe_acp_model_options(
     started = time.monotonic()
     timed_out_at: float | None = None
     cleanup_budget = 0.0
+    effective_timeout_s = max(60.0, entry.init_timeout_s) if timeout_s is None else timeout_s
     try:
-        timeout_s = parse_init_timeout_s(timeout_s)
+        effective_timeout_s = parse_init_timeout_s(effective_timeout_s)
         # The default leaves 55s active: 32.3s observed plus 22.7s margin, and 5s cleanup.
-        cleanup_budget = min(5.0, timeout_s / 5)
+        cleanup_budget = min(5.0, effective_timeout_s / 5)
         with tempfile.TemporaryDirectory(prefix="model-probe-") as cwd:
             executor = _CatalogProbeExecutor(
                 config=AcpAgentConfig(
@@ -186,7 +187,7 @@ async def probe_acp_model_options(
                 cwd=cwd,
             )
             try:
-                async with asyncio.timeout(timeout_s - cleanup_budget):
+                async with asyncio.timeout(effective_timeout_s - cleanup_budget):
                     await executor._start_process()
                     if executor._proc is not None:
                         _proc.remember_process_group(executor._proc)
@@ -356,11 +357,11 @@ async def probe_acp_model_options(
                 pass
         error = "ACP probe failed"
         if timed_out_at is not None:
-            budget = cleanup_budget if stage == "cleanup" else timeout_s - cleanup_budget
+            budget = cleanup_budget if stage == "cleanup" else effective_timeout_s - cleanup_budget
             error = (
                 f"ACP probe timed out during {stage}: elapsed {timed_out_at - started:.2f}s, "
                 f"budget {budget:.2f}s {'cleanup' if stage == 'cleanup' else 'active'} "
-                f"/ {timeout_s:.2f}s total"
+                f"/ {effective_timeout_s:.2f}s total"
             )
         if diagnostic is not None:
             error += f"; diagnostic: {diagnostic}"

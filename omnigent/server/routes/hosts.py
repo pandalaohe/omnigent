@@ -294,13 +294,20 @@ async def _proxy_model_options(
     refresh: str | None = None,
 ) -> dict[str, Any]:
     """Ask a host for the model catalog it would use for a new session."""
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, is_acp_harness
     from omnigent.server.routes._host_model_options import request_host_model_options
 
-    timeout_s = (
-        _ACP_MODEL_REFRESH_TIMEOUT_S
-        if refresh in ("force", "auto") and canonicalize_harness(harness) == "acp"
-        else _MODEL_OPTIONS_TIMEOUT_S
-    )
+    if refresh in ("force", "auto") and (
+        canonicalize_harness(harness) == "acp" or is_acp_harness(harness)
+    ):
+        row = ACP_CLI_HARNESSES.get(harness)
+        timeout_s = (
+            max(_ACP_MODEL_REFRESH_TIMEOUT_S, row.init_timeout_s + 5.0)
+            if row is not None and row.init_timeout_s is not None
+            else _ACP_MODEL_REFRESH_TIMEOUT_S
+        )
+    else:
+        timeout_s = _MODEL_OPTIONS_TIMEOUT_S
     try:
         return await request_host_model_options(
             host_registry=host_registry,
@@ -1779,12 +1786,13 @@ def create_hosts_router(
             else canonicalize_harness(harness) or harness,
             refresh=refresh,
         )
+        from omnigent.acp_cli_harnesses import is_acp_harness
         from omnigent.server.routes._host_model_options import (
             EMPTY_ACP_MODEL_CATALOG,
             record_host_model_options,
         )
 
-        acp = canonicalize_harness(harness) == "acp"
+        acp = canonicalize_harness(harness) == "acp" or is_acp_harness(harness)
         catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
         if catalog_store is not None and acp:
             await record_host_model_options(

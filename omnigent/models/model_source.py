@@ -164,7 +164,11 @@ def _source_catalog(harness: str, source: ModelSource) -> tuple[str, str, Any]:
             or row.binary
         )
         entry = AcpAgentEntry(
-            slug=harness, name=row.label, command=join_command_argv([executable, *row.args])
+            slug=harness,
+            name=row.label,
+            command=join_command_argv([executable, *row.args]),
+            init_timeout_s=row.init_timeout_s if row.init_timeout_s is not None else 30.0,
+            permission_concepts=row.permission_concepts,
         )
     if entry is None:
         raise ValueError("agent source needs a configured ACP agent")

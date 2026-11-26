@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => ({
   customAgents: [] as CustomAgent[],
   installed: [] as { id: string; name: string; harness: string; integration_mode?: string }[],
   installedNext: [] as { id: string; name: string; harness: string }[],
+  registryItems: [] as Record<string, unknown>[],
+  legacyProducts: {} as Record<string, Record<string, unknown>>,
   agents: [
     {
       id: "agent-claude",
@@ -63,7 +65,11 @@ vi.mock("@/lib/agentLabels", async (original) => ({
 }));
 vi.mock("@/hooks/useAgentRegistry", async (original) => ({
   ...(await original<Record<string, unknown>>()),
-  useAgentRegistry: () => ({ items: [], installedServerAgents: [], legacyProducts: {} }),
+  useAgentRegistry: () => ({
+    items: mocks.registryItems,
+    installedServerAgents: [],
+    legacyProducts: mocks.legacyProducts,
+  }),
 }));
 vi.mock("@/hooks/useCustomAgents", async () => {
   const { useState } = await import("react");
@@ -181,6 +187,8 @@ beforeEach(() => {
   mocks.customAgents = [];
   mocks.installed = [];
   mocks.installedNext = [];
+  mocks.registryItems = [];
+  mocks.legacyProducts = {};
   mocks.capabilities = {};
 });
 
@@ -216,6 +224,109 @@ describe("CallingDefaultsSection", () => {
     expect(installed.queryByTestId("agent-name-mark")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
     expect(screen.queryByRole("button", { name: /Select Release assistant/ })).toBeNull();
+  });
+
+  it("omits user-scope rows duplicating seeded native or built-in product agents", async () => {
+    mocks.legacyProducts = {
+      "8001677c98097148edfa65fb5c334189": {
+        key: "8001677c98097148edfa65fb5c334189",
+        label: "Hermes-fn",
+        name: "hermes-fn",
+        section: "acp",
+        harness: "acp:hermes-fn",
+        description: null,
+        source: "builtin",
+        deployed: true,
+      },
+    };
+    mocks.installed = [
+      { id: "dup-claude", name: "claude-native-ui", harness: "claude-native" },
+      { id: "dup-claude-fork", name: "claude-native-ui (fork a1b2)", harness: "claude-native" },
+      { id: "dup-hermes", name: "hermes-fn", harness: "acp:hermes-fn" },
+      { id: "keep-custom", name: "My helper", harness: "claude-native" },
+    ];
+    render(<CallingDefaultsSection />);
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    expect(screen.queryByRole("link", { name: "claude-native-ui details" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "claude-native-ui (fork a1b2) details" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "hermes-fn details" })).toBeNull();
+    expect(screen.getByRole("link", { name: "My helper details" })).toHaveAttribute(
+      "href",
+      "/settings/agents/custom/keep-custom",
+    );
+  });
+
+  it("shows ag-acp beside AG with ACP permission options and badge id", async () => {
+    mocks.legacyProducts = {
+      "58137a60fc3308392a40de7d8dbc55d8": {
+        key: "58137a60fc3308392a40de7d8dbc55d8",
+        label: "AG ACP",
+        name: "ag-acp",
+        section: "acp",
+        harness: "ag-acp",
+        description: null,
+        source: "builtin",
+        deployed: true,
+      },
+    };
+    mocks.hosts = [
+      {
+        ...HOST,
+        configured_harnesses: {
+          "antigravity-native": true,
+          "ag-acp": true,
+          "codex-native": true,
+        },
+      },
+    ];
+    mocks.capabilities = {
+      "antigravity-native": {
+        label: "AG",
+        integration_mode: "native-tui",
+        calling_defaults: { model_options: true, inherits_from: null },
+      },
+      "ag-acp": {
+        label: "AG ACP",
+        integration_mode: "acp-subprocess",
+        calling_defaults: { model_options: true, inherits_from: null },
+      },
+      "codex-native": {
+        label: "Codex",
+        integration_mode: "native-tui",
+        calling_defaults: { model_options: true, inherits_from: null },
+      },
+    };
+    mocks.listCatalogs.mockResolvedValue([
+      {
+        host_id: "host-a",
+        harness: "ag-acp",
+        fetched_at: 1,
+        stale: false,
+        error: null,
+        models: [{ id: "gemini-4-neon", isDefault: true }],
+        permission_options: [
+          { value: "default", label: "Default", concept: "manual" },
+          { value: "auto_edit", label: "Auto Edit", concept: "edit-automatic" },
+        ],
+      },
+    ]);
+    render(<CallingDefaultsSection />);
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    const detailLinks = screen
+      .getAllByRole("link", { name: /details$/ })
+      .map((link) => link.getAttribute("aria-label"));
+    expect(detailLinks.indexOf("AG ACP details")).toBe(detailLinks.indexOf("AG details") + 1);
+    expect(screen.getByRole("link", { name: "AG ACP details" })).toHaveAttribute(
+      "href",
+      "/settings/agents/ag-acp?host=host-a",
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
+    fireEvent.click(screen.getByTestId("layered-cell-ag-acp-host-a"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Permission" }));
+    expect(await screen.findByRole("option", { name: "Auto Edit" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Auto Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readMaster()["host-a"]["ag-acp"]).toEqual({ permission: "auto_edit" });
   });
 
   it("keeps the selected setting and page when returning from an installed agent", async () => {

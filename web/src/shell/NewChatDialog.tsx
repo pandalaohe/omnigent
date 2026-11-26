@@ -4512,7 +4512,12 @@ function NewChatLandingContent({
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
   );
-  const acpHarness = selectionHarness?.startsWith("acp:") ? selectionHarness : null;
+  const acpHarness =
+    selectionHarness &&
+    (selectionHarness.startsWith("acp:") ||
+      harnessCapabilities?.[selectionHarness]?.integration_mode === "acp-subprocess")
+      ? selectionHarness
+      : null;
   const { data: callingCatalogs } = useQuery({
     queryKey: ["calling-default-catalogs"],
     queryFn: listCallingDefaultCatalogs,

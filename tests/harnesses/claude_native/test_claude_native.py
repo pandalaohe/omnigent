@@ -4270,19 +4270,16 @@ async def test_create_claude_session_omits_title_for_generic_seed_path(
         :returns: Mock Omnigent response.
         """
         if request.method == "POST":
-            body = request.content.decode("utf-8")
-            marker = 'name="metadata"'
-            idx = body.find(marker)
-            assert idx != -1, f"metadata part not found in body: {body!r}"
-            json_start = body.index("\r\n\r\n", idx) + 4
-            json_end = body.index("\r\n", json_start)
-            captured_metadata.update(json.loads(body[json_start:json_end]))
-            return httpx.Response(200, json={"session_id": session_id_returned})
+            assert request.headers["content-type"].startswith("application/json")
+            captured_metadata.update(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(201, json={"id": session_id_returned})
         raise AssertionError(
             f"unexpected request: {request.method} {request.url}; "
             "_create_claude_session must not PATCH the title — the server's "
             "seed helper now populates an empty title on the first user message."
         )
+
+    from omnigent.db.utils import builtin_agent_id
 
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
@@ -4294,6 +4291,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path(
         )
 
     assert session_id == session_id_returned
+    assert captured_metadata["agent_id"] == builtin_agent_id("claude-native-ui")
     assert startup_events == [("session_resolved", session_id_returned)]
     # No title in metadata: any title here would defeat the generic seed
     # path and resurrect the claude-specific carve-out we just removed.

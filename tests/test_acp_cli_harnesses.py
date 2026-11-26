@@ -410,3 +410,62 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
 # ---------------------------------------------------------------------------
 # jcode managed-connect support
 # ---------------------------------------------------------------------------
+
+
+def test_ag_acp_row_config_spawn_env_and_managed_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ag-acp ships with spawn, 120s init timeout, permission concepts, and managed-agy match."""
+    from omnigent.acp_cli_harnesses import is_acp_harness, is_antigravity_acp_command
+    from omnigent.models.model_source import ModelSource, _source_catalog
+    from omnigent.permission_tiers import normalize_permission_tier
+    from omnigent.server.permission_tiers import is_acp_permission_harness
+
+    row = ACP_CLI_HARNESSES["ag-acp"]
+    assert row.binary == "agy"
+    assert row.args == ("acp", "--stdio")
+    assert row.spawn is True
+    assert row.init_timeout_s == 120.0
+    assert dict(row.permission_concepts) == {
+        "default": "manual",
+        "auto_edit": "edit-automatic",
+    }
+
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda name, **k: r"C:\Tools\Antigravity\agy.cmd" if name == "agy" else None,
+    )
+    monkeypatch.delenv("OMNIGENT_AG_ACP_PATH", raising=False)
+    monkeypatch.setattr("omnigent.runtime.workflow.load_config", dict)
+    monkeypatch.setattr("omnigent.models.model_source.load_config", dict)
+
+    env = _build_acp_cli_spawn_env(_spec("ag-acp"), harness="ag-acp")
+    assert is_antigravity_acp_command(env["HARNESS_ACP_COMMAND"])
+    assert env["HARNESS_ACP_INIT_TIMEOUT_S"] == "120.0"
+    assert json.loads(env["HARNESS_ACP_PERMISSION_CONCEPTS"]) == {
+        "default": "manual",
+        "auto_edit": "edit-automatic",
+    }
+    assert "HARNESS_ACP_MODEL" not in env
+
+    spec_with_model = dataclasses.replace(
+        _spec("ag-acp"),
+        executor=ExecutorSpec(
+            type="omnigent", config={"harness": "ag-acp"}, model="gemini-4-neon"
+        ),
+    )
+    env_with_model = _build_acp_cli_spawn_env(spec_with_model, harness="ag-acp")
+    assert env_with_model["HARNESS_ACP_MODEL"] == "gemini-4-neon"
+
+    _, _, probe_entry = _source_catalog("ag-acp", ModelSource("agent"))
+    assert probe_entry.init_timeout_s == 120.0
+    assert dict(probe_entry.permission_concepts) == {
+        "default": "manual",
+        "auto_edit": "edit-automatic",
+    }
+    assert is_acp_harness("ag-acp") is True
+    assert is_acp_permission_harness("ag-acp") is True
+    assert normalize_permission_tier("auto", harness="ag-acp", legacy=False) == "auto"
+    with pytest.raises(ValueError, match="Full permission is unavailable"):
+        normalize_permission_tier("full", harness="ag-acp", legacy=False)

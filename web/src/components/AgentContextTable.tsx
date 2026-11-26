@@ -255,7 +255,8 @@ export function AgentPromptCard({
   const catalogs = useQuery({
     queryKey: ["calling-default-catalogs"],
     queryFn: listCallingDefaultCatalogs,
-    enabled: harness.startsWith("acp:"),
+    enabled:
+      harness.startsWith("acp:") || capabilities?.[harness]?.integration_mode === "acp-subprocess",
   });
   const notSent = catalogs.data?.some(
     (row) =>

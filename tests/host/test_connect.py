@@ -5931,6 +5931,33 @@ async def test_hello_advertises_managed_tools_only_for_antigravity_acp(monkeypat
     } == {"acp", "acp:ag"}
 
 
+async def test_hello_advertises_managed_tools_for_configured_builtin_ag_acp(monkeypatch):
+    from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", list)
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda name, **k: r"C:\Tools\agy.cmd" if name == "agy" else None,
+    )
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    host._configured_harnesses = {"ag-acp": True}
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert {
+        capability.removeprefix(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+        for capability in hello.capabilities
+        if capability.startswith(CAP_AGY_ACP_PERMISSIONS_PREFIX)
+    } == {"ag-acp"}
+
+
 async def test_hello_does_not_wait_for_forkserver_control(
     tmp_path: Path,
 ) -> None:

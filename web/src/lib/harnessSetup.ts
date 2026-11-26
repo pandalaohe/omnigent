@@ -143,6 +143,16 @@ export function harnessReadinessOnHost(
 
   const configured = host.configured_harnesses;
   if (!configured || !(harness in configured)) {
+    if (
+      configured &&
+      harness.startsWith("acp:") &&
+      Object.keys(configured).some((key) => key.startsWith("acp:"))
+    ) {
+      return harnessReadinessResult("setup-required", "unconfigured", true, {
+        label: "Setup required",
+        description: "Set up this harness on the selected host before using it.",
+      });
+    }
     return harnessReadinessResult("available", "readiness-unknown", false, null);
   }
 
@@ -303,11 +313,13 @@ export function harnessUnavailableReasonOnHost(
   // particular slug's readiness.
   // An absent/empty map still fails open (the guard above, plus the size check),
   // so a host that reports no readiness at all is never emptied out.
+  const reportedKeys = Object.keys(host.configured_harnesses);
+  const reportsConcreteAcp = reportedKeys.some((key) => key.startsWith("acp:"));
   if (
     availability === undefined &&
     !isAutoHarness(harness) &&
-    !harness.startsWith("acp:") &&
-    Object.keys(host.configured_harnesses).length > 0
+    (!harness.startsWith("acp:") || reportsConcreteAcp) &&
+    reportedKeys.length > 0
   ) {
     return "unconfigured";
   }

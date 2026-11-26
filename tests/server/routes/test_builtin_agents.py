@@ -133,3 +133,61 @@ async def test_suppressed_agents_are_hidden_and_named(
     assert body["suppressed_agent_names"] == ["debby", "polly"]
     # Hidden, not deleted: sessions bound to the row can still resolve it.
     assert agent_store.get_by_name("polly") is not None
+
+
+async def test_seeded_acp_builtin_reports_product_of_for_badge_and_registry(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A server-seeded remote acp:<slug> built-in exposes product_of='acp:<slug>'."""
+    from omnigent.server.app import _ensure_remote_acp_agents
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    artifact_store = app.state.artifact_store
+    agent_cache = app.state.agent_cache
+    seeded = _ensure_remote_acp_agents(
+        agent_store, artifact_store, agent_cache, {"acp:hermes-fn": True}
+    )
+    assert seeded == ["hermes-fn"]
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    row = next(item for item in resp.json()["data"] if item["name"] == "hermes-fn")
+    assert row["id"] == builtin_agent_id("hermes-fn")
+    assert row["builtin"] is True
+    assert row["harness"] == "acp:hermes-fn"
+    assert row["product_of"] == "acp:hermes-fn"
+    assert row["integration_mode"] == "acp-subprocess"
+
+
+async def test_create_claude_session_against_seeded_server_binds_builtin_without_user_duplicate(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """CLI _create_claude_session binds the built-in over JSON and reads SessionResponse.id."""
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.server.app import _ensure_default_native_agents
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    _ensure_default_native_agents(agent_store, app.state.artifact_store, app.state.agent_cache)
+
+    session_id = await claude_native._create_claude_session(
+        client,
+        b"unused-fallback-bundle",
+        bridge_id=None,
+        terminal_launch_args=["--dangerously-skip-permissions"],
+    )
+    assert session_id
+
+    session_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert session_resp.status_code == 200
+    session_body = session_resp.json()
+    assert session_body["id"] == session_id
+    assert session_body["agent_id"] == builtin_agent_id("claude-native-ui")
+    assert session_body["terminal_launch_args"] == ["--dangerously-skip-permissions"]
+
+    user_agents = await client.get("/v1/agents?scope=user&limit=100")
+    assert user_agents.status_code == 200
+    assert not any(item["name"] == "claude-native-ui" for item in user_agents.json()["data"])

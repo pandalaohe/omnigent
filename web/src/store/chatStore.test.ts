@@ -27401,7 +27401,10 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     seedSession("conv_codex_timeout", []);
     const { sinks, controller, loop } = await openLoop("conv_codex_timeout");
     const route = fetchMock.getMockImplementation()!;
-    const { promise: held, resolve: release } = Promise.withResolvers<void>();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (/\/elicitations\/elic_reused\/resolve$/.test(input.toString())) {
         await held;

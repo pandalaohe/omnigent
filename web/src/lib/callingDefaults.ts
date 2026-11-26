@@ -172,7 +172,12 @@ export function callingPermissionOptions(
   capabilities?: HarnessCapabilityMap,
   acpOptions?: readonly PermissionOption[],
 ): PermissionOption[] {
-  if (harness === "acp" || harness.startsWith("acp:")) return [...(acpOptions ?? [])];
+  if (
+    harness === "acp" ||
+    harness.startsWith("acp:") ||
+    capabilities?.[harness]?.integration_mode === "acp-subprocess"
+  )
+    return [...(acpOptions ?? [])];
   const declared = capabilities?.[harness]?.session_modes?.permission?.options;
   if (declared && declared !== "per-model")
     return declared.filter((row) => row.contexts.includes("default"));

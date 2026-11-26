@@ -1984,3 +1984,78 @@ async def test_sdk_session_catalog_recovers_502_empty_cache_and_host_change(
     assert changed.status_code == 200, changed.text
     assert changed.json()["models"] == [{"id": "other-host-model"}]
     assert seen == [HOST_A, HOST_A, HOST_A, HOST_B]
+
+
+async def test_ag_acp_calling_default_permission_and_proxy_timeout(
+    client, app, stores, monkeypatch
+):
+    """Saved and explicit ag-acp permissions apply at create, and refresh honors 125s budget."""
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+    from omnigent.server.routes.hosts import _proxy_model_options
+
+    ag_acp_id = builtin_agent_id("ag-acp")
+    _seed_agent(stores, ag_acp_id, "ag-acp", name="ag-acp")
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"ag-acp": True})
+    _register_host(app, HOST_A)
+    conn = app.state.host_registry.get(HOST_A)
+    assert conn is not None
+    stores.cache.upsert(
+        HOST_A,
+        "ag-acp",
+        [{"id": "gemini-4-neon", "isDefault": True}],
+        now_epoch(),
+        permission_options=[
+            {"value": "default", "label": "Default", "concept": "manual"},
+            {"value": "auto_edit", "label": "Auto Edit", "concept": "edit-automatic"},
+        ],
+    )
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"ag-acp": {"permission": "auto_edit"}}}
+    )
+    resolved = await client.get(
+        "/v1/calling-defaults/resolve", params={"host_id": HOST_A, "harness": "ag-acp"}
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["permission"] == "auto_edit", resolved.text
+
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=ag_acp_id, host_id=HOST_A, workspace="/opt/work", runner_id="test-runner"
+    )
+    created_default = await client.post(
+        "/v1/sessions",
+        json={"agent_id": ag_acp_id, "parent_session_id": parent.id},
+    )
+    assert created_default.status_code == 201, created_default.text
+    assert created_default.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "auto_edit"
+
+    created_explicit = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": ag_acp_id,
+            "parent_session_id": parent.id,
+            "permission_mode": "default",
+        },
+    )
+    assert created_explicit.status_code == 201, created_explicit.text
+    assert created_explicit.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "default"
+
+    seen_timeouts: list[float] = []
+
+    async def fake_request_host_model_options(**kwargs: Any) -> dict[str, Any]:
+        seen_timeouts.append(kwargs["timeout_s"])
+        return {"status": "ok", "models": [{"id": "gemini-4-neon"}]}
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_model_options.request_host_model_options",
+        fake_request_host_model_options,
+    )
+    await _proxy_model_options(
+        host_registry=app.state.host_registry,
+        host_conn=conn,
+        harness="ag-acp",
+        refresh="force",
+    )
+    assert seen_timeouts == [125.0]

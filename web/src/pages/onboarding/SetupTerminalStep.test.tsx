@@ -225,10 +225,14 @@ describe("SetupTerminalStep", () => {
   });
 
   it("does not start the connection after Cancel while installation is finishing", async () => {
-    const { promise: installing, resolve: finishInstall } = Promise.withResolvers<{
-      ok: boolean;
-    }>();
-    const { promise: canceling, resolve: finishCancel } = Promise.withResolvers<void>();
+    let finishInstall!: (value: { ok: boolean }) => void;
+    let finishCancel!: () => void;
+    const installing = new Promise<{ ok: boolean }>((resolve) => {
+      finishInstall = resolve;
+    });
+    const canceling = new Promise<void>((resolve) => {
+      finishCancel = resolve;
+    });
     const onRun = vi.fn().mockResolvedValue({ ok: true });
     render(
       <SetupTerminalStep

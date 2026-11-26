@@ -37,7 +37,8 @@ so the registry, onboarding, and runner layers can all read it without cycles.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 
 from omnigent import _platform
@@ -56,6 +57,13 @@ def is_antigravity_acp_command(command: str) -> bool:
     )
     return (
         len(argv) >= 2 and PureWindowsPath(argv[0]).name.lower() in accepted and argv[1] == "acp"
+    )
+
+
+def is_acp_harness(harness: str | None) -> bool:
+    """Return whether *harness* runs through the generic ACP executor."""
+    return harness is not None and (
+        harness == "acp" or harness.startswith("acp:") or harness in ACP_CLI_HARNESSES
     )
 
 
@@ -78,6 +86,12 @@ class AcpCliHarness:
         for its own auth, e.g. ``("XAI_API_KEY",)``. The ACP spawn env is
         deny-by-default, so a key the row's ``auth_hint`` advertises is
         dropped before the CLI starts unless it is named here.
+    :param spawn: Whether the seeded built-in agent opts into child-session
+        spawn tools (``spawn: true`` in its bundle spec).
+    :param init_timeout_s: Optional positive finite seconds for ACP
+        initialization/session setup; ``None`` leaves the wrap's default.
+    :param permission_concepts: Optional owner-declared mapping from vendor ACP
+        mode ids to Omnigent permission concepts (e.g. ``{"default": "manual"}``).
     """
 
     install: HarnessInstallSpec
@@ -85,6 +99,9 @@ class AcpCliHarness:
     aliases: tuple[str, ...] = ()
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    spawn: bool = False
+    init_timeout_s: float | None = None
+    permission_concepts: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -107,6 +124,25 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Antigravity (``agy`` CLI) over ACP stdio. Works cross-platform (including
+    # Windows where the native PTY wrapper is unavailable), keeps managed-agy
+    # permission matching via ``is_antigravity_acp_command``, and grants child
+    # spawn access with an extended cold-start init deadline.
+    "ag-acp": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "AG ACP",
+            "agy",
+            None,
+            login_args=(),
+            status_args=("models",),
+            install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
+            auth_hint="run `agy` and complete the browser sign-in",
+        ),
+        args=("acp", "--stdio"),
+        spawn=True,
+        init_timeout_s=120.0,
+        permission_concepts={"default": "manual", "auto_edit": "edit-automatic"},
+    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no

@@ -510,7 +510,9 @@ _UNBOUND_DELETE = "A delete needs a bindable target: an unresolved name could de
 
 
 def normalize_permission_tier(raw: object, *, harness: str, legacy: bool) -> PermissionTier:
-    acp = harness == "acp" or harness.startswith("acp:")
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
+    acp = is_acp_harness(harness)
     if harness not in ("pi", "pi-native", "antigravity-native") and not acp:
         raise ValueError("Unknown harness")
     if legacy and raw is None:
