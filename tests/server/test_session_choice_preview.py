@@ -215,6 +215,62 @@ async def test_scoped_count_and_rule_order_are_explained_without_pool_count_subs
 
 
 @pytest.mark.asyncio
+async def test_candidate_preview_explains_multi_member_binding_caps(preview_env):
+    env = preview_env
+    second_agent = await create_test_agent(
+        env.client,
+        name="preview-agent-b",
+        include_llm=False,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    host_b = "2" * 32
+    env.hosts.upsert_on_connect(host_b, "second-host", OWNER)
+    rows = [
+        env.app.state.conversation_store.create_conversation(
+            agent_id=agent_id,
+            parent_conversation_id=env.parent,
+            kind="sub_agent",
+            host_id=host_id,
+            workspace="/opt/work/project",
+            model_override="model-x",
+            labels={SLOT_LABEL: f"admitted@{host_id}@shared@{time.time()}"},
+        )
+        for agent_id, host_id in [
+            (env.agent, HOST),
+            (second_agent["id"], host_b),
+        ]
+    ]
+    env.body.update(include_running=True)
+    env.body["settings"]["limitRules"] = [
+        {"id": "single", "agent": env.agent, "maxRunning": 4},
+        {
+            "id": "shared-group",
+            "members": [
+                {"agent": env.agent, "host": HOST, "model": "model-x"},
+                {"agent": second_agent["id"], "host": host_b, "model": "model-x"},
+            ],
+            "maxRunning": 2,
+        },
+    ]
+    response = await env.client.post(URL + "/preview", json=env.body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["check"] == {"state": "blocked", "reason": "busy"}
+    cap = result["effectiveLimits"]["maxRunning"]
+    assert cap["sourceRuleId"] == "shared-group"
+    assert cap["value"] == 2
+    assert cap["runningCount"] == cap["reservedCount"] == 2
+    assert set(cap["runningSessionIds"]) == {rows[0].id, rows[1].id}
+    assert len(cap["members"]) == 2
+    assert [
+        (item["ruleId"], item["runningCount"], item["maxRunning"]) for item in cap["bindingRules"]
+    ] == [
+        ("shared-group", 2, 2),
+        ("single", 1, 4),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_candidate_errors_and_owner_boundaries(preview_env):
     env = preview_env
     for change, status in [

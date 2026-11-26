@@ -138,3 +138,68 @@ it("shows unresolved candidate errors without presenting a successful explanatio
   expect(await screen.findByRole("alert")).toHaveTextContent("candidate_unresolved");
   expect(screen.queryByText(/Passes current checks/)).not.toBeInTheDocument();
 });
+
+it("renders multi-member scopes and every binding cap rule with its running count", async () => {
+  const multi = response();
+  multi.check = { state: "blocked", reason: "busy" };
+  multi.effectiveLimits.maxRunning = {
+    defined: true,
+    value: 3,
+    sourceRuleId: "opus-cap",
+    specificity: null,
+    scope: null,
+    members: [
+      { agent: "agent-a", host: "host-a", model: "opus-5" },
+      { agent: "agent-b", host: "host-b", model: "opus-5" },
+    ],
+    countState: "known",
+    runningCount: 3,
+    reservedCount: 1,
+    bindingRules: [
+      {
+        ruleId: "opus-cap",
+        maxRunning: 3,
+        members: [
+          { agent: "agent-a", host: "host-a", model: "opus-5" },
+          { agent: "agent-b", host: "host-b", model: "opus-5" },
+        ],
+        runningCount: 3,
+        reservedCount: 1,
+        countState: "known",
+      },
+      {
+        ruleId: "base",
+        maxRunning: 5,
+        members: [{ agent: "agent-a" }],
+        runningCount: 2,
+        reservedCount: 0,
+        countState: "known",
+      },
+    ],
+  };
+  request.mockResolvedValue(multi);
+  render(
+    <ChoiceCandidateCheck
+      {...props}
+      document={{
+        ...document,
+        limitRules: [
+          { id: "base", agent: "agent-a", maxRunning: 5 },
+          {
+            id: "opus-cap",
+            members: [
+              { agent: "agent-a", host: "host-a", model: "opus-5" },
+              { agent: "agent-b", host: "host-b", model: "opus-5" },
+            ],
+            maxRunning: 3,
+          },
+        ],
+      }}
+    />,
+  );
+  open();
+  fireEvent.click(screen.getByRole("button", { name: "Check draft" }));
+  await screen.findByText(/Binding caps:/);
+  expect(screen.getByText(/opus-cap: 3\/3/)).toBeInTheDocument();
+  expect(screen.getByText(/base: 2\/5/)).toBeInTheDocument();
+});

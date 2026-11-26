@@ -632,6 +632,16 @@ def register_open_routes(
             "git_branch": conv.git_branch,
             "first_message": first_message,
             "shared_with": [],
+            **(
+                {"permission_tier": created.permission_tier}
+                if created.permission_tier is not None
+                else {}
+            ),
+            **(
+                {"permission_tier_source": created.permission_tier_source}
+                if created.permission_tier_source is not None
+                else {}
+            ),
             **({"session_choice": selected} if selected is not None else {}),
         }
         if git is not None and not git.existing_worktree:

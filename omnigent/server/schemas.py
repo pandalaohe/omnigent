@@ -2975,6 +2975,7 @@ class SessionResponse(BaseModel):
     llm_model: str | None = None
     harness: str | None = None
     permission_tier: Literal["ask", "plan", "accept-edits", "auto", "full"] | None = None
+    permission_tier_source: Literal["explicit", "link", "host_default"] | None = None
     harness_namespace: str | None = None
     permission_tier_revision: int | None = None
     permission_tier_state: Literal["ready", "switching", "blocked"] | None = None

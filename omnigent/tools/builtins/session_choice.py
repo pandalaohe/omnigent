@@ -65,7 +65,8 @@ class SysSessionChoiceReadTool(_ChoiceTool):
     tool_name = "sys_session_choice_read"
     tool_description = (
         "Read your session choice document and revision: work types, per-host tiers, "
-        "preset fallback chains, explicit Agent/Host/Model limit rules, legacy pool limits, "
+        "preset fallback chains (including optional per-link permissionTier), "
+        "explicit single-scope and multi-member Agent/Host/Model limit rules, legacy pool limits, "
         "ability order, supported document capabilities, and active drain locks."
     )
 
@@ -74,10 +75,27 @@ class SysSessionChoiceUpdateTool(_ChoiceTool):
     tool_name = "sys_session_choice_update"
     tool_description = (
         "Replace the session choice document after reading it. Pass expected_revision; "
-        "stale saves return 409. Null clears the document. Requires user approval by default."
+        "stale saves return 409. Null clears the document. Requires user approval by default. "
+        "In schemaVersion 2, each limitRules entry accepts either single-scope "
+        "{id, agent, host?, model?, maxRunning?, reserve?, reserveExempt?} or multi-member "
+        "{id, members: [{agent, host?, model?}, ...], maxRunning?} (1..n exact scopes; "
+        "maxRunning caps the summed running sessions across all members; every matching cap "
+        "holds and the tightest decides; reserve and reserveExempt are refused on multi-member "
+        "rules). Any preset or row link may also carry optional permissionTier "
+        "(ask | plan | accept-edits | auto), used when sys_session_create omits permission_tier "
+        "and validated like an explicit tier (absent uses the host default)."
     )
     properties = {
-        "settings": {"type": ["object", "null"], "additionalProperties": True},
+        "settings": {
+            "type": ["object", "null"],
+            "additionalProperties": True,
+            "description": (
+                "Complete session choice document, or null to clear. Supports single-scope or "
+                "multi-member limitRules (members: 1..n {agent, host?, model?} scopes with a "
+                "summed maxRunning cap) and optional link permissionTier "
+                "(ask, plan, accept-edits, auto)."
+            ),
+        },
         "expected_revision": {"type": "string"},
         "conversion_proof": {
             "type": "object",

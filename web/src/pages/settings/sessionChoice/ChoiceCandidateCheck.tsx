@@ -241,8 +241,15 @@ export function ChoiceCandidateCheck({
                       {(document.limitRules ?? []).findIndex(
                         (rule) => rule.id === field.sourceRuleId,
                       ) + 1}{" "}
-                      · {field.scope?.agent} / {field.scope?.host ?? "All hosts"} /{" "}
-                      {field.scope?.model ?? "All models"}
+                      ·{" "}
+                      {field.members?.length
+                        ? field.members
+                            .map(
+                              (member) =>
+                                `${member.agent} / ${member.host ?? "All hosts"} / ${member.model ?? "All models"}`,
+                            )
+                            .join(" + ")
+                        : `${field.scope?.agent} / ${field.scope?.host ?? "All hosts"} / ${field.scope?.model ?? "All models"}`}
                     </dd>
                   )}
                   {name === "maxRunning" && field.defined && (
@@ -250,6 +257,24 @@ export function ChoiceCandidateCheck({
                       Running: {field.countState === "known" ? field.runningCount : "Unknown"} ·
                       Reserved: {field.reservedCount ?? "Unknown"} · Counted across the source
                       rule’s scope
+                    </dd>
+                  )}
+                  {name === "maxRunning" && Boolean(field.bindingRules?.length) && (
+                    <dd className="mt-1 space-y-1 text-xs text-muted-foreground">
+                      <span className="font-medium text-foreground">Binding caps:</span>{" "}
+                      {field.bindingRules!.map((cap) => (
+                        <span key={cap.ruleId} className="block break-words">
+                          {cap.ruleId}: {cap.countState === "known" ? cap.runningCount : "Unknown"}/
+                          {cap.maxRunning} (
+                          {cap.members
+                            .map(
+                              (member) =>
+                                `${member.agent} / ${member.host ?? "All hosts"} / ${member.model ?? "All models"}`,
+                            )
+                            .join(" + ")}
+                          )
+                        </span>
+                      ))}
                     </dd>
                   )}
                 </div>

@@ -3,6 +3,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 
 export type ChoiceFallbackMode = "drain" | "return";
+export type ChoicePermissionTier = "ask" | "plan" | "accept-edits" | "auto";
 
 export interface ChoiceLink {
   agent: string;
@@ -11,6 +12,7 @@ export interface ChoiceLink {
   meter?: string | null;
   maxRunning?: number | null;
   fallbackMode?: ChoiceFallbackMode | null;
+  permissionTier?: ChoicePermissionTier | null;
 }
 export interface ChoiceRow {
   preset?: string | null;
@@ -82,12 +84,19 @@ export interface ChoiceConversionPlan {
   settings: SessionChoiceDocument | null;
 }
 
-export interface ChoiceLimitRule {
-  [key: string]: unknown;
-  id: string;
+export interface ChoiceLimitScope {
   agent: string;
   host?: string | null;
   model?: string | null;
+}
+
+export interface ChoiceLimitRule {
+  [key: string]: unknown;
+  id: string;
+  agent?: string;
+  host?: string | null;
+  model?: string | null;
+  members?: ChoiceLimitScope[];
   maxRunning?: number | null;
   reserve?: {
     [key: string]: unknown;
@@ -99,15 +108,26 @@ export interface ChoiceLimitRule {
   reserveExempt?: string[];
 }
 
+export interface ChoiceBindingCap {
+  ruleId: string;
+  maxRunning: number;
+  members: ChoiceLimitScope[];
+  runningCount: number | null;
+  reservedCount: number | null;
+  countState: string;
+}
+
 export interface ChoiceEffectiveField {
   defined: boolean;
   value: unknown;
   sourceRuleId: string | null;
   specificity: number | null;
-  scope: { agent: string; host?: string | null; model?: string | null } | null;
+  scope: ChoiceLimitScope | null;
+  members?: ChoiceLimitScope[] | null;
   runningCount?: number | null;
   reservedCount?: number | null;
   countState?: string;
+  bindingRules?: ChoiceBindingCap[];
 }
 
 export interface ChoiceCandidatePreview {

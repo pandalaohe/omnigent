@@ -90,6 +90,8 @@ PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 Identifier = Annotated[StrictStr, Field(min_length=1, max_length=32)]
 RoutePrefix = Annotated[StrictStr, Field(pattern=r"^[^/\s]+$")]
 PoolName = Annotated[StrictStr, Field(min_length=1)]
+LinkPermissionTier = Literal["ask", "plan", "accept-edits", "auto"]
+PermissionTierSource = Literal["explicit", "link", "host_default"]
 
 
 class ChoiceRevisionConflict(ValueError):
@@ -110,6 +112,7 @@ class Link(_DocumentModel):
     meter: StrictStr | None = None
     max_running: PositiveInt | None = None
     fallback_mode: Literal["drain", "return"] | None = None
+    permission_tier: LinkPermissionTier | None = None
 
     @field_validator("fallback_mode")
     @classmethod
@@ -211,8 +214,30 @@ class LimitScope(_DocumentModel):
         )
 
 
-class LimitRule(LimitScope):
+def _scope_matches(
+    scope: LimitScope,
+    *,
+    agent: str,
+    host: str | None,
+    model: str | None,
+    groups: ProviderGroups | None = None,
+) -> bool:
+    matched_model = (
+        scope.model
+        if scope.model is not None
+        and model is not None
+        and canonical_model(scope.model, groups or {}) == canonical_model(model, groups or {})
+        else model
+    )
+    return scope.matches(agent=agent, host=host, model=matched_model)
+
+
+class LimitRule(_DocumentModel):
     id: Identifier
+    agent: Annotated[StrictStr, Field(min_length=1)] | None = None
+    host: Annotated[StrictStr, Field(min_length=1)] | None = None
+    model: Annotated[StrictStr, Field(min_length=1)] | None = None
+    members: Annotated[tuple[LimitScope, ...], Field(min_length=1)] | None = None
     max_running: PositiveInt | None = None
     reserve: ReservePatch | None = None
     reserve_exempt: tuple[Identifier, ...] = ()
@@ -221,8 +246,109 @@ class LimitRule(LimitScope):
     @classmethod
     def expand_reserve_cancellation(cls, value: Any) -> Any:
         if isinstance(value, dict) and "reserve" in value and value["reserve"] is None:
+            members = value.get("members")
+            if isinstance(members, (list, tuple)) and len(members) > 1:
+                return value
             return {**value, "reserve": {"pct": None, "stopPct": None}}
         return value
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if self.members is not None:
+            if (
+                any(name in self.model_fields_set for name in ("agent", "host", "model"))
+                or self.agent is not None
+                or self.host is not None
+                or self.model is not None
+            ):
+                raise ValueError("limit rule must specify either agent or members, not both")
+            if len(self.members) > 1 and (
+                "reserve" in self.model_fields_set or "reserve_exempt" in self.model_fields_set
+            ):
+                raise ValueError("reserve and reserveExempt are not allowed on multi-member rules")
+            return self
+        if self.agent is None:
+            raise ValueError("limit rule requires agent or members")
+        if any(value == "*" for value in (self.agent, self.host, self.model)):
+            raise ValueError("selectors must be exact identities, not wildcards")
+        return self
+
+    @property
+    def is_multi_member(self) -> bool:
+        return self.members is not None and len(self.members) > 1
+
+    @property
+    def scopes(self) -> tuple[LimitScope, ...]:
+        if self.members is not None:
+            return self.members
+        assert self.agent is not None
+        return (LimitScope(agent=self.agent, host=self.host, model=self.model),)
+
+    @property
+    def specificity(self) -> int:
+        return self.scopes[0].specificity
+
+    def matches(
+        self,
+        *,
+        agent: str,
+        host: str | None,
+        model: str | None,
+        groups: ProviderGroups | None = None,
+    ) -> bool:
+        return any(
+            _scope_matches(scope, agent=agent, host=host, model=model, groups=groups)
+            for scope in self.scopes
+        )
+
+    def unresolved_for_missing_model(self, agent: str, host: str | None) -> bool:
+        """True when a model-less candidate has unresolved membership in this rule."""
+        if self.members is not None and any(
+            scope.agent == agent
+            and (scope.host is None or scope.host == host)
+            and scope.model is None
+            for scope in self.members
+        ):
+            return False
+        return any(
+            scope.agent == agent
+            and (scope.host is None or scope.host == host)
+            and scope.model is not None
+            for scope in self.scopes
+        )
+
+
+@dataclass(frozen=True)
+class BindingCap:
+    rule_id: str
+    max_running: int
+    scopes: tuple[LimitScope, ...]
+    specificity: int | None = None
+    is_members_rule: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluatedBindingCap:
+    cap: BindingCap
+    running_ids: tuple[str, ...] | None
+
+    @property
+    def remaining(self) -> int | None:
+        return None if self.running_ids is None else self.cap.max_running - len(self.running_ids)
+
+    @property
+    def blocked(self) -> bool:
+        return self.running_ids is not None and len(self.running_ids) >= self.cap.max_running
+
+
+def _cap_tightness_key(item: EvaluatedBindingCap) -> tuple[int, int, int, str]:
+    if item.blocked:
+        assert item.remaining is not None
+        return (0, item.remaining, item.cap.max_running, item.cap.rule_id)
+    if item.running_ids is None:
+        return (1, 0, item.cap.max_running, item.cap.rule_id)
+    assert item.remaining is not None
+    return (2, item.remaining, item.cap.max_running, item.cap.rule_id)
 
 
 @dataclass(frozen=True)
@@ -251,7 +377,7 @@ def resolve_limit_rules(
     model: str | None,
     groups: ProviderGroups | None = None,
 ) -> dict[str, ResolvedLimitField]:
-    """Resolve each field independently; stable sorting preserves visible tie order."""
+    """Resolve single-scope fields by specificity; stable sorting preserves visible tie order."""
     resolved = {
         name: ResolvedLimitField()
         for name in (
@@ -267,24 +393,17 @@ def resolve_limit_rules(
         (
             rule
             for rule in rules
-            if rule.matches(
-                agent=agent,
-                host=host,
-                model=rule.model
-                if rule.model is not None
-                and model is not None
-                and canonical_model(rule.model, groups or {})
-                == canonical_model(model, groups or {})
-                else model,
-            )
+            if not rule.is_multi_member
+            and _scope_matches(rule.scopes[0], agent=agent, host=host, model=model, groups=groups)
         ),
         key=lambda rule: -rule.specificity,
     )
     for rule in matching:
-        scope = LimitScope(agent=rule.agent, host=rule.host, model=rule.model)
+        scope = rule.scopes[0]
+        names = ("max_running", "reserve_exempt") if rule.members is None else ("reserve_exempt",)
         patches: list[tuple[str, Any]] = [
             (to_camel(name), getattr(rule, name))
-            for name in ("max_running", "reserve_exempt")
+            for name in names
             if name in rule.model_fields_set
         ]
         if rule.reserve is not None:
@@ -302,12 +421,92 @@ def resolve_limit_rules(
     return resolved
 
 
+def resolve_binding_caps(
+    rules: Sequence[LimitRule],
+    *,
+    agent: str,
+    host: str | None,
+    model: str | None,
+    groups: ProviderGroups | None = None,
+) -> tuple[BindingCap, ...]:
+    """Return every cap binding this candidate.
+
+    Compatibility boundary: legacy single-scope rules (``members is None``) keep specificity-then-
+    order field resolution (including explicit ``maxRunning: null`` overrides). Every matching
+    ``members``-form cap is additive and evaluated alongside the resolved single-scope cap so
+    tightest wins independent of rule order.
+    """
+    fields = resolve_limit_rules(rules, agent=agent, host=host, model=model, groups=groups)
+    caps: list[BindingCap] = []
+    single_cap = fields["maxRunning"]
+    if (
+        single_cap.defined
+        and isinstance(single_cap.value, int)
+        and single_cap.source_rule_id is not None
+        and single_cap.scope is not None
+    ):
+        caps.append(
+            BindingCap(
+                rule_id=single_cap.source_rule_id,
+                max_running=single_cap.value,
+                scopes=(single_cap.scope,),
+                specificity=single_cap.specificity,
+                is_members_rule=False,
+            )
+        )
+    for rule in rules:
+        if (
+            rule.members is not None
+            and rule.max_running is not None
+            and rule.matches(agent=agent, host=host, model=model, groups=groups)
+        ):
+            caps.append(
+                BindingCap(
+                    rule_id=rule.id,
+                    max_running=rule.max_running,
+                    scopes=rule.members,
+                    specificity=None,
+                    is_members_rule=True,
+                )
+            )
+    return tuple(caps)
+
+
+def evaluate_binding_caps(
+    caps: Sequence[BindingCap],
+    running: Mapping[str, tuple[str, ...]],
+    groups: ProviderGroups | None = None,
+) -> tuple[EvaluatedBindingCap, ...]:
+    """Count running sessions per cap and order tightest-first independent of rule list order."""
+    evaluated = [
+        EvaluatedBindingCap(
+            cap=cap,
+            running_ids=(
+                running.scoped_many(cap.scopes, groups)
+                if isinstance(running, RunningSnapshot)
+                else None
+            ),
+        )
+        for cap in caps
+    ]
+    return tuple(sorted(evaluated, key=_cap_tightness_key))
+
+
 def validate_limit_rule_intersections(rules: Sequence[LimitRule]) -> None:
     """Check every selector equivalence cell, including unlisted host/model identities."""
-    for agent in dict.fromkeys(rule.agent for rule in rules):
-        agent_rules = [rule for rule in rules if rule.agent == agent]
-        hosts = list(dict.fromkeys(rule.host for rule in agent_rules if rule.host is not None))
-        models = list(dict.fromkeys(rule.model for rule in agent_rules if rule.model is not None))
+    single_rules = [rule for rule in rules if not rule.is_multi_member]
+    for agent in dict.fromkeys(rule.scopes[0].agent for rule in single_rules):
+        agent_rules = [rule for rule in single_rules if rule.scopes[0].agent == agent]
+        hosts = list(
+            dict.fromkeys(
+                rule.scopes[0].host for rule in agent_rules if rule.scopes[0].host is not None
+            )
+        )
+        models = list(
+            dict.fromkeys(
+                rule.scopes[0].model for rule in agent_rules if rule.scopes[0].model is not None
+            )
+        )
         for host in [*hosts, None]:
             for model in [*models, None]:
                 fields = resolve_limit_rules(agent_rules, agent=agent, host=host, model=model)
@@ -427,11 +626,20 @@ def choice_document(settings: SessionChoice) -> dict[str, object]:
         rules = []
         for rule in settings.limit_rules:
             patch = rule.model_dump(mode="json", by_alias=True, exclude_unset=True)
+            if rule.members is not None:
+                patch["members"] = [
+                    scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for scope in rule.members
+                ]
+                for selector in ("agent", "host", "model"):
+                    patch.pop(selector, None)
+            else:
+                for selector in ("host", "model"):
+                    if patch.get(selector) is None:
+                        patch.pop(selector, None)
+                patch.pop("members", None)
             if patch.get("reserve", {}) is None:
                 patch["reserve"] = {"pct": None, "stopPct": None}
-            for selector in ("host", "model"):
-                if patch.get(selector) is None:
-                    patch.pop(selector, None)
             rules.append(patch)
         result["limitRules"] = rules
     return result
@@ -904,30 +1112,43 @@ class RunningSnapshot(Mapping[str, tuple[str, ...]]):
             identities=tuple(row for row in self.identities if row.session_id != session_id),
         )
 
+    @staticmethod
+    def _match_row(
+        scope: LimitScope, row: RunningIdentity, groups: ProviderGroups | None
+    ) -> Literal["match", "miss", "unknown"]:
+        dimensions = (
+            (scope.agent, row.agent),
+            (scope.host, row.host),
+            (
+                canonical_model(scope.model, groups or {}) if scope.model else None,
+                canonical_model(row.model, groups or {}) if row.model else None,
+            ),
+        )
+        if any(want is not None and got is not None and want != got for want, got in dimensions):
+            return "miss"
+        if any(want is not None and got is None for want, got in dimensions):
+            return "unknown"
+        if not row.owner_known:
+            return "unknown"
+        return "match"
+
     def scoped(
         self, scope: LimitScope, groups: ProviderGroups | None = None
     ) -> tuple[str, ...] | None:
+        return self.scoped_many((scope,), groups)
+
+    def scoped_many(
+        self, scopes: Sequence[LimitScope], groups: ProviderGroups | None = None
+    ) -> tuple[str, ...] | None:
         if not self.available:
             return None
-        ids = set()
+        ids: set[str] = set()
         for row in self.identities:
-            dimensions = (
-                (scope.agent, row.agent),
-                (scope.host, row.host),
-                (
-                    canonical_model(scope.model, groups or {}) if scope.model else None,
-                    canonical_model(row.model, groups or {}) if row.model else None,
-                ),
-            )
-            if any(
-                want is not None and got is not None and want != got for want, got in dimensions
-            ):
-                continue
-            if any(want is not None and got is None for want, got in dimensions):
+            states = tuple(self._match_row(scope, row, groups) for scope in scopes)
+            if "match" in states:
+                ids.add(row.session_id)
+            elif "unknown" in states:
                 return None
-            if not row.owner_known:
-                return None
-            ids.add(row.session_id)
         return tuple(sorted(ids))
 
 
@@ -995,9 +1216,7 @@ def check_candidate_limits(
         settings.schema_version == 2
         and link.model is None
         and any(
-            rule.agent == link.agent_id
-            and (rule.host is None or rule.host == request.host)
-            and rule.model is not None
+            rule.unresolved_for_missing_model(link.agent_id, request.host)
             and (
                 bool(rule.model_fields_set & {"max_running", "reserve_exempt"})
                 or (rule.reserve is not None and bool(rule.reserve.model_fields_set))
@@ -1053,20 +1272,26 @@ def check_candidate_limits(
         if len(ids) >= cap:
             return Skipped(link, "busy", now, ids)
     if settings.schema_version == 2:
-        limits, fields = rule_limits(
-            settings, link.agent_id, request.host, link.model, request.provider_groups
+        caps = resolve_binding_caps(
+            settings.limit_rules,
+            agent=link.agent_id,
+            host=request.host,
+            model=link.model,
+            groups=request.provider_groups,
         )
-        scope = fields["maxRunning"].scope
-        if limits.max_running is not None and scope is not None:
-            ids = (
-                running.scoped(scope, request.provider_groups)
-                if isinstance(running, RunningSnapshot)
-                else None
-            )
-            if ids is None:
-                return Skipped(link, "count_unavailable")
-            if len(ids) >= limits.max_running:
-                return Skipped(link, "busy", now, ids)
+        evaluated = evaluate_binding_caps(caps, running, request.provider_groups)
+        if evaluated:
+            tightest = evaluated[0]
+            if tightest.blocked:
+                return Skipped(
+                    link,
+                    "busy",
+                    now,
+                    tightest.running_ids or (),
+                    rule_id=tightest.cap.rule_id,
+                )
+            if tightest.running_ids is None:
+                return Skipped(link, "count_unavailable", rule_id=tightest.cap.rule_id)
     return None
 
 
@@ -1207,6 +1432,7 @@ class Skipped:
     why: str
     until: float | None = None
     running: tuple[str, ...] = ()
+    rule_id: str | None = None
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -1214,6 +1440,7 @@ class Skipped:
             "why": self.why,
             "until": self.until,
             "running": list(self.running),
+            **({"ruleId": self.rule_id} if self.rule_id is not None else {}),
         }
 
 
@@ -1234,14 +1461,29 @@ class Choice:
     effective_limits: dict[str, Any] | None = None
     legacy_checks: dict[str, Any] | None = None
     notes: tuple[dict[str, str], ...] = ()
+    permission_tier: str | None = None
+    permission_tier_source: PermissionTierSource | None = None
 
     def payload(self) -> dict[str, Any]:
+        link_payload = (
+            self.link.model_dump(mode="json", by_alias=True, exclude_none=True)
+            if self.link is not None
+            else {}
+        )
+        if self.permission_tier_source is not None:
+            link_payload.pop("permissionTier", None)
         return {
             "outcome": self.outcome,
             "work_type": self.work_type,
+            **link_payload,
             **(
-                self.link.model_dump(mode="json", by_alias=True, exclude_none=True)
-                if self.link is not None
+                {"permissionTier": self.permission_tier}
+                if self.permission_tier is not None
+                else {}
+            ),
+            **(
+                {"permissionTierSource": self.permission_tier_source}
+                if self.permission_tier_source is not None
                 else {}
             ),
             "tier": self.tier,
