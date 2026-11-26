@@ -7328,7 +7328,7 @@ async def test_agy_post_prompt_usage_update_keeps_quiet_settle_for_trailing_text
 
     task = asyncio.create_task(run())
     try:
-        await prompt_sent.wait()
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
         feed(
             _acp_update_frame(
                 "s1",
@@ -7419,6 +7419,7 @@ async def test_agy_buffered_prompt_reply_preserves_read_file_backfill(
     ex._stdout_eof_event = asyncio.Event()
     ex._initialized = True
     ex._session_id = "s1"
+    ex._active_mode = "default"
     ex._reader_task = asyncio.create_task(ex._read_stdout())
     if managed:
         ex._policy_evaluator = AsyncMock(
@@ -7445,7 +7446,7 @@ async def test_agy_buffered_prompt_reply_preserves_read_file_backfill(
 
     task = asyncio.create_task(run())
     try:
-        await prompt_sent.wait()
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
         if reply_kind == "rpc_error":
             prompt_reply: dict[str, object] = {
                 "jsonrpc": "2.0",
@@ -7549,7 +7550,7 @@ async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_
 
     task = asyncio.create_task(run())
     try:
-        await prompt_sent.wait()
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
         cmd_input = {"CommandLine": "omni --version"}
         feed(
             _acp_update_frame(
@@ -7626,6 +7627,7 @@ async def test_acp_phase2_read_backfill_policy_aborts_at_deadline_without_readin
     ex._stdout_eof_event = asyncio.Event()
     ex._initialized = True
     ex._session_id = "s1"
+    ex._active_mode = "default"
     ex._reader_task = asyncio.create_task(ex._read_stdout())
 
     policy_entered = asyncio.Event()
@@ -7659,7 +7661,7 @@ async def test_acp_phase2_read_backfill_policy_aborts_at_deadline_without_readin
 
     task = asyncio.create_task(run())
     try:
-        await prompt_sent.wait()
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
         feed(
             _acp_update_frame(
                 "s1",
