@@ -981,7 +981,9 @@ def _stamped_revisions(conn: sa.Connection) -> set[str]:
 def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
     parameter = getattr(request, "param", _DISPATCH_REVISION)
-    starting_revision, exact = parameter if isinstance(parameter, tuple) else (parameter, False)
+    starting_revision, crdb_target = (
+        parameter if isinstance(parameter, tuple) else (parameter, None)
+    )
     root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
     admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
@@ -997,9 +999,7 @@ def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) ->
             uri = admin.url.set(database=name).render_as_string(hide_password=False)
         engine = sa.create_engine(uri)
         config = _build_alembic_config(uri)
-        if exact:
-            _migrate_on_one_connection(engine, starting_revision)
-        elif engine.dialect.name == "cockroachdb":
+        if engine.dialect.name == "cockroachdb":
             if _crdb_server_version(engine) >= Version("24.1"):
                 # Create indexes with their new tables instead of separate schema-change jobs.
                 with engine.connect().execution_options(isolation_level="SERIALIZABLE") as conn:
@@ -1011,7 +1011,7 @@ def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) ->
                 command.stamp(config, "head")
             engine.dispose()
             engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
-            command.downgrade(config, starting_revision)
+            _migrate_on_one_connection(engine, crdb_target or starting_revision, downgrade=True)
         else:
             command.upgrade(config, starting_revision)
         yield engine
@@ -1558,22 +1558,35 @@ def test_smart_routing_migration_leaves_existing_tasks_unset_and_round_trips(
 
 
 @pytest.mark.parametrize(
-    ("dispatch_migration_engine", "start"),
+    ("dispatch_migration_engine", "start", "crdb_companion"),
     [
-        (("a76c20261126", True), "a76c20261126"),
-        ((_SMART_ROUTING_REVISION, True), _SMART_ROUTING_REVISION),
-        (("a77c20261126", True), "a77c20261126"),
-        ((_WORKFLOW_ID_REVISION, True), _WORKFLOW_ID_REVISION),
+        (
+            ("a76c20261126", f"{_WORKFLOW_ID_REVISION}@{_SMART_ROUTING_PREVIOUS}"),
+            "a76c20261126",
+            None,
+        ),
+        (_SMART_ROUTING_REVISION, _SMART_ROUTING_REVISION, "a76c20261126"),
+        (
+            ("a77c20261126", f"{_WORKFLOW_ID_REVISION}@{_SMART_ROUTING_REVISION}"),
+            "a77c20261126",
+            None,
+        ),
+        (_WORKFLOW_ID_REVISION, _WORKFLOW_ID_REVISION, "a77c20261126"),
     ],
     indirect=["dispatch_migration_engine"],
     ids=["fork-routing", "upstream-routing", "fork-final", "upstream-final"],
 )
 def test_smart_routing_join_preserves_tasks_on_both_lineages(
-    dispatch_migration_engine: Engine, start: str
+    dispatch_migration_engine: Engine, start: str, crdb_companion: str | None
 ) -> None:
     engine = dispatch_migration_engine
+    expected_heads = {start}
+    # CockroachDB bootstraps the integrated schema. A rollback to an upstream
+    # revision retains the fork stamp rather than replaying pre-CRDB DDL.
+    if engine.dialect.name == "cockroachdb" and crdb_companion is not None:
+        expected_heads.add(crdb_companion)
     with engine.connect() as conn:
-        assert MigrationContext.configure(conn).get_current_heads() == (start,)
+        assert _stamped_revisions(conn) == expected_heads
     task_id = b"t" * 16
     run_id = b"r" * 16
     timer_id = b"i" * 16
@@ -1648,8 +1661,13 @@ def test_smart_routing_join_preserves_tasks_on_both_lineages(
 
 
 @pytest.mark.parametrize(
-    "starting_revision",
-    [_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, _COMMENT_ANCHOR_REVISION],
+    ("dispatch_migration_engine", "starting_revision"),
+    [
+        (_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_PREVIOUS),
+        (_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION),
+        (_MCP_SERVICES_PREVIOUS, _COMMENT_ANCHOR_REVISION),
+    ],
+    indirect=["dispatch_migration_engine"],
     ids=["before-both", "mcp-services-branch", "comment-anchor-branch"],
 )
 def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
@@ -1657,21 +1675,30 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
 ) -> None:
     """A database on either branch, or neither, gains both columns and one head."""
     engine = dispatch_migration_engine
-    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    command.upgrade(config, starting_revision)
-    command.upgrade(config, _MCP_SERVICES_MERGE_REVISION)
+    with engine.connect() as conn:
+        starting_heads = _stamped_revisions(conn)
+    assert _MCP_SERVICES_PREVIOUS in starting_heads
+    sibling_heads = starting_heads - {_MCP_SERVICES_PREVIOUS}
+    _migrate_on_one_connection(engine, starting_revision)
+
+    inspector = sa.inspect(engine)
+    assert ("mcp_services" in {c["name"] for c in inspector.get_columns("scheduled_tasks")}) == (
+        starting_revision == _MCP_SERVICES_REVISION
+    )
+    assert ("anchor_metadata" in {c["name"] for c in inspector.get_columns("comments")}) == (
+        starting_revision == _COMMENT_ANCHOR_REVISION
+    )
+    _migrate_on_one_connection(engine, _MCP_SERVICES_MERGE_REVISION)
 
     inspector = sa.inspect(engine)
     assert "mcp_services" in {c["name"] for c in inspector.get_columns("scheduled_tasks")}
     assert "anchor_metadata" in {c["name"] for c in inspector.get_columns("comments")}
     with engine.connect() as conn:
-        assert conn.execute(
-            sa.text("SELECT version_num FROM alembic_version")
-        ).scalars().all() == [_MCP_SERVICES_MERGE_REVISION]
+        assert _stamped_revisions(conn) == sibling_heads | {_MCP_SERVICES_MERGE_REVISION}
 
-    command.downgrade(config, _MCP_SERVICES_REVISION)
+    _migrate_on_one_connection(engine, _MCP_SERVICES_REVISION, downgrade=True)
     with engine.connect() as conn:
-        assert set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()) == {
+        assert _stamped_revisions(conn) == sibling_heads | {
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
         }
@@ -1722,13 +1749,13 @@ def test_timer_kind_migration_round_trips_once_timers_are_gone(
     with engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
         conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
+    with engine.connect() as conn:
+        upgraded_heads = _stamped_revisions(conn)
+    assert _TIMER_KIND_REVISION in upgraded_heads
     with pytest.raises(RuntimeError, match="Cancel or delete"):
         _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
     with engine.connect() as conn:
-        assert (
-            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-            == _TIMER_KIND_REVISION
-        )
+        assert _stamped_revisions(conn) == upgraded_heads
     with engine.begin() as conn:
         conn.execute(tasks.delete().where(tasks.c.kind == 3))
     _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)

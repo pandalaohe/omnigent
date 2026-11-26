@@ -1043,6 +1043,10 @@ async def answer(
             data["content"] = {"0": approval["approve" if body.decision == "approve" else "deny"]}
         if params.get("phase") == "acp_permission" and body.decision == "approve":
             data["content"] = {"answer": params["acp_allow_once"]}
+        fingerprint = params.get("approval_request_fingerprint")
+        if params.get("phase") == "codex_command_approval" and isinstance(fingerprint, str):
+            # Bind the single-use verdict to the exact offer rechecked under the card lock.
+            data["content"] = {"request_fingerprint": fingerprint}
         parked = _harness_parked_elicitations.get(elicitation_id)
         server_owned = (
             (_harness_elicitation_owners.get(elicitation_id) == target_id and future is not None)

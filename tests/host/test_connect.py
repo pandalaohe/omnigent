@@ -5517,6 +5517,7 @@ async def test_run_prewarms_zygote_during_capability_discovery(
 
     monkeypatch.setattr(host, "_initialize_capabilities", _discover)
     monkeypatch.setattr(host, "_connect_and_serve", _connect)
+    monkeypatch.setattr(host, "_start_workspace_socket", AsyncMock(return_value=None))
     monkeypatch.setattr(
         host, "_ensure_zygote_started", lambda: loop.call_soon_threadsafe(prewarm_started.set)
     )

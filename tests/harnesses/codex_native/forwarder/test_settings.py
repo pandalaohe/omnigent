@@ -618,10 +618,10 @@ async def test_permission_sync_failure_retries_observation_only() -> None:
 
 @pytest.mark.parametrize(
     ("sandbox_type", "expected"),
-    [("dangerFullAccess", "full-access"), ("workspaceWrite", None)],
+    [("dangerFullAccess", "full-access"), ("workspaceWrite", "custom")],
 )
 def test_resume_response_records_approval_preset_from_its_sandbox(
-    sandbox_type: str, expected: str | None
+    sandbox_type: str, expected: str
 ) -> None:
     """A thread/resume result names its sandbox ``sandbox``, not ``sandboxPolicy``.
 
@@ -641,7 +641,8 @@ def test_resume_response_records_approval_preset_from_its_sandbox(
         }
     )
 
-    assert state.approval_preset == expected
+    assert state.permission_observation is not None
+    assert state.permission_observation.mode == expected
 
 
 @pytest.mark.asyncio

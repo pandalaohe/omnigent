@@ -1006,7 +1006,9 @@ describe("NewChatLandingScreen nested agent creation", () => {
 
       searchParams = new URLSearchParams("sibling=first");
       renderLanding({ sibling_sessions: true }, {}, client);
-      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(nestedText);
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
+        nestedText ? `${nestedText} [file 1] ` : nestedText,
+      );
       act(() => {
         discardNestedSessionDraft(client, parkedDrafts[0].key);
       });
@@ -1105,7 +1107,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
         "aria-label",
-        "Host: corey-laptop, Online",
+        "Host: This machine, Online",
       );
       fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
         target: { files: [new File(["submitted"], "submitted.txt", { type: "text/plain" })] },

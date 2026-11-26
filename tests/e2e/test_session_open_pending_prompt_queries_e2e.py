@@ -131,6 +131,11 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
         ) as base_url,
         httpx.Client(base_url=base_url, trust_env=False, timeout=60) as client,
     ):
+        # Measure replay while the original hook is waiting for a verdict.
+        client.patch(
+            "/v1/me/preferences/approval_timeout",
+            json={"value": {"asyncApprovals": False}},
+        ).raise_for_status()
         root = create_native_session(
             client, base_url, harness="claude", metadata={"title": "fan-out root"}
         )

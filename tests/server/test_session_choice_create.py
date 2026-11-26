@@ -3254,6 +3254,7 @@ async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(
             bridge_dir=tmp_path,
             thread_id="thread",
             turns=[{"id": "success", "status": "completed", "items": []}],
+            replay_from_turn_id="success",
         )
     else:
         edge = fwd._terminal_turn_status_edge(

@@ -520,6 +520,7 @@ def test_framework_reads_allow_every_tier_and_are_plan_visible(name: str) -> Non
     [
         "sys_session_create",
         "sys_session_send",
+        "sys_session_message",
         "sys_session_open",
         "sys_session_rename",
         "sys_session_update",
@@ -772,7 +773,7 @@ def test_deferred_and_unregistered_tools_keep_unknown_tiers(
 
 
 def test_third_party_mcp_server_cannot_reuse_known_omnigent_names() -> None:
-    for name in ("sys_session_list", "sys_session_send"):
+    for name in ("sys_session_list", "sys_session_send", "sys_session_message"):
         args = {"ServerName": "third-party", "ToolName": name, "Arguments": {}}
         assert decision("ask", "call_mcp_tool", args).action == Verdict.ASK
         assert decision("plan", "call_mcp_tool", args).action == Verdict.DENY

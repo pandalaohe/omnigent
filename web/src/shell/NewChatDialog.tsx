@@ -2565,16 +2565,13 @@ function NewChatWorkspaceControls({
   disabled: boolean;
 }) {
   const isMobile = useIsMobileViewport();
+  if (!isMobile) return children;
   return (
     <fieldset
       disabled={disabled}
-      className={
-        isMobile
-          ? "new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
-          : "contents"
-      }
+      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
     >
-      {isMobile && <OmniGlassSurface borderRadius={20} className="-z-10" />}
+      <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
     </fieldset>
   );
@@ -7719,14 +7716,14 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const bound = bindDraft({ quotes: [], text: message }, files, (d) => d.text, {
+      const bound = bindDraft({ quotes: [], text: message }, attachedFiles, (d) => d.text, {
         transformText: (text) => expandMentionTokens(text, taggedMentions),
       });
-      const submittedFiles = bound.bound > 0 ? bound.files : files;
+      const submittedFiles = bound.files;
       const promptParts =
         bound.bound > 0
           ? composerPartsFromProjection(sanitizeInitialPrompt(bound.projection), submittedFiles)
-          : legacyComposerParts(sanitizeInitialPrompt(bound.snapshot.text), files);
+          : legacyComposerParts(sanitizeInitialPrompt(bound.snapshot.text), submittedFiles);
       const tagsSessions = taggedMentions.some((m) => m.marker.startsWith("[Session: "));
       const hint = tagsSessions ? withSessionMentionHint("", true) : "";
       const orderedPromptParts = normalizeComposerParts([

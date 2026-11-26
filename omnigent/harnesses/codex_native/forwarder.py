@@ -2007,6 +2007,7 @@ class _CodexForwarderState:
                 "approvals_reviewer",
                 "sandboxPolicy",
                 "sandbox_policy",
+                "sandbox",
                 "activePermissionProfile",
                 "active_permission_profile",
             )
