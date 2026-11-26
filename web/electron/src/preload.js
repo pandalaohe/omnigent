@@ -756,6 +756,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
    *  @param {string} url @param {"local"|"remote"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Stop the in-flight connectRunner sign-in. Resolves whether one was running. */
+  cancelRunnerConnect: () => ipcRenderer.invoke("omnigent:cancel-runner-connect"),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */
   onRunnerConnectLog: (callback) => {
@@ -831,6 +833,7 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * the installer finishes; output streams via onCliInstallLog.
    */
   installCli: () => ipcRenderer.invoke("omnigent:cli-install"),
+  cancelCliInstall: () => ipcRenderer.invoke("omnigent:cancel-cli-install"),
   /**
    * Subscribe to the CLI installer's output lines. Returns an unsubscribe fn.
    * @param {(line: string) => void} callback

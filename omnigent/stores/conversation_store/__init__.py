@@ -30,6 +30,13 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 PENDING_INPUT_RESPONSE_ID = "pending_input"
 MAX_PENDING_INPUTS = 100
 
+
+class ConversationSearchHit(ConversationItem):
+    """A search item with its parent session's id."""
+
+    conversation_id: str
+
+
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
 
@@ -1688,7 +1695,9 @@ class ConversationStore(ABC):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
-    ) -> list[ConversationItem]:
+        *,
+        accessible_by: str,
+    ) -> list[ConversationSearchHit]:
         """
         Full-text search over conversation items.
 
@@ -1701,8 +1710,9 @@ class ConversationStore(ABC):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
-        :returns: A list of matching :class:`ConversationItem`
-            objects ranked by relevance.
+        :param accessible_by: Authenticated user whose session permissions
+            restrict matches before the result limit.
+        :returns: Matching items with their conversation ids, ranked by relevance.
         """
         ...
 

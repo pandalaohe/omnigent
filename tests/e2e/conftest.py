@@ -757,6 +757,13 @@ def live_runner_id() -> str:
     return _live_runner_state["runner_id"]
 
 
+# Test-only policy handler modules the live server may reference from fixture agents.
+_E2E_POLICY_MODULES = [
+    "omnigent._e2e_policy_callables",
+    "tests.resources.examples._shared.search_rate_limit_policy",
+]
+
+
 @pytest.fixture(scope="session")
 def live_server(
     request: pytest.FixtureRequest,
@@ -888,13 +895,14 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         "model": "_policy_llm_",
                         "connection": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
                         },
-                    }
+                    },
                 }
             )
         )
@@ -904,6 +912,7 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         # Stable key: session-scoped server must not
                         # depend on which test boots it first.
@@ -912,7 +921,7 @@ def live_server(
                             "base_url": model_base_url(databricks_workspace_host, "mlflow/v1"),
                             "api_key": llm_api_key,
                         },
-                    }
+                    },
                 }
             )
         )

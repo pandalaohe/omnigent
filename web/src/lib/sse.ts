@@ -1370,9 +1370,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       fileEdit: fileEditRequestFromWire(p.file_edit),
       codexCommand:
-        phase === "codex_command_approval" && typeof command === "string" && command
+        phase === "codex_command_approval" &&
+        ((typeof command === "string" && command) ||
+          typeof p.approval_request_fingerprint === "string")
           ? {
-              command,
+              command: typeof command === "string" && command ? command : null,
               cwd: typeof cwd === "string" && cwd ? cwd : null,
               reason: typeof reason === "string" && reason ? reason : null,
               execPolicyAmendment:
@@ -1380,6 +1382,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 execPolicyAmendment.every((entry): entry is string => typeof entry === "string")
                   ? execPolicyAmendment
                   : null,
+              ...(typeof p.approval_request_fingerprint === "string"
+                ? { requestFingerprint: p.approval_request_fingerprint }
+                : {}),
             }
           : null,
       allowAllEdits,

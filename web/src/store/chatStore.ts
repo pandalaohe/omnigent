@@ -4049,6 +4049,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const originalBlock = scopedState.blocks.find(
       (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
     );
+    const displayedFingerprint = originalBlock?.codexCommand?.requestFingerprint ?? undefined;
+    const submittedFingerprint = content?.request_fingerprint;
+    if (displayedFingerprint !== undefined && submittedFingerprint !== displayedFingerprint)
+      return false;
+    const fingerprint =
+      typeof submittedFingerprint === "string" ? submittedFingerprint : displayedFingerprint;
+    const matchesRequest = (b: AnyBlock): b is ElicitationBlock =>
+      b.type === "elicitation" &&
+      b.elicitationId === elicitationId &&
+      (b.codexCommand?.requestFingerprint ?? undefined) === fingerprint;
     if (
       originalBlock?.nativeDelivery &&
       (originalBlock.status !== "pending" || originalBlock.nativeDelivery.state === "sending")
@@ -4076,9 +4086,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const markResponded = () =>
       write((s) => ({
         blocks: s.blocks.map((b) =>
-          b.type === "elicitation" && b.elicitationId === elicitationId
-            ? { ...b, status: "responded", response: responseValue }
-            : b,
+          matchesRequest(b) ? { ...b, status: "responded", response: responseValue } : b,
         ),
       }));
     if (originalBlock?.nativeDelivery) {
@@ -4112,7 +4120,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       phase: "complete",
       status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
     });
-    elicitationVerdictsInFlight.add(elicitationId);
+    elicitationVerdictsInFlight.set(elicitationId, responseValue);
     bumpElicitationVerdictRevision(sessionId, elicitationId);
     try {
       await approveElicitation(targetSessionId, elicitationId, {
@@ -4120,6 +4128,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      const replacement = setterForState(sessionId)?.blocks.some(
+        (b) => b.type === "elicitation" && b.elicitationId === elicitationId && !matchesRequest(b),
+      );
+      if (replacement || elicitationVerdictsInFlight.get(elicitationId) !== responseValue) {
+        cancelLocalElicitationResolution(elicitationId, holdToken);
+        return true;
+      }
       if (asyncQuestion) markResponded();
       acknowledgeLocalElicitationResolution(elicitationId, holdToken);
       clearAskUserQuestionDraft(elicitationId);
@@ -4129,13 +4144,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return true;
     } catch (error) {
       cancelLocalElicitationResolution(elicitationId, holdToken);
+      if (elicitationVerdictsInFlight.get(elicitationId) !== responseValue) return false;
       // The prompt timed out before this verdict arrived and the server
       // refused it. Keep the block responded as timed out so the card
       // hides instead of re-offering a retry that can never succeed.
       if (error instanceof ApiError && error.code === "elicitation_timed_out") {
         write((s) => ({
           blocks: s.blocks.map((b) =>
-            b.type === "elicitation" && b.elicitationId === elicitationId
+            matchesRequest(b)
               ? {
                   ...b,
                   status: "responded",
@@ -4156,9 +4172,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // answered.
       write((s) => ({
         blocks: s.blocks.map((b) =>
-          b.type === "elicitation" &&
-          b.elicitationId === elicitationId &&
-          (!b.nativeDelivery || (b.status === "pending" && b.response === responseValue))
+          matchesRequest(b) && b.response === responseValue
             ? {
                 ...b,
                 status: "pending",
@@ -4170,8 +4184,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       return false;
     } finally {
-      elicitationVerdictsInFlight.delete(elicitationId);
-      elicitationRechecksAfterVerdict.delete(elicitationId);
+      if (elicitationVerdictsInFlight.get(elicitationId) === responseValue) {
+        elicitationVerdictsInFlight.delete(elicitationId);
+        elicitationRechecksAfterVerdict.delete(elicitationId);
+      }
     }
   },
 
@@ -6963,6 +6979,17 @@ function reconcileElicitationBlocks(
       return { ...currentDelivery, ctx: b.ctx };
     }
     if (
+      currentDelivery !== undefined &&
+      !b.nativeDelivery &&
+      preGapCards.get(b.elicitationId) === b &&
+      currentDelivery.codexCommand?.requestFingerprint &&
+      currentDelivery.codexCommand.requestFingerprint !== b.codexCommand?.requestFingerprint
+    ) {
+      // A reused id now carries a different Codex command request.
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
+    if (
       b.status === "pending" &&
       preGapPendingIds.has(b.elicitationId) &&
       !pendingNow.has(b.elicitationId)
@@ -8500,8 +8527,8 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
   );
 }
 
-/** Elicitation ids whose verdict POST (`submitApproval`) has not returned. */
-const elicitationVerdictsInFlight = new Set<string>();
+/** Latest verdict POST for an elicitation ID, until that request returns. */
+const elicitationVerdictsInFlight = new Map<string, ElicitationBlock["response"]>();
 
 /**
  * Whether a responded card may flip back to pending when the server shows
@@ -8622,6 +8649,20 @@ function revivePendingElicitationBlock(
     if (incoming.nativeDelivery) {
       if (target.status === "responded" && target.response?.action !== "auto_resolved") return {};
       const updated = { ...incoming, ctx: target.ctx };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
+    // A reused id carrying a different Codex command request replaces the card,
+    // including a pending card or one with an in-flight verdict for the old request.
+    const changedCodexRequest =
+      incoming.codexCommand?.requestFingerprint &&
+      incoming.codexCommand.requestFingerprint !== target.codexCommand?.requestFingerprint;
+    if (changedCodexRequest) {
+      const updated: ElicitationBlock = {
+        ...incoming,
+        ctx: target.ctx,
+        status: "pending",
+        response: null,
+      };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
     if (!isRevivableElicitation(target)) return {};
@@ -8853,9 +8894,8 @@ export async function pumpStreamEvents(
       // not persisted items), so the dedupe above can't see them. The
       // server re-publishes the same id whenever a severed harness wait
       // re-parks (hook retries reuse their id), so an already-rendered
-      // id must not append a second card: a pending card (or one
-      // carrying an in-flight user verdict) stays untouched, and a
-      // responded card is revived to answerable in place.
+      // id must not append a second card. A re-publish replaces a
+      // buffered card; a rendered card is revived or refreshed in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
         const buffered = buffer.findIndex(
@@ -8866,7 +8906,11 @@ export async function pumpStreamEvents(
           if (
             target.type === "elicitation" &&
             target.status === "pending" &&
-            (block.nativeDelivery || block.triage || target.triage)
+            (block.nativeDelivery ||
+              block.triage ||
+              target.triage ||
+              block.codexCommand?.requestFingerprint ||
+              target.codexCommand?.requestFingerprint)
           ) {
             buffer[buffered] = { ...block, ctx: target.ctx };
           }

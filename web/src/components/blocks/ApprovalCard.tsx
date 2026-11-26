@@ -314,10 +314,11 @@ interface ApprovalCardProps {
    * card renders command metadata instead of the raw JSON preview.
    */
   codexCommand?: {
-    command: string;
+    command: string | null;
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the binary
@@ -501,8 +502,13 @@ export function ApprovalCard({
   const hotkeyTarget = useApprovesOnHotkey(
     elicitationId,
     status === "pending" && !browserApprovalBlocked,
+    codexCommand?.requestFingerprint ?? undefined,
   );
-  useApprovalPromptOnScreen(elicitationId, inChat && status === "pending");
+  useApprovalPromptOnScreen(
+    elicitationId,
+    inChat && status === "pending",
+    codexCommand?.requestFingerprint ?? undefined,
+  );
   const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
   const declineKeys = hotkeyTarget && inChat ? DECLINE_KEYS : undefined;
   // In a side-chat pane this resolves to the child id, so the verdict targets
@@ -540,12 +546,20 @@ export function ApprovalCard({
         }
       : undefined;
   const submit: SubmitApprovalFn = (...args) => {
-    if (!nativeDelivery) return submitVerdict(...args);
+    const fingerprint = codexCommand?.requestFingerprint;
+    if (!nativeDelivery && !fingerprint) return submitVerdict(...args);
     const [id, action, content, meta] = args;
-    submitVerdict(id, action, content, {
-      ...meta,
-      native_delivery_attempt: nativeDelivery.attempt,
-    });
+    const requestContent = fingerprint ? { ...content, request_fingerprint: fingerprint } : content;
+    if (nativeDelivery) {
+      submitVerdict(id, action, requestContent, {
+        ...meta,
+        native_delivery_attempt: nativeDelivery.attempt,
+      });
+    } else if (meta !== undefined) {
+      submitVerdict(id, action, requestContent, meta);
+    } else {
+      submitVerdict(id, action, requestContent);
+    }
   };
   const submitBinary = (action: "accept" | "decline") => {
     return submit(elicitationId, action);
@@ -564,8 +578,8 @@ export function ApprovalCard({
     // must be str / int / float / bool / list[str] / null).
     return submit(elicitationId, "accept", answers, meta);
   };
-  const submitExecPolicyAmendment = (amendment: string[]) => {
-    submit(elicitationId, "accept", { execpolicy_amendment: amendment });
+  const submitExecPolicyAmendment = () => {
+    submit(elicitationId, "accept", { remember: true });
   };
   const submitAutoMode = () => {
     submit(elicitationId, "accept", { allow_auto_mode: true });
@@ -638,7 +652,7 @@ export function ApprovalCard({
   const schemaFormFields =
     askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
   const isSchemaForm = schemaFormFields.length > 0;
-  const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
+  const isCodexCommandApproval = codexCommand?.command != null;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
@@ -694,8 +708,7 @@ export function ApprovalCard({
       ? codexCommand.execPolicyAmendment
       : null;
   const acceptedWithExecPolicy =
-    Array.isArray(response?.content?.execpolicy_amendment) &&
-    response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
+    isCodexCommandApproval && response?.action === "accept" && response.content?.remember === true;
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedAutoMode =
     response?.action === "accept" && response.content?.allow_auto_mode === true;
@@ -901,16 +914,21 @@ export function ApprovalCard({
           Approve
         </Button>
       </KeyboardShortcutTooltip>
-      {execPolicyAmendment && (
+      {execPolicyAmendment && codexCommand?.requestFingerprint && (
         <Button
           size="sm"
           variant="outline"
-          className={MOBILE_CHOICE_CLASS}
-          onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
+          className={cn("h-auto max-w-full whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
+          onClick={submitExecPolicyAmendment}
           componentId="approval.approve_command_remember"
         >
-          <CheckIcon className="mr-1 size-3.5" />
-          Approve and remember
+          <CheckIcon className="mr-1 size-3.5 shrink-0" />
+          <span className="min-w-0">
+            Approve and remember commands starting with{" "}
+            <code className="break-all rounded bg-muted px-1 font-mono">
+              {JSON.stringify(execPolicyAmendment)}
+            </code>
+          </span>
         </Button>
       )}
       <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
@@ -1135,6 +1153,14 @@ export function ApprovalCard({
                     <span className="text-muted-foreground">cwd: </span>
                     <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">
                       {codexCommand.cwd}
+                    </code>
+                  </span>
+                )}
+                {acceptedWithExecPolicy && execPolicyAmendment && (
+                  <span>
+                    Remembered command prefix:{" "}
+                    <code className="rounded bg-muted px-1 font-mono text-sm">
+                      {JSON.stringify(execPolicyAmendment)}
                     </code>
                   </span>
                 )}

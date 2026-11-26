@@ -168,6 +168,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -4984,6 +4985,44 @@ async def _resolve_elicitation_locked(
             pending_entry.get("params"),
             file_store,
         )
+    if not reuse_verdict and isinstance(elicitation_id, str):
+        raw_content = data.get("content")
+        content = raw_content if isinstance(raw_content, dict) else {}
+        request_params = pending_entry.get("params") if pending_entry is not None else None
+        if not isinstance(request_params, dict):
+            if "request_fingerprint" in content:
+                raise OmnigentError(
+                    "This command approval is no longer pending.", code=ErrorCode.INVALID_INPUT
+                )
+        elif request_params.get("phase") == "codex_command_approval":
+            displayed_fingerprint = content.get("request_fingerprint")
+            current_fingerprint = request_params.get("approval_request_fingerprint")
+            parked = _harness_parked_elicitations.get(elicitation_id)
+            try:
+                pending_fingerprint = _harness_elicitation_request_fingerprint(
+                    ElicitationRequestParams.model_validate(request_params)
+                )
+            except ValidationError as err:
+                raise OmnigentError(
+                    "Invalid command approval request.", code=ErrorCode.INVALID_INPUT
+                ) from err
+            if (
+                displayed_fingerprint != current_fingerprint
+                or (content.get("remember") is True and not isinstance(current_fingerprint, str))
+                or (
+                    parked is not None
+                    and (
+                        parked.session_id != session_id
+                        or _harness_elicitation_owners.get(elicitation_id, session_id)
+                        != session_id
+                        or parked.request_fingerprint != pending_fingerprint
+                    )
+                )
+            ):
+                raise OmnigentError(
+                    "This command approval changed. Refresh it before answering.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
         session_id, elicitation_id, data, conversation_store
     ):
@@ -11176,6 +11215,12 @@ async def _forward_event_to_runner(
         ]
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
+    caller_user_id = created_by
+    if caller_user_id is None and local_single_user_enabled():
+        # Attribution drops the single-user identity; it is still the caller.
+        caller_user_id = RESERVED_USER_LOCAL
+    if caller_user_id is not None:
+        runner_body["caller_user_id"] = caller_user_id
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -18673,6 +18718,11 @@ async def _handle_mcp_tools_call(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return _mcp_error_response(rpc_id, -32000, f"Agent not found: {conv.agent_id!r}")
+    server_search = (
+        execute_tool is None
+        and namespaced_name == "search_conversations"
+        and any(tool.name == namespaced_name for tool in spec.tools.builtins)
+    )
 
     from omnigent.permission_tiers import Verdict
     from omnigent.server.permission_gate import (
@@ -18748,6 +18798,23 @@ async def _handle_mcp_tools_call(
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
 
+        elicitation_id_from_state = state.get("elicitation_id")
+        if not isinstance(elicitation_id_from_state, str):
+            return _mcp_error_response(rpc_id, -32000, "Invalid elicitation id")
+        pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+        if pending is None:
+            return _mcp_error_response(rpc_id, -32000, "Elicitation not found or already resolved")
+        identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
+        if not pending.from_mcp or pending.mcp_call_identity != identity:
+            return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
+        if pending.reviewed_arguments is None or arguments != pending.reviewed_arguments:
+            return _mcp_error_response(
+                rpc_id, -32000, "Retry arguments do not match the approved request"
+            )
+        approval = input_responses.get(elicitation_id_from_state) or {}
+        if approval.get("action") != "accept":
+            return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
+
         # Re-evaluate policy on every retry; approval cannot override a denial.
         retry_ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
@@ -18775,67 +18842,36 @@ async def _handle_mcp_tools_call(
                 f"Denied by policy: {retry_result.reason or 'no reason given'}",
             )
 
-        if retry_result.action == PolicyAction.ASK:
-            # Policy still requires approval — verify the elicitation was
-            # genuinely issued by the server (present in the pending map) and
-            # that the user approved it.
-            elicitation_id_from_state: str = state.get("elicitation_id", "")
-            if elicitation_id_from_state not in _pending_policy_ask_writes:
-                approval: dict[str, Any] = input_responses.get(elicitation_id_from_state) or {}
-                if approval.get("action") == "accept":
-                    return _mcp_error_response(
-                        rpc_id, -32000, "Elicitation not found or already resolved"
-                    )
-                return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            approval = input_responses.get(elicitation_id_from_state) or {}
-            if approval.get("action") != "accept":
-                return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+        # These application cards record a separate owner verdict.
+        try:
             if namespaced_name == "sys_host_restart":
                 from omnigent.server.host_restart_approval import require_restart_card_approval
 
-                try:
-                    require_restart_card_approval(session_id, elicitation_id_from_state)
-                except OmnigentError as exc:
-                    return _mcp_error_response(rpc_id, -32000, exc.message)
-            if namespaced_name == "sys_terminal_request_access":
+                require_restart_card_approval(session_id, elicitation_id_from_state)
+            elif namespaced_name == "sys_terminal_request_access":
                 from omnigent.server.terminal_agent_access import require_terminal_card_approval
 
-                try:
-                    require_terminal_card_approval(session_id, elicitation_id_from_state)
-                except OmnigentError as exc:
-                    return _mcp_error_response(rpc_id, -32000, exc.message)
-            identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
-            if _pending is not None and _pending.mcp_call_identity not in (None, identity):
-                return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
-            _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
-            # Approval applies to the stored call and its reviewed transform.
-            # Older pending entries use the re-evaluated transform.
-            if _pending is not None and _pending.reviewed_arguments is not None:
-                if arguments != _pending.reviewed_arguments:
-                    return _mcp_error_response(
-                        rpc_id, -32000, "Retry arguments do not match the approved request"
-                    )
-                if _pending.transformed_arguments is not None:
-                    arguments = cast("dict[str, object]", _pending.transformed_arguments)
-                else:
-                    arguments = cast("dict[str, object]", _pending.reviewed_arguments)
-            elif retry_result.data is not None:
-                arguments = cast("dict[str, object]", retry_result.data)
+                require_terminal_card_approval(session_id, elicitation_id_from_state)
+        except OmnigentError as exc:
+            return _mcp_error_response(rpc_id, -32000, exc.message)
+
+        # Recheck after policy evaluation yields: another retry may have consumed it.
+        if _pending_policy_ask_writes.get(elicitation_id_from_state) is not pending:
+            return _mcp_error_response(rpc_id, -32000, "Elicitation not found or already resolved")
+        _pending_policy_ask_writes.pop(elicitation_id_from_state)
+        # Approval never overrides transforms required by the current policy.
+        if retry_result.data is not None:
+            arguments = cast("dict[str, object]", retry_result.data)
+        if retry_result.action == PolicyAction.ASK:
             # Apply the deciding policy's deferred writes now that the user
             # approved (POLICIES.md §7.2: only on accept).
-            if _pending is not None:
-                if _pending.set_labels:
-                    await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
-                if _pending.state_updates:
-                    with contextlib.suppress(ConversationNotFoundError):
-                        await asyncio.to_thread(
-                            engine.apply_state_updates, _pending.state_updates, approved=True
-                        )
-        else:
-            # The current policy controls arguments when approval is no longer required.
-            if retry_result.data is not None:
-                arguments = cast("dict[str, object]", retry_result.data)
+            if pending.set_labels:
+                await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
+            if pending.state_updates:
+                with contextlib.suppress(ConversationNotFoundError):
+                    await asyncio.to_thread(
+                        engine.apply_state_updates, pending.state_updates, approved=True
+                    )
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
@@ -18949,7 +18985,7 @@ async def _handle_mcp_tools_call(
         "mcp__omnigent__sys_advise_models",
     )
     if pi_continuation and (
-        server_advisor or execute_tool is not None or registry_config is not None
+        server_advisor or server_search or execute_tool is not None or registry_config is not None
     ):
         # These branches bypass the runner's retained MCP execution cache.
         binding = tier_inspection.binding
@@ -19009,9 +19045,28 @@ async def _handle_mcp_tools_call(
     from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
     runner_client: httpx.AsyncClient | None = None
+    exec_data: dict[str, Any]
     if execute_tool is not None:
         try:
             exec_data = await execute_tool(arguments)
+        finally:
+            await finish_server_execution()
+    elif server_search:
+        from omnigent.tools.base import ToolContext
+        from omnigent.tools.builtins.search_conversations import SearchConversationsTool
+
+        try:
+            output = await asyncio.to_thread(
+                SearchConversationsTool(conversation_store).invoke,
+                json.dumps(arguments),
+                ToolContext(
+                    task_id=session_id,
+                    agent_id=conv.agent_id,
+                    conversation_id=session_id,
+                    caller_user_id=(actor or {}).get("run_as"),
+                ),
+            )
+            exec_data = {"result": {"output": output}}
         finally:
             await finish_server_execution()
     elif registry_config is not None:
@@ -19247,7 +19302,7 @@ async def _handle_mcp_tools_call(
     )
 
     if result_policy.action == PolicyAction.ASK and (
-        execute_tool is not None or registry_config is not None
+        execute_tool is not None or registry_config is not None or server_search
     ):
         output = "[Result withheld: MCP gateway result-review approval is not supported]"
     elif result_policy.action == PolicyAction.DENY:

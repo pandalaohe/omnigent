@@ -46,6 +46,7 @@ interface ElicitationData {
   policy_name?: string;
   content_preview?: string;
   native_delivery?: NativePermissionDelivery;
+  approval_request_fingerprint?: string;
   permission_directories?: string[];
   file_edit?: unknown;
 }
@@ -133,14 +134,20 @@ export function ApprovePage() {
       content?: Record<string, unknown>,
       meta?: Record<string, unknown>,
     ) => {
-      if (!sessionId || !elicitationId || submission.current.pending) return;
+      if (!sessionId || !elicitationId || state.kind !== "pending" || submission.current.pending) {
+        return;
+      }
+      const fingerprint = state.data.approval_request_fingerprint;
+      const requestContent = fingerprint
+        ? { ...content, request_fingerprint: fingerprint }
+        : content;
       const submitted = {
         revision: submission.current.revision + 1,
         pending: true,
-        attempt: state.kind === "pending" ? state.data.native_delivery?.attempt : undefined,
+        attempt: state.data.native_delivery?.attempt,
       };
       submission.current = submitted;
-      if (state.kind === "pending" && state.data.native_delivery) {
+      if (state.data.native_delivery) {
         setState({
           kind: "pending",
           data: {
@@ -159,7 +166,7 @@ export function ApprovePage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               action,
-              ...(content ? { content } : {}),
+              ...(requestContent ? { content: requestContent } : {}),
               ...(meta ? { _meta: meta } : {}),
             }),
           },

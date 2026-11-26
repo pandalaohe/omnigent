@@ -257,10 +257,11 @@ export interface ElicitationRequest {
    * without dumping the full Codex JSON-RPC payload.
    */
   codexCommand?: {
-    command: string;
+    command: string | null;
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Producer-supplied extra (claude-native edit-tool prompts only):

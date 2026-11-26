@@ -208,6 +208,62 @@ describe("SetupTerminalStep", () => {
     expect(bar()).toBe("70%");
   });
 
+  it("offers Cancel while the action is still running, and not once it has finished", async () => {
+    const onCancel = vi.fn();
+    let finish: (v: { ok: boolean }) => void = () => {};
+    const onRun = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    await act(async () => finish({ ok: false }));
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("does not start the connection after Cancel while installation is finishing", async () => {
+    const { promise: installing, resolve: finishInstall } = Promise.withResolvers<{
+      ok: boolean;
+    }>();
+    const { promise: canceling, resolve: finishCancel } = Promise.withResolvers<void>();
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
+    render(
+      <SetupTerminalStep
+        onInstallCli={() => installing}
+        onCancel={() => canceling}
+        onRun={onRun}
+        onBack={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Cancelling…" })).toBeDisabled();
+    await act(async () => finishInstall({ ok: true }));
+    expect(onRun).not.toHaveBeenCalled();
+    await act(async () => finishCancel());
+  });
+
+  it("leaves the server connect's own Cancel alone", () => {
+    const onCancel = vi.fn();
+    const onCancelConnect = vi.fn();
+    render(
+      <SetupTerminalStep
+        onRun={() => new Promise(() => {})}
+        onBack={vi.fn()}
+        onCancel={onCancel}
+        onCancelConnect={onCancelConnect}
+        connection={{ phase: "connecting" }}
+      />,
+    );
+    const buttons = screen.getAllByRole("button", { name: /cancel/i });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onCancelConnect).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
   it("fires onBack from Back on the failure screen", async () => {
     const onBack = vi.fn();
     render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />);

@@ -173,10 +173,11 @@ export type RenderItem =
       exitPlanMode?: Record<string, unknown> | null;
       fileEdit?: FileEditRequest | null;
       codexCommand?: {
-        command: string;
+        command: string | null;
         cwd: string | null;
         reason: string | null;
         execPolicyAmendment: string[] | null;
+        requestFingerprint?: string | null;
       } | null;
       allowAllEdits?: boolean;
       interruptible?: boolean;

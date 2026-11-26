@@ -45,6 +45,8 @@ export interface ConnectResult {
 /** Result of a setup operation; `error` remains the combined legacy message. */
 export interface SetupResult {
   ok: boolean;
+  /** The user cancelled; not a failure. */
+  canceled?: boolean;
   error?: string;
   errorMessage?: string;
   errorAction?: string;
@@ -114,6 +116,7 @@ export interface ServerSelectorV2Setup {
   /** Install the omnigent CLI (macOS). Present only when the CLI is missing and
    *  the shell supports it; absent → the install step is skipped. */
   onInstallCli?: () => Promise<SetupResult>;
+  onCancelInstallCli?: () => Promise<boolean>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Runners the "Where do you work today?" step offers for `url`, and whether
@@ -124,6 +127,8 @@ export interface ServerSelectorV2Setup {
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
   onConnectRunner?: (url: string, runner: Runner) => Promise<SetupResult>;
+  /** Stop the in-flight onConnectRunner sign-in; resolves whether one was running. */
+  onCancelRunnerConnect?: () => Promise<boolean>;
   /** Subscribe to onConnectRunner's output lines; returns an unsubscribe. */
   onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
@@ -343,14 +348,24 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       errorAction: result.errorAction,
     };
   };
+  // Bumped per run and on Cancel, so a run the user cancelled can't go on to open the server.
+  const terminalRun = useRef(0);
+  const cancelTerminal = async (cancel?: () => Promise<boolean>) => {
+    const canceledRun = ++terminalRun.current;
+    await cancel?.();
+    if (terminalRun.current === canceledRun) setStep(terminalTarget.back);
+  };
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
   const runTerminal = async () => {
     setRemoteRunnerFailed(false);
+    const run = ++terminalRun.current;
+    const cancelled = { ok: false, error: "Cancelled." };
     const t = terminalTarget;
     if (t.kind === "connect" && t.runner && setup.onConnectRunner) {
       if (!confirmServer(t.url)) return { ok: false, error: "Connection cancelled." };
       const res = await setup.onConnectRunner(t.url, t.runner);
+      if (res.canceled || run !== terminalRun.current) return cancelled;
       if (!res.ok) {
         setRemoteRunnerFailed(t.runner === "remote");
         return res;
@@ -536,10 +551,20 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               // Switching to server-only connect, or skipping the install, starts a fresh run.
               key={`${terminalRunner ?? terminalTarget.kind}:${skipInstall}`}
               onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
+              onCancelInstall={
+                setup.onCancelInstallCli
+                  ? () => cancelTerminal(setup.onCancelInstallCli)
+                  : undefined
+              }
               onInstallLog={setup.onInstallLog}
               onRun={runTerminal}
               onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
               onBack={() => setStep(terminalTarget.back)}
+              onCancel={
+                terminalTarget.kind === "connect" && terminalTarget.runner !== "remote"
+                  ? () => cancelTerminal(setup.onCancelRunnerConnect)
+                  : undefined
+              }
               onConnectAnyway={connectAnyway}
               runningLabel={terminalCopy.label}
               runningHint={terminalCopy.hint}

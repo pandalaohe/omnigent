@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+if TYPE_CHECKING:
+    from omnigent.stores.conversation_store import ConversationStore
 
 _MAX_SEARCH_RESULTS = 100
 
@@ -20,6 +23,9 @@ class SearchConversationsTool(Tool):
     surrounding context so the agent can recall information
     from prior interactions.
     """
+
+    def __init__(self, store: ConversationStore | None = None) -> None:
+        self._store = store
 
     @classmethod
     def name(cls) -> str:
@@ -86,7 +92,8 @@ class SearchConversationsTool(Tool):
         :param arguments: JSON with ``"query"`` and optional
             ``"limit"`` keys, e.g.
             ``'{"query": "database config", "limit": 5}'``.
-        :param ctx: Server-side execution context (unused).
+        :param ctx: Server-side execution context with the authenticated
+            turn actor.
         :returns: JSON string with search results.
         """
         args, error = parse_json_object_arguments(arguments)
@@ -102,10 +109,13 @@ class SearchConversationsTool(Tool):
             return json.dumps({"error": "limit must be a positive integer"})
         limit = min(limit, _MAX_SEARCH_RESULTS)
 
+        if not ctx.caller_user_id:
+            return json.dumps({"error": "conversation search requires an authenticated caller"})
+
         from omnigent.runtime import get_conversation_store
 
-        conv_store = get_conversation_store()
-        items = conv_store.search(query, limit=limit)
+        conv_store = self._store if self._store is not None else get_conversation_store()
+        items = conv_store.search(query, limit=limit, accessible_by=ctx.caller_user_id)
 
         if not items:
             return json.dumps({"results": [], "message": "No matching conversations found."})
@@ -130,7 +140,7 @@ def _format_results(
     results: list[dict[str, Any]] = []
     for item in items:
         result: dict[str, Any] = {
-            "conversation_id": item.response_id,
+            "conversation_id": item.conversation_id,
             "item_id": item.id,
             "created_at": item.created_at,
             "type": item.type,

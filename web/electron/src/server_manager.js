@@ -30,7 +30,7 @@ const MAX_LOG_CHARS = 8000;
 /** serverUrl(normalized) -> { child, serverUrl, log } for host processes we started. */
 const hostChildren = new Map();
 
-/** serverUrl(normalized) -> in-flight ensureHostConnected promise (dedup). */
+/** serverUrl(normalized) -> in-flight connect and its interested callers. */
 const connectingHosts = new Map();
 
 /**
@@ -126,7 +126,7 @@ function ownsLiveHost(key) {
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, child: import("child_process").ChildProcess, holder: {text: string}, error?: string }>}
  */
-function spawnHostChild(cliCommand, serverUrl) {
+function spawnHostChild(cliCommand, serverUrl, signal) {
   return new Promise((resolve) => {
     const holder = { text: "" };
     let child;
@@ -159,6 +159,7 @@ function spawnHostChild(cliCommand, serverUrl) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
       resolve(result);
     };
 
@@ -177,14 +178,17 @@ function spawnHostChild(cliCommand, serverUrl) {
     // An exit *before* the connected marker is a failure (auth error, conflict,
     // bad URL). The settled guard makes this a no-op once connected, so the
     // persistent cleanup listener (registered by the caller) handles later exits.
-    child.on("exit", (code, signal) =>
+    child.on("exit", (code, exitSignal) =>
       finish({
         ok: false,
         child,
         holder,
-        error: holder.text.trim() || `host exited (code=${code}, signal=${signal})`,
+        error: holder.text.trim() || `host exited (code=${code}, signal=${exitSignal})`,
       }),
     );
+    const abort = () => finish({ ok: false, child, holder, canceled: true });
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
   });
 }
 
@@ -200,25 +204,57 @@ function spawnHostChild(cliCommand, serverUrl) {
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
  */
-async function ensureHostConnected(cliCommand, serverUrl) {
+async function ensureHostConnected(cliCommand, serverUrl, { signal } = {}) {
+  if (signal?.aborted) return { ok: false, ownedByDesktop: false, canceled: true };
   const key = cli.normalizeServerUrl(serverUrl);
   if (key === "") return { ok: false, ownedByDesktop: false, error: "missing server URL" };
   if (ownsLiveHost(key)) return { ok: true, ownedByDesktop: true };
   // Dedupe concurrent connects for the same server (the restore-on-load path
   // racing the connect-time path, or a double-clicked Start) so we never spawn
   // two `omnigent host` processes for one target.
-  const inflight = connectingHosts.get(key);
-  if (inflight) return inflight;
-  const op = connectHost(cliCommand, serverUrl, key);
-  connectingHosts.set(key, op);
-  // Ping the renderer right away so it re-reads (e.g. refetches the server's
-  // host list), then again once the connect settles.
-  emitChange();
-  try {
-    return await op;
-  } finally {
-    connectingHosts.delete(key);
+  let attempt = connectingHosts.get(key);
+  if (attempt?.controller.signal.aborted) {
+    await attempt.done.catch(() => {});
+    return ensureHostConnected(cliCommand, serverUrl, { signal });
+  }
+  if (!attempt) {
+    const controller = new AbortController();
+    const done = connectHost(cliCommand, serverUrl, key, controller.signal).finally(() => {
+      connectingHosts.delete(key);
+      emitChange();
+    });
+    attempt = { controller, done, waiters: new Set() };
+    connectingHosts.set(key, attempt);
     emitChange();
+  }
+  const waiter = {};
+  attempt.waiters.add(waiter);
+  let cancel;
+  try {
+    if (!signal) return await attempt.done;
+    return await new Promise((resolve, reject) => {
+      cancel = async () => {
+        attempt.waiters.delete(waiter);
+        if (attempt.waiters.size === 0) {
+          attempt.controller.abort();
+          await attempt.done.catch(() => {});
+        }
+        resolve({ ok: false, ownedByDesktop: false, canceled: true });
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      attempt.done.then(
+        (result) => {
+          if (!signal.aborted) resolve(result);
+        },
+        (error) => {
+          if (!signal.aborted) reject(error);
+        },
+      );
+      if (signal.aborted) void cancel();
+    });
+  } finally {
+    if (cancel) signal.removeEventListener("abort", cancel);
+    attempt.waiters.delete(waiter);
   }
 }
 
@@ -231,7 +267,7 @@ async function ensureHostConnected(cliCommand, serverUrl) {
  * @param {string} key Normalized server URL.
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
  */
-async function connectHost(cliCommand, serverUrl, key) {
+async function connectHost(cliCommand, serverUrl, key, signal) {
   // Adopt only a daemon we can VERIFY is connected (live process + an online
   // tunnel, via the fast disk-read + single HTTP probe — not the slow `omnigent
   // host status` subprocess). PID-liveness alone is not enough: a stale registry
@@ -240,11 +276,16 @@ async function connectHost(cliCommand, serverUrl, key) {
   // tunnel is momentarily down, we fall through to spawn and the isDaemonConflict
   // backstop below adopts it instead of creating a duplicate.
   const conn = await cli.getHostConnectionFast(serverUrl);
+  if (signal.aborted) return { ok: false, ownedByDesktop: false, canceled: true };
   if (conn.connected) {
     return { ok: true, ownedByDesktop: false, adopted: true };
   }
 
-  const spawned = await spawnHostChild(cliCommand, serverUrl);
+  const spawned = await spawnHostChild(cliCommand, serverUrl, signal);
+  if (signal.aborted) {
+    await stopChild(spawned.child);
+    return { ok: false, ownedByDesktop: false, canceled: true };
+  }
   if (!spawned.ok) {
     // Connect failed or timed out. Await the child's termination — escalating to
     // SIGKILL after the grace period — rather than firing a single SIGTERM and
@@ -320,27 +361,41 @@ async function disconnectHost(cliCommand, serverUrl) {
  *
  * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
- * @param {{ onLogin?: () => void, loginTimeoutMs?: number }} [opts] `onLogin`
- *   fires just before the login (which may open the browser) runs.
+ * @param {{ onLogin?: () => void, loginTimeoutMs?: number, signal?: AbortSignal }} [opts]
+ *   `onLogin` fires just before the login (which may open the browser) runs;
+ *   aborting `signal` stops the login and resolves `{ ok: false, canceled: true }`.
  * @returns {Promise<{
  *   ok: boolean,
  *   authError?: boolean,
+ *   canceled?: boolean,
  *   error?: string,
  *   errorMessage?: string,
  *   errorAction?: string,
  *   failure?: import("./omnigent_cli").CliFailure,
  * }>}
  */
-async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs } = {}) {
+async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs, signal } = {}) {
+  if (signal?.aborted) return { ok: false, canceled: true };
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
-  const probe = await cli.probeServerAuth(serverUrl);
+  const probe = await cli.probeServerAuth(serverUrl, signal ? { signal } : undefined);
+  // Cancelled during the probe: neither report success nor start a login.
+  if (signal?.aborted) return { ok: false, canceled: true };
   const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
   // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
   // Skip unreachable servers so the connect attempt reports the connectivity error.
   if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
   onLogin?.();
-  const loginOptions = loginTimeoutMs === undefined ? [] : [{ timeoutMs: loginTimeoutMs }];
+  const loginOptions =
+    loginTimeoutMs === undefined && !signal
+      ? []
+      : [
+          {
+            ...(loginTimeoutMs === undefined ? {} : { timeoutMs: loginTimeoutMs }),
+            ...(signal ? { signal } : {}),
+          },
+        ];
   const res = await cli.loginServer(cliCommand, serverUrl, ...loginOptions);
+  if (signal?.aborted) return { ok: false, canceled: true };
   if (res.ok) return { ok: true };
   const { errorMessage, errorAction } = loginFailureCopy(
     cliCommand,
@@ -448,7 +503,7 @@ async function restartHost(cliCommand, serverUrl) {
  */
 function stopChild(child) {
   return new Promise((resolve) => {
-    if (!child || child.exitCode !== null) {
+    if (!child || child.exitCode !== null || child.signalCode != null || child.pid == null) {
       resolve();
       return;
     }

@@ -81,6 +81,34 @@ describe("installCli", () => {
     assert.deepEqual(calls[0].args, ["/res/install_oss.sh", "--non-interactive"]);
   });
 
+  it("cancels the owned installer and waits for its exit", async () => {
+    const controller = new AbortController();
+    const child = fakeChild();
+    const signals = [];
+    child.kill = (signal) => signals.push(signal);
+    const { promise: spawned, resolve: didSpawn } = Promise.withResolvers();
+    const install = installCli({
+      platform: "darwin",
+      resolveInstallScript: () => "/res/install_oss.sh",
+      ensureUv: async () => ({ ok: true }),
+      signal: controller.signal,
+      spawn: () => {
+        didSpawn();
+        return child;
+      },
+    });
+    let returned = false;
+    void install.then(() => {
+      returned = true;
+    });
+    await spawned;
+    controller.abort();
+    assert.deepEqual(signals, ["SIGKILL"]);
+    assert.equal(returned, false);
+    child.emit("exit", null, "SIGKILL");
+    assert.deepEqual(await install, { ok: false, canceled: true });
+  });
+
   it("stops when uv can't be ensured", async () => {
     const calls = [];
     const res = await installCli({

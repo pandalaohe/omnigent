@@ -69,8 +69,9 @@ function resolveInstallScript(deps = {}) {
  *   spawn?: typeof spawn,
  *   onOutput?: (text: string) => void,
  *   timeoutMs?: number,
+ *   signal?: AbortSignal,
  * }} [deps]
- * @returns {Promise<{ code: number | null, timedOut: boolean }>}
+ * @returns {Promise<{ code: number | null, timedOut: boolean, canceled?: boolean }>}
  */
 function runStreaming(command, args, deps = {}) {
   const spawnFn = deps.spawn || spawn;
@@ -79,6 +80,11 @@ function runStreaming(command, args, deps = {}) {
   // Grace between SIGTERM and the hard SIGKILL escalation on timeout.
   const killGraceMs = deps.killGraceMs ?? 5000;
   return new Promise((resolve) => {
+    const signal = deps.signal;
+    if (signal?.aborted) {
+      resolve({ code: null, timedOut: false, canceled: true });
+      return;
+    }
     let child;
     try {
       // `detached` puts the child in its own process group so we can signal the
@@ -98,17 +104,18 @@ function runStreaming(command, args, deps = {}) {
     const settle = (result) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", cancel);
       resolve(result);
     };
     // Signal the child's whole process group; fall back to the lone child if the
     // group send fails (e.g. no pid, or the injected fake in tests).
-    const killTree = (signal) => {
+    const killTree = (terminationSignal) => {
       try {
-        if (typeof child.pid === "number") process.kill(-child.pid, signal);
-        else child.kill(signal);
+        if (typeof child.pid === "number") process.kill(-child.pid, terminationSignal);
+        else child.kill(terminationSignal);
       } catch {
         try {
-          child.kill(signal);
+          child.kill(terminationSignal);
         } catch {
           // Already gone.
         }
@@ -116,6 +123,12 @@ function runStreaming(command, args, deps = {}) {
     };
     let timedOut = false;
     let killTimer;
+    const cancel = () => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      killTree("SIGKILL");
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
       killTree("SIGTERM");
@@ -131,7 +144,7 @@ function runStreaming(command, args, deps = {}) {
     const finish = (result) => {
       clearTimeout(timer);
       clearTimeout(killTimer);
-      settle(result);
+      settle(signal?.aborted ? { ...result, canceled: true } : result);
     };
     child.stdout?.on("data", (chunk) => onOutput(String(chunk)));
     child.stderr?.on("data", (chunk) => onOutput(String(chunk)));
@@ -140,6 +153,7 @@ function runStreaming(command, args, deps = {}) {
       finish({ code: null, timedOut });
     });
     child.on("exit", (code) => finish({ code, timedOut }));
+    if (signal?.aborted) cancel();
   });
 }
 
@@ -168,7 +182,9 @@ async function ensureUv(deps = {}) {
     onOutput,
     env,
     timeoutMs: 5 * 60 * 1000,
+    signal: deps.signal,
   });
+  if (run.canceled) return { ok: false, canceled: true };
   // uv's installer drops the binary in ~/.local/bin (or ~/.cargo/bin) and wires
   // PATH only for future shells; add those dirs to the env we hand to the
   // re-check and the installer, mirroring scripts/install_oss.sh's recovery.
@@ -256,7 +272,12 @@ async function installCli(deps = {}) {
     return { ok: false, error: "The bundled installer script was not found." };
   }
   const scriptArg = path.join(path.dirname(script), INSTALL_SCRIPT_NAME);
-  const uv = await (deps.ensureUv || ensureUv)({ spawn: deps.spawn, onOutput });
+  const uv = await (deps.ensureUv || ensureUv)({
+    spawn: deps.spawn,
+    onOutput,
+    signal: deps.signal,
+  });
+  if (deps.signal?.aborted) return { ok: false, canceled: true };
   if (!uv.ok) return uv;
 
   onOutput("Installing the Omnigent CLI…\n");
@@ -268,7 +289,9 @@ async function installCli(deps = {}) {
     env: uv.env,
     timeoutMs: deps.timeoutMs,
     killGraceMs: deps.killGraceMs,
+    signal: deps.signal,
   });
+  if (run.canceled) return { ok: false, canceled: true };
   if (run.timedOut) {
     return { ok: false, error: "The installer timed out. Check your connection and try again." };
   }

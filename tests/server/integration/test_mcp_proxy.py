@@ -13,11 +13,18 @@ so the endpoint is reachable and runner-dependent methods return the
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.entities import NewConversationItem
+from omnigent.entities.conversation import MessageData
+from omnigent.server.auth import LEVEL_OWNER
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.session import bundle_files
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -185,6 +192,51 @@ async def test_mcp_tools_call_missing_name_returns_error(
     payload = resp.json()
     assert payload["error"]["code"] == -32000
     assert "Missing tool name" in payload["error"]["message"]
+
+
+async def test_mcp_search_uses_the_authenticated_caller_and_server_store(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    caller = "caller@example.com"
+    auth_client.headers["X-Forwarded-Email"] = caller
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: search-agent\n"
+                b"executor:\n  config:\n    harness: claude-sdk\n"
+                b"tools:\n  builtins:\n    - name: search_conversations\n"
+            )
+        }
+    )
+    session = await create_test_session(auth_client, bundle=bundle)
+    store = SqlAlchemyConversationStore(db_uri)
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    private = store.create_conversation(title="Someone else's session")
+    permission_store.grant("other@example.com", private.id, LEVEL_OWNER)
+    for session_id, text in ((session["id"], "quartz visible"), (private.id, "quartz restricted")):
+        store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="turn_test",
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                )
+            ],
+        )
+    response = await _post_mcp(
+        auth_client,
+        session["id"],
+        _jsonrpc(
+            "tools/call", params={"name": "search_conversations", "arguments": {"query": "quartz"}}
+        ),
+    )
+    assert response.status_code == 200, response.text
+    [content] = response.json()["result"]["content"]
+    output = json.loads(content["text"])
+    assert "results" in output, output
+    assert [row["text"] for row in output["results"]] == ["quartz visible"]
+    assert [row["conversation_id"] for row in output["results"]] == [session["id"]]
 
 
 # ── Tests: nonexistent session ────────────────────────────

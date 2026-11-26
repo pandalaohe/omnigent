@@ -1531,6 +1531,7 @@ async def _execute_local_python_tool(
     agent_id: str | None,
     runner_workspace: Path | None,
     local_tool_workdir: Path | None,
+    caller_user_id: str | None,
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
@@ -1541,6 +1542,7 @@ async def _execute_local_python_tool(
             agent_id=agent_id or agent_spec.name or "runner-agent",
             workspace=runner_workspace,
             conversation_id=conversation_id,
+            caller_user_id=caller_user_id,
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
@@ -12687,6 +12689,7 @@ async def execute_tool(
     skill_bundle_dir: Path | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
+    caller_user_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -13140,6 +13143,7 @@ async def execute_tool(
                     if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
                     else cast(Path | None, local_tool_workdir)
                 ),
+                caller_user_id=caller_user_id,
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
@@ -13249,6 +13253,7 @@ async def dispatch_tool_locally(
     effective_harness: str | None = None,
     skill_bundle_dir: Path | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    caller_user_id: str | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -13309,6 +13314,7 @@ async def dispatch_tool_locally(
         skill_bundle_dir=skill_bundle_dir,
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
+        caller_user_id=caller_user_id,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

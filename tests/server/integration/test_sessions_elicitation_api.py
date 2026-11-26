@@ -101,6 +101,40 @@ async def test_get_nonexistent_elicitation_on_valid_session(
     assert "policy_name" not in data
 
 
+async def test_standalone_codex_approval_round_trip(client: httpx.AsyncClient) -> None:
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._codex_elicitation import _codex_command_approval_params
+    from omnigent.server.schemas import ElicitationRequestEvent
+
+    agent = await create_test_agent(client, "test-codex-approval-page")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_command_approval"
+    url = f"/v1/sessions/{session_id}/elicitations/{elicitation_id}"
+    params = _codex_command_approval_params(
+        1, "item/commandExecution/requestApproval", {"command": "pytest -q"}
+    )
+    assert params.approval_request_fingerprint
+    pending_elicitations.record_publish(
+        session_id,
+        ElicitationRequestEvent(
+            type="response.elicitation_request", elicitation_id=elicitation_id, params=params
+        ).model_dump(),
+    )
+    try:
+        response = await client.get(url)
+        assert response.status_code == 200, response.text
+        fingerprint = response.json()["approval_request_fingerprint"]
+        assert fingerprint == params.approval_request_fingerprint
+        resolved = await client.post(
+            f"{url}/resolve",
+            json={"action": "decline", "content": {"request_fingerprint": fingerprint}},
+        )
+        assert resolved.status_code == 202, resolved.text
+        assert (await client.get(url)).json()["status"] == "resolved"
+    finally:
+        pending_elicitations.resolve(session_id, elicitation_id)
+
+
 async def test_get_nonexistent_session_returns_404(
     client: httpx.AsyncClient,
 ) -> None:

@@ -20,7 +20,7 @@ from omnigent.tools.builtins.search_conversations import (
     _format_results,
 )
 
-_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
+_CTX = ToolContext(task_id="task_test", agent_id="agent_test", caller_user_id="caller@example.com")
 
 
 # ── Stubs ────────────────────────────────────────────────
@@ -31,7 +31,7 @@ class _FakeItem:
     """Minimal stub for ConversationItem."""
 
     id: str
-    response_id: str
+    conversation_id: str
     created_at: int
     type: str
     data: Any
@@ -42,8 +42,8 @@ class _FakeConversationStore:
         self._items = items
         self.calls: list[dict[str, Any]] = []
 
-    def search(self, query: str, limit: int = 10) -> list[Any]:
-        self.calls.append({"query": query, "limit": limit})
+    def search(self, query: str, limit: int = 10, *, accessible_by: str) -> list[Any]:
+        self.calls.append({"query": query, "limit": limit, "accessible_by": accessible_by})
         return self._items[:limit]
 
 
@@ -103,7 +103,7 @@ def test_invoke_returns_results(monkeypatch: pytest.MonkeyPatch) -> None:
     items = [
         _FakeItem(
             id="item_1",
-            response_id="conv_1",
+            conversation_id="conv_1",
             created_at=1000,
             type="message",
             data=_message_data(),
@@ -183,7 +183,7 @@ def test_invoke_caps_limit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     tool = SearchConversationsTool()
     tool.invoke('{"query": "test", "limit": 1000}', _CTX)
-    assert store.calls == [{"query": "test", "limit": 100}]
+    assert store.calls == [{"query": "test", "limit": 100, "accessible_by": "caller@example.com"}]
 
 
 # ── _extract_text ────────────────────────────────────────

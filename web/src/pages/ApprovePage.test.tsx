@@ -314,6 +314,29 @@ describe("ApprovePage submission", () => {
     expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
   });
 
+  it.each([
+    ["Approve", "accept"],
+    ["Reject", "decline"],
+  ])("posts the displayed Codex command fingerprint when clicking %s", async (label, action) => {
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse({
+        status: "pending",
+        phase: "codex_command_approval",
+        message: "Run the checks?",
+        approval_request_fingerprint: "displayed-command",
+      }),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: label }));
+    const resolveCall = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.find(([url]) => String(url).includes("/resolve"));
+    expect(JSON.parse(String(resolveCall?.[1]?.body))).toEqual({
+      action,
+      content: { request_fingerprint: "displayed-command" },
+    });
+  });
+
   it("shows a resolve error when the POST returns a non-ok status", async () => {
     // WHY: a failed resolve POST routes to the `error` branch with the status.
     vi.mocked(identity.authenticatedFetch)

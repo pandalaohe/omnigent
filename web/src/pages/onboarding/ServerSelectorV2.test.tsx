@@ -45,6 +45,39 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByText(/starting the local server/i)).toBeInTheDocument();
   });
 
+  it("cancels the local CLI installation before starting a server", async () => {
+    let finishInstall: (result: { ok: boolean }) => void = () => {};
+    const onInstallCli = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishInstall = resolve;
+        }),
+    );
+    const onCancelInstallCli = vi.fn().mockResolvedValue(true);
+    const onCancelRunnerConnect = vi.fn();
+    const onStartLocal = vi.fn();
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          onInstallCli,
+          onCancelInstallCli,
+          onCancelRunnerConnect,
+          onStartLocal,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: /install omnigent/i }));
+    await waitFor(() => expect(onInstallCli).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /set up omnigent locally/i });
+    await act(async () => finishInstall({ ok: true }));
+    expect(onCancelInstallCli).toHaveBeenCalledOnce();
+    expect(onCancelRunnerConnect).not.toHaveBeenCalled();
+    expect(onStartLocal).not.toHaveBeenCalled();
+  });
+
   it("a returning user (has recents) starts on the server list, not the landing", () => {
     render(
       <ServerSelectorV2 setup={makeSetup({ recentServers: ["https://team.example.com/"] })} />,
@@ -1002,12 +1035,12 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
     fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
     await screen.findByText("Installer failed");
-    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry setup" })).toBeInTheDocument();
     onConnect.mockResolvedValueOnce({ error: "Server unavailable" });
     fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
     await screen.findByText("Server unavailable");
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     await waitFor(() => expect(onConnect).toHaveBeenCalledTimes(2));
     expect(onInstallCli).toHaveBeenCalledOnce();
     expect(onConnectRunner).not.toHaveBeenCalled();
@@ -1024,10 +1057,107 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
     fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
     await screen.findByText("Installer failed");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(onInstallCli).toHaveBeenCalledTimes(2);
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  });
+
+  it("Cancel during the install returns to the join choice, and a later finish does nothing", async () => {
+    let finishInstall: (v: { ok: boolean }) => void = () => {};
+    const onInstallCli = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishInstall = resolve;
+        }),
+    );
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onInstallCli).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishInstall({ ok: true }));
+
+    expect(onConnectRunner).not.toHaveBeenCalled();
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "Cancel during the laptop sign-in returns to the join choice (shell cancel resolves %s)",
+    async (shellStopped) => {
+      const onCancelRunnerConnect = vi.fn().mockResolvedValue(shellStopped);
+      const onConnectRunner = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+      const onConnect = vi.fn().mockResolvedValue({});
+      joinTypedServer({
+        installed: false,
+        onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+        onConnectRunner,
+        onConnect,
+        onCancelRunnerConnect,
+      });
+      fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await screen.findByRole("heading", { name: /how do you want to join/i });
+      expect(onCancelRunnerConnect).toHaveBeenCalledOnce();
+      expect(onConnect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("a laptop connect that succeeds after Cancel doesn't open the server", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnectRunner,
+      onConnect,
+      onCancelRunnerConnect: vi.fn().mockResolvedValue(true),
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishRunner({ ok: true }));
+
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: /how do you want to join/i })).toBeInTheDocument();
+  });
+
+  it("a remote-environment connect offers no Cancel, since it can't be stopped from here", async () => {
+    await installFromRunnerStep(
+      {
+        installed: true,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        onConnectRunner: vi.fn(() => new Promise<{ ok: boolean }>(() => {})),
+      },
+      undefined,
+      "Open Omnigent",
+    );
+    await screen.findByText(/connecting your remote environment/i);
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("starting the local server offers no Cancel, since it can't be stopped from here", async () => {
+    const onStartLocal = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+    render(<ServerSelectorV2 setup={makeSetup({ installed: true, onStartLocal })} />);
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^(start|open) omnigent$/i }));
+    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
   });
 
   it("a failed laptop connect after the install can retry or continue without a host", async () => {
@@ -1050,7 +1180,7 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
     fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
     await screen.findByText("no host");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     await waitFor(() => expect(onConnectRunner).toHaveBeenCalledTimes(3));
     expect(onConnectRunner).toHaveBeenLastCalledWith("https://team.example.com/", "local");
     fireEvent.click(await screen.findByRole("button", { name: "Continue anyway" }));
@@ -1138,7 +1268,7 @@ describe("ServerSelectorV2", () => {
         button: 0,
       },
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove this server from the list" }));
     expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
   });
 
@@ -1159,7 +1289,7 @@ describe("ServerSelectorV2", () => {
       screen.getByRole("button", { name: /More options for team.example.com/ }),
       { button: 0 },
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove this server from the list" }));
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
     await screen.findByRole("heading", { name: /how do you want to join/i });
     fireEvent.click(screen.getByRole("button", { name: "Back" }));

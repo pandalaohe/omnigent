@@ -4970,6 +4970,34 @@ function registerIpc() {
     return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
   });
 
+  // In-flight onboarding runner connects, per setup window, so Cancel can stop one.
+  const runnerConnects = new Map();
+  let cliInstallInFlight = null;
+  async function cancelCliInstall(sender) {
+    const attempt = cliInstallInFlight;
+    const subscription = attempt?.subscribers.get(sender);
+    if (!subscription) return false;
+    attempt.subscribers.delete(sender);
+    if (attempt.subscribers.size === 0) {
+      attempt.controller.abort();
+      await attempt.done.catch(() => {});
+    }
+    subscription.cancel();
+    return true;
+  }
+  ipcMain.handle("omnigent:cancel-runner-connect", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cancel-runner-connect is only available to the setup page");
+    }
+    const connect = runnerConnects.get(event.sender);
+    connect?.controller.abort();
+    const [installCanceled] = await Promise.all([
+      cancelCliInstall(event.sender),
+      connect?.done.catch(() => {}),
+    ]);
+    return Boolean(connect) || installCanceled;
+  });
+
   // Setup page → connect the runner picked in onboarding to `url`, streaming
   // output, before the window opens the server. The Install click on this
   // bundled page is the user's consent, so no enrollment dialog here.
@@ -4979,10 +5007,39 @@ function registerIpc() {
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
-    const target = await resolveConnectTarget(url);
-    // Resolving can probe the network; don't start anything for a closed window.
-    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
+    // One attempt per window; Cancel, a newer attempt, or closing the window aborts it.
+    const previous = runnerConnects.get(event.sender);
+    previous?.controller.abort();
+    const controller = new AbortController();
+    const abortOnClose = () => controller.abort();
+    event.sender.once("destroyed", abortOnClose);
+    const done = (async () => {
+      if (previous) await previous.done.catch(() => {});
+      if (controller.signal.aborted) return { ok: false, canceled: true };
+      return await connectRunnerAttempt(event, url, runner, controller.signal);
+    })().finally(() => {
+      event.sender.removeListener("destroyed", abortOnClose);
+      if (runnerConnects.get(event.sender)?.controller === controller) {
+        runnerConnects.delete(event.sender);
+      }
+    });
+    runnerConnects.set(event.sender, { controller, done });
+    return await done;
+  });
+
+  async function connectRunnerAttempt(event, url, runner, signal) {
+    const canceled = { ok: false, canceled: true };
+    let target;
+    try {
+      target = await resolveConnectTarget(url, { signal });
+    } catch (error) {
+      if (signal.aborted) return canceled;
+      throw error;
+    }
+    // Resolving can probe the network; don't start anything for a stopped attempt.
+    if (signal.aborted || event.sender.isDestroyed()) return canceled;
     const log = (line) => {
+      if (signal.aborted) return;
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
       } catch {
@@ -4994,6 +5051,7 @@ function registerIpc() {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
       const result = await connectOnboardingArca(target, log, event.sender);
+      if (signal.aborted) return canceled;
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -5010,7 +5068,9 @@ function registerIpc() {
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
+      signal,
     });
+    if (auth.canceled || signal.aborted) return canceled;
     if (!auth.ok) {
       return {
         ok: false,
@@ -5021,14 +5081,15 @@ function registerIpc() {
     }
     // Close out the sign-in lines so the log never ends on a stale prompt.
     log("Signed in. Connecting this laptop to the server…");
-    const result = await serverManager.ensureHostConnected(cliCommand, target);
+    const result = await serverManager.ensureHostConnected(cliCommand, target, { signal });
     broadcastHostStatus();
+    if (result.canceled || signal.aborted) return canceled;
     if (result.ok) {
       log("Connected this laptop.");
       rememberOnboardingRunner(target, runner);
     }
     return { ok: result.ok, error: result.error };
-  });
+  }
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
     if (!isSetupPageSender(event)) {
@@ -5500,35 +5561,80 @@ function registerIpc() {
   // Setup page → install the omnigent CLI (macOS). Runs the bundled
   // install_oss.sh (ensuring uv first) and streams its output to the page, then
   // re-probes status so the caller learns whether the binary is now resolvable.
-  // Single-flight guard: a duplicate cli-install (e.g. a renderer effect that
-  // re-fired) joins the in-flight install instead of spawning a second one.
-  let cliInstallInFlight = null;
+  // Share one installer. Each setup window can leave without stopping the
+  // installer while a different window still needs it.
+  const canceledCliInstall = { ok: false, canceled: true };
+  function startCliInstall(previous) {
+    const controller = new AbortController();
+    const subscribers = new Map();
+    const onOutput = (text) => {
+      if (controller.signal.aborted) return;
+      for (const sender of subscribers.keys()) {
+        try {
+          sender.send("omnigent:cli-install-log", { line: text });
+        } catch {
+          /* window torn down mid-install */
+        }
+      }
+    };
+    const done = Promise.resolve(previous?.done)
+      .catch(() => {})
+      .then(async () => {
+        if (controller.signal.aborted) return canceledCliInstall;
+        const result = await cliInstall.installCli({
+          onOutput,
+          installDocsUrl: distributionInstallDocsUrl,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return result;
+        const status = await omnigentCli.getCliStatus(
+          loadSettings().omnigent_path,
+          distributionCliOptions,
+        );
+        return { ...result, installed: status.installed === true };
+      })
+      .finally(() => {
+        if (cliInstallInFlight?.done === done) cliInstallInFlight = null;
+      });
+    return { controller, done, subscribers };
+  }
+
+  ipcMain.handle("omnigent:cancel-cli-install", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cancel-cli-install is only available to the setup page");
+    }
+    return cancelCliInstall(event.sender);
+  });
+
   ipcMain.handle("omnigent:cli-install", async (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("cli-install is only available to the setup page");
     }
-    if (cliInstallInFlight) return cliInstallInFlight;
-    const onOutput = (text) => {
-      try {
-        event.sender.send("omnigent:cli-install-log", { line: text });
-      } catch {
-        /* window torn down mid-install */
-      }
-    };
-    cliInstallInFlight = (async () => {
-      const result = await cliInstall.installCli({
-        onOutput,
-        installDocsUrl: distributionInstallDocsUrl,
-      });
-      const status = await omnigentCli.getCliStatus(
-        loadSettings().omnigent_path,
-        distributionCliOptions,
+    const { sender } = event;
+    if (sender.isDestroyed()) return canceledCliInstall;
+    if (!cliInstallInFlight || cliInstallInFlight.controller.signal.aborted) {
+      cliInstallInFlight = startCliInstall(cliInstallInFlight);
+    }
+    const attempt = cliInstallInFlight;
+    const previous = attempt.subscribers.get(sender);
+    if (previous) return previous.done;
+
+    const onClose = () => void cancelCliInstall(sender);
+    let cancel;
+    const done = new Promise((resolve, reject) => {
+      cancel = () => resolve(canceledCliInstall);
+      attempt.done.then(
+        (result) => {
+          if (attempt.subscribers.has(sender)) resolve(result);
+        },
+        (error) => {
+          if (attempt.subscribers.has(sender)) reject(error);
+        },
       );
-      return { ...result, installed: status.installed === true };
-    })().finally(() => {
-      cliInstallInFlight = null;
-    });
-    return cliInstallInFlight;
+    }).finally(() => sender.removeListener("destroyed", onClose));
+    attempt.subscribers.set(sender, { cancel, done });
+    sender.once("destroyed", onClose);
+    return done;
   });
 
   registerFileReveal({

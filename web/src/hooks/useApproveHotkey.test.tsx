@@ -64,6 +64,28 @@ describe("useApproveHotkey", () => {
     required: ["branch"],
   };
 
+  it.each([
+    ["Enter", { metaKey: true }, "accept"],
+    ["Escape", {}, "decline"],
+  ])("binds %s to the displayed Codex command", (key, mods, action) => {
+    const codexCommand = { requestFingerprint: "new command" };
+    blocks = [{ ...pending, codexCommand }];
+    renderHook(() => useApproveHotkey(true));
+    const card = renderHook(
+      ({ fingerprint }) => useApprovalPromptOnScreen("e1", true, fingerprint),
+      {
+        initialProps: { fingerprint: "old command" },
+      },
+    );
+    press(mods, key);
+    expect(submitApproval).not.toHaveBeenCalled();
+    card.rerender({ fingerprint: "new command" });
+    press(mods, key);
+    expect(submitApproval).toHaveBeenCalledExactlyOnceWith("e1", action, {
+      request_fingerprint: "new command",
+    });
+  });
+
   it("does not accept a prompt that asks for fields", () => {
     // The card disables Submit until the required fields are answered. A
     // keystroke that accepts anyway walks around that gate and sends the

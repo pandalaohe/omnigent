@@ -73,16 +73,21 @@ const useApproveHotkeyBindings = create<{ count: number }>(() => ({ count: 0 }))
 const promptsOnScreen = new Map<string, number>();
 
 /** Marks a pending prompt's card as shown in the open chat while it is mounted. */
-export function useApprovalPromptOnScreen(elicitationId: string, pending: boolean): void {
+export function useApprovalPromptOnScreen(
+  elicitationId: string,
+  pending: boolean,
+  fingerprint?: string,
+): void {
   useEffect(() => {
     if (!pending) return;
-    promptsOnScreen.set(elicitationId, (promptsOnScreen.get(elicitationId) ?? 0) + 1);
+    const key = JSON.stringify([elicitationId, fingerprint]);
+    promptsOnScreen.set(key, (promptsOnScreen.get(key) ?? 0) + 1);
     return () => {
-      const count = (promptsOnScreen.get(elicitationId) ?? 1) - 1;
-      if (count > 0) promptsOnScreen.set(elicitationId, count);
-      else promptsOnScreen.delete(elicitationId);
+      const count = (promptsOnScreen.get(key) ?? 1) - 1;
+      if (count > 0) promptsOnScreen.set(key, count);
+      else promptsOnScreen.delete(key);
     };
-  }, [elicitationId, pending]);
+  }, [elicitationId, pending, fingerprint]);
 }
 
 /**
@@ -90,14 +95,14 @@ export function useApprovalPromptOnScreen(elicitationId: string, pending: boolea
  * in the open chat, when it takes a plain verdict and has been delivered. A
  * newer form or an unconfirmed delivery hides every older approval.
  */
-export function approveHotkeyTarget(blocks: readonly AnyBlock[]): string | null {
+function approveHotkeyTarget(blocks: readonly AnyBlock[]): ElicitationBlock | null {
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     const block = blocks[index];
     if (!isPendingElicitation(block)) continue;
     if (block.nativeDelivery && block.nativeDelivery.state !== "ready") return null;
     const takesAPlainVerdict =
       !block.askUserQuestion && schemaFields(block.requestedSchema).length === 0;
-    return takesAPlainVerdict ? block.elicitationId : null;
+    return takesAPlainVerdict ? block : null;
   }
   return null;
 }
@@ -107,12 +112,37 @@ function isPendingElicitation(block: AnyBlock | undefined): block is Elicitation
 }
 
 /** Whether ⌘↵ and Esc act on this prompt, so its buttons can name them. */
-export function useApprovesOnHotkey(elicitationId: string, pending: boolean): boolean {
+export function useApprovesOnHotkey(
+  elicitationId: string,
+  pending: boolean,
+  fingerprint?: string,
+): boolean {
   const bound = useApproveHotkeyBindings((state) => state.count > 0);
-  const target = useChatStore(
-    (state) => pending && approveHotkeyTarget(state.blocks) === elicitationId,
-  );
+  const target = useChatStore((state) => {
+    if (!pending) return false;
+    const block = approveHotkeyTarget(state.blocks);
+    return (
+      block?.elicitationId === elicitationId &&
+      (block.codexCommand?.requestFingerprint ?? undefined) === fingerprint
+    );
+  });
   return bound && target;
+}
+
+function isPromptOnScreen(prompt: ElicitationBlock): boolean {
+  return promptsOnScreen.has(
+    JSON.stringify([prompt.elicitationId, prompt.codexCommand?.requestFingerprint]),
+  );
+}
+
+function submitHotkeyVerdict(prompt: ElicitationBlock, action: "accept" | "decline"): void {
+  const { submitApproval } = useChatStore.getState();
+  const fingerprint = prompt.codexCommand?.requestFingerprint;
+  if (fingerprint) {
+    void submitApproval(prompt.elicitationId, action, { request_fingerprint: fingerprint });
+  } else {
+    void submitApproval(prompt.elicitationId, action);
+  }
 }
 
 /**
@@ -150,13 +180,13 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       if (e.key === "Escape") {
         if (e.repeat || e.isComposing || !matchesShortcut(e, "approval.decline")) return;
         if (escapeBelongsElsewhere(e.target)) return;
-        const { blocks, submitApproval } = useChatStore.getState();
+        const { blocks } = useChatStore.getState();
         const target = approveHotkeyTarget(blocks);
-        if (target === null || !promptsOnScreen.has(target)) return;
+        if (target === null || !isPromptOnScreen(target)) return;
         // Ahead of the composer's Esc-to-stop: declining is what Esc means here.
         e.preventDefault();
         e.stopPropagation();
-        void submitApproval(target, "decline");
+        submitHotkeyVerdict(target, "decline");
         return;
       }
       if (hasCustomShortcutBindings("approvePrompt")) {
@@ -176,14 +206,15 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       // send path is separately gated while a prompt is pending).
       if (isDraftingTarget(e.target)) return;
 
-      const { blocks, submitApproval } = useChatStore.getState();
+      const { blocks } = useChatStore.getState();
       const target = approveHotkeyTarget(blocks);
       if (target === null) return;
+      if (target.codexCommand?.requestFingerprint && !isPromptOnScreen(target)) return;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();
       e.stopPropagation();
-      void submitApproval(target, "accept");
+      submitHotkeyVerdict(target, "accept");
     };
 
     window.addEventListener("keydown", handler, true);

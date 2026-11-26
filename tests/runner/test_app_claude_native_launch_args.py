@@ -1424,13 +1424,14 @@ async def test_auto_create_claude_terminal_startup_text_follows_configured_promp
     """
     Configured ``harness.claude-native.args`` are prepended after augmentation, yet count.
 
-    Startup text goes by file unless the config carries its own prompt flag,
-    which Claude rejects beside a file flag; then it stays inline.
+    When the config carries its own prompt flag, the launcher delivers its
+    startup text through the session-start hook.
 
     :param configured: Whether the configured args carry a prompt flag.
     """
     from unittest.mock import Mock
 
+    from omnigent.harnesses.claude_native.bridge import CLAUDE_STARTUP_CONTEXT_FILE
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
     launched: list[list[str]] = []
@@ -1461,37 +1462,55 @@ async def test_auto_create_claude_terminal_startup_text_follows_configured_promp
     if configured:
         assert "--append-system-prompt-file" not in args
         inline = [args[i + 1] for i, arg in enumerate(args) if arg == "--append-system-prompt"]
-        assert inline[0] == "configured"
-        assert "Be brief." in inline[1]
+        assert inline == ["configured"]
+        settings_path = Path(args[args.index("--settings") + 1])
+        assert "Be brief." in (settings_path.parent / CLAUDE_STARTUP_CONTEXT_FILE).read_text(
+            encoding="utf-8"
+        )
     else:
         assert "--append-system-prompt" not in args
         prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
         assert "Be brief." in prompt_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("portable_skill", [True, False], ids=["portable-skill", "no-skills"])
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    portable_skill: bool,
 ) -> None:
     """
     Terminal auto-create hands the pane's launch env to trust seeding.
 
     A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
     reach the seeder, and seeding must happen before the terminal launches.
+    The portable-skill ``--add-dir`` overlay is trusted only when it is passed.
+
+    :param portable_skill: Whether the workspace has a portable skill to stage.
     """
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
-    seeded: list[tuple[Path, dict[str, str] | None]] = []
+    seeded: list[tuple[Path, dict[str, str] | None, tuple[Path, ...]]] = []
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
-    def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
+    def record_seed(
+        workspace: Path,
+        env: dict[str, str] | None = None,
+        *,
+        added_dirs: tuple[Path, ...] = (),
+    ) -> None:
         registry.launch_required_terminal.assert_not_called()
-        seeded.append((workspace, env))
+        seeded.append((workspace, env, added_dirs))
 
+    if portable_skill:
+        skill = bridge_dir / ".agents" / "skills" / "portable" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nBody.\n")
+    monkeypatch.setenv("HOME", str(bridge_dir / "home"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
@@ -1514,11 +1533,18 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
         )
 
     assert len(seeded) == 1
-    workspace, env = seeded[0]
+    workspace, env, added_dirs = seeded[0]
     assert workspace == Path(bridge_dir).resolve()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+    launch_args = registry.launch_required_terminal.await_args.kwargs["spec"].args
+    if portable_skill:
+        overlay = launch_args[launch_args.index("--add-dir") + 1]
+        assert added_dirs == (Path(overlay),)
+    else:
+        assert "--add-dir" not in launch_args
+        assert added_dirs == ()
 
 
 async def test_auto_create_claude_terminal_logs_stage_timings(
@@ -1620,7 +1646,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     async def record_turn_shutdown(_session_id: str, router: object) -> None:
         shutdowns.append(("turn", router))
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_seed(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1695,7 +1721,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
     async def record_turn_shutdown(_session_id: str, _router: object) -> None:
         shutdowns.append("turn")
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_seed(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(

@@ -30,6 +30,8 @@ export function SetupTerminalStep({
   runningHint = "Starting the local server…",
   connection = null,
   onCancelConnect,
+  onCancelInstall,
+  onCancel,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<SetupResult>;
@@ -49,6 +51,10 @@ export function SetupTerminalStep({
   /** Progress of the run phase's server connect (null when not connecting). */
   connection?: ConnectProgress | null;
   onCancelConnect?: () => void;
+  /** Leave while installing, releasing this window's installer subscription. */
+  onCancelInstall?: () => void | Promise<void>;
+  /** Leave while installing or connecting (e.g. a browser sign-in that never finishes). */
+  onCancel?: () => void | Promise<void>;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -56,6 +62,8 @@ export function SetupTerminalStep({
   const [lines, setLines] = useState<string[]>([]);
   // Bump to re-run the sequence on retry.
   const [attempt, setAttempt] = useState(0);
+  const [canceling, setCanceling] = useState(false);
+  const cancelRequested = useRef(false);
   // Guard against a resolve landing after unmount (window navigated away).
   const alive = useRef(true);
   const logBox = useRef<HTMLDivElement>(null);
@@ -70,6 +78,7 @@ export function SetupTerminalStep({
   // the stream source (installing vs not) so a later ready/failed transition
   // doesn't needlessly resubscribe.
   const installing = phase === "installing";
+  const cancelSetup = installing ? (onCancelInstall ?? onCancel) : onCancel;
   useEffect(() => {
     const subscribe = installing ? onInstallLog : onSetupLog;
     if (!subscribe) return;
@@ -111,10 +120,10 @@ export function SetupTerminalStep({
           await new Promise((resolve) => {
             setTimeout(resolve, WARMUP_MS);
           });
-          if (canceled || !alive.current) return;
+          if (canceled || cancelRequested.current || !alive.current) return;
         }
         const res = await install();
-        if (canceled || !alive.current) return;
+        if (canceled || cancelRequested.current || !alive.current) return;
         if (!res.ok) {
           setPhase("failed");
           setError(res.errorMessage ?? res.error ?? "Couldn't install the Omnigent CLI.");
@@ -125,7 +134,7 @@ export function SetupTerminalStep({
       }
       setPhase("running");
       const result = await onRunRef.current();
-      if (canceled || !alive.current) return;
+      if (canceled || cancelRequested.current || !alive.current) return;
       if (result.ok) setPhase("ready");
       else {
         setPhase("failed");
@@ -227,6 +236,22 @@ export function SetupTerminalStep({
       </div>
 
       <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
+      {inProgress && connection === null && cancelSetup && (
+        <div className="mt-3 flex">
+          <Button
+            variant="outline"
+            disabled={canceling}
+            onClick={() => {
+              cancelRequested.current = true;
+              setCanceling(true);
+              void cancelSetup();
+            }}
+          >
+            {canceling ? "Cancelling…" : "Cancel"}
+          </Button>
+        </div>
+      )}
 
       {phase === "failed" && (
         <div className="mt-3 flex justify-between gap-2">

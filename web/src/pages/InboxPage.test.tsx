@@ -103,6 +103,7 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) =>
       props.nativeDelivery ||
+      props.codexCommand ||
       props.permissionDirectories ||
       props.triage ||
       props.askUserQuestion ? (
@@ -509,6 +510,52 @@ describe("InboxPage approval items", () => {
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
     expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
+  });
+
+  it("keeps a replacement Codex command actionable after the old verdict times out", async () => {
+    const row = conversation({ id: "sess_1" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    const prompt = (command: string) => ({
+      pendingElicitations: [
+        rawElicitation("eli_1", `Run ${command}?`, {
+          phase: "codex_command_approval",
+          ...(command === "old command" ? { command } : {}),
+          approval_request_fingerprint: command,
+        }),
+      ],
+    });
+    vi.mocked(sessionsApi.getSession).mockResolvedValue(
+      prompt("old command") as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>,
+    );
+    let rejectPrevious: (error: Error) => void = () => {};
+    vi.mocked(sessionsApi.approve).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPrevious = reject;
+        }),
+    );
+    renderPage(queryClient);
+    fireEvent.click(await screen.findByRole("button", { name: /approve/i }));
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_1", "eli_1", {
+      action: "accept",
+      content: { request_fingerprint: "old command" },
+    });
+
+    await act(async () => {
+      queryClient.setQueryData(
+        ["inbox-elicitations", row.id, row.pending_elicitations_count, row.updated_at],
+        prompt("new command"),
+      );
+    });
+    await act(async () =>
+      rejectPrevious(new sessionsApi.ApiError("Timed out", 409, "elicitation_timed_out")),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /approve/i }));
+    expect(sessionsApi.approve).toHaveBeenLastCalledWith("sess_1", "eli_1", {
+      action: "accept",
+      content: { request_fingerprint: "new command" },
+    });
   });
 
   it("keeps an answered approval of an unseen idle session out of the unread list", async () => {

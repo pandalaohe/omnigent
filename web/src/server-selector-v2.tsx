@@ -34,6 +34,7 @@ interface OmnigentSetup {
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
   connectRunner?: (url: string, runner: Runner) => Promise<Partial<SetupResult>>;
+  cancelRunnerConnect?: () => Promise<boolean>;
   onRunnerConnectLog?: (cb: (line: string) => void) => () => void;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
@@ -51,6 +52,7 @@ interface OmnigentSetup {
   startLocalServer: () => Promise<Partial<SetupResult> & { url?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
   installCli?: () => Promise<Partial<SetupResult> & { installed?: boolean }>;
+  cancelCliInstall?: () => Promise<boolean>;
   onCliInstallLog?: (cb: (line: string) => void) => () => void;
 }
 
@@ -274,6 +276,7 @@ export function BridgeSetupApp() {
             if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
             try {
               const result = await bridge.installCli();
+              if (result?.canceled) return { ok: false, canceled: true };
               setInstalled(result?.installed === true);
               // The installer can exit 0 yet leave the binary unresolvable (PATH
               // issue). Treat "installed:false after a successful run" as a
@@ -301,6 +304,15 @@ export function BridgeSetupApp() {
             }
           }
         : undefined,
+    onCancelInstallCli: setupBridge()?.cancelCliInstall
+      ? async () => {
+          try {
+            return (await setupBridge()?.cancelCliInstall?.()) === true;
+          } catch {
+            return false;
+          }
+        }
+      : undefined,
     onInstallLog: setupBridge()?.onCliInstallLog
       ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
@@ -317,12 +329,22 @@ export function BridgeSetupApp() {
             const result = await setupBridge()?.connectRunner?.(url, runner);
             return {
               ok: result?.ok === true,
+              canceled: result?.canceled === true,
               error: result?.error,
               errorMessage: result?.errorMessage,
               errorAction: result?.errorAction,
             };
           } catch (e) {
             return { ok: false, error: e instanceof Error ? e.message : String(e) };
+          }
+        }
+      : undefined,
+    onCancelRunnerConnect: setupBridge()?.cancelRunnerConnect
+      ? async () => {
+          try {
+            return (await setupBridge()?.cancelRunnerConnect?.()) === true;
+          } catch {
+            return false;
           }
         }
       : undefined,

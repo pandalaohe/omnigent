@@ -24,6 +24,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    bindparam,
     case,
     delete,
     desc,
@@ -40,7 +41,7 @@ from sqlalchemy import (
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, defer, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
@@ -183,6 +184,7 @@ from omnigent.stores.conversation_store import (
     ConversationAlreadyExistsError,
     ConversationArchiveClosingError,
     ConversationNotFoundError,
+    ConversationSearchHit,
     ConversationStore,
     ConversationUpdateResult,
     CreatedSession,
@@ -410,9 +412,51 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # ``list_conversations(search_scope=...)`` values; see its docstring.
 _SEARCH_SCOPES = frozenset({"all", "title", "content"})
 
+# Ranked search candidates checked per round when permissions live in another
+# database. Bounds the metadata lookup to one indexed IN batch.
+_SEARCH_CANDIDATE_WINDOW = 200
+
+# Ranked candidates one search reads. Bounds the total work when most matches
+# are unreadable; readable matches ranked below it are not returned.
+_SEARCH_MAX_CANDIDATES = 2_000
+
 # Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
 # ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
 _LIKE_ESCAPE = "/"
+
+
+def _binary_id_hex(value: bytes | memoryview | str) -> str:
+    """
+    Return the bare 32-char hex of a raw or Uuid16 conversation/item id.
+
+    :param value: Raw 16-byte id bytes from the driver, or an already-hex string.
+    :returns: The lowercase bare hex form, e.g. ``"a1b2c3..."``.
+    """
+    if isinstance(value, (bytes, memoryview)):
+        return bytes(value).hex()
+    return uuid_to_bytes(value).hex()
+
+
+def _fts_uuid_bytes(column: str) -> str:
+    """Convert the mirror's text UUID to a primary-key operand on older SQLite and D1."""
+    # The UUID suffix is stored bare, dashed, or after a legacy prefix.
+    uuid_hex = f"substr(lower(replace({column}, '-', '')), -32)"
+    digits = "'0123456789abcdef'"
+    alphabet = "x'" + bytes(range(256)).hex() + "'"
+    octets = []
+    for offset in range(1, 33, 2):
+        high = f"instr({digits}, substr({uuid_hex}, {offset}, 1)) - 1"
+        low = f"instr({digits}, substr({uuid_hex}, {offset + 1}, 1)) - 1"
+        octets.append(f"substr({alphabet}, 16 * ({high}) + ({low}) + 1, 1)")
+    return f"CASE WHEN length({uuid_hex}) = 32 AND {uuid_hex} NOT GLOB '*[^0-9a-f]*' " + (
+        "THEN CAST(" + " || ".join(octets) + " AS BLOB) END"
+    )
+
+
+_FTS_ITEM_KEY_MATCH = (
+    f"{{items}}.conversation_id = {_fts_uuid_bytes('f.conversation_id')} "
+    f"AND {{items}}.id = {_fts_uuid_bytes('f.item_id')} "
+)
 
 
 def _like_contains_pattern(query: str) -> str:
@@ -4396,7 +4440,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
-    ) -> list[ConversationItem]:
+        *,
+        accessible_by: str,
+    ) -> list[ConversationSearchHit]:
         """
         Full-text search over conversation items.
 
@@ -4408,74 +4454,124 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
-        :returns: A list of matching :class:`ConversationItem`
-            objects in relevance order.
+        :param accessible_by: Authenticated user whose permissions restrict
+            which ranked candidates can become results.
+        :returns: Matching items with their conversation ids, in relevance order.
         """
+        if not accessible_by or limit <= 0:
+            return []
+        workspace_id = current_workspace_id()
+        conversation_filter = (
+            "AND ci.conversation_id = :cid " if conversation_id is not None else ""
+        )
         with self._conv_session("search_conversations") as session:
             # SQLite's FTS mirror and other backends' search_text column carry
             # the same extracted transcript text, without JSON quote escaping.
-            use_fts = _supports_fts5(self._conv_engine.dialect.name)
+            dialect = self._conv_engine.dialect.name
+            use_fts = _supports_fts5(dialect)
+            like_op = "LIKE" if dialect in {"mysql", "sqlite", "cloudflare_d1"} else "ILIKE"
+            params: dict[str, str | int | bytes] = {"ws": workspace_id}
+            if conversation_id is not None:
+                params["cid"] = uuid_to_bytes(conversation_id)
             if use_fts:
-                # MATCH parses operators and quotes. Archive search is literal
-                # user text, so quote the whole value and escape inner quotes.
                 query = '"' + query.replace('"', '""') + '"'
-                if conversation_id is not None:
-                    stmt = text(
-                        "SELECT item_id FROM conversation_items_fts "
-                        "WHERE conversation_id = :cid "
-                        "AND search_text MATCH :query "
-                        "ORDER BY rank LIMIT :limit"
+                params["query"] = query
+                candidate_sql = (
+                    "SELECT ci.conversation_id, ci.id, min(f.rowid) "
+                    "FROM conversation_items_fts AS f CROSS JOIN conversation_items AS ci "
+                    "WHERE f.search_text MATCH :query "
+                    f"{conversation_filter}"
+                    "AND ci.workspace_id = :ws "
+                    f"AND {_FTS_ITEM_KEY_MATCH.format(items='ci')}"
+                    "AND ci.search_text = f.search_text "
+                    "GROUP BY ci.conversation_id, ci.id "
+                    "ORDER BY min(f.rank), ci.conversation_id, ci.id"
+                )
+            else:
+                candidate_sql = (
+                    "SELECT ci.conversation_id, ci.id, NULL "
+                    "FROM conversation_items AS ci "
+                    "WHERE ci.workspace_id = :ws "
+                    f"{conversation_filter}"
+                    f"AND ci.search_text {like_op} :query ESCAPE :escape "
+                    "ORDER BY ci.created_at DESC, ci.conversation_id, ci.id"
+                )
+                params.update(query=_literal_like_pattern(query), escape="\\")
+            ranked_matches = [
+                (_binary_id_hex(conv), _binary_id_hex(item), match_rowid)
+                for conv, item, match_rowid in session.execute(
+                    text(f"{candidate_sql} LIMIT :limit"),
+                    {**params, "limit": _SEARCH_MAX_CANDIDATES},
+                ).fetchall()
+            ]
+
+            # Read permissions from the metadata DB before fetching transcript items.
+            window = _SEARCH_CANDIDATE_WINDOW
+            if self._engine.dialect.name == "cloudflare_d1":
+                window = min(window, 90)
+            item_keys: dict[tuple[str, str], int | None] = {}
+            for start in range(0, len(ranked_matches), window):
+                if len(item_keys) >= limit:
+                    break
+                candidates = ranked_matches[start : start + window]
+                permitted = self._permitted_conversation_hexes(
+                    {conv for conv, _, _ in candidates}, accessible_by
+                )
+                for cid, iid, match_rowid in candidates:
+                    if cid in permitted:
+                        item_keys.setdefault((cid, iid), match_rowid)
+            keys = list(item_keys)[:limit]
+            if not keys:
+                return []
+            rows: list[SqlConversationItem] = []
+            # Each D1 query stays below its bind limit, including the FTS row ids.
+            for batch in batched(keys, 25):
+                selected = (
+                    select(SqlConversationItem)
+                    .options(defer(SqlConversationItem.search_text))
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        tuple_(
+                            SqlConversationItem.conversation_id,
+                            SqlConversationItem.id,
+                        ).in_(batch),
+                    )
+                )
+                # The transcript can change between reads. Recheck the match
+                # on the selected rows without projecting their search text.
+                if use_fts:
+                    selected = selected.where(
+                        text(
+                            "EXISTS (SELECT 1 FROM conversation_items_fts AS f "
+                            "WHERE f.rowid IN :matched_rows AND f.search_text MATCH :query "
+                            f"AND {_FTS_ITEM_KEY_MATCH.format(items='conversation_items')}"
+                            "AND conversation_items.search_text = f.search_text)"
+                        ).bindparams(
+                            bindparam(
+                                "matched_rows", [item_keys[key] for key in batch], expanding=True
+                            ),
+                            bindparam("query", query),
+                        )
                     )
                 else:
-                    stmt = text(
-                        "SELECT item_id FROM conversation_items_fts "
-                        "WHERE search_text MATCH :query "
-                        "ORDER BY rank LIMIT :limit"
+                    selected = selected.where(
+                        text(
+                            f"conversation_items.search_text {like_op} :query ESCAPE :escape"
+                        ).bindparams(
+                            bindparam("query", params["query"]),
+                            bindparam("escape", params["escape"]),
+                        )
                     )
-            else:
-                pattern = _literal_like_pattern(query)
-                search_text = SqlConversationItem.search_text
-                match = (
-                    search_text.like(pattern, escape="\\")
-                    if self._conv_engine.dialect.name == "mysql"
-                    else search_text.ilike(pattern, escape="\\")
-                )
-                stmt = (
-                    select(SqlConversationItem.id)
-                    .where(SqlConversationItem.workspace_id == current_workspace_id(), match)
-                    .order_by(SqlConversationItem.created_at.desc())
-                    .limit(limit)
-                )
-                if conversation_id is not None:
-                    stmt = stmt.where(SqlConversationItem.conversation_id == conversation_id)
-            params: dict[str, str | int | bytes] = {}
-            if use_fts:
-                params = {"query": query, "limit": limit}
-                if conversation_id is not None:
-                    # Only the raw FTS branch binds a text ID; the ORM branch
-                    # above lets Uuid16 encode its conversation filter.
-                    params["cid"] = conversation_id
-            item_ids = [
-                item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
-                for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
-            ]
-            if not item_ids:
-                return []
-            rows = (
-                session.execute(
-                    select(SqlConversationItem).where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.id.in_(item_ids),
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            # Preserve FTS rank order
-            order = {iid: i for i, iid in enumerate(item_ids)}
-            ordered = sorted(rows, key=lambda r: order[r.id])
+                rows.extend(session.scalars(selected).all())
+            # Preserve FTS rank or recency order without widening the result
+            # to a second conversation that reused an item id.
+            order = {key: i for i, key in enumerate(keys)}
+            ordered = sorted(rows, key=lambda r: order[(r.conversation_id, r.id)])
             decoded = self._decode_item_data_batch([r.data for r in ordered])
-            return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+            return [
+                ConversationSearchHit(conversation_id=r.conversation_id, **_to_item(r, d).__dict__)
+                for r, d in zip(ordered, decoded, strict=True)
+            ]
 
     def search_visible_items_literal(
         self,
@@ -4521,6 +4617,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             decoded = self._decode_item_data_batch([row.data for row in rows])
             return [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
+
+    def _permitted_conversation_hexes(
+        self, conversation_hexes: set[str], user_id: str
+    ) -> set[str]:
+        """
+        Return the subset of *conversation_hexes* that *user_id* can read.
+
+        Reads the metadata database, which holds ``session_permissions`` when
+        the conversation tables live elsewhere. The caller bounds the set size.
+
+        :param conversation_hexes: Bare 32-char hex conversation ids.
+        :param user_id: The grantee to check, e.g. ``"alice@example.com"``.
+        :returns: The permitted bare 32-char hex ids.
+        """
+        with self._session("search_conversations_acl") as meta_session:
+            rows = (
+                meta_session.execute(
+                    select(SqlSessionPermission.conversation_id).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id.in_(sorted(conversation_hexes)),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return set(rows)
 
     def list_host_conversation_ids(
         self,

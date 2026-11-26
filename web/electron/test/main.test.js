@@ -162,6 +162,7 @@ function loadNavigationHarness({
   managedServers = [],
   internalFeatures = false,
   cliPath = null,
+  cliInstallResult = async () => ({ ok: true }),
   hostConnectResult = { ok: true },
   sshConnectResult = { ok: true, shownInConsole: true },
   serverAuthResult = { ok: true },
@@ -703,11 +704,14 @@ function loadNavigationHarness({
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
+    "./cli_install": { installCli: cliInstallResult },
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
+      ensureServerAuth: async (...args) =>
+        typeof serverAuthResult === "function" ? serverAuthResult(...args) : serverAuthResult,
+      ensureHostConnected: async (...args) =>
+        typeof hostConnectResult === "function" ? hostConnectResult(...args) : hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -3411,7 +3415,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target, \{ signal \}\)/,
     );
   });
 
@@ -5568,13 +5572,15 @@ describe("onboarding runner IPC", () => {
   // A setup-page sender that can be closed mid-request.
   function setupSender() {
     let destroyed = false;
+    const events = new EventEmitter();
     return {
       send() {},
-      once() {},
-      removeListener() {},
+      once: (name, listener) => events.once(name, listener),
+      removeListener: (name, listener) => events.removeListener(name, listener),
       isDestroyed: () => destroyed,
       destroy: () => {
         destroyed = true;
+        events.emit("destroyed");
       },
     };
   }
@@ -5584,6 +5590,47 @@ describe("onboarding runner IPC", () => {
     h.api.registerIpc();
     return h;
   }
+
+  it("lets one window leave a shared CLI install and waits for the last child's exit", async (t) => {
+    const installs = [];
+    const h = harness(t, {
+      cliInstallResult: ({ signal }) =>
+        new Promise((finish) => {
+          installs.push({ signal, finish });
+        }),
+    });
+    const first = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const second = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const install = h.ipc.get("omnigent:cli-install");
+    const cancel = h.ipc.get("omnigent:cancel-cli-install");
+    const firstResult = install(first);
+    const secondResult = install(second);
+    await until(() => installs.length === 1, "shared installer started");
+
+    first.sender.destroy();
+    assert.deepEqual(plain(await firstResult), { ok: false, canceled: true });
+    assert.equal(installs[0].signal.aborted, false);
+
+    let released = false;
+    const stopping = cancel(second).then((stopped) => {
+      released = stopped;
+    });
+    assert.equal(installs[0].signal.aborted, true);
+    const restart = install(second);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(released, false);
+    assert.equal(installs.length, 1);
+    installs[0].finish({ ok: false, canceled: true });
+
+    await stopping;
+    assert.equal(released, true);
+    assert.deepEqual(plain(await secondResult), { ok: false, canceled: true });
+    await until(() => installs.length === 2, "a retry started after cleanup");
+    installs[1].finish({ ok: true });
+    assert.equal((await restart).ok, true);
+  });
 
   it("serves only the setup page, and rejects bad input", async (t) => {
     const h = harness(t);
@@ -5624,6 +5671,140 @@ describe("onboarding runner IPC", () => {
     assert.equal(result.errorMessage, "The omnigent CLI was not found.");
     assert.equal(result.errorAction, "Install it or set its path.");
     assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
+  });
+
+  it("Cancel stops a pending laptop sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const event = { sender, senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signal !== undefined, "sign-in started");
+
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+    // Nothing left to cancel once it has finished.
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), false);
+    await assert.rejects(
+      () => h.ipc.get("omnigent:cancel-runner-connect")({ sender, senderFrame: { url: server } }),
+      /only available to the setup page/,
+    );
+  });
+
+  it("Cancel right after the request starts stops it before it signs in or connects the host", async (t) => {
+    let authCalls = 0;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: () => {
+        authCalls += 1;
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    // Before the target resolves: the attempt is already registered.
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(authCalls, 0);
+    assert.equal(hostConnected, false);
+  });
+
+  it("closing the window stops a pending sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const connecting = h.ipc.get("omnigent:connect-runner")(
+      { sender, senderFrame: setupFrame(h) },
+      server,
+      "local",
+    );
+    await until(() => signal !== undefined, "sign-in started");
+
+    sender.destroy();
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+  });
+
+  it("a newer attempt stops the previous one from the same window", async (t) => {
+    const signals = [];
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: (_cli, _url, options) => {
+        signals.push(options.signal);
+        if (signals.length > 1) return { ok: true };
+        return new Promise((resolve) => {
+          options.signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const first = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signals.length === 1, "first sign-in started");
+
+    const second = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(await first), { ok: false, canceled: true });
+    assert.equal(signals[0].aborted, true);
+    assert.equal(second.ok, true);
+  });
+
+  it("a cancel that lands during the host connect isn't recorded as a connected laptop", async (t) => {
+    let cancel;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        cancel();
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    cancel = () => h.ipc.get("omnigent:cancel-runner-connect")(event);
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, canceled: true });
+    const saved = fs.existsSync(h.settingsPath)
+      ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8"))
+      : {};
+    assert.equal(saved.onboarding_runner, undefined);
   });
 
   it("passes separate authentication message and action fields to the setup page", async (t) => {

@@ -166,9 +166,17 @@ type RespondedMap = Record<
     reason?: "timed_out";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
-    attempt?: string;
+    requestKey: string;
   }
 >;
+
+function approvalRequestKey(item: InboxItem): string {
+  return JSON.stringify([
+    item.resolveSessionId,
+    item.elicitation.nativeDelivery?.attempt,
+    item.elicitation.codexCommand?.requestFingerprint,
+  ]);
+}
 
 /**
  * Per-session reply state; absent means idle. `retryStableId` names the failed
@@ -293,7 +301,9 @@ export function InboxPage() {
     if (!proactiveInbox.enabled) setPinnedSuggestions({});
   }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
-  const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
+  const pendingSubmissions = useRef(
+    new Map<string, { verdict: RespondedMap[string]; holdToken: number }>(),
+  );
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
   // approval. Keying by id (not index) keeps a user's explicit toggles
@@ -492,16 +502,29 @@ export function InboxPage() {
       isFirstRender.current = false;
       return;
     }
+    for (const item of items) {
+      const id = item.elicitation.elicitationId;
+      const pending = pendingSubmissions.current.get(id);
+      if (
+        item.elicitation.codexCommand &&
+        pending &&
+        pending.verdict.requestKey !== approvalRequestKey(item)
+      ) {
+        pendingSubmissions.current.delete(id);
+        cancelLocalElicitationResolution(id, pending.holdToken);
+      }
+    }
     setResponded((prev) => {
       if (Object.keys(prev).length === 0) return prev;
       const stale = items
-        .filter(({ elicitation }) => {
+        .filter((item) => {
+          const { elicitation } = item;
           const verdict = prev[elicitation.elicitationId];
           return (
             verdict &&
-            (elicitation.nativeDelivery
-              ? verdict.attempt !== elicitation.nativeDelivery.attempt
-              : !pendingSubmissions.current.has(elicitation.elicitationId))
+            (verdict.requestKey !== approvalRequestKey(item) ||
+              (!elicitation.nativeDelivery &&
+                !pendingSubmissions.current.has(elicitation.elicitationId)))
           );
         })
         .map(({ elicitation }) => elicitation.elicitationId);
@@ -536,16 +559,15 @@ export function InboxPage() {
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
     return async (elicitationId, action, content, meta) => {
-      const attempt = item.elicitation.nativeDelivery?.attempt;
+      const requestKey = approvalRequestKey(item);
       const previous = pendingSubmissions.current.get(elicitationId);
-      if (previous && previous.attempt === attempt) return false;
+      if (previous?.verdict.requestKey === requestKey) return false;
       const verdict = {
-        attempt,
+        requestKey,
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       };
-      pendingSubmissions.current.set(elicitationId, verdict);
       const asyncQuestion = item.elicitation.asyncKind === "question";
       if (!asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
       const holdToken = beginLocalElicitationResolution(
@@ -557,13 +579,15 @@ export function InboxPage() {
         ),
         { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
       );
+      const submission = { verdict, holdToken };
+      pendingSubmissions.current.set(elicitationId, submission);
       try {
         await approve(item.resolveSessionId, elicitationId, {
           action,
           ...(content === undefined ? {} : { content }),
           ...(meta === undefined ? {} : { _meta: meta }),
         });
-        if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
+        if (pendingSubmissions.current.get(elicitationId) !== submission) return false;
         pendingSubmissions.current.delete(elicitationId);
         acknowledgeLocalElicitationResolution(elicitationId, holdToken);
         clearAskUserQuestionDraft(elicitationId);
@@ -576,7 +600,7 @@ export function InboxPage() {
         }
         return true;
       } catch (error: unknown) {
-        if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
+        if (pendingSubmissions.current.get(elicitationId) !== submission) return false;
         pendingSubmissions.current.delete(elicitationId);
         cancelLocalElicitationResolution(elicitationId, holdToken);
         // The prompt timed out before this verdict arrived. Keep the
@@ -586,7 +610,7 @@ export function InboxPage() {
         if (error instanceof ApiError && error.code === "elicitation_timed_out") {
           setResponded((prev) => ({
             ...prev,
-            [elicitationId]: { action: "auto_resolved", reason: "timed_out" },
+            [elicitationId]: { requestKey, action: "auto_resolved", reason: "timed_out" },
           }));
           return false;
         }
@@ -758,8 +782,7 @@ export function InboxPage() {
       const { item } = entry;
       const elicitationId = item.elicitation.elicitationId;
       const optimistic = responded[elicitationId];
-      const verdict =
-        optimistic?.attempt === item.elicitation.nativeDelivery?.attempt ? optimistic : undefined;
+      const verdict = optimistic?.requestKey === approvalRequestKey(item) ? optimistic : undefined;
       // Same display mapping the sidebar uses: native-wrapper sessions read
       // "Claude Code" / "Codex", never the internal agent name. Hidden when
       // it would just repeat the title (untitled native sessions).
