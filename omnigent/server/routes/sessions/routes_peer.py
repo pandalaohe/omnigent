@@ -1174,6 +1174,7 @@ def register_peer_routes(
         text: str,
         *,
         attempt_id: str | None = None,
+        expected_reason: str | None = None,
         acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
         require_init_success: bool = False,
     ) -> tuple[str, str | None]:
@@ -1190,15 +1191,9 @@ def register_peer_routes(
 
         :param peer_id: This delivery's own record id, threaded into the
             envelope's ``msg=`` field for restart reconciliation.
+        :param expected_reason: The sweeper's reason marker, when it set one.
         :returns: The delivery disposition and its reason, if any.
         """
-        native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
-        record = (
-            await asyncio.to_thread(peer_message_store.get, peer_id)
-            if peer_message_store is not None
-            else None
-        )
-        sdk_delivery = bool(record is not None and sdk_attempt(record.reason))
         envelope = format_peer_envelope(
             sender_session_id=sender.id,
             sender_title=sender.title,
@@ -1214,6 +1209,22 @@ def register_peer_routes(
             kwargs["acting_user_id"] = acting_user_id
         if require_init_success:
             kwargs["require_init_success"] = True
+        native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
+        record = (
+            await asyncio.to_thread(peer_message_store.get, peer_id)
+            if peer_message_store is not None
+            else None
+        )
+        if attempt_id is None and (
+            record is None
+            or record.state != "delivering"
+            or _native_claimed(record.reason)
+            or (expected_reason is not None and record.reason != expected_reason)
+        ):
+            # An earlier copy may have been claimed during the readiness or
+            # terminal lookup. Leave its record to the receipt and reconciliation.
+            return "uncertain", "not_ready"
+        sdk_delivery = bool(record is not None and sdk_attempt(record.reason))
         try:
             delivery = await deliver_impl(
                 request,
