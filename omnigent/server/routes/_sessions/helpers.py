@@ -48,6 +48,7 @@ from omnigent.calling_defaults import resolve_calling
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
     CodexPermissionObservation,
+    codex_permission_application_receipt,
     codex_permission_observation_from_payload,
     codex_permission_observation_with_metadata,
     decode_codex_permission_observation,
@@ -4302,6 +4303,40 @@ def _codex_permission_observation_labels(
     }, decode_codex_permission_observation(encoded)
 
 
+async def _persist_web_codex_permission_observation(
+    session_id: str,
+    before: Conversation,
+    requested_mode: str,
+    observed: CodexPermissionObservation,
+    conversation_store: ConversationStore,
+) -> None:
+    """Reconcile a runner response with reports received during the web switch."""
+    change = _live_settings_change(session_id)
+    async with change.write_lock:
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if current is None or current.runner_id != before.runner_id:
+            return
+        key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
+        previous = current.labels.get(key)
+        if previous and previous != before.labels.get(key):
+            try:
+                competing = decode_codex_permission_observation(previous)
+            except ValueError:
+                observed = codex_permission_application_receipt(requested_mode)
+            else:
+                if (
+                    competing.runner_id == current.runner_id
+                    and competing.source == "native-settings"
+                ):
+                    if competing.mode != requested_mode:
+                        observed = codex_permission_application_receipt(requested_mode)
+                    elif observed.source == "application-receipt":
+                        return
+        labels, observed = _codex_permission_observation_labels(observed, current)
+        await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+        _publish_codex_approval_mode(session_id, observed.mode, observed)
+
+
 async def _persist_external_codex_approval_mode_change(
     session_id: str,
     conv: Conversation,
@@ -4318,13 +4353,24 @@ async def _persist_external_codex_approval_mode_change(
             )
             if body.data["approval_mode"] != observed.mode:
                 raise ValueError("approval_mode disagrees with the observation")
-            labels, observed = _codex_permission_observation_labels(observed, conv)
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-        if any(conv.labels.get(key) != value for key, value in labels.items()):
-            await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
-        # A prior attempt may have persisted before its publish failed.
-        _publish_codex_approval_mode(session_id, observed.mode, observed)
+        change = _live_settings_change(session_id)
+        async with change.write_lock:
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != conv.runner_id:
+                return
+            key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
+            if conv.labels.get(key) != current.labels.get(key):
+                return
+            try:
+                labels, observed = _codex_permission_observation_labels(observed, current)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            if any(current.labels.get(key) != value for key, value in labels.items()):
+                await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+            # A prior attempt may have persisted before its publish failed.
+            _publish_codex_approval_mode(session_id, observed.mode, observed)
         return
     raw_args = body.data.get("terminal_launch_args")
     raw_mode = body.data.get("approval_mode")
@@ -6690,8 +6736,8 @@ def _require_codex_approval_mode_forward(
     """
     Require the existing runner response for a live Codex control request.
 
-    The popup echo matcher is not bound to this request. A successful response
-    therefore supports an application receipt, not fresh native confirmation.
+    A successful popup response supports an application receipt. The runner's
+    separate app-server readback supplies native settings when available.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param mode: Requested approval mode, e.g. ``"read-only"``.
@@ -9941,6 +9987,8 @@ async def _forward_session_change_to_runner_impl(
     runner_router: Any,
     event: dict[str, Any],
     timeout_s: float = 5.0,
+    *,
+    conversation: Conversation | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -9983,6 +10031,7 @@ async def _forward_session_change_to_runner_impl(
     :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
         runner answers by driving the TUI pass
         :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
+    :param conversation: Pin routing to the already-read session binding when supplied.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -9995,8 +10044,12 @@ async def _forward_session_change_to_runner_impl(
     try:
         if event_type in ("interrupt", "cost_approval_popup", "policy_blocked_notice"):
             runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
-        else:
+        elif conversation is None:
             runner_client = await _get_runner_client(session_id, runner_router)
+        else:
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=conversation
+            )
     except OmnigentError as exc:
         if event_type not in ("effort_change", "model_change") or not (
             isinstance(exc, RuntimeSupportError)

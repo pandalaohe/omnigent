@@ -18836,7 +18836,7 @@
                 "type": "null"
               }
             ],
-            "description": "The permission mode the session is in, in its harness's vocabulary, e.g. `\"auto\"` or `\"approve-for-me\"` (the names `sys_session_create` takes). Follows a switch made while it runs to a mode that keeps approval; a mode that skips approval shows only when the session's launch settings select it. `None` when the harness has no permission modes or the mode cannot be told.",
+            "description": "The permission mode the session is in, in its harness's vocabulary, e.g. `\"auto\"` or `\"approve-for-me\"` (the names `sys_session_create` takes). Follows a switch made while it runs. Codex native readback reports `\"custom\"` for non-preset settings or `\"unknown\"` while a mode is unconfirmed. `None` when the harness has no permission modes or there is no mode to report.",
             "title": "Permission Mode"
           },
           "permission_tier": {

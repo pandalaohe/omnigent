@@ -9,6 +9,11 @@ import pytest
 import yaml
 
 import omnigent.runtime.agent_cache as agent_cache_module
+from omnigent.codex_approval_modes import (
+    codex_permission_observation_from_thread_settings,
+    codex_permission_observation_with_metadata,
+    encode_codex_permission_observation,
+)
 from omnigent.entities.agent import Agent
 from omnigent.errors import OmnigentError
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
@@ -25,7 +30,10 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_support,
 )
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
+)
 from tests._helpers.session import bundle_files
 
 _NULL_HINT = "JSON null (not the string 'null') for the agent default"
@@ -530,6 +538,14 @@ _CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
             id="bypass-off-host",
         ),
         pytest.param("codex-native", {}, None, True, None, id="mode-unknown"),
+        pytest.param(
+            "codex-native",
+            {_CODEX_APPROVAL_MODE: "unknown"},
+            _CODEX_ARGS["full-access"],
+            True,
+            None,
+            id="web-switch-unconfirmed",
+        ),
     ],
 )
 def test_session_another_session_starts_uses_the_creators_mode(
@@ -586,6 +602,25 @@ def test_other_harnesses_report_their_launch_mode_without_passing_it_on(
         session, harness=harness, creator_harness=harness, on_creator_host=True
     )
     assert options is None
+
+
+@pytest.mark.parametrize("runner_id", ["runner-current", "runner-replacement", None])
+def test_codex_session_info_requires_the_observed_runner(runner_id: str | None) -> None:
+    observed = codex_permission_observation_from_thread_settings(
+        {"approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"}}, origin="resume"
+    )
+    encoded = encode_codex_permission_observation(
+        codex_permission_observation_with_metadata(
+            observed, received_at=1, runner_id="runner-current"
+        )
+    )
+    session = SimpleNamespace(
+        labels={CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY: encoded},
+        runner_id=runner_id,
+        terminal_launch_args=_CODEX_ARGS["approve-for-me"],
+    )
+    expected = "full-access" if runner_id == "runner-current" else "unknown"
+    assert session_permission_mode(session, "codex-native") == expected
 
 
 _CUSTOM_HANDLER_CONFIG = yaml.dump(

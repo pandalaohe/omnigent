@@ -1,10 +1,9 @@
 """An agent reads the permission mode a session is in with ``sys_session_get_info``.
 
-Real local server, host, runners, Codex and Claude Code processes; only the
-reading agent's model is scripted. Codex and Claude Code report and switch modes
-in their own terminals without calling a model. The web picker switches each
-one mid-session, and the reader must then see the new mode. The reader runs a
-harness without permission modes, so its own mode reads as null.
+Real local server, host, runners, Codex and Claude Code processes with scripted
+models. The web picker switches both terminals. Before its first turn, Codex
+has no rollout to read back. After a turn, the reader sees the native mode.
+The reader's harness has no permission modes, so its own mode reads as null.
 """
 
 import ast
@@ -19,7 +18,9 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from omnigent.codex_approval_modes import decode_codex_permission_observation
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.stores.conversation_store import CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -28,10 +29,11 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallba
 
 _REPO = Path(__file__).resolve().parents[2]
 _CLAUDE_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
-# The second marker extends the first, so the mock routes the resent
-# conversation to the newer turn.
+# Each marker extends the previous one so the mock routes the resent
+# conversation to the newest turn.
 _READ_TASK = "READ_PERMISSION_MODES"
 _REREAD_TASK = f"{_READ_TASK}_AFTER_SWITCH"
+_READ_CONFIRMED_TASK = f"{_REREAD_TASK}_CONFIRMED"
 
 
 @pytest.mark.posix_only
@@ -175,17 +177,22 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                 def switch(session_id, change):
                     # The live terminal applies a switch, so retry until it is up to it.
                     attempts = []
+                    snapshot = None
 
                     def applied():
+                        nonlocal snapshot
                         response = client.patch(f"/v1/sessions/{session_id}", json=change)
                         attempts.append(f"{response.status_code}: {response.text[:300]}")
-                        return response.status_code == 200
+                        if response.status_code == 200:
+                            snapshot = response.json()
+                        return snapshot is not None
 
                     try:
                         poll_until(applied, timeout_s=90, interval_s=2)
                     except AssertionError as error:
                         error.add_note(f"last PATCH: {attempts[-1:]}")
                         raise
+                    return snapshot
 
                 # Claude has read its mode off its own footer.
                 poll_until(
@@ -205,15 +212,12 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                 # The web picker switches each session while it runs. Codex offers
                 # Read Only on Linux only with a permission profile, so use a preset
                 # every platform lists.
-                switch(codex, {"approval_mode": "ask-for-approval"})
+                switch(codex, {"approval_mode": "full-access"})
                 switch(claude, {"permission_mode": "acceptEdits"})
                 after = read_modes(
                     _REREAD_TASK,
                     {"codex": {"session_id": codex}, "claude": {"session_id": claude}},
                 )
-                # Codex's launch args still name the mode it started in; only its
-                # reported mode moved.
-                assert session(codex)["terminal_launch_args"] == codex_launch_args
                 seen = {
                     f"{name} {phase}": info.get("permission_mode", "<absent>")
                     for phase, reads in (("before", before), ("after", after))
@@ -223,6 +227,30 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                     "own before": None,
                     "codex before": "approve-for-me",
                     "claude before": "default",
-                    "codex after": "ask-for-approval",
+                    "codex after": "unknown",
                     "claude after": "acceptEdits",
                 }
+
+                materialize = "MATERIALIZE_CODEX_PERMISSION_READBACK"
+                configure_mock_llm(mock, [{"text": "Codex rollout ready."}], match=materialize)
+                send_user_text(client, session_id=codex, text=materialize)
+
+                def turn_finished():
+                    items = client.get(f"/v1/sessions/{codex}/items", params={"limit": 30})
+                    return (
+                        "Codex rollout ready." in items.text and session(codex)["status"] == "idle"
+                    )
+
+                poll_until(turn_finished, timeout_s=60)
+                snapshot = switch(codex, {"approval_mode": "ask-for-approval"})
+                observed = decode_codex_permission_observation(
+                    snapshot["labels"][CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY]
+                )
+                assert (observed.source, observed.origin, observed.mode) == (
+                    "native-settings",
+                    "resume",
+                    "ask-for-approval",
+                )
+                assert snapshot["terminal_launch_args"] == codex_launch_args
+                confirmed = read_modes(_READ_CONFIRMED_TASK, {"codex": {"session_id": codex}})
+                assert confirmed["codex"]["permission_mode"] == "ask-for-approval"

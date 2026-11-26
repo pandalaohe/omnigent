@@ -1009,11 +1009,21 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
+@pytest.mark.parametrize(
+    ("active_turn_id", "readback_thread"),
+    [
+        pytest.param("turn_running", None, id="busy"),
+        pytest.param(None, None, id="no-rollout"),
+        pytest.param(None, "invalid-json", id="invalid-json"),
+        pytest.param(None, "other_thread", id="wrong-thread"),
+        pytest.param(None, "thread_codex", id="confirmed"),
+    ],
+)
 async def test_events_codex_native_approval_mode_change_types_only_when_idle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     active_turn_id: str | None,
+    readback_thread: str | None,
 ) -> None:
     """
     An approval-mode switch while Codex runs a turn is refused, not keyed in.
@@ -1023,7 +1033,28 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
     the person why the mode did not change. Once the session is idle the same
     request drives the /permissions popup and reports the confirmed mode.
     """
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native import app_server
     from tests.runner.helpers import make_test_terminal_instance
+
+    app_client = AsyncMock()
+    if readback_thread == "invalid-json":
+        app_client.request.side_effect = ConnectionError("reader exited")
+        app_client.close.side_effect = json.JSONDecodeError("invalid frame", "{", 0)
+    elif readback_thread is None:
+        app_client.request.side_effect = app_server.CodexAppServerResponseError(
+            {"code": -32600, "message": "no rollout found for thread id thread_codex"}
+        )
+    else:
+        app_client.request.return_value = {
+            "result": {
+                "thread": {"id": readback_thread},
+                "approvalPolicy": "never",
+                "sandbox": {"type": "dangerFullAccess"},
+            },
+        }
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: app_client)
 
     popup = (
         "  Update Model Permissions\n\n"
@@ -1091,7 +1122,20 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
 
     if active_turn_id is None:
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"approval_mode": "full-access"}
+        assert resp.json()["approval_mode"] == "full-access"
+        observed = resp.json().get("permission_observation")
+        if readback_thread == "thread_codex":
+            assert (observed["source"], observed["origin"], observed["mode"]) == (
+                "native-settings",
+                "resume",
+                "full-access",
+            )
+        else:
+            assert observed is None
+        app_client.request.assert_awaited_once_with(
+            "thread/resume", {"threadId": "thread_codex", "excludeTurns": True}
+        )
+        app_client.close.assert_awaited_once()
         target = instance.tmux_target
         assert tmux_calls == [
             ("send-keys", "-t", target, "C-u"),
@@ -1109,6 +1153,7 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
         "or stop the turn first."
     )
     assert tmux_calls == []
+    app_client.connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -5265,14 +5310,14 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
             if method == "thread/resume":
                 if scenario == "full-unknown":
                     raise RuntimeError("temporary read failure")
+                sandbox = {
+                    "native-full": "dangerFullAccess",
+                    "native-read-only": "readOnly",
+                }.get(scenario, "workspaceWrite")
                 return {
                     "result": {
                         "approvalPolicy": "never" if scenario == "native-full" else "on-request",
-                        "sandboxPolicy": {
-                            "type": "readOnly"
-                            if scenario == "native-read-only"
-                            else "workspaceWrite"
-                        },
+                        "sandboxPolicy": {"type": sandbox},
                     }
                 }
             interrupted.append((method, params))

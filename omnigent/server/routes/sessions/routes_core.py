@@ -41,6 +41,7 @@ from omnigent.calling_defaults import load_master
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
     codex_permission_application_receipt,
+    codex_permission_observation_from_payload,
     decode_codex_permission_observation,
 )
 from omnigent.db.utils import (
@@ -240,7 +241,6 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _child_pending_elicitations_by_parent,
-    _codex_permission_observation_labels,
     _codex_plan_mode_enabled,
     _create_session_worktree,
     _delete_stored_session_bundle_after_failure,
@@ -267,6 +267,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_session_create_metadata,
     _pending_elicitation_key,
     _permission_level_from_grants,
+    _persist_web_codex_permission_observation,
     _pin_claude_permission_launch_args,
     _place_project_session,
     _presentation_labels_for_agent,
@@ -6539,6 +6540,7 @@ def register_core_routes(
         if (
             "speed_tier" in body.model_fields_set
             or "permission_mode" in body.model_fields_set
+            or "approval_mode" in body.model_fields_set
             or (not body.silent and settings_change_requested)
         ):
             live_change = _live_settings_change(session_id)
@@ -8497,6 +8499,7 @@ def register_core_routes(
                 # pressing the preset's digit, then confirming the echo — which
                 # outlasts the default forward budget.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                conversation=updated,
             )
             if (
                 sdk_approval_mode
@@ -8507,8 +8510,7 @@ def register_core_routes(
                     "SDK approval mode was not applied by the runner; try again",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            # Preserve the control response/error handling. A successful response
-            # is an application receipt, not fresh native settings confirmation.
+            approval_payload = None
             if _approval_result is not None:
                 try:
                     approval_payload = json.loads(_approval_result.body)
@@ -8540,14 +8542,12 @@ def register_core_routes(
                                 ],
                             ),
                         )
-                        receipt_labels, _receipt = _codex_permission_observation_labels(
-                            codex_permission_application_receipt(requested_codex_approval_mode),
-                            updated,
-                        )
-                        await asyncio.to_thread(
-                            conversation_store.set_labels,
+                        await _persist_web_codex_permission_observation(
                             session_id,
-                            receipt_labels,
+                            updated,
+                            requested_codex_approval_mode,
+                            codex_permission_application_receipt(requested_codex_approval_mode),
+                            conversation_store,
                         )
                     return JSONResponse(status_code=409, content=approval_payload)
             _require_codex_approval_mode_forward(
@@ -8556,10 +8556,30 @@ def register_core_routes(
                 _approval_result,
             )
             if not sdk_approval_mode:
-                receipt_labels, _receipt = _codex_permission_observation_labels(
-                    codex_permission_application_receipt(requested_codex_approval_mode), updated
+                # The live readback takes precedence over a scalar label in the same PATCH.
+                labels_to_set.pop(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY, None)
+                labels_to_set.pop(CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY, None)
+                observed = codex_permission_application_receipt(requested_codex_approval_mode)
+                if (
+                    isinstance(approval_payload, dict)
+                    and "permission_observation" in approval_payload
+                ):
+                    with contextlib.suppress(ValueError):
+                        confirmed = codex_permission_observation_from_payload(
+                            approval_payload["permission_observation"]
+                        )
+                        if (
+                            confirmed.origin == "resume"
+                            and confirmed.mode == requested_codex_approval_mode
+                        ):
+                            observed = confirmed
+                await _persist_web_codex_permission_observation(
+                    session_id,
+                    updated,
+                    requested_codex_approval_mode,
+                    observed,
+                    conversation_store,
                 )
-                labels_to_set.update(receipt_labels)
         if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
             labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
         if requested_speed is not None:
