@@ -643,24 +643,13 @@ describe("Settings source guard on shared components and the walk's reach", () =
     expect(sites("importedClass")).toEqual(["Wrapped.tsx › ClassRaw › input"]);
   });
 
-  it("walks an aliased or memo() component when it renders unowned", () => {
-    // Its own switch and buttons aren't under a setting, so they're rejected through each wrapper.
-    expect(sites("aliasedComponent").length).toBeGreaterThan(0);
-    expect(sites("aliasedComponent").every((site) => site.startsWith("ThemeColorPicker.tsx"))).toBe(
-      true,
-    );
-    expect(sites("memoComponent").length).toBeGreaterThan(0);
-    expect(sites("memoComponent").every((site) => site.startsWith("ThemeColorPicker.tsx"))).toBe(
-      true,
-    );
-  });
-
-  it("walks a component table's components", () => {
-    expect(sites("componentTable").length).toBeGreaterThan(0);
-    expect(sites("componentTable").every((site) => site.startsWith("ThemeColorPicker.tsx"))).toBe(
-      true,
-    );
-  });
+  it.each(["aliasedComponent", "memoComponent", "componentTable"])(
+    "walks the unowned picker and its spectrum through %s",
+    (fixture) => {
+      const files = new Set(sites(fixture).map((site) => site.split(" › ", 1)[0]));
+      expect(files).toEqual(new Set(["ThemeColorPicker.tsx", "ColorSpectrum.tsx"]));
+    },
+  );
 
   it("owns nothing through an entry search doesn't list", () => {
     expect(unlisted).toEqual([`${CATALOG_FILE}#FIXTURE_UNLISTED`]);
