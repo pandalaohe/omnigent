@@ -1,42 +1,67 @@
 import { AlertTriangleIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { useSession } from "@/hooks/useSession";
-import { modelResolutionNotes, sessionHeaderModelState } from "@/lib/modelReference";
+import { useHoverPinFloat } from "@/hooks/useHoverPinFloat";
+import {
+  modelResolutionNotes,
+  sessionHeaderModelState,
+  type ModelResolutionNote,
+  type SessionHeaderModelState,
+} from "@/lib/modelReference";
+import type { Session } from "@/lib/types";
 
-export function SessionHeaderModel({ sessionId }: { sessionId: string }) {
-  const { session } = useSession(sessionId);
-  const { launched } = sessionHeaderModelState(session);
-  if (!launched) return null;
-  return (
-    <span
-      data-testid="session-header-model"
-      title={launched}
-      aria-label={`Launched model: ${launched}`}
-      className="inline-flex max-w-28 shrink-0 truncate rounded-md border border-border/60 bg-background/60 px-2 py-0.5 font-mono text-xs text-muted-foreground sm:max-w-44"
-    >
-      {launched}
-    </span>
-  );
-}
+type ModelResolutionSession = Pick<
+  Session,
+  "harness" | "requested" | "launched" | "running" | "codexModelOptions" | "labels"
+>;
 
-export function ModelResolutionChip({ sessionId }: { sessionId: string }) {
-  const { session } = useSession(sessionId);
+export function ModelResolutionChip({
+  session,
+}: {
+  session: ModelResolutionSession | null | undefined;
+}) {
   const notes = modelResolutionNotes(session?.labels);
   const modelState = sessionHeaderModelState(session);
   if (notes.length === 0 && !modelState.hasDifference) return null;
+  return <ModelResolutionWarningButton modelState={modelState} notes={notes} />;
+}
+
+function ModelResolutionWarningButton({
+  modelState,
+  notes,
+}: {
+  modelState: SessionHeaderModelState;
+  notes: readonly ModelResolutionNote[];
+}) {
+  const { open, setOpen, triggerHandlers, contentHandlers } = useHoverPinFloat();
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
           type="button"
+          data-testid="model-resolution-warning"
           aria-label="Model resolution warning"
-          className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-amber-500/40 bg-background px-2 text-xs text-amber-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="relative flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-transparent px-1.5 text-amber-600 hover:text-amber-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background md:h-6 md:min-w-6 md:px-1 dark:text-amber-500 dark:hover:text-amber-400"
+          {...triggerHandlers}
+          onClick={(event) => {
+            // A click or tap pins the float; Escape or a click beside it clears it.
+            event.preventDefault();
+            setOpen(true);
+          }}
         >
           <AlertTriangleIcon className="size-3.5" aria-hidden="true" />
-          Model reference
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] space-y-3 text-sm">
+      <PopoverContent
+        side="top"
+        align="end"
+        collisionPadding={8}
+        data-pop=""
+        data-testid="model-resolution-popover"
+        className="w-80 max-w-[calc(100vw-1rem)] space-y-3 text-sm"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => event.preventDefault()}
+        {...contentHandlers}
+      >
         <h2 className="font-medium">Model resolution</h2>
         {modelState.hasDifference && (
           <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">

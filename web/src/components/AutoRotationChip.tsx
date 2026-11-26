@@ -318,10 +318,10 @@ export function AutoRotationChip({
               data-testid="auto-rotation-chip-trigger"
               aria-label={chipLabel}
               className={cn(
-                "inline-flex h-7 shrink-0 items-center justify-center gap-1 rounded-full px-2 text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "inline-flex h-7 shrink-0 items-center justify-center rounded-full text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 appearance === "bar"
-                  ? "min-h-9 min-w-11 justify-center px-1.5"
-                  : "border border-border bg-background",
+                  ? "min-h-8 min-w-8 justify-center gap-0.5 px-1.5"
+                  : "gap-1 border border-border bg-background px-2",
               )}
             >
               <RefreshCwIcon className="size-3.5 shrink-0" aria-hidden="true" />

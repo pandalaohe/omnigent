@@ -81,7 +81,17 @@ describe("SubagentTaskIndicator", () => {
 
     const pill = screen.getByTestId("subagent-task-pill");
     expect(pill).toHaveTextContent("4");
-    expect(pill).toHaveClass("px-1", "md:px-2", "font-normal", "tabular-nums", "text-destructive");
+    expect(pill).toHaveClass(
+      "h-8",
+      "min-w-8",
+      "gap-0.5",
+      "px-1.5",
+      "md:h-6",
+      "md:px-1.5",
+      "font-normal",
+      "tabular-nums",
+      "text-destructive",
+    );
     expect(pill).toHaveAttribute("data-state", "error");
     expect(pill).toHaveAccessibleName(
       "4 sub-agents: 1 active, 1 awaiting input, 1 disconnected, 1 needs attention",

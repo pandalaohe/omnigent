@@ -313,6 +313,7 @@ import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { PhoneBarScroller } from "@/components/composer/PhoneBarScroller";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
 import { AutoRotationChip } from "@/components/AutoRotationChip";
+import { ModelResolutionChip } from "@/components/ModelResolutionChip";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -5297,13 +5298,16 @@ function ComposerImpl(
                 onOpen={openComposerGithubTab}
                 conversationId={composerSessionId ?? undefined}
               />
-              <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+              <div
+                data-testid="composer-status-indicators"
+                className="phone-session-bar-indicators ml-auto flex min-w-0 shrink-0 items-center gap-0"
+              >
                 <div
                   data-testid="composer-task-indicators"
                   className="flex items-center gap-0 empty:hidden"
                 >
                   {/* Phone shows background tasks in the header pill. */}
-                  {!isMobile && <BackgroundTaskIndicator />}
+                  {!isMobile && <BackgroundTaskIndicator className="gap-0.5 px-1.5 md:px-1.5" />}
                   <SubagentTaskIndicator conversationId={conversationId} />
                   {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
                   <RunnerLogRunawayIndicator
@@ -5312,6 +5316,7 @@ function ComposerImpl(
                     fallbackLabels={runnerLogFallbackLabels}
                   />
                 </div>
+                {composerSessionId && <ModelResolutionChip session={composerSession} />}
                 {conversationId && (
                   <ComposerContextRing
                     contextWindow={composerContextWindow}

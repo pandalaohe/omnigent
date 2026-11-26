@@ -82,6 +82,185 @@ function antigravityModelIdentity(value: string): string {
     .replace(/[^a-z0-9]/g, "");
 }
 
+const CLAUDE_MODEL_ALIASES = new Set(["fable", "opus", "sonnet", "haiku"]);
+const CLAUDE_CATALOG_PREFIXES = ["databricks-", "system.ai."] as const;
+const CLAUDE_CONTEXT_SUFFIX_RE = /\[[^[\]\s]+\]$/;
+const CLAUDE_FALLBACK_MODEL_RE =
+  /^(?:(?:databricks-|system\.ai\.)|(?:(?:us|eu|ap|au|ca|jp|global)\.)?anthropic\.)?claude-([a-z0-9._:-]+)$/;
+
+function isClaudeHarness(harness: string | null | undefined): boolean {
+  return (
+    harness === "claude-native" ||
+    harness === "native-claude" ||
+    harness === "claude-sdk" ||
+    harness === "claude_sdk" ||
+    harness === "claude"
+  );
+}
+
+function claudeContextSuffix(bareModel: string): string | null {
+  return CLAUDE_CONTEXT_SUFFIX_RE.exec(bareModel.trim().toLowerCase())?.[0] ?? null;
+}
+
+function normalizeClaudeContext(bareModel: string, stripContext: boolean): string {
+  const lower = bareModel.trim().toLowerCase();
+  return stripContext ? lower.replace(CLAUDE_CONTEXT_SUFFIX_RE, "") : lower;
+}
+
+function claudeContextMatches(
+  leftModel: string,
+  rightModel: string,
+  allowContextOmission: boolean,
+): boolean {
+  const leftSuffix = claudeContextSuffix(leftModel);
+  const rightSuffix = claudeContextSuffix(rightModel);
+  if (leftSuffix === rightSuffix) return true;
+  if (!allowContextOmission) return false;
+  // Running reports may omit [1m] or add the default [1m], but conflicting explicit suffixes warn.
+  return leftSuffix === null || rightSuffix === null;
+}
+
+function parseClaudeAlias(bareModel: string): string | null {
+  const stripped = normalizeClaudeContext(bareModel, true);
+  return CLAUDE_MODEL_ALIASES.has(stripped) ? stripped : null;
+}
+
+function claudeComparableId(bareModel: string, stripContext: boolean): string {
+  let bare = normalizeClaudeContext(bareModel, stripContext);
+  for (const prefix of CLAUDE_CATALOG_PREFIXES) {
+    if (bare.startsWith(prefix)) {
+      bare = bare.slice(prefix.length);
+      break;
+    }
+  }
+  return bare;
+}
+
+function canonicalClaudeId(bareModel: string, stripContext: boolean): string | null {
+  const normalized = normalizeClaudeContext(bareModel, stripContext);
+  const index = normalized.lastIndexOf("claude-");
+  if (index === -1) return null;
+  if (index > 0 && !/[._:-]/.test(normalized[index - 1])) return null;
+  return normalized.slice(index);
+}
+
+function claudeConcreteFamily(bareModel: string): string | null {
+  const stripped = normalizeClaudeContext(bareModel, true);
+  const match = CLAUDE_FALLBACK_MODEL_RE.exec(stripped);
+  if (!match) return null;
+  let found: string | null = null;
+  for (const segment of match[1].split(/[^a-z0-9]+/)) {
+    if (!CLAUDE_MODEL_ALIASES.has(segment)) continue;
+    if (found !== null && found !== segment) return null;
+    found = segment;
+  }
+  return found;
+}
+
+function resolveClaudeCatalogTarget(
+  value: string,
+  options?: readonly NativeModelOption[] | null,
+): string | null {
+  if (!options || options.length === 0) return null;
+  const lower = value.trim().toLowerCase();
+  const suffix = claudeContextSuffix(lower);
+  const withPreservedSuffix = (target: string): string =>
+    suffix !== null ? `${target.replace(CLAUDE_CONTEXT_SUFFIX_RE, "")}${suffix}` : target;
+  const findConcrete = (idLower: string): string | null => {
+    for (const option of options) {
+      if (option.id.trim().toLowerCase() !== idLower) continue;
+      const target = typeof option.model === "string" ? option.model.trim() : "";
+      if (!target) continue;
+      if (parseClaudeAlias(splitModelId(target).model) === null) return target;
+    }
+    return null;
+  };
+  const exact = findConcrete(lower);
+  if (exact !== null) return withPreservedSuffix(exact);
+  if (suffix !== null) {
+    const base = lower.slice(0, -suffix.length);
+    if (CLAUDE_MODEL_ALIASES.has(splitModelId(base).model)) {
+      const target = findConcrete(base);
+      if (target !== null) return withPreservedSuffix(target);
+    }
+  }
+  return null;
+}
+
+function hasClaudeCatalogModel(
+  value: string,
+  options?: readonly NativeModelOption[] | null,
+): boolean {
+  if (!options || options.length === 0) return false;
+  const target = splitModelId(value);
+  const targetModel = normalizeClaudeContext(target.model, true);
+  return options.some((option) => {
+    if (typeof option.model !== "string") return false;
+    const optionSplit = splitModelId(option.model);
+    return (
+      optionSplit.provider === target.provider &&
+      normalizeClaudeContext(optionSplit.model, true) === targetModel
+    );
+  });
+}
+
+function claudeModelsEquivalent(
+  left: string,
+  right: string,
+  options: readonly NativeModelOption[] | null | undefined,
+  allowContextOmission: boolean,
+): boolean {
+  if (left === right) return true;
+  const leftSplit = splitModelId(left);
+  const rightSplit = splitModelId(right);
+  const leftAlias = parseClaudeAlias(leftSplit.model);
+  const rightAlias = parseClaudeAlias(rightSplit.model);
+  // Keep context-suffix drops (e.g. opus[1m] -> opus) and family swaps visible between two aliases.
+  if (leftAlias !== null && rightAlias !== null) {
+    return (
+      leftSplit.provider === rightSplit.provider &&
+      leftSplit.model.toLowerCase() === rightSplit.model.toLowerCase()
+    );
+  }
+  const leftTarget = resolveClaudeCatalogTarget(left, options);
+  const rightTarget = resolveClaudeCatalogTarget(right, options);
+  const effectiveLeft = leftTarget ?? left;
+  const effectiveRight = rightTarget ?? right;
+  if (effectiveLeft === effectiveRight) return true;
+  const effLeftSplit = splitModelId(effectiveLeft);
+  const effRightSplit = splitModelId(effectiveRight);
+  if (effLeftSplit.provider !== effRightSplit.provider) return false;
+  const effLeftAlias = parseClaudeAlias(effLeftSplit.model);
+  const effRightAlias = parseClaudeAlias(effRightSplit.model);
+  if (effLeftAlias === null && effRightAlias === null) {
+    if (!claudeContextMatches(effLeftSplit.model, effRightSplit.model, allowContextOmission)) {
+      return false;
+    }
+    const leftComparable = claudeComparableId(effLeftSplit.model, true);
+    const rightComparable = claudeComparableId(effRightSplit.model, true);
+    if (leftComparable !== "" && leftComparable === rightComparable) return true;
+    const matchesPinnedCanonical = (pinnedModel: string, candidateModel: string): boolean => {
+      const candidate = normalizeClaudeContext(candidateModel, true);
+      return candidate.startsWith("claude-") && canonicalClaudeId(pinnedModel, true) === candidate;
+    };
+    const leftPinned = leftTarget !== null || hasClaudeCatalogModel(effectiveLeft, options);
+    const rightPinned = rightTarget !== null || hasClaudeCatalogModel(effectiveRight, options);
+    return (
+      (leftPinned && matchesPinnedCanonical(effLeftSplit.model, effRightSplit.model)) ||
+      (rightPinned && matchesPinnedCanonical(effRightSplit.model, effLeftSplit.model))
+    );
+  }
+  const aliasFamily = effLeftAlias ?? effRightAlias;
+  const concreteModel = effLeftAlias !== null ? effRightSplit.model : effLeftSplit.model;
+  if (aliasFamily === null || claudeConcreteFamily(concreteModel) !== aliasFamily) return false;
+  const leftSuffix = claudeContextSuffix(effLeftSplit.model);
+  const rightSuffix = claudeContextSuffix(effRightSplit.model);
+  if (allowContextOmission) {
+    return leftSuffix === null || rightSuffix === null || leftSuffix === rightSuffix;
+  }
+  return leftSuffix === null || leftSuffix === rightSuffix;
+}
+
 function codexModelsEquivalent(
   launched: string,
   running: string,
@@ -187,13 +366,32 @@ export function sessionHeaderModelState(
   const requested = trimOrNull(session?.requested);
   const launched = trimOrNull(session?.launched);
   const running = trimOrNull(session?.running);
-  const requestedDiffers = Boolean(requested && launched && requested !== launched);
+  const claudeHarness = isClaudeHarness(session?.harness);
+  const requestedDiffers = Boolean(
+    requested &&
+    launched &&
+    (claudeHarness
+      ? !claudeModelsEquivalent(requested, launched, session?.codexModelOptions, false)
+      : requested !== launched),
+  );
   let runningDiffers = false;
   if (launched && running) {
-    runningDiffers =
-      session?.harness === "codex-native" || session?.harness === "codex"
-        ? !codexModelsEquivalent(launched, running, session.codexModelOptions)
-        : running !== launched;
+    if (session?.harness === "codex-native" || session?.harness === "codex") {
+      runningDiffers = !codexModelsEquivalent(launched, running, session.codexModelOptions);
+    } else if (claudeHarness) {
+      runningDiffers = !claudeModelsEquivalent(launched, running, session?.codexModelOptions, true);
+      // Do not let an unresolved alias bridge hide a concrete requested -> running version change.
+      if (
+        !runningDiffers &&
+        !requestedDiffers &&
+        requested &&
+        !claudeModelsEquivalent(requested, running, session?.codexModelOptions, true)
+      ) {
+        runningDiffers = true;
+      }
+    } else {
+      runningDiffers = running !== launched;
+    }
   } else if (!launched && session?.harness === "antigravity-native" && requested && running) {
     runningDiffers = antigravityModelIdentity(requested) !== antigravityModelIdentity(running);
   }

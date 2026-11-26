@@ -71,6 +71,12 @@
   justify-content: center;
 }
 
+/* Right-hand status indicator group uses tighter 32x32 hit boxes so icons sit closer. */
+.phone-session-bar .phone-session-bar-indicators :is(button, a) {
+  min-width: 32px;
+  min-height: 32px;
+}
+
 .phone-session-bar :is(button, a)::after {
   display: none;
 }

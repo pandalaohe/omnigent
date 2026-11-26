@@ -70,10 +70,10 @@ export function StandingApprovalChip({
               type="button"
               aria-label={`Standing approval: ${summary}`}
               className={cn(
-                "flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "flex h-7 shrink-0 items-center rounded-full text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 appearance === "bar"
-                  ? "min-h-9 min-w-11 justify-center px-1.5"
-                  : "border border-border bg-background",
+                  ? "min-h-8 min-w-8 justify-center gap-0.5 px-1.5"
+                  : "gap-1 border border-border bg-background px-2",
               )}
             >
               <ShieldCheckIcon className="size-3.5" aria-hidden="true" />
