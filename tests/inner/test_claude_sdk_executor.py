@@ -9544,3 +9544,107 @@ async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch
         finally:
             await executor.close()
     assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
+
+
+@pytest.mark.asyncio
+async def test_claude_sdk_windows_connect_sets_no_window_on_anyio_open_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import anyio
+
+    from omnigent.inner import _proc, claude_sdk_executor
+
+    no_window = 0x08000000
+    new_group = 0x00000200
+    recorded: list[tuple[str, int]] = []
+
+    async def _fake_open_process(command: object, **kwargs: object) -> object:
+        recorded.append((str(command), int(kwargs.get("creationflags", 0))))
+        return SimpleNamespace(pid=12345, returncode=0)
+
+    monkeypatch.setattr(anyio, "open_process", _fake_open_process)
+
+    # POSIX leaves anyio.open_process untouched.
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    with claude_sdk_executor._windows_no_window_anyio_spawn():
+        assert anyio.open_process is _fake_open_process
+        await anyio.open_process(["claude", "-v"])
+    assert recorded == [("['claude', '-v']", 0)]
+    recorded.clear()
+
+    # Windows wraps only the active connect task (not detached tasks spawned
+    # during connect) and injects CREATE_NO_WINDOW only.
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    monkeypatch.setattr(stdlib_subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+
+    inside_entered = asyncio.Event()
+    release_inside = asyncio.Event()
+    detached_ready = asyncio.Event()
+    run_detached_spawn = asyncio.Event()
+    detached_tasks: list[asyncio.Task[None]] = []
+
+    async def _detached_callback() -> None:
+        detached_ready.set()
+        await run_detached_spawn.wait()
+        await anyio.open_process(["detached-callback"])
+
+    async def _connect_like_task() -> None:
+        with claude_sdk_executor._windows_no_window_anyio_spawn():
+            detached_tasks.append(asyncio.create_task(_detached_callback()))
+            inside_entered.set()
+            await anyio.open_process(["claude", "-v"])
+            await release_inside.wait()
+            await anyio.open_process(["claude", "--print"])
+
+    async def _unrelated_task() -> None:
+        await inside_entered.wait()
+        await anyio.open_process(["other-tool"])
+        release_inside.set()
+
+    await asyncio.gather(_connect_like_task(), _unrelated_task())
+    assert anyio.open_process is _fake_open_process
+    assert ("['claude', '-v']", no_window) in recorded
+    assert ("['claude', '--print']", no_window) in recorded
+    assert ("['other-tool']", 0) in recorded
+
+    # Detached task spawned during connect #1 must not inherit no-window flags
+    # even when it spawns while connect #2 is active.
+    await detached_ready.wait()
+    recorded.clear()
+    with claude_sdk_executor._windows_no_window_anyio_spawn():
+        run_detached_spawn.set()
+        await detached_tasks[0]
+        await anyio.open_process(["claude", "--second"])
+    assert anyio.open_process is _fake_open_process
+    assert ("['detached-callback']", 0) in recorded
+    assert ("['claude', '--second']", no_window) in recorded
+
+    # Failure during connect still restores anyio.open_process.
+    with pytest.raises(RuntimeError, match="boom"):
+        with claude_sdk_executor._windows_no_window_anyio_spawn():
+            raise RuntimeError("boom")
+    assert anyio.open_process is _fake_open_process
+
+    # _get_or_create_client wires the wrapper inside the wait_for connect task.
+    recorded.clear()
+
+    class _ConnectSpawningClient(_SDKClient):
+        async def connect(self) -> None:
+            await anyio.open_process(["claude", "--sdk"])
+
+    class _ConnectFakeSDK(_sdk_types()):
+        ClaudeSDKClient = _ConnectSpawningClient
+
+    executor = _default_executor()
+    options = _ConnectFakeSDK.ClaudeAgentOptions(env={})
+    try:
+        await executor._get_or_create_client(
+            _ConnectFakeSDK, session_key="win-no-window", options=options, model=None
+        )
+    finally:
+        await executor.close()
+    assert anyio.open_process is _fake_open_process
+    assert recorded == [("['claude', '--sdk']", no_window)]

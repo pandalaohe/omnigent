@@ -36,6 +36,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import (
     AsyncGenerator,
@@ -975,6 +976,67 @@ def _terminate_process_tree(process: _Process | None) -> None:
 
 def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
+
+
+_CLAUDE_NO_WINDOW_TASKS: set[asyncio.Task[Any]] = set()  # type: ignore[explicit-any]
+_ANYIO_OPEN_PROCESS_LOCK = threading.Lock()
+_ANYIO_OPEN_PROCESS_ORIG: Callable[..., Awaitable[Any]] | None = None  # type: ignore[explicit-any]
+_ANYIO_OPEN_PROCESS_DEPTH = 0
+
+
+@contextmanager
+def _windows_no_window_anyio_spawn() -> Iterator[None]:
+    """Ensure ``claude_agent_sdk`` subprocesses spawned by this task hide Windows consoles."""
+    flags = _proc.windows_no_window_flags()
+    if _proc.IS_POSIX or not flags:
+        yield
+        return
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if current_task is None:
+        yield
+        return
+    try:
+        import anyio
+    except ImportError:
+        yield
+        return
+
+    global _ANYIO_OPEN_PROCESS_DEPTH, _ANYIO_OPEN_PROCESS_ORIG
+
+    with _ANYIO_OPEN_PROCESS_LOCK:
+        if _ANYIO_OPEN_PROCESS_DEPTH == 0:
+            original_open_process = anyio.open_process
+            _ANYIO_OPEN_PROCESS_ORIG = original_open_process
+
+            async def _open_process_no_window(
+                *args: Any,
+                **kwargs: Any,  # type: ignore[explicit-any]
+            ) -> Any:  # type: ignore[explicit-any]
+                try:
+                    active_task = asyncio.current_task()
+                except RuntimeError:
+                    active_task = None
+                if active_task is not None and active_task in _CLAUDE_NO_WINDOW_TASKS:
+                    no_window = _proc.windows_no_window_flags()
+                    if no_window:
+                        kwargs["creationflags"] = int(kwargs.get("creationflags", 0)) | no_window
+                return await original_open_process(*args, **kwargs)
+
+            anyio.open_process = _open_process_no_window  # type: ignore[assignment]
+        _ANYIO_OPEN_PROCESS_DEPTH += 1
+        _CLAUDE_NO_WINDOW_TASKS.add(current_task)
+    try:
+        yield
+    finally:
+        with _ANYIO_OPEN_PROCESS_LOCK:
+            _CLAUDE_NO_WINDOW_TASKS.discard(current_task)
+            _ANYIO_OPEN_PROCESS_DEPTH -= 1
+            if _ANYIO_OPEN_PROCESS_DEPTH == 0 and _ANYIO_OPEN_PROCESS_ORIG is not None:
+                anyio.open_process = _ANYIO_OPEN_PROCESS_ORIG  # type: ignore[assignment]
+                _ANYIO_OPEN_PROCESS_ORIG = None
 
 
 @contextmanager
@@ -2528,7 +2590,12 @@ class ClaudeSDKExecutor(Executor):
                         env_stack.enter_context(
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
-                    await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+
+                    async def _connect_client() -> None:
+                        with _windows_no_window_anyio_spawn():
+                            await client.connect()
+
+                    await asyncio.wait_for(_connect_client(), timeout=_CONNECT_TIMEOUT_SECONDS)
                     connected = True
             except TimeoutError as exc:
                 self._resident_inventory_detached = True
