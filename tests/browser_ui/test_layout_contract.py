@@ -232,6 +232,68 @@ def test_settings_layout(
     browser_contract.json("/v1/mcp-registry/services", {"data": [], "next_cursor": None})
     browser_contract.json("/v1/policies", list_payload([]))
     browser_contract.json("/v1/policy-registry", list_payload([]))
+    if section == "agents":
+        browser_contract.json(
+            "/v1/agents",
+            list_payload(
+                [
+                    {
+                        "id": "agent-native",
+                        "name": "codex-native-ui",
+                        "harness": "codex-native",
+                        "product_of": "codex-native",
+                        "builtin": True,
+                    },
+                    {
+                        "id": "agent-sdk",
+                        "name": "codex-sdk",
+                        "harness": "codex",
+                        "product_of": "codex",
+                        "builtin": True,
+                    },
+                ]
+            ),
+        )
+        browser_contract.json(
+            "/v1/hosts",
+            {
+                "hosts": [
+                    {
+                        "host_id": "example-host",
+                        "name": "Example host",
+                        "owner": "example",
+                        "status": "online",
+                        "configured_harnesses": {"codex-native": True, "codex": True},
+                    }
+                ]
+            },
+        )
+        browser_contract.json(
+            "/v1/hosts/example-host/agent-settings/codex",
+            {
+                "family": "codex",
+                "root": "/opt/work/agent-home",
+                "choosable": False,
+                "exists": False,
+                "read_only_reason": None,
+                "revision": None,
+                "fields": [],
+                "account": None,
+            },
+        )
+        browser_contract.json(
+            "/v1/hosts/example-host/harnesses/codex/model-options", {"models": []}
+        )
+        browser_contract.json(
+            "/v1/hosts/example-host/harnesses/codex/startup", {"environment": None}
+        )
+        page.add_init_script("""
+            localStorage.setItem("omnigent:agent-badge-preferences", JSON.stringify({
+              version: 1,
+              enabled: true,
+              entries: {"agent-sdk": {label: "XS", borderColor: "#ca8a04", textColor: "theme"}},
+            }));
+        """)
     if section in {"browser", "cli", "updates"}:
         page.add_init_script(
             "window.omnigentDesktop = {kind: 'electron', browserOpenOrNavigate() {}}"
@@ -244,7 +306,67 @@ def test_settings_layout(
     main = page.get_by_role("main").filter(has=heading).last
     marker = _LONG_MEMBER if populated_members else ready_text
     expect(main.get_by_text(marker, exact=True)).to_be_visible(timeout=5_000)
+    if section == "agents":
+        table = main.get_by_role("table", name="Model defaults")
+        native = table.get_by_text("Codex", exact=True)
+        sdk = table.get_by_text("Codex SDK", exact=True)
+        sdk_row = table.get_by_role("row").filter(has=page.get_by_text("Codex SDK", exact=True))
+        native_row = table.get_by_role("row").filter(has=page.get_by_text("Codex", exact=True))
+        badge = sdk_row.get_by_test_id("agent-name-badge")
+        kind = sdk_row.get_by_test_id("agent-name-mark")
+        expect(badge).to_have_text("XS")
+        expect(kind).to_have_text("SDK")
+        expect(native_row.get_by_test_id("agent-name-mark")).to_have_count(0)
+        for target in (sdk, badge, kind, sdk_row.get_by_role("link", name="Codex SDK details")):
+            expect(target).to_be_in_viewport(ratio=1)
+        native_box, sdk_box = native.bounding_box(), sdk.bounding_box()
+        assert native_box is not None and sdk_box is not None
+        assert abs(native_box["x"] - sdk_box["x"]) < 1
     assert_layout(main, f"settings-{section}", Path(output_path))
+    if section == "agents":
+        main.get_by_role("link", name="Codex SDK details").click()
+        edit_badge = page.get_by_role("button", name="Edit badge for Codex SDK")
+        expect(edit_badge).to_be_visible(timeout=5_000)
+        edit_badge.click()
+        dialog = page.get_by_role("dialog")
+        expect(dialog.get_by_test_id("agent-badge-editor")).to_be_visible(timeout=5_000)
+        if width < 768:
+            trigger = dialog.get_by_test_id("agent-badge-color-trigger")
+            expect(trigger).to_be_visible()
+            assert_layout(dialog, "settings-agents-badge-editor", Path(output_path))
+            trigger.click()
+            sheet = page.get_by_role("dialog", name="Badge color")
+            expect(sheet).to_be_visible(timeout=5_000)
+            palette_root = sheet
+            min_swatch_width = 34
+        else:
+            palette_root = dialog
+            min_swatch_width = 24
+        swatches = palette_root.get_by_role("group", name="Badge color").get_by_role("button")
+        expect(swatches).to_have_count(40)
+        geometry = swatches.evaluate_all(
+            """buttons => {
+                const boxes = buttons.map(button => button.getBoundingClientRect());
+                const cols = new Set(boxes.map(box => Math.round(box.x)));
+                const rows = new Set(boxes.map(box => Math.round(box.y)));
+                const minWidth = Math.min(...boxes.map(box => box.width));
+                return { cols: cols.size, rows: rows.size, minWidth };
+            }"""
+        )
+        assert geometry["cols"] == 8 and geometry["rows"] == 5
+        assert geometry["minWidth"] >= min_swatch_width
+        expect(palette_root.get_by_test_id("agent-badge-color-spectrum")).to_be_in_viewport(
+            ratio=1
+        )
+        expect(palette_root.get_by_test_id("agent-badge-color-hue")).to_be_in_viewport(ratio=1)
+        expect(palette_root.get_by_label("Outline color hex")).to_be_in_viewport(ratio=1)
+        assert_layout(
+            palette_root,
+            "settings-agents-badge-palette-sheet"
+            if width < 768
+            else "settings-agents-badge-editor",
+            Path(output_path),
+        )
     if populated_members:
         expect(main.get_by_role("button", name="Remove user")).to_be_in_viewport(
             ratio=1, timeout=2_000

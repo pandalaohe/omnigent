@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
-import { AgentNameTag } from "./AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "./AgentNameTag";
 
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
@@ -33,6 +33,23 @@ describe("AgentNameTag", () => {
     render(<AgentNameTag agentId="agent-a" name="Research" harness="claude-sdk" />);
     expect(screen.queryByTestId("agent-name-badge")).toBeNull();
     expect(screen.getByTestId("agent-name-mark")).toHaveTextContent("SDK");
+  });
+
+  it.each([
+    { harness: "pi", integrationMode: "cli-subprocess", kind: "RPC" },
+    { harness: "example-acp", integrationMode: "acp-subprocess", kind: "ACP" },
+  ])("keeps the $kind tag alongside a configured badge", ({ harness, integrationMode, kind }) => {
+    writeAgentBadgePreferences(preferences);
+    render(
+      <AgentNameTag
+        agentId="agent-a"
+        name="Agent"
+        harness={harness}
+        kindTag={nonNativeAgentKind(harness, integrationMode)}
+      />,
+    );
+    expect(screen.getByTestId("agent-name-mark")).toHaveTextContent(kind);
+    expect(screen.getByTestId("agent-name-badge")).toHaveStyle({ borderColor: "#8b5cf6" });
   });
 
   it.each([

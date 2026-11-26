@@ -1,12 +1,12 @@
 import { useState, type ReactElement, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
 import { ClaudeFastModeHelp } from "@/components/SessionDefaultModeSelect";
 import { ArrowRightIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
-import { LayeredOwn, LayeredTable } from "@/components/LayeredTable";
+import { LayeredOwn, LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
@@ -40,7 +40,7 @@ import type { CallingDefaultsCatalogRow } from "@/lib/callingDefaultsApi";
 import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   agentPresentOnHost,
-  agentProductHarness,
+  agentSettingsHost,
   agentSettingsPath,
   groupAgentHarnesses,
 } from "@/lib/agentSettings";
@@ -112,7 +112,8 @@ export interface AgentDefaultsTableProps {
   field?: AgentField;
   harnesses?: readonly string[];
   names?: Readonly<Record<string, string>>;
-  agentIds?: Readonly<Record<string, string>>;
+  detailRows?: LayeredTableProps["detailRows"];
+  agentIds?: Readonly<Record<string, string | undefined>>;
   linkToDetails?: boolean;
   visibleHostId?: string;
   onChange: (table: CallingDefaultsTable) => void;
@@ -343,6 +344,7 @@ export function AgentDefaultsTable({
   field: fixedField,
   harnesses: suppliedHarnesses,
   names,
+  detailRows,
   agentIds,
   linkToDetails = false,
   visibleHostId,
@@ -423,9 +425,6 @@ export function AgentDefaultsTable({
   const resolve = (row: string, col: string) =>
     resolveAgentMasterField(master, col, row, field, capabilities, layerOptions(col));
   const label = (row: string) => names?.[row] ?? callingHarnessLabel(row, capabilities);
-  const dependent = (row: string) =>
-    agentProductHarness(row, capabilities) !== row &&
-    harnesses.includes(agentProductHarness(row, capabilities));
   const hostLabel = (col: string) =>
     hostList.find((candidate) => candidate.host_id === col)?.name || col;
   const sourceLabel = (source: LayeredLevel | null) =>
@@ -661,39 +660,44 @@ export function AgentDefaultsTable({
           field === "permission" &&
           COLUMN_CONCEPTS.some((concept) => concept === master["*"]?.["*"]?.permission)
         }
-        rows={harnesses.map((row) => ({
-          id: row,
-          label: label(row),
-          content: (
-            <span className={dependent(row) ? "pl-4" : undefined}>
-              <AgentNameTag
-                agentId={agentIds?.[row] ?? null}
-                name={label(row)}
-                harness={row}
-                markOnly={dependent(row)}
-              />
-              {dependent(row) && <span className="sr-only">{label(row)}</span>}
-            </span>
-          ),
-          action: linkToDetails ? (
-            <Link
-              to={agentSettingsPath(row, visibleHostId)}
-              aria-label={`${label(row)} details`}
-              className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              componentId="settings.agents.detail"
-            >
-              <ArrowRightIcon className="size-4" aria-hidden />
-            </Link>
-          ) : undefined,
-          detail: master["*"]?.[row]?.[field]
-            ? displayValue(master["*"][row][field], row)
-            : undefined,
-          mark:
-            master["*"]?.[row]?.[field] !== undefined &&
-            layerOptions().canHold(row, field, master["*"][row][field]) &&
-            layerOptions().normalize(row, field, master["*"][row][field]) !==
-              inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
-        }))}
+        rows={harnesses.map((row) => {
+          const kind = nonNativeAgentKind(row, capabilities?.[row]?.integration_mode);
+          return {
+            id: row,
+            label: label(row),
+            content: (
+              <span className="block whitespace-normal">
+                <AgentNameTag
+                  agentId={agentIds?.[row] ?? null}
+                  name={label(row)}
+                  harness={row}
+                  kindTag={kind}
+                  className="max-w-full"
+                />
+              </span>
+            ),
+            action: linkToDetails ? (
+              <Link
+                to={agentSettingsPath(row, agentSettingsHost(row, hostList, visibleHostId))}
+                aria-label={`${label(row)} details`}
+                aria-description={kind ?? undefined}
+                className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                componentId="settings.agents.detail"
+              >
+                <ArrowRightIcon className="size-4" aria-hidden />
+              </Link>
+            ) : undefined,
+            detail: master["*"]?.[row]?.[field]
+              ? displayValue(master["*"][row][field], row)
+              : undefined,
+            mark:
+              master["*"]?.[row]?.[field] !== undefined &&
+              layerOptions().canHold(row, field, master["*"][row][field]) &&
+              layerOptions().normalize(row, field, master["*"][row][field]) !==
+                inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
+          };
+        })}
+        detailRows={detailRows}
         columns={hostList
           .filter((host) => !visibleHostId || host.host_id === visibleHostId)
           .map((host) => ({

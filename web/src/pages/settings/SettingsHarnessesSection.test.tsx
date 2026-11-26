@@ -18,7 +18,7 @@ import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 import type { RegistryItem } from "@/hooks/useAgentRegistry";
 import { AgentDefaultsTable } from "@/components/AgentDefaultsTable";
-import { readAgentBadgePreferences } from "@/lib/agentBadgePreferences";
+import { readAgentBadgePreferences, writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 
 vi.mock("@/components/CallingDefaultsSection", () => ({
   CallingDefaultsSection: () => <div data-testid="calling-defaults-section">Master defaults</div>,
@@ -237,14 +237,12 @@ vi.mock("./HarnessFixDialog", () => ({
   },
 }));
 
-function renderHarnesses(harness?: string, search = "") {
+function renderHarnesses(harness?: string, search = "", base = "/settings/harnesses") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter
-          initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}${search}`]}
-        >
+        <MemoryRouter initialEntries={[`${base}${harness ? `/${harness}` : ""}${search}`]}>
           <SettingsHarnessesSection />
         </MemoryRouter>
       </TooltipProvider>
@@ -383,7 +381,16 @@ describe("Agent setup list", () => {
 });
 
 describe("Harness details", () => {
+  it("opens a host-reported harness before a matching catalog record exists", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "acp:example": true } }];
+    renderHarnesses("acp%3Aexample", "", "/settings/agents");
+    expect(screen.getByRole("heading", { name: "ACP · example" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Edit badge for ACP · example" })).toBeNull();
+  });
+
   it("opens the SDK identity from its dependent row and saves its badge independently", async () => {
+    const savedBadge = { label: "S", borderColor: "#025677", textColor: "#eeeeee" };
+    writeAgentBadgePreferences({ version: 1, enabled: true, entries: { ag_sdk: savedBadge } });
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": true, codex: true } }];
     const product = (harness: string, label: string): RegistryItem => ({
       key: `harness:${harness}`,
@@ -428,13 +435,22 @@ describe("Harness details", () => {
     );
     fireEvent.click(screen.getByRole("link", { name: "Codex SDK details" }));
     fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
-    fireEvent.click(await screen.findByRole("switch", { name: "Show badge" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Badge text" }), {
-      target: { value: "S" },
-    });
+    expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#025677" });
+    fireEvent.click(screen.getByRole("button", { name: "Dark Pink outline" }));
+    expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#db2777" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(readAgentBadgePreferences().entries.ag_sdk).toEqual(savedBadge);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
+    expect(screen.getByTestId("agent-badge-preview")).toHaveStyle({ borderColor: "#025677" });
+    fireEvent.click(screen.getByRole("button", { name: "Dark Pink outline" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(readAgentBadgePreferences().entries.ag_sdk?.label).toBe("S");
+    expect(readAgentBadgePreferences().entries.ag_sdk).toEqual({
+      ...savedBadge,
+      borderColor: "#db2777",
+    });
+    expect(screen.getByTestId("agent-name-badge")).toHaveStyle({ borderColor: "#db2777" });
     expect(readAgentBadgePreferences().entries.ag_native).toBeUndefined();
   });
 

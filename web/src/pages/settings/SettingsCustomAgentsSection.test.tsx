@@ -8,6 +8,8 @@ import { buildAgentBundle } from "@/lib/agentBundle";
 import type { AgentConfig } from "@/lib/agentsApi";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
 import { expectSettingsPages } from "@/test/settingsPaging";
+import { readAgentBadgePreferences } from "@/lib/agentBadgePreferences";
+import type * as AgentsSettingsModule from "@/components/AgentsSettings";
 
 const flags = vi.hoisted(() => ({
   feature: true,
@@ -40,7 +42,8 @@ vi.mock("@/lib/agentLabels", () => ({
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/agentBundle", () => ({ buildAgentBundle: vi.fn() }));
-vi.mock("@/components/AgentsSettings", () => ({
+vi.mock("@/components/AgentsSettings", async (original) => ({
+  ...(await original<typeof AgentsSettingsModule>()),
   AgentsSettings: ({
     renderInstalled,
   }: {
@@ -83,13 +86,13 @@ let failSave: boolean;
 let failDelete: boolean;
 let inUse: boolean;
 
-function mount(path = "/settings/custom-agents") {
+function mount(path = "/settings/custom-agents", state?: { fromAgentsTable: boolean }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[path]}>
+      <MemoryRouter initialEntries={[{ pathname: path, state }]}>
         <SettingsCustomAgentsSection />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -155,10 +158,27 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
 describe("Custom agents settings", () => {
+  it("edits an installed agent's badge from its configuration page", async () => {
+    mount("/settings/agents/custom/a1", { fromAgentsTable: true });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit badge for research" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show badge" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Badge text" }), {
+      target: { value: "R" },
+    });
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(readAgentBadgePreferences().entries.a1?.label).toBe("R");
+    expect(readAgentBadgePreferences().entries.a2).toBeUndefined();
+    expect(await screen.findByLabelText("Instructions")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
+  });
+
   it("rebuilds server-agent paging after a deleted cursor returns an empty terminal page", async () => {
     let cursorDeleted = false;
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {

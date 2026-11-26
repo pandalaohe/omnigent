@@ -16,11 +16,16 @@ import { AgentPromptCard } from "@/components/AgentContextTable";
 import { useAgentRegistry } from "@/hooks/useAgentRegistry";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
-import { agentPresentOnHost, agentSettingsPath } from "@/lib/agentSettings";
+import {
+  agentPresentOnHost,
+  agentSettingsHarnessLabel,
+  agentSettingsPath,
+  harnessSettingsBadgeId,
+} from "@/lib/agentSettings";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Switch } from "@/components/ui/switch";
 import { Segmented } from "@/components/ui/segmented";
-import { callingDefaultParent } from "@/lib/callingDefaults";
+import { callingDefaultHarnesses, callingDefaultParent } from "@/lib/callingDefaults";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -186,23 +191,29 @@ export const SettingsHarnessesSection = () => {
     (entry) => !sortedHosts.some((host) => agentPresentOnHost(entry.harness, host)),
   );
 
-  const registered = registry.items.find((item) => item.key === `harness:${harness}`);
+  const registered = registry.items.find(
+    (item) => item.key === `harness:${harness}` || item.aliasKeys?.includes(`harness:${harness}`),
+  );
+  const knownHarness =
+    harness &&
+    (registered ||
+      Object.hasOwn(capabilities, harness) ||
+      callingDefaultHarnesses(capabilities).includes(harness) ||
+      sortedHosts.some((host) => Object.hasOwn(host.configured_harnesses ?? {}, harness)));
   const detailEntry =
     HARNESS_ENTRIES.find((entry) => entry.harness === harness) ??
-    (registered?.harness
+    (knownHarness
       ? {
-          harness: registered.harness,
-          name: registered.label,
-          description: registered.description ?? "",
-          agentName: registered.name ?? registered.harness,
+          harness,
+          name: agentSettingsHarnessLabel(harness, capabilities, registered?.label),
+          description: registered?.description ?? "",
+          agentName: registered?.name ?? harness,
         }
       : undefined);
   const detail = detailEntry
     ? {
         ...detailEntry,
-        agentId: Object.entries(registry.legacyProducts).find(
-          ([, item]) => item.harness === detailEntry.harness,
-        )?.[0],
+        agentId: harnessSettingsBadgeId(detailEntry.harness, registry.legacyProducts),
       }
     : undefined;
 
