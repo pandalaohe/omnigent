@@ -179,6 +179,7 @@ _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
 
 _AGY_ACP_COMMAND_FIELDS = {
     "CommandLine": str,
+    "Cwd": str,
     "WaitMsBeforeAsync": int,
     "NotificationTimeoutSeconds": int,
     "toolSummary": str,
@@ -215,6 +216,10 @@ _AGY_ACP_READ_PATH_CONFLICT_FIELDS = _AGY_ACP_READ_CONFLICT_FIELDS - {"Path"}
 
 _AGY_READ_FILE_MAX_BYTES = 64 * 1024
 _AGY_READ_FILE_MAX_SCAN_BYTES = 2 * 1024 * 1024
+_AGY_MISSING_READ_BODY = (
+    "Antigravity did not return file contents, and Omnigent could not recover them "
+    "from the authorized workspace."
+)
 _AGY_QUESTION_TEXT_LIMIT = 8_000
 _AGY_QUESTION_LABEL_LIMIT = 512
 _AGY_TOOL_NAME_MAP: Mapping[str, str] = {
@@ -548,11 +553,15 @@ class _AgyBackgroundWork:
                     self._denied_tools.discard(key)
                 else:
                     return
-            if kind == _UPDATE_TOOL_CALL:
-                effective = status if isinstance(status, str) else "pending"
-                self._set(sid, f"tool:{call_id}", effective not in _INACTIVE_TOOL_STATUSES)
-            elif isinstance(status, str):
-                self._set(sid, f"tool:{call_id}", status not in _INACTIVE_TOOL_STATUSES)
+            if kind == _UPDATE_TOOL_CALL or isinstance(status, str):
+                # A call waiting for approval is not running in the background.
+                self._set(
+                    sid,
+                    f"tool:{call_id}",
+                    isinstance(status, str)
+                    and status != "pending"
+                    and status not in _INACTIVE_TOOL_STATUSES,
+                )
 
     def drop_tool(self, session_id: object, call_id: str) -> None:
         """Remove a tool call that was denied or cancelled before running."""
@@ -819,6 +828,21 @@ def _normalize_agy_tool_output(update: _AcpJsonObject, *, is_shell: bool) -> Any
             cleaned["imagePath"] = _normalize_agy_path(cleaned["imagePath"])
         return cleaned
     return raw_output
+
+
+def _agy_read_body_missing(result: object) -> bool:
+    if result in (None, "", [], {}):
+        return True
+    if not isinstance(result, list):
+        return False
+    return all(
+        isinstance(block, dict)
+        and block.get("type") == "content"
+        and isinstance(content := block.get("content"), dict)
+        and content.get("type") == "text"
+        and content.get("text") == ""
+        for block in result
+    )
 
 
 def _is_agy_file_read(raw_name: str, kind: object, raw_input: _AcpJsonObject) -> bool:
@@ -1759,7 +1783,7 @@ class AcpExecutor(Executor):
                             task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await task
-            if req_task.done():
+            if req_task.done() and not req_task.cancelled():
                 await req_task
                 return True
             req_task.cancel()
@@ -3229,7 +3253,15 @@ class AcpExecutor(Executor):
                 if isinstance(reject_id, str) and reject_id and reject_id != grant.get("optionId"):
                     labeled = [("Allow once", grant), ("Reject", reject)]
         if choice_handler is not None and labeled is not None:
-            allow_once = next((name for name, o in labeled if o.get("kind") == "allow_once"), None)
+            once_id = self._allow_once_id(params)
+            allow_once = next(
+                (
+                    name
+                    for name, option in labeled
+                    if once_id and option.get("optionId") == once_id
+                ),
+                None,
+            )
             chosen = await choice_handler(
                 tool_name, tool_input, [name for name, _ in labeled], allow_once, policy_ask
             )
@@ -3568,12 +3600,14 @@ class AcpExecutor(Executor):
 
     def _allow_once_id(self, params: _AcpJsonObject) -> str | None:
         options = self._permission_options(params)
-        for option in options:
-            option_id = option.get("optionId")
+        grants = [
+            option.get("optionId") for option in options if option.get("kind") == "allow_once"
+        ]
+        if len(grants) == 1:
+            option_id = grants[0]
             if (
-                option.get("kind") == "allow_once"
-                and isinstance(option_id, str)
-                and option_id
+                isinstance(option_id, str)
+                and option_id.strip()
                 and sum(row.get("optionId") == option_id for row in options) == 1
             ):
                 return option_id
@@ -3991,12 +4025,7 @@ class AcpExecutor(Executor):
                         else raw_fallback_name
                     )
                     result = _normalize_agy_tool_output(update, is_shell=(name == "shell"))
-                    if (
-                        status == _TOOL_STATUS_COMPLETED
-                        and result in (None, "", [], {})
-                        and not (self._os_env is not None and self._os_env.fork)
-                        and call_id not in self._denied_permission_calls
-                    ):
+                    if _agy_read_body_missing(result):
                         if authorized_read is not None:
                             backfill_tool, backfill_args = authorized_read
                             backfill_locations: object = None
@@ -4010,7 +4039,14 @@ class AcpExecutor(Executor):
                                 backfill_tool, raw_meta.get("kind"), backfill_args
                             )
                         if eligible:
-                            if self._policy_evaluator is None:
+                            result = _AGY_MISSING_READ_BODY
+                            may_backfill = (
+                                status == _TOOL_STATUS_COMPLETED
+                                and not (self._os_env is not None and self._os_env.fork)
+                                and call_id not in self._denied_permission_calls
+                            )
+                            status = _TOOL_STATUS_FAILED
+                            if may_backfill and self._policy_evaluator is None:
                                 active_prompt_id = (
                                     self._active_turn_prompt_id
                                     if turn_prompt_id is _UNSET_PROMPT_ID
@@ -4043,7 +4079,8 @@ class AcpExecutor(Executor):
                                     )
                                     if backfilled is not None:
                                         result = backfilled
-                            else:
+                                        status = _TOOL_STATUS_COMPLETED
+                            elif may_backfill:
                                 self._pending_read_backfills[call_id] = (
                                     backfill_tool,
                                     backfill_args,
@@ -4359,7 +4396,7 @@ class AcpExecutor(Executor):
             if backfilled is not None:
                 events[idx] = ToolCallComplete(
                     name=event.name,
-                    status=event.status,
+                    status=ToolCallStatus.SUCCESS,
                     result=backfilled,
                     metadata=event.metadata,
                 )
@@ -5118,6 +5155,7 @@ class AcpExecutor(Executor):
         self._post_prompt_wait_active = False
         self._post_prompt_deadline = None
         self._reader_agy_bg_work = reader_bg_work
+        permission_requests: dict[asyncio.Task[bool], _AcpJsonObject] = {}
 
         try:
             await self._send(
@@ -5301,7 +5339,10 @@ class AcpExecutor(Executor):
                             else deadline
                         )
                         remaining = effective_deadline - now
-                        if remaining <= 0:
+                        if permission_requests:
+                            # A pending card pauses the prompt idle clock.
+                            remaining = max(remaining, self._poll_interval_s)
+                        elif remaining <= 0:
                             self._active_prompt_request_id = None
                             self._turn_prompt_id = None
                             yield ExecutorError(
@@ -5328,8 +5369,17 @@ class AcpExecutor(Executor):
 
                 method = notification.get("method", "")
                 params = notification.get("params", {})
+                completed_request: _AcpJsonObject | None = None
+                permission_task = notification.get("_omnigent_permission_done")
 
-                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(params, dict):
+                if (
+                    isinstance(permission_task, asyncio.Task)
+                    and permission_task in permission_requests
+                ):
+                    finished_request = permission_requests.pop(permission_task)
+                    if permission_task.result():
+                        completed_request = finished_request
+                elif method == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(params, dict):
                     update = params.get("update", {})
                     if isinstance(update, dict):
                         notif_session_id = params.get("sessionId")
@@ -5419,19 +5469,40 @@ class AcpExecutor(Executor):
                 elif notification.get("id") is not None and notification.get("method"):
                     # Server-initiated request (session/request_permission / fs/*):
                     # routes through policy + elicitation, bounded by turn lifetime.
-                    completed = await self._run_bounded_agent_request(
+                    request = self._run_bounded_agent_request(
                         notification,
                         deadline=bg_deadline,
                         cancel_event=cancel_event,
                         prompt_fut=fut,
                         phase2=prompt_result is not None,
                     )
-                    if not completed:
+                    if (
+                        is_agy
+                        and method == _AGENT_REQUEST_REQUEST_PERMISSION
+                        and isinstance(params, dict)
+                        and params.get("sessionId") == session_id
+                        and not self._is_agy_interaction_shaped(params)
+                    ):
+                        permission_task = asyncio.create_task(request)
+                        permission_requests[permission_task] = notification
+                        permission_task.add_done_callback(
+                            lambda done: self._queue.put_nowait(
+                                {"_omnigent_permission_done": done}
+                            )
+                        )
+                    elif await request:
+                        completed_request = notification
+                    else:
                         continue
+
+                if completed_request is not None:
                     now = self._now()
                     if self._denied_turn_tools:
+                        request_params = completed_request.get("params")
                         req_session_id = (
-                            params.get("sessionId") if isinstance(params, dict) else None
+                            request_params.get("sessionId")
+                            if isinstance(request_params, dict)
+                            else None
                         )
                         for denied_id in self._denied_turn_tools:
                             running_tool_deadlines.pop(denied_id, None)
@@ -5463,6 +5534,9 @@ class AcpExecutor(Executor):
                 )
             yield TurnComplete(response="".join(accumulated_text), usage=usage)
         finally:
+            if permission_requests:
+                cancel_event.set()
+                await asyncio.gather(*permission_requests, return_exceptions=True)
             if self._active_prompt_request_id == req_id and self._cancel_grace_deadline is None:
                 self._active_prompt_request_id = None
             if self._turn_prompt_id == req_id:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from omnigent import _platform
 from omnigent.permission_tiers import (
     NativeCallBinding,
     NativeInputSnapshot,
@@ -18,6 +19,7 @@ from omnigent.permission_tiers import (
     PermissionTier,
     TierDecision,
     Verdict,
+    is_powershell_version_query,
     load_rules,
 )
 from omnigent.permission_tiers.host import (
@@ -759,9 +761,14 @@ class PermissionTierRuntime:
         if decision.action == Verdict.ALLOW and name == "run_command":
             from omnigent.server.child_approvals import floor
 
+            command = arguments.get("CommandLine")
             if (
-                floor({"phase": "acp_permission", "command": arguments.get("CommandLine")})
-                == "user_only"
+                not (
+                    _platform.IS_WINDOWS
+                    and isinstance(command, str)
+                    and is_powershell_version_query(command)
+                )
+                and floor({"phase": "acp_permission", "command": command}) == "user_only"
             ):
                 return TierDecision(Verdict.ASK, "Command requires user approval"), tier
         return decision, tier

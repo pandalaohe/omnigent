@@ -236,6 +236,30 @@ def test_acp_host_permission_uses_shared_deny_rules(tmp_path, tier, name, argume
     )
 
 
+@pytest.mark.parametrize(
+    ("windows", "command", "expected"),
+    [
+        (True, "$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW),
+        (False, "$PSVersionTable.PSVersion.ToString()", Verdict.ASK),
+        (True, "$PSVersionTable.PSVersion.ToString(); Remove-Item report.txt", Verdict.ASK),
+    ],
+)
+def test_acp_host_floor_exempts_only_the_windows_version_query(
+    tmp_path, monkeypatch, windows, command, expected
+):
+    from omnigent import _platform
+    from omnigent.permission_tiers import TierDecision
+
+    runtime = _runtime(tmp_path, "auto")
+    runtime._harnesses["session-a"] = "acp"
+    monkeypatch.setattr(_platform, "IS_WINDOWS", windows)
+    monkeypatch.setattr(
+        runtime, "_evaluate", lambda *_args, **_kwargs: TierDecision(Verdict.ALLOW)
+    )
+    call = {"call_id": "tool-1", "name": "run_command", "arguments": {"CommandLine": command}}
+    assert runtime.evaluate_acp_call_decision("session-a", call)[0].action == expected
+
+
 def test_acp_host_permission_decision_carries_rule_and_mode_metadata(tmp_path):
     from omnigent.permission_tiers import format_tier_denial
 

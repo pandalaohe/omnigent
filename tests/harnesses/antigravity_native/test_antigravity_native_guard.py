@@ -73,6 +73,14 @@ def assert_pre_tool_reply(result):
         ("ask", "unknown_tool", {}, "force_ask"),
         ("auto", "unknown_tool", {}, "force_ask"),
         ("plan", "unknown_tool", {}, "deny"),
+        ("auto", "update_steps", {"steps": []}, "ask"),
+        ("plan", "update_steps", {"steps": []}, "ask"),
+        (
+            "auto",
+            "call_mcp_tool",
+            {"ServerName": "other", "ToolName": "update_steps", "Arguments": {}},
+            "deny",
+        ),
         ("auto", "run_command", {}, "deny"),
     ],
 )

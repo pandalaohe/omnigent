@@ -1218,7 +1218,7 @@ class ExecutorAdapter(HarnessApp):
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
         params = self._permission_card(tool_name, tool_input, phase=phase)
         result = await ctx.elicit(elicitation_id, params)
-        if result.action == "decline":
+        if result.action == "decline" and self._startup_source != "acp":
             # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
             ctx.cancelled.set()
         return result.action == "accept"
@@ -1320,7 +1320,7 @@ class ExecutorAdapter(HarnessApp):
             params = params.model_copy(update={"acp_allow_once": allow_once})
         result = await ctx.elicit(elicitation_id, params)
         if result.action != "accept":
-            if result.action == "decline":
+            if result.action == "decline" and self._startup_source != "acp":
                 ctx.cancelled.set()
             return None
         answer = (result.content or {}).get("answer")

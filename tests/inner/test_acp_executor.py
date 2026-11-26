@@ -31,6 +31,7 @@ from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import (
+    _AGY_MISSING_READ_BODY,
     AcpAgentConfig,
     AcpExecutor,
     _is_auth_required_error,
@@ -1324,7 +1325,7 @@ async def test_managed_policy_denial_does_not_select_a_user_reject_option() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["unbound", "no-once", "once", "opencode"])
+@pytest.mark.parametrize("scenario", ["unbound", "no-once", "ambiguous-once", "once", "opencode"])
 async def test_managed_agy_permission_logs_windows_auto_decision(
     scenario: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1363,8 +1364,10 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
     options = [{"kind": "allow_always", "optionId": "persistent"}]
     if scenario != "no-once":
         options.append({"kind": "allow_once", "optionId": "once"})
+    if scenario == "ambiguous-once":
+        options.append({"kind": "allow_once", "optionId": "another"})
     request_call: dict[str, object] = {"toolCallId": "shell-1"}
-    if scenario in ("no-once", "once"):
+    if scenario in ("no-once", "ambiguous-once", "once"):
         request_call["rawInput"] = {"CommandLine": command}
     with caplog.at_level(logging.INFO, logger=acp_executor_module.__name__):
         await ex._respond_to_agent_request(
@@ -1382,7 +1385,7 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
     sent = ex._send.await_args
     assert sent is not None
     reply = sent.args[0]
-    if scenario in ("unbound", "no-once"):
+    if scenario in ("unbound", "no-once", "ambiguous-once"):
         assert reply["error"]["code"] == -32000
     else:
         assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
@@ -1410,7 +1413,8 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
                 "once_offer=valid option=allow_once"
             ),
         }
-        assert logs == [f"acp agy permission decision: {fields[scenario]}"]
+        key = "no-once" if scenario == "ambiguous-once" else scenario
+        assert logs == [f"acp agy permission decision: {fields[key]}"]
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1423,8 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
     [
         ("command", None, "run_command", "allow"),
         ("command", "other", "run_command", "allow"),
+        ("cwd", "execute", "run_command", "allow"),
+        ("script", "execute", "run_command", "ask"),
         ("protected-write", "other", "write_to_file", "deny"),
         ("workspace-write", "edit", "write_to_file", "allow"),
         ("unknown", "other", "unknown", "ask"),
@@ -1445,6 +1451,8 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     write_args = {"Path": path, "Content": "fixture\n", "Overwrite": True}
     title, arguments = {
         "command": (command, command_args),
+        "cwd": (command, {**command_args, "Cwd": r"C:\work\project"}),
+        "script": (command, {"CommandLine": "$a = Get-Location\nWrite-Output $a"}),
         "protected-write": (f"File {path}", write_args),
         "workspace-write": ("File tmp/fixture.txt", write_args),
         "unknown": (command, {"toolSummary": "Show the installed version"}),
@@ -1769,7 +1777,7 @@ async def test_managed_agy_permission_rejects_mixed_shapes(
         (None, {"CommandLine": "omni --version", "RequestedTerminalID": False}),
         (None, {"CommandLine": "omni --version", "IsDaemon": 0}),
         (None, {"CommandLine": "omni --version", "NotificationTimeoutSeconds": False}),
-        ("execute", {"CommandLine": "omni --version", "Cwd": r"C:\work\project"}),
+        ("execute", {"CommandLine": "omni --version", "Cwd": True}),
         ("edit", {"TargetFile": False, "Content": "abc"}),
         (None, {"Path": 1, "Content": "abc"}),
         ("edit", {"TargetFile": "note.txt", "Content": []}),
@@ -1787,7 +1795,7 @@ async def test_managed_agy_permission_rejects_mixed_shapes(
         "boolean-terminal-id",
         "number-daemon",
         "boolean-notification-timeout",
-        "unrecognized-command-key",
+        "boolean-cwd",
         "boolean-target-file",
         "number-path",
         "list-content",
@@ -4785,7 +4793,7 @@ def test_agy_acp_read_file_honors_line_range_and_byte_offset(tmp_path: Path) -> 
             {"sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "completed"}
         )
         assert isinstance(bad_done[0], ToolCallComplete)
-        assert bad_done[0].result is None
+        assert bad_done[0].result == _AGY_MISSING_READ_BODY
 
 
 def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
@@ -4839,16 +4847,22 @@ def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
     # Agent-provided content is preserved untouched.
     agent_content = [{"type": "content", "content": {"type": "text", "text": "FROM_AGENT"}}]
     assert _run_read(ex, "c_agent", str(inside), content=agent_content).result == agent_content
+    empty_block = [{"type": "content", "content": {"type": "text", "text": ""}}]
+    empty_file = workspace / "empty.txt"
+    empty_file.touch()
+    empty_done = _run_read(ex, "c_empty", str(empty_file))
+    assert empty_done.status == ToolCallStatus.SUCCESS and empty_done.result == ""
     # Failed read does not backfill.
-    assert _run_read(ex, "c_fail", str(inside), status="failed").result is None
+    assert _run_read(ex, "c_fail", str(inside), status="failed").result == _AGY_MISSING_READ_BODY
     # Outside workspace and symlink escape are refused.
-    assert _run_read(ex, "c_out", str(outside)).result is None
-    assert _run_read(ex, "c_sym", str(escape_link)).result is None
-    # Binary file returns None.
-    assert _run_read(ex, "c_bin", str(binary)).result is None
+    outside_done = _run_read(ex, "c_out", str(outside), content=empty_block)
+    assert outside_done.status == ToolCallStatus.ERROR
+    assert outside_done.result == _AGY_MISSING_READ_BODY
+    assert _run_read(ex, "c_sym", str(escape_link)).result == _AGY_MISSING_READ_BODY
+    assert _run_read(ex, "c_bin", str(binary)).result == _AGY_MISSING_READ_BODY
     # Embedded NUL and malformed file:// URI fail closed cleanly (never raise ValueError).
-    assert _run_read(ex, "c_nul", str(inside) + "\x00.txt").result is None
-    assert _run_read(ex, "c_bad_uri", "file://[").result is None
+    assert _run_read(ex, "c_nul", str(inside) + "\x00.txt").result == _AGY_MISSING_READ_BODY
+    assert _run_read(ex, "c_bad_uri", "file://[").result == _AGY_MISSING_READ_BODY
 
     # Dual path fields (AbsolutePath + Path) are rejected unambiguously before policy or disk read.
     ex._handle_session_update(
@@ -4863,13 +4877,13 @@ def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
     dual_done = ex._handle_session_update(
         {"sessionUpdate": "tool_call_update", "toolCallId": "c_dual", "status": "completed"}
     )[0]
-    assert isinstance(dual_done, ToolCallComplete) and dual_done.result is None
+    assert isinstance(dual_done, ToolCallComplete) and dual_done.result == _AGY_MISSING_READ_BODY
 
     # POSIX FIFO does not block and fails closed (not a regular file).
     if hasattr(os, "mkfifo"):
         fifo_path = workspace / "pipe.fifo"
         os.mkfifo(fifo_path)
-        assert _run_read(ex, "c_fifo", str(fifo_path)).result is None
+        assert _run_read(ex, "c_fifo", str(fifo_path)).result == _AGY_MISSING_READ_BODY
 
     # Exact 64 KiB boundary splitting a 3-byte UTF-8 character decodes cleanly without error.
     utf8_edge = workspace / "utf8_edge.txt"
@@ -4897,7 +4911,7 @@ def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
             "locations": [{"path": str(inside)}],
         }
     )[0]
-    assert isinstance(swapped, ToolCallComplete) and swapped.result is None
+    assert isinstance(swapped, ToolCallComplete) and swapped.result == _AGY_MISSING_READ_BODY
 
     orphan = ex._handle_session_update(
         {
@@ -4939,7 +4953,7 @@ def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
         cwd=str(workspace),
         os_env=OSEnvSpec(type="caller_process", fork=True),
     )
-    assert _run_read(forked_ex, "c_fork", str(inside)).result is None
+    assert _run_read(forked_ex, "c_fork", str(inside)).result == _AGY_MISSING_READ_BODY
 
     # Non-AG ACP agent never backfills from disk.
     non_ag = AcpExecutor(AcpAgentConfig(command="opencode acp"), cwd=str(workspace))
@@ -5680,7 +5694,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         update_session_id="s1",
     )
     await ex._resolve_agy_read_backfills("s1", "s1", events_denied)
-    assert isinstance(events_denied[0], ToolCallComplete) and events_denied[0].result is None
+    assert isinstance(events_denied[0], ToolCallComplete)
+    assert events_denied[0].result == _AGY_MISSING_READ_BODY
 
     # Policy-allowed file inside workspace is backfilled for the active session.
     ex._handle_session_update(
@@ -5699,6 +5714,7 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
     )
     await ex._resolve_agy_read_backfills("s1", "s1", events_ok)
     assert isinstance(events_ok[0], ToolCallComplete)
+    assert events_ok[0].status == ToolCallStatus.SUCCESS
     assert events_ok[0].result == "ALLOWED_CONTENT\n"
 
     # Missing sessionId on start fails closed when a session is active (policy & direct paths).
@@ -5739,7 +5755,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         },
         update_session_id="s_other",
     )
-    assert isinstance(direct_done[0], ToolCallComplete) and direct_done[0].result is None
+    assert isinstance(direct_done[0], ToolCallComplete)
+    assert direct_done[0].result == _AGY_MISSING_READ_BODY
 
     # Live subprocess without a startup workspace anchor fails closed instead of reopening by path.
     direct_ex._proc = Mock(returncode=None)
@@ -5759,7 +5776,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         {"sessionUpdate": "tool_call_update", "toolCallId": "r_unanchored", "status": "completed"},
         update_session_id="s1",
     )
-    assert isinstance(unanchored_done[0], ToolCallComplete) and unanchored_done[0].result is None
+    assert isinstance(unanchored_done[0], ToolCallComplete)
+    assert unanchored_done[0].result == _AGY_MISSING_READ_BODY
 
     # Cross-session update never backfills.
     ex._handle_session_update(
@@ -5777,7 +5795,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         update_session_id="s_other",
     )
     await ex._resolve_agy_read_backfills("s1", "s_other", events_wrong)
-    assert isinstance(events_wrong[0], ToolCallComplete) and events_wrong[0].result is None
+    assert isinstance(events_wrong[0], ToolCallComplete)
+    assert events_wrong[0].result == _AGY_MISSING_READ_BODY
 
     # Explicit permission denial prevents backfill even if a completion later arrives.
     ex._denied_permission_calls.add("r_perm_denied")
@@ -5801,7 +5820,7 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
     )
     await ex._resolve_agy_read_backfills("s1", "s1", events_perm_denied)
     assert isinstance(events_perm_denied[0], ToolCallComplete)
-    assert events_perm_denied[0].result is None
+    assert events_perm_denied[0].result == _AGY_MISSING_READ_BODY
 
     # Foreign-session tool_call start is not cached for backfill in the active session.
     ex._handle_session_update(
@@ -5845,7 +5864,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         update_session_id="s1",
     )
     await ex._resolve_agy_read_backfills("s1", "s1", events_dual)
-    assert isinstance(events_dual[0], ToolCallComplete) and events_dual[0].result is None
+    assert isinstance(events_dual[0], ToolCallComplete)
+    assert events_dual[0].result == _AGY_MISSING_READ_BODY
 
     # ASK verdict from policy also blocks silent backfill.
     async def _ask_only(_phase: str, _data: dict[str, object]) -> PolicyVerdictPayload:
@@ -5867,7 +5887,8 @@ async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorizati
         update_session_id="s1",
     )
     await ex_ask._resolve_agy_read_backfills("s1", "s1", events_ask)
-    assert isinstance(events_ask[0], ToolCallComplete) and events_ask[0].result is None
+    assert isinstance(events_ask[0], ToolCallComplete)
+    assert events_ask[0].result == _AGY_MISSING_READ_BODY
     ex_ask._policy_evaluator.assert_awaited_once()
 
 
@@ -6906,7 +6927,7 @@ async def test_agy_post_prompt_burst_completion_behind_prompt_response_not_dropp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("abort_mode", ["deadline", "interrupt"])
+@pytest.mark.parametrize("abort_mode", ["deadline", "interrupt", "approval_future_cancelled"])
 async def test_agy_post_prompt_bounded_request_aborts_on_deadline_and_interrupt(
     abort_mode: str,
 ) -> None:
@@ -6920,11 +6941,11 @@ async def test_agy_post_prompt_bounded_request_aborts_on_deadline_and_interrupt(
     ex._session_id = "s1"
 
     elicit_started = asyncio.Event()
-    never_answered = asyncio.Event()
+    never_answered = asyncio.get_running_loop().create_future()
 
     async def hanging_elicit(_tool: str, _args: dict[str, object]) -> bool:
         elicit_started.set()
-        await never_answered.wait()
+        await never_answered
         return True
 
     ex._elicitation_handler = hanging_elicit  # type: ignore[assignment]
@@ -6985,6 +7006,8 @@ async def test_agy_post_prompt_bounded_request_aborts_on_deadline_and_interrupt(
         assert "30 minutes" in (events[-1].response or "")
         assert "still running" in (events[-1].response or "")
     else:
+        if abort_mode == "approval_future_cancelled":
+            never_answered.cancel()
         assert await ex.interrupt_session("s1") is True
         await asyncio.wait_for(task, timeout=2.0)
         assert isinstance(events[-1], TurnCancelled)
@@ -7670,12 +7693,15 @@ async def test_agy_buffered_prompt_reply_preserves_read_file_backfill(
     if expect_body:
         assert "hello from disk" in str(completions[0].result)
     else:
-        assert completions[0].result in (None, "")
+        assert completions[0].status == ToolCallStatus.ERROR
+        assert completions[0].result == _AGY_MISSING_READ_BODY
 
 
 @pytest.mark.asyncio
-async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_policy() -> None:
-    """A Phase 1 prompt error cancels an in-flight permission policy await immediately."""
+async def test_agy_parallel_permission_completes_sibling_and_aborts_pending_on_prompt_error() -> (
+    None
+):
+    """A pending approval leaves a parallel request runnable and is cancelled on prompt failure."""
     from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
     ex = AcpExecutor(
@@ -7692,9 +7718,10 @@ async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_
     policy_entered = asyncio.Event()
     never_returns = asyncio.Event()
 
-    async def hanging_policy(*_args, **_kwargs) -> PolicyVerdictPayload:
-        policy_entered.set()
-        await never_returns.wait()
+    async def hanging_policy(_phase, data) -> PolicyVerdictPayload:
+        if data["arguments"]["CommandLine"] != "Get-Date":
+            policy_entered.set()
+            await never_returns.wait()
         return PolicyVerdictPayload(
             action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"}
         )
@@ -7702,10 +7729,13 @@ async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_
     ex._policy_evaluator = hanging_policy  # type: ignore[assignment]
     sent: list[dict[str, object]] = []
     prompt_sent = asyncio.Event()
+    sibling_replied = asyncio.Event()
     prompt_id: list[int] = []
 
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
+        if message.get("id") == 602:
+            sibling_replied.set()
         if message.get("method") == "session/prompt":
             prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
             prompt_sent.set()
@@ -7750,6 +7780,29 @@ async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_
             }
         )
         await asyncio.wait_for(policy_entered.wait(), timeout=2.0)
+        sibling_call = {
+            "toolCallId": "cmd-sibling",
+            "kind": "execute",
+            "rawInput": {"CommandLine": "Get-Date"},
+        }
+        feed(_acp_update_frame("s1", {"sessionUpdate": "tool_call", **sibling_call}))
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 602,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": sibling_call,
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(sibling_replied.wait(), timeout=2.0)
+        assert next(reply for reply in sent if reply.get("id") == 602)["result"] == {
+            "outcome": {"outcome": "selected", "optionId": "once"}
+        }
+        assert all(reply.get("id") != 601 for reply in sent)
         feed(
             {
                 "jsonrpc": "2.0",
@@ -7886,7 +7939,8 @@ async def test_acp_phase2_read_backfill_policy_aborts_at_deadline_without_readin
         if isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "late-read"}
     ]
     assert len(completions) == 1
-    assert completions[0].result in (None, "")
+    assert completions[0].status == ToolCallStatus.ERROR
+    assert completions[0].result == _AGY_MISSING_READ_BODY
     assert isinstance(events[-1], TurnComplete)
     assert "30 minutes" in (events[-1].response or "")
 
