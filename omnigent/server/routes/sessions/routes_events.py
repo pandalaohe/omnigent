@@ -2456,10 +2456,37 @@ def register_events_routes(
                 or workflow_answer
             ):
                 body.data["_input_admission_required"] = True
-                if isinstance(request, Request) and getattr(
-                    request.state, "runtime_notice", False
-                ):
-                    body.data["_runtime_notice"] = True
+            raw_content = body.data.get("content")
+            notice_text = (
+                raw_content
+                if isinstance(raw_content, str)
+                else (_message_text(raw_content) if isinstance(raw_content, list) else None)
+            )
+            runner_runtime_notice = (
+                _has_runner_created_by_authority(request, conv)
+                and not workflow_answer
+                and retry_guard is None
+                and (
+                    not isinstance(request, Request)
+                    or (
+                        AGENT_SESSION_HEADER not in request.headers
+                        and ORCHESTRATION_SOURCE_HEADER not in request.headers
+                    )
+                )
+                and (
+                    body.data.get("is_meta") is True
+                    or (
+                        isinstance(notice_text, str)
+                        and notice_text.lstrip().startswith("[System: ")
+                    )
+                )
+            )
+            if not body.data.get("peer_message_id") and (
+                (isinstance(request, Request) and getattr(request.state, "runtime_notice", False))
+                or active_final_dispatch() is not None
+                or runner_runtime_notice
+            ):
+                body.data["_runtime_notice"] = True
         opens_codex_side_chat = body.type == "message" and await _opens_codex_side_chat(conv, body)
         if (
             body.type == "message"
