@@ -32,9 +32,15 @@ const {
 } = require("./browserUrlPolicy");
 const crypto = require("node:crypto");
 const path = require("node:path");
+const { isDesktopOpenRequest } = require("./desktopOpenServer");
 const { createAgentNavigation } = require("./agentNavigation");
 const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
+const {
+  forwardedKeydown,
+  matchesForwardedChord,
+  normalizeForwardedChords,
+} = require("./browserForwardedChords");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
@@ -100,6 +106,10 @@ function createBrowserViewRegistry({
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   isHostFocused = () => true,
+  // Give the shell window keyboard focus, for a chord forwarded from a page.
+  focusHost = () => {},
+  // Which keys write text depends on the OS (AltGr arrives as Ctrl+Alt off the Mac).
+  platform = process.platform,
   // Desktop affordances for the pane's context menu; injected so the registry
   // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
@@ -188,6 +198,10 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // The app chords the renderer handles itself; none until a renderer that handles them asks.
+  let forwardedChords = [];
+  // The list a started host navigation set aside, until a new document commits or the old one stays.
+  let heldForwardedChords = null;
   // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
   // SPA would drop them, so modifier-clicks navigate in place until declared.
   let openTabSupported = false;
@@ -516,6 +530,38 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  // During a host navigation an update waits with the held list: the old renderer that sent it
+  // may stay, and a replacement document asks for its own keys.
+  function setForwardedChords(chords) {
+    const chordList = normalizeForwardedChords(chords);
+    if (heldForwardedChords !== null) heldForwardedChords = chordList;
+    else forwardedChords = chordList;
+    return { ok: true, count: chordList.length };
+  }
+
+  // A navigation may replace the renderer with a bundle that never asks, so pages keep their
+  // keys until it ends; a navigation that supersedes another keeps the list already held.
+  function holdForwardedChords() {
+    if (heldForwardedChords === null) heldForwardedChords = forwardedChords;
+    forwardedChords = [];
+  }
+
+  // The navigation ended: `restore` when the old renderer stayed, so its keys work again.
+  function releaseForwardedChords(restore) {
+    if (heldForwardedChords === null) return;
+    if (restore) forwardedChords = heldForwardedChords;
+    heldForwardedChords = null;
+  }
+
+  // Hand the renderer's app chords to it, focused, so ⌘K acts as if the page weren't there.
+  function forwardAppChord(event, input) {
+    if (!matchesForwardedChord(forwardedChords, input, platform)) return false;
+    event.preventDefault();
+    focusHost();
+    sendToRenderer("browser-forwarded-input", forwardedKeydown(input));
+    return true;
+  }
+
   function attachRecentSessionInput(entry) {
     // Another view taking keys for the page (the design tools' overlay) forwards them too.
     entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
@@ -525,9 +571,10 @@ function createBrowserViewRegistry({
   function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
-      if (!recentSessionSwitchSupported) return;
       // An agent's key presses are for the page, never the shell.
       if (agentInputInFlight(wc)) return;
+      if (forwardAppChord(event, input)) return;
+      if (!recentSessionSwitchSupported) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -595,31 +642,34 @@ function createBrowserViewRegistry({
     beginAgentNavigation,
   });
 
+  function liveWebContents(entry) {
+    try {
+      const contents = entry.view.webContents;
+      return contents && !contents.isDestroyed?.() ? contents : null;
+    } catch {
+      return null;
+    }
+  }
+
   function entryForWebContents(webContentsId) {
+    if (!webContentsId) return null;
     for (const entry of entries.values()) {
-      try {
-        if (entry.view.webContents.id === webContentsId) return entry;
-      } catch {
-        continue; // destroyed
-      }
+      if (liveWebContents(entry)?.id === webContentsId) return entry;
     }
     return null;
   }
 
   function ownsWebContents(webContentsId) {
-    for (const entry of entries.values()) {
-      try {
-        if (entry.view.webContents.id === webContentsId) return true;
-      } catch {
-        /* destroyed */
-      }
-    }
-    return false;
+    return entryForWebContents(webContentsId) !== null;
+  }
+
+  function ownsPartition(partition) {
+    return [...entries.values()].some((entry) => entry.partition === partition);
   }
 
   function requestPolicyFor(webContentsId, partition) {
     const entry = entryForWebContents(webContentsId);
-    if (entry) {
+    if (entry && (partition === undefined || entry.partition === partition)) {
       return entry.navigationPolicyEnforced
         ? {
             ...agentNavPolicyOptions(entry.agentContext),
@@ -628,17 +678,41 @@ function createBrowserViewRegistry({
           }
         : null;
     }
-    return null;
+    if (typeof partition !== "string") return null;
+    const owners = [...entries.values()].filter((owner) => owner.partition === partition);
+    const { blocked, ask } = getBrowserAccess() ?? {};
+    // A worker without a view can only inherit unanimous loopback access in an
+    // isolated partition. Persistent partitions may also have owners in other windows.
+    return {
+      partition,
+      access: { blocked, ask },
+      allowLocalhost:
+        !entry &&
+        !partition.startsWith("persist:") &&
+        owners.length > 0 &&
+        owners.every(
+          (owner) =>
+            owner.navigationPolicyEnforced &&
+            liveWebContents(owner) !== null &&
+            allowsLocalhost(owner.agentContext),
+        ),
+    };
   }
 
   function hostnameOf(url) {
     return URL.canParse(url) ? new URL(url).hostname : "";
   }
 
+  function isDocumentRequest(resourceType) {
+    return !resourceType || ["mainFrame", "subFrame", "object"].includes(resourceType);
+  }
+
   // Resolve named hosts in the owning partition before any request is sent.
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
-  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+  async function shouldCancelAgentRequest({ webContentsId, url, resourceType }, partition) {
+    // A page in an embedded browser pane must not steer the user's main window.
+    if (isDesktopOpenRequest(url)) return true;
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
@@ -648,7 +722,7 @@ function createBrowserViewRegistry({
       verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
     }
     if (verdict.ok) return false;
-    if (policy.conversationId) {
+    if (policy.conversationId && isDocumentRequest(resourceType)) {
       sendToRenderer("browser-nav-blocked", {
         conversationId: policy.conversationId,
         url,
@@ -739,7 +813,7 @@ function createBrowserViewRegistry({
       const destination = await checkAgentNavigationWithPolicy(policyUrl, policy);
       if (destination.ok) return false;
     }
-    if (policy.conversationId) {
+    if (policy.conversationId && isDocumentRequest(resourceType)) {
       sendToRenderer("browser-nav-blocked", {
         conversationId: policy.conversationId,
         url,
@@ -960,10 +1034,14 @@ function createBrowserViewRegistry({
     agentRequestHeaders,
     shouldCancelAgentResponse,
     ownsWebContents,
+    ownsPartition,
     setActive,
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setForwardedChords,
+    holdForwardedChords,
+    releaseForwardedChords,
     setOpenTabSupported,
     close,
     closeAll,

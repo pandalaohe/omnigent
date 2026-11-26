@@ -66,6 +66,21 @@ class TestParseCodexElicitationRequest:
         assert req.method == "mcpServer/elicitation/request"
         assert req.params.mode == "form"
 
+    def test_duplicate_input_question_ids_are_rejected(self) -> None:
+        with pytest.raises(OmnigentError, match="answer IDs must be unique"):
+            parse_codex_elicitation_request(
+                {
+                    "id": 1,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [
+                            {"id": "answer", "question": "Private answer", "isSecret": True},
+                            {"id": "answer", "question": "Other answer"},
+                        ],
+                    },
+                }
+            )
+
     def test_valid_command_approval(self) -> None:
         req = parse_codex_elicitation_request(
             {

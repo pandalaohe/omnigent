@@ -9,6 +9,7 @@ const BROWSER_TAB: ShortcutCatalogContext = {
   browser: false,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: false,
   grids: false,
   splitTerminal: false,

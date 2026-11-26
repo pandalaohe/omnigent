@@ -135,6 +135,9 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # The relay records an ``input_only`` failure under its own response id and
     # keeps the tracked turn; an older server would end that turn instead.
     accepts_input_only_failures: bool = False
+    # Whether the server can route. The runner holds no routing backends of
+    # its own, so this is how it learns to advertise ``sys_advise_models``.
+    smart_routing_available: bool = False
 
 
 def build_runner_session_init_payload(
@@ -152,12 +155,17 @@ def build_runner_session_init_payload(
     usage_storage_location: str | None = None,
     recovery_prompt: str | None = None,
     require_recovery_admission: bool = False,
+    smart_routing_available: bool | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body.
 
     ``project_code`` appears in the payload only when supplied, so a
     session without one keeps the payload byte-identical to before the
     field existed.
+
+    :param smart_routing_available: The routing answer to stamp. ``None`` stamps
+        this process's own answer: the builder runs on the server, the only
+        process that can route, so no call site has to remember to pass it.
     """
     from omnigent.inference_config import snapshot_runtime_config
 
@@ -171,6 +179,10 @@ def build_runner_session_init_payload(
 
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
+    if smart_routing_available is None:
+        from omnigent.runtime import routing_stamp
+
+        smart_routing_available = routing_stamp()
     own_archive_state = runner_archive_state(conversation)
     effective_archive_states = (
         archive_states if archive_states is not None else [own_archive_state]
@@ -188,6 +200,7 @@ def build_runner_session_init_payload(
         require_recovery_admission=require_recovery_admission,
         accepts_inferred_status=True,
         accepts_input_only_failures=True,
+        smart_routing_available=smart_routing_available,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

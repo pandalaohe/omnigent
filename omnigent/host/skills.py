@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.host.frames import HostSkillsFrame
+from omnigent.memory_availability import MEMORY_HEADER, without_memory_tools
 from omnigent.spec import load
 from omnigent.spec.skill_sources import (
     resolve_harness_skills,
@@ -166,6 +167,8 @@ class HostSkillDiscovery:
                     expand_env=response.headers.get("X-Agent-Session-Scoped") == "false",
                     prune_invalid_sub_agents=True,
                 )
+                if response.headers.get(MEMORY_HEADER) != "1":
+                    spec = without_memory_tools(spec)
                 if frame.sub_agent_name:
                     spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
                 skills = resolve_session_skills(

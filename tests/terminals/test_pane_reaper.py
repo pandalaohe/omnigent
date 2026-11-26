@@ -656,6 +656,8 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
 
     assert not await reaper._is_busy(pane)
 
+    background_shell = resources._session_background_publisher
+    assert background_shell is not None
     if live_work == "approval_wait":
         marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
         marker.parent.mkdir(parents=True)
@@ -665,10 +667,28 @@ async def test_runner_busy_check_spares_a_pane_with_live_work(
     else:
         assert resources._session_background_publisher is not None
         resources._session_background_publisher("conv_parked", True)
+        # Claude reports ``shell`` (idle) while a background command outlives the turn.
+        background_shell("conv_parked", True)
     assert await reaper._is_busy(pane)
     # Another session's live work does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
+
+    if live_work == "background_shell":
+        # A shell alone holds the pane for a bounded time, so a forgotten server
+        # cannot pin it forever; other work and each new shell re-arm that hold.
+        hold_since = app.state.background_shell_pane_hold_since
+        hold_since["conv_parked"] -= pane_reaper.BACKGROUND_SHELL_PANE_HOLD_S
+        assert not await reaper._is_busy(pane)
+        agent_sessions.add("conv_parked")
+        assert await reaper._is_busy(pane)
+        agent_sessions.discard("conv_parked")
+        assert await reaper._is_busy(pane)
+        hold_since["conv_parked"] -= pane_reaper.BACKGROUND_SHELL_PANE_HOLD_S
+        background_shell("conv_parked", False)
+        assert not await reaper._is_busy(pane)
+        background_shell("conv_parked", True)
+        assert await reaper._is_busy(pane)
 
 
 @pytest.mark.parametrize("terminal_name", ["antigravity", "codex"])

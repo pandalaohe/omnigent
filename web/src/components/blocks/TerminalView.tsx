@@ -842,7 +842,10 @@ export function TerminalView({
         terminalSession = new TerminalSession(
           node,
           url,
-          notifyState,
+          // A session given up for a later attach, or this view unmounting, reports nothing more.
+          (next) => {
+            if (!superseded()) notifyState(next);
+          },
           isDarkRef.current,
           notifyActivity,
           notifyInput,

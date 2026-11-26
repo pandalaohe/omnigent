@@ -38,7 +38,7 @@ export const MEMBERS_LIST_ENTRY = settingsEntry({
   // Each member's own actions, and the dialog each opens; none of their data is searchable.
   regions: {
     members: {
-      rowActions: { resetPassword: "Reset", remove: "Remove" },
+      rowActions: { resetPassword: "Reset", remove: "Remove user" },
       rowOverlays: {
         resetPassword: {
           rowActions: { copy: "Copy password", done: "Done" },

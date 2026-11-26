@@ -37,8 +37,44 @@ export const DEFAULT_BASE_BRANCH_ENTRY = settingsEntry({
   keywords: ["branch", "main", "base", "worktree", "git"],
 });
 
+export const WORKTREE_LOCATION_ENTRY = settingsEntry({
+  id: "worktree-location",
+  section: "git",
+  label: "Worktree location",
+  description:
+    "Choose where new worktrees are created. Custom templates include the repository and branch. The server validates paths before saving.",
+  keywords: ["worktree", "folder", "directory", "template"],
+  parts: {
+    preset: "Worktree location",
+    template: "Worktree location template",
+    entry: "Insert project folder",
+    repo_parent: "Insert repository parent",
+    repo: "Insert repository name",
+    branch: "Insert branch name",
+    save: "Save location",
+    reset: "Use default location",
+  },
+  partChoices: { preset: ["Next to repository", "Inside project", "Custom"] },
+  presence: {
+    template: { states: ["custom location"] },
+    entry: { states: ["custom location"] },
+    repo_parent: { states: ["custom location"] },
+    repo: { states: ["custom location"] },
+    branch: { states: ["custom location"] },
+  },
+  reachedBy: {
+    template: "preset",
+    entry: "preset",
+    repo_parent: "preset",
+    repo: "preset",
+    branch: "preset",
+  },
+  focus: "preset",
+});
+
 export const GIT_SETTINGS = [
   ALWAYS_USE_WORKTREE_ENTRY,
   DEFAULT_BASE_BRANCH_ENTRY,
   DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
+  WORKTREE_LOCATION_ENTRY,
 ] as const;

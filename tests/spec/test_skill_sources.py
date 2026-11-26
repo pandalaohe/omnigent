@@ -10,6 +10,7 @@ import pytest
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
+    framework_skills,
     generic_walk_includes_agents,
     resolve_harness_skills,
     resolve_session_skill_registry,
@@ -17,7 +18,7 @@ from omnigent.spec.skill_sources import (
     session_skill_roots,
     skill_source_context_from_env,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec, ToolGroupsConfig
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -2294,6 +2295,22 @@ def test_claude_personal_commands_follow_config_dir_and_skip_home(
 
     assert names(_ctx(workspace, home)) == {"home-cmd", "scratch-cmd"}
     assert names(_ctx(workspace, home, claude_config_dir=config)) == {"config-cmd", "scratch-cmd"}
+
+
+@pytest.mark.parametrize("memory_on", [False, True])
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+def test_framework_skills_gate_each_on_its_own_tool_group(
+    memory_on: bool, workflows_enabled: bool
+) -> None:
+    """Workflow skills need the workflows flag; the memory skill needs only its tool group."""
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=memory_on))
+
+    names = {s.name for s in framework_skills(spec, workflows_enabled=workflows_enabled)}
+
+    expected = ({"workflow", "save-workflow"} if workflows_enabled else set()) | (
+        {"import-memory"} if memory_on else set()
+    )
+    assert names == expected
 
 
 def test_claude_commands_follow_symlinks_and_load_each_file_once(

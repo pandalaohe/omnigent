@@ -26,6 +26,8 @@ interface FileMentionMenuProps {
   fileQuery?: string;
   /** Index of the highlighted row (-1 = none). */
   activeIndex: number;
+  /** Opens below the prompt's first line when the composer sits at the window top. */
+  placement?: "above" | "below";
   /** Entries of the current directory (folders first), already filtered + capped. */
   entries: WorkspaceFile[];
   /**
@@ -90,6 +92,7 @@ export function FileMentionMenu({
   query = "",
   fileQuery = "",
   activeIndex,
+  placement = "above",
   entries,
   members = NO_SESSION_MEMBERS,
   loading = false,
@@ -122,15 +125,26 @@ export function FileMentionMenu({
   const showFiles = level === null && (entries.length > 0 || loading);
 
   return (
-    <div className="absolute bottom-full left-0 z-30 mb-2 flex items-end gap-2">
+    <div
+      className={cn(
+        "absolute left-0 z-30 flex gap-2",
+        placement === "above"
+          ? "bottom-full mb-2 items-end"
+          : "top-11 max-h-[calc(100%-2.75rem)] items-stretch",
+      )}
+    >
       <div
         data-testid="file-mention-menu"
-        className="mobile-menu-glass max-md:relative w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+        className={cn(
+          "mobile-menu-glass max-md:relative w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150",
+          // Capped below the prompt, the card shrinks to fit and its list is the only scroller.
+          placement === "below" && "flex flex-col",
+        )}
       >
         <MobileMenuGlassSurface />
         {/* One scroll container over both sections so the arrow-keyed row —
             member or file — is scrolled into view either way. */}
-        <div ref={listRef} className="max-h-80 overflow-y-auto">
+        <div ref={listRef} className="max-h-80 min-h-0 overflow-y-auto">
           {memberCount > 0 && (
             <>
               <div className="px-1.5 py-1 text-sm font-medium text-muted-foreground">Members</div>

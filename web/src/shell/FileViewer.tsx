@@ -417,6 +417,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Shown in place of the header's path, such as the tabs sidebar's breadcrumbs. */
+  pathHeader?: ReactNode;
   /** The same frameless viewer fills the mobile viewport without remounting. */
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
@@ -480,6 +482,7 @@ function FileViewerBody({
   permissionLevel,
   comparisonDiff,
   frameless,
+  pathHeader,
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
@@ -2088,22 +2091,24 @@ function FileViewerBody({
               </KeyboardShortcutTooltip>
             </div>
           )}
-          <FilePathBar
-            key={`${conversationId}:${path}`}
-            path={path}
-            absolutePath={absoluteWorkspacePath(path, workspaceRoot) ?? path}
-            validate={async (destination, signal) => {
-              const result = await fetchFileContent(conversationId, destination, signal);
-              if (result.object !== "session.environment.filesystem.file_content") {
-                throw new Error("This is a folder. Enter a file path.");
+          {pathHeader ?? (
+            <FilePathBar
+              key={`${conversationId}:${path}`}
+              path={path}
+              absolutePath={absoluteWorkspacePath(path, workspaceRoot) ?? path}
+              validate={async (destination, signal) => {
+                const result = await fetchFileContent(conversationId, destination, signal);
+                if (result.object !== "session.environment.filesystem.file_content") {
+                  throw new Error("This is a folder. Enter a file path.");
+                }
+              }}
+              onNavigate={
+                onNavigateTo
+                  ? (destination) => guardDirty(() => onNavigateTo(destination))
+                  : undefined
               }
-            }}
-            onNavigate={
-              onNavigateTo
-                ? (destination) => guardDirty(() => onNavigateTo(destination))
-                : undefined
-            }
-          />
+            />
+          )}
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"

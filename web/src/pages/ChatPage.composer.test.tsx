@@ -1221,9 +1221,10 @@ describe("Composer send shortcut", () => {
     [true, "metaKey"],
     [true, "ctrlKey"],
   ] as const)(
-    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    "steers the draft and backlog with Always steer off (alternate send: %s, modifier: %s)",
     (alternate, modifier) => {
       localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(false);
       const onSend = vi.fn((text: string, files?: File[]) => {
         useChatStore.getState().enqueueMessage(text, files);
       });
@@ -1268,6 +1269,64 @@ describe("Composer send shortcut", () => {
           sendQueued.mock.invocationCallOrder[0]!,
         );
         expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "queues the draft behind the turn with Always steer on (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(true);
+      const sendNow = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [{ queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" }],
+        sessionStatus: "running",
+        send: sendNow,
+        status: "streaming",
+      });
+      const onSend = vi.fn();
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        fireEvent.change(textarea(), { target: { value: "after this turn" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledExactlyOnceWith("after this turn", undefined, undefined, {
+          queue: true,
+        });
+        expect(textarea()).toHaveValue("");
+        // The existing backlog stays queued; nothing is steered into the turn.
+        expect(sendNow).not.toHaveBeenCalled();
+        expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+          "queued first",
+        ]);
+
+        // With nothing to queue, the chord still steers the backlog.
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(sendNow.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+        ]);
       } finally {
         act(() =>
           useChatStore.setState({

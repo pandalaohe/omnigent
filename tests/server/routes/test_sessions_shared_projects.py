@@ -103,6 +103,7 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
             "id": None,
             "name": "Bob Project",
             "icon": None,
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         }

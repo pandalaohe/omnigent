@@ -158,6 +158,9 @@ import {
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
+  isListeningForInitialPrompt,
+  onPendingInitialPrompt,
+  returnPendingInitialPrompt,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -6399,6 +6402,35 @@ describe("chatStore — first message during native model startup", () => {
     },
   );
 
+  it("a held first message whose upload fails restores its text, files and error without a stop", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const baseFetch = fetchMock.getMockImplementation()!;
+    let releaseUpload!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          releaseUpload = () => resolve(mockResponse({}, { ok: false, status: 500 }));
+        });
+      }
+      return baseFetch(input, init);
+    });
+    begin([file]);
+    await settle();
+    reportModel();
+    await settle();
+    releaseUpload();
+    await settle();
+
+    // The held first message keeps the ordinary failure path: its text and file come back
+    // into the composer draft with the error shown, and nothing is posted.
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: original,
+      files: [file],
+    });
+    expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(true);
+  });
+
   it.each([false, true])(
     "never posts an initial message canceled during upload (failed=%s)",
     async (failed) => {
@@ -9573,7 +9605,7 @@ describe("chatStore — send (file attachments)", () => {
     await useChatStore.getState().send("summarize these photos", "agent_xyz", [zip]);
 
     const state = useChatStore.getState();
-    // Optimistic bubble rolled back — the send never reached the server.
+    // Never reached the server, so nothing is in the transcript's pending queue either.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.blocks.at(-1)).toMatchObject({
       failedAttachmentSend: {
@@ -25843,8 +25875,36 @@ describe("pending initial prompt transport", () => {
     expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
   });
 
+  it("keeps stashed prompts in order, and a returned one goes back to the front", () => {
+    setPendingInitialPrompt("conv_order", { text: "one", skill: null });
+    setPendingInitialPrompt("conv_order", { text: "two", skill: null });
+    const one = consumePendingInitialPrompt("conv_order");
+    setPendingInitialPrompt("conv_order", { text: "three", skill: null });
+    returnPendingInitialPrompt("conv_order", one!);
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("one");
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("two");
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("three");
+    expect(consumePendingInitialPrompt("conv_order")).toBeNull();
+  });
+
   it("returns null for a conversation with no pending prompt", () => {
     expect(consumePendingInitialPrompt("conv_never_set")).toBeNull();
+  });
+
+  it("tells a page's listener about prompts stashed for its conversation, until it unsubscribes", () => {
+    const heard: string[] = [];
+    const stop = onPendingInitialPrompt("conv_listened", () => heard.push("conv_listened"));
+    expect(isListeningForInitialPrompt("conv_listened")).toBe(true);
+    expect(isListeningForInitialPrompt("conv_other")).toBe(false);
+    setPendingInitialPrompt("conv_listened", { text: "first", skill: null });
+    setPendingInitialPrompt("conv_other", { text: "elsewhere", skill: null });
+    stop();
+    expect(isListeningForInitialPrompt("conv_listened")).toBe(false);
+    setPendingInitialPrompt("conv_listened", { text: "second", skill: null });
+    expect(heard).toEqual(["conv_listened"]);
+    expect(consumePendingInitialPrompt("conv_listened")?.text).toBe("first");
+    expect(consumePendingInitialPrompt("conv_listened")?.text).toBe("second");
+    expect(consumePendingInitialPrompt("conv_other")).toEqual({ text: "elsewhere", skill: null });
   });
 
   it("ignores a blank prompt so a blank message never auto-sends", () => {

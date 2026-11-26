@@ -19,6 +19,7 @@ import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
   supportsBrowser,
   type BrowserHostOptions,
   type BrowserNavigationResult,
@@ -85,6 +86,7 @@ interface BrowserDesktopBridge {
     elsewhere?: boolean;
     hostIsThisMachine?: boolean;
     sshPreviewHost?: boolean;
+    trustedRemotePreviewHost?: boolean;
     url?: string;
     title?: string;
   }>;
@@ -297,6 +299,7 @@ async function dispatch(
         if (
           isLoopbackPreviewUrl(url) &&
           r.sshPreviewHost !== true &&
+          r.trustedRemotePreviewHost !== true &&
           sourceHostId &&
           rememberedArcaHostId &&
           sourceHostId !== rememberedArcaHostId
@@ -545,7 +548,10 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       if (needsHostRevalidation && desktop.browserHasView) {
         try {
           const view = await desktop.browserHasView(target.viewId);
-          privilegedView = view.hostIsThisMachine === true || view.sshPreviewHost === true;
+          privilegedView =
+            view.hostIsThisMachine === true ||
+            view.sshPreviewHost === true ||
+            view.trustedRemotePreviewHost === true;
         } catch {
           // A failed probe requires current host metadata before acting.
         }
@@ -559,6 +565,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
         ? {
             sessionHostProtocol: SESSION_HOST_PROTOCOL,
             sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+            trustedRemotePreviewProtocol: TRUSTED_REMOTE_PREVIEW_PROTOCOL,
             sourceHostId,
           }
         : undefined;
@@ -701,6 +708,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             : await agentDispatch(currentHostId, {
                 sessionHostProtocol: SESSION_HOST_PROTOCOL,
                 sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+                trustedRemotePreviewProtocol: TRUSTED_REMOTE_PREVIEW_PROTOCOL,
                 sourceHostId: currentHostId,
               });
         }

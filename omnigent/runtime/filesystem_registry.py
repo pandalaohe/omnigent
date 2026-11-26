@@ -1360,6 +1360,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # A scan killed at its timeout must not strand ``.git/index.lock``
         # against the user's own commits in this repository.
         argv = ["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]
+        argv.extend(self._workspace_pathspecs())
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
@@ -1582,6 +1583,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         base = "" if prefix_posix == "." else f"{prefix_posix}/"
         return [f":(exclude){base}{name}" for name in sorted(_SKIP_DIRS)]
 
+    def _workspace_pathspecs(self) -> list[str]:
+        """Return a pathspec limiting a git read to the workspace's subtree.
+
+        ``:(literal)`` keeps glob characters in a directory name from
+        widening the match, as in :meth:`list_tracked_files`.
+
+        :returns: ``[":(literal)<prefix>"]`` for a workspace below the git
+            root, e.g. ``[":(literal)sub/ws"]``; ``[]`` when the workspace is
+            the git root or escapes it.
+        """
+        try:
+            prefix = self._cwd.relative_to(self._git_root).as_posix()
+        except ValueError:
+            return []
+        return [] if prefix == "." else [f":(literal){prefix}"]
+
     def _git_to_rel(self, git_path: str) -> str | None:
         """Convert a git-root-relative path to a cwd-relative path.
 
@@ -1658,6 +1675,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
             "--no-renames",
             "HEAD",
         ]
+        workspace = self._workspace_pathspecs()
+        if workspace:
+            argv += ["--", *workspace]
         try:
             result = self._run_git(argv)
         except (subprocess.TimeoutExpired, OSError):

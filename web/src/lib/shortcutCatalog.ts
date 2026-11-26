@@ -23,7 +23,10 @@ import {
 } from "@/lib/shortcuts/shortcutPage";
 
 export type ShortcutCatalogContext = ShortcutPageContext;
-type ShortcutRow = ShortcutPageRow & { lastKeySeparator?: string };
+type ShortcutRow = Omit<ShortcutPageRow, "shortcutId"> & {
+  shortcutId?: ShortcutPageRow["shortcutId"];
+  lastKeySeparator?: string;
+};
 type ShortcutGroup = Omit<ShortcutPageGroup, "items"> & { items: ShortcutRow[] };
 
 const configurableActions: Partial<Record<string, ShortcutActionId>> = {

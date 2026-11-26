@@ -19,6 +19,7 @@ import { MCP_SETTINGS } from "./mcp";
 import { MEMBERS_SETTINGS } from "./members";
 import { POLICIES_SETTINGS } from "./policies";
 import { SHARING_SETTINGS } from "./sharing";
+import { SHORTCUTS_SETTINGS } from "./shortcuts";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
 
@@ -30,7 +31,8 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   git: GIT_SETTINGS,
   integrations: INTEGRATION_SETTINGS,
   mcp: MCP_SETTINGS,
-  shortcuts: [],
+  // Its other rows are generated from the shortcut registry; see shortcutEntries.ts.
+  shortcuts: SHORTCUTS_SETTINGS,
   import: IMPORT_SETTINGS,
   "api-keys": [],
   account: ACCOUNT_SETTINGS,

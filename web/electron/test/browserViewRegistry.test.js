@@ -13,6 +13,7 @@ const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
 const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
+const { DESKTOP_OPEN_PORTS } = require("../src/desktopOpenServer");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 // Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
@@ -189,6 +190,7 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
 function makeRecentSessionInputRegistry({
   isHostFocused = () => true,
   supportsRecentSessionSwitch = true,
+  focusHost = () => {},
 } = {}) {
   const listeners = new Map();
   const sent = [];
@@ -208,12 +210,114 @@ function makeRecentSessionInputRegistry({
     detachFromHost() {},
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     isHostFocused,
+    focusHost,
+    platform: "darwin",
   });
   registry.openOrNavigate("conv_1", "https://example.com");
   registry.setActive("conv_1");
   registry.setRecentSessionSwitchSupported(supportsRecentSessionSwitch);
   return { registry, listeners, sent };
 }
+
+describe("browserViewRegistry — app chords a page hands to the shell", () => {
+  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+
+  function press(listeners, input) {
+    let prevented = false;
+    listeners.get("before-input-event")(
+      { preventDefault: () => (prevented = true) },
+      { type: "keyDown", ...input },
+    );
+    return prevented;
+  }
+
+  it("takes no key from a page until the renderer lists its chords", () => {
+    const { listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+    });
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.deepEqual(
+      sent.filter((item) => item.channel === "browser-forwarded-input"),
+      [],
+    );
+  });
+
+  it("hands a listed chord to the focused shell, and other keys to the page", () => {
+    let focused = 0;
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => (focused += 1),
+    });
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    const forwarded = () => sent.filter((item) => item.channel === "browser-forwarded-input");
+
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), true);
+    assert.equal(focused, 1);
+    assert.deepEqual(forwarded()[0].payload, {
+      type: "keydown",
+      key: "k",
+      code: "KeyK",
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      metaKey: true,
+      repeat: false,
+    });
+    assert.equal(press(listeners, { key: "j", code: "KeyJ", meta: true }), false);
+    assert.equal(
+      press(listeners, { key: "k", code: "KeyK", meta: true, isComposing: true }),
+      false,
+    );
+
+    // An empty list, which main sets when the renderer is replaced, hands every key back.
+    registry.setForwardedChords([]);
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.equal(forwarded().length, 1);
+  });
+
+  it("holds the list through a navigation, restoring it only when the old renderer stays", () => {
+    const { registry, listeners } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => {},
+    });
+    const commandK = () => press(listeners, { key: "k", code: "KeyK", meta: true });
+    registry.setForwardedChords([COMMAND_K]);
+
+    // A navigation superseded by another still restores the first list.
+    registry.holdForwardedChords();
+    registry.holdForwardedChords();
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+
+    // A new document drops the held list, and a later stop doesn't bring it back.
+    registry.holdForwardedChords();
+    registry.releaseForwardedChords(false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+
+    // An update during a navigation waits: it applies if the old renderer stays...
+    registry.holdForwardedChords();
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+    registry.holdForwardedChords();
+    registry.setForwardedChords([]);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+
+    // ...and goes with it when a new document replaces it.
+    registry.holdForwardedChords();
+    registry.setForwardedChords([COMMAND_K]);
+    registry.releaseForwardedChords(false);
+    assert.equal(commandK(), false);
+    registry.setForwardedChords([COMMAND_K]);
+    assert.equal(commandK(), true);
+  });
+});
 
 describe("browserViewRegistry — recent-session input forwarding", () => {
   it("leaves page shortcuts untouched until the renderer advertises support", () => {
@@ -781,23 +885,89 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
-  it("does not apply a tab policy to unowned worker requests", async () => {
-    const { registry, lookups } = makeNetworkGuardRegistry();
-    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+  it("applies the strictest partition policy to unattributed workers", async () => {
+    const context = { hostIsThisMachine: true };
+    const { registry } = makeNetworkGuardRegistry({ allowsLocalhost: (ctx) => ctx === context });
+    const open = (viewId) =>
+      registry.openOrNavigate(viewId, "http://localhost:8080/", undefined, {
+        agent: true,
+        agentContext: context,
+      });
+    open("conv_1");
     const partition = agentPartition("w-test", "conv_1");
     const request = {
       webContentsId: 0,
-      url: "http://lvh.me/worker.js",
+      url: "http://localhost:8080/worker.js",
       resourceType: "script",
       ip: "127.0.0.1",
     };
     assert.equal(await registry.shouldCancelAgentRequest(request, partition), false);
     assert.equal(await registry.shouldCancelAgentResponse(request, partition), false);
-    assert.deepEqual(
-      registry.agentRequestHeaders({ ...request, requestHeaders: {} }, partition),
-      {},
+    registry.openOrNavigate("browser-tab:conv_1:t1", null);
+    await Promise.all(
+      [0, undefined, 999].map(async (webContentsId) => {
+        const unowned = { ...request, webContentsId };
+        assert.equal(await registry.shouldCancelAgentRequest(unowned, partition), true);
+        assert.equal(await registry.shouldCancelAgentResponse(unowned, partition), true);
+      }),
     );
-    assert.deepEqual(lookups, []);
+    assert.deepEqual(registry.agentRequestHeaders({ ...request, requestHeaders: {} }, partition), {
+      requestHeaders: { "Cache-Control": "no-cache" },
+    });
+    assert.equal(
+      await registry.shouldCancelAgentRequest(
+        { ...request, url: "https://example.com/worker.js" },
+        partition,
+      ),
+      false,
+    );
+    registry.close("conv_1");
+    registry.close("browser-tab:conv_1:t1");
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+  });
+
+  it("requires a view to use a local grant in a persistent partition", async () => {
+    const partition = "persist:shared-test";
+    const context = { hostIsThisMachine: true };
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      allowsLocalhost: (ctx) => ctx === context,
+      partitionForView: () => partition,
+    });
+    registry.openOrNavigate("conv_1", "http://localhost:8080/", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    const request = { url: "http://localhost:8080/asset", resourceType: "script" };
+    const webContentsId = idOf("conv_1");
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ ...request, webContentsId }, partition),
+      false,
+    );
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+  });
+
+  it("applies both explicit denial rules to worker requests without a view", async () => {
+    await Promise.all(
+      [agentPartition("w-test", "conv_1"), "persist:shared-test"].map(async (partition) => {
+        const { registry } = makeNetworkGuardRegistry({
+          partitionForView: () => partition,
+          getBrowserAccess: () => ({
+            level: "none",
+            blocked: ["example.com"],
+            ask: ["cdn.example.net"],
+          }),
+        });
+        registry.openOrNavigate("conv_1", "https://rebind.example/", undefined, { agent: true });
+        const blocked = { url: "https://example.com/script", ip: "93.184.215.14" };
+        const ask = { url: "https://cdn.example.net/script", ip: "93.184.215.15" };
+        await Promise.all(
+          [blocked, ask].map(async (request) => {
+            assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+            assert.equal(await registry.shouldCancelAgentResponse(request, partition), true);
+          }),
+        );
+      }),
+    );
   });
 
   it("keeps an address-based localhost allowance through every navigation guard", async () => {
@@ -866,6 +1036,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(frame), false);
     assert.equal(await registry.shouldCancelAgentResponse(frame), false);
     assert.equal(fire("will-frame-navigate", frame.url).prevented, false);
+    // A pane allowed to load a local server still can't hand a conversation to the main window.
+    for (const port of DESKTOP_OPEN_PORTS) {
+      for (const route of ["open-conversation", "status"]) {
+        const handoff = { ...frame, url: `http://127.0.0.1:${port}/${route}`, resourceType: "xhr" };
+        // oxlint-disable-next-line no-await-in-loop -- Sequential by design: one request at a time.
+        assert.equal(await registry.shouldCancelAgentRequest(handoff), true, handoff.url);
+      }
+    }
     registry.openOrNavigate("remote", "https://example.com", undefined, { agent: true });
     assert.equal(
       await registry.shouldCancelAgentRequest({ ...frame, webContentsId: idOf("remote") }),
@@ -1231,19 +1409,21 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
 
   it("sends *.localhost requests and IP-less upgrades only on a direct route for an eligible view", async () => {
     const context = { hostIsThisMachine: true };
+    const localPage = "http://preview.dev.localhost:5173/";
+    const localSocket = "ws://preview.dev.localhost:5173/hmr";
     const verdictsOn = async (resolveProxy, viewId = "local") => {
       const { registry, idOf, lookups } = makeNetworkGuardRegistry({
         allowsLocalhost: (ctx) => ctx === context,
         resolveProxy,
       });
-      registry.openOrNavigate("local", "http://spog.dev.localhost:5173/", undefined, {
+      registry.openOrNavigate("local", localPage, undefined, {
         agent: true,
         agentContext: context,
       });
       registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
       const webContentsId = idOf(viewId);
-      const page = { webContentsId, url: "http://spog.dev.localhost:5173/", resourceType: "xhr" };
-      const socket = { webContentsId, url: "ws://spog.dev.localhost:5173/hmr" };
+      const page = { webContentsId, url: localPage, resourceType: "xhr" };
+      const socket = { webContentsId, url: localSocket };
       const worker = { ...page, webContentsId: undefined };
       const verdicts = {
         request: await registry.shouldCancelAgentRequest(page),
@@ -1282,11 +1462,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       "Chromium connects a direct *.localhost to loopback",
     );
     // WebSockets are looked up by their own scheme, which picks their proxy.
-    assert.deepEqual(directLookups, [
-      "http://spog.dev.localhost:5173/",
-      "ws://spog.dev.localhost:5173/hmr",
-      "ws://spog.dev.localhost:5173/hmr",
-    ]);
+    assert.deepEqual(directLookups, [localPage, localPage, localSocket, localSocket]);
     // An `https=`-only proxy rule carries WebSockets but not plain HTTP.
     assert.deepEqual(
       await verdictsOn(async (url) =>
@@ -1304,7 +1480,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       await verdictsOn(direct, "remote"),
       {
         request: true,
-        workerRequest: false,
+        workerRequest: true,
         socketRequest: true,
         upgrade: true,
         exactLocalhost: true,
@@ -1325,7 +1501,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     // Exact localhost keeps its existing request-stage behaviour.
     const refused = {
       request: true,
-      workerRequest: false,
+      workerRequest: true,
       socketRequest: true,
       upgrade: true,
       exactLocalhost: false,

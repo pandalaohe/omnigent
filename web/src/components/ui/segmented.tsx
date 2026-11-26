@@ -3,6 +3,7 @@ import { useRef, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 export interface SegmentedProps<T extends string> {
+  "data-settings-control"?: string;
   "data-settings-row-field"?: string;
   label: string;
   options: readonly {
@@ -38,6 +39,7 @@ export function Segmented<T extends string>({
   fitHeight,
   className,
   "data-settings-row-field": settingsRowField,
+  "data-settings-control": settingsControl,
 }: SegmentedProps<T>) {
   const buttons = useRef<(HTMLButtonElement | null)[]>([]);
   return (
@@ -45,6 +47,7 @@ export function Segmented<T extends string>({
       role="radiogroup"
       aria-label={label}
       aria-disabled={disabled}
+      data-settings-control={settingsControl}
       data-settings-row-field={settingsRowField}
       className={cn(
         "inline-flex max-w-full rounded-lg bg-muted p-1",

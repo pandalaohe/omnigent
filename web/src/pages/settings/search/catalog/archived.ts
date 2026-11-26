@@ -83,7 +83,7 @@ export const ARCHIVED_SESSIONS_ENTRY = settingsEntry({
   // Each archived session's own Delete and Unarchive, and the confirmation Delete opens.
   regions: {
     sessions: {
-      rowActions: { delete: "Delete session", unarchive: "Unarchive" },
+      rowActions: { delete: "Delete session", unarchive: "Unarchive session" },
       rowOverlays: { delete: { rowActions: { cancel: "Cancel", delete: "Delete" } } },
     },
   },

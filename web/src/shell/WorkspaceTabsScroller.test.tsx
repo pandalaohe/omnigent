@@ -35,6 +35,7 @@ function strip(tabLeft: number, tabWidth = 50) {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("scrollTabIntoView", () => {

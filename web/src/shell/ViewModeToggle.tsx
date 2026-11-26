@@ -30,7 +30,16 @@ const ignoreViewChange = () => {};
  * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
  * view switch and the "…" menu.
  */
-export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
+export function ViewModeToggle({
+  hotkeyEnabled = true,
+  alwaysVisible = false,
+  variant = "header",
+}: {
+  hotkeyEnabled?: boolean;
+  alwaysVisible?: boolean;
+  /** "pane": the chat pane strip's recessed track, sized to the strip's row. */
+  variant?: "header" | "pane";
+} = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
   const segmentedRef = useRef<HTMLDivElement>(null);
@@ -65,6 +74,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
     <div
       ref={segmentedRef}
       data-testid="view-mode-toggle"
+      data-variant={variant}
       className="flex shrink-0 items-center"
       onFocusCapture={(event) => {
         const testId = (event.target as HTMLElement).dataset.testid;
@@ -79,6 +89,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
         label="Switch between chat and terminal"
         quiet
         fitHeight
+        className={variant === "pane" ? "view-mode-track" : undefined}
         options={[
           {
             value: "chat",

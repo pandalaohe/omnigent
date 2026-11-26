@@ -117,6 +117,12 @@ export function peekUnsentSends(conversationId: string): UnsentSend[] {
   return read(UNSENT_SENDS_KEY, parseUnsentSends)[conversationId] ?? [];
 }
 
+/** The latest unsent message a session holds, if any. */
+export function peekUnsentSend(conversationId: string): UnsentSend | null {
+  const sends = peekUnsentSends(conversationId);
+  return sends[sends.length - 1] ?? null;
+}
+
 /** Record the messages a session's queue holds, in order; an empty list clears it. */
 export function rememberQueuedSends(conversationId: string, sends: UnsentSend[]): void {
   if (pageHiding) return;

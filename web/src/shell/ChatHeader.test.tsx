@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -13,8 +13,8 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import type { SessionStartupHold, Session } from "@/lib/types";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import type { ChildSessionLike } from "./subagentRailGroups";
-import * as sessionsApi from "@/lib/sessionsApi";
 import { ChatHeader } from "./ChatHeader";
+import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -95,8 +95,6 @@ function renderHeader(props: {
   childCwd?: string | null;
   conversationId?: string;
   workingDirectory?: string;
-  createdBySessionId?: string;
-  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -119,6 +117,7 @@ function renderHeader(props: {
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
   settingsMode?: boolean;
+  queryClient?: QueryClient;
 }) {
   const qc =
     props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -139,7 +138,6 @@ function renderHeader(props: {
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
             workingDirectory={props.workingDirectory}
-            createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -180,57 +178,6 @@ afterEach(() => {
 });
 
 beforeEach(() => localStorage.clear());
-it.each([false, true])("links the creating session (mobile=%s)", async (mobile) => {
-  isMobileMock.mockReturnValue(mobile);
-  let resolveCreator!: (session: Session) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((resolve) => {
-      resolveCreator = resolve;
-    }),
-  );
-  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "manager" });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  await act(async () => {
-    resolveCreator({ id: "manager", title: "Release manager" } as Session);
-  });
-  expect(await screen.findByRole("link", { name: "Release manager" })).toHaveAttribute(
-    "href",
-    "/c/manager",
-  );
-  expect(lookup).toHaveBeenCalledWith("manager");
-  expect(screen.getByText(/Created by/)).toBeInTheDocument();
-  expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
-});
-
-it("rechecks creator access without displaying cached metadata", async () => {
-  const queryClient = new QueryClient();
-  const cached = { id: "private", title: "Previously shared manager" } as Session;
-  queryClient.setQueryData(["session", "private"], cached);
-  queryClient.setQueryData(["session-creator", "private"], cached);
-  let rejectCreator!: (error: Error) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((_, reject) => {
-      rejectCreator = reject;
-    }),
-  );
-  renderHeader({
-    sidebarOpen: true,
-    conversationId: "worker",
-    createdBySessionId: "private",
-    queryClient,
-  });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
-  await act(async () => {
-    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
-  });
-  expect(await screen.findByText("Created by another session")).toBeInTheDocument();
-  expect(lookup).toHaveBeenCalledWith("private");
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
-});
-
 describe("ChatHeader — deployed Share presentation", () => {
   it("matches the compact Vercel action", () => {
     renderHeader({ sidebarOpen: true, canShare: true });
@@ -915,6 +862,33 @@ describe("ChatHeader — phone session chips", () => {
     const chip = screen.queryByRole("button", { name: /^Standing approval:/ });
     if (shown) expect(chip).toBeInTheDocument();
     else expect(chip).toBeNull();
+  });
+});
+
+describe("ChatHeader — the switch in the chat pane's strip", () => {
+  it("renders the Chat/Terminal switch in the chat pane's spot while one is claimed", () => {
+    const view = renderHeaderWithSession(makeTerminalFirstCtx());
+    const header = view.container.querySelector("header")!;
+    const switchIn = (root: ParentNode) => root.querySelector('[data-testid="view-mode-toggle"]');
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+
+    const spot = document.createElement("span");
+    document.body.append(spot);
+    act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    // The claim is module-wide: let it go even when an assertion below fails.
+    onTestFinished(() => {
+      releaseChatPaneViewToggleHost("sess-1", spot);
+      spot.remove();
+    });
+    expect(switchIn(header)).toBeNull();
+    expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
+    // One switch, so its chord stays bound once.
+    expect(
+      screen.getAllByRole("group", { name: /switch between chat and terminal/i }),
+    ).toHaveLength(1);
+
+    act(() => releaseChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
   });
 });
 

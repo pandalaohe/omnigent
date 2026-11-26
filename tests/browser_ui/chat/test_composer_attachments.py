@@ -247,15 +247,10 @@ def test_landing_rejects_oversized_file_and_keeps_message(
     expect(error).to_have_count(0, timeout=10_000)
 
 
-def test_failed_upload_restores_the_message(
+def test_failed_upload_restores_the_draft_with_server_reason(
     page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path
 ) -> None:
-    """A send whose upload fails hands the message back to the composer.
-
-    Before, a failed upload left the user with an error and an empty composer:
-    ``submit`` clears the text optimistically, the optimistic bubble rolls
-    back, and nothing else held the message. Now ``send`` stashes it in
-    ``failedSendDraft`` and the composer restores it.
+    """A failed upload keeps the message editable and shows the server error.
 
     The failure is injected at the network boundary (the upload route responds
     413 with the server's real body) rather than by attaching an oversized

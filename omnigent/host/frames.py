@@ -121,6 +121,9 @@ CAP_WORKSPACE_API = "workspace_api"
 # The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
 # (32,000) instead of 8,000, so automations can send long instructions:
 CAP_LONG_SESSION_MESSAGES = "long_session_messages"
+# The host's runners ship the ``import-memory`` framework skill, so the server may
+# list it; an older runner cannot load its content:
+CAP_MEMORY_IMPORT_SKILL = "memory_import_skill"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
@@ -175,6 +178,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
     CAP_LONG_SESSION_MESSAGES,
+    CAP_MEMORY_IMPORT_SKILL,
 ]
 # The workspace API needs the optional `omnigent[workspace-api]` extra.
 if importlib.util.find_spec("connectrpc") is not None:
@@ -1708,6 +1712,20 @@ class HostFsWriteFrame:
     params: _JsonObject = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PullRequestVouch:
+    """The server's word for the pull request a call reads, from the PRs it stores.
+
+    :param server_tracked: The server stores the session's PRs and the call's PR is one of
+        them, so the host serves it even if it never recorded it.
+    :param default_pr_url: The PR a call that names none reads, e.g.
+        ``"https://github.com/example/app/pull/7"``.
+    """
+
+    server_tracked: bool = False
+    default_pr_url: str | None = None
+
+
 @dataclass
 class HostWorkspaceCallFrame:
     """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
@@ -1716,12 +1734,18 @@ class HostWorkspaceCallFrame:
     :param workspace: The session's workspace on the host, chosen by the server.
     :param method: Method name, e.g. ``"ReadFile"``.
     :param request: The serialized request message.
+    :param session_id: The session the caller was authorized for, on pull request calls.
+        Only the server sets it; a host serves no pull request call without it.
+    :param vouch: The server's vouch for a pull request call's PR, or ``None`` when the
+        server stores none of the session's PRs yet, so the host's own record decides.
     """
 
     request_id: str
     workspace: str
     method: str
     request: bytes = b""
+    session_id: str | None = None
+    vouch: PullRequestVouch | None = None
 
 
 @dataclass
@@ -2964,6 +2988,18 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "method": frame.method,
                 "request": base64.b64encode(frame.request).decode(),
+                # Older hosts ignore these keys, and serve no pull request call.
+                **({"session_id": frame.session_id} if frame.session_id is not None else {}),
+                **(
+                    {
+                        "vouch": {
+                            "server_tracked": frame.vouch.server_tracked,
+                            "default_pr_url": frame.vouch.default_pr_url,
+                        }
+                    }
+                    if frame.vouch is not None
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostWorkspaceReplyFrame):
@@ -3920,6 +3956,8 @@ def _decode_known_host_frame(
                 workspace=_required_str(msg, "workspace"),
                 method=_required_str(msg, "method"),
                 request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+                session_id=_optional_nullable_str(msg, "session_id"),
+                vouch=_optional_pull_request_vouch(msg, "vouch"),
             )
         case HostFrameKind.WORKSPACE_REPLY:
             message = _optional_nullable_str(msg, "message")
@@ -5620,6 +5658,29 @@ def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+
+
+def _optional_pull_request_vouch(msg: _JsonObject, key: str) -> PullRequestVouch | None:
+    """Return a workspace call's vouch, typed strictly: it decides which PRs ``gh`` reads.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, ``"vouch"``.
+    :returns: The vouch, or ``None`` when absent or null. Unknown keys are ignored.
+    :raises ValueError: If it isn't an object, ``server_tracked`` isn't a boolean, or
+        ``default_pr_url`` isn't a string or null.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, dict):
+        raise ValueError(f"frame field must be an object or null: {key!r}")
+    server_tracked = val.get("server_tracked", False)
+    if not isinstance(server_tracked, bool):
+        raise ValueError("frame field must be a boolean: 'vouch.server_tracked'")
+    default_pr_url = val.get("default_pr_url")
+    if default_pr_url is not None and not isinstance(default_pr_url, str):
+        raise ValueError("frame field must be a string or null: 'vouch.default_pr_url'")
+    return PullRequestVouch(server_tracked=server_tracked, default_pr_url=default_pr_url or None)
 
 
 def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:

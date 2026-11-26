@@ -946,30 +946,74 @@ async def test_codex_and_pi_stop_route_to_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_codex_interrupt_defers_to_runner_when_no_bridge_state() -> None:
-    """A missing native bridge must not suppress cancellation of runner setup."""
+async def test_codex_interrupt_defers_to_the_runner_turn_before_codex_has_a_thread() -> None:
+    """
+    Before Codex has a thread, interrupt hands Stop back to the runner's turn.
+
+    A message held while Codex starts lives in the runner's in-process turn, so
+    ``None`` lets the caller cancel that turn instead of answering 204 for nothing.
+    """
     runner, _ = _make_runner()  # default codex_bridge_state returns None
-    resp = await runner.interrupt("codex-native", "conv_cx")
-    assert resp is None
-
-
-@pytest.mark.asyncio
-async def test_codex_interrupt_defers_to_runner_before_first_native_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    from omnigent.harnesses.codex_native import bridge
-    from tests.runner.helpers import NullServerClient
-
-    async def idle_bridge(*args, **kwargs):
-        return SimpleNamespace(active_turn_id=None), tmp_path
-
-    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _id: tmp_path)
-    monkeypatch.setattr(bridge, "cancel_pending_mcp_startup", lambda _path: [])
-    runner, captured = _make_runner(
-        server_client=NullServerClient(), codex_bridge_state_for_session=idle_bridge
-    )
     assert await runner.interrupt("codex-native", "conv_cx") is None
-    assert captured["published"] == []
+
+
+@pytest.mark.parametrize("mcp_starting", [False, True], ids=["idle-thread", "mcp-unreachable"])
+@pytest.mark.asyncio
+async def test_codex_interrupt_defers_to_the_runner_turn_while_codex_runs_no_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mcp_starting: bool,
+) -> None:
+    """
+    With a thread but no Codex turn, interrupt hands Stop back to the runner's turn.
+
+    A message not yet submitted is the runner's to cancel. A pending MCP startup
+    is still cancelled locally first, and an app-server that cannot be reached yet
+    does not turn the Stop into a failure. No parent wake is deferred: no Codex turn
+    was interrupted for one to wait on.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id="conv_cx",
+        socket_path="ws://127.0.0.1:43215",
+        thread_id="thread_cx",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id=None,
+    )
+    codex_native_bridge.write_bridge_state(tmp_path, state)
+    if mcp_starting:
+        codex_native_bridge.update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    connects: list[str] = []
+
+    class _UnreachableAppServer:
+        async def connect(self) -> None:
+            connects.append("connect")
+            raise ConnectionRefusedError(111, "Connect call failed")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_a, **_kw: _UnreachableAppServer()
+    )
+
+    async def _bridge_state(conv_id: str, *, action: str, **_kw: Any) -> tuple[Any, Path]:
+        return state, tmp_path
+
+    runner, _ = _make_runner(
+        codex_bridge_state_for_session=_bridge_state,
+        server_client=SimpleNamespace(post=AsyncMock()),
+    )
+
+    assert await runner.interrupt("codex-native", "conv_cx") is None
+    assert runner._pending_interrupts == {}
+    assert connects == (["connect"] if mcp_starting else [])
+    if mcp_starting:
+        assert codex_native_bridge.read_mcp_startup(tmp_path) == {
+            "storage-console": {"status": "cancelled", "error": None}
+        }
 
 
 @pytest.mark.asyncio

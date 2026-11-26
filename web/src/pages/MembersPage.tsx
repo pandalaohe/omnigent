@@ -529,7 +529,6 @@ function InviteUrlField({ value }: { value: string }) {
               variant="outline"
               size="icon-sm"
               onClick={() => void copy()}
-              aria-label={copied ? "Copied" : "Copy"}
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>

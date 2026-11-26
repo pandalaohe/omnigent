@@ -35,6 +35,9 @@ from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.runtime import _globals
+from omnigent.runtime.caps import RuntimeCaps
+from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.runner_session_init import (
     RunnerSessionInitializer,
     runner_archive_states_for_conversation,
@@ -269,6 +272,10 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
         "omnigent.server.runner_session_init._read_build_info", lambda: (123.0, "a" * 40)
     )
     caplog.set_level(logging.INFO, logger="omnigent.server.runner_session_init")
+    # A routing server, so the envelope's routing answer is the one under test.
+    monkeypatch.setattr(
+        _globals, "_caps", RuntimeCaps(routing_backends=RoutingBackends(local=Mock()))
+    )
     registry = _Registry()
     client = _Client()
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
@@ -294,6 +301,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
     assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["smart_routing_available"] is True
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response

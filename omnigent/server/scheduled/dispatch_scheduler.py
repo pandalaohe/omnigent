@@ -26,6 +26,7 @@ from omnigent.server.scheduled.schedule import (
     next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
+    timer_interval,
 )
 from omnigent.server.scheduled.telemetry import (
     run_log_context,
@@ -230,36 +231,65 @@ class StartupLease:
             )
 
         finished_at = self._now()
-
-        def log_outcome(_previous: ScheduledTaskRun) -> None:
-            outcome = self.run.status
-            _logger.info(
-                "Scheduled run %s startup ended with status %s",
-                self.run.id,
-                outcome,
-                extra=_run_event(
-                    "scheduled_run_startup_ended",
-                    self.run,
-                    target=self._target,
-                    outcome=outcome,
-                    error_code=self.run.error_code,
-                    failure_stage=(failure_stage or startup_failure_stage(self.run.error_code))
-                    if outcome == status
-                    else None,
-                    startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
-                    prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if outcome in ("running", "succeeded")
-                    else None,
-                ),
-            )
-
         await self._transition(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
             archived_target=archived_target,
-            committed=log_outcome,
+            committed=lambda _previous: self._log_startup_ended(
+                status, failure_stage=failure_stage, finished_at=finished_at
+            ),
+        )
+
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return this timer firing unsent, for the replica that owns *host_id* to claim.
+
+        The run records ``skipped``: ``timer_host_moved``, or ``timer_cancelled`` when the
+        timer was cancelled first, which leaves nothing to claim.
+
+        :param host_id: The host the timer's session moved to, e.g. ``"host_2"``.
+        :raises StartupLeaseLost: If the run's lease no longer matches.
+        """
+        finished_at = self._now()
+        await self._write(
+            lambda: self._store.hand_back_timer_firing(self.run, now=self._now, host_id=host_id),
+            committed=lambda _previous: self._log_startup_ended(
+                "skipped",
+                failure_stage=None,
+                finished_at=finished_at,
+            ),
+        )
+
+    def _log_startup_ended(
+        self, status: str, *, failure_stage: str | None, finished_at: float
+    ) -> None:
+        """Log how this run's startup ended, once that outcome is committed.
+
+        :param status: The run's outcome, e.g. ``"skipped"``.
+        :param failure_stage: The stage that failed, or ``None`` to derive it from the code.
+        :param finished_at: When the outcome was decided, as a Unix time.
+        """
+        outcome = self.run.status
+        error_code = self.run.error_code
+        _logger.info(
+            "Scheduled run %s startup ended with status %s",
+            self.run.id,
+            outcome,
+            extra=_run_event(
+                "scheduled_run_startup_ended",
+                self.run,
+                target=self._target,
+                outcome=outcome,
+                error_code=error_code,
+                failure_stage=(failure_stage or startup_failure_stage(error_code))
+                if outcome == status
+                else None,
+                startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
+                prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
+                if outcome in ("running", "succeeded")
+                else None,
+            ),
         )
 
     def _when_writes_settle(self, callback: Callable[[], None]) -> None:
@@ -727,14 +757,18 @@ class PersistentTaskScheduler:
 
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
-            await asyncio.to_thread(
-                validate_rrule,
-                task.rrule,
-                session_mode=task.session_mode,
-                execution_target=task.execution_target,
-                # COUNT counts from creation here, so a one-time rule fires once.
-                allow_single_fire=True,
-            )
+            if task.kind == "timer":
+                # A timer keeps its own whole-second interval, not an automation's minimum.
+                timer_interval(task.rrule)
+            else:
+                await asyncio.to_thread(
+                    validate_rrule,
+                    task.rrule,
+                    session_mode=task.session_mode,
+                    execution_target=task.execution_target,
+                    # COUNT counts from creation here, so a one-time rule fires once.
+                    allow_single_fire=True,
+                )
         except RRuleSearchError:
             raise
         except RRuleValidationError:

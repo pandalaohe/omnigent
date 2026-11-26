@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -11818,6 +11819,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    resetCodeMirrorComposerLoadForTests();
   });
 
   function input() {
@@ -11936,6 +11938,36 @@ describe("NewChatLandingScreen @-file-mention", () => {
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
     expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py] explain this");
+  });
+
+  it("keeps a tag when text is typed right after its token", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    act(() => insertComposerText(composerTargetOf(input())!, "@RE"));
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(composerTargetOf(input())!.value).toBe("@README.md ");
+
+    act(() => {
+      EditorView.findFromDOM(input())!.dispatch({
+        changes: { from: 10, insert: "x" },
+        selection: { anchor: 11 },
+        userEvent: "input.type",
+      });
+    });
+    expect(composerTargetOf(input())!.value).toBe("@README.md x ");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {
@@ -12105,6 +12137,26 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // Retyping the same text without picking it is literal, not the deleted tag.
     fireEvent.change(input(), { target: { value: "read @README.md now", selectionStart: 19 } });
     expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+  });
+
+  it("brings a token deleted with Backspace back, still tagged, on undo", () => {
+    renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    fireEvent.change(input(), { target: { value: "Read @README.md", selectionStart: 15 } });
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+
+    // The textarea's own undo reports itself as a historyUndo input.
+    const textarea = input() as HTMLTextAreaElement;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+        textarea,
+        "Read @README.md",
+      );
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "historyUndo" }));
+    });
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
   });
 });
 

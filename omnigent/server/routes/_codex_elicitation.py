@@ -153,6 +153,7 @@ def _structured_codex_request_user_input(
     if not isinstance(questions_raw, list) or not questions_raw:
         return None
     questions: list[dict[str, Any]] = []
+    question_ids: set[str] = set()
     for entry in questions_raw:
         if not isinstance(entry, dict):
             continue
@@ -162,6 +163,12 @@ def _structured_codex_request_user_input(
             continue
         if not isinstance(question_text, str) or not question_text:
             continue
+        if question_id in question_ids:
+            raise OmnigentError(
+                "Codex answer IDs must be unique within a question card.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        question_ids.add(question_id)
         options_raw = entry.get("options")
         options: list[dict[str, Any]] = []
         if isinstance(options_raw, list):

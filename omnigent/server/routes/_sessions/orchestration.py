@@ -361,6 +361,7 @@ from omnigent.server.routes._sessions.helpers import (
     _had_recorded_usage,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
+    _inherited_parent_permission_launch_args,
     _inherited_placement,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
@@ -490,6 +491,7 @@ from omnigent.server.schemas import (
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
+    SessionFamily,
     SessionListItem,
     SessionModelEvent,
     SessionPullRequestSummary,
@@ -3584,6 +3586,86 @@ def _build_session_response(
     )
 
 
+# Warn-once keys for pricing fallbacks: an unconfigured provider name, or a
+# per-agent lookup failure. Pricing runs per usage event, so each logs once.
+_WARNED_PRICING_LOOKUPS: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+
+def _resolve_session_provider_entry(
+    conv: Any,
+) -> Any | None:
+    """Return the ProviderEntry for the session's actual named provider, if any.
+
+    When a session's agent declares ``executor.auth: {type: provider, name: X}``,
+    the pricing path must use provider X's configured rates rather than the
+    harness default's rates. This helper loads the agent spec via the agent
+    cache and returns the named entry when the auth is a ProviderAuth, else
+    None so the caller falls back to the default-provider lookup.
+
+    A failed lookup returns None with a warning, so it never breaks cost
+    accounting; the caller then falls back to catalog or default-provider pricing.
+
+    Known limitation: the provider is read from the agent's current bundle, not
+    the identity captured at launch. Republishing an agent with a different
+    named provider while one of its sessions is running can misattribute that
+    session's cost until the session restarts. Persisting the launch identity
+    needs an additive column, tracked as a follow-up in a separate schema PR.
+    """
+    if conv is None or not getattr(conv, "agent_id", None):
+        return None
+    try:
+        from omnigent.inference_config import load_runtime_inference_config
+        from omnigent.onboarding.detected import resolve_named_provider
+        from omnigent.onboarding.provider_config import load_config
+        from omnigent.runtime import get_agent_cache, get_agent_store
+        from omnigent.spec.types import ProviderAuth
+
+        # Bundle-resolution site: this reads the agent's CURRENT bundle (see the
+        # known limitation in the docstring), not the provider the live process
+        # launched with.
+        agent = get_agent_store().get(conv.agent_id)
+        if agent is None:
+            return None
+        agent_cache = get_agent_cache()
+        # Gate env expansion on operator_authored, not session_id: a user bundle
+        # can have no session yet still be tenant input whose ${VAR} must not expand.
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+        # Sub-agent sessions price on their own executor; resolve the child
+        # spec recursively (as the policy builder does) so nested sub-agents
+        # and the synthesized web_fetch researcher use their own provider.
+        executor = loaded.spec.executor
+        if conv.sub_agent_name:
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            if sub is not None and sub is not loaded.spec:
+                executor = sub.executor
+        auth = executor.auth if executor else None
+        if not isinstance(auth, ProviderAuth):
+            return None
+        entry = resolve_named_provider(auth.name, load_runtime_inference_config(load_config()))
+        if entry is None and auth.name not in _WARNED_PRICING_LOOKUPS:
+            # A declared provider absent from config silently reverts to
+            # default-provider pricing; warn once per name so persistent
+            # mispricing is visible without spamming this per-event path.
+            _WARNED_PRICING_LOOKUPS.add(auth.name)
+            _logger.warning(
+                "session executor names provider %r but it is not configured; "
+                "pricing falls back to the default provider",
+                auth.name,
+            )
+        return entry
+    except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
+        # Pricing reverts to the default provider here, the mispricing this
+        # resolver exists to remove, so make it visible: once per agent, since
+        # this runs on every usage event.
+        warn_key = f"lookup-error:{getattr(conv, 'agent_id', None)}"
+        if warn_key not in _WARNED_PRICING_LOOKUPS:
+            _WARNED_PRICING_LOOKUPS.add(warn_key)
+            _logger.warning("named-provider lookup failed for pricing", exc_info=True)
+        return None
+
+
 def _sane_relay_token_count(value: object) -> int:
     """
     Coerce a runner-reported token count to a trusted non-negative int.
@@ -3720,8 +3802,15 @@ def _accumulate_session_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual provider the session was launched with so
+            # sessions on a non-default named provider are priced at their
+            # configured rate rather than the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                llm_model, provider_config=provider_config, harness=harness
+                llm_model,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             price_ref = pricing.price_ref if pricing is not None else None
             priced = pricing is not None
@@ -4084,8 +4173,14 @@ def _persist_native_cumulative_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual named provider so non-default sessions are
+            # priced at their configured rate, not the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                model_name, provider_config=provider_config, harness=harness
+                model_name,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             if pricing is not None:
                 # PER GROWTH, not the running total: this report's token growth
@@ -8539,6 +8634,8 @@ async def _bind_and_launch_managed_runner(
                 tunnel_registry,
                 tracker,
                 settle_failure=False,
+                conversation_store=conversation_store,
+                host_id=managed.host_id,
             )
             if not connected:
                 reason = "managed runner did not connect after launch"
@@ -9721,6 +9818,7 @@ async def _run_managed_wake(
                 on_stage=_on_stage,
                 agent_name=agent_name,
                 slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                launch_state=tracker.get(session_id),
             )
         except SandboxGoneError:
             _logger.info(
@@ -15504,7 +15602,7 @@ async def _evaluate_independent_tool_call_policy(
 
 
 async def _evaluate_input_policy(
-    request: Request,
+    request: Request | None,
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -15532,7 +15630,8 @@ async def _evaluate_input_policy(
 
     :param request: The active FastAPI request, threaded to
         :func:`_hold_native_ask_gate` for upstream-disconnect detection
-        while parked on an ASK.
+        while parked on an ASK. ``None`` when no one waits on this input,
+        such as a timer's wake: an ASK then denies, as no one can approve it.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: The session's :class:`Conversation` entity.
@@ -15632,6 +15731,11 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
+    if request is None:
+        return {
+            "verdict": "deny",
+            "reason": f"{result.reason or 'Approval required'} (no one can approve this wake)",
+        }
     approval_started = time.monotonic()
     try:
         approved = await _hold_native_ask_gate(
@@ -18133,6 +18237,14 @@ async def _create_session_from_existing_agent_impl(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    # A sub-agent nothing above configured starts in its parent's current mode.
+    if needs_launch_args_from_spec and validated_launch_args is None:
+        validated_launch_args = await asyncio.to_thread(
+            _inherited_parent_permission_launch_args,
+            _parent_for_routing,
+            selected_harness,
+            own_spec,
+        )
 
     if explicit_permission_application is not None and explicit_permission_application.args:
         try:
@@ -18833,6 +18945,7 @@ def _create_session_from_bundle(
     worktree: str | None = None,
     agent_store: AgentStore | None = None,
     project_admission: Literal["reject", "inherit"] = "reject",
+    parent: Conversation | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -18866,6 +18979,8 @@ def _create_session_from_bundle(
         whose launch directory is their working tree.
     :param agent_store: Store holding the uploader's agents. ``None``
         gives every upload its own row.
+    :param parent: The authorized parent session row of a child upload. A
+        child whose spec sets no launch args starts in its current mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -18908,6 +19023,10 @@ def _create_session_from_bundle(
                 f"invalid terminal_launch_args in bundled child spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if terminal_launch_args is None:
+            terminal_launch_args = _inherited_parent_permission_launch_args(
+                parent, _spec_harness(spec), spec
+            )
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
     elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
@@ -20689,41 +20808,61 @@ async def _get_session_snapshot(
         observed = int(raw_window_label)
         if observed > 0:
             context_window = observed
-    # Resolve strict runner + host liveness for the open-session view.
-    # The lookup hits the conversations + hosts tables, so offload it to
-    # a worker thread (mirroring _apply_liveness_to_items). Left None on
-    # both fields when no lookup is wired (focused tests).
+    permission_store = (
+        getattr(request.app.state, "permission_store", None) if request is not None else None
+    )
+
+    def _read_overlays() -> tuple[
+        dict[str, SessionLiveness] | None,
+        dict[str, Any],
+        Host | None,
+        list[dict[str, Any]],
+        dict[str, SessionFamily] | None,
+    ]:
+        # Independent reads share one worker-thread hop: each hop waits in the
+        # default executor's queue, which dominates latency on a busy replica.
+        # Liveness hits the conversations + hosts tables; left None when no
+        # lookup is wired (focused tests).
+        liveness = liveness_lookup([session_id]) if liveness_lookup is not None else None
+        # Display costs include descendants. Empty usage marks a skipped aggregate;
+        # None would fall back to the parent's own spend and under-report it.
+        usage = (
+            load_session_usage(conv.id, conv_store, root_conversation_id=conv.root_conversation_id)
+            if include_usage
+            else {}
+        )
+        # Static signal telling the open view a host-bound, host-down session is a
+        # resumable managed host it can wake by sending a message, vs a terminal
+        # host_offline dead-end. Computed independently of liveness_lookup (the web
+        # chat passes include_liveness=False, so host_online is None here and
+        # liveness arrives via the poll/stream). One indexed host read, gated to
+        # host-bound sessions.
+        host = (
+            host_store.get_host(conv.host_id)
+            if host_store is not None and sandbox_config is not None and conv.host_id is not None
+            else None
+        )
+        pending = _pending_elicitation_snapshot_for_session(conv_store, conv)
+        families = None
+        if request is not None:
+            from omnigent.server.session_families import project_families
+
+            _, families = project_families(conv_store, permission_store, [conv], viewer_id)
+        return liveness, usage, host, pending, families
+
+    liveness, subtree_usage, host_for_resume, pending_events, families = await asyncio.to_thread(
+        _read_overlays
+    )
     runner_online: bool | None = None
     host_online: bool | None = None
-    if liveness_lookup is not None:
-        liveness = await asyncio.to_thread(liveness_lookup, [session_id])
+    if liveness is not None:
         result = liveness.get(session_id)
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Display costs include descendants. Empty usage marks a skipped aggregate;
-    # None would fall back to the parent's own spend and under-report it.
-    subtree_usage = (
-        await asyncio.to_thread(
-            load_session_usage,
-            conv.id,
-            conv_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
-        if include_usage
-        else {}
-    )
-    # Static signal telling the open view a host-bound, host-down session is a
-    # resumable managed host it can wake by sending a message, vs a terminal
-    # host_offline dead-end. Computed independently of liveness_lookup (the web
-    # chat passes include_liveness=False, so host_online is None here and
-    # liveness arrives via the poll/stream). One indexed host read, gated to
-    # host-bound sessions.
     host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
-        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
-        if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    if host_for_resume is not None and sandbox_config is not None:
+        host_resumable = host_resume_supported(host_for_resume, sandbox_config)
     # A claude-native turn waiting on its background agent keeps the collapsed
     # ``running`` status: released headless ``-p`` clients stop polling on any
     # other value and would return before the agent's result. The agents ride
@@ -20732,11 +20871,6 @@ async def _get_session_snapshot(
         _session_background_agents_cache.get(session_id)
         if status == "running" and _session_status_cache.get(session_id) == "waiting"
         else None
-    )
-    pending_elicitation_events = await asyncio.to_thread(
-        _pending_elicitation_snapshot_for_session,
-        conv_store,
-        conv,
     )
     # The sweeper owns the per-agent cold-after read (owner resolution +
     # preferences). Without one — focused tests, or a request-free caller —
@@ -20768,7 +20902,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        pending_elicitation_events=pending_elicitation_events,
+        pending_elicitation_events=pending_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,
@@ -20778,16 +20912,7 @@ async def _get_session_snapshot(
         harness=harness,
         agent=agent,
     )
-    if request is not None:
-        from omnigent.server.session_families import project_families
-
-        _, families = await asyncio.to_thread(
-            project_families,
-            conv_store,
-            getattr(request.app.state, "permission_store", None),
-            [conv],
-            viewer_id,
-        )
+    if families is not None:
         response.family = families.get(conv.id)
         if (
             response.family

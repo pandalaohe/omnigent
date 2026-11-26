@@ -914,6 +914,14 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response | None:
+        """
+        Interrupt the session's Codex turn, or hand a turn waiting for Codex to the caller.
+
+        :param conv_id: Session whose turn to interrupt.
+        :returns: The interrupt's response, or ``None`` when Codex runs no turn
+            (after stopping any MCP startup), so the caller cancels an in-process
+            turn still waiting to submit its message, or settles a Stop with no turn.
+        """
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
             client_for_transport,
@@ -930,6 +938,7 @@ class NativeInterruptRunner:
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
+            # A message held for Codex to start lives in the runner's turn, not in Codex.
             return None
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         active_child_turns = [
@@ -937,6 +946,7 @@ class NativeInterruptRunner:
             for child_tid, info in read_active_child_turns(bridge_dir).items()
         ]
         if state.active_turn_id is None and not pending_mcp and not active_child_turns:
+            # Nothing to stop in Codex; a message not yet submitted is the runner's to cancel.
             self._logger.info(
                 "Codex-native interrupt defers to runner cancellation for %s: "
                 "no active turn or MCP startup.",
@@ -1077,6 +1087,15 @@ class NativeInterruptRunner:
                             # A superseded id proves a newer helper turn is still live.
                             raise
         except Exception as exc:
+            if state.active_turn_id is None and not active_child_turns:
+                # The MCP cancel already took effect locally; a held message is still the
+                # runner's to cancel even when the app-server cannot be reached yet.
+                self._logger.warning(
+                    "Codex-native MCP startup interrupt failed for session=%s",
+                    conv_id,
+                    exc_info=True,
+                )
+                return None
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,
@@ -1098,6 +1117,9 @@ class NativeInterruptRunner:
                 await asyncio.wait_for(
                     codex_client.close(), timeout=_CODEX_INTERRUPT_CLOSE_TIMEOUT_S
                 )
+        if state.active_turn_id is None:
+            # Only MCP startup was stopped; a message not yet submitted is the runner's to cancel.
+            return None
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 

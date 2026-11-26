@@ -26,6 +26,7 @@ import {
   containsMermaidDiagram,
   keyboardActiveQuestionId,
   placeUndeliveredBubbles,
+  withUncommittedUserBubbles,
 } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
@@ -1480,5 +1481,27 @@ describe("ConversationScrollRefBridge", () => {
     );
     expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
     expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
+  });
+});
+
+describe("withUncommittedUserBubbles", () => {
+  it("keeps the order of pending sends in submission order", () => {
+    const earlier = {
+      tempId: "pend_10",
+      content: [{ type: "input_text" as const, text: "first" }],
+      createdAtS: 100,
+    };
+    const later = {
+      tempId: "pend_9",
+      content: [{ type: "input_text" as const, text: "second" }],
+      createdAtS: 100,
+    };
+
+    const bubbles = withUncommittedUserBubbles([], [earlier, later], [], null);
+
+    expect(bubbles.map((bubble) => (bubble.kind === "user" ? bubble.itemId : null))).toEqual([
+      "pend_10",
+      "pend_9",
+    ]);
   });
 });

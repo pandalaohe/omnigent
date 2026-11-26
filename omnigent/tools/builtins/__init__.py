@@ -287,11 +287,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "sys_standing_pass": None,
     "sys_approval_answer": None,
     "sys_host_restart": None,
-    # Session file tools: auto-registered by ``ToolManager._register_file_tools``
-    # unless the spec sets ``tool_groups.files: false``.
-    "sys_upload_file": None,
-    "sys_list_files": None,
-    "sys_download_file": None,
+    # Session file tools: registered by ``ToolManager._register_file_tools``
+    # only when the spec sets ``tool_groups.files: true``.
+    "sys_files_upload": None,
+    "sys_files_list": None,
+    "sys_files_download": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved

@@ -459,6 +459,7 @@ async def test_session_projects_unions_first_class_and_labels(
             "id": both["id"],
             "name": "Both",
             "icon": None,
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         },
@@ -466,6 +467,7 @@ async def test_session_projects_unions_first_class_and_labels(
             "id": empty["id"],
             "name": "Empty FC",
             "icon": None,
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         },
@@ -473,6 +475,7 @@ async def test_session_projects_unions_first_class_and_labels(
             "id": None,
             "name": "Label Only",
             "icon": None,
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         },
@@ -501,6 +504,7 @@ async def test_session_projects_surfaces_config_icon(
             "id": fire["id"],
             "name": "Fire",
             "icon": "🔥",
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         },
@@ -508,9 +512,30 @@ async def test_session_projects_surfaces_config_icon(
             "id": plain["id"],
             "name": "Plain",
             "icon": None,
+            "muted": False,
             "archived_at": None,
             "archive_summary": {"sessions": 0, "tasks": 0},
         },
+    ]
+
+
+async def test_session_projects_surfaces_config_muted(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Only a literal ``config.muted: true`` marks the sidebar folder muted."""
+    muted = (
+        await project_client.post("/v1/projects", json={"name": "A", "config": {"muted": True}})
+    ).json()
+    # A non-boolean value someone else wrote into the opaque config doesn't mute.
+    truthy = (
+        await project_client.post("/v1/projects", json={"name": "B", "config": {"muted": "yes"}})
+    ).json()
+
+    resp = await project_client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert [(row["id"], row["muted"]) for row in resp.json()] == [
+        (muted["id"], True),
+        (truthy["id"], False),
     ]
 
 

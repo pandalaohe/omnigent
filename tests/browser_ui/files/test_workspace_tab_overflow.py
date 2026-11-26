@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.browser_ui.files.test_file_line_navigation import (
     BrowserSession,
@@ -19,12 +19,10 @@ from tests.browser_ui.files.test_file_line_navigation import (
 seeded_session = seeded_session_fixture
 
 
-@pytest.mark.parametrize("width", [240, 360, 472, 900])
-def test_workspace_tab_overflow(
-    page: Page, seeded_session: BrowserSession, width: int, output_path: str
-) -> None:
-    Path(output_path).mkdir(parents=True, exist_ok=True)
-    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(12)}
+def _open_file_tabs(
+    page: Page, seeded_session: BrowserSession, files: dict[str, str], width: int
+) -> Locator:
+    """Open every file as a tab in a rail *width* pixels wide; return the tab toolbar."""
     paths = list(files)
     _mock_markdown_files(page, seeded_session, files)
     environment_url = (
@@ -70,6 +68,38 @@ def test_workspace_tab_overflow(
     page.set_viewport_size({"width": 1800, "height": 1000})
     page.goto(f"{seeded_session.contract.base_url}/c/{seeded_session.session_id}")
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")
+    expect(toolbar.locator("[data-workspace-tabs-viewport]")).to_be_visible(timeout=30_000)
+    return toolbar
+
+
+def test_workspace_tabs_shrink_before_showing_icons(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    # Too wide together at full width, but they fit at the 64px floor.
+    files = {f"src/shrinking-workspace-tab-{index}.md": f"# Tab {index}" for index in range(6)}
+    toolbar = _open_file_tabs(page, seeded_session, files, 900)
+    viewport = toolbar.locator("[data-workspace-tabs-viewport]")
+    tabs = viewport.locator('[role="button"][aria-current]')
+    expect(tabs).to_have_count(len(files))
+
+    # The tabs keep their labels, truncated to fit, and the strip doesn't scroll.
+    expect(viewport.locator("[data-compact]")).to_have_count(0)
+    assert viewport.evaluate("el => el.scrollWidth <= el.clientWidth")
+    assert tabs.evaluate_all("""tabs => tabs.every((tab) => {
+        const label = tab.querySelector('span.truncate');
+        const width = tab.getBoundingClientRect().width;
+        return label && label.scrollWidth > label.clientWidth && width >= 63.5;
+    })""")
+
+
+@pytest.mark.parametrize("width", [240, 360, 472, 900])
+def test_workspace_tab_overflow(
+    page: Page, seeded_session: BrowserSession, width: int, output_path: str
+) -> None:
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(12)}
+    paths = list(files)
+    toolbar = _open_file_tabs(page, seeded_session, files, width)
     viewport = toolbar.locator("[data-workspace-tabs-viewport]")
     expect(viewport).to_be_visible(timeout=30_000)
     # Tabs fit the strip; the picker holds tabs beyond the minimum usable width.
@@ -96,7 +126,9 @@ def test_workspace_tab_overflow(
     )
     page.screenshot(path=Path(output_path) / f"tab-picker-{width}.png")
     page.get_by_role("menuitem", name=paths[-1], exact=True).click()
-    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("Panel 11")
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
+        f"Panel {len(paths) - 1}"
+    )
     # Radix refocuses the trigger from a timer queued after the menu unmounts; a
     # mouse pick must skip that or the tooltip re-opens. Give that timer a short,
     # bounded window before asserting that focus and the tooltip stayed away.

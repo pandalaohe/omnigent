@@ -56,7 +56,9 @@ _logger = logging.getLogger(__name__)
 # the idle clock.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
 
-# A background shell alone can spare a pane for a day after its other work.
+# A background shell that outlives its turn emits nothing, so it alone spares the
+# pane for at most this long after the pane's other work, as a human wait does
+# for the runner: a long build survives, a forgotten server cannot pin the pane.
 BACKGROUND_SHELL_PANE_HOLD_S = 24 * 60 * 60.0
 AGY_BACKGROUND_TASK_CAPTURE_TIMEOUT_S = 1.0
 

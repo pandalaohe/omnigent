@@ -255,9 +255,11 @@ export class ConversationRegistry {
       const existingPendingIds = new Set(
         existingState.pendingUserMessages.map((item) => item.tempId),
       );
-      const missingPending = old
-        .getState()
-        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
+      // Every pending message the live entry lacks, posted or not: a just-sent bubble stays until its echo.
+      const oldState = old.getState();
+      const missingPending = oldState.pendingUserMessages.filter(
+        (item) => !existingPendingIds.has(item.tempId),
+      );
       if (missingPending.length > 0) {
         existing.setState({
           pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],

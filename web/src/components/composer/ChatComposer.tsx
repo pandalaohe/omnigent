@@ -104,7 +104,7 @@ export type EngineComposerInput = Omit<ComposerInputProps, "onKeyDown"> & {
 };
 
 /** The engine a ChatComposer renders, for the inputs inside it (the tail and quote blocks). */
-const ComposerEngineContext = createContext<ComposerInputEngine>("textarea");
+export const ComposerEngineContext = createContext<ComposerInputEngine>("textarea");
 
 type ChatComposerInputProps =
   | {

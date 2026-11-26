@@ -782,7 +782,7 @@ class SysSessionGetInfoTool(Tool):
     A **global read**: resolves against any session the caller is
     permitted to access (bounded by the server's per-user permission
     model), not just the caller's spawn subtree. Reports lifecycle
-    status, title, agent binding (id + name), runner binding and live
+    status, archived state, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, current permission mode, parent
     linkage, workspace / git branch, project, persisted last-activity time,
@@ -795,8 +795,9 @@ class SysSessionGetInfoTool(Tool):
     the server observes status; for a claude-native session without its
     status file a quiet lull reads as idle and restarts it. Comparing
     ``running_since`` / ``last_activity_at`` across polls distinguishes a
-    running session that is advancing from one that has stalled. For the
-    conversation transcript, use
+    running session that is advancing from one that has stalled. With
+    ``include_usage`` the metadata includes aggregate cost and tokens by
+    model. For the conversation transcript, use
     ``sys_session_get_history`` instead. List rows carry project,
     workspace, last activity time and a last-message excerpt.
 
@@ -836,6 +837,7 @@ class SysSessionGetInfoTool(Tool):
             "server clock; running_since is the start of the current running "
             "period as the server observes status (for claude-native without "
             "its status file, a quiet lull reads as idle and restarts it). "
+            "Pass include_usage: true to aggregate cost and token usage by model. "
             "Global read — any session you can access. Pass session_id to "
             "target one session, or session_ids (up to 20) to describe many "
             'in one call as {"sessions": [...]} with per-item errors; omit '
@@ -866,7 +868,7 @@ class SysSessionGetInfoTool(Tool):
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict; ``session_id`` / ``session_ids`` are
             optional and mutually exclusive, and ``include_host_readiness``
-            opts the batch form into host readiness.
+            opts the batch form into host readiness. ``include_usage`` requests usage totals.
         """
         return {
             "type": "function",
@@ -885,6 +887,14 @@ class SysSessionGetInfoTool(Tool):
                                 "sys_session_send handle. Omit to "
                                 "describe the calling session itself. "
                                 "Mutually exclusive with session_ids."
+                            ),
+                        },
+                        "include_usage": {
+                            "type": "boolean",
+                            "description": (
+                                "Also return the session's cost and token "
+                                "usage so far. Off by default because it sums "
+                                "usage over the session's sub-agents."
                             ),
                         },
                         "session_ids": {
@@ -1365,10 +1375,13 @@ class SysSessionCreateTool(Tool):
                                 "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
-                                "are refused. Omit to start it in your current mode when both "
-                                "run Claude Code or Codex and its agent sets none (a mode that "
-                                "skips approval only on your own host), else in the agent's "
-                                "default."
+                                "are refused. Omit it and a child of a Claude Code "
+                                "session starts in the closest match to that session's "
+                                "current mode, if the agent sets none; another session "
+                                "starts in your current mode when both run Claude Code or "
+                                "Codex and its agent sets none (a mode that skips approval "
+                                "only on your own host), else in "
+                                "the agent's default."
                             ),
                         },
                         "speed": {

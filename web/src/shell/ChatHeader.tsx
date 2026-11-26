@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArchiveIcon,
@@ -45,7 +46,6 @@ import {
 import { AgentInfoButton, agentDisplayLabel } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import type { ChildSessionLike } from "./subagentRailGroups";
-import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -64,6 +64,7 @@ import { PIN_TRAILING_PADDING } from "./MobileMenuPinToggle";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
+import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
@@ -186,7 +187,6 @@ interface ChatHeaderProps {
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   workingDirectory?: string | null;
-  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed row backing the title-adjacent action menu. */
@@ -395,7 +395,6 @@ export function ChatHeader({
   childCwd,
   conversationId,
   workingDirectory,
-  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -433,6 +432,8 @@ export function ChatHeader({
   const phoneComposerHidden =
     isMobile && !!terminalFirst && (terminalFirst.isShellView || terminalFirst.view === "terminal");
   const rightPanelShortcut = useShortcutHint("toggleWorkspaceSidebar");
+  // Floating panes give the switch to the chat pane's own strip.
+  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
   const canvas = useCanvasWorkspace();
   const serverInfo = useServerInfo();
   useCanvasHeaderPaletteCommands(canvas);
@@ -818,9 +819,6 @@ export function ChatHeader({
             Queued (host load)
           </span>
         )}
-        {conversationId && createdBySessionId && (
-          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
-        )}
         {conversationId && (
           <SessionChoiceCard
             labels={actionConversation?.labels}
@@ -884,7 +882,13 @@ export function ChatHeader({
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {!pending && conversationId && <ViewModeToggle />}
+        {!pending &&
+          conversationId &&
+          (viewToggleHost ? (
+            createPortal(<ViewModeToggle variant="pane" alwaysVisible />, viewToggleHost)
+          ) : (
+            <ViewModeToggle />
+          ))}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

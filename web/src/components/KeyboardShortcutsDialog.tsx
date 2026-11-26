@@ -2,7 +2,7 @@
 // It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
 // Mount it once near the app shell.
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 
 import { Kbd, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import {
@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -30,6 +31,11 @@ import {
 } from "@/lib/nativeBridge";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
 import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
+import {
+  type ShortcutPageContext,
+  type ShortcutPageGroup,
+  shortcutPageGroups,
+} from "@/lib/shortcuts/shortcutPage";
 import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -42,38 +48,54 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-/**
- * The shortcut reference shared by the dialog and Settings page. The dialog
- * keeps the compact inline list; Settings uses section headings with bordered
- * list cards to match the rest of its content.
- */
-/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
-export function useShortcutPageGroups() {
+/** What the Keyboard shortcuts page lists here, computed at render so tests can vary the runtime. */
+export function useShortcutPageContext(): ShortcutPageContext {
   useKeyboardShortcutsVersion();
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
-  return shortcutGroupsFor({
+  const alwaysSteer = useAlwaysSteer();
+  return {
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
     submitWithModEnter: readSubmitWithModEnter(),
     preventsKeyboardSubmit,
+    alwaysSteer,
     contentSearch: !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
     grids: !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
-  });
+  };
 }
 
+/** The Keyboard shortcuts page's groups here, rebuilt only when a field of the context changes. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
+  // A string, since every render makes a new context object.
+  const contextKey = JSON.stringify(useShortcutPageContext());
+  return useMemo(
+    () => shortcutPageGroups(JSON.parse(contextKey) as ShortcutPageContext),
+    [contextKey],
+  );
+}
+
+/**
+ * The shortcut reference shared by the dialog and Settings page. The dialog
+ * keeps the compact inline list; Settings uses section headings with bordered
+ * list cards to match the rest of its content.
+ */
 export function KeyboardShortcutsList({
   variant = "compact",
+  groups: shownGroups,
 }: {
   variant?: "compact" | "settings";
+  /** The groups to list, such as the Settings page's filtered ones; every group otherwise. */
+  groups?: readonly ShortcutPageGroup[];
 }) {
-  const groups = useShortcutPageGroups();
+  const context = useShortcutPageContext();
+  const groups = shownGroups ?? shortcutGroupsFor(context);
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
@@ -94,6 +116,7 @@ export function KeyboardShortcutsList({
           <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
             {group.items.map((item) => {
               const keys = item.keys;
+              const lastKeySeparator = "lastKeySeparator" in item ? item.lastKeySeparator : null;
               const className = settings
                 ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
                 : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0";
@@ -103,9 +126,9 @@ export function KeyboardShortcutsList({
                   <span className="flex shrink-0 items-center gap-1">
                     {keys.map((key, index) => (
                       <Fragment key={`${item.label}-${key}`}>
-                        {index === keys.length - 1 && item.lastKeySeparator ? (
+                        {index === keys.length - 1 && lastKeySeparator ? (
                           <span aria-hidden="true" className="text-muted-foreground/70">
-                            {item.lastKeySeparator}
+                            {lastKeySeparator}
                           </span>
                         ) : null}
                         <Kbd>{key}</Kbd>
@@ -122,11 +145,11 @@ export function KeyboardShortcutsList({
                   </span>
                 </>
               );
-              // Settings lists each row so search can reveal it; the shortcut dialog doesn't.
-              return settings ? (
+              // Settings lists each row so search can reveal it; the dialog doesn't.
+              return settings && item.shortcutId !== undefined ? (
                 <ShortcutSettingsRow
                   key={item.label}
-                  row={item}
+                  row={{ ...item, shortcutId: item.shortcutId }}
                   group={group}
                   className={className}
                 >

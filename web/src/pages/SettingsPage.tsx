@@ -59,6 +59,8 @@ import { SETTINGS_PAGE_SIZE } from "@/lib/settingsPagination";
 import { useSettingsPageCursor } from "@/hooks/useSettingsPageCursor";
 import { ApiError } from "@/lib/sessionsApi";
 import { isRetryableRequestError } from "@/lib/queryRetry";
+import { paneCornersSetting } from "@/shell/settingsCommands";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useComments } from "@/hooks/useComments";
 import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
@@ -143,7 +145,9 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROACTIVE_AGENT_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
@@ -156,6 +160,7 @@ import {
   COLOR_THEME_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
+  PANE_CORNERS_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -176,6 +181,7 @@ import {
   ALWAYS_USE_WORKTREE_ENTRY,
   DEFAULT_BASE_BRANCH_ENTRY,
   DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
+  WORKTREE_LOCATION_ENTRY,
 } from "@/pages/settings/search/catalog/git";
 import {
   DATABRICKS_CONNECTION_ENTRY,
@@ -196,6 +202,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Switch } from "@/components/ui/switch";
 import { Segmented } from "@/components/ui/segmented";
 import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
+import { TrustedRemoteHostsSettingsGroup } from "@/components/BrowserPane/agentTools/TrustedRemoteHostsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -477,10 +484,16 @@ import {
   isElectronShell,
   resetCliPath,
   supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import {
+  desktopAppHandoffSupported,
+  readOpenInDesktopApp,
+  writeOpenInDesktopApp,
+} from "@/lib/desktopAppHandoff";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 import { cn } from "@/lib/utils";
 import {
@@ -490,8 +503,10 @@ import {
 import { SettingsAgentsSection } from "./settings/SettingsAgentsSection";
 import { ApiKeysSettings } from "@/components/ApiKeysSettings";
 import { ConnectedAppsSettings } from "@/components/ConnectedAppsSettings";
+import { SearchableShortcutsList } from "./settings/SearchableShortcutsList";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
+import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies / Global
 // instructions / Sharing settings sub-categories. Visible to admins in all
@@ -859,6 +874,54 @@ function TerminalThemeControl() {
         />
       </SettingsOwner>
     </SettingsItem>
+  );
+}
+
+/** Floating panes or sharp corners on this device; the same setting ⌘K's Pane corners row offers. */
+function PaneCornersControl() {
+  const paneCorners = usePaneCorners();
+  const setting = paneCornersSetting(paneCorners);
+  const current = setting.choices.find((choice) => choice.value === setting.current);
+  return (
+    <SettingsItem entry={PANE_CORNERS_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={PANE_CORNERS_ENTRY} className="flex-1" />
+      <SettingsOwner entry={PANE_CORNERS_ENTRY}>
+        <Select
+          value={setting.current}
+          onValueChange={(next) => void setting.choose(next)}
+          componentId="settings.appearance.pane_corners"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            {...settingsControlProps(PANE_CORNERS_ENTRY)}
+            data-testid="pane-corners-select"
+            className="w-full sm:w-56"
+          >
+            <SelectValue>{current?.label}</SelectValue>
+          </SelectTrigger>
+          <SelectContent {...settingsOverlayProps(PANE_CORNERS_ENTRY)}>
+            {setting.choices.map((choice) => (
+              <SelectItem
+                key={choice.value}
+                value={choice.value}
+                data-testid={`pane-corners-${choice.value}`}
+              >
+                {choice.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SettingsOwner>
+    </SettingsItem>
+  );
+}
+
+function PaneCornersRow() {
+  if (!usePaneCorners().available) return null;
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <PaneCornersControl />
+    </div>
   );
 }
 
@@ -1596,6 +1659,7 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />
             </div>
+            <PaneCornersRow />
             <div className="mt-4 border-t border-border pt-4">
               <TerminalThemeControl />
             </div>
@@ -2362,6 +2426,35 @@ function ProjectKanbanBoardControl() {
   );
 }
 
+/**
+ * Whether a conversation link opened in this browser moves to the running
+ * desktop app. Ordinary browsers only; off until the user accepts the page's offer.
+ */
+function OpenInDesktopAppControl() {
+  const [enabled, setEnabled] = useState(readOpenInDesktopApp);
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenInDesktopApp(next);
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={OPEN_IN_DESKTOP_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_IN_DESKTOP_APP_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(OPEN_IN_DESKTOP_APP_ENTRY)}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-in-desktop-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_in_desktop_app"
+      />
+    </SettingsItem>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
 
@@ -2527,7 +2620,7 @@ function ProactiveAgentGroup() {
   if (!available) return null;
   return (
     <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
-      <ProactiveAgentSettingControl scope="me" />
+      <ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />
     </SettingsGroup>
   );
 }
@@ -2536,6 +2629,8 @@ function GeneralSection() {
   const info = useServerInfo();
   const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   const titleInstructions = info !== "loading" && info.session_title_instructions === true;
+  const globalShortcut = supportsGlobalShortcut();
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   return (
     <Section title="General">
       <div className="flex flex-col gap-6">
@@ -2666,6 +2761,11 @@ function GeneralSection() {
             </ExpandableSettings>
           </SettingsGroup>
         )}
+        {desktopAppHandoffSupported() && (
+          <SettingsGroup title="Conversation links" testId="settings-group-conversation-links">
+            <OpenInDesktopAppControl />
+          </SettingsGroup>
+        )}
         {usageBoardAvailable(info) && (
           <SettingsGroup title="Usage board" testId="settings-group-usage-settings">
             <ExpandableSettings id="usage-settings" title="Usage board">
@@ -2677,13 +2777,19 @@ function GeneralSection() {
         )}
         <ProactiveAgentGroup />
         <BrowserAgentToolsSettingsGroup />
-        {supportsGlobalShortcut() && (
+        <TrustedRemoteHostsSettingsGroup />
+        {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
-            <GlobalShortcutControl />
-            {isFeatureEnabled(info, "floating_composer") && (
+            {globalShortcut && <GlobalShortcutControl />}
+            {globalShortcut && isFeatureEnabled(info, "floating_composer") && (
               // Empty, and hidden, unless the shell can change the panel's shortcut by id.
               <div className="mt-4 border-t border-border pt-4 empty:hidden">
                 <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
+            {widenWindowForRightSidebar && (
+              <div className={cn(globalShortcut && "mt-4 border-t border-border pt-4")}>
+                <WidenWindowForRightSidebarControl />
               </div>
             )}
           </SettingsGroup>
@@ -2816,125 +2922,132 @@ function WorktreeLocationControl() {
   const error = loadFailed ? "Could not load the worktree location." : saveError;
 
   return (
-    <fieldset disabled={controlsDisabled} className="min-w-0 space-y-3">
-      <SettingsLabel
-        label="Worktree location"
-        note={null}
-        description="Where new worktrees are created on every host. Custom paths must include the repository and branch variables and start with {entry}, {repo_parent}, ~ or an absolute path. The server checks the path before saving."
-      />
-      <Segmented<WorktreeLocationPreset>
-        label="Worktree location"
-        value={preset}
-        onChange={(value) => {
-          setPreset(value);
-          setSaveError(null);
-        }}
-        options={[
-          { value: "sibling", label: "Next to repository" },
-          { value: "project", label: "Inside project" },
-          { value: "custom", label: "Custom" },
-        ]}
-      />
-      {preset === "custom" && (
-        <div className="space-y-2">
-          <Input
-            ref={inputRef}
-            type="text"
-            aria-label="Worktree location template"
-            data-testid="settings-worktree-location-input"
-            placeholder="{repo_parent}/{repo}-worktrees/{branch}"
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            className="h-9 w-full min-w-0"
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              setSaveError(null);
-            }}
-            disabled={controlsDisabled}
-            componentId="settings.git.worktree_location"
-          />
-          <div className="flex flex-wrap gap-2" aria-label="Path variables">
-            {[
-              ["entry", "Project folder"],
-              ["repo_parent", "Repository parent"],
-              ["repo", "Repository name"],
-              ["branch", "Branch name"],
-            ].map(([variable, label]) => (
-              <Button
-                key={variable}
-                type="button"
-                variant="outline"
-                size="sm"
-                aria-label={`Insert ${label.toLowerCase()}`}
-                onClick={() => {
-                  const input = inputRef.current;
-                  const start = input?.selectionStart ?? draft.length;
-                  const end = input?.selectionEnd ?? start;
-                  const token = `{${variable}}`;
-                  setDraft(draft.slice(0, start) + token + draft.slice(end));
-                  setSaveError(null);
-                  requestAnimationFrame(() => {
-                    input?.focus();
-                    input?.setSelectionRange(start + token.length, start + token.length);
-                  });
-                }}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-        </div>
-      )}
-      {error === null && (
-        <p className="text-sm text-muted-foreground">
-          Template with sample values (not validated):{" "}
-          <span
-            data-testid="settings-worktree-location-example"
-            className="font-mono wrap-anywhere"
-          >
-            {example || "Enter a custom path."}
-          </span>
-        </p>
-      )}
-      <div className="flex flex-wrap gap-2">
-        <Button
-          size="sm"
-          className="h-9"
-          disabled={!canSave}
-          loading={saving}
-          data-testid="settings-worktree-location-save"
-          onClick={() => void save(nextTemplate)}
-          componentId="settings.git.worktree_location_save"
-        >
-          Save location
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-9"
-          disabled={controlsDisabled || stored === null}
-          data-testid="settings-worktree-location-reset"
-          onClick={() => {
-            setPreset("sibling");
-            void save(null);
+    <SettingsItem entry={WORKTREE_LOCATION_ENTRY}>
+      <fieldset disabled={controlsDisabled} className="min-w-0 space-y-3">
+        <SettingsEntryLabel
+          entry={WORKTREE_LOCATION_ENTRY}
+          note={null}
+          description="Where new worktrees are created on every host. Custom paths must include the repository and branch variables and start with {entry}, {repo_parent}, ~ or an absolute path. The server checks the path before saving."
+        />
+        <Segmented<WorktreeLocationPreset>
+          label={WORKTREE_LOCATION_ENTRY.parts.preset}
+          {...settingsControlProps(WORKTREE_LOCATION_ENTRY, "preset")}
+          value={preset}
+          onChange={(value) => {
+            setPreset(value);
+            setSaveError(null);
           }}
-          componentId="settings.git.worktree_location_reset"
-        >
-          Use default location
-        </Button>
-      </div>
-      {error !== null && (
-        <p
-          role="alert"
-          data-testid="settings-worktree-location-error"
-          className="text-sm text-destructive"
-        >
-          {error}
-        </p>
-      )}
-    </fieldset>
+          options={[
+            { value: "sibling", label: "Next to repository" },
+            { value: "project", label: "Inside project" },
+            { value: "custom", label: "Custom" },
+          ]}
+        />
+        {preset === "custom" && (
+          <div className="space-y-2">
+            <Input
+              ref={inputRef}
+              type="text"
+              {...settingsControlProps(WORKTREE_LOCATION_ENTRY, "template")}
+              data-testid="settings-worktree-location-input"
+              placeholder="{repo_parent}/{repo}-worktrees/{branch}"
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              className="h-9 w-full min-w-0"
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                setSaveError(null);
+              }}
+              disabled={controlsDisabled}
+              componentId="settings.git.worktree_location"
+            />
+            <div className="flex flex-wrap gap-2" aria-label="Path variables">
+              {(
+                [
+                  ["entry", "Project folder"],
+                  ["repo_parent", "Repository parent"],
+                  ["repo", "Repository name"],
+                  ["branch", "Branch name"],
+                ] as const
+              ).map(([variable, label]) => (
+                <Button
+                  key={variable}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  {...settingsControlProps(WORKTREE_LOCATION_ENTRY, variable)}
+                  onClick={() => {
+                    const input = inputRef.current;
+                    const start = input?.selectionStart ?? draft.length;
+                    const end = input?.selectionEnd ?? start;
+                    const token = `{${variable}}`;
+                    setDraft(draft.slice(0, start) + token + draft.slice(end));
+                    setSaveError(null);
+                    requestAnimationFrame(() => {
+                      input?.focus();
+                      input?.setSelectionRange(start + token.length, start + token.length);
+                    });
+                  }}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
+        {error === null && (
+          <p className="text-sm text-muted-foreground">
+            Template with sample values (not validated):{" "}
+            <span
+              data-testid="settings-worktree-location-example"
+              className="font-mono wrap-anywhere"
+            >
+              {example || "Enter a custom path."}
+            </span>
+          </p>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Button
+            {...settingsControlProps(WORKTREE_LOCATION_ENTRY, "save")}
+            size="sm"
+            className="h-9"
+            disabled={!canSave}
+            loading={saving}
+            data-testid="settings-worktree-location-save"
+            onClick={() => void save(nextTemplate)}
+            componentId="settings.git.worktree_location_save"
+          >
+            Save location
+          </Button>
+          <Button
+            {...settingsControlProps(WORKTREE_LOCATION_ENTRY, "reset")}
+            variant="outline"
+            size="sm"
+            className="h-9"
+            disabled={controlsDisabled || stored === null}
+            data-testid="settings-worktree-location-reset"
+            onClick={() => {
+              setPreset("sibling");
+              void save(null);
+            }}
+            componentId="settings.git.worktree_location_reset"
+          >
+            Use default location
+          </Button>
+        </div>
+        {error !== null && (
+          <p
+            role="alert"
+            data-testid="settings-worktree-location-error"
+            className="text-sm text-destructive"
+          >
+            {error}
+          </p>
+        )}
+      </fieldset>
+    </SettingsItem>
   );
 }
 
@@ -3356,6 +3469,7 @@ function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts">
       <div className="flex flex-col gap-8">
+        <SearchableShortcutsList />
         <KeyboardShortcutEditor />
         <div className="border-t border-border pt-6">
           <h2 className="text-ui font-medium">Mobile controls</h2>

@@ -45,6 +45,9 @@ import {
 } from "@/lib/composerTokens";
 import { uploadFile } from "@/lib/filesApi";
 import { clearQuestionCardInputTarget, setQuestionCardInputTarget } from "@/lib/questionCardInput";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
+import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
   eventMatchesShortcutAction,
@@ -58,6 +61,17 @@ import {
   getAskUserQuestionDraft,
   saveAskUserQuestionDraft,
 } from "@/lib/askUserQuestionDrafts";
+import { presentTaggedMentions, type SessionMention } from "@/lib/composerMentions";
+import {
+  composerTargetOf,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import {
+  AnswerMentionScope,
+  type AnswerMentions,
+  AskUserQuestionAnswerEditor,
+  expandAnswerMentions,
+} from "./AskUserQuestionAnswerEditor";
 
 /**
  * Map from question id/text → either a single selected label
@@ -143,6 +157,7 @@ function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft,
     selections: {},
     customSelected: {},
     customInputs: {},
+    sessionMentions: {},
   };
   for (const q of questions) {
     const key = questionKey(q);
@@ -208,7 +223,34 @@ function plainEnterIsBoundToCardAction(): boolean {
   );
 }
 
-export function AskUserQuestionForm({
+export function AskUserQuestionForm(props: AskUserQuestionFormProps) {
+  const keys = new Set(props.questions.map(questionKey));
+  if (keys.size !== props.questions.length) {
+    return (
+      <div className="flex flex-col items-start gap-3">
+        <p role="alert">This question card has duplicate answer IDs.</p>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => {
+            if (props.elicitationId) {
+              clearAskUserQuestionDraft(
+                props.elicitationId,
+                askUserQuestionSignature(props.questions),
+              );
+            }
+            void props.onReject();
+          }}
+        >
+          Cancel
+        </Button>
+      </div>
+    );
+  }
+  return <QuestionForm {...props} />;
+}
+
+function QuestionForm({
   elicitationId: savedElicitationId,
   questions,
   onSubmit,
@@ -225,6 +267,15 @@ export function AskUserQuestionForm({
   const [signature] = useState(() => askUserQuestionSignature(questions));
   const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
   const [initial] = useState(() => initialAnswers(questions));
+  const editorInputRef = useRef<ComposerTextTarget | null>(null);
+  const radioArrowKeyRef = useRef(false);
+  const isMobileViewport = useIsMobileViewport();
+  const textareaHandoffRef = useRef<{
+    key: string;
+    focused: boolean;
+    start: number;
+    end: number;
+  } | null>(null);
 
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
@@ -302,7 +353,10 @@ export function AskUserQuestionForm({
   useLayoutEffect(() => {
     const pending = pendingCaretRef.current;
     if (!pending || !current || pending.key !== questionKey(current)) return;
-    customInputRef.current?.setSelectionRange(pending.offset, pending.offset);
+    (customInputRef.current ?? editorInputRef.current)?.setSelectionRange(
+      pending.offset,
+      pending.offset,
+    );
     caretRef.current[pending.key] = { start: pending.offset, end: pending.offset };
     pendingCaretRef.current = null;
   }, [customInputs, current]);
@@ -408,17 +462,54 @@ export function AskUserQuestionForm({
       ?.querySelector<HTMLElement>('[data-highlighted="true"]')
       ?.scrollIntoView({ block: "nearest" });
   }, [keyboardActive, highlight, currentIndex]);
+  const requestedEngine = useRequestedComposerEngine();
+  const engine = useComposerEngineHandoff(asyncTarget ? "textarea" : requestedEngine, rootRef, {
+    draftKey: elicitationId,
+  });
+  const nativeAnswer = asyncTarget !== undefined || current?.isSecret === true;
+  const useRichEditor = engine === "codemirror" && !nativeAnswer;
+  // Session tags per question: each question's scope reads its entry and writes it back here.
+  const currentQuestionKey = questions[currentIndex] ? questionKey(questions[currentIndex]) : "";
+  const [sessionMentionsByKey, setSessionMentionsByKey] = useState<
+    Record<string, SessionMention[]>
+  >(draft?.sessionMentions ?? {});
+  const rememberTextareaCaret = (element: HTMLTextAreaElement) => {
+    textareaHandoffRef.current = {
+      key: currentQuestionKey,
+      focused: document.activeElement === element,
+      start: element.selectionStart,
+      end: element.selectionEnd,
+    };
+  };
+  // After the editor replaces the textarea, the user's caret and focus go with it.
+  useLayoutEffect(() => {
+    const snapshot = textareaHandoffRef.current;
+    textareaHandoffRef.current = null;
+    const editor = editorInputRef.current;
+    if (!useRichEditor || !snapshot || snapshot.key !== currentQuestionKey || !editor) return;
+    editor.setSelectionRange(snapshot.start, snapshot.end);
+    if (snapshot.focused) editor.focus();
+  }, [useRichEditor, currentQuestionKey]);
 
   useEffect(() => {
     const answers = {
       selections: { ...selections },
       customSelected: { ...customSelected },
       customInputs: { ...customInputs },
+      sessionMentions: {} as Record<string, SessionMention[]>,
     };
-    // Answers to a secret question are never kept past this mount.
+    // Answers to a secret question are never kept past this mount, nor their session tags.
     for (const q of draftQuestions) {
-      if (!q.isSecret) continue;
       const key = questionKey(q);
+      if (!q.isSecret) {
+        // Only tags whose token still shows in their own answer are kept.
+        const kept = presentTaggedMentions(
+          { files: [], sessions: sessionMentionsByKey[key] ?? [] },
+          [customInputs[key] ?? ""],
+        )?.sessions;
+        if (kept) answers.sessionMentions[key] = kept;
+        continue;
+      }
       answers.selections[key] = initial.selections[key]!;
       answers.customSelected[key] = initial.customSelected[key]!;
       answers.customInputs[key] = initial.customInputs[key]!;
@@ -438,6 +529,7 @@ export function AskUserQuestionForm({
     selections,
     customSelected,
     customInputs,
+    sessionMentionsByKey,
   ]);
   if (!current) return null;
   const currentKey = questionKey(current);
@@ -480,17 +572,19 @@ export function AskUserQuestionForm({
     setCustomSelected((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
+  const handleCustomInput = (key: string, value: string | ChangeEvent<HTMLTextAreaElement>) => {
     if (submittingRef.current) return;
-    const text = e.target.value;
+    const text = typeof value === "string" ? value : value.target.value;
     setClearedInputs((prev) => ({ ...prev, [key]: "" }));
     editRevisionRef.current[key] = (editRevisionRef.current[key] ?? 0) + 1;
     customInputsRef.current = { ...customInputsRef.current, [key]: text };
     setCustomInputs(customInputsRef.current);
-    caretRef.current[key] = {
-      start: e.target.selectionStart,
-      end: e.target.selectionEnd,
-    };
+    const target = typeof value === "string" ? editorInputRef.current : value.target;
+    if (target)
+      caretRef.current[key] = {
+        start: target.selectionStart ?? text.length,
+        end: target.selectionEnd ?? text.length,
+      };
     // Typing implies intent to use the custom answer — auto-check
     // the custom radio/checkbox so the user doesn't have to click
     // twice. Clearing the text doesn't auto-uncheck (the user may
@@ -536,7 +630,7 @@ export function AskUserQuestionForm({
         q,
         selections[key] ?? "",
         customSelected[key] ?? false,
-        customInputs[key] ?? "",
+        expandAnswerMentions(customInputs[key] ?? "", sessionMentionsByKey[key] ?? []),
       );
       if (answer === null && (!asyncTarget || !images[key]?.length)) return;
       finalAnswers[key] = answer ?? "";
@@ -748,8 +842,11 @@ export function AskUserQuestionForm({
       e.stopPropagation();
       return;
     }
-    if (e.nativeEvent.isComposing || isKeyOwningOverlayOpen(rootRef.current)) return;
-    const isCustomTextarea = e.target instanceof HTMLTextAreaElement;
+    if (e.defaultPrevented || e.nativeEvent.isComposing || isKeyOwningOverlayOpen(rootRef.current))
+      return;
+    const isCustomInput =
+      e.target instanceof HTMLTextAreaElement ||
+      (e.target instanceof Element && composerTargetOf(e.target) !== null);
     const isButtonLike = e.target instanceof Element && e.target.closest("button, a") !== null;
     const isOptionInput =
       e.target instanceof HTMLInputElement &&
@@ -777,7 +874,7 @@ export function AskUserQuestionForm({
     // The custom text box keeps its own keys: Enter is a newline unless the
     // next/submit action claims it; Esc returns to the options.
     if (
-      isCustomTextarea &&
+      isCustomInput &&
       actionId !== "questionCardNextOrSubmit" &&
       actionId !== "questionCardLeave"
     ) {
@@ -825,7 +922,7 @@ export function AskUserQuestionForm({
         goToQuestion(currentIndex + 1, true);
         return;
       case "questionCardLeave":
-        if (isCustomTextarea) {
+        if (isCustomInput) {
           setHighlight(current.options.length);
           rootRef.current?.focus();
         } else {
@@ -865,7 +962,90 @@ export function AskUserQuestionForm({
   const canRestore = !customRowValue && !!clearedInputs[currentKey];
   const clearLabel = canRestore ? "Restore answer" : "Clear answer";
 
-  return (
+  const renderCustomTextarea = (mentions?: AnswerMentions) => (
+    <textarea
+      ref={(element) => {
+        customInputRef.current = element;
+        if (mentions) editorInputRef.current = element;
+      }}
+      rows={1}
+      placeholder="Type something"
+      value={customRowValue}
+      onChange={(e) => {
+        mentions?.browser.noteTextChange(e);
+        handleCustomInput(currentKey, e);
+        rememberTextareaCaret(e.currentTarget);
+      }}
+      onFocus={(event) => {
+        rememberTextareaCaret(event.currentTarget);
+        if (asyncTarget) setFocusedText(event.currentTarget);
+        setHighlight(current.options.length);
+        if (pendingCaretRef.current?.key === currentKey) return;
+        caretRef.current[currentKey] = {
+          start: event.currentTarget.selectionStart,
+          end: event.currentTarget.selectionEnd,
+        };
+      }}
+      onBlur={(event) => {
+        rememberTextareaCaret(event.currentTarget);
+        setFocusedText(null);
+      }}
+      onSelect={(event) => {
+        rememberTextareaCaret(event.currentTarget);
+        if (pendingCaretRef.current?.key === currentKey) return;
+        caretRef.current[currentKey] = {
+          start: event.currentTarget.selectionStart,
+          end: event.currentTarget.selectionEnd,
+        };
+      }}
+      onKeyDown={
+        asyncTarget
+          ? (event) => {
+              if (
+                submittingRef.current ||
+                (event.key !== "Backspace" && event.key !== "Delete") ||
+                event.ctrlKey ||
+                event.metaKey ||
+                event.altKey ||
+                event.shiftKey ||
+                event.currentTarget.selectionStart !== event.currentTarget.selectionEnd
+              )
+                return;
+              const edit = deleteTokenAt(
+                event.currentTarget,
+                event.currentTarget.value,
+                event.currentTarget.selectionStart,
+                event.key,
+                imagesRef.current[currentKey] ?? [],
+              );
+              if (edit) {
+                event.preventDefault();
+                commitCustomText(currentKey, edit.text, edit.caret);
+              }
+            }
+          : undefined
+      }
+      onPaste={
+        asyncTarget
+          ? (event) => {
+              const pasted = Array.from(event.clipboardData?.items ?? [])
+                .filter((item) => item.kind === "file")
+                .map((item) => item.getAsFile())
+                .filter((file): file is File => file !== null);
+              if (pasted.length) {
+                event.preventDefault();
+                addImages(currentKey, pasted);
+              }
+            }
+          : undefined
+      }
+      data-testid="ask-user-question-custom-input"
+      aria-label="Custom answer"
+      className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+    />
+  );
+
+  const renderBody = () => (
     <div
       ref={rootRef}
       tabIndex={-1}
@@ -905,6 +1085,14 @@ export function AskUserQuestionForm({
         disabled={submitting}
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
+        onKeyDown={(event) => {
+          if (!event.key.startsWith("Arrow")) return;
+          radioArrowKeyRef.current = true;
+          // The radio changes in this keydown's default action, before the timeout runs.
+          setTimeout(() => {
+            radioArrowKeyRef.current = false;
+          });
+        }}
       >
         <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">
           {current.question}
@@ -990,89 +1178,46 @@ export function AskUserQuestionForm({
                     id={customRowId}
                     name={current.multiSelect ? undefined : currentKey}
                     checked={customRowChecked}
-                    onChange={() =>
-                      current.multiSelect
-                        ? handleCustomToggleMulti(currentKey)
-                        : handleCustomToggleSingle(currentKey)
-                    }
+                    onChange={() => {
+                      if (current.multiSelect) handleCustomToggleMulti(currentKey);
+                      else handleCustomToggleSingle(currentKey);
+                      if (!customRowChecked && !radioArrowKeyRef.current) {
+                        (customInputRef.current ?? editorInputRef.current)?.focus();
+                      }
+                    }}
                     onFocus={() => setHighlight(current.options.length)}
                     aria-label="Select custom answer"
                     className="mt-1 mobile-app:mt-0"
                     data-testid="ask-user-question-custom-toggle"
                   />
                 </label>
-                {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
-                the textarea to fit its content, so typing past the
-                first line wraps and expands downward instead of
-                scrolling within a fixed single row. */}
-                <textarea
-                  ref={customInputRef}
-                  rows={1}
-                  placeholder="Type something"
-                  value={customRowValue}
-                  onChange={(e) => handleCustomInput(currentKey, e)}
-                  onFocus={(event) => {
-                    if (asyncTarget) setFocusedText(event.currentTarget);
-                    setHighlight(current.options.length);
-                    if (pendingCaretRef.current?.key === currentKey) return;
-                    caretRef.current[currentKey] = {
-                      start: event.currentTarget.selectionStart,
-                      end: event.currentTarget.selectionEnd,
-                    };
-                  }}
-                  onBlur={() => setFocusedText(null)}
-                  onSelect={(event) => {
-                    if (pendingCaretRef.current?.key === currentKey) return;
-                    caretRef.current[currentKey] = {
-                      start: event.currentTarget.selectionStart,
-                      end: event.currentTarget.selectionEnd,
-                    };
-                  }}
-                  onKeyDown={
-                    asyncTarget
-                      ? (event) => {
-                          if (
-                            submittingRef.current ||
-                            (event.key !== "Backspace" && event.key !== "Delete") ||
-                            event.ctrlKey ||
-                            event.metaKey ||
-                            event.altKey ||
-                            event.shiftKey ||
-                            event.currentTarget.selectionStart !== event.currentTarget.selectionEnd
-                          )
-                            return;
-                          const edit = deleteTokenAt(
-                            event.currentTarget,
-                            event.currentTarget.value,
-                            event.currentTarget.selectionStart,
-                            event.key,
-                            imagesRef.current[currentKey] ?? [],
-                          );
-                          if (edit) {
-                            event.preventDefault();
-                            commitCustomText(currentKey, edit.text, edit.caret);
-                          }
-                        }
-                      : undefined
-                  }
-                  onPaste={
-                    asyncTarget
-                      ? (event) => {
-                          const pasted = Array.from(event.clipboardData?.items ?? [])
-                            .filter((item) => item.kind === "file")
-                            .map((item) => item.getAsFile())
-                            .filter((file): file is File => file !== null);
-                          if (pasted.length) {
-                            event.preventDefault();
-                            addImages(currentKey, pasted);
-                          }
-                        }
-                      : undefined
-                  }
-                  data-testid="ask-user-question-custom-input"
-                  aria-label="Custom answer"
-                  className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-                />
+                {nativeAnswer ? (
+                  renderCustomTextarea()
+                ) : (
+                  <AnswerMentionScope
+                    key={currentKey}
+                    currentKey={currentKey}
+                    customText={customRowValue}
+                    onCustomTextChange={(text) => handleCustomInput(currentKey, text)}
+                    initialSessions={sessionMentionsByKey[currentKey] ?? []}
+                    onSessionsChange={setSessionMentionsByKey}
+                    isMobile={isMobileViewport}
+                    inputRef={editorInputRef}
+                  >
+                    {(mentions) =>
+                      useRichEditor ? (
+                        <AskUserQuestionAnswerEditor
+                          inputRef={editorInputRef}
+                          value={customRowValue}
+                          onValueChange={(text) => handleCustomInput(currentKey, text)}
+                          mentions={mentions}
+                        />
+                      ) : (
+                        renderCustomTextarea(mentions)
+                      )
+                    }
+                  </AnswerMentionScope>
+                )}
               </div>
               <div className="flex flex-wrap items-center gap-2 pl-6">
                 <Button
@@ -1087,7 +1232,9 @@ export function AskUserQuestionForm({
                     commitCustomText(currentKey, restored, restored.length);
                     if (!canRestore)
                       setClearedInputs((prev) => ({ ...prev, [currentKey]: customRowValue }));
-                    customInputRef.current?.focus({ preventScroll: true });
+                    (customInputRef.current ?? editorInputRef.current)?.focus({
+                      preventScroll: true,
+                    });
                   }}
                 >
                   {canRestore ? (
@@ -1096,7 +1243,7 @@ export function AskUserQuestionForm({
                     <EraserIcon className="size-3.5" />
                   )}
                 </Button>
-                {!current.isSecret && (
+                {!current.isSecret && !useRichEditor && (
                   <QuestionDictationControls
                     key={currentKey}
                     inputRef={customInputRef}
@@ -1306,4 +1453,5 @@ export function AskUserQuestionForm({
       </div>
     </div>
   );
+  return renderBody();
 }

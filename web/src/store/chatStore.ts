@@ -900,6 +900,11 @@ export interface ConversationState {
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
   /**
+   * Sends whose upload failed before posting. Kept out of `pendingUserMessages`, so a
+   * later message's consumed event can never pair with one. Each shows its failed
+   * attachment with Retry and Remove until the user picks one.
+   */
+  /**
    * Recent shell mirrors and the bubbles they settled. Retaining both client
    * and server ids protects later inputs from duplicate or legacy receipts.
    */
@@ -2161,6 +2166,20 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
 type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
+/** A resource one send attempt created, held privately until its POST starts. */
+interface OwnedUpload {
+  file: File;
+  block: UploadedFileBlock;
+}
+
+/** Publishes uploads to the shared cache, so a later send with the same File reuses them. */
+function publishUploads(sessionId: string, uploads: readonly OwnedUpload[]): void {
+  for (const { file, block } of uploads) {
+    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
+    bySession.set(sessionId, block);
+    uploadedFileBlockCache.set(file, bySession);
+  }
+}
 const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
 const cancelPendingUploads = new Map<string, () => void>();
 const queuedHeadUploads = new Set<string>();
@@ -2344,11 +2363,10 @@ async function uploadAttachmentBatch(
     );
     throw error;
   }
-  for (const [file, block] of newUploads) {
-    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
-    bySession.set(sessionId, block);
-    uploadedFileBlockCache.set(file, bySession);
-  }
+  publishUploads(
+    sessionId,
+    [...newUploads].map(([file, block]) => ({ file, block })),
+  );
   return blocks;
 }
 
@@ -2544,7 +2562,10 @@ export interface PendingInitialPrompt {
 // host-provided routing (the host router may not carry react-router
 // state through navigate() → useLocation()). Both surfaces share this
 // module-level singleton, so it works identically standalone and embedded.
-const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
+// Stashed prompts per conversation, oldest first; each is consumed once, in order.
+const pendingInitialPrompts = new Map<string, PendingInitialPrompt[]>();
+// Pages showing a conversation, each listening for prompts stashed for it.
+const initialPromptListeners = new Map<string, Set<() => void>>();
 
 /**
  * Stash the first message for a freshly created conversation so ChatPage
@@ -2565,7 +2586,34 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  pendingInitialPrompts.set(conversationId, [
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+    prompt,
+  ]);
+  for (const listener of initialPromptListeners.get(conversationId) ?? []) listener();
+}
+
+/**
+ * Hear each prompt stashed for `conversationId` while the listener is subscribed, so a page
+ * already showing the session takes a floating-panel launch that arrives after its route.
+ *
+ * @returns An unsubscribe function.
+ */
+export function onPendingInitialPrompt(conversationId: string, listener: () => void): () => void {
+  const listeners = initialPromptListeners.get(conversationId) ?? new Set<() => void>();
+  listeners.add(listener);
+  initialPromptListeners.set(conversationId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && initialPromptListeners.get(conversationId) === listeners) {
+      initialPromptListeners.delete(conversationId);
+    }
+  };
+}
+
+/** Whether a page is showing `conversationId` and would take a prompt stashed for it now. */
+export function isListeningForInitialPrompt(conversationId: string): boolean {
+  return (initialPromptListeners.get(conversationId)?.size ?? 0) > 0;
 }
 
 /**
@@ -2580,10 +2628,25 @@ export function setPendingInitialPrompt(
  *   already consumed).
  */
 export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
-  const prompt = pendingInitialPrompts.get(conversationId);
+  const [prompt, ...rest] = pendingInitialPrompts.get(conversationId) ?? [];
   if (prompt === undefined) return null;
-  pendingInitialPrompts.delete(conversationId);
+  if (rest.length === 0) pendingInitialPrompts.delete(conversationId);
+  else pendingInitialPrompts.set(conversationId, rest);
   return prompt;
+}
+
+/**
+ * Put back a prompt a page consumed but didn't send, ahead of any stashed since. It doesn't notify
+ * listeners, so the page putting it back doesn't take it again.
+ */
+export function returnPendingInitialPrompt(
+  conversationId: string,
+  prompt: PendingInitialPrompt,
+): void {
+  pendingInitialPrompts.set(conversationId, [
+    prompt,
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+  ]);
 }
 
 /**
@@ -3540,6 +3603,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         } catch (error) {
           if (opts?.external || opts?.signal?.aborted) throw error;
           if (controller.signal.aborted) return false;
+          // A failed first message returns to its composer and keeps the queued
+          // messages behind it until the user retries.
+          if (initialDraft) throw error;
           opts?.onUploadNotPosted?.();
           const card = failedAttachmentCard(error, stableId, {
             agentId,
@@ -3566,9 +3632,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
 
       opts?.signal?.throwIfAborted();
-      const heldBack = opts?.beforePost ? await opts.beforePost() : null;
-      if (heldBack !== null) throw new Error(heldBack);
+      const heldBack = opts?.beforePost
+        ? await unlessAborted(opts.beforePost(), opts.signal)
+        : null;
       opts?.signal?.throwIfAborted();
+      if (initialDraft && !initialSendPending()) return false;
+      if (heldBack !== null) throw new Error(heldBack);
 
       const postingState = setterForState(sessionId);
       const sentWhileRunning =
@@ -3846,7 +3915,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
@@ -11664,7 +11732,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         isFirstPlan(event.entry) &&
         event.conversationId === useChatStore.getState().conversationId
       ) {
-        showTasksTabBesideChat(event.conversationId);
+        showTasksTabBesideChat(event.conversationId, "first-plan");
       }
       return;
     case "session_changed_files_invalidated":

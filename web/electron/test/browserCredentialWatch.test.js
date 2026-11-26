@@ -44,7 +44,7 @@ it("tracks early reveal and open shadow fields without exposing the observer", a
     assert.ok(!snapshot.includes("FAKE-S1-CREDENTIAL"));
     assert.ok(!snapshot.includes("FAKE-SHADOW"));
     assert.ok(snapshot.includes("ordinary"));
-    assert.ok(w.eval(buildBrowserActionScript("snapshot")).includes("FAKE-S1-CREDENTIAL"));
+    assert.ok(!w.eval(buildBrowserActionScript("snapshot")).includes("FAKE-S1-CREDENTIAL"));
     const before = w.eval(STATE_JS).counter;
     password.type = "password";
     password.type = "text";

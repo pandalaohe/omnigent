@@ -616,6 +616,34 @@ async def test_permission_sync_failure_retries_observation_only() -> None:
     assert state.posted_permission_observation == state.permission_observation
 
 
+@pytest.mark.parametrize(
+    ("sandbox_type", "expected"),
+    [("dangerFullAccess", "full-access"), ("workspaceWrite", None)],
+)
+def test_resume_response_records_approval_preset_from_its_sandbox(
+    sandbox_type: str, expected: str | None
+) -> None:
+    """A thread/resume result names its sandbox ``sandbox``, not ``sandboxPolicy``.
+
+    A session launched with Full Access flags reports no permission profile, so
+    the preset must come from that field.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_resume_response(
+        {
+            "result": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandbox": {"type": sandbox_type},
+                "activePermissionProfile": None,
+            }
+        }
+    )
+
+    assert state.approval_preset == expected
+
+
 @pytest.mark.asyncio
 async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> None:
     """

@@ -221,8 +221,9 @@ describe("MembersPage actions", () => {
     // The new password renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue("fresh-pw-123")).toBeInTheDocument();
     expect(screen.getByDisplayValue("fresh-pw-123")).toHaveAccessibleName("New password for bob");
-    await userInput.click(screen.getByRole("button", { name: "Copy" }));
-    expect(await screen.findByRole("button", { name: "Copied" })).toBeVisible();
+    const copy = screen.getByRole("button", { name: "Copy password" });
+    await userInput.click(copy);
+    expect(copy).toHaveTextContent("Copied");
   });
 
   it("deletes a user through the confirmation dialog and refreshes the list", async () => {
@@ -254,6 +255,7 @@ describe("MembersPage actions", () => {
     // The single-use invite URL renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue(/register\?invite=tok/)).toBeInTheDocument();
     expect(screen.getByDisplayValue(/register\?invite=tok/)).toHaveAccessibleName("Invite URL");
+    expect(screen.getByRole("button", { name: "Copy invite URL" })).toBeVisible();
   });
 
   it("renders the invite and member rows from their Settings catalog entries", async () => {

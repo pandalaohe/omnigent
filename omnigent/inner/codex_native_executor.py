@@ -40,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+    CODEX_STARTUP_PENDING_CODE,
     CodexNativeBridgeState,
     CodexStartupFailure,
     cancel_pending_mcp_startup,
@@ -81,9 +82,11 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     Message,
     NativeTurnAcceptance,
+    TextChunk,
     ToolSpec,
     TurnComplete,
 )
@@ -114,6 +117,13 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
+# Turn starts awaiting Codex's acknowledgment, by bridge directory. An interrupt
+# that finds no recorded turn waits for the start to record the one Codex accepted.
+_TURN_STARTS_IN_FLIGHT: dict[Path, asyncio.Event] = {}
+_CODEX_STARTUP_WAIT_MESSAGE = (
+    "Codex is still starting in this session's terminal. Your message will be sent "
+    "once it's ready, so you don't need to send it again."
+)
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _GOAL_RPC_TIMEOUT_SECONDS = 30.0
@@ -244,6 +254,52 @@ async def _wait_for_bridge_state(
                 max_wait_seconds = extended_wait_seconds
                 startup_timeout_observed = True
     return state, waited_seconds, max_wait_seconds, startup_timeout_observed
+
+
+def _codex_startup_pending(bridge_dir: Path) -> bool:
+    """Return whether the runner records Codex as still starting behind a live pane."""
+    failure = read_bridge_startup_failure(bridge_dir)
+    return failure is not None and failure.code == CODEX_STARTUP_PENDING_CODE
+
+
+async def _wait_out_codex_startup(
+    bridge_dir: Path, *, session_id: str | None, announce: bool
+) -> AsyncIterator[ExecutorEvent]:
+    """
+    Hold a message while Codex is still starting, until its thread starts or startup fails.
+
+    The runner keeps waiting for the thread past its budget while the pane is
+    alive, so the message waits with it instead of failing. A sign-in prompt,
+    a pane exit or the launch ending replaces the record and ends the hold; a
+    cancelled turn ends it with nothing delivered.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Omnigent session the message belongs to, for logging.
+    :param announce: Whether to tell the chat why the message waits, once per turn.
+    :returns: Async iterator yielding the wait notice when *announce* is set,
+        then :class:`ExecutorWait` after each check.
+    """
+    held_at = asyncio.get_running_loop().time()
+    _logger.info(
+        "Codex is still starting; holding the message until its thread starts",
+        extra=with_input_attributes(debug_event("codex_input_held", session_id=session_id)),
+    )
+    if announce:
+        yield TextChunk(text=_CODEX_STARTUP_WAIT_MESSAGE)
+    while read_bridge_state(bridge_dir) is None and _codex_startup_pending(bridge_dir):
+        yield ExecutorWait()
+        await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+    _logger.info(
+        "Codex startup hold ended",
+        extra=with_input_attributes(
+            debug_event(
+                "codex_input_hold_ended",
+                session_id=session_id,
+                held_ms=round((asyncio.get_running_loop().time() - held_at) * 1000),
+                bridge_state_ready=read_bridge_state(bridge_dir) is not None,
+            )
+        ),
+    )
 
 
 def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
@@ -698,6 +754,31 @@ async def _start_codex_turn(
         os.environ,
         codex_home=Path(state.codex_home),
     )
+    acknowledged = asyncio.Event()
+    _TURN_STARTS_IN_FLIGHT[bridge_dir] = acknowledged
+    try:
+        return await _request_codex_turn_start(client, bridge_dir, state, input_items)
+    finally:
+        acknowledged.set()
+        if _TURN_STARTS_IN_FLIGHT.get(bridge_dir) is acknowledged:
+            del _TURN_STARTS_IN_FLIGHT[bridge_dir]
+
+
+async def _request_codex_turn_start(
+    client: CodexAppServerClient,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+) -> tuple[NativeTurnAcceptance | None, CodexNativeBridgeState | None]:
+    """
+    Send ``turn/start`` and record the turn id Codex acknowledges.
+
+    :param client: Connected app-server client.
+    :param bridge_dir: Native Codex bridge directory.
+    :param state: Bridge state the turn starts on.
+    :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "hi"}]``.
+    :returns: The accepted turn and its matching bridge binding, when each is known.
+    """
     response = await _native_delivery_request(
         client,
         "turn/start",
@@ -1218,7 +1299,8 @@ class CodexNativeExecutor(Executor):
         cancelled the way the Codex TUI does — ``turn/interrupt`` with an
         empty turn id (its ``startup_interrupt``). Either alone also works:
         no recorded turn cancels just the startup; no pending startup
-        interrupts just the turn.
+        interrupts just the turn. A turn start awaiting Codex's acknowledgment is
+        waited for, so the turn Codex accepted is the one interrupted.
 
         Abandoned-executor cleanup uses its acknowledged owned turn snapshot
         and leaves shared startup state untouched.
@@ -1233,6 +1315,11 @@ class CodexNativeExecutor(Executor):
             if state != self._abandoned_turn_state:
                 return False
         else:
+            state = read_bridge_state(self._bridge_dir)
+            turn_start = _TURN_STARTS_IN_FLIGHT.get(self._bridge_dir)
+            if state is not None and state.active_turn_id is None and turn_start is not None:
+                # Codex may have accepted a turn whose id the start is about to record.
+                await turn_start.wait()
             state = read_bridge_state(self._bridge_dir)
         if state is None:
             return False
@@ -1361,7 +1448,11 @@ class CodexNativeExecutor(Executor):
             startup instructions are configured before the app-server launches.
         :param config: Per-turn executor config. Model and reasoning effort
             apply via ``thread/settings/update`` before starting the turn.
-        :returns: Async iterator yielding one terminal event.
+        :returns: Async iterator yielding one terminal event. While the runner
+            records Codex as still starting, it first yields a wait notice and
+            keep-alives (see :func:`_wait_out_codex_startup`); after any wait for
+            Codex, one more :class:`ExecutorWait` precedes the submission so the
+            adapter can honor a Stop that arrived meanwhile.
         """
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
@@ -1428,8 +1519,11 @@ class CodexNativeExecutor(Executor):
         delivery_unconfirmed = False
         preserve_session = False
         native_acceptance: NativeTurnAcceptance | None = None
+        startup_wait_announced = False
+        waited_for_codex = False
         while True:
             if state is None:
+                waited_for_codex = True
                 (
                     state,
                     waited_seconds,
@@ -1441,6 +1535,24 @@ class CodexNativeExecutor(Executor):
                     max_wait_seconds=max_wait_seconds,
                     startup_timeout_observed=startup_timeout_observed,
                 )
+            if state is None and _codex_startup_pending(self._bridge_dir):
+                async for wait_event in _wait_out_codex_startup(
+                    self._bridge_dir,
+                    session_id=self._request_session_id,
+                    announce=not startup_wait_announced,
+                ):
+                    yield wait_event
+                startup_wait_announced = True
+                state = read_bridge_state(self._bridge_dir)
+                if state is None and read_bridge_startup_error(self._bridge_dir) is None:
+                    # The record cleared ahead of the bridge state (a sign-in finished
+                    # just then): wait for the state with a fresh budget, as at launch.
+                    waited_seconds = 0.0
+                    max_wait_seconds = _bridge_state_wait_seconds(self._bridge_dir)
+                    continue
+            if waited_for_codex and state is not None:
+                # Stop is seen only between events: let the adapter look before submitting.
+                yield ExecutorWait()
 
             # No client-side wait for Codex MCP startup: the app-server accepts
             # ``turn/start`` mid-startup and defers execution until the round
@@ -1486,10 +1598,11 @@ class CodexNativeExecutor(Executor):
                     )
                     if (
                         startup_failure is not None
-                        and startup_failure.code == "agent_startup_pending"
+                        and startup_failure.code == CODEX_STARTUP_PENDING_CODE
                     ):
-                        # The runner is still discovering this same live terminal.
-                        # Keep the original input outside the injection lock.
+                        # Recorded again since the hold ended: hold once more, keeping no
+                        # still-starting cause for a later, unrelated failure to report.
+                        startup_failure = None
                         continue
                     if startup_failure is not None and not startup_failure.code:
                         startup_failure = None

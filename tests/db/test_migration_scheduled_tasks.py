@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from importlib import import_module
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,7 @@ from packaging.version import Version
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from omnigent.db.cockroachdb import _crdb_server_version
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import (
     ConversationBase,
     OmnigentBase,
@@ -57,6 +58,10 @@ _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
 _SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
 _SMART_ROUTING_REVISION = "5ab01aaca219"
+_TIMER_KIND_REVISION = "bf30d7cbda61"
+_TIMER_KIND_MIGRATION = "omnigent.db.migrations.versions.bf30d7cbda61_allow_scheduled_task_timers"
+_WORKFLOW_ID_REVISION = "47d3e8fc3e25"
+_FORK_SCHEDULED_JOIN = "a78c20261127"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -69,31 +74,34 @@ _SCHEMA_PATHS = [
 ]
 
 
-@pytest.mark.parametrize("starting_head", ["a50c20261027", "d0a1f879a01d", "a73c20261126"])
+@pytest.mark.parametrize(
+    "starting_head",
+    ["a50c20261027", "d0a1f879a01d", "a73c20261126", "a77c20261126", _WORKFLOW_ID_REVISION],
+)
 def test_joined_heads_preserve_existing_project_assignments(
     tmp_path: Path, starting_head: str
 ) -> None:
-    """Either deployed branch upgrades and rolls back without losing its project column."""
+    """Both lineages retain assignments when they cross the joined schema."""
     uri = f"sqlite:///{tmp_path / 'joined-heads.db'}"
     engine = sa.create_engine(uri)
     config = _build_alembic_config(uri)
     project_id = b"p" * 16
+    workflow_id = b"w" * 16 if starting_head == _WORKFLOW_ID_REVISION else None
     try:
         command.upgrade(config, starting_head)
         tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
         with engine.begin() as conn:
-            conn.execute(
-                tasks.insert().values(
-                    id=b"t" * 16,
-                    name="existing",
-                    prompt=b"fixture",
-                    rrule="FREQ=DAILY",
-                    agent_id=b"a" * 16,
-                    project_id=project_id,
-                    timezone="UTC",
-                    created_at=1,
-                )
+            row = tasks.insert().values(
+                id=b"t" * 16,
+                name="existing",
+                prompt=b"fixture",
+                rrule="FREQ=DAILY",
+                agent_id=b"a" * 16,
+                project_id=project_id,
+                timezone="UTC",
+                created_at=1,
             )
+            conn.execute(row.values(workflow_id=workflow_id) if workflow_id is not None else row)
         for target in ("head", starting_head, "head"):
             if target == "head":
                 command.upgrade(config, target)
@@ -102,10 +110,21 @@ def test_joined_heads_preserve_existing_project_assignments(
             columns = [c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")]
             assert columns.count("project_id") == 1
             with engine.connect() as conn:
+                if target == "head":
+                    assert MigrationContext.configure(conn).get_current_heads() == (
+                        _FORK_SCHEDULED_JOIN,
+                    )
                 assert (
                     conn.execute(sa.text("SELECT project_id FROM scheduled_tasks")).scalar_one()
                     == project_id
                 )
+                if "workflow_id" in columns:
+                    assert (
+                        conn.execute(
+                            sa.text("SELECT workflow_id FROM scheduled_tasks")
+                        ).scalar_one()
+                        == workflow_id
+                    )
     finally:
         engine.dispose()
 
@@ -151,6 +170,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
+    assert columns["workflow_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
     assert columns["smart_routing"]["nullable"] is True
@@ -191,6 +211,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_mode",
         "session_id",
         "source_session_id",
+        "workflow_id",
         "kind",
         "smart_routing",
     }
@@ -347,6 +368,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "created_at",
         "id",
     ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_kind_scope"] == [
+        "kind",
+        "workspace_id",
+        "user_id",
+        "created_at",
+        "id",
+    ]
     assert scheduled_tasks_idx_cols["ix_scheduled_tasks_due"] == [
         "state",
         "next_run_at",
@@ -484,22 +512,21 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
-    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    """Migrated and model-built ``kind`` CHECKs both accept a timer (3) and reject 4."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "kind",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
     # MySQL reports CHECK violations as OperationalError (3819).
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
-        conn.execute(
-            tasks.insert().values(
-                id=b"k" * 16,
-                name="bad kind",
-                prompt=b"p",
-                rrule="FREQ=DAILY;BYHOUR=9",
-                agent_id=b"g" * 16,
-                timezone="UTC",
-                kind=3,
-                created_at=1,
-            )
-        )
+        conn.execute(tasks.insert().values(id=b"k" * 16, kind=4, **values))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
@@ -953,7 +980,8 @@ def _stamped_revisions(conn: sa.Connection) -> set[str]:
 @pytest.fixture
 def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
-    starting_revision = getattr(request, "param", _DISPATCH_REVISION)
+    parameter = getattr(request, "param", _DISPATCH_REVISION)
+    starting_revision, exact = parameter if isinstance(parameter, tuple) else (parameter, False)
     root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
     admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
@@ -969,7 +997,9 @@ def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) ->
             uri = admin.url.set(database=name).render_as_string(hide_password=False)
         engine = sa.create_engine(uri)
         config = _build_alembic_config(uri)
-        if engine.dialect.name == "cockroachdb":
+        if exact:
+            _migrate_on_one_connection(engine, starting_revision)
+        elif engine.dialect.name == "cockroachdb":
             if _crdb_server_version(engine) >= Version("24.1"):
                 # Create indexes with their new tables instead of separate schema-change jobs.
                 with engine.connect().execution_options(isolation_level="SERIALIZABLE") as conn:
@@ -1528,80 +1558,93 @@ def test_smart_routing_migration_leaves_existing_tasks_unset_and_round_trips(
 
 
 @pytest.mark.parametrize(
-    "start", ["a76c20261126", _SMART_ROUTING_REVISION], ids=["fork", "upstream"]
+    ("dispatch_migration_engine", "start"),
+    [
+        (("a76c20261126", True), "a76c20261126"),
+        ((_SMART_ROUTING_REVISION, True), _SMART_ROUTING_REVISION),
+        (("a77c20261126", True), "a77c20261126"),
+        ((_WORKFLOW_ID_REVISION, True), _WORKFLOW_ID_REVISION),
+    ],
+    indirect=["dispatch_migration_engine"],
+    ids=["fork-routing", "upstream-routing", "fork-final", "upstream-final"],
 )
-def test_smart_routing_join_preserves_tasks_on_both_lineages(tmp_path: Path, start: str) -> None:
-    uri = f"sqlite:///{tmp_path / 'routing-join.db'}"
-    engine = sa.create_engine(uri)
-    config = _build_alembic_config(uri)
-    existing = {"project_id": b"p" * 16} if start == "a76c20261126" else {"smart_routing": 2}
+def test_smart_routing_join_preserves_tasks_on_both_lineages(
+    dispatch_migration_engine: Engine, start: str
+) -> None:
+    engine = dispatch_migration_engine
+    with engine.connect() as conn:
+        assert MigrationContext.configure(conn).get_current_heads() == (start,)
     task_id = b"t" * 16
     run_id = b"r" * 16
+    timer_id = b"i" * 16
     conversation_id = b"c" * 16
     owner = "owner@example.com"
     grantee = "reader@example.com"
-    try:
-        command.upgrade(config, start)
-        schema = sa.MetaData()
-        tasks = sa.Table("scheduled_tasks", schema, autoload_with=engine)
-        runs = sa.Table("scheduled_task_runs", schema, autoload_with=engine)
-        shares = sa.Table("scheduled_task_shares", schema, autoload_with=engine)
-        with engine.begin() as conn:
-            conn.execute(
-                tasks.insert().values(
-                    id=task_id,
-                    user_id=owner,
-                    name="existing",
-                    prompt=b"fixture",
-                    rrule="FREQ=DAILY",
-                    agent_id=b"a" * 16,
-                    timezone="UTC",
-                    created_at=1,
-                    **existing,
-                )
+    project_id = b"p" * 16 if start in {"a76c20261126", "a77c20261126"} else None
+    routing = None if start == "a76c20261126" else 2
+    workflow_id = b"w" * 16 if start == _WORKFLOW_ID_REVISION else None
+    schema = sa.MetaData()
+    tasks = sa.Table("scheduled_tasks", schema, autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", schema, autoload_with=engine)
+    shares = sa.Table("scheduled_task_shares", schema, autoload_with=engine)
+    values = {
+        "user_id": owner,
+        "name": "existing",
+        "prompt": b"fixture",
+        "rrule": "FREQ=DAILY",
+        "agent_id": b"a" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with engine.begin() as conn:
+        task = tasks.insert().values(id=task_id, **values)
+        if project_id is not None:
+            task = task.values(project_id=project_id)
+        if routing is not None:
+            task = task.values(smart_routing=routing)
+        if workflow_id is not None:
+            task = task.values(workflow_id=workflow_id)
+            conn.execute(tasks.insert().values(id=timer_id, kind=3, **values))
+        conn.execute(task)
+        conn.execute(
+            runs.insert().values(
+                id=run_id,
+                scheduled_task_id=task_id,
+                conversation_id=conversation_id,
+                status=3,
+                scheduled_at=1,
             )
-            conn.execute(
-                runs.insert().values(
-                    id=run_id,
-                    scheduled_task_id=task_id,
-                    conversation_id=conversation_id,
-                    status=3,
-                    scheduled_at=1,
-                )
+        )
+        conn.execute(
+            shares.insert().values(
+                workspace_id=0, scheduled_task_id=task_id, user_id=grantee, level=1
             )
-            conn.execute(
-                shares.insert().values(
-                    workspace_id=0, scheduled_task_id=task_id, user_id=grantee, level=1
-                )
-            )
-        command.upgrade(config, "a77c20261126")
-        with engine.connect() as conn:
-            assert MigrationContext.configure(conn).get_current_heads() == ("a77c20261126",)
-            tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=conn)
-            saved = conn.execute(
-                sa.select(tasks.c.id, tasks.c.user_id, tasks.c.smart_routing, tasks.c.project_id)
-            ).one()
-            assert saved == (
-                task_id,
-                owner,
-                existing.get("smart_routing"),
-                existing.get("project_id"),
-            )
+        )
+    _migrate_on_one_connection(engine, _FORK_SCHEDULED_JOIN)
+    with engine.connect() as conn:
+        assert MigrationContext.configure(conn).get_current_heads() == (_FORK_SCHEDULED_JOIN,)
+        tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=conn)
+        saved = conn.execute(
+            sa.select(
+                tasks.c.user_id, tasks.c.smart_routing, tasks.c.project_id, tasks.c.workflow_id
+            ).where(tasks.c.id == task_id)
+        ).one()
+        assert saved == (owner, routing, project_id, workflow_id)
+        if workflow_id is not None:
             assert conn.execute(
-                sa.select(
-                    runs.c.id, runs.c.scheduled_task_id, runs.c.conversation_id, runs.c.status
-                )
-            ).one() == (run_id, task_id, conversation_id, 3)
-            assert conn.execute(
-                sa.select(
-                    shares.c.workspace_id,
-                    shares.c.scheduled_task_id,
-                    shares.c.user_id,
-                    shares.c.level,
-                )
-            ).one() == (0, task_id, grantee, 1)
-    finally:
-        engine.dispose()
+                sa.select(tasks.c.kind, tasks.c.workflow_id).where(tasks.c.id == timer_id)
+            ).one() == (3, None)
+        assert conn.execute(
+            sa.select(runs.c.id, runs.c.scheduled_task_id, runs.c.conversation_id, runs.c.status)
+        ).one() == (run_id, task_id, conversation_id, 3)
+        assert conn.execute(
+            sa.select(
+                shares.c.workspace_id,
+                shares.c.scheduled_task_id,
+                shares.c.user_id,
+                shares.c.level,
+            )
+        ).one() == (0, task_id, grantee, 1)
 
 
 @pytest.mark.parametrize(
@@ -1632,3 +1675,86 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
         }
+
+
+def test_timer_kind_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_TIMER_KIND_REVISION}:{_SMART_ROUTING_REVISION}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
+
+
+def _migrate_on_one_connection(engine: Engine, revision: str, *, downgrade: bool = False) -> None:
+    """Migrate the way startup does: one connection, committed once the run finishes.
+
+    The timer-kind migration commits part way on CockroachDB, which a connection
+    opened with ``engine.begin()`` refuses.
+    """
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        (command.downgrade if downgrade else command.upgrade)(config, revision)
+        connection.commit()
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_REVISION], indirect=True)
+def test_timer_kind_migration_round_trips_once_timers_are_gone(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    values = {
+        "name": "Timer",
+        "prompt": b"p",
+        "rrule": "FREQ=SECONDLY;INTERVAL=120",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    # Before the migration a timer cannot be stored.
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"t" * 16, kind=3, **values))
+    _migrate_on_one_connection(engine, _TIMER_KIND_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+        conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
+    with pytest.raises(RuntimeError, match="Cancel or delete"):
+        _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _TIMER_KIND_REVISION
+        )
+    with engine.begin() as conn:
+        conn.execute(tasks.delete().where(tasks.c.kind == 3))
+    _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
+    indexes = {index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")}
+    assert "ix_scheduled_tasks_kind_scope" not in indexes
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1]
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_REVISION], indirect=True)
+def test_timer_kind_downgrade_finds_timers_through_the_kind_index(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """The downgrade's check for timers reads one index entry, not the table."""
+    engine = dispatch_migration_engine
+    _migrate_on_one_connection(engine, _TIMER_KIND_REVISION)
+    check = import_module(_TIMER_KIND_MIGRATION)._TIMER_EXISTS.compile(engine)
+    assert "LIMIT" in str(check)
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as connection:
+        plan = str(
+            connection.exec_driver_sql(
+                f"EXPLAIN QUERY PLAN {check}", tuple(check.params.values())
+            ).all()
+        )
+    assert "ix_scheduled_tasks_kind_scope" in plan and "SEARCH" in plan, plan

@@ -166,6 +166,9 @@ class _CommentRelayBinding:
         flip rebuilds the relay like an agent switch does.
     :param session_open_enabled: Session-open flag the surface was built
         with; a flip rebuilds the relay like an agent switch does.
+    :param workflows_enabled: Whether the workflow tools were advertised.
+    :param routing_available: The routing stamp the advertised surface was built
+        under; the advisor is advertised only while it is ``True``.
     """
 
     relay: ClaudeNativeToolRelay
@@ -176,6 +179,7 @@ class _CommentRelayBinding:
     pi_scope_relay: PiScopeRelay | None = dataclasses.field(default=None, repr=False)
     mcp_discovery_failed: bool = False
     workflows_enabled: bool = False
+    routing_available: bool = False
 
 
 def _require_full_native_lock_coverage(

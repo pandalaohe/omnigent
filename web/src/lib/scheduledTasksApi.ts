@@ -47,8 +47,11 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`.
+   * Null for a trigger automation when the server decides when it polls (automations v2).
+   */
+  rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -95,6 +98,13 @@ export interface ScheduledTask {
    * with this session's history. `null`/absent for ordinary automations.
    */
   sourceSessionId?: string | null;
+  /**
+   * The saved workflow every run starts as a run of, whose run message `prompt` holds.
+   * `null` for other automations, and from servers that don't store it.
+   */
+  workflowId?: string | null;
+  /** The specifics each run of `workflowId` carries; `null` without a workflow. */
+  workflowDetails?: string | null;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -183,7 +193,15 @@ export interface CreateScheduledTaskInput {
   /** Diagnostic creation attribution, sent as headers for older-server compatibility. */
   templateId?: AutomationTemplateId;
   name: string;
-  prompt: string;
+  /** Required unless `workflowId` names the saved workflow to run. */
+  prompt?: string;
+  /**
+   * A saved workflow every run starts as a run of, on a server that advertises
+   * `scheduled_task_workflow_id`; the server writes the prompt that runs it. `null` names none.
+   */
+  workflowId?: string | null;
+  /** This run's specifics for `workflowId`. */
+  workflowDetails?: string;
   rrule: string;
   agentId: string;
   timezone?: string;
@@ -261,6 +279,10 @@ export interface UpdateScheduledTaskInput {
    */
   executionTarget?: ScheduledTaskExecutionTarget;
   state?: ScheduledTaskState;
+  /** Run this saved workflow from now on; `null` stops running one and needs a `prompt`. */
+  workflowId?: string | null;
+  /** New specifics for each run of the task's saved workflow; `null` clears them. */
+  workflowDetails?: string | null;
 }
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
@@ -268,7 +290,7 @@ interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;
@@ -289,6 +311,9 @@ interface ScheduledTaskWire {
   paused_by_archive_batch?: string | null;
   execution_target: ScheduledTaskExecutionTarget;
   source_session_id?: string | null;
+  // Absent on servers that don't store the saved workflow a task runs.
+  workflow_id?: string | null;
+  workflow_details?: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -386,6 +411,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     pausedByArchiveBatch: wire.paused_by_archive_batch ?? null,
     executionTarget: wire.execution_target,
     sourceSessionId: wire.source_session_id ?? null,
+    workflowId: wire.workflow_id ?? null,
+    workflowDetails: wire.workflow_details ?? null,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -590,10 +617,12 @@ export async function listScheduledTaskRunPullRequests(
 export async function createScheduledTask(input: CreateScheduledTaskInput): Promise<ScheduledTask> {
   const body: Record<string, unknown> = {
     name: input.name,
-    prompt: input.prompt,
     rrule: input.rrule,
     agent_id: input.agentId,
   };
+  if (input.prompt !== undefined) body.prompt = input.prompt;
+  if (input.workflowId) body.workflow_id = input.workflowId;
+  if (input.workflowDetails) body.workflow_details = input.workflowDetails;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
@@ -679,6 +708,8 @@ export async function updateScheduledTask(
   if (input.projectId !== undefined) body.project_id = input.projectId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
+  if (input.workflowId !== undefined) body.workflow_id = input.workflowId;
+  if (input.workflowDetails !== undefined) body.workflow_details = input.workflowDetails;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
