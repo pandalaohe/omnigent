@@ -7,6 +7,10 @@
   var NONCE = (document.currentScript && document.currentScript.dataset.omniNonce) || "";
   if (!NONCE) return;
 
+  var panelBase =
+    location.protocol === "about:" && document.querySelector("base[data-omni-artifact][href]");
+  var documentUrl = panelBase ? new URL(panelBase.href) : location;
+
   var SRC = "omni-html-comment";
   var T = {
     init: "omni:init",
@@ -675,15 +679,17 @@
     if (!anchor) return;
     // The first `v1/artifacts` marks the route boundary; a bundle's own files
     // may contain that segment again deeper in the path.
-    var m = /^(.*?\/v1\/artifacts\/[^/]+\/)/.exec(location.pathname);
+    // The srcdoc head handles fragment-only links after report click handlers.
+    if (panelBase && /^\s*#/.test(anchor.getAttribute("href"))) return;
+    var m = /^(.*?\/v1\/artifacts\/[^/]+\/)/.exec(documentUrl.pathname);
     if (!m) return;
     var url;
     try {
-      url = new URL(anchor.href, location.href);
+      url = new URL(anchor.href, documentUrl.href);
     } catch {
       return;
     }
-    var sameOrigin = url.protocol === location.protocol && url.host === location.host;
+    var sameOrigin = url.protocol === documentUrl.protocol && url.host === documentUrl.host;
     var inBundle = sameOrigin && url.pathname.indexOf(m[1]) === 0;
     if (!VISIT) {
       // A workspace file outside this artifact: the parent resolves the raw
@@ -819,7 +825,7 @@
         }
       };
       if (e.data.restoreScroll && !scrollRestore) startScrollRestore(e.data.restoreScroll);
-      send({ type: T.ready, pathname: location.pathname });
+      send({ type: T.ready, pathname: documentUrl.pathname });
       if (scrollReportMissed) onScroll();
     }
   });

@@ -9,10 +9,9 @@
 // iframe via the injected bridge, relayed over a private MessageChannel. See
 // htmlCommentBridge.ts for the protocol and trust model.
 //
-// Standalone the frame loads the artifact URL as `src`, so relative resources
-// and in-bundle links resolve inside the bundle and the server inlines the
-// bridge into every panel page. Embed mode (a host fetcher is configured, which
-// cannot carry an iframe `src`) keeps the client-injected srcdoc.
+// In standalone panel previews the artifact response supplies the frame and
+// comment source. Its artifact URL remains the base for relative links.
+// Embed mode uses the client-injected srcdoc from workspace content.
 // Embedded hosts may supply their own isolated frame.
 
 import { createPortal } from "react-dom";
@@ -38,6 +37,7 @@ import {
   type ActiveSelection,
   HTML_PANEL_SANDBOX,
   HTML_PREVIEW_SANDBOX,
+  prepareArtifactSrcdoc,
 } from "./codeViewerHelpers";
 import { useFileViewer, useWorkspacePaths } from "./FileViewerContext";
 import {
@@ -382,6 +382,18 @@ export function HtmlCommentViewer({
   const [refreshError, setRefreshError] = useState<{ key: string; message: string } | null>(null);
   const refreshedEntry = refreshed?.key === loadKey ? refreshed.entry : null;
   const entry = refreshedEntry ?? (load?.status === "ready" ? load.entry : null);
+  const entrySrcdoc = useMemo(
+    () =>
+      entry?.document
+        ? prepareArtifactSrcdoc(
+            entry.document,
+            entry.source,
+            entry.nonce,
+            new URL(withBasePath(entry.url), window.location.origin).href,
+          )
+        : null,
+    [entry],
+  );
   const refreshErrorMessage = refreshError?.key === loadKey ? refreshError.message : null;
   const errorMessage = refreshErrorMessage ?? (load?.status === "error" ? load.message : null);
   const nonce = embedDoc?.nonce ?? entry?.nonce ?? null;
@@ -533,7 +545,10 @@ export function HtmlCommentViewer({
           const prefix = artifactUrlPrefix(fresh.url);
           setRefreshed({
             key: loadKey,
-            entry: prefix && tail ? { ...fresh, url: prefix + tail } : fresh,
+            entry:
+              prefix && tail && tail !== artifactTail(fresh.url)
+                ? { ...fresh, url: prefix + tail, document: null }
+                : fresh,
           });
         },
         (err: unknown) => {
@@ -897,7 +912,9 @@ export function HtmlCommentViewer({
       <iframe
         ref={setIframeNode}
         onLoad={handlePreviewLoad}
-        src={withBasePath(entry.url)}
+        src={entrySrcdoc === null ? withBasePath(entry.url) : undefined}
+        srcDoc={entrySrcdoc ?? undefined}
+        referrerPolicy="no-referrer"
         sandbox={HTML_PANEL_SANDBOX}
         title="HTML preview"
         className="w-full h-full border-0"
