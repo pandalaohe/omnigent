@@ -211,6 +211,7 @@ vi.mock("@/hooks/useComments", () => ({
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: { content: "", path: "file1.py" } })),
+  useBinaryFilePreview: vi.fn(() => ({ data: undefined })),
 }));
 
 vi.mock("@/hooks/useFileDiff", () => ({
@@ -280,7 +281,7 @@ import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
-import { useFileContent } from "@/hooks/useFileContent";
+import { useBinaryFilePreview, useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -3396,6 +3397,97 @@ describe("FileViewer 3D model files", () => {
     renderViewer({ open: true, path: "mesh.obj" });
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+  });
+});
+
+describe("FileViewer raw binary preview routing", () => {
+  afterEach(() => {
+    vi.mocked(useFileContent).mockReset();
+    vi.mocked(useBinaryFilePreview).mockReset();
+    vi.mocked(useFileContent).mockImplementation(
+      () => ({ data: { content: "", path: "file1.py" } }) as ReturnType<typeof useFileContent>,
+    );
+    vi.mocked(useBinaryFilePreview).mockImplementation(
+      () => ({ data: undefined }) as ReturnType<typeof useBinaryFilePreview>,
+    );
+  });
+
+  it.each(["assets/photo.png", "assets/photo.jpe", "docs/report.pdf", "cad/part.stl"])(
+    "skips JSON useFileContent and fetches raw bytes via useBinaryFilePreview for %s",
+    (path) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path });
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", null, { visible: true });
+      expect(useBinaryFilePreview).toHaveBeenLastCalledWith("conv_1", path, { visible: true });
+    },
+  );
+
+  it("keeps Download file available in the settings menu for raw binary previews", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: undefined,
+    } as ReturnType<typeof useFileContent>);
+    vi.mocked(useBinaryFilePreview).mockReturnValue({
+      data: undefined,
+      isLoadingError: true,
+      error: new Error("File is too large to preview (64 MiB limit)."),
+    } as ReturnType<typeof useBinaryFilePreview>);
+    renderViewer({ open: true, path: "docs/huge.pdf" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+  });
+
+  it("applies a ?comment= deep link on a PDF once binaryQuery resolves", async () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.05 }], "Quoted PDF text");
+    const pdfComment: Comment = {
+      ...makeComment("c_pdf_link"),
+      path: "docs/report.pdf",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+      body: "Check figure 1",
+    };
+    useCommentsMock.mockReturnValue(makeCommentsQuery([pdfComment]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: undefined,
+    } as ReturnType<typeof useFileContent>);
+    vi.mocked(useBinaryFilePreview).mockReturnValue({
+      data: {
+        blob: new Blob(["%PDF-1.4"], { type: "application/pdf" }),
+        contentType: "application/pdf",
+        bytes: 8,
+        fingerprint: "8:application/pdf:1:2",
+        pollable: false,
+      },
+    } as ReturnType<typeof useBinaryFilePreview>);
+
+    renderViewer({ open: true, path: "docs/report.pdf", initialSearch: "comment=c_pdf_link" });
+
+    await waitFor(() => expect(screen.getByTestId("comments-panel")).toBeInTheDocument());
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute(
+      "data-active-comment-id",
+      "c_pdf_link",
+    );
+  });
+
+  it("shows the stale-refresh banner when a binary preview refresh fails", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useBinaryFilePreview).mockReturnValue({
+      data: {
+        blob: new Blob([new Uint8Array([1, 2])], { type: "image/png" }),
+        contentType: "image/png",
+        bytes: 2,
+        fingerprint: "2:image/png:1:2",
+        pollable: false,
+      },
+      isRefetchError: true,
+      error: new Error("503 Service Unavailable"),
+    } as ReturnType<typeof useBinaryFilePreview>);
+
+    renderViewer({ open: true, path: "assets/photo.png" });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Couldn't refresh this file (503 Service Unavailable). Showing the last loaded version.",
+    );
   });
 });
 

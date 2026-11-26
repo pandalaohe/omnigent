@@ -314,6 +314,16 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
     );
     await waitFor(() => expect(parseCalls).toContain("stl"));
   });
+
+  it("renders directly from a raw preview Blob without calling atob", async () => {
+    const atobSpy = vi.spyOn(globalThis, "atob");
+    const rawBlob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: "model/stl" });
+    render(<ModelViewer blob={rawBlob} contentType="model/stl" path="raw.stl" />);
+    await waitFor(() => expect(parseCalls).toContain("stl"));
+    expect(atobSpy).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Unable to render/)).toBeNull();
+    atobSpy.mockRestore();
+  });
 });
 
 describe("ModelViewer error states", () => {

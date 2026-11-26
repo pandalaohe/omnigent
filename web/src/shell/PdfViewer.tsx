@@ -69,7 +69,8 @@ interface FloatingAnchor {
 }
 
 export interface PdfViewerProps {
-  data: FileContentResponse;
+  blob?: Blob;
+  data?: FileContentResponse;
   conversationId: string;
   comments?: Comment[];
   activeSelection?: ActiveSelection | null;
@@ -129,6 +130,7 @@ function PdfCommentHighlights({
 }
 
 export function PdfViewer({
+  blob,
   data,
   conversationId,
   comments = EMPTY_COMMENTS,
@@ -136,6 +138,7 @@ export function PdfViewer({
   onSetActiveSelection,
 }: PdfViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const truncated = data?.truncated ?? false;
   const [numPages, setNumPages] = useState(0);
   const [errored, setErrored] = useState(false);
   const [scale, setScale] = useState(1);
@@ -161,12 +164,15 @@ export function PdfViewer({
   // so every load gets its own buffer. Memoized so the Document only reloads
   // when the file changes. A truncated PDF is a partial byte stream pdf.js can't
   // parse, so show the error/banner UI instead.
-  const pdfFile = useMemo(() => (data.truncated ? null : fileContentToBlob(data)), [data]);
+  const pdfFile = useMemo(
+    () => (blob ? blob : data && !data.truncated ? fileContentToBlob(data) : null),
+    [blob, data],
+  );
 
   useEffect(() => {
-    setErrored(!!data.truncated);
+    setErrored(truncated || !pdfFile);
     setNumPages(0);
-  }, [data]);
+  }, [truncated, pdfFile]);
 
   // Measure the container so pages fit its width (minus padding) at scale 1.
   useEffect(() => {
@@ -292,15 +298,15 @@ export function PdfViewer({
 
   useEffect(() => {
     setFloating(null);
-  }, [scale, data]);
+  }, [scale, blob, data]);
 
   if (errored) {
     const body = centered(
-      data.truncated
+      truncated
         ? "PDF is too large to preview (truncated by the server)."
         : "Unable to render PDF.",
     );
-    if (!data.truncated) return body;
+    if (!truncated) return body;
     return (
       <div className="flex h-full flex-col">
         <TruncatedBanner />

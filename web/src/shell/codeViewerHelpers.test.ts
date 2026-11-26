@@ -17,10 +17,13 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isRawBinaryPreviewPath,
   lineOverlapsSelection,
   modelViewerTheme,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
+  previewMimeTypeForPath,
+  resolveBinaryPreviewKind,
 } from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
@@ -353,6 +356,61 @@ describe("modelViewerTheme", () => {
   it("provides an STL default material color for each mode", () => {
     expect(typeof modelViewerTheme("light").stlMaterial).toBe("number");
     expect(typeof modelViewerTheme("dark").stlMaterial).toBe("number");
+  });
+});
+
+describe("isRawBinaryPreviewPath and previewMimeTypeForPath", () => {
+  it.each([
+    ["assets/photo.png", true],
+    ["assets/photo.jpe", true],
+    ["docs/report.pdf", true],
+    ["cad/part.stl", true],
+    ["cad/assembly.3mf", true],
+    ["cad/mesh.obj", true],
+    ["icons/logo.svg", true],
+    ["src/app.ts", false],
+    ["docs/readme.md", false],
+    ["archive/data.bin", false],
+    ["video/clip.mp4", false],
+  ])("classifies %s as raw binary preview = %s", (path, expected) => {
+    expect(isRawBinaryPreviewPath(path)).toBe(expected);
+  });
+
+  it("keeps recognized preview server MIME authoritative and strips parameters", () => {
+    expect(previewMimeTypeForPath("photo.png", "image/webp; charset=binary")).toBe("image/webp");
+    expect(previewMimeTypeForPath("links/report.png", "application/pdf")).toBe("application/pdf");
+    expect(previewMimeTypeForPath("notes.txt", "text/plain; charset=utf-8")).toBe("text/plain");
+  });
+
+  it("uses extension MIME when server sends missing, octet-stream, or non-preview MIME", () => {
+    expect(previewMimeTypeForPath("icons/logo.svg", "application/octet-stream")).toBe(
+      "image/svg+xml",
+    );
+    expect(previewMimeTypeForPath("icons/symlink.svg", "text/plain; charset=utf-8")).toBe(
+      "image/svg+xml",
+    );
+    expect(previewMimeTypeForPath("pics/shot.jpe", null)).toBe("image/jpeg");
+    expect(previewMimeTypeForPath("pics/shot.avif", null)).toBe("image/avif");
+    expect(previewMimeTypeForPath("docs/report.pdf", "application/octet-stream")).toBe(
+      "application/pdf",
+    );
+    expect(previewMimeTypeForPath("cad/part.stl", null)).toBe("model/stl");
+    expect(previewMimeTypeForPath("cad/mesh.obj", "text/plain; charset=utf-8")).toBe("model/obj");
+    expect(previewMimeTypeForPath("raw/unknown.xyz", null)).toBe("application/octet-stream");
+  });
+
+  it("ignores Object.prototype keys like .constructor in extension lookups", () => {
+    expect(getModelFormat("sample.constructor")).toBeNull();
+    expect(isRawBinaryPreviewPath("sample.constructor")).toBe(false);
+    expect(previewMimeTypeForPath("sample.constructor", null)).toBe("application/octet-stream");
+    expect(resolveBinaryPreviewKind("sample.constructor", "application/octet-stream")).toBeNull();
+  });
+
+  it("resolves binary preview kind MIME-first across image, PDF, and model types", () => {
+    expect(resolveBinaryPreviewKind("links/report.png", "application/pdf")).toBe("pdf");
+    expect(resolveBinaryPreviewKind("links/part.pdf", "model/stl")).toBe("model");
+    expect(resolveBinaryPreviewKind("links/mesh.stl", "image/png")).toBe("image");
+    expect(resolveBinaryPreviewKind("cad/part.stl", "application/octet-stream")).toBe("model");
   });
 });
 
