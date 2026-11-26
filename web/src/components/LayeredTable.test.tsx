@@ -79,14 +79,26 @@ function sourceName(source: LayeredLevel | null): string {
   return "This cell";
 }
 
+function rowOrder() {
+  return screen
+    .getAllByRole("rowheader")
+    .map(
+      (cell) =>
+        cell.querySelector("[data-testid^='layered-row-']")?.getAttribute("data-testid") ??
+        cell.textContent,
+    );
+}
+
 function StatefulTable({
   initial = baseStore,
   unavailable = NO_UNAVAILABLE,
   showExtraRows = false,
+  foldUnconfigured = false,
 }: {
   initial?: Store;
   unavailable?: Record<string, string>;
   showExtraRows?: boolean;
+  foldUnconfigured?: boolean;
 }) {
   const [store, setStore] = useState(initial);
   const [undo, setUndo] = useState<Store | null>(null);
@@ -133,6 +145,7 @@ function StatefulTable({
     <LayeredTable
       label="Keep-warm test layers"
       cornerLabel="All agents on all hosts"
+      foldUnconfigured={foldUnconfigured}
       rows={[
         {
           id: "codex",
@@ -397,6 +410,68 @@ describe("LayeredTable and LayeredEditor", () => {
     await user.click(screen.getByRole("button", { name: "Select cells" }));
     await user.click(screen.getByTestId("layered-corner"));
     expect(screen.getByText("0 selected")).toBeVisible();
+  });
+
+  it("folds rows without a marked cell, keeps them out of selection, and refolds a cleared row", async () => {
+    const user = userEvent.setup();
+    render(<StatefulTable showExtraRows foldUnconfigured />);
+    const toggle = screen.getByRole("button", { name: "Not configured (2)" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("layered-row-codex")).toBeVisible();
+    expect(screen.queryByTestId("layered-row-native")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Select cells" }));
+    await user.click(screen.getByTestId("layered-corner"));
+    expect(screen.getByText("1 selected")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Done selecting" }));
+
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(rowOrder()).toEqual([
+      "layered-row-codex",
+      "Not configured (2)",
+      "layered-row-native",
+      "layered-row-acp",
+    ]);
+    await user.click(toggle);
+    await user.click(screen.getByTestId("layered-cell-codex-desktop"));
+    await user.click(screen.getByRole("button", { name: "Set Off" }));
+    expect(screen.getByRole("button", { name: "Not configured (3)" })).toBeVisible();
+    expect(screen.queryByTestId("layered-row-codex")).toBeNull();
+  });
+
+  it("keeps a marked row or configured cell on top and folds detail rows", async () => {
+    const user = userEvent.setup();
+    render(
+      <LayeredTable
+        label="Read-only layers"
+        cornerLabel="Agent"
+        readOnly
+        foldUnconfigured
+        rows={[
+          { id: "plain", label: "Plain" },
+          { id: "marked", label: "Marked", mark: true },
+          { id: "reported", label: "Reported" },
+        ]}
+        detailRows={[{ id: "custom", content: <span>Custom agent</span> }]}
+        columns={[{ id: "desktop", label: "Desktop" }]}
+        renderCell={(row) => ({ content: row, configured: row === "reported" })}
+        renderEditor={(_at, trigger) => trigger}
+      />,
+    );
+    expect(rowOrder()).toEqual([
+      "layered-row-marked",
+      "layered-row-reported",
+      "Not configured (2)",
+    ]);
+    await user.click(screen.getByRole("button", { name: "Not configured (2)" }));
+    expect(rowOrder()).toEqual([
+      "layered-row-marked",
+      "layered-row-reported",
+      "Not configured (2)",
+      "layered-row-plain",
+      "Custom agent",
+    ]);
   });
 
   it("displays the normalized runtime value rather than the stored seconds", () => {

@@ -320,6 +320,7 @@ export function CallingDefaultsSection() {
               agentIds={agentIds}
               capabilities={capabilities}
               detailRows={detailRows}
+              foldUnconfigured
             />
           ) : (
             <AgentDefaultsTable
@@ -334,6 +335,7 @@ export function CallingDefaultsSection() {
               agentIds={agentIds}
               linkToDetails
               detailRows={detailRows}
+              foldUnconfigured
               onLoadCatalog={loadCatalog}
               onChange={(next) => patchCallingDefaults(callingDefaultsPatch(master, next))}
             />

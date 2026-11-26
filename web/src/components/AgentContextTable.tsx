@@ -47,15 +47,9 @@ function startupPromptsPath(agentKey: string, hostId: string) {
   return `/settings/instructions?${new URLSearchParams({ view: "route", agent: agentKey, host: hostId })}`;
 }
 
-function ProviderValue({
-  harness,
-  host,
-  capabilities,
-}: {
-  harness: string;
-  host: Host;
-  capabilities: HarnessCapabilityMap;
-}) {
+const UNSET_PROVIDERS = new Set(["Not reported", "Not signed in"]);
+
+function providerValue(harness: string, host: Host, capabilities: HarnessCapabilityMap) {
   if (host.gateway_inference?.[harness] === true) return "Unity Gateway";
   const account =
     host.harness_accounts?.[harnessAccountKey(agentProductHarness(harness, capabilities))];
@@ -79,6 +73,7 @@ export function AgentContextTable({
   capabilities: HarnessCapabilityMap;
   detailRows?: LayeredTableProps["detailRows"];
   visibleHostId?: string;
+  foldUnconfigured?: boolean;
 }) {
   return field === "prompt" ? (
     <PromptTable {...props} />
@@ -124,6 +119,7 @@ function ContextTable({
   agentIds,
   capabilities,
   detailRows,
+  foldUnconfigured,
   layers,
   loading,
   catalogs,
@@ -174,6 +170,7 @@ function ContextTable({
         };
       })}
       detailRows={detailRows}
+      foldUnconfigured={foldUnconfigured}
       columns={hosts
         .filter((host) => !visibleHostId || host.host_id === visibleHostId)
         .map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
@@ -186,10 +183,10 @@ function ContextTable({
         const host = hosts.find((candidate) => candidate.host_id === hostId)!;
         if (!agentPresentOnHost(harness, host))
           return { content: null, unavailable: missingCellText(harness, host.platform) };
-        if (field === "provider")
-          return {
-            content: <ProviderValue harness={harness} host={host} capabilities={capabilities} />,
-          };
+        if (field === "provider") {
+          const provider = providerValue(harness, host, capabilities);
+          return { content: provider, configured: !UNSET_PROVIDERS.has(provider) };
+        }
         if (
           catalogs?.some(
             (row) =>
@@ -204,6 +201,7 @@ function ContextTable({
             (route) => route.agent_key === agent.key && route.host_id === hostId,
           );
         return {
+          configured: !!agent,
           content: agent ? (
             <Link
               to={startupPromptsPath(agent.key, hostId)}

@@ -93,6 +93,40 @@ describe("agent context lenses", () => {
       expect(screen.queryByText("Personal subscription")).toBeNull();
   });
 
+  it("folds rows with no reported provider or prompt below the configured rows", () => {
+    const { unmount } = render(
+      <MemoryRouter>
+        <AgentContextTable
+          {...props}
+          field="provider"
+          foldUnconfigured
+          hosts={[
+            {
+              ...host,
+              harness_accounts: { codex: { kind: "none" } as HarnessAccount },
+              gateway_inference: { codex: true },
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Unity Gateway")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Not configured (1)" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    unmount();
+
+    render(
+      <MemoryRouter>
+        <AgentContextTable {...props} field="prompt" foldUnconfigured />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("button", { name: "Not configured (2)" })).toBeVisible();
+    expect(screen.queryByText("Not available")).toBeNull();
+  });
+
   it("reads the same Claude account for Native and SDK through the product family", () => {
     render(
       <MemoryRouter>

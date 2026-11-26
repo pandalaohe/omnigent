@@ -1,4 +1,4 @@
-import { TriangleAlertIcon } from "lucide-react";
+import { ChevronRightIcon, TriangleAlertIcon } from "lucide-react";
 import { useEffect, useState, type ReactElement, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
@@ -34,6 +34,8 @@ export interface LayeredCell {
   summary?: string;
   clash?: string;
   unavailable?: string;
+  /** Counts as a set value for `foldUnconfigured` in tables that show no marks. */
+  configured?: boolean;
 }
 
 export type LayeredCellLevel = Extract<LayeredLevel, { level: "cell" }>;
@@ -62,6 +64,8 @@ export interface LayeredTableProps {
   className?: string;
   testId?: string;
   readOnly?: boolean;
+  /** Moves rows with no marked, clashing or configured cell into one collapsed group at the bottom. */
+  foldUnconfigured?: boolean;
 }
 
 function selectionKey(row: string, col: string): string {
@@ -203,11 +207,28 @@ export function LayeredTable({
   className,
   testId,
   readOnly = false,
+  foldUnconfigured = false,
 }: LayeredTableProps) {
   const firstColumn = cn(FIRST_COLUMN, rows.some((row) => row.action) && "min-w-50 max-w-50");
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const availableLevels: LayeredCellLevel[] = rows.flatMap((row) =>
+  const [unfolded, setUnfolded] = useState(false);
+  const topRows = foldUnconfigured
+    ? rows.filter(
+        (row) =>
+          row.mark ||
+          columns.some((col) => {
+            const cell = renderCell(row.id, col.id);
+            return cell.mark || cell.configured || !!cell.clash;
+          }),
+      )
+    : rows;
+  const foldedRows = rows.filter((row) => !topRows.includes(row));
+  const foldedCount = foldUnconfigured ? foldedRows.length + (detailRows?.length ?? 0) : 0;
+  const foldOpen = !foldUnconfigured || unfolded;
+  // Folded rows stay out of header and corner selection while they are hidden.
+  const shownRows = foldOpen ? [...topRows, ...foldedRows] : topRows;
+  const availableLevels: LayeredCellLevel[] = shownRows.flatMap((row) =>
     columns.flatMap((col) =>
       renderCell(row.id, col.id).unavailable
         ? []
@@ -281,6 +302,92 @@ export function LayeredTable({
 
     if (selecting) return button;
     return renderEditor(at, button);
+  }
+
+  function renderRow(row: LayeredTableRow) {
+    return (
+      <tr key={row.id} className="[&:last-child>*]:border-b-0">
+        <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
+          <div className="flex size-full min-w-0 items-stretch">
+            <div className="min-w-0 flex-1">
+              {editorButton(
+                { level: "row", row: row.id },
+                <>
+                  <span className={LEVEL_NAME}>
+                    <LevelLabel label={row.label}>{row.content ?? row.label}</LevelLabel>
+                  </span>
+                  {row.detail && <LevelState mark={row.mark}>{row.detail}</LevelState>}
+                </>,
+                selecting ? `Select ${row.label} cells` : `Edit ${row.label}`,
+                undefined,
+                columns.flatMap((col) =>
+                  renderCell(row.id, col.id).unavailable
+                    ? []
+                    : [{ level: "cell" as const, row: row.id, col: col.id }],
+                ),
+                `layered-row-${row.id}`,
+                row.summary,
+              )}
+            </div>
+            {row.action}
+          </div>
+        </th>
+        {columns.map((col) => {
+          const cell = renderCell(row.id, col.id);
+          const at: LayeredCellLevel = { level: "cell", row: row.id, col: col.id };
+          return (
+            <td key={col.id} className={cn("relative", LEVEL_CELL, BODY_COLUMN)}>
+              {cell.unavailable ? (
+                <span className="flex size-full min-h-11 items-center px-2.5 py-1.75 text-muted-foreground">
+                  {cell.unavailable}
+                </span>
+              ) : (
+                <>
+                  {editorButton(
+                    at,
+                    <LevelState mark={cell.mark}>{cell.content}</LevelState>,
+                    selecting
+                      ? `Select ${row.label} on ${col.label}`
+                      : `Edit ${row.label} on ${col.label}`,
+                    cell.clash,
+                    [at],
+                    `layered-cell-${row.id}-${col.id}`,
+                    cell.summary,
+                  )}
+                  {cell.clash && (
+                    <HelpTip
+                      label={`Warning: ${cell.clash}`}
+                      icon={<TriangleAlertIcon className="size-3.5" />}
+                      className="absolute top-0 right-0 size-11 text-warning hover:text-warning md:top-2 md:right-2 md:size-4"
+                    >
+                      <span className="block whitespace-pre-line">{cell.clash}</span>
+                      {!selecting && (
+                        <span className="mt-2 block text-muted-foreground">
+                          Click this cell to set it here.
+                        </span>
+                      )}
+                    </HelpTip>
+                  )}
+                </>
+              )}
+            </td>
+          );
+        })}
+      </tr>
+    );
+  }
+
+  function renderDetailRow(row: { id: string; content: ReactNode }) {
+    return (
+      <tr key={row.id} className="[&:last-child>*]:border-b-0">
+        <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
+          {row.content}
+        </th>
+        {columns.map((col) => (
+          <td key={col.id} className={cn(LEVEL_CELL, BODY_COLUMN)} />
+        ))}
+      </tr>
+    );
   }
 
   return (
@@ -361,7 +468,7 @@ export function LayeredTable({
                     </>,
                     selecting ? `Select ${col.label} cells` : `Edit ${col.label}`,
                     undefined,
-                    rows.flatMap((row) =>
+                    shownRows.flatMap((row) =>
                       renderCell(row.id, col.id).unavailable
                         ? []
                         : [{ level: "cell" as const, row: row.id, col: col.id }],
@@ -374,86 +481,35 @@ export function LayeredTable({
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
-              <tr key={row.id} className="[&:last-child>*]:border-b-0">
-                <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
-                  <div className="flex size-full min-w-0 items-stretch">
-                    <div className="min-w-0 flex-1">
-                      {editorButton(
-                        { level: "row", row: row.id },
-                        <>
-                          <span className={LEVEL_NAME}>
-                            <LevelLabel label={row.label}>{row.content ?? row.label}</LevelLabel>
-                          </span>
-                          {row.detail && <LevelState mark={row.mark}>{row.detail}</LevelState>}
-                        </>,
-                        selecting ? `Select ${row.label} cells` : `Edit ${row.label}`,
-                        undefined,
-                        columns.flatMap((col) =>
-                          renderCell(row.id, col.id).unavailable
-                            ? []
-                            : [{ level: "cell" as const, row: row.id, col: col.id }],
-                        ),
-                        `layered-row-${row.id}`,
-                        row.summary,
+            {topRows.map(renderRow)}
+            {foldedCount > 0 && (
+              <tr className="[&:last-child>*]:border-b-0">
+                <th
+                  scope="rowgroup"
+                  colSpan={columns.length + 1}
+                  className={cn(LEVEL_CELL, "bg-muted/40")}
+                >
+                  <button
+                    type="button"
+                    aria-expanded={unfolded}
+                    data-testid="layered-fold-toggle"
+                    className="sticky left-0 flex min-h-11 w-fit items-center gap-1.5 px-2.5 text-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    onClick={() => setUnfolded((current) => !current)}
+                  >
+                    <ChevronRightIcon
+                      aria-hidden
+                      className={cn(
+                        "size-4 shrink-0 transition-transform",
+                        unfolded && "rotate-90",
                       )}
-                    </div>
-                    {row.action}
-                  </div>
+                    />
+                    <span>Not configured ({foldedCount})</span>
+                  </button>
                 </th>
-                {columns.map((col) => {
-                  const cell = renderCell(row.id, col.id);
-                  const at: LayeredCellLevel = { level: "cell", row: row.id, col: col.id };
-                  return (
-                    <td key={col.id} className={cn("relative", LEVEL_CELL, BODY_COLUMN)}>
-                      {cell.unavailable ? (
-                        <span className="flex size-full min-h-11 items-center px-2.5 py-1.75 text-muted-foreground">
-                          {cell.unavailable}
-                        </span>
-                      ) : (
-                        <>
-                          {editorButton(
-                            at,
-                            <LevelState mark={cell.mark}>{cell.content}</LevelState>,
-                            selecting
-                              ? `Select ${row.label} on ${col.label}`
-                              : `Edit ${row.label} on ${col.label}`,
-                            cell.clash,
-                            [at],
-                            `layered-cell-${row.id}-${col.id}`,
-                            cell.summary,
-                          )}
-                          {cell.clash && (
-                            <HelpTip
-                              label={`Warning: ${cell.clash}`}
-                              icon={<TriangleAlertIcon className="size-3.5" />}
-                              className="absolute top-0 right-0 size-11 text-warning hover:text-warning md:top-2 md:right-2 md:size-4"
-                            >
-                              <span className="block whitespace-pre-line">{cell.clash}</span>
-                              {!selecting && (
-                                <span className="mt-2 block text-muted-foreground">
-                                  Click this cell to set it here.
-                                </span>
-                              )}
-                            </HelpTip>
-                          )}
-                        </>
-                      )}
-                    </td>
-                  );
-                })}
               </tr>
-            ))}
-            {detailRows?.map((row) => (
-              <tr key={row.id} className="[&:last-child>*]:border-b-0">
-                <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
-                  {row.content}
-                </th>
-                {columns.map((col) => (
-                  <td key={col.id} className={cn(LEVEL_CELL, BODY_COLUMN)} />
-                ))}
-              </tr>
-            ))}
+            )}
+            {foldOpen && foldedRows.map(renderRow)}
+            {foldOpen && detailRows?.map(renderDetailRow)}
           </tbody>
         </table>
       </div>
