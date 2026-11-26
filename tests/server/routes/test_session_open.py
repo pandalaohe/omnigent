@@ -38,6 +38,7 @@ from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes.sessions import routes_open
 from omnigent.server.routes.sessions.routes_open import register_open_routes
 from omnigent.server.routes.sessions.routes_peer import register_peer_routes
+from omnigent.server.schemas import SessionResponse
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -305,7 +306,13 @@ def _patch_create(
         )
         if error is not None:
             raise error
-        return SimpleNamespace(id=sid, session_choice=None), conv, body
+        response = SessionResponse(
+            id=sid,
+            agent_id=body.agent_id or env["agent_id"],
+            status="idle",
+            created_at=conv.created_at,
+        )
+        return response, conv, body
 
     monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
     return captured
@@ -334,7 +341,13 @@ def _patch_create_gated(
             project_id=body.project_id,
             runner_id=token_bound_runner_id(secrets.token_hex(16)),
         )
-        return SimpleNamespace(id=sid, session_choice=None), conv, body
+        response = SessionResponse(
+            id=sid,
+            agent_id=body.agent_id or env["agent_id"],
+            status="idle",
+            created_at=conv.created_at,
+        )
+        return response, conv, body
 
     monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
     return gate, captured
