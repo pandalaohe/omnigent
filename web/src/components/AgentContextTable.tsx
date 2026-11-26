@@ -7,8 +7,8 @@ import {
   type CallingDefaultsCatalogRow,
 } from "@/lib/callingDefaultsApi";
 import { ArrowRightIcon } from "lucide-react";
-import { AgentNameTag } from "@/components/AgentNameTag";
-import { LayeredTable } from "@/components/LayeredTable";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
+import { LayeredTable, type LayeredTableProps } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
 import {
   useInstructionLayers,
@@ -16,7 +16,12 @@ import {
   type InstructionLayers,
 } from "@/hooks/useInstructionLayers";
 import type { Host } from "@/hooks/useHosts";
-import { agentPresentOnHost, agentProductHarness, agentSettingsPath } from "@/lib/agentSettings";
+import {
+  agentPresentOnHost,
+  agentProductHarness,
+  agentSettingsHost,
+  agentSettingsPath,
+} from "@/lib/agentSettings";
 import { missingCellText } from "@/lib/layeredValues";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { Link } from "@/lib/routing";
@@ -64,36 +69,21 @@ function ProviderValue({
 
 export function AgentContextTable({
   field,
-  hosts,
-  harnesses,
-  names,
-  agentIds,
-  capabilities,
+  ...props
 }: {
   field: "prompt" | "provider";
   hosts: readonly Host[];
   harnesses: readonly string[];
   names: Readonly<Record<string, string>>;
-  agentIds: Readonly<Record<string, string>>;
+  agentIds: Readonly<Record<string, string | undefined>>;
   capabilities: HarnessCapabilityMap;
+  detailRows?: LayeredTableProps["detailRows"];
+  visibleHostId?: string;
 }) {
   return field === "prompt" ? (
-    <PromptTable
-      hosts={hosts}
-      harnesses={harnesses}
-      names={names}
-      agentIds={agentIds}
-      capabilities={capabilities}
-    />
+    <PromptTable {...props} />
   ) : (
-    <ContextTable
-      field={field}
-      hosts={hosts}
-      harnesses={harnesses}
-      names={names}
-      agentIds={agentIds}
-      capabilities={capabilities}
-    />
+    <ContextTable {...props} field={field} />
   );
 }
 
@@ -128,10 +118,12 @@ function PromptTable(props: Omit<ContextProps, "field">) {
 function ContextTable({
   field,
   hosts,
+  visibleHostId,
   harnesses,
   names,
   agentIds,
   capabilities,
+  detailRows,
   layers,
   loading,
   catalogs,
@@ -140,40 +132,51 @@ function ContextTable({
   loading?: boolean;
   catalogs?: CallingDefaultsCatalogRow[];
 }) {
-  const dependent = (harness: string) =>
-    agentProductHarness(harness, capabilities) !== harness &&
-    harnesses.includes(agentProductHarness(harness, capabilities));
   return (
     <LayeredTable
       label={`${field === "prompt" ? "Prompt" : "Provider"} by agent and host`}
       cornerLabel="Agent"
       readOnly
-      rows={harnesses.map((harness) => ({
-        id: harness,
-        label: names[harness] ?? harness,
-        content: (
-          <span className={dependent(harness) ? "pl-4" : undefined}>
-            <AgentNameTag
-              agentId={agentIds[harness] ?? null}
-              name={names[harness] ?? harness}
-              harness={harness}
-              markOnly={dependent(harness)}
-            />
-            {dependent(harness) && <span className="sr-only">{names[harness] ?? harness}</span>}
-          </span>
-        ),
-        action: (
-          <Link
-            to={agentSettingsPath(harness, hosts.length === 1 ? hosts[0].host_id : undefined)}
-            aria-label={`${names[harness] ?? harness} details`}
-            componentId="settings.agents.detail"
-            className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ArrowRightIcon className="size-4" aria-hidden />
-          </Link>
-        ),
-      }))}
-      columns={hosts.map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
+      rows={harnesses.map((harness) => {
+        const kind = nonNativeAgentKind(harness, capabilities[harness]?.integration_mode);
+        return {
+          id: harness,
+          label: names[harness] ?? harness,
+          content: (
+            <span className="block whitespace-normal">
+              <AgentNameTag
+                agentId={agentIds[harness] ?? null}
+                name={names[harness] ?? harness}
+                harness={harness}
+                kindTag={kind}
+                className="max-w-full"
+              />
+            </span>
+          ),
+          action: (
+            <Link
+              to={agentSettingsPath(
+                harness,
+                agentSettingsHost(
+                  harness,
+                  hosts,
+                  visibleHostId ?? (hosts.length === 1 ? hosts[0].host_id : undefined),
+                ),
+              )}
+              aria-label={`${names[harness] ?? harness} details`}
+              aria-description={kind ?? undefined}
+              componentId="settings.agents.detail"
+              className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ArrowRightIcon className="size-4" aria-hidden />
+            </Link>
+          ),
+        };
+      })}
+      detailRows={detailRows}
+      columns={hosts
+        .filter((host) => !visibleHostId || host.host_id === visibleHostId)
+        .map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
       renderEditor={(_at, trigger: ReactElement) => (
         <div className="flex min-h-11 min-w-0 flex-col justify-center px-2.5 py-1.75">
           {(trigger.props as { children: ReactNode }).children}

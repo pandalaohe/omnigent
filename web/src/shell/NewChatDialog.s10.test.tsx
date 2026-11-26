@@ -513,7 +513,6 @@ describe("NewChatLandingScreen tokens", () => {
     renderLanding();
     const field = landingInput();
     let top = 14;
-    let width = 360;
     let contentHeight = 720;
     const currentBoxHeight = () => {
       const parsed = Number.parseFloat(field.style.height);
@@ -522,13 +521,13 @@ describe("NewChatLandingScreen tokens", () => {
     Object.defineProperties(field, {
       offsetTop: { configurable: true, get: () => top },
       offsetLeft: { configurable: true, value: 12 },
-      offsetWidth: { configurable: true, get: () => width },
       offsetHeight: { configurable: true, get: currentBoxHeight },
       clientHeight: { configurable: true, get: currentBoxHeight },
       scrollHeight: { configurable: true, get: () => contentHeight },
     });
     field.style.lineHeight = "20px";
     field.style.padding = "0";
+    field.style.width = "360px";
 
     // Attachment-only draft (no command or @mention) activates backdrop alignment.
     attach([img()]);
@@ -544,7 +543,7 @@ describe("NewChatLandingScreen tokens", () => {
     expect(overlay.scrollTop).toBe(540);
 
     // Resize updates the overlay box and clamped scroll offset.
-    width = 420;
+    field.style.width = "420px";
     top = 18;
     contentHeight = 500;
     act(() => notifyTextareaResize.forEach((notify) => notify()));

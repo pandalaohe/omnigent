@@ -212,7 +212,7 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
             data-state={triggerState}
             aria-label={countLabel}
             className={cn(
-              "shrink-0 gap-1 px-1 font-normal tabular-nums md:px-2",
+              "h-8 min-w-8 shrink-0 gap-0.5 px-1.5 font-normal tabular-nums md:h-6 md:min-w-0 md:px-1.5",
               triggerState === "error" && "text-destructive hover:text-destructive",
               triggerState === "parked" && "text-warning hover:text-warning",
             )}

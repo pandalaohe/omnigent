@@ -158,7 +158,9 @@ _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
 _AGY_ACP_COMMAND_FIELDS = {
     "CommandLine": str,
     "WaitMsBeforeAsync": int,
+    "NotificationTimeoutSeconds": int,
     "toolSummary": str,
+    "IsDaemon": bool,
     "RunPersistent": bool,
     "RequestedTerminalID": str,
 }
@@ -1704,6 +1706,13 @@ class AcpExecutor(Executor):
         """
         if bound_call is not None:
             tool_name, tool_input = bound_call["name"], bound_call["arguments"]
+            if (
+                tool_name == "run_command"
+                and tool_input.get("IsDaemon") is True
+                and is_antigravity_acp_command(self._config.command)
+            ):
+                # The agent does not attest to the daemon's working directory.
+                return False, None
         else:
             tool_name, tool_input = self._extract_tool_call(params)
         policy_eval = getattr(self, "_policy_evaluator", None)

@@ -7,6 +7,7 @@ from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     PEER_SESSION_GRANT,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
     InstructionPart,
     build_instructions,
     build_instructions_nullable,
@@ -29,6 +30,7 @@ def test_native_parts_follow_received_order_without_stripping_user_text():
         "author",
         "framework",
         "framework",
+        "framework",
         "user_layers",
         "peer_grant",
         "child_rule",
@@ -38,12 +40,14 @@ def test_native_parts_follow_received_order_without_stripping_user_text():
             "  Author\n",
             SUBAGENT_WAKE_NOTICE_INSTRUCTION,
             EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            WORKSPACE_IMAGE_INSTRUCTION,
             "  Route\n",
             PEER_SESSION_GRANT,
             CHILD_QUIET_INSTRUCTION,
         ]
     )
     assert "\n\n".join(part.text for part in parts) == expected
+    assert "collect its result with sys_read_inbox" in expected
     assert (
         native_startup_instructions(
             spec, global_instructions="\n\n".join(part.text for part in session)
@@ -55,8 +59,22 @@ def test_native_parts_follow_received_order_without_stripping_user_text():
 def test_per_turn_parts_strip_framework_but_preserve_author_and_request():
     spec = AgentSpec(spec_version=1, instructions=" Author ")
     parts = instruction_parts(spec, " Request ", [], framework_instructions=[" Route ", " \n"])
-    assert [part.kind for part in parts] == ["author", "per_request", "framework", "framework"]
-    expected = " Author \n\n Request \n\n" + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION + "\n\nRoute"
+    assert [part.kind for part in parts] == [
+        "author",
+        "per_request",
+        "framework",
+        "framework",
+        "framework",
+    ]
+    expected = "\n\n".join(
+        [
+            " Author ",
+            " Request ",
+            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            WORKSPACE_IMAGE_INSTRUCTION,
+            "Route",
+        ]
+    )
     assert "\n\n".join(part.text for part in parts) == expected
     assert (
         build_instructions(spec, " Request ", [], framework_instructions=[" Route ", " \n"])
@@ -66,11 +84,9 @@ def test_per_turn_parts_strip_framework_but_preserve_author_and_request():
 
 def test_regular_and_nullable_fallbacks_stay_distinct():
     spec = AgentSpec(spec_version=1)
-    assert (
-        build_instructions(spec, None, [])
-        == "You are a helpful assistant.\n\n" + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-    )
-    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    framework = "\n\n".join((EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION))
+    assert build_instructions(spec, None, []) == f"You are a helpful assistant.\n\n{framework}"
+    assert build_instructions_nullable(spec, None, []) == framework
 
 
 def test_explicit_host_side_placeholders_keep_their_position():

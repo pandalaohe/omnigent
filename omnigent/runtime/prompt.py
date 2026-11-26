@@ -98,7 +98,9 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
 CHILD_QUIET_INSTRUCTION = (
     "On a turn you started yourself (timer, flow, background wake, keep-warm check) with "
     "nothing your parent must act on, end with the exact final line `[quiet]`; the runtime "
-    "records it without waking your parent. A turn your parent asked for reports normally."
+    "records it without waking your parent. A notice that your own sub-agent finished is "
+    "not such a turn: collect its result with sys_read_inbox and continue your task first. "
+    "A turn your parent asked for reports normally."
 )
 
 

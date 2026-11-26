@@ -524,15 +524,6 @@ class PeerSweeper:
                 record, origin_state, "busy_recheck", expected_reason=attempt_reason
             )
             return
-        if (
-            _native_attempt_id(attempt_reason) is None
-            and sdk_attempt(attempt_reason) is None
-            and not await asyncio.to_thread(self._still_unclaimed, record.id, attempt_reason)
-        ):
-            # An earlier copy was claimed after this attempt took the record; a
-            # second forward could only be refused at paste.
-            _logger.warning("Peer sweeper skipped forwarding claimed record %s", record.id)
-            return
         request = self._synthetic_request(receiver.id, self._app)
         receiver_owner = effective_owner_id(
             receiver, self._conversation_store, self._permission_store
@@ -551,6 +542,7 @@ class PeerSweeper:
                     if sdk_identity is not None
                     else _native_attempt_id(attempt_reason)
                 ),
+                expected_reason=attempt_reason,
                 acting_user_id=receiver_owner,
             )
         except Exception:
@@ -601,26 +593,6 @@ class PeerSweeper:
             reason,
             ("delivering",),
             expected_reason=attempt_reason,
-        )
-
-    def _still_unclaimed(self, peer_id: str, attempt_reason: str | None) -> bool:
-        """Whether this attempt still holds an unclaimed ``delivering`` record."""
-        if self._store.transition(
-            peer_id,
-            "delivering",
-            None,
-            ("delivering",),
-            expected_reason=attempt_reason,
-            exclude_reason_prefix=_NATIVE_CLAIMED_REASON_PREFIX,
-        ):
-            return True
-        # An identical same-second rewrite can report no changed row.
-        current = self._store.get(peer_id)
-        return (
-            current is not None
-            and current.state == "delivering"
-            and not _native_claimed(current.reason)
-            and (attempt_reason is None or current.reason == attempt_reason)
         )
 
     async def _revert_delivering(

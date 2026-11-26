@@ -942,6 +942,8 @@ export interface ConversationState {
   loadingConversation: boolean;
   /** Error from the snapshot fetch in `switchTo`, if any. */
   conversationLoadError: Error | null;
+  /** The retained session metadata could not be refreshed. */
+  sessionMetadataStale: boolean;
   /**
    * The active session's REAL model override (server ``model_override``):
    * what the next turn actually uses, ``null`` when none and the agent
@@ -2559,6 +2561,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   boundAgentName: null,
   loadingConversation: false,
   conversationLoadError: null,
+  sessionMetadataStale: false,
   sessionModelOverride: null,
   sessionReasoningEffort: null,
   sessionModelSeeded: false,
@@ -5151,6 +5154,9 @@ function cacheSessionSnapshot(
   }
   snapshot = preserveStreamModelDisplay(snapshot, modelDisplayBeforeFetch);
   queryClient?.setQueryData(["session", session.id], snapshot);
+  setterFor(session.id)((state) =>
+    state.sessionMetadataStale ? { sessionMetadataStale: false } : {},
+  );
   followSupersededSession(session.id, snapshot.labels?.["omnigent.succeeded_by"]);
 }
 
@@ -7494,11 +7500,21 @@ async function reconcileOnReconnect(
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
+  const snapshotKey = ["session", id] as const;
+  const metadataVersion = queryClient.getQueryState(snapshotKey)?.dataUpdateCount;
   let session: Session;
   let page: SessionItemsPage;
   try {
     [session, page] = await Promise.all([
-      withReadTimeout((signal) => getIndependentSessionMetadata(id, { signal })),
+      withReadTimeout((signal) => getIndependentSessionMetadata(id, { signal })).catch((error) => {
+        if (
+          !stale() &&
+          queryClient?.getQueryState(snapshotKey)?.dataUpdateCount === metadataVersion
+        ) {
+          set({ sessionMetadataStale: true });
+        }
+        throw error;
+      }),
       withReadTimeout((signal) => fetchSessionItemsPage(id, { signal })),
     ]);
   } catch {

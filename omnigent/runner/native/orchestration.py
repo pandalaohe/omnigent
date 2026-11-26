@@ -349,14 +349,27 @@ async def teardown_codex_native_app_server(session_id: str, *, clear_helpers: bo
         return
     incarnation = getattr(app_server, "resident_incarnation_id", None)
     await _cancel_auto_forwarder_task(session_id)
-    with contextlib.suppress(Exception):
-        await _close_native_backend(session_id, "codex-native", app_server)
+    if getattr(app_server, "resident_incarnation_id", None) != incarnation:
+        return
+    if any(
+        owner != session_id and backend is app_server
+        for owner, backend in _AUTO_CODEX_APP_SERVERS.items()
+    ):
+        return
+    # A cancelled forwarder can finish and confirm this backend's exit itself.
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server or not getattr(
+        app_server, "exit_confirmed", False
+    ):
+        with contextlib.suppress(Exception):
+            await _close_native_backend(session_id, "codex-native", app_server)
+    if getattr(app_server, "resident_incarnation_id", None) != incarnation:
+        return
     registered_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     if registered_server is app_server:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
     # Forwarder cleanup can retire its own backend; a newer launch can reuse its path.
-    if registered_server in (None, app_server) and (
-        getattr(app_server, "resident_incarnation_id", None) == incarnation
+    if (
+        registered_server in (None, app_server)
         and _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
     ):
         if (

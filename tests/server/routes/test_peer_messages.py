@@ -2877,6 +2877,56 @@ async def test_list_receiver_records(
         peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
 
 
+@pytest.mark.parametrize("claim_stage", ["readiness", "terminal_lookup", "unclaimed"])
+async def test_swept_legacy_peer_checks_the_record_without_refreshing_its_age(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    claim_stage: str,
+) -> None:
+    from omnigent.server.peer_sweeper import mark_peer_copy_claimed
+    from omnigent.stores.peer_message_store import sqlalchemy_store
+
+    receiver = _native_receiver(monkeypatch, peer_env, harness_override="claude-native")
+    record = _queued_record(peer_env, sender_id=peer_env["sender"].id, receiver_id=receiver.id)
+    store: SqlAlchemyPeerMessageStore = peer_env["peer_store"]
+    sweeper = peer_env["app"].state.peer_sweeper
+    sweeper._app = peer_env["app"]
+    now = int(time.time())
+    write_time = now
+    attempt_id = "a" * 32
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: write_time)
+
+    async def true_state(*_args: Any, **_kwargs: Any) -> tuple[str, bool]:
+        nonlocal write_time
+        current = store.get(record.id)
+        assert current is not None
+        if current.state == "delivering":
+            # Time passed after claim_oldest, while the sweeper rechecked readiness.
+            write_time = now + 20
+            if claim_stage == "readiness":
+                assert mark_peer_copy_claimed(store, receiver.id, record.id, attempt_id)
+        return "idle", True
+
+    def resolve_terminal_type(_conv: Conversation) -> bool:
+        if claim_stage == "terminal_lookup":
+            assert mark_peer_copy_claimed(store, receiver.id, record.id, attempt_id)
+        return True
+
+    monkeypatch.setattr(sweeper, "_true_state", true_state)
+    monkeypatch.setattr(peer_module, "_is_native_terminal_session", resolve_terminal_type)
+    peer_env["fake"].error = HTTPException(502)
+    await sweeper._process_due(record, now)
+
+    stored = store.get(record.id)
+    assert stored is not None and stored.state == "delivering"
+    if claim_stage != "unclaimed":
+        assert stored.reason == f"native_claimed:{attempt_id}"
+        assert not peer_env["fake"].calls
+    else:
+        assert len(peer_env["fake"].calls) == 1
+        assert stored.updated_at == now
+
+
 async def test_held_claimed_record_is_not_released_for_a_resend(
     peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
 ) -> None:

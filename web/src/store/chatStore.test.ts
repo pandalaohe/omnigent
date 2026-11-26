@@ -1695,6 +1695,34 @@ describe("chatStore — switchTo", () => {
     });
   });
 
+  it("marks a retained session snapshot stale on failed metadata read and clears on recovery", async () => {
+    seedSession("conv_native_revisit", [userMessage("response_1", "keep this transcript")]);
+    seedSession("conv_other", []);
+    const switchTo = useChatStore.getState().switchTo;
+    await switchTo("conv_native_revisit");
+    await switchTo("conv_other");
+
+    let denyRead = true;
+    const route = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (denyRead && String(input).includes("/v1/sessions/conv_native_revisit?")) {
+        return Promise.resolve(new Response("Session access denied", { status: 403 }));
+      }
+      return route(input, init);
+    });
+    await switchTo("conv_native_revisit");
+    await vi.waitFor(() => expect(useChatStore.getState().sessionMetadataStale).toBe(true));
+    expect(useChatStore.getState().conversationLoadError).toBeNull();
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+
+    await switchTo("conv_other");
+    expect(useChatStore.getState().sessionMetadataStale).toBe(false);
+    denyRead = false;
+    await switchTo("conv_native_revisit");
+    await vi.waitFor(() => expect(useChatStore.getState().sessionMetadataStale).toBe(false));
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
   it("shares snapshot completion tombstones with a retained live stream", async () => {
     const sink = pushableStream();
     seedSession("conv_native_revisit", []);

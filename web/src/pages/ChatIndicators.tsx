@@ -142,7 +142,7 @@ export function RunnerLogRunawayIndicator({
           size="xs"
           aria-label="Runner log growth warning — show details"
           data-testid="runner-log-runaway-indicator"
-          className="shrink-0 px-1 md:px-2"
+          className="h-8 min-w-8 shrink-0 px-1.5 md:h-6 md:min-w-0 md:px-1"
         >
           <TriangleAlertIcon className="size-3.5 text-warning" aria-hidden />
         </Button>

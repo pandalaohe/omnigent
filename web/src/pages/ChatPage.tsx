@@ -311,6 +311,7 @@ import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { PhoneBarScroller } from "@/components/composer/PhoneBarScroller";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
 import { AutoRotationChip } from "@/components/AutoRotationChip";
+import { ModelResolutionChip } from "@/components/ModelResolutionChip";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -879,6 +880,9 @@ export function ChatPage() {
     isLoading: sessionLoading,
     error: activeSessionError,
   } = useSession(sessionConvId ?? null);
+  const sessionMetadataStale = useChatStore(
+    (state) => state.conversationId === sessionConvId && state.sessionMetadataStale,
+  );
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -1492,8 +1496,10 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      nativePermissionSession={
-        !activeSessionError && activeSession?.id === sessionConvId ? activeSession : null
+      terminalSession={
+        !activeSessionError && !sessionMetadataStale && activeSession?.id === sessionConvId
+          ? activeSession
+          : null
       }
       hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
@@ -1635,7 +1641,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
-  nativePermissionSession?: Session | null;
+  terminalSession?: Session | null;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1851,7 +1857,7 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  nativePermissionSession,
+  terminalSession,
   hostId,
   status,
   isWorking,
@@ -2165,17 +2171,20 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
         />
         {isShown && (
           <>
-            {showCodexApprovalMode && (
-              <CodexPermissionReadbackChip
-                session={nativePermissionSession ?? null}
-                permissionLevel={permissionLevel}
-                offline={
-                  runnerOnline === false ||
-                  liveness.kind === "host_offline" ||
-                  liveness.kind === "local_stranded"
-                }
-              />
-            )}
+            <div className="flex shrink-0 items-center px-3 empty:hidden">
+              {showCodexApprovalMode && (
+                <CodexPermissionReadbackChip
+                  session={terminalSession ?? null}
+                  permissionLevel={permissionLevel}
+                  offline={
+                    runnerOnline === false ||
+                    liveness.kind === "host_offline" ||
+                    liveness.kind === "local_stranded"
+                  }
+                />
+              )}
+              <ModelResolutionChip session={terminalSession} />
+            </div>
             <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
           </>
         )}
@@ -2993,7 +3002,7 @@ export function CodexPermissionReadbackChip({
   );
   if (!readback) return null;
   return (
-    <div className="flex shrink-0 items-center px-3 py-1">
+    <div className="flex shrink-0 items-center py-1">
       <ComposerPermissionPicker
         label="Permission mode"
         value={readback.value}
@@ -5550,13 +5559,16 @@ function ComposerImpl(
                 onOpen={openComposerGithubTab}
                 conversationId={composerSessionId ?? undefined}
               />
-              <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+              <div
+                data-testid="composer-status-indicators"
+                className="phone-session-bar-indicators ml-auto flex min-w-0 shrink-0 items-center gap-0"
+              >
                 <div
                   data-testid="composer-task-indicators"
                   className="flex items-center gap-0 empty:hidden"
                 >
                   {/* Phone shows background tasks in the header pill. */}
-                  {!isMobile && <BackgroundTaskIndicator />}
+                  {!isMobile && <BackgroundTaskIndicator className="gap-0.5 px-1.5 md:px-1.5" />}
                   <SubagentTaskIndicator conversationId={conversationId} />
                   {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
                   <RunnerLogRunawayIndicator
@@ -5565,6 +5577,7 @@ function ComposerImpl(
                     fallbackLabels={runnerLogFallbackLabels}
                   />
                 </div>
+                {composerSessionId && <ModelResolutionChip session={composerSession} />}
                 {conversationId && (
                   <ComposerContextRing
                     contextWindow={composerContextWindow}

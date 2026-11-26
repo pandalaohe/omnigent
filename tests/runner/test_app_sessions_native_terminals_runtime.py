@@ -1329,10 +1329,12 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            if "external_session_id" in json:
+            if json.keys() == {"external_session_id"}:
                 patched_external_ids.append(json["external_session_id"])
             else:
-                assert json["labels"][LAUNCHED_MODEL_LABEL]
+                assert json.keys() == {"labels"}
+                assert json["labels"].keys() == {LAUNCHED_MODEL_LABEL}
+                assert isinstance(json["labels"][LAUNCHED_MODEL_LABEL], str)
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:
@@ -1657,10 +1659,12 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            if "external_session_id" in json:
+            if json.keys() == {"external_session_id"}:
                 patched_external_ids.append(json["external_session_id"])
             else:
-                assert json["labels"][LAUNCHED_MODEL_LABEL]
+                assert json.keys() == {"labels"}
+                assert json["labels"].keys() == {LAUNCHED_MODEL_LABEL}
+                assert isinstance(json["labels"][LAUNCHED_MODEL_LABEL], str)
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:

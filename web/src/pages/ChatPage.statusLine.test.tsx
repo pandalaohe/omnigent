@@ -842,6 +842,86 @@ describe("Composer status line (branch + context ring)", () => {
     },
   );
 
+  it.each([false, true])(
+    "shows the icon-only model resolution warning in the lower status row on both desktop and phone (mobile=%s)",
+    (mobile) => {
+      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...mediaQuery,
+        media: query,
+        matches: mobile && query === "(max-width: 767.98px)",
+      }));
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_test",
+          harness: "claude-native",
+          requested: "opus",
+          launched: "opus",
+          running: "claude-sonnet-5-5",
+          codexModelOptions: [{ id: "opus", model: "claude-opus-5-5", displayName: "Opus 5.5" }],
+          labels: {},
+        },
+        isLoading: false,
+        error: null,
+      });
+
+      const { rerender } = render(
+        <MemoryRouter>
+          <MobileHeaderControlsProvider>
+            <TooltipProvider>
+              <MobileHeaderButtonGroup data-testid="header-actions">
+                <MobileHeaderControlsSlot sessionId="conv_test" />
+              </MobileHeaderButtonGroup>
+              <Composer {...composerProps()} />
+            </TooltipProvider>
+          </MobileHeaderControlsProvider>
+        </MemoryRouter>,
+      );
+
+      const bar = screen.getByTestId("composer-workspace-controls");
+      const statusGroup = screen.getByTestId("composer-status-indicators");
+      const header = screen.getByTestId("header-actions");
+      const warning = screen.getByTestId("model-resolution-warning");
+      expect(bar).toContainElement(warning);
+      expect(statusGroup).toHaveClass("gap-0");
+      expect(statusGroup).toContainElement(warning);
+      expect(header).not.toContainElement(warning);
+      expect(warning).toHaveAccessibleName("Model resolution warning");
+      expect(warning).toHaveClass("h-8", "min-w-8", "px-1.5", "md:h-6", "md:min-w-6", "md:px-1");
+      expect(warning.textContent?.trim()).toBe("");
+      fireEvent.click(warning);
+      expect(screen.getByTestId("model-resolution-popover")).toHaveTextContent("claude-sonnet-5-5");
+
+      // Matching alias hides the warning completely.
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_test",
+          harness: "claude-native",
+          requested: "opus",
+          launched: "opus",
+          running: "claude-opus-5-5",
+          codexModelOptions: [{ id: "opus", model: "claude-opus-5-5", displayName: "Opus 5.5" }],
+          labels: {},
+        },
+        isLoading: false,
+        error: null,
+      });
+      rerender(
+        <MemoryRouter>
+          <MobileHeaderControlsProvider>
+            <TooltipProvider>
+              <MobileHeaderButtonGroup data-testid="header-actions">
+                <MobileHeaderControlsSlot sessionId="conv_test" />
+              </MobileHeaderButtonGroup>
+              <Composer {...composerProps()} />
+            </TooltipProvider>
+          </MobileHeaderControlsProvider>
+        </MemoryRouter>,
+      );
+      expect(screen.queryByTestId("model-resolution-warning")).toBeNull();
+    },
+  );
+
   it("keeps the tray hidden for a session with no host and nothing else to show", () => {
     // onShowReconnectHelp is now passed for every session, so it must not
     // resurrect an empty tray on a session with no host badge to hang it on.

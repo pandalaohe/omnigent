@@ -487,7 +487,10 @@ async def test_sdk_mode_snapshot_and_event_reach_next_turn(
     event_type: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("omnigent.runner.tool_dispatch.session_skill_registry", lambda *args: [])
+    monkeypatch.setattr(
+        "omnigent.runner.tool_dispatch.session_skill_registry",
+        lambda spec, *_args, workflows_enabled=False: list(spec.skills),
+    )
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -5384,7 +5387,9 @@ async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
     from omnigent.harnesses.codex_native import app_server, bridge
 
     conv_id = "8864122f95f2f013c9599f4014725784"
-    bridge_dir = tmp_path / "bridge"
+    # The runner can import the bridge lookup during this test's first Codex launch.
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = bridge.bridge_dir_for_bridge_id(conv_id)
     bridge.write_bridge_state(
         bridge_dir,
         bridge.CodexNativeBridgeState(
@@ -5394,7 +5399,6 @@ async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
             codex_home=str(tmp_path / "home"),
         ),
     )
-    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
     calls = []
 
     class Client:

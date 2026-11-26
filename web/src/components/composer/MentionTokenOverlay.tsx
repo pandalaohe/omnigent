@@ -30,10 +30,12 @@ export function renderMentionTokens(text: string, tokens: readonly string[]): Re
 }
 
 function alignMirror(overlay: HTMLDivElement, textarea: HTMLTextAreaElement) {
-  const { offsetTop, offsetLeft, offsetWidth, offsetHeight, scrollTop } = textarea;
+  const { offsetTop, offsetLeft, offsetHeight, scrollTop } = textarea;
+  // A rounded width can move a glyph to a different line at a soft wrap.
+  const { width } = getComputedStyle(textarea);
   overlay.style.top = `${offsetTop}px`;
   overlay.style.left = `${offsetLeft}px`;
-  overlay.style.width = `${offsetWidth}px`;
+  overlay.style.width = width;
   overlay.style.height = `${offsetHeight}px`;
   overlay.scrollTop = scrollTop;
 }

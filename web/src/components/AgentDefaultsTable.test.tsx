@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import {
   type CallingDefaultsTable,
 } from "@/lib/callingDefaults";
 import { AgentDefaultsTable, type AgentField } from "./AgentDefaultsTable";
+import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 import validityCases from "@/lib/__fixtures__/callingDefaultValidity.json";
 
 const { queuePatch } = vi.hoisted(() => ({ queuePatch: vi.fn() }));
@@ -104,7 +105,12 @@ describe("agent layered defaults", () => {
     );
   });
 
-  it("keeps a details entry for the SDK identity beside its Native product", () => {
+  it.each([true, false])("shows the SDK name and details with badges enabled=%s", (enabled) => {
+    writeAgentBadgePreferences({
+      version: 1,
+      enabled,
+      entries: { ag_sdk: { label: "XS", borderColor: "#ffaa00", textColor: "theme" } },
+    });
     render(
       <MemoryRouter>
         <AgentDefaultsTable
@@ -123,6 +129,20 @@ describe("agent layered defaults", () => {
     expect(screen.getByRole("link", { name: "Codex SDK details" })).toHaveAttribute(
       "href",
       "/settings/agents/codex?host=desktop",
+    );
+    expect(screen.getByRole("link", { name: "Codex SDK details" })).toHaveAccessibleDescription(
+      "SDK",
+    );
+    const name = screen.getByText("Codex SDK");
+    expect(name.closest(".sr-only")).toBeNull();
+    const sdkRow = name.closest("tr")!;
+    const nativeRow = sdkRow.previousElementSibling as HTMLElement;
+    expect(within(nativeRow).getByText("Codex")).toBeVisible();
+    expect(within(nativeRow).queryByTestId("agent-name-mark")).toBeNull();
+    expect(name.closest(".pl-4")).toBeNull();
+    expect(within(sdkRow).getByTestId("agent-name-mark")).toHaveTextContent("SDK");
+    expect(screen.queryByTestId("agent-name-badge")?.textContent ?? null).toBe(
+      enabled ? "XS" : null,
     );
   });
 

@@ -118,7 +118,14 @@ describe("agent context lenses", () => {
   it("shows reported providers as text and leaves selection and editing out", () => {
     render(
       <MemoryRouter>
-        <AgentContextTable {...props} field="provider" />
+        <AgentContextTable
+          {...props}
+          field="provider"
+          hosts={[
+            { ...host, host_id: "other-host", configured_harnesses: { "claude-native": true } },
+            host,
+          ]}
+        />
       </MemoryRouter>,
     );
     expect(screen.getAllByText("Example provider")).toHaveLength(2);
@@ -128,7 +135,11 @@ describe("agent context lenses", () => {
       "href",
       "/settings/agents/codex-native?host=host%20%26%20one",
     );
-    expect(screen.getByText("Codex SDK")).toHaveClass("sr-only");
+    expect(screen.getByText("Codex SDK").closest(".sr-only")).toBeNull();
+    expect(screen.getByText("Codex SDK").closest(".pl-4")).toBeNull();
+    expect(
+      within(screen.getByText("Codex SDK").closest("tr")!).getByTestId("agent-name-mark"),
+    ).toHaveTextContent("SDK");
   });
 
   it("opens the same host and agent in Startup prompts with the composed size", () => {
@@ -138,6 +149,7 @@ describe("agent context lenses", () => {
         <AgentContextTable {...props} field="prompt" />
       </MemoryRouter>,
     );
+    expect(screen.getByText("Codex SDK").closest(".sr-only")).toBeNull();
     for (const link of screen.getAllByRole("link", { name: "123 chars" })) {
       expect(link).toHaveAttribute(
         "href",

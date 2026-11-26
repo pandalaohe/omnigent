@@ -4137,6 +4137,7 @@ describe("Composer native permission readback", () => {
       sessionHarness: "codex-native",
       codexApprovalMode: "full-access",
       codexPermissionReadbacks: {},
+      sessionMetadataStale: false,
     });
     Object.assign(composerSessionSnapshot, {
       id: "native-details",
@@ -4153,7 +4154,7 @@ describe("Composer native permission readback", () => {
       labels: {},
       permissionLevel: null,
     });
-    useChatStore.setState({ codexPermissionReadbacks: {} });
+    useChatStore.setState({ codexPermissionReadbacks: {}, sessionMetadataStale: false });
     composerSessionAccess.error = null;
   });
   it.each([
@@ -4378,7 +4379,7 @@ describe("Composer native permission readback", () => {
     expect(chip).toHaveFocus();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
-  it.each(["read failure", "wrong session"])(
+  it.each(["read failure", "wrong session", "background refresh failure"])(
     "withdraws details on the actual Terminal surface after cached %s",
     async (change) => {
       Object.assign(composerSessionSnapshot, { permissionLevel: 1 });
@@ -4386,6 +4387,15 @@ describe("Composer native permission readback", () => {
         "omnigent.wrapper": "codex-native-ui",
         "omnigent.ui": "terminal",
         [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: encoded,
+        "omnigent.model_resolution": JSON.stringify([
+          {
+            setting: "model",
+            saved: "requested-model",
+            model: "available-model",
+            outcome: "resolved",
+            host: "runner",
+          },
+        ]),
       };
       useChatStore.setState({
         loadingConversation: false,
@@ -4432,15 +4442,19 @@ describe("Composer native permission readback", () => {
       );
       const view = render(page());
       expect(screen.getByTestId("terminal-transport-stub")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Model resolution warning" })).toBeVisible();
+      expect(screen.queryByRole("textbox", { name: "Message the agent" })).toBeNull();
       expect(screen.getByTestId("terminal-permission-chip")).toBeEnabled();
       fireEvent.keyDown(screen.getByTestId("terminal-permission-chip"), { key: "Enter" });
       expect(screen.getByText("Approvals")).toBeInTheDocument();
       if (change === "read failure")
         composerSessionAccess.error = new Error("Session access denied");
-      else composerSessionSnapshot.id = "another-session";
+      else if (change === "wrong session") composerSessionSnapshot.id = "another-session";
+      else act(() => useChatStore.setState({ sessionMetadataStale: true }));
       view.rerender(page());
       expect(screen.getByTestId("terminal-transport-stub")).toBeInTheDocument();
       expect(screen.queryByTestId("terminal-permission-chip")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Model resolution warning" })).toBeNull();
       expect(screen.queryByText("Approvals")).toBeNull();
       queries.clear();
     },
@@ -8796,18 +8810,17 @@ describe("Composer file-attachment focus", () => {
     render(<Composer {...composerProps()} />);
     const input = textarea();
     let top = 12;
-    let width = 400;
     let contentHeight = 800;
     Object.defineProperties(input, {
       offsetTop: { get: () => top },
       offsetLeft: { value: 16 },
-      offsetWidth: { get: () => width },
       offsetHeight: { value: 180 },
       clientHeight: { value: 180 },
       scrollHeight: { get: () => contentHeight },
     });
     input.style.lineHeight = "20px";
     input.style.padding = "0";
+    input.style.width = "400px";
     const image = new File(["image"], "example.png", { type: "image/png" });
     fireEvent.change(fileInput(), { target: { files: [image] } });
     const overlay = screen.getByTestId("composer-highlight-overlay");
@@ -8829,7 +8842,7 @@ describe("Composer file-attachment focus", () => {
     expect.soft(overlay.style.top).toBe("18px");
     expect.soft(overlay.scrollTop).toBe(640);
 
-    width = 320;
+    input.style.width = "320px";
     contentHeight = 880;
     input.scrollTop = 700;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
@@ -8870,7 +8883,6 @@ describe("Composer file-attachment focus", () => {
     render(<Composer {...composerProps()} ref={ref} />);
     const input = textarea();
     let top = 12;
-    let width = 400;
     let contentHeight = 800;
     const currentBoxHeight = () => {
       const parsed = Number.parseFloat(input.style.height);
@@ -8879,13 +8891,13 @@ describe("Composer file-attachment focus", () => {
     Object.defineProperties(input, {
       offsetTop: { configurable: true, get: () => top },
       offsetLeft: { configurable: true, value: 16 },
-      offsetWidth: { configurable: true, get: () => width },
       offsetHeight: { configurable: true, get: currentBoxHeight },
       clientHeight: { configurable: true, get: currentBoxHeight },
       scrollHeight: { configurable: true, get: () => contentHeight },
     });
     input.style.lineHeight = "20px";
     input.style.padding = "0";
+    input.style.width = "400px";
 
     // Add a reply quote, then attach an image in the tail textarea so the
     // attachment backdrop is active before removing the quote toggles maxRows.
@@ -8913,7 +8925,7 @@ describe("Composer file-attachment focus", () => {
 
     // Resize that keeps the height capped while shrinking scrollHeight must clamp
     // textarea scrollTop before the mirror copies it.
-    width = 440;
+    input.style.width = "440px";
     contentHeight = 500;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
     expect.soft(input.style.height).toBe("200px");
@@ -8923,7 +8935,7 @@ describe("Composer file-attachment focus", () => {
     expect.soft(overlay.scrollTop).toBe(300);
 
     // Resize below the height cap must re-measure height before the mirror copies it.
-    width = 480;
+    input.style.width = "480px";
     contentHeight = 140;
     act(() => notifyTextareaResize.forEach((notify) => notify()));
     expect(input.style.height).toBe("140px");
@@ -8941,7 +8953,6 @@ describe("Composer file-attachment focus", () => {
     Object.defineProperties(input, {
       offsetTop: { configurable: true, get: () => top },
       offsetLeft: { configurable: true, value: 16 },
-      offsetWidth: { configurable: true, value: 400 },
       offsetHeight: { configurable: true, value: 40 },
     });
 

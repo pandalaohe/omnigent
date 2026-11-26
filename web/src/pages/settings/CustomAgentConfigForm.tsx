@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { TrashIcon } from "lucide-react";
-import { useNavigate } from "@/lib/routing";
 import { BackButton } from "./HarnessCatalog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,13 +28,18 @@ import { ApiError } from "@/lib/sessionsApi";
 export function CustomAgentConfigForm({
   id,
   name,
+  badgeAction,
+  returnLabel,
+  onBack,
   onDelete,
 }: {
   id: string;
   name: string;
+  badgeAction: ReactNode;
+  returnLabel: string;
+  onBack: () => void;
   onDelete: () => void;
 }) {
-  const navigate = useNavigate();
   const query = useCustomAgentConfig(id);
   const save = usePatchCustomAgent(id);
   const labels = useBrainHarnessLabels();
@@ -88,7 +92,7 @@ export function CustomAgentConfigForm({
   function request(action: "reload" | "back") {
     if (busy) return;
     if (dirty) setConfirm(action);
-    else if (action === "back") navigate("/settings/custom-agents");
+    else if (action === "back") onBack();
     else void reload();
   }
   async function submit(event: React.FormEvent) {
@@ -135,21 +139,24 @@ export function CustomAgentConfigForm({
   return (
     <>
       <BackButton
-        label="Custom agents"
+        label={returnLabel}
         onClick={() => request("back")}
         componentId="settings.custom_agents.back"
       />
       <div className="mb-6 flex items-start justify-between gap-4">
         <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">{name}</h1>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Delete agent"
-          disabled={busy}
-          onClick={onDelete}
-        >
-          <TrashIcon className="size-4" />
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {badgeAction}
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Delete agent"
+            disabled={busy}
+            onClick={onDelete}
+          >
+            <TrashIcon className="size-4" />
+          </Button>
+        </div>
       </div>
       {!draft ? (
         loadError ? (
@@ -327,7 +334,7 @@ export function CustomAgentConfigForm({
               variant="destructive"
               onClick={() => {
                 if (confirm === "reload") void reload();
-                else navigate("/settings/custom-agents");
+                else onBack();
               }}
             >
               Discard changes

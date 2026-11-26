@@ -658,6 +658,7 @@ def test_child_session_quiet_instruction_only_for_children() -> None:
     assert child_session_framework_instructions(has_parent=False) == []
     assert "`[quiet]`" in CHILD_QUIET_INSTRUCTION
     assert "turn you started yourself" in CHILD_QUIET_INSTRUCTION
+    assert "collect its result with sys_read_inbox" in CHILD_QUIET_INSTRUCTION
 
 
 def _code_locations() -> list[ProjectCodeLocation]:

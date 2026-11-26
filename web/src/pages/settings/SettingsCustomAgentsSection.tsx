@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
-import { Link, useNavigate } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled } from "@/lib/capabilities";
 import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
@@ -10,7 +10,8 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
-import { AgentsSettings } from "@/components/AgentsSettings";
+import { AgentSettingsEditor, AgentsSettings } from "@/components/AgentsSettings";
+import { AGENT_SETTINGS_TABLE_PATH, customAgentSettingsPath } from "@/lib/agentSettings";
 import { SettingsPager } from "@/components/SettingsPager";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import {
@@ -46,7 +47,6 @@ const formatHarnessLabel = (
     (harness === "pi-rpc" ? "Pi RPC" : harness.startsWith("acp:") ? "ACP" : harness)
   );
 };
-const agentPath = (id: string) => `/settings/agents/custom/${encodeURIComponent(id)}`;
 const date = (value: number | null) =>
   value === null
     ? "—"
@@ -83,6 +83,9 @@ function InstalledAgentsSettingsSection({
   const supported = enabled && info !== "loading" && info.agent_detail === true;
   const { agentId } = useSettingsRoute();
   const navigate = useNavigate();
+  const fromAgentsTable = useLocation().state?.fromAgentsTable === true;
+  const returnTo = fromAgentsTable ? AGENT_SETTINGS_TABLE_PATH : BASE;
+  const returnLabel = fromAgentsTable ? "Agents" : "Custom agents";
   const { query: servers, pager: serverPager } = useCustomAgents("server", supported && !agentId);
   const { query: yours, pager: userPager } = useCustomAgents("user", supported && !agentId);
   const save = useSaveCustomAgent();
@@ -119,7 +122,7 @@ function InstalledAgentsSettingsSection({
   if (!enabled) return null;
   if (!supported) return <UnsupportedServer />;
   const back = (
-    <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+    <BackButton label={returnLabel} to={returnTo} componentId="settings.custom_agents.back" />
   );
   if (agentId === "new") {
     return (
@@ -132,7 +135,7 @@ function InstalledAgentsSettingsSection({
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
             const agent = await save.mutateAsync(input);
-            navigate(agentPath(agent.id));
+            navigate(customAgentSettingsPath(agent.id));
           }}
         />
       </div>
@@ -168,7 +171,9 @@ function InstalledAgentsSettingsSection({
             owned={detail.data.user_owned}
             editable={info.agent_config_edit === true}
             harness={formatHarnessLabel(detail.data.harness, labels)}
-            onDeleted={() => navigate(BASE)}
+            returnLabel={returnLabel}
+            returnTo={returnTo}
+            onDeleted={() => navigate(returnTo)}
           />
         ) : (
           <>
@@ -201,7 +206,7 @@ function InstalledAgentsSettingsSection({
           />
         </div>
         <Button asChild size="sm">
-          <Link to={agentPath("new")} componentId="settings.custom_agents.create">
+          <Link to={customAgentSettingsPath("new")} componentId="settings.custom_agents.create">
             <PlusIcon />
             Create
           </Link>
@@ -250,7 +255,7 @@ function InstalledAgentsSettingsSection({
                   >
                     <td className="max-w-0 p-2">
                       <Link
-                        to={agentPath(agent.id)}
+                        to={customAgentSettingsPath(agent.id)}
                         componentId="settings.custom_agents.review"
                         className="flex items-center gap-2.5 rounded-sm outline-none after:absolute after:inset-0 focus-visible:ring-2 focus-visible:ring-ring"
                         aria-label={agent.name}
@@ -310,7 +315,7 @@ function InstalledAgentsSettingsSection({
             {builtins.map((agent) => (
               <Link
                 key={agent.id}
-                to={agentPath(agent.id)}
+                to={customAgentSettingsPath(agent.id)}
                 componentId="settings.custom_agents.review_server"
                 className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
               >
@@ -379,16 +384,22 @@ function AgentDetail({
   owned,
   editable,
   harness,
+  returnLabel,
+  returnTo,
   onDeleted,
 }: {
   agent: ManagedAgent;
   owned: boolean | undefined;
   editable: boolean;
   harness: string;
+  returnLabel: string;
+  returnTo: string;
   onDeleted: () => void;
 }) {
   const remove = useDeleteCustomAgent();
+  const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
+  const [badgeEditing, setBadgeEditing] = useState(false);
   const [inUse, setInUse] = useState<string | null>(null);
   function confirmDelete() {
     remove.reset();
@@ -396,6 +407,16 @@ function AgentDetail({
     setConfirm(true);
   }
   const canEdit = owned === true && editable;
+  const badgeAction = (
+    <Button
+      variant="ghost"
+      size="sm"
+      aria-label={`Edit badge for ${agent.name}`}
+      onClick={() => setBadgeEditing(true)}
+    >
+      Edit badge
+    </Button>
+  );
   async function onRemove() {
     try {
       const count = await remove.mutateAsync({ id: agent.id, force: inUse !== null });
@@ -408,19 +429,34 @@ function AgentDetail({
   return (
     <>
       {canEdit ? (
-        <CustomAgentConfigForm id={agent.id} name={agent.name} onDelete={confirmDelete} />
+        <CustomAgentConfigForm
+          id={agent.id}
+          name={agent.name}
+          badgeAction={badgeAction}
+          returnLabel={returnLabel}
+          onBack={() => navigate(returnTo)}
+          onDelete={confirmDelete}
+        />
       ) : (
         <>
-          <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+          <BackButton label={returnLabel} to={returnTo} componentId="settings.custom_agents.back" />
           <div className="flex items-start justify-between gap-4">
             <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
               {agent.name}
             </h1>
-            {owned === true && (
-              <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
-                <TrashIcon className="size-4" />
-              </Button>
-            )}
+            <div className="flex shrink-0 items-center gap-2">
+              {badgeAction}
+              {owned === true && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Delete agent"
+                  onClick={confirmDelete}
+                >
+                  <TrashIcon className="size-4" />
+                </Button>
+              )}
+            </div>
           </div>
           <p className="mt-3 text-sm text-muted-foreground">
             {agent.description || "No description."}
@@ -495,6 +531,13 @@ function AgentDetail({
             ? "Server-provided agents are read-only."
             : "Update the server to enable agent deletion. Ownership information is unavailable."}
       </p>
+      {badgeEditing && (
+        <AgentSettingsEditor
+          agent={{ id: agent.id, name: agent.name, harness: agent.harness, custom: false }}
+          onClose={() => setBadgeEditing(false)}
+          onSaved={async () => {}}
+        />
+      )}
       <Dialog
         open={confirm}
         onOpenChange={(open) => {

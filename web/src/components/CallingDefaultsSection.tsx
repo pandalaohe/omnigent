@@ -4,9 +4,12 @@
 // surface edits only the master layer and the cached catalogs.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowRightIcon } from "lucide-react";
 
 import { AgentDefaultsTable, type AgentField } from "@/components/AgentDefaultsTable";
 import { AgentContextTable } from "@/components/AgentContextTable";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
+import { SettingsPager } from "@/components/SettingsPager";
 import { Segmented } from "@/components/ui/segmented";
 import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
@@ -22,9 +25,19 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useHosts } from "@/hooks/useHosts";
 import { useAgentRegistry } from "@/hooks/useAgentRegistry";
+import { useCustomAgents as useManagedAgents } from "@/hooks/useCustomAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
-import { agentPresentOnHost, groupAgentHarnesses } from "@/lib/agentSettings";
+import {
+  agentPresentOnHost,
+  agentSettingsHarnessLabel,
+  customAgentSettingsPath,
+  groupAgentHarnesses,
+  harnessSettingsBadgeId,
+} from "@/lib/agentSettings";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { customAgentsSettingsEnabled } from "@/lib/capabilities";
+import { Link } from "@/lib/routing";
 import {
   callingDefaultHarnesses,
   patchCallingDefaults,
@@ -81,6 +94,13 @@ export function CallingDefaultsSection() {
   const { data: hosts } = useHosts();
   const capabilities = useHarnessCapabilities();
   const registry = useAgentRegistry();
+  const info = useServerInfo();
+  const agentDetailsAvailable =
+    info !== "loading" && info.agent_detail === true && customAgentsSettingsEnabled(info);
+  const { query: installedAgents, pager: installedPager } = useManagedAgents(
+    "user",
+    agentDetailsAvailable,
+  );
   const mobile = useIsMobileViewport();
   const [field, setField] = useState<AgentField | "prompt" | "provider">("model");
   const master = useCallingDefaults();
@@ -146,10 +166,6 @@ export function CallingDefaultsSection() {
   const hostList = hosts ?? [];
   const host = hostList.find((candidate) => candidate.host_id === selectedHostId) ?? hostList[0];
   const products = registry.items.filter((item) => item.key.startsWith("harness:") && item.harness);
-  const names = Object.fromEntries(products.map((item) => [item.harness!, item.label]));
-  const agentIds = Object.fromEntries(
-    Object.entries(registry.legacyProducts).map(([id, item]) => [item.harness!, id]),
-  );
   const harnesses = groupAgentHarnesses(
     [
       ...products.map((item) => item.harness!),
@@ -160,6 +176,53 @@ export function CallingDefaultsSection() {
     ],
     capabilities,
   ).filter((harness) => hostList.some((candidate) => agentPresentOnHost(harness, candidate)));
+  const names = Object.fromEntries(
+    harnesses.map((harness) => [
+      harness,
+      agentSettingsHarnessLabel(
+        harness,
+        capabilities,
+        products.find(
+          (item) => item.harness === harness || item.aliasKeys?.includes(`harness:${harness}`),
+        )?.label,
+      ),
+    ]),
+  );
+  const agentIds = Object.fromEntries(
+    harnesses.map((harness) => [harness, harnessSettingsBadgeId(harness, registry.legacyProducts)]),
+  );
+  const detailRows = agentDetailsAvailable
+    ? [
+        ...registry.installedServerAgents.map((agent) => ({
+          id: agent.id,
+          name: agent.display_name,
+          harness: agent.harness,
+          integration_mode: agent.integration_mode,
+        })),
+        ...(installedAgents.data?.data ?? []),
+      ].map(({ id, name, harness, integration_mode }) => {
+        const kind = nonNativeAgentKind(
+          harness,
+          integration_mode ?? (harness ? capabilities[harness]?.integration_mode : undefined),
+        );
+        return {
+          id,
+          content: (
+            <Link
+              to={customAgentSettingsPath(id)}
+              state={{ fromAgentsTable: true }}
+              aria-label={`${name} details`}
+              aria-description={kind ?? undefined}
+              componentId="settings.agents.detail"
+              className="flex min-h-11 min-w-0 items-center justify-between gap-2 px-2.5 text-left hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            >
+              <AgentNameTag agentId={id} name={name} harness={harness} kindTag={kind} />
+              <ArrowRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            </Link>
+          ),
+        };
+      })
+    : [];
   const fields = [
     { value: "model", label: "Model" },
     { value: "effort", label: "Thinking" },
@@ -233,7 +296,7 @@ export function CallingDefaultsSection() {
           {error}
         </p>
       )}
-      {hostList.length > 0 && (
+      {(hostList.length > 0 || detailRows.length > 0) && (
         <>
           {mobile && host && (
             <Segmented
@@ -250,11 +313,13 @@ export function CallingDefaultsSection() {
           {field === "prompt" || field === "provider" ? (
             <AgentContextTable
               field={field}
-              hosts={mobile && host ? [host] : hostList}
+              hosts={hostList}
+              visibleHostId={mobile ? host?.host_id : undefined}
               harnesses={harnesses}
               names={names}
               agentIds={agentIds}
               capabilities={capabilities}
+              detailRows={detailRows}
             />
           ) : (
             <AgentDefaultsTable
@@ -268,11 +333,15 @@ export function CallingDefaultsSection() {
               names={names}
               agentIds={agentIds}
               linkToDetails
+              detailRows={detailRows}
               onLoadCatalog={loadCatalog}
               onChange={(next) => patchCallingDefaults(callingDefaultsPatch(master, next))}
             />
           )}
         </>
+      )}
+      {agentDetailsAvailable && (
+        <SettingsPager label="Installed agents pages" {...installedPager} />
       )}
       <details id="calling-defaults" className="border-t border-border pt-4">
         <summary className="cursor-pointer text-ui font-medium">New session options</summary>
