@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import shutil
 import subprocess
@@ -44,6 +45,13 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnigent._platform import CLI_FALLBACK_DIRS_ENV_VAR, IS_WINDOWS, resolve_cli_binary
+from omnigent._windows_launcher import (
+    merge_shim_env,
+    probe_windows_binary_in_dir,
+    unwrap_windows_cmd_shim,
+    windows_launch_spec,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
 from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess
@@ -106,7 +114,9 @@ def agy_binary_path() -> str:
     """Return the absolute path to the ``agy`` CLI executable.
 
     Searches PATH first via :func:`shutil.which`, then falls back to
-    ``~/.local/bin/agy`` (the installer's default location).
+    ``~/.local/bin/agy`` (the installer's default location). On Windows it
+    resolves through the unified launcher base (merged registry PATH, known
+    package-manager dirs, ``PATHEXT``, and native ``.cmd`` shim unwrapping).
 
     :returns: Absolute path string for the agy executable, e.g.
         ``"/home/user/.local/bin/agy"``.
@@ -114,6 +124,20 @@ def agy_binary_path() -> str:
         ``~/.local/bin/agy`` does not exist.  The error message includes
         the curl installer command.
     """
+    if IS_WINDOWS:
+        resolved = resolve_cli_binary("agy", which=shutil.which)
+        if resolved is None and os.environ.get(CLI_FALLBACK_DIRS_ENV_VAR) is None:
+            resolved = probe_windows_binary_in_dir(
+                _AGY_FALLBACK_PATH.parent, _AGY_FALLBACK_PATH.name
+            )
+        if resolved is not None:
+            unwrapped = unwrap_windows_cmd_shim(Path(resolved))
+            if unwrapped is not None and unwrapped.kind == "native" and unwrapped.target.is_file():
+                return str(unwrapped.target)
+            return resolved
+        raise RuntimeError(
+            f"agy CLI not found on PATH and not at {_AGY_FALLBACK_PATH}.\n{_AGY_INSTALL_HINT}"
+        )
     on_path = shutil.which("agy")
     if on_path is not None:
         return on_path
@@ -204,9 +228,16 @@ async def _probe_agy_subscription_model(
     command: str, model: str, effort: str | None
 ) -> bool | None:
     """Return acceptance, explicit rejection, or an inconclusive probe."""
-    args = [command, f"--gemini_dir={Path.home() / '.gemini'}", "--model", model]
+    cmd_argv, shim_env = windows_launch_spec(command, is_windows=IS_WINDOWS)
+    args = [
+        *cmd_argv,
+        f"--gemini_dir={Path.home() / '.gemini'}",
+        "--model",
+        model,
+    ]
     if effort is not None:
         args.extend(["--effort", effort])
+    probe_env = merge_shim_env(None, shim_env)
     try:
         process = await asyncio.create_subprocess_exec(
             *args,
@@ -215,6 +246,7 @@ async def _probe_agy_subscription_model(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=probe_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, NotImplementedError):

@@ -320,14 +320,17 @@ def command_binary_on_path(command: str) -> bool:
     :param command: The configured command, e.g. ``"gemini --experimental-acp"``.
     :returns: ``True`` when the first token is runnable.
     """
-    import shlex
+    from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+    from omnigent._windows_launcher import split_command_argv
 
     try:
-        parts = shlex.split(command)
+        parts = split_command_argv(command)
     except ValueError:
         return False
     if not parts:
         return False
+    if IS_WINDOWS:
+        return resolve_cli_binary(parts[0], which=shutil.which) is not None
     return shutil.which(parts[0]) is not None
 
 

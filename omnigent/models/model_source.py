@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -151,6 +150,7 @@ def _source_catalog(harness: str, source: ModelSource) -> tuple[str, str, Any]:
     )
     if harness in ACP_CLI_HARNESSES:
         from omnigent._platform import resolve_cli_binary
+        from omnigent._windows_launcher import join_command_argv
         from omnigent.harness_startup_config import (
             config_harness_path_override,
             resolve_harness_path,
@@ -164,11 +164,13 @@ def _source_catalog(harness: str, source: ModelSource) -> tuple[str, str, Any]:
             or row.binary
         )
         entry = AcpAgentEntry(
-            slug=harness, name=row.label, command=shlex.join([executable, *row.args])
+            slug=harness, name=row.label, command=join_command_argv([executable, *row.args])
         )
     if entry is None:
         raise ValueError("agent source needs a configured ACP agent")
-    argv = shlex.split(entry.command)
+    from omnigent._windows_launcher import split_command_argv
+
+    argv = split_command_argv(entry.command)
     if not argv:
         raise ValueError("ACP command is empty")
     return "acp", fingerprint_of(entry.command, binary_identity(argv[0])), entry
