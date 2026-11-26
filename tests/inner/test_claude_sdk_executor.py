@@ -405,7 +405,7 @@ async def test_resident_inventory_keeps_connecting_client_incarnation(monkeypatc
     [
         ("error", "ok"),
         ("timeout", "ok"),
-        ("cancel", "none"),
+        ("cancel", "ok"),
         ("error", "error"),
         ("timeout", "cancel"),
     ],
@@ -453,9 +453,9 @@ async def test_resident_inventory_connect_failure_keeps_absence_unknown(
             connecting.cancel()
         else:
             finish_connect.set()
-            await asyncio.wait_for(cleaning.wait(), 2)
-            assert executor.resident_inventory() is None
-            finish_cleanup.set()
+        await asyncio.wait_for(cleaning.wait(), 2)
+        assert executor.resident_inventory() is None
+        finish_cleanup.set()
         expected = (
             asyncio.CancelledError
             if "cancel" in (outcome, cleanup)
@@ -472,7 +472,6 @@ async def test_resident_inventory_connect_failure_keeps_absence_unknown(
             model=None,
         )
         assert executor.resident_inventory() is None
-        assert cleaning.is_set() is (outcome != "cancel")
     finally:
         finish_connect.set()
         finish_cleanup.set()
@@ -4074,7 +4073,9 @@ class TestStreamEventStreaming(unittest.TestCase):
             executor._elicitation_handler = _allow_elicitation
             original_build_prompt = executor._build_prompt
 
-            def _checked_prompt(messages, *, resume_session, history_token_budget=None):
+            def _checked_prompt(
+                messages, *, resume_session, history_token_budget=None, after_interrupt=False
+            ):
                 if len(prompts) == 2:
                     self.assertTrue(clients[0].closed)
                     self.assertFalse(resume_session)
@@ -4088,6 +4089,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                     messages,
                     resume_session=resume_session,
                     history_token_budget=history_token_budget,
+                    after_interrupt=after_interrupt,
                 )
 
             first = [{"role": "user", "content": "hello", "session_id": "session-a"}]
@@ -4147,13 +4149,19 @@ class TestStreamEventStreaming(unittest.TestCase):
                     self.assertIsInstance(events[-1], TurnComplete)
                     if mode == "bypassPermissions":
                         with patch.object(
-                            executor, "_can_use_tool_for_permission", new_callable=AsyncMock
+                            executor,
+                            "_elicitation_handler",
+                            new_callable=AsyncMock,
+                            return_value=True,
                         ) as elicitation:
                             await clients[-1].options.can_use_tool("sleep", {}, None)
                             elicitation.assert_not_awaited()
                     if messages is sixth:
                         with patch.object(
-                            executor, "_can_use_tool_for_permission", new_callable=AsyncMock
+                            executor,
+                            "_elicitation_handler",
+                            new_callable=AsyncMock,
+                            return_value=True,
                         ) as elicitation:
                             await clients[-1].options.can_use_tool("sleep", {}, None)
                             elicitation.assert_awaited_once()
@@ -4238,13 +4246,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                     self.assertIsInstance(events[-1], TurnComplete)
 
             self.assertEqual(len(clients), 2)
-            with patch.object(
-                executor, "_can_use_tool_for_permission", new_callable=AsyncMock
-            ) as elicitation:
-                await clients[0].options.can_use_tool("Bash", {}, None)
-                elicitation.assert_awaited_once()
-                await clients[1].options.can_use_tool("Bash", {}, None)
-                elicitation.assert_awaited_once()
+            await clients[0].options.can_use_tool("Bash", {}, None)
+            executor._elicitation_handler.assert_awaited_once_with("Bash", {})
+            await clients[1].options.can_use_tool("Bash", {}, None)
+            executor._elicitation_handler.assert_awaited_once_with("Bash", {})
 
         _run(_t())
 
@@ -11345,3 +11350,107 @@ async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch
         finally:
             await executor.close()
     assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
+
+
+@pytest.mark.asyncio
+async def test_claude_sdk_windows_connect_sets_no_window_on_anyio_open_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import anyio
+
+    from omnigent.inner import _proc, claude_sdk_executor
+
+    no_window = 0x08000000
+    new_group = 0x00000200
+    recorded: list[tuple[str, int]] = []
+
+    async def _fake_open_process(command: object, **kwargs: object) -> object:
+        recorded.append((str(command), int(kwargs.get("creationflags", 0))))
+        return SimpleNamespace(pid=12345, returncode=0)
+
+    monkeypatch.setattr(anyio, "open_process", _fake_open_process)
+
+    # POSIX leaves anyio.open_process untouched.
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    with claude_sdk_executor._windows_no_window_anyio_spawn():
+        assert anyio.open_process is _fake_open_process
+        await anyio.open_process(["claude", "-v"])
+    assert recorded == [("['claude', '-v']", 0)]
+    recorded.clear()
+
+    # Windows wraps only the active connect task (not detached tasks spawned
+    # during connect) and injects CREATE_NO_WINDOW only.
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    monkeypatch.setattr(stdlib_subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+
+    inside_entered = asyncio.Event()
+    release_inside = asyncio.Event()
+    detached_ready = asyncio.Event()
+    run_detached_spawn = asyncio.Event()
+    detached_tasks: list[asyncio.Task[None]] = []
+
+    async def _detached_callback() -> None:
+        detached_ready.set()
+        await run_detached_spawn.wait()
+        await anyio.open_process(["detached-callback"])
+
+    async def _connect_like_task() -> None:
+        with claude_sdk_executor._windows_no_window_anyio_spawn():
+            detached_tasks.append(asyncio.create_task(_detached_callback()))
+            inside_entered.set()
+            await anyio.open_process(["claude", "-v"])
+            await release_inside.wait()
+            await anyio.open_process(["claude", "--print"])
+
+    async def _unrelated_task() -> None:
+        await inside_entered.wait()
+        await anyio.open_process(["other-tool"])
+        release_inside.set()
+
+    await asyncio.gather(_connect_like_task(), _unrelated_task())
+    assert anyio.open_process is _fake_open_process
+    assert ("['claude', '-v']", no_window) in recorded
+    assert ("['claude', '--print']", no_window) in recorded
+    assert ("['other-tool']", 0) in recorded
+
+    # Detached task spawned during connect #1 must not inherit no-window flags
+    # even when it spawns while connect #2 is active.
+    await detached_ready.wait()
+    recorded.clear()
+    with claude_sdk_executor._windows_no_window_anyio_spawn():
+        run_detached_spawn.set()
+        await detached_tasks[0]
+        await anyio.open_process(["claude", "--second"])
+    assert anyio.open_process is _fake_open_process
+    assert ("['detached-callback']", 0) in recorded
+    assert ("['claude', '--second']", no_window) in recorded
+
+    # Failure during connect still restores anyio.open_process.
+    with pytest.raises(RuntimeError, match="boom"):
+        with claude_sdk_executor._windows_no_window_anyio_spawn():
+            raise RuntimeError("boom")
+    assert anyio.open_process is _fake_open_process
+
+    # _get_or_create_client wires the wrapper inside the wait_for connect task.
+    recorded.clear()
+
+    class _ConnectSpawningClient(_SDKClient):
+        async def connect(self) -> None:
+            await anyio.open_process(["claude", "--sdk"])
+
+    class _ConnectFakeSDK(_sdk_types()):
+        ClaudeSDKClient = _ConnectSpawningClient
+
+    executor = _default_executor()
+    options = _ConnectFakeSDK.ClaudeAgentOptions(env={})
+    try:
+        await executor._get_or_create_client(
+            _ConnectFakeSDK, session_key="win-no-window", options=options, model=None
+        )
+    finally:
+        await executor.close()
+    assert anyio.open_process is _fake_open_process
+    assert recorded == [("['claude', '--sdk']", no_window)]

@@ -1947,6 +1947,7 @@ def _build_acp_cli_spawn_env(
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
     from omnigent._platform import resolve_cli_binary
+    from omnigent._windows_launcher import join_command_argv
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
     from omnigent.harness_startup_config import (
         config_harness_path_override,
@@ -1961,7 +1962,7 @@ def _build_acp_cli_spawn_env(
         or row.binary
     )
     env = {
-        "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
+        "HARNESS_ACP_COMMAND": join_command_argv([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
         # Rows whose CLI doesn't yet support session-scoped MCP and ignores
         # session/new mcpServers (e.g. jcode) opt out of advertising the

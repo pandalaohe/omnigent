@@ -8611,7 +8611,14 @@ async def _auto_create_antigravity_terminal(
     )
     model_warning = await launch.check_subscription_model()
     env_overrides.update(launch.env)
-    argv = [launch.argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
+    from omnigent._windows_launcher import merge_shim_env, windows_launch_spec
+
+    cmd_argv, shim_env = windows_launch_spec(launch.argv[0])
+    if shim_env:
+        merged_overrides = merge_shim_env(env_overrides, shim_env)
+        if merged_overrides is not None:
+            env_overrides = merged_overrides
+    argv = [*cmd_argv, f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
     argv = wrap_agy_gateway_launch(argv, env_overrides)

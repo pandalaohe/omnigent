@@ -194,14 +194,24 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
     import re
     import subprocess
 
+    from omnigent._windows_launcher import merge_shim_env
+    from omnigent.harnesses.pi_cli import pi_cli_argv as default_pi_cli_argv
+    from omnigent.harnesses.pi_cli import pi_cli_launch
+
     try:
+        if pi_cli_argv is default_pi_cli_argv:
+            cmd_argv, shim_env = pi_cli_launch(executable)
+        else:
+            cmd_argv, shim_env = pi_cli_argv(executable), {}
+        probe_env = merge_shim_env(None, shim_env)
         result = subprocess.run(
-            [*pi_cli_argv(executable), "--version"],
+            [*cmd_argv, "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=5.0,
+            env=probe_env,
             creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if IS_WINDOWS else 0,
         )
     except Exception:  # noqa: BLE001

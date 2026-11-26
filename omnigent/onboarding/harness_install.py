@@ -51,7 +51,8 @@ from typing import NamedTuple
 
 from packaging.version import InvalidVersion, Version
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent._windows_launcher import merge_shim_env, windows_launch_spec
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_availability import (
@@ -1148,9 +1149,11 @@ def _harness_cli_version_string(
             cached = _VERSION_PROBE_CACHE.get(sig)
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
+    cmd_argv, shim_env = windows_launch_spec(binary, is_windows=IS_WINDOWS)
+    probe_env = merge_shim_env(None, shim_env)
     try:
         completed = run_isolated(
-            [binary, "--version"],
+            [*cmd_argv, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=sys.platform != "win32",
@@ -1158,6 +1161,7 @@ def _harness_cli_version_string(
             errors="replace" if sys.platform != "win32" else None,
             timeout=timeout,
             cwd=probe_cwd,
+            env=probe_env,
         )
     except subprocess.TimeoutExpired:
         if raise_on_timeout:
@@ -1478,7 +1482,11 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = (
+        resolve_cli_binary(spec.binary)
+        if (key == GEMINI_FAMILY or IS_WINDOWS)
+        else shutil.which(spec.binary)
+    )
     if binary is None:
         return False
     probe_cwd = _cli_probe_cwd()
@@ -1495,9 +1503,11 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
+    cmd_argv, shim_env = windows_launch_spec(binary, is_windows=IS_WINDOWS)
+    probe_env = merge_shim_env(None, shim_env)
     try:
         result = run_isolated(
-            [binary, *spec.status_args],
+            [*cmd_argv, *spec.status_args],
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
@@ -1506,6 +1516,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             encoding="utf-8" if sys.platform != "win32" else None,
             errors="replace" if sys.platform != "win32" else None,
             cwd=probe_cwd,
+            env=probe_env,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1554,10 +1565,19 @@ def harness_login(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = (
+        resolve_cli_binary(spec.binary)
+        if (key == GEMINI_FAMILY or IS_WINDOWS)
+        else shutil.which(spec.binary)
+    )
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
+    cmd_argv, shim_env = (
+        windows_launch_spec(binary, is_windows=True)
+        if IS_WINDOWS
+        else ([binary if key == GEMINI_FAMILY else spec.binary], {})
+    )
+    login_env = merge_shim_env(None, shim_env)
     if harness_cli_logged_in(key):
         return True
     try:
@@ -1573,14 +1593,20 @@ def harness_login(key: str) -> bool:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
             except OSError:
                 tty_fd = None
-        argv = [argv_binary, *spec.login_args]
+        argv = [*cmd_argv, *spec.login_args]
         try:
             if tty_fd is not None:
                 subprocess.run(
-                    argv, check=False, timeout=600, stdin=tty_fd, stdout=tty_fd, stderr=tty_fd
+                    argv,
+                    check=False,
+                    timeout=600,
+                    stdin=tty_fd,
+                    stdout=tty_fd,
+                    stderr=tty_fd,
+                    env=login_env,
                 )
             else:
-                subprocess.run(argv, check=False, timeout=600)
+                subprocess.run(argv, check=False, timeout=600, env=login_env)
         finally:
             if tty_fd is not None:
                 os.close(tty_fd)

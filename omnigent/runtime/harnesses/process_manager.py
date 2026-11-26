@@ -2189,6 +2189,7 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            **_proc.no_window_kwargs(),
         )
 
     def _finish_closing_entry(self, session_id: str, entry: _SubprocessEntry) -> None:
@@ -2235,8 +2236,19 @@ class HarnessProcessManager:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
 
+        reap_task: asyncio.Task[None] | None = None
+
+        async def _reap_windows_once() -> None:
+            nonlocal reap_task
+            if reap_task is None:
+                reap_task = asyncio.create_task(asyncio.to_thread(_proc.kill_tree, entry.process))
+            await asyncio.shield(reap_task)
+
         async def _force_kill_and_wait() -> None:
-            _proc.kill_tree(entry.process)
+            if IS_WINDOWS:
+                await _reap_windows_once()
+            else:
+                _proc.kill_tree(entry.process)
             await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
 
         closed = False
@@ -2248,6 +2260,8 @@ class HarnessProcessManager:
                     # handle strands both when an executor close() never runs.
                     _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                    if IS_WINDOWS:
+                        await _reap_windows_once()
                 except asyncio.CancelledError as exc:
                     # Cancellation during either wait must not abandon the child.
                     cancellation = exc
@@ -2267,6 +2281,13 @@ class HarnessProcessManager:
                         cancellation = exc
                     except Exception:
                         _logger.exception("harness subprocess did not exit during teardown")
+            elif IS_WINDOWS and _proc.has_unresolved_identities(entry.process):
+                try:
+                    await _reap_windows_once()
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                except Exception:
+                    _logger.exception("harness descendants did not exit during teardown")
             pid_reaped = False
             if entry.process.returncode is None:
                 # A zygote-forked harness learns its exit code from a
@@ -2293,7 +2314,8 @@ class HarnessProcessManager:
                     # above — not this return — is the proof of exit.
                     await entry.process.wait()
                     pid_reaped = True
-            closed = entry.process.returncode is not None or pid_reaped
+            has_survivors = IS_WINDOWS and _proc.has_unresolved_identities(entry.process)
+            closed = (entry.process.returncode is not None or pid_reaped) and not has_survivors
         finally:
             if closed:
                 entry.exit_confirmed = True

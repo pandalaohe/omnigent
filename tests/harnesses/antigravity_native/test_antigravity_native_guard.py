@@ -71,7 +71,8 @@ def assert_pre_tool_reply(result):
         ),
         ("plan", "edit_file", {"Path": "a.py", "Target": "x", "Replacement": "y"}, "deny"),
         ("ask", "unknown_tool", {}, "force_ask"),
-        ("auto", "unknown_tool", {}, "deny"),
+        ("auto", "unknown_tool", {}, "force_ask"),
+        ("plan", "unknown_tool", {}, "deny"),
         ("auto", "run_command", {}, "deny"),
     ],
 )
@@ -81,8 +82,10 @@ def test_native_decision_mapping(state, tier, name, args, expected):
     assert_pre_tool_reply(result)
     assert result["decision"] == expected
     if name == "run_command" and "mkfs" in args.get("CommandLine", ""):
-        assert "[disk-destroy]" in result["reason"]
+        assert "Denied by rule [disk-destroy]:" in result["reason"]
         assert "ARES-218" in result["reason"]
+    if tier == "plan" and expected == "deny":
+        assert "Denied by permission mode (plan):" in result["reason"]
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
@@ -466,7 +469,7 @@ def test_persistent_state_timeout_is_recoverable_at_shared_deadline(native_trans
 def test_nonstring_policy_denial_reason_keeps_valid_hook_reply(native_transport):
     matching, run = native_transport
     result, _, _ = run([matching, {"result": "POLICY_ACTION_DENY", "reason": ["invalid"]}])
-    assert result == {"decision": "deny", "reason": "Omnigent policy denied"}
+    assert result == {"decision": "deny", "reason": "Denied by policy: Omnigent policy denied"}
 
 
 @pytest.mark.parametrize("policy", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"])

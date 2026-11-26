@@ -45,6 +45,7 @@ import psutil
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_LINUX, resolve_cli_binary
+from omnigent._windows_launcher import merge_shim_env, windows_launch_spec
 from omnigent.databricks_ai_gateway import (
     CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
@@ -695,13 +696,16 @@ async def _codex_cli_version_text(
     codex_path: str, *, env: Mapping[str, str] | None = None
 ) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
+    codex_argv, shim_env = windows_launch_spec(codex_path)
+    launch_env = merge_shim_env(env, shim_env)
     try:
         proc = await _create_subprocess_exec(
-            codex_path,
+            *codex_argv,
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=env,
+            env=launch_env,
+            **_proc.no_window_kwargs(),
         )
     except OSError:
         return None
@@ -2581,16 +2585,19 @@ def _probe_codex_model_catalog(
 ) -> dict[str, Any] | None:
     """Run ``codex debug models``, returning ``None`` on any failure."""
     try:
-        argv = [codex_path, "debug", "models"]
+        codex_argv, shim_env = windows_launch_spec(codex_path)
+        argv = [*codex_argv, "debug", "models"]
         if bundled:
             argv.append("--bundled")
+        probe_env = merge_shim_env({**os.environ, "CODEX_HOME": str(source_home)}, shim_env)
         completed = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "CODEX_HOME": str(source_home)},
+            env=probe_env,
             check=False,
+            **_proc.no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("could not read the codex model catalog (%s)", exc)
@@ -2802,13 +2809,18 @@ def write_required_brokered_model_catalog(
     env["CODEX_HOME"] = str(target_dir)
     if runtime_bin is not None:
         env[CODEX_RUNTIME_BIN_ENV] = runtime_bin
+    codex_argv, shim_env = windows_launch_spec(codex_path)
+    merged_env = merge_shim_env(env, shim_env)
+    if merged_env is not None:
+        env = merged_env
     try:
         completed = subprocess.run(
-            [codex_path, "debug", "models", "--bundled"],
+            [*codex_argv, "debug", "models", "--bundled"],
             capture_output=True,
             timeout=timeout,
             env=env,
             check=False,
+            **_proc.no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
@@ -4212,7 +4224,11 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error = None
-        argv = [self._worker_launch.launch_path, "app-server"]
+        worker_argv, shim_env = windows_launch_spec(self._worker_launch.launch_path)
+        merged_env = merge_shim_env(proc_env, shim_env)
+        if merged_env is not None:
+            proc_env = merged_env
+        argv = [*worker_argv, "app-server"]
         for override in overrides:
             argv.extend(["-c", override])
         if self._workspace_profile is not None:

@@ -64,9 +64,10 @@ from weakref import WeakValueDictionary
 import httpx
 
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
+from omnigent._windows_launcher import merge_shim_env
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
 from omnigent.debug_logging import debug_event
-from omnigent.harnesses.pi_cli import pi_cli_argv
+from omnigent.harnesses.pi_cli import pi_cli_argv, pi_cli_launch
 from omnigent.harnesses.pi_native.bridge import (
     PERMISSION_INSTALLATION_FILE,
     PI_PERMISSION_INSTALLATION_FIELDS,
@@ -169,6 +170,7 @@ from .executor import (
 from .model_credential import _authoritative_expiry
 
 logger = logging.getLogger(__name__)
+_DEFAULT_PI_CLI_ARGV = pi_cli_argv
 
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
@@ -2423,7 +2425,12 @@ class _PiRpcSession:
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
-        args = [*pi_cli_argv(pi_path), *launcher_args, "--mode", "rpc", "--no-session"]
+        if pi_cli_argv is _DEFAULT_PI_CLI_ARGV:
+            pi_prefix, shim_env = pi_cli_launch(pi_path)
+        else:
+            pi_prefix, shim_env = pi_cli_argv(pi_path), {}
+        args = [*pi_prefix, *launcher_args, "--mode", "rpc", "--no-session"]
+        spawn_env = (merge_shim_env(env, shim_env) or env) if shim_env else env
         if session_id:
             args.extend(["--session-id", session_id])
         if model:
@@ -2452,7 +2459,7 @@ class _PiRpcSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                env=env,
+                env=spawn_env,
                 **_proc.spawn_kwargs(),
             )
         except BaseException:

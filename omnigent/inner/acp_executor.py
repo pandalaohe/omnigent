@@ -53,16 +53,31 @@ import logging
 import math
 import operator
 import os
+import re
 import secrets
-import shlex
+import shutil
+import stat
 import subprocess
+from asyncio import Event as _AsyncioEvent
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import unquote, urlparse
+
+if TYPE_CHECKING:
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 from omnigent._platform import IS_WINDOWS
+from omnigent._windows_launcher import (
+    merge_shim_env,
+    merged_windows_path,
+    resolve_windows_command_argv,
+    split_command_argv,
+    windows_short_path,
+    windows_short_temp_dir,
+)
 from omnigent.acp_cli_harnesses import is_antigravity_acp_command
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
@@ -89,8 +104,10 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
+    executor_turn_context,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.models.model_catalog_store import (
@@ -129,6 +146,9 @@ _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]
 _ElicitationChoiceHandler: TypeAlias = Callable[
     [str, _AcpJsonObject, Sequence[str], str | None, bool], Awaitable[str | None]
 ]
+_FormElicitationHandler: TypeAlias = Callable[
+    [str, "ElicitationRequestParams"], Awaitable["ElicitationResult"]
+]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code an agent maps to a filesystem "not found" (ENOENT) when a
@@ -166,6 +186,7 @@ _AGY_ACP_COMMAND_FIELDS = {
 }
 _AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
 _AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
+_ACP_KNOWN_TOOL_KINDS = frozenset({"execute", "read", "edit"})
 # toolSummary is display metadata shared by agy tools.
 _AGY_ACP_SHELL_FIELDS = (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"}) | {"Cwd"}
 _AGY_ACP_READ_CONFLICT_FIELDS = (
@@ -174,6 +195,43 @@ _AGY_ACP_READ_CONFLICT_FIELDS = (
     | _AGY_ACP_WRITE_FIELDS
     | {"Edits", "Target", "Replacement"}
 )
+_AGY_ACP_READ_FILE_FIELDS = {
+    "Path": str,
+    "StartLine": int,
+    "EndLine": int,
+    "ByteOffset": int,
+    "toolSummary": str,
+}
+_AGY_ACP_READ_PATH_CONFLICT_FIELDS = _AGY_ACP_READ_CONFLICT_FIELDS - {"Path"}
+
+_AGY_READ_FILE_MAX_BYTES = 64 * 1024
+_AGY_READ_FILE_MAX_SCAN_BYTES = 2 * 1024 * 1024
+_AGY_QUESTION_TEXT_LIMIT = 8_000
+_AGY_QUESTION_LABEL_LIMIT = 512
+_AGY_TOOL_NAME_MAP: Mapping[str, str] = {
+    "run_command": "shell",
+    "read_file": "read",
+    "view_file": "read",
+    "client_view_file": "read",
+    "write_file": "write",
+    "write_to_file": "write",
+    "edit_file": "edit",
+    "replace_file_content": "edit",
+    "multi_replace_file_content": "edit",
+    "list_dir": "list",
+    "list_directory": "list",
+    "grep_search": "grep",
+    "code_search": "grep",
+    "find_by_name": "glob",
+    "search_web": "web_search",
+    "read_url_content": "web_read",
+}
+_AGY_READ_TOOLS = frozenset({"read_file", "view_file", "client_view_file"})
+_AGY_NON_FILE_READ_TOOLS = frozenset(
+    {"list_dir", "list_directory", "grep_search", "code_search", "find_by_name"}
+)
+_AGY_TITLE_TOOL_RE = re.compile(r"^(?:Running|Run)\s+([A-Za-z0-9_]+)\??$")
+_AGY_WINDOWS_LEADING_SLASH_RE = re.compile(r"^/([A-Za-z]:[/\\].*)$")
 
 # session/update.update.sessionUpdate discriminator values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
@@ -200,6 +258,17 @@ _AGENT_METHOD_SET_MODEL = "session/set_model"
 _TOOL_STATUS_IN_PROGRESS = "in_progress"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
+_TOOL_STATUS_CANCELLED = "cancelled"
+_TOOL_STATUS_PAUSED = "paused"
+_INACTIVE_TOOL_STATUSES = frozenset(
+    {
+        _TOOL_STATUS_COMPLETED,
+        _TOOL_STATUS_FAILED,
+        _TOOL_STATUS_CANCELLED,
+        _TOOL_STATUS_PAUSED,
+    }
+)
+_INACTIVE_SUBAGENT_STATES = frozenset({"idle", "completed", "failed", "cancelled"})
 
 # Idle (time-without-progress) timeout for a prompt turn, in seconds.
 # Some ACP agents stay silent while an external interaction is pending, so
@@ -216,6 +285,15 @@ if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
 
 # A running tool can be silent for the harness's normal one-hour idle window.
 _RUNNING_TOOL_TIMEOUT_SECONDS = 3600.0
+
+# Upper bound for keeping an Antigravity turn open after ``session/prompt``
+# returns while non-daemon background tools or subagents are still running.
+_AGY_BACKGROUND_WAIT_SECONDS = 30.0 * 60.0
+# Quiet settle window after Antigravity background work clears, so a follow-up
+# reply can arrive before the turn settles.
+_AGY_BACKGROUND_SETTLE_GRACE_SECONDS = 3.0
+# Upper bound for sending a best-effort abort reply to a cancelled agent request.
+_ABORT_REPLY_TIMEOUT_SECONDS = 1.0
 
 # Default deadline for each initial ACP handshake / session setup RPC.
 _INIT_TIMEOUT_SECONDS = 180.0
@@ -343,6 +421,169 @@ class _AcpPermissionTrace:
     once_offer: str = "unchecked"
 
 
+def _is_daemon_tool_input(raw_input: object) -> bool:
+    """True when an Antigravity tool input marks a long-lived daemon command."""
+    if not isinstance(raw_input, dict):
+        return False
+    flag = raw_input.get("IsDaemon")
+    return flag is True or (isinstance(flag, str) and flag.strip().lower() == "true")
+
+
+def _format_wait_bound(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{seconds:g}s"
+
+
+def _notify_turn_progress() -> None:
+    """Refresh the harness scaffold's idle watchdog on silent tool progress."""
+    ctx = executor_turn_context.get()
+    reset = getattr(ctx, "_reset_idle_watchdog", None)
+    if callable(reset):
+        reset()
+
+
+def _prompt_response_error_message(response: object) -> str | None:
+    """Return an error message when a JSON-RPC prompt response has an error or invalid shape."""
+    if not isinstance(response, dict):
+        return "Malformed ACP prompt response"
+    if "error" in response:
+        err = response["error"]
+        if isinstance(err, dict):
+            msg = err.get("message")
+            return str(msg) if msg else "Unknown ACP error"
+        return str(err) if err not in (None, "") else "Unknown ACP error"
+    return None
+
+
+_UNSET_PROMPT_ID: Any = object()
+
+
+def _prompt_fut_is_terminal_abort(fut: asyncio.Future[_AcpJsonObject] | None) -> bool:
+    """Return True when a resolved prompt future ended in error or non-end_turn stop."""
+    if fut is None or not fut.done():
+        return False
+    if fut.cancelled():
+        return True
+    try:
+        response = fut.result()
+    except Exception:  # noqa: BLE001
+        return True
+    if _prompt_response_error_message(response) is not None:
+        return True
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+    return stop_reason != "end_turn"
+
+
+class _AgyBackgroundWork:
+    """Track Antigravity non-daemon tools and subagents that outlive ``session/prompt``."""
+
+    def __init__(self, root_session_id: str) -> None:
+        self._root = root_session_id
+        self._live: dict[str, set[str]] = {}
+        self._children: dict[str, set[str]] = {}
+        self._daemon_tools: set[tuple[str, str]] = set()
+        self._denied_tools: set[tuple[str, str]] = set()
+
+    def is_known_session(self, session_id: object) -> bool:
+        if session_id is None:
+            return True
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        if session_id == self._root:
+            return True
+        seen: set[str] = set()
+        stack = [self._root]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            children = self._children.get(current, ())
+            if session_id in children:
+                return True
+            stack.extend(children)
+        return False
+
+    def observe(self, session_id: object, update: _AcpJsonObject) -> None:
+        """Update live background state from one ``session/update`` notification."""
+        if not self.is_known_session(session_id):
+            return
+        sid = self._root if session_id is None else str(session_id)
+        kind = update.get("sessionUpdate")
+        if kind == "subagent_update":
+            child_id = update.get("sessionId")
+            if isinstance(child_id, str) and child_id:
+                if child_id != sid:
+                    self._children.setdefault(sid, set()).add(child_id)
+                state = update.get("state")
+                if isinstance(state, dict) and isinstance(state.get("state"), str):
+                    active = state["state"] not in _INACTIVE_SUBAGENT_STATES
+                    self._set(sid, f"subagent:{child_id}", active)
+            return
+        if kind in (_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE):
+            call_id = update.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id:
+                return
+            key = (sid, call_id)
+            if _is_daemon_tool_input(update.get("rawInput")):
+                self._daemon_tools.add(key)
+                self._set(sid, f"tool:{call_id}", False)
+                return
+            if key in self._daemon_tools:
+                return
+            status = update.get("status")
+            if key in self._denied_tools:
+                if status == _TOOL_STATUS_IN_PROGRESS:
+                    self._denied_tools.discard(key)
+                else:
+                    return
+            if kind == _UPDATE_TOOL_CALL:
+                effective = status if isinstance(status, str) else "pending"
+                self._set(sid, f"tool:{call_id}", effective not in _INACTIVE_TOOL_STATUSES)
+            elif isinstance(status, str):
+                self._set(sid, f"tool:{call_id}", status not in _INACTIVE_TOOL_STATUSES)
+
+    def drop_tool(self, session_id: object, call_id: str) -> None:
+        """Remove a tool call that was denied or cancelled before running."""
+        sid = session_id if isinstance(session_id, str) and session_id else self._root
+        self._denied_tools.add((sid, call_id))
+        self._set(sid, f"tool:{call_id}", False)
+
+    def has_live(self, session_id: str | None = None, _seen: set[str] | None = None) -> bool:
+        sid = self._root if session_id is None else session_id
+        seen = set() if _seen is None else _seen
+        if sid in seen:
+            return False
+        seen.add(sid)
+        if self._live.get(sid):
+            return True
+        return any(self.has_live(child, seen) for child in self._children.get(sid, ()))
+
+    def live_keys(self, session_id: str | None = None, _seen: set[str] | None = None) -> list[str]:
+        sid = self._root if session_id is None else session_id
+        seen = set() if _seen is None else _seen
+        if sid in seen:
+            return []
+        seen.add(sid)
+        out = sorted(self._live.get(sid, ()))
+        for child in sorted(self._children.get(sid, ())):
+            out.extend(self.live_keys(child, seen))
+        return out
+
+    def _set(self, session_id: str, item: str, active: bool) -> None:
+        if active:
+            self._live.setdefault(session_id, set()).add(item)
+        else:
+            items = self._live.get(session_id)
+            if items is not None:
+                items.discard(item)
+                if not items:
+                    self._live.pop(session_id, None)
+
+
 def _same_json_value(left: object, right: object) -> bool:
     """Compare ACP values without treating booleans and numbers as interchangeable."""
     if type(left) is not type(right):
@@ -356,6 +597,636 @@ def _same_json_value(left: object, right: object) -> bool:
             _same_json_value(a, b) for a, b in zip(left, right, strict=True)
         )
     return left == right
+
+
+def _bound_agy_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def _parse_agy_file_uri(value: str) -> str | None:
+    """Parse a local ``file://`` URI to a local path, or None if remote or malformed."""
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if parsed.netloc not in ("", "localhost"):
+        return None
+    decoded = unquote(parsed.path)
+    match = _AGY_WINDOWS_LEADING_SLASH_RE.match(decoded)
+    return match.group(1) if match else decoded
+
+
+def _normalize_agy_path(value: str) -> str:
+    """Normalize AG file:// URIs and Windows leading-slash drive paths to local paths."""
+    if value.lower().startswith("file://"):
+        parsed_path = _parse_agy_file_uri(value)
+        return parsed_path if parsed_path is not None else value
+    match = _AGY_WINDOWS_LEADING_SLASH_RE.match(value)
+    return match.group(1) if match else value
+
+
+def _extract_agy_location_path(locations: object) -> str | None:
+    if not isinstance(locations, list):
+        return None
+    for entry in locations:
+        if isinstance(entry, dict):
+            path = entry.get("path")
+            if isinstance(path, str) and path:
+                return _normalize_agy_path(path)
+    return None
+
+
+def _resolve_agy_tool_name(
+    update: _AcpJsonObject, raw_input: _AcpJsonObject, locations: object
+) -> tuple[str, str]:
+    """Resolve an AG ACP tool update to ``(canonical_name, raw_name)``."""
+    raw_name_val = update.get("name")
+    title_val = update.get("title")
+    raw_name = raw_name_val.strip() if isinstance(raw_name_val, str) else ""
+    if not raw_name and isinstance(title_val, str):
+        title_stripped = title_val.strip()
+        title_match = _AGY_TITLE_TOOL_RE.match(title_stripped)
+        if title_match:
+            raw_name = title_match.group(1)
+        elif title_stripped in _AGY_TOOL_NAME_MAP:
+            raw_name = title_stripped
+    if raw_name in _AGY_TOOL_NAME_MAP:
+        return _AGY_TOOL_NAME_MAP[raw_name], raw_name
+
+    kind = update.get("kind")
+    keys = raw_input.keys()
+    has_command = any(
+        isinstance(raw_input.get(k), str) and raw_input[k]
+        for k in ("CommandLine", "command_line", "commandLine", "command")
+    )
+    has_path = (
+        any(
+            isinstance(raw_input.get(k), str) and raw_input[k]
+            for k in (
+                "Path",
+                "AbsolutePath",
+                "absolute_path",
+                "TargetFile",
+                "file_path",
+                "path",
+            )
+        )
+        or _extract_agy_location_path(locations) is not None
+    )
+    if kind == "execute" or has_command:
+        return "shell", raw_name or "run_command"
+    if kind == "read" and has_path and raw_name not in _AGY_NON_FILE_READ_TOOLS:
+        return "read", raw_name or "read_file"
+    if kind == "edit":
+        if keys & {"TargetContent", "ReplacementContent", "Target", "Replacement", "Edits"}:
+            return "edit", raw_name or "edit_file"
+        if keys & {"Content", "CodeContent"}:
+            return "write", raw_name or "write_file"
+        if has_path:
+            return "edit", raw_name or "edit_file"
+
+    fallback = raw_name or str(update.get("title") or kind or "tool")
+    return fallback, raw_name
+
+
+def _normalize_agy_edits(raw_edits: object) -> list[_AcpJsonObject] | None:
+    if not isinstance(raw_edits, list):
+        return None
+    normalized: list[_AcpJsonObject] = []
+    for entry in raw_edits:
+        if not isinstance(entry, dict):
+            return None
+        old_text = entry.get("TargetContent")
+        if not isinstance(old_text, str):
+            old_text = entry.get("Target")
+        new_text = entry.get("ReplacementContent")
+        if not isinstance(new_text, str):
+            new_text = entry.get("Replacement")
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            return None
+        item: _AcpJsonObject = {"oldText": old_text, "newText": new_text}
+        if entry.get("ReplaceAll") is True or entry.get("replaceAll") is True:
+            item["replaceAll"] = True
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_agy_tool_args(
+    raw_input: _AcpJsonObject, locations: object, *, tool_name: str
+) -> _AcpJsonObject:
+    """Normalize AG PascalCase / vendor tool arguments to Omnigent's shared lowercase keys."""
+    out: _AcpJsonObject = dict(raw_input)
+
+    def _alias(
+        canonical: str,
+        aliases: tuple[str, ...],
+        *,
+        transform: Callable[[str], str] | None = None,
+        allow_empty: bool = False,
+    ) -> None:
+        if canonical in out:
+            if transform is not None and isinstance(out[canonical], str):
+                out[canonical] = transform(out[canonical])
+            return
+        for key in aliases:
+            value = out.get(key)
+            if isinstance(value, str) and (allow_empty or value):
+                out.pop(key, None)
+                out[canonical] = transform(value) if transform is not None else value
+                return
+
+    _alias("command", ("CommandLine", "command_line", "commandLine"))
+    _alias("cwd", ("Cwd", "WorkingDirectory", "working_dir", "workingDir"))
+    _alias(
+        "path",
+        (
+            "Path",
+            "AbsolutePath",
+            "absolute_path",
+            "TargetFile",
+            "file_path",
+            "DirectoryPath",
+            "SearchPath",
+            "SearchDirectory",
+        ),
+        transform=_normalize_agy_path,
+    )
+    if "path" not in out:
+        loc_path = _extract_agy_location_path(locations)
+        if loc_path is not None:
+            out["path"] = loc_path
+    _alias("content", ("Content", "CodeContent"), allow_empty=True)
+    _alias("oldText", ("TargetContent", "Target"), allow_empty=True)
+    _alias("newText", ("ReplacementContent", "Replacement"), allow_empty=True)
+    if "edits" not in out and "Edits" in out:
+        normalized_edits = _normalize_agy_edits(out["Edits"])
+        if normalized_edits is not None:
+            out.pop("Edits", None)
+            out["edits"] = normalized_edits
+    _alias("pattern", ("Pattern",))
+    if tool_name in ("grep", "glob"):
+        _alias("pattern", ("Query",))
+    else:
+        _alias("query", ("Query",))
+    _alias("url", ("Url",))
+    return out
+
+
+def _normalize_agy_tool_output(update: _AcpJsonObject, *, is_shell: bool) -> Any:  # type: ignore[explicit-any]
+    """Normalize AG ACP tool completion payload without altering structured ACP content."""
+    content = update.get("content")
+    if content:
+        return content
+    raw_output = update.get("rawOutput")
+    if isinstance(raw_output, dict):
+        text: str | None = None
+        for key in ("combinedOutput", "combined_output", "output"):
+            val = raw_output.get(key)
+            if isinstance(val, str):
+                text = val
+                break
+        exit_code: int | None = None
+        for key in ("exitCode", "exit_code"):
+            val = raw_output.get(key)
+            if type(val) is int:
+                exit_code = val
+                break
+        if is_shell and (text is not None or exit_code is not None):
+            body = text or ""
+            if exit_code is not None and exit_code != 0:
+                suffix = f"[exit code: {exit_code}]"
+                return f"{body.rstrip(chr(10))}\n{suffix}" if body else suffix
+            return body
+        cleaned = dict(raw_output)
+        combined = cleaned.get("combinedOutput")
+        if not isinstance(combined, str):
+            combined = cleaned.get("combined_output")
+        if isinstance(combined, str):
+            for dup_key in ("formatted_output", "formattedOutput"):
+                if cleaned.get(dup_key) == combined:
+                    cleaned.pop(dup_key, None)
+        if isinstance(cleaned.get("imagePath"), str):
+            cleaned["imagePath"] = _normalize_agy_path(cleaned["imagePath"])
+        return cleaned
+    return raw_output
+
+
+def _is_agy_file_read(raw_name: str, kind: object, raw_input: _AcpJsonObject) -> bool:
+    if raw_name in _AGY_READ_TOOLS:
+        return True
+    if raw_name in _AGY_NON_FILE_READ_TOOLS:
+        return False
+    if kind != "read":
+        return False
+    return any(
+        isinstance(raw_input.get(key), str) and raw_input[key]
+        for key in ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+    )
+
+
+def _decode_utf8_prefix(data: bytes, *, truncated: bool) -> str | None:
+    if b"\x00" in data:
+        return None
+    if not truncated:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    for trim in range(4):
+        end = len(data) - trim
+        if end < 0:
+            break
+        try:
+            return data[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _normalize_windows_kernel_path(resolved: str) -> str:
+    if resolved.startswith("\\\\?\\UNC\\"):
+        resolved = "\\\\" + resolved[8:]
+    elif resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+def _windows_final_handle_path_raw(handle: int) -> str | None:
+    """Query the kernel final path for an open Windows OS handle without re-resolving by name."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        get_final = windll.kernel32.GetFinalPathNameByHandleW
+        get_final.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+        get_final.restype = ctypes.c_uint32
+        buf_size = get_final(handle, None, 0, 0)
+        if buf_size == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(buf_size)
+        written = get_final(handle, buf, buf_size, 0)
+        if written == 0 or written >= buf_size:
+            return None
+        return _normalize_windows_kernel_path(buf.value)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _windows_final_handle_path(fd: int) -> str | None:
+    """Resolve the final kernel path of an open Windows fd without re-resolving by name."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import msvcrt
+
+        get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
+        if get_osfhandle is None:
+            return None
+        return _windows_final_handle_path_raw(get_osfhandle(fd))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _open_windows_workspace_handle(cwd: str) -> int | None:
+    """Open a shareable Windows directory handle for the workspace root, or None."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        create_file = windll.kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        invalid_handle = ctypes.c_void_p(-1).value
+        handle = create_file(cwd, 0, 7, None, 3, 0x02000000, None)
+        if not handle or handle == invalid_handle:
+            return None
+        return int(handle)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _close_windows_handle(handle: int) -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is not None:
+            windll.kernel32.CloseHandle(handle)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _windows_workspace_root_norm(cwd: str) -> str | None:
+    """Resolve the Windows workspace root directly via an open directory handle."""
+    handle = _open_windows_workspace_handle(cwd)
+    if handle is None:
+        return None
+    try:
+        return _windows_final_handle_path_raw(handle)
+    finally:
+        _close_windows_handle(handle)
+
+
+@dataclass(frozen=True)
+class _AgyReadSpec:
+    perm_name: str
+    norm_path: str
+    policy_args: _AcpJsonObject
+    start_line: int | None
+    end_line: int | None
+    byte_offset: int
+
+
+_AGY_READ_PATH_KEYS = ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+
+
+def _extract_agy_read_spec(raw_input: _AcpJsonObject, locations: object) -> _AgyReadSpec | None:
+    """Validate and extract one unambiguous read target and range for policy and disk backfill."""
+    present_path_keys = [
+        key for key in _AGY_READ_PATH_KEYS if key in raw_input and raw_input[key] is not None
+    ]
+    if len(present_path_keys) > 1:
+        return None
+
+    perm_name = "read_file"
+    raw_path: str | None = None
+    if len(present_path_keys) == 1:
+        key = present_path_keys[0]
+        val = raw_input[key]
+        if not isinstance(val, str) or not val:
+            return None
+        raw_path = val
+        if key == "AbsolutePath":
+            perm_name = "view_file"
+    else:
+        if isinstance(locations, list):
+            loc_paths = [
+                entry.get("path")
+                for entry in locations
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]
+            ]
+            if len(loc_paths) == 1:
+                raw_path = loc_paths[0]
+    if not raw_path or "\x00" in raw_path:
+        return None
+    if raw_path.lower().startswith("file://"):
+        norm_path = _parse_agy_file_uri(raw_path)
+        if not norm_path:
+            return None
+    else:
+        norm_path = _normalize_agy_path(raw_path)
+    if "\x00" in norm_path:
+        return None
+
+    start_line: int | None = None
+    end_line: int | None = None
+    byte_offset = 0
+    if "StartLine" in raw_input and raw_input["StartLine"] is not None:
+        val = raw_input["StartLine"]
+        if type(val) is not int or val < 1:
+            return None
+        start_line = val
+    if "EndLine" in raw_input and raw_input["EndLine"] is not None:
+        val = raw_input["EndLine"]
+        if type(val) is not int or val < 1:
+            return None
+        end_line = val
+    if start_line is not None and end_line is not None and end_line < start_line:
+        return None
+    if start_line is None and end_line is None:
+        if "line" in raw_input and raw_input["line"] is not None:
+            val = raw_input["line"]
+            if type(val) is not int or val < 1:
+                return None
+            start_line = val
+        if "limit" in raw_input and raw_input["limit"] is not None:
+            val = raw_input["limit"]
+            if type(val) is not int or val < 1:
+                return None
+            base = start_line if start_line is not None else 1
+            end_line = base + val - 1
+    if "ByteOffset" in raw_input and raw_input["ByteOffset"] is not None:
+        val = raw_input["ByteOffset"]
+        if type(val) is not int or val < 0:
+            return None
+        byte_offset = val
+
+    path_field = "AbsolutePath" if perm_name == "view_file" else "Path"
+    policy_args: _AcpJsonObject = {path_field: norm_path}
+    if start_line is not None:
+        policy_args["StartLine"] = start_line
+    if end_line is not None:
+        policy_args["EndLine"] = end_line
+    if byte_offset:
+        policy_args["ByteOffset"] = byte_offset
+    return _AgyReadSpec(
+        perm_name=perm_name,
+        norm_path=norm_path,
+        policy_args=policy_args,
+        start_line=start_line,
+        end_line=end_line,
+        byte_offset=byte_offset,
+    )
+
+
+def _open_workspace_regular_file(
+    cwd: str,
+    norm_path: str,
+    *,
+    workspace_fd: int | None = None,
+    workspace_win_handle: int | None = None,
+    workspace_real: str | None = None,
+    require_anchor: bool = False,
+) -> int | None:
+    """Open a workspace-contained regular file anchored to the workspace directory."""
+    if "\x00" in norm_path or "\x00" in cwd:
+        return None
+    try:
+        cwd_real = (
+            Path(workspace_real) if workspace_real is not None else Path(os.path.realpath(cwd))
+        )
+        candidate = Path(norm_path) if os.path.isabs(norm_path) else cwd_real / norm_path
+        target_real = Path(os.path.realpath(candidate))
+        if not target_real.is_relative_to(cwd_real):
+            return None
+        rel_parts = target_real.relative_to(cwd_real).parts
+        if not rel_parts:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    o_cloexec = getattr(os, "O_CLOEXEC", 0)
+    o_nonblock = getattr(os, "O_NONBLOCK", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_directory = getattr(os, "O_DIRECTORY", 0)
+
+    if o_nofollow and o_directory and os.open in os.supports_dir_fd:
+        if workspace_fd is None and require_anchor:
+            return None
+        own_root = workspace_fd is None
+        dir_fd = -1
+        try:
+            if workspace_fd is not None:
+                dir_fd = workspace_fd
+            else:
+                dir_fd = os.open(cwd_real, os.O_RDONLY | o_directory | o_cloexec)
+            for segment in rel_parts[:-1]:
+                next_fd = os.open(
+                    segment, os.O_RDONLY | o_directory | o_nofollow | o_cloexec, dir_fd=dir_fd
+                )
+                if dir_fd != workspace_fd:
+                    os.close(dir_fd)
+                dir_fd = next_fd
+            fd = os.open(
+                rel_parts[-1], os.O_RDONLY | o_nonblock | o_nofollow | o_cloexec, dir_fd=dir_fd
+            )
+        except (OSError, ValueError):
+            return None
+        finally:
+            if dir_fd != -1 and (own_root or dir_fd != workspace_fd):
+                with contextlib.suppress(OSError):
+                    os.close(dir_fd)
+    else:
+        if IS_WINDOWS and workspace_win_handle is None and require_anchor:
+            return None
+        try:
+            fd = os.open(target_real, os.O_RDONLY | o_nonblock | o_nofollow | o_cloexec)
+        except (OSError, ValueError):
+            return None
+        if IS_WINDOWS:
+            root_norm = (
+                _windows_final_handle_path_raw(workspace_win_handle)
+                if workspace_win_handle is not None
+                else _windows_workspace_root_norm(cwd)
+            )
+            final_norm = _windows_final_handle_path(fd)
+            if (
+                root_norm is None
+                or final_norm is None
+                or not final_norm.startswith(root_norm.rstrip("\\/") + os.sep)
+            ):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                return None
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return None
+    return fd
+
+
+def _read_agy_file_body(
+    cwd: str,
+    raw_input: _AcpJsonObject,
+    locations: object,
+    *,
+    spec: _AgyReadSpec | None = None,
+    workspace_fd: int | None = None,
+    workspace_win_handle: int | None = None,
+    workspace_real: str | None = None,
+    require_anchor: bool = False,
+) -> str | None:
+    """Safely read a workspace-contained UTF-8 text file for AG ACP read_file backfill."""
+    read_spec = spec if spec is not None else _extract_agy_read_spec(raw_input, locations)
+    if read_spec is None:
+        return None
+    start_line = read_spec.start_line
+    end_line = read_spec.end_line
+    byte_offset = read_spec.byte_offset
+
+    fd = _open_workspace_regular_file(
+        cwd,
+        read_spec.norm_path,
+        workspace_fd=workspace_fd,
+        workspace_win_handle=workspace_win_handle,
+        workspace_real=workspace_real,
+        require_anchor=require_anchor,
+    )
+    if fd is None:
+        return None
+
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            collected = bytearray()
+            scanned = 0
+            skipped_range_bytes = 0
+            truncated = False
+            first_line = start_line or 1
+            line_no = 0
+            at_line_start = True
+            while True:
+                raw_line = handle.readline(_AGY_READ_FILE_MAX_BYTES + 1)
+                if not raw_line:
+                    break
+                if b"\x00" in raw_line:
+                    return None
+                scanned += len(raw_line)
+                if scanned > _AGY_READ_FILE_MAX_SCAN_BYTES:
+                    truncated = True
+                    break
+                if at_line_start:
+                    line_no += 1
+                at_line_start = raw_line.endswith(b"\n")
+                if line_no < first_line:
+                    continue
+                if end_line is not None and line_no > end_line:
+                    break
+                chunk = raw_line
+                if skipped_range_bytes < byte_offset:
+                    remaining_skip = byte_offset - skipped_range_bytes
+                    if len(chunk) <= remaining_skip:
+                        skipped_range_bytes += len(chunk)
+                        continue
+                    chunk = chunk[remaining_skip:]
+                    skipped_range_bytes = byte_offset
+                remaining_budget = _AGY_READ_FILE_MAX_BYTES - len(collected)
+                if len(chunk) > remaining_budget:
+                    collected.extend(chunk[:remaining_budget])
+                    truncated = True
+                    break
+                collected.extend(chunk)
+                if len(collected) >= _AGY_READ_FILE_MAX_BYTES:
+                    if not at_line_start or end_line is None or line_no < end_line:
+                        if handle.read(1):
+                            truncated = True
+                    break
+    except OSError:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        return None
+
+    decoded = _decode_utf8_prefix(bytes(collected), truncated=truncated)
+    if decoded is None:
+        return None
+    return f"{decoded}\n...[truncated]" if truncated else decoded
 
 
 def _looks_like_missing_file(message: str) -> bool:
@@ -525,6 +1396,7 @@ class AcpExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         *,
         extension: AcpExtension = NO_ACP_EXTENSION,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """Initialize the generic ACP executor.
 
@@ -578,9 +1450,12 @@ class AcpExecutor(Executor):
         self._model_switch_supported: bool = True
 
         # Parsed argv; the first token is the binary we resolve / sandbox.
-        self._argv: list[str] = shlex.split(config.command)
+        self._argv: list[str] = split_command_argv(config.command, is_windows=IS_WINDOWS)
         if not self._argv:
             raise ValueError("AcpAgentConfig.command is empty")
+        # Short per-instance TEMP/TMP dir created on Windows for Antigravity
+        # to keep unpacked runtime archive paths under Windows' 260-char MAX_PATH.
+        self._agy_runtime_temp_dir: Path | None = None
 
         self._proc: asyncio.subprocess.Process | None = None
         self._context_source = AcpProcessContextSource("acp", lambda: self._proc)
@@ -599,7 +1474,17 @@ class AcpExecutor(Executor):
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
         self._active_prompt_request_id: int | None = None
+        self._turn_prompt_id: int | None = None
         self._cancel_grace_deadline: float | None = None
+        self._clock: Callable[[], float] | None = clock
+        self._poll_interval_s: float = 2.0
+        self._post_prompt_wait_active: bool = False
+        self._post_prompt_deadline: float | None = None
+        self._reader_agy_bg_work: _AgyBackgroundWork | None = None
+        self._denied_turn_tools: set[str] = set()
+        self._turn_cancel_event: asyncio.Event | None = None
+        self._turn_wake_event: asyncio.Event | None = None
+        self._stdout_eof_event: asyncio.Event | None = None
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -623,9 +1508,21 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        self._tool_raw_meta: dict[str, _AcpJsonObject] = {}
         self._permission_calls: dict[str, _AcpJsonObject] = {}
         self._answered_permission_calls: set[str] = set()
         self._terminal_permission_calls: set[str] = set()
+        self._denied_permission_calls: set[str] = set()
+        self._authorized_read_calls: dict[str, tuple[str, _AcpJsonObject]] = {}
+        self._pending_read_backfills: dict[
+            str, tuple[str, _AcpJsonObject, object, bool, object, int | None]
+        ] = {}
+        self._tainted_interaction_calls: set[str] = set()
+        self._observed_terminal_calls: set[str] = set()
+        self._workspace_dir_fd: int | None = None
+        self._workspace_win_handle: int | None = None
+        self._workspace_real_path: str | None = None
+        self._windows_reap_task: asyncio.Task[None] | None = None
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -639,6 +1536,7 @@ class AcpExecutor(Executor):
         self._elicitation_handler: _ElicitationHandler | None = None
         self._policy_elicitation_handler: _ElicitationHandler | None = None
         self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
+        self._form_elicitation_handler: _FormElicitationHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
@@ -680,6 +1578,7 @@ class AcpExecutor(Executor):
         # fail early with a clear message if that directory was also deleted.
         if not os.path.isabs(self._cwd):
             _resolve_cwd(None, session_id=self._session_id)
+        self._anchor_workspace_fd()
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -696,31 +1595,252 @@ class AcpExecutor(Executor):
         self._model_selection_pending = False
         self._model_options = []
         env = self._build_spawn_env()
-        launch_path, argv = self._sandbox_launch(tuple(env.keys()))
-        _STREAM_LIMIT = 16 * 1024 * 1024
-        # Keep the process group for teardown without opening a Windows console.
-        spawn_options = _proc.spawn_kwargs()
-        if IS_WINDOWS:
-            spawn_options["creationflags"] = spawn_options.get("creationflags", 0) | int(
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            resolved_argv: list[str] | None = None
+            if IS_WINDOWS:
+                resolved_argv, shim_env = resolve_windows_command_argv(
+                    self._argv, env=env, is_windows=True
+                )
+                if shim_env:
+                    merged_env = merge_shim_env(
+                        env, shim_env, deny_exact=getattr(self._config, "env_unset", ())
+                    )
+                    if merged_env is not None:
+                        env = merged_env
+            launch_path, argv = self._sandbox_launch(
+                tuple(env.keys()), resolved_argv=resolved_argv
             )
-        self._proc = await asyncio.create_subprocess_exec(
-            launch_path,
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=self._cwd,
-            limit=_STREAM_LIMIT,
-            # Own session/group: the sandbox launcher forks the real agent,
-            # and without a group boundary teardown reaches only the wrapper.
-            **spawn_options,
-        )
+            _STREAM_LIMIT = 16 * 1024 * 1024
+            # Keep the process group for teardown without opening a Windows console.
+            spawn_options = _proc.spawn_kwargs()
+            if IS_WINDOWS:
+                spawn_options["creationflags"] = spawn_options.get("creationflags", 0) | int(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+            self._proc = await asyncio.create_subprocess_exec(
+                launch_path,
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self._cwd,
+                limit=_STREAM_LIMIT,
+                # Own session/group: the sandbox launcher forks the real agent,
+                # and without a group boundary teardown reaches only the wrapper.
+                **spawn_options,
+            )
+        except BaseException:
+            self._cleanup_agy_runtime_temp_dir()
+            self._close_workspace_fd()
+            raise
+        if IS_WINDOWS and isinstance(self._proc.pid, int):
+            _proc.refresh_process_tree(self._proc)
+        self._windows_reap_task = None
+        self._stdout_eof_event = _AsyncioEvent()
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
 
-    def _sandbox_launch(self, spawn_env_names: tuple[str, ...]) -> tuple[str, list[str]]:
+    def _now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return asyncio.get_running_loop().time()
+
+    def _wake_turn(self) -> None:
+        if self._turn_wake_event is not None:
+            self._turn_wake_event.set()
+
+    def _is_stdout_closed(self) -> bool:
+        if self._stdout_eof_event is not None and self._stdout_eof_event.is_set():
+            return True
+        if self._reader_task is not None and self._reader_task.done():
+            return True
+        return self._proc is not None and self._proc.returncode is not None
+
+    @property
+    def _turn_accepts_permissions(self) -> bool:
+        if self._turn_cancel_event is not None and self._turn_cancel_event.is_set():
+            return False
+        if self._cancel_grace_deadline is not None:
+            return False
+        if self._is_stdout_closed():
+            return False
+        if self._active_prompt_request_id is not None:
+            return True
+        if not self._post_prompt_wait_active:
+            return False
+        if self._post_prompt_deadline is not None and self._now() >= self._post_prompt_deadline:
+            return False
+        return True
+
+    @property
+    def _active_turn_prompt_id(self) -> int | None:
+        if self._cancel_grace_deadline is not None:
+            return None
+        if self._active_prompt_request_id is not None:
+            return self._active_prompt_request_id
+        if self._post_prompt_wait_active and self._turn_accepts_permissions:
+            return self._turn_prompt_id
+        return None
+
+    async def _run_bounded_agent_request(
+        self,
+        notification: _AcpJsonObject,
+        *,
+        deadline: float | None,
+        cancel_event: asyncio.Event,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
+        phase2: bool = True,
+    ) -> bool:
+        """Run an agent request bounded by turn lifetime, deadline, cancel, and EOF."""
+        req_task: asyncio.Task[None] = asyncio.create_task(
+            self._respond_to_agent_request(notification)
+        )
+        try:
+            while not req_task.done():
+                effective_deadline = (
+                    deadline if deadline is not None else self._post_prompt_deadline
+                )
+                if (
+                    cancel_event.is_set()
+                    or self._cancel_grace_deadline is not None
+                    or self._is_stdout_closed()
+                ):
+                    break
+                if not phase2 and prompt_fut is not None and prompt_fut.done():
+                    if _prompt_fut_is_terminal_abort(prompt_fut):
+                        break
+                    # When the reader already observed end_turn without entering Phase 2,
+                    # the turn is over and cannot transition; direct-queue unit tests leave
+                    # _active_prompt_request_id set and continue draining the queued request.
+                    if (
+                        not self._post_prompt_wait_active
+                        and self._active_prompt_request_id is None
+                    ):
+                        break
+                remaining = self._poll_interval_s
+                if effective_deadline is not None:
+                    remaining = effective_deadline - self._now()
+                    if remaining <= 0:
+                        break
+                waiters: set[asyncio.Future[Any]] = {req_task}
+                extra_tasks: list[asyncio.Task[bool]] = []
+                c_task = asyncio.create_task(cancel_event.wait())
+                waiters.add(c_task)
+                extra_tasks.append(c_task)
+                if self._stdout_eof_event is not None:
+                    e_task = asyncio.create_task(self._stdout_eof_event.wait())
+                    waiters.add(e_task)
+                    extra_tasks.append(e_task)
+                if not phase2 and prompt_fut is not None and not prompt_fut.done():
+                    waiters.add(prompt_fut)
+                if self._turn_wake_event is not None:
+                    self._turn_wake_event.clear()
+                    w_task = asyncio.create_task(self._turn_wake_event.wait())
+                    waiters.add(w_task)
+                    extra_tasks.append(w_task)
+                try:
+                    await asyncio.wait(
+                        waiters,
+                        timeout=max(0.0, min(remaining, self._poll_interval_s)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in extra_tasks:
+                        if not task.done():
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
+            if req_task.done():
+                await req_task
+                return True
+            req_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await req_task
+            if not self._is_stdout_closed() and notification.get("id") is not None:
+                if notification.get("method") == _AGENT_REQUEST_REQUEST_PERMISSION:
+                    abort_reply: _AcpJsonObject = {
+                        "jsonrpc": "2.0",
+                        "id": notification.get("id"),
+                        "result": {"outcome": {"outcome": "cancelled"}},
+                    }
+                else:
+                    abort_reply = {
+                        "jsonrpc": "2.0",
+                        "id": notification.get("id"),
+                        "error": {"code": -32000, "message": "ACP request cancelled"},
+                    }
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        self._send(abort_reply), timeout=_ABORT_REPLY_TIMEOUT_SECONDS
+                    )
+            return False
+        except BaseException:
+            if not req_task.done():
+                req_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await req_task
+            raise
+
+    async def _await_queue_item(
+        self,
+        *,
+        timeout: float,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> _AcpJsonObject | None:
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if prompt_fut is not None and prompt_fut.done():
+            return None
+        if self._stdout_eof_event is not None and self._stdout_eof_event.is_set():
+            return None
+        queue_task: asyncio.Task[_AcpJsonObject] = asyncio.create_task(self._queue.get())
+        waiters: set[asyncio.Future[Any]] = {queue_task}
+        extra_tasks: list[asyncio.Task[bool]] = []
+        if prompt_fut is not None:
+            waiters.add(prompt_fut)
+        if cancel_event is not None:
+            task = asyncio.create_task(cancel_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        if self._stdout_eof_event is not None:
+            task = asyncio.create_task(self._stdout_eof_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        if self._turn_wake_event is not None:
+            self._turn_wake_event.clear()
+            task = asyncio.create_task(self._turn_wake_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        try:
+            await asyncio.wait(
+                waiters,
+                timeout=max(0.0, min(timeout, self._poll_interval_s)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if queue_task.done() and not queue_task.cancelled():
+                return queue_task.result()
+            return None
+        finally:
+            if not queue_task.done():
+                queue_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await queue_task
+            for task in extra_tasks:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    def _sandbox_launch(
+        self,
+        spawn_env_names: tuple[str, ...],
+        *,
+        resolved_argv: Sequence[str] | None = None,
+    ) -> tuple[str, list[str]]:
         """Return ``(launch_path, argv)`` — sandbox launcher or the bare binary.
 
         When ``os_env.sandbox`` requests confinement, wraps the agent binary in
@@ -734,8 +1854,9 @@ class AcpExecutor(Executor):
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
         """
-        binary = self._argv[0]
-        rest = self._argv[1:]
+        effective_argv = list(self._argv) if resolved_argv is None else list(resolved_argv)
+        binary = effective_argv[0]
+        rest = effective_argv[1:]
         os_env = self._os_env
         if os_env is None:
             return binary, rest
@@ -819,6 +1940,14 @@ class AcpExecutor(Executor):
         try:
             await self._read_stdout_unobserved()
         finally:
+            if self._stdout_eof_event is not None:
+                self._stdout_eof_event.set()
+            for pending_fut in list(self._pending.values()):
+                if not pending_fut.done():
+                    pending_fut.set_exception(EOFError("ACP subprocess closed stdout"))
+                    pending_fut.add_done_callback(
+                        lambda fut: fut.exception() if not fut.cancelled() else None
+                    )
             self._context_source.transport_ended(process, generation)
 
     async def _read_stdout_unobserved(self) -> None:
@@ -835,6 +1964,8 @@ class AcpExecutor(Executor):
                 if not raw_line:
                     # EOF — the subprocess exited. Wake in-flight futures so
                     # run_turn fails fast instead of blocking until idle timeout.
+                    if self._stdout_eof_event is not None:
+                        self._stdout_eof_event.set()
                     for fut in self._pending.values():
                         if not fut.done():
                             fut.set_exception(EOFError("ACP subprocess closed stdout"))
@@ -856,17 +1987,19 @@ class AcpExecutor(Executor):
                 # check prevents a colliding request from mis-resolving our future.
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
-                    if msg_id == self._active_prompt_request_id:
+                    was_active_prompt = msg_id == self._active_prompt_request_id
+                    if was_active_prompt:
                         self._active_prompt_request_id = None
                         # run_turn may already be cancelled when the response arrives.
-                        error = msg.get("error")
-                        if isinstance(error, dict):
+                        error_msg = _prompt_response_error_message(msg)
+                        if error_msg is not None:
+                            error = msg.get("error") if isinstance(msg, dict) else None
                             logger.debug(
                                 "acp[%s] session/prompt %s error code=%s message=%s",
                                 self._config.name,
                                 msg_id,
-                                error.get("code"),
-                                error.get("message"),
+                                error.get("code") if isinstance(error, dict) else None,
+                                error_msg,
                             )
                         else:
                             result = msg.get("result", {})
@@ -877,20 +2010,40 @@ class AcpExecutor(Executor):
                                 msg_id,
                                 reason,
                             )
+                            if (
+                                reason == "end_turn"
+                                and self._reader_agy_bg_work is not None
+                                and self._reader_agy_bg_work.has_live()
+                                and (
+                                    self._turn_cancel_event is None
+                                    or not self._turn_cancel_event.is_set()
+                                )
+                            ):
+                                self._post_prompt_deadline = (
+                                    self._now() + _AGY_BACKGROUND_WAIT_SECONDS
+                                )
+                                self._post_prompt_wait_active = True
+                                self._wake_turn()
                     if not fut.done():
                         fut.set_result(msg)
+                    if was_active_prompt:
+                        await self._queue.put({"_omnigent_prompt_done": msg_id})
                 else:
                     params = msg.get("params", {})
                     update = params.get("update", {}) if isinstance(params, dict) else {}
                     if msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(
                         update, dict
                     ):
+                        if self._reader_agy_bg_work is not None and isinstance(params, dict):
+                            self._reader_agy_bg_work.observe(params.get("sessionId"), update)
                         if (
                             self._config.host_permission_tier
-                            and self._active_prompt_request_id is not None
+                            and self._turn_accepts_permissions
                             and isinstance(params, dict)
                         ):
                             self._note_permission_update(params.get("sessionId"), update)
+                        if self._is_agy_acp and isinstance(params, dict):
+                            self._note_agy_interaction_activity(params.get("sessionId"), update)
                         if update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION:
                             self._note_config_options(update.get("configOptions"))
                             continue
@@ -955,6 +2108,25 @@ class AcpExecutor(Executor):
     # ACP handshake
     # ------------------------------------------------------------------
 
+    def _is_agy_command(self) -> bool:
+        config = getattr(self, "_config", None)
+        command = getattr(config, "command", "")
+        if isinstance(command, str) and command and is_antigravity_acp_command(command):
+            return True
+        argv = getattr(self, "_argv", ())
+        if not argv:
+            return False
+        from pathlib import PureWindowsPath
+
+        return PureWindowsPath(argv[0]).stem.lower() == "agy"
+
+    def _cleanup_agy_runtime_temp_dir(self) -> None:
+        agy_temp_dir = getattr(self, "_agy_runtime_temp_dir", None)
+        if agy_temp_dir is not None:
+            self._agy_runtime_temp_dir = None
+            with contextlib.suppress(OSError):
+                shutil.rmtree(agy_temp_dir, ignore_errors=True)
+
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
@@ -971,14 +2143,43 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
+        deny_exact = tuple(getattr(config, "env_unset", ()))
+        env = clean_agent_env(
             allow_prefixes=(),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
-            deny_exact=getattr(config, "env_unset", ()),
+            deny_exact=deny_exact,
         )
+        if IS_WINDOWS:
+            denied_upper = {name.upper() for name in deny_exact}
+            # Enforce case-insensitive Windows denies on inherited keys too.
+            for key in [k for k in env if k.upper() in denied_upper]:
+                env.pop(key, None)
+            if "PATH" not in denied_upper:
+                merged_path = merged_windows_path(env, is_windows=True)
+                if merged_path:
+                    for key in [k for k in env if k.upper() == "PATH"]:
+                        env.pop(key, None)
+                    env["PATH"] = merged_path
+            if self._is_agy_command() and not ({"TEMP", "TMP"} <= denied_upper):
+                existing_temp = getattr(self, "_agy_runtime_temp_dir", None)
+                if existing_temp is None or not existing_temp.is_dir():
+                    temp_path, short_temp = windows_short_temp_dir(
+                        "og-ag",
+                        env=env,
+                        is_windows=True,
+                    )
+                    self._agy_runtime_temp_dir = temp_path
+                else:
+                    short_temp = windows_short_path(existing_temp, is_windows=True)
+                for target_var in ("TEMP", "TMP"):
+                    if target_var not in denied_upper:
+                        for key in [k for k in env if k.upper() == target_var]:
+                            env.pop(key, None)
+                        env[target_var] = short_temp
+        return env
 
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
@@ -1259,15 +2460,53 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow, option_id = await self._decide_permission(params)
-                if allow is None or (
-                    self._config.host_permission_tier and self._active_prompt_request_id is None
-                ):
-                    result = {"outcome": {"outcome": "cancelled"}}
-                elif self._config.host_permission_tier and not allow and option_id is None:
-                    raise _AcpRequestError(-32000, "Omnigent did not authorize this tool call.")
+                if self._is_agy_acp and self._is_agy_interaction_shaped(params):
+                    result = await self._handle_agy_interaction_request(params)
+                    outcome = result.get("outcome")
+                    if isinstance(outcome, dict) and outcome.get("outcome") != "selected":
+                        tool_call = params.get("toolCall")
+                        denied_id = (
+                            tool_call.get("toolCallId") if isinstance(tool_call, dict) else None
+                        )
+                        if isinstance(denied_id, str) and denied_id:
+                            self._denied_turn_tools.add(denied_id)
                 else:
-                    result = self._permission_outcome(params, allow=allow, option_id=option_id)
+                    allow, option_id, denial_reason = await self._decide_permission_detail(params)
+                    if allow is not True:
+                        tool_call = params.get("toolCall")
+                        denied_id = (
+                            tool_call.get("toolCallId") if isinstance(tool_call, dict) else None
+                        )
+                        if isinstance(denied_id, str) and denied_id:
+                            self._denied_turn_tools.add(denied_id)
+                    if (
+                        allow is None
+                        or (
+                            self._config.host_permission_tier
+                            and not self._turn_accepts_permissions
+                        )
+                        or (
+                            self._turn_cancel_event is not None
+                            and self._turn_cancel_event.is_set()
+                        )
+                        or (
+                            self._post_prompt_wait_active
+                            and self._post_prompt_deadline is not None
+                            and self._now() >= self._post_prompt_deadline
+                        )
+                    ):
+                        result = {"outcome": {"outcome": "cancelled"}}
+                    elif self._config.host_permission_tier and not allow and option_id is None:
+                        raise _AcpRequestError(
+                            -32000,
+                            denial_reason
+                            or (
+                                "Denied by permission mode: "
+                                "Omnigent did not authorize this tool call."
+                            ),
+                        )
+                    else:
+                        result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -1394,8 +2633,266 @@ class AcpExecutor(Executor):
         return self._config.permission_mode == "bypassPermissions"
 
     @property
+    def _is_agy_acp(self) -> bool:
+        return is_antigravity_acp_command(self._config.command)
+
+    @property
     def _managed_agy(self) -> bool:
         return self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
+
+    def _anchor_workspace_fd(self) -> None:
+        """Pin a trusted workspace directory descriptor (POSIX) or root handle (Windows)."""
+        self._close_workspace_fd()
+        if not self._is_agy_acp:
+            return
+        if IS_WINDOWS:
+            handle = _open_windows_workspace_handle(self._cwd)
+            if handle is None:
+                return
+            root_norm = _windows_final_handle_path_raw(handle)
+            if root_norm is None:
+                _close_windows_handle(handle)
+                return
+            self._workspace_win_handle = handle
+            self._workspace_real_path = root_norm
+            return
+        o_directory = getattr(os, "O_DIRECTORY", 0)
+        o_cloexec = getattr(os, "O_CLOEXEC", 0)
+        if not (o_directory and os.open in os.supports_dir_fd):
+            return
+        try:
+            cwd_real = os.path.realpath(self._cwd)
+            self._workspace_dir_fd = os.open(cwd_real, os.O_RDONLY | o_directory | o_cloexec)
+            self._workspace_real_path = cwd_real
+        except (OSError, ValueError):
+            self._workspace_dir_fd = None
+            self._workspace_real_path = None
+
+    def _close_workspace_fd(self) -> None:
+        fd = self._workspace_dir_fd
+        win_handle = self._workspace_win_handle
+        self._workspace_dir_fd = None
+        self._workspace_win_handle = None
+        self._workspace_real_path = None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if win_handle is not None:
+            _close_windows_handle(win_handle)
+
+    def _note_agy_interaction_activity(self, session_id: object, update: _AcpJsonObject) -> None:
+        """Track live updates on ``interaction_*`` ids while an elicitation card may be open."""
+        if self._session_id is not None and session_id != self._session_id:
+            return
+        if update.get("sessionUpdate") not in (_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE):
+            return
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id.startswith("interaction_"):
+            return
+        raw_input = update.get("rawInput")
+        if update.get("kind") not in (None, "other") or (
+            raw_input is not None and raw_input != {}
+        ):
+            self._tainted_interaction_calls.add(call_id)
+        if update.get("status") in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED, "cancelled"):
+            self._observed_terminal_calls.add(call_id)
+
+    @staticmethod
+    def _is_agy_interaction_shaped(params: _AcpJsonObject) -> bool:
+        """True when a permission request is question-shaped (never a tool approval)."""
+        tool_call = params.get("toolCall")
+        if not isinstance(tool_call, dict):
+            return False
+        call_id = tool_call.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id.startswith("interaction_"):
+            return False
+        if tool_call.get("kind") not in (None, "other"):
+            return False
+        raw_input = tool_call.get("rawInput")
+        return raw_input is None or raw_input == {}
+
+    def _is_agy_interaction_request(self, params: _AcpJsonObject) -> bool:
+        """True for a clean, non-tainted, non-terminal AG ACP ``interaction_*`` question."""
+        if not self._is_agy_interaction_shaped(params):
+            return False
+        tool_call = params.get("toolCall")
+        assert isinstance(tool_call, dict)
+        call_id = tool_call.get("toolCallId")
+        assert isinstance(call_id, str)
+        if (
+            call_id in self._tainted_interaction_calls
+            or call_id in self._observed_terminal_calls
+            or call_id in self._terminal_permission_calls
+        ):
+            return False
+        observed = self._permission_calls.get(call_id)
+        if observed is not None:
+            obs_input = observed.get("rawInput")
+            if observed.get("kind") not in (None, "other") or (
+                obs_input is not None and obs_input != {}
+            ):
+                return False
+        raw_meta = self._tool_raw_meta.get(call_id)
+        if raw_meta is not None:
+            meta_input = raw_meta.get("raw_input")
+            if raw_meta.get("kind") not in (None, "other") or (
+                meta_input is not None and meta_input != {}
+            ):
+                return False
+        cached_input = self._tool_inputs.get(call_id)
+        if cached_input is not None and cached_input != {}:
+            return False
+        return True
+
+    @staticmethod
+    def _build_agy_display_options(
+        parsed_options: list[tuple[str, str]],
+    ) -> list[tuple[str, str]] | None:
+        """Build strictly unique display labels for an AG question card, or None on collision."""
+
+        def _disambiguate(base: str, opt_id: str) -> str:
+            suffix = f" ({opt_id})"
+            if len(suffix) >= _AGY_QUESTION_LABEL_LIMIT:
+                return _bound_agy_text(opt_id, _AGY_QUESTION_LABEL_LIMIT)
+            max_base = _AGY_QUESTION_LABEL_LIMIT - len(suffix)
+            prefix = _bound_agy_text(base, max_base) if len(base) > max_base else base
+            return f"{prefix}{suffix}"
+
+        labels = [base for _, base in parsed_options]
+        for _ in range(2):
+            counts: dict[str, int] = {}
+            for lbl in labels:
+                counts[lbl] = counts.get(lbl, 0) + 1
+            if all(c == 1 for c in counts.values()):
+                return [
+                    (lbl, opt_id) for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)
+                ]
+            labels = [
+                _disambiguate(lbl, opt_id) if counts[lbl] > 1 else lbl
+                for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)
+            ]
+        if len(set(labels)) != len(labels):
+            return None
+        return [(lbl, opt_id) for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)]
+
+    async def _handle_agy_interaction_request(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Route an AG ACP ``interaction_*`` request to an Omnigent question card."""
+        cancelled: _AcpJsonObject = {"outcome": {"outcome": "cancelled"}}
+        if not self._is_agy_interaction_request(params):
+            return cancelled
+        tool_call = params.get("toolCall")
+        if not isinstance(tool_call, dict):
+            return cancelled
+        call_id = tool_call.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            return cancelled
+        req_session_id = params.get("sessionId")
+        orig_prompt_id = self._active_turn_prompt_id
+        if (
+            orig_prompt_id is None
+            or not self._turn_accepts_permissions
+            or self._session_id is None
+            or req_session_id != self._session_id
+            or call_id in self._answered_permission_calls
+            or call_id in self._terminal_permission_calls
+            or call_id in self._observed_terminal_calls
+            or call_id in self._tainted_interaction_calls
+        ):
+            return cancelled
+        self._answered_permission_calls.add(call_id)
+        self._permission_calls.pop(call_id, None)
+
+        options = self._permission_options(params)
+        if not options:
+            return cancelled
+        seen_ids: set[str] = set()
+        parsed_options: list[tuple[str, str]] = []
+        for opt in options:
+            option_id = opt.get("optionId")
+            if not isinstance(option_id, str) or not option_id.strip() or option_id in seen_ids:
+                return cancelled
+            seen_ids.add(option_id)
+            raw_name = opt.get("name")
+            base_label = (
+                raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else option_id
+            )
+            parsed_options.append(
+                (option_id, _bound_agy_text(base_label, _AGY_QUESTION_LABEL_LIMIT))
+            )
+
+        handler = self._form_elicitation_handler
+        if handler is None:
+            return cancelled
+
+        display_options = self._build_agy_display_options(parsed_options)
+        if display_options is None:
+            return cancelled
+        label_to_id = dict(display_options)
+        if len(label_to_id) != len(display_options):
+            return cancelled
+
+        raw_title = tool_call.get("title")
+        question_text = _bound_agy_text(
+            raw_title.strip()
+            if isinstance(raw_title, str) and raw_title.strip()
+            else "Choose an option.",
+            _AGY_QUESTION_TEXT_LIMIT,
+        )
+
+        from omnigent.server.schemas import ElicitationRequestParams
+
+        elicit_params = ElicitationRequestParams(
+            mode="form",
+            message="Antigravity needs your input",
+            requestedSchema=None,
+            url=None,
+            phase="agy_ask_question",
+            policy_name="agy_acp_ask_question",
+            ask_user_question={
+                "questions": [
+                    {
+                        "id": call_id,
+                        "header": "Question",
+                        "question": question_text,
+                        "options": [{"label": label} for label, _ in display_options],
+                        "multiSelect": False,
+                        "isOther": False,
+                    }
+                ]
+            },
+        )
+        orig_session_id = self._session_id
+        result = await handler(f"elicit_acp_{secrets.token_hex(12)}", elicit_params)
+        if (
+            self._session_id != orig_session_id
+            or self._active_turn_prompt_id != orig_prompt_id
+            or not self._turn_accepts_permissions
+            or call_id in self._terminal_permission_calls
+            or call_id in self._observed_terminal_calls
+            or not self._is_agy_interaction_request(params)
+        ):
+            return cancelled
+        if result is None or result.action != "accept" or not isinstance(result.content, dict):
+            return cancelled
+
+        raw_answer = result.content.get(call_id)
+        if raw_answer is None:
+            raw_answer = result.content.get(question_text)
+        if isinstance(raw_answer, list):
+            if len(raw_answer) != 1 or not isinstance(raw_answer[0], str):
+                return cancelled
+            answer = raw_answer[0]
+        elif isinstance(raw_answer, str):
+            answer = raw_answer
+        else:
+            return cancelled
+        if not answer:
+            return cancelled
+
+        matched_id = label_to_id.get(answer)
+        if matched_id is not None:
+            return {"outcome": {"outcome": "selected", "optionId": matched_id}}
+        return cancelled
 
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
@@ -1453,7 +2950,7 @@ class AcpExecutor(Executor):
     def _bound_permission_call(self, params: _AcpJsonObject) -> _AcpJsonObject | None:
         """Bind a permission request to the pending tool event, never its display title."""
         if (
-            self._active_prompt_request_id is None
+            not self._turn_accepts_permissions
             or self._session_id is None
             or params.get("sessionId") != self._session_id
         ):
@@ -1477,16 +2974,24 @@ class AcpExecutor(Executor):
         if not isinstance(arguments, dict):
             return None
         kind = observed.get("kind")
+        if kind is not None and not isinstance(kind, str):
+            return None
         if is_agy:
             agy_tool = self._validate_agy_permission_tool(kind, arguments)
             if agy_tool is None:
                 return None
             name, arguments = agy_tool
-        elif kind == "execute" and isinstance(arguments.get("CommandLine"), str):
+        elif kind == "execute":
+            if not isinstance(arguments.get("CommandLine"), str):
+                return None
             name = "run_command"
-        elif kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
+        elif kind == "read":
+            if not isinstance(arguments.get("AbsolutePath"), str):
+                return None
             name = "view_file"
-        elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
+        elif kind == "edit":
+            if not isinstance(arguments.get("TargetFile"), str):
+                return None
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
         else:
@@ -1498,9 +3003,26 @@ class AcpExecutor(Executor):
         kind: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
-        keys = arguments.keys()
-        if (kind == "read" or "AbsolutePath" in keys) and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
+        if kind is not None and not isinstance(kind, str):
             return None
+        keys = arguments.keys()
+        if "AbsolutePath" in keys and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
+            return None
+        if kind == "read" and "AbsolutePath" not in keys:
+            if keys & _AGY_ACP_READ_PATH_CONFLICT_FIELDS:
+                return None
+            if "Path" in keys:
+                read_path = arguments.get("Path")
+                if (
+                    not isinstance(read_path, str)
+                    or not read_path
+                    or any(
+                        type(value) is not _AGY_ACP_READ_FILE_FIELDS.get(key)
+                        for key, value in arguments.items()
+                    )
+                ):
+                    return None
+                return "read_file", arguments
         if "CommandLine" in keys:
             command = arguments["CommandLine"]
             if (
@@ -1535,6 +3057,8 @@ class AcpExecutor(Executor):
         path = arguments.get("AbsolutePath")
         if kind == "read" and isinstance(path, str):
             return ("view_file", arguments) if path else None
+        if kind in _ACP_KNOWN_TOOL_KINDS:
+            return None
         return "unknown", arguments
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
@@ -1635,34 +3159,87 @@ class AcpExecutor(Executor):
         ) if allowed and self._config.host_permission_tier else None
 
     async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool | None, str | None]:
+        allow, option_id, _reason = await self._decide_permission_detail(params)
+        return allow, option_id
+
+    async def _decide_permission_detail(
+        self, params: _AcpJsonObject
+    ) -> tuple[bool | None, str | None, str | None]:
+        tool_call_obj = params.get("toolCall")
+        req_call_id = (
+            tool_call_obj.get("toolCallId")
+            if isinstance(tool_call_obj, dict) and isinstance(tool_call_obj.get("toolCallId"), str)
+            else None
+        )
         if not self._config.host_permission_tier:
-            return await self._evaluate_permission(params)
+            unmanaged_result = await self._evaluate_permission(params)
+            if req_call_id:
+                if unmanaged_result[0] is True:
+                    raw_args = (
+                        tool_call_obj.get("rawInput") if isinstance(tool_call_obj, dict) else None
+                    )
+                    if not isinstance(raw_args, dict):
+                        raw_args = self._tool_inputs.get(req_call_id)
+                    if isinstance(raw_args, dict) and any(
+                        isinstance(raw_args.get(k), str) and raw_args[k]
+                        for k in ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+                    ):
+                        perm_name = "view_file" if "AbsolutePath" in raw_args else "read_file"
+                        self._authorized_read_calls[req_call_id] = (
+                            perm_name,
+                            copy.deepcopy(raw_args),
+                        )
+                else:
+                    self._denied_permission_calls.add(req_call_id)
+            return unmanaged_result
         bound_call = self._bound_permission_call(params)
         trace = _AcpPermissionTrace() if self._managed_agy else None
         binding = "unbound"
-        result: tuple[bool | None, str | None] = False, None
+        result: tuple[bool | None, str | None, str | None] = (
+            False,
+            None,
+            "Denied by permission mode (acp): Unbound or malformed ACP tool call.",
+        )
         if bound_call is not None:
             call_id = bound_call["call_id"]
             pending = self._permission_calls[call_id]
-            decision = await self._evaluate_permission(params, bound_call, trace)
+            decision = await self._evaluate_permission(params, bound_call, trace, pending=pending)
             if (
-                self._active_prompt_request_id is None
+                not self._turn_accepts_permissions
                 or self._permission_calls.get(call_id) is not pending
             ):
                 binding = "changed"
+                result = (
+                    False,
+                    None,
+                    "Denied by permission mode (acp): Tool call changed during permission check.",
+                )
             else:
                 binding = "current"
                 self._permission_calls.pop(call_id)
                 result = decision
+        if req_call_id:
+            if (
+                result[0] is True
+                and bound_call is not None
+                and bound_call["name"] in ("read_file", "view_file")
+            ):
+                self._authorized_read_calls[req_call_id] = (
+                    bound_call["name"],
+                    copy.deepcopy(bound_call["arguments"]),
+                )
+            elif result[0] is not True:
+                self._denied_permission_calls.add(req_call_id)
         if trace is not None:
             tool_name = bound_call["name"] if bound_call is not None else "unbound"
             intent_kind = {
                 "unbound": "unbound",
                 "run_command": "execute",
                 "view_file": "read",
+                "read_file": "read",
                 "write_to_file": "edit",
             }.get(tool_name, "unknown")
-            allowed, option_id = result
+            allowed, option_id, _reason = result
             option_kind = "none"
             if option_id is not None:
                 option_kind = "allow_once" if allowed else "reject_once"
@@ -1683,7 +3260,9 @@ class AcpExecutor(Executor):
         params: _AcpJsonObject,
         bound_call: _AcpJsonObject | None = None,
         trace: _AcpPermissionTrace | None = None,
-    ) -> tuple[bool | None, str | None]:
+        *,
+        pending: _AcpJsonObject | None = None,
+    ) -> tuple[bool | None, str | None, str | None]:
         """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
@@ -1701,10 +3280,12 @@ class AcpExecutor(Executor):
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
 
-        :returns: ``(allowed, option_id)``. ``allowed=None`` cancels a managed
-            request without selecting a user rejection. An option id names a
-            specific one-time grant or rejection.
+        :returns: ``(allowed, option_id, denial_reason)``. ``allowed=None``
+            cancels a managed request without selecting a user rejection. An
+            option id names a specific one-time grant or rejection.
         """
+        from omnigent.permission_tiers import format_denial_reason
+
         if bound_call is not None:
             tool_name, tool_input = bound_call["name"], bound_call["arguments"]
             if (
@@ -1713,12 +3294,26 @@ class AcpExecutor(Executor):
                 and is_antigravity_acp_command(self._config.command)
             ):
                 # The agent does not attest to the daemon's working directory.
-                return False, None
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        "Background daemon working directory cannot be confirmed.",
+                        detail="acp",
+                    ),
+                )
         else:
             tool_name, tool_input = self._extract_tool_call(params)
+        card_tool_name = tool_name
+        if bound_call is not None and tool_name == "unknown" and isinstance(pending, dict):
+            observed_label = pending.get("title") or pending.get("name") or pending.get("kind")
+            if isinstance(observed_label, str) and observed_label.strip():
+                card_tool_name = observed_label.strip()
         policy_eval = getattr(self, "_policy_evaluator", None)
         action: str | None = None
         tier: str | None = None
+        verdict_reason: str | None = None
         # Either bridge can carry the question to the user.
         can_ask = (
             self._elicitation_handler is not None or self._elicitation_choice_handler is not None
@@ -1731,6 +3326,9 @@ class AcpExecutor(Executor):
                     data["_omnigent_acp_call"] = bound_call
                 verdict = await policy_eval("PHASE_TOOL_CALL", data)
                 action = getattr(verdict, "action", None)
+                raw_reason = getattr(verdict, "reason", None)
+                if isinstance(raw_reason, str) and raw_reason.strip():
+                    verdict_reason = raw_reason.strip()
                 verdict_data = getattr(verdict, "data", None)
                 if bound_call is not None and isinstance(verdict_data, dict):
                     tier = verdict_data.get("_omnigent_acp_tier")
@@ -1741,45 +3339,106 @@ class AcpExecutor(Executor):
                 trace.tier_verdict = tier
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
-                return False, None
+                if verdict_reason is not None and (
+                    tier == "deny"
+                    or verdict_reason.startswith(("Denied by policy:", "Denied by policy ("))
+                ):
+                    denial_reason = verdict_reason
+                else:
+                    denial_reason = format_denial_reason(
+                        "policy",
+                        verdict_reason or "Omnigent policy denied this tool call.",
+                    )
+                return False, None, denial_reason
             if action == "POLICY_ACTION_ASK":
                 if not can_ask:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
                         tool_name,
                     )
-                    return False, None
-                return await self._ask_user(tool_name, tool_input, params, policy_ask=True)
+                    return (
+                        False,
+                        None,
+                        format_denial_reason(
+                            "policy",
+                            "Approval required but no approval handler is available.",
+                        ),
+                    )
+                allow, option_id = await self._ask_user(
+                    card_tool_name, tool_input, params, policy_ask=True
+                )
+                reason = (
+                    format_denial_reason(
+                        "permission mode",
+                        "Agent did not offer a one-time allow option.",
+                        detail="acp",
+                    )
+                    if allow is False and option_id is None
+                    else None
+                )
+                return allow, option_id, reason
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if bound_call is not None:
-            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") or tier not in (
-                "allow",
-                "ask",
-            ):
-                return False, None
+            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "policy",
+                        verdict_reason or "Omnigent policy evaluation unavailable.",
+                    ),
+                )
+            if tier not in ("allow", "ask"):
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        verdict_reason or "Host permission tier did not authorize this tool call.",
+                    ),
+                )
             if tier == "allow":
                 option_id = self._allow_once_id(params)
                 if trace is not None:
                     trace.once_offer = "valid" if option_id is not None else "missing"
                 if option_id is not None:
-                    return True, option_id
-            return (
-                await self._ask_user(tool_name, tool_input, params) if can_ask else (False, None)
+                    return True, option_id, None
+            if not can_ask:
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        "Approval required but no approval handler is available.",
+                        detail="acp",
+                    ),
+                )
+            allow, option_id = await self._ask_user(card_tool_name, tool_input, params)
+            reason = (
+                format_denial_reason(
+                    "permission mode",
+                    "Agent did not offer a one-time allow option.",
+                    detail="acp",
+                )
+                if allow is False and option_id is None
+                else None
             )
+            return allow, option_id, reason
 
         if can_ask and not self._bypass_permissions:
-            return await self._ask_user(tool_name, tool_input, params)
+            allow, option_id = await self._ask_user(tool_name, tool_input, params)
+            return allow, option_id, None
         if can_ask:
             # bypassPermissions: no policy had an opinion and the user asked not
             # to be prompted. Logged at info so the audit trail still names what
             # ran unreviewed. Answered per-request (never the agent's own bypass
             # option) so every later call stays visible to policy.
             logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
-            return True, None
+            return True, None, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
-        return True, None
+        return True, None, None
 
     def _allow_once_id(self, params: _AcpJsonObject) -> str | None:
         options = self._permission_options(params)
@@ -2063,12 +3722,29 @@ class AcpExecutor(Executor):
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
+        self._tool_raw_meta.clear()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         self._terminal_permission_calls.clear()
+        self._denied_permission_calls.clear()
+        self._authorized_read_calls.clear()
+        self._pending_read_backfills.clear()
+        self._tainted_interaction_calls.clear()
+        self._observed_terminal_calls.clear()
+        self._turn_prompt_id = None
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = None
+        self._denied_turn_tools.clear()
         self._bridge_tool_aliases = frozenset()
 
-    def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
+    def _handle_session_update(
+        self,
+        update: _AcpJsonObject,
+        *,
+        update_session_id: object = None,
+        turn_prompt_id: Any = _UNSET_PROMPT_ID,
+    ) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
         Returns the events to yield (usually 0 or 1). Side effects: records the
@@ -2120,19 +3796,53 @@ class AcpExecutor(Executor):
                 events.append(ReasoningChunk(delta=text, event_type="reasoning_text"))
         elif update_type == _UPDATE_TOOL_CALL:
             call_id = update.get("toolCallId")
-            name = update.get("title") or update.get("kind") or "tool"
+            raw_title_name = update.get("title") or update.get("kind") or "tool"
             raw_input = update.get("rawInput")
-            args = raw_input if isinstance(raw_input, dict) else {}
+            args: _AcpJsonObject = raw_input if isinstance(raw_input, dict) else {}
+            is_bridge = self._is_bridge_tool_call(str(raw_title_name), update)
+            if self._is_agy_acp and not is_bridge:
+                locations = update.get("locations")
+                name, raw_name = _resolve_agy_tool_name(update, args, locations)
+                norm_args = _normalize_agy_tool_args(args, locations, tool_name=name)
+            else:
+                name = str(raw_title_name)
+                raw_name = ""
+                norm_args = args
             if isinstance(call_id, str) and call_id:
-                self._tool_names[call_id] = str(name)
+                # Keep raw title/input for unmanaged _extract_tool_call policy fallback.
+                self._tool_names[call_id] = str(raw_title_name)
                 self._tool_inputs[call_id] = args
+                active_prompt_id = (
+                    self._active_turn_prompt_id
+                    if turn_prompt_id is _UNSET_PROMPT_ID
+                    else turn_prompt_id
+                )
+                same_session = (
+                    self._session_id is None
+                    and active_prompt_id is None
+                    and update_session_id is None
+                ) or (self._session_id is not None and update_session_id == self._session_id)
+                if self._is_agy_acp and not is_bridge and same_session:
+                    self._tool_raw_meta[call_id] = {
+                        "display_name": str(name),
+                        "raw_name": raw_name,
+                        "kind": update.get("kind"),
+                        "raw_input": copy.deepcopy(args),
+                        "locations": copy.deepcopy(update.get("locations")),
+                        "session_id": update_session_id,
+                        "prompt_id": active_prompt_id,
+                    }
+                    if call_id.startswith("interaction_") and (
+                        update.get("kind") not in (None, "other") or args != {}
+                    ):
+                        self._tainted_interaction_calls.add(call_id)
                 metadata: _AcpJsonObject = {"call_id": call_id}
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
                 # queue would mis-pair the next bridge completion.
-                if not self._is_bridge_tool_call(str(name), update):
+                if not is_bridge:
                     metadata["internally_executed"] = True
-                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
+                events.append(ToolCallRequest(name=str(name), args=norm_args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -2140,8 +3850,83 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_COMPLETED,
                 _TOOL_STATUS_FAILED,
             ):
-                name = self._tool_names.pop(call_id, "tool")
+                self._observed_terminal_calls.add(call_id)
+                raw_fallback_name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
+                raw_meta = self._tool_raw_meta.pop(call_id, None)
+                authorized_read = self._authorized_read_calls.pop(call_id, None)
+                if self._is_agy_acp and isinstance(raw_meta, dict):
+                    display_name = raw_meta.get("display_name")
+                    name = (
+                        display_name
+                        if isinstance(display_name, str) and display_name
+                        else raw_fallback_name
+                    )
+                    result = _normalize_agy_tool_output(update, is_shell=(name == "shell"))
+                    if (
+                        status == _TOOL_STATUS_COMPLETED
+                        and result in (None, "", [], {})
+                        and not (self._os_env is not None and self._os_env.fork)
+                        and call_id not in self._denied_permission_calls
+                    ):
+                        if authorized_read is not None:
+                            backfill_tool, backfill_args = authorized_read
+                            backfill_locations: object = None
+                            eligible = True
+                        else:
+                            meta_args = raw_meta.get("raw_input")
+                            backfill_args = dict(meta_args) if isinstance(meta_args, dict) else {}
+                            backfill_locations = raw_meta.get("locations")
+                            backfill_tool = str(raw_meta.get("raw_name") or "")
+                            eligible = _is_agy_file_read(
+                                backfill_tool, raw_meta.get("kind"), backfill_args
+                            )
+                        if eligible:
+                            if self._policy_evaluator is None:
+                                active_prompt_id = (
+                                    self._active_turn_prompt_id
+                                    if turn_prompt_id is _UNSET_PROMPT_ID
+                                    else turn_prompt_id
+                                )
+                                direct_bound = (
+                                    self._session_id is None
+                                    and active_prompt_id is None
+                                    and update_session_id is None
+                                ) or (
+                                    self._session_id is not None
+                                    and update_session_id == self._session_id
+                                    and raw_meta.get("session_id") == self._session_id
+                                    and active_prompt_id is not None
+                                    and raw_meta.get("prompt_id") == active_prompt_id
+                                )
+                                deadline_open = (
+                                    self._post_prompt_deadline is None
+                                    or self._now() < self._post_prompt_deadline
+                                )
+                                if direct_bound and deadline_open:
+                                    backfilled = _read_agy_file_body(
+                                        self._cwd,
+                                        backfill_args,
+                                        backfill_locations,
+                                        workspace_fd=self._workspace_dir_fd,
+                                        workspace_win_handle=self._workspace_win_handle,
+                                        workspace_real=self._workspace_real_path,
+                                        require_anchor=(self._proc is not None),
+                                    )
+                                    if backfilled is not None:
+                                        result = backfilled
+                            else:
+                                self._pending_read_backfills[call_id] = (
+                                    backfill_tool,
+                                    backfill_args,
+                                    backfill_locations,
+                                    authorized_read is not None,
+                                    raw_meta.get("session_id"),
+                                    raw_meta.get("prompt_id"),
+                                )
+                else:
+                    name = raw_fallback_name
+                    result = update.get("content") or update.get("rawOutput")
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -2150,10 +3935,21 @@ class AcpExecutor(Executor):
                             if status == _TOOL_STATUS_COMPLETED
                             else ToolCallStatus.ERROR
                         ),
-                        result=update.get("content") or update.get("rawOutput"),
+                        result=result,
                         metadata={"call_id": call_id},
                     )
                 )
+            elif self._is_agy_acp and isinstance(call_id, str) and call_id:
+                if status == "cancelled":
+                    self._observed_terminal_calls.add(call_id)
+                    self._tool_raw_meta.pop(call_id, None)
+                    self._authorized_read_calls.pop(call_id, None)
+                elif call_id.startswith("interaction_"):
+                    upd_raw = update.get("rawInput")
+                    if update.get("kind") not in (None, "other") or (
+                        upd_raw is not None and upd_raw != {}
+                    ):
+                        self._tainted_interaction_calls.add(call_id)
         elif update_type == _UPDATE_USAGE:
             size = update.get("size")
             if isinstance(size, int) and size > 0:
@@ -2165,6 +3961,280 @@ class AcpExecutor(Executor):
             self._note_session_modes(update)
 
         return events
+
+    async def _is_agy_read_backfill_allowed(
+        self, call_id: str, raw_name: str, spec: _AgyReadSpec
+    ) -> bool:
+        """Verify policy + host tier allow the exact validated read target and range."""
+        policy_eval = self._policy_evaluator
+        if policy_eval is None:
+            return True
+        data: _AcpJsonObject = {"name": spec.perm_name, "arguments": dict(spec.policy_args)}
+        if self._config.host_permission_tier:
+            data["_omnigent_acp_call"] = {
+                "call_id": call_id,
+                "name": spec.perm_name,
+                "arguments": dict(spec.policy_args),
+            }
+        try:
+            verdict = await policy_eval("PHASE_TOOL_CALL", data)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("acp read_file backfill policy check failed (%s): %s", raw_name, exc)
+            return False
+        action = getattr(verdict, "action", None)
+        if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK"):
+            return False
+        if self._config.host_permission_tier:
+            verdict_data = getattr(verdict, "data", None)
+            tier = (
+                verdict_data.get("_omnigent_acp_tier") if isinstance(verdict_data, dict) else None
+            )
+            return (
+                action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") and tier == "allow"
+            )
+        return True
+
+    def _can_backfill_read(
+        self,
+        *,
+        expected_session_id: str,
+        update_session_id: object,
+        active_prompt_id: int | None,
+        explicit_prompt_binding: bool,
+        phase2: bool,
+        deadline: float | None,
+        cancel_event: asyncio.Event | None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None,
+    ) -> bool:
+        if update_session_id != expected_session_id or self._session_id != expected_session_id:
+            return False
+        if active_prompt_id is None:
+            return False
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if self._turn_cancel_event is not None and self._turn_cancel_event.is_set():
+            return False
+        if self._cancel_grace_deadline is not None:
+            return False
+        if explicit_prompt_binding and self._turn_prompt_id != active_prompt_id:
+            return False
+        effective_deadline = (
+            min(deadline, self._post_prompt_deadline)
+            if deadline is not None and self._post_prompt_deadline is not None
+            else (deadline if deadline is not None else self._post_prompt_deadline)
+        )
+        if effective_deadline is not None and self._now() >= effective_deadline:
+            return False
+        if phase2:
+            return self._turn_accepts_permissions
+        if not explicit_prompt_binding and self._active_turn_prompt_id != active_prompt_id:
+            return False
+        if _prompt_fut_is_terminal_abort(prompt_fut):
+            return False
+        return True
+
+    async def _await_bounded_backfill_policy(
+        self,
+        call_id: str,
+        raw_name: str,
+        spec: _AgyReadSpec,
+        *,
+        expected_session_id: str,
+        update_session_id: object,
+        active_prompt_id: int,
+        explicit_prompt_binding: bool,
+        deadline: float | None,
+        cancel_event: asyncio.Event | None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None,
+        phase2: bool,
+    ) -> bool:
+        """Bound a backfill policy check by turn lifetime, cancel, EOF, and deadline."""
+        check_task: asyncio.Task[bool] = asyncio.create_task(
+            self._is_agy_read_backfill_allowed(call_id, raw_name, spec)
+        )
+        try:
+            while not check_task.done():
+                if not self._can_backfill_read(
+                    expected_session_id=expected_session_id,
+                    update_session_id=update_session_id,
+                    active_prompt_id=active_prompt_id,
+                    explicit_prompt_binding=explicit_prompt_binding,
+                    phase2=phase2,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    prompt_fut=prompt_fut,
+                ):
+                    break
+                if self._is_stdout_closed() and (
+                    phase2 or prompt_fut is None or not prompt_fut.done()
+                ):
+                    break
+                effective_deadline = (
+                    min(deadline, self._post_prompt_deadline)
+                    if deadline is not None and self._post_prompt_deadline is not None
+                    else (deadline if deadline is not None else self._post_prompt_deadline)
+                )
+                remaining = self._poll_interval_s
+                if effective_deadline is not None:
+                    remaining = effective_deadline - self._now()
+                    if remaining <= 0:
+                        break
+                waiters: set[asyncio.Future[Any]] = {check_task}
+                extra_tasks: list[asyncio.Task[bool]] = []
+                if cancel_event is not None:
+                    c_task = asyncio.create_task(cancel_event.wait())
+                    waiters.add(c_task)
+                    extra_tasks.append(c_task)
+                if (
+                    self._turn_cancel_event is not None
+                    and self._turn_cancel_event is not cancel_event
+                ):
+                    tc_task = asyncio.create_task(self._turn_cancel_event.wait())
+                    waiters.add(tc_task)
+                    extra_tasks.append(tc_task)
+                if self._stdout_eof_event is not None and (
+                    phase2 or prompt_fut is None or not prompt_fut.done()
+                ):
+                    e_task = asyncio.create_task(self._stdout_eof_event.wait())
+                    waiters.add(e_task)
+                    extra_tasks.append(e_task)
+                if not phase2 and prompt_fut is not None and not prompt_fut.done():
+                    waiters.add(prompt_fut)
+                if self._turn_wake_event is not None:
+                    self._turn_wake_event.clear()
+                    w_task = asyncio.create_task(self._turn_wake_event.wait())
+                    waiters.add(w_task)
+                    extra_tasks.append(w_task)
+                try:
+                    await asyncio.wait(
+                        waiters,
+                        timeout=max(0.0, min(remaining, self._poll_interval_s)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in extra_tasks:
+                        if not task.done():
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
+            if check_task.done():
+                return await check_task
+            check_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await check_task
+            return False
+        except BaseException:
+            if not check_task.done():
+                check_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await check_task
+            raise
+
+    async def _resolve_agy_read_backfills(
+        self,
+        expected_session_id: str,
+        update_session_id: object,
+        events: list[ExecutorEvent],
+        *,
+        turn_prompt_id: Any = _UNSET_PROMPT_ID,
+        deadline: float | None = None,
+        cancel_event: asyncio.Event | None = None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
+        phase2: bool = False,
+    ) -> None:
+        """Resolve queued AG read_file backfills asynchronously with policy authorization."""
+        pending = dict(self._pending_read_backfills)
+        self._pending_read_backfills.clear()
+        explicit_prompt_binding = turn_prompt_id is not _UNSET_PROMPT_ID
+        active_prompt_id: int | None = (
+            turn_prompt_id if explicit_prompt_binding else self._active_turn_prompt_id
+        )
+        # Ensure every turn backfill policy check has a finite bound even after buffered end_turn.
+        backfill_deadline = (
+            deadline
+            if deadline is not None
+            else (
+                self._post_prompt_deadline
+                if self._post_prompt_deadline is not None
+                else (self._now() + _PROMPT_TIMEOUT_SECONDS if prompt_fut is not None else None)
+            )
+        )
+        if active_prompt_id is None or not self._can_backfill_read(
+            expected_session_id=expected_session_id,
+            update_session_id=update_session_id,
+            active_prompt_id=active_prompt_id,
+            explicit_prompt_binding=explicit_prompt_binding,
+            phase2=phase2,
+            deadline=backfill_deadline,
+            cancel_event=cancel_event,
+            prompt_fut=prompt_fut,
+        ):
+            return
+        for idx, event in enumerate(events):
+            if not isinstance(event, ToolCallComplete):
+                continue
+            call_id = event.metadata.get("call_id") if isinstance(event.metadata, dict) else None
+            if not isinstance(call_id, str) or call_id not in pending:
+                continue
+            (
+                raw_name,
+                raw_args,
+                locations,
+                already_authorized,
+                start_session_id,
+                start_prompt_id,
+            ) = pending[call_id]
+            if (
+                call_id in self._denied_permission_calls
+                or start_session_id != expected_session_id
+                or start_prompt_id != active_prompt_id
+            ):
+                continue
+            spec = _extract_agy_read_spec(raw_args, locations)
+            if spec is None:
+                continue
+            if not already_authorized and not await self._await_bounded_backfill_policy(
+                call_id,
+                raw_name,
+                spec,
+                expected_session_id=expected_session_id,
+                update_session_id=update_session_id,
+                active_prompt_id=active_prompt_id,
+                explicit_prompt_binding=explicit_prompt_binding,
+                deadline=backfill_deadline,
+                cancel_event=cancel_event,
+                prompt_fut=prompt_fut,
+                phase2=phase2,
+            ):
+                continue
+            if call_id in self._denied_permission_calls or not self._can_backfill_read(
+                expected_session_id=expected_session_id,
+                update_session_id=update_session_id,
+                active_prompt_id=active_prompt_id,
+                explicit_prompt_binding=explicit_prompt_binding,
+                phase2=phase2,
+                deadline=backfill_deadline,
+                cancel_event=cancel_event,
+                prompt_fut=prompt_fut,
+            ):
+                continue
+            backfilled = _read_agy_file_body(
+                self._cwd,
+                raw_args,
+                locations,
+                spec=spec,
+                workspace_fd=self._workspace_dir_fd,
+                workspace_win_handle=self._workspace_win_handle,
+                workspace_real=self._workspace_real_path,
+                require_anchor=(self._proc is not None),
+            )
+            if backfilled is not None:
+                events[idx] = ToolCallComplete(
+                    name=event.name,
+                    status=event.status,
+                    result=backfilled,
+                    metadata=event.metadata,
+                )
 
     def _note_config_options(self, options: object, *, model_switch: bool = False) -> str | None:
         """Record which session config options the agent exposes, and their values.
@@ -2675,6 +4745,10 @@ class AcpExecutor(Executor):
         (agents often report their model right after ``session/new``) is noted
         rather than lost, so the model it names and its option id are current.
         """
+        self._active_prompt_request_id = None
+        self._turn_prompt_id = None
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
         while not self._queue.empty():
             try:
                 stale = self._queue.get_nowait()
@@ -2882,9 +4956,15 @@ class AcpExecutor(Executor):
 
         # Drain stale items from a prior turn, plus anything the switch above queued.
         await self._drain_stale_queue()
+        self._tool_raw_meta.clear()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         self._terminal_permission_calls.clear()
+        self._denied_permission_calls.clear()
+        self._authorized_read_calls.clear()
+        self._pending_read_backfills.clear()
+        self._tainted_interaction_calls.clear()
+        self._observed_terminal_calls.clear()
         reported_mode = self._active_mode
         if reported_mode:
             yield SessionModeChanged(
@@ -2893,107 +4973,380 @@ class AcpExecutor(Executor):
 
         self._rpc_id += 1
         req_id = self._rpc_id
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
         self._active_prompt_request_id = req_id
+        self._turn_prompt_id = req_id
         self._cancel_grace_deadline = None
+        is_agy = is_antigravity_acp_command(self._config.command)
+        bg_work = _AgyBackgroundWork(session_id) if is_agy else None
+        reader_bg_work = _AgyBackgroundWork(session_id) if is_agy else None
+        self._denied_turn_tools.clear()
+        cancel_event = _AsyncioEvent()
+        wake_event = _AsyncioEvent()
+        self._turn_cancel_event = cancel_event
+        self._turn_wake_event = wake_event
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = reader_bg_work
 
-        await self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
-                },
-            }
-        )
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": _AGENT_METHOD_SESSION_PROMPT,
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": prompt_blocks,
+                        "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                    },
+                }
+            )
 
-        opening_settled()
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
-        running_tool_deadlines: dict[str, float] = {}
-        accumulated_text: list[str] = []
-        if mode_notice:
-            accumulated_text.append(mode_notice)
-            yield TextChunk(text=mode_notice)
-        target_model = self._model_override_target(requested_model)
-        if target_model and target_model != self._active_model:
-            notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
-            accumulated_text.append(notice)
-            yield TextChunk(text=notice)
+            opening_settled()
+            tool_window = max(_RUNNING_TOOL_TIMEOUT_SECONDS, _PROMPT_TIMEOUT_SECONDS)
+            deadline = self._now() + _PROMPT_TIMEOUT_SECONDS
+            running_tool_deadlines: dict[str, float] = {}
+            accumulated_text: list[str] = []
+            if mode_notice:
+                accumulated_text.append(mode_notice)
+                yield TextChunk(text=mode_notice)
+            target_model = self._model_override_target(requested_model)
+            if target_model and target_model != self._active_model:
+                notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
+                accumulated_text.append(notice)
+                yield TextChunk(text=notice)
 
-        while True:
-            # Complete only once the future is resolved AND the queue is drained,
-            # so trailing chunks aren't truncated.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:
-                    logger.exception("ACP process response retrieval failed")
-                    self._reset_session_state()
-                    yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
-                    return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    if "Session not found" in error_msg:
-                        self._reset_session_state()
-                    yield ExecutorError(message=error_msg, retryable=True)
-                    return
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
-                if self._active_mode and self._active_mode != reported_mode:
-                    yield SessionModeChanged(
-                        mode=self._active_mode,
-                        requested_mode=requested_mode,
-                        selection_id=mode_selection,
-                    )
-                yield TurnComplete(response="".join(accumulated_text), usage=usage)
-                return
+            prompt_result: _AcpJsonObject | None = None
+            bg_deadline: float | None = None
+            settle_deadline: float | None = None
+            prompt_marker_seen = False
+            prompt_wait_declined = False
 
-            remaining = max(deadline, max(running_tool_deadlines.values(), default=deadline))
-            remaining -= loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
-                return
-
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except TimeoutError:
-                continue
-
-            method = notification.get("method", "")
-            params = notification.get("params", {})
-
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                if params.get("sessionId") == session_id and update.get("sessionUpdate") in (
-                    _UPDATE_TOOL_CALL,
-                    _UPDATE_TOOL_CALL_UPDATE,
+            while True:
+                # Enter AG background wait in wire order at the prompt marker so burst
+                # post-prompt frames are not dropped; ordinary turns still drain the queue
+                # completely before emitting TurnComplete or ExecutorError.
+                if (
+                    prompt_result is None
+                    and fut.done()
+                    and (prompt_marker_seen or self._queue.empty())
                 ):
-                    call_id, status = update.get("toolCallId"), update.get("status")
-                    if isinstance(call_id, str) and call_id:
-                        if status == _TOOL_STATUS_IN_PROGRESS:
-                            running_tool_deadlines.setdefault(
-                                call_id, loop.time() + _RUNNING_TOOL_TIMEOUT_SECONDS
-                            )
-                        elif status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED):
-                            running_tool_deadlines.pop(call_id, None)
-                for event in self._handle_session_update(update):
-                    if isinstance(event, TextChunk):
-                        accumulated_text.append(event.text)
-                    yield event
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (session/request_permission / fs/*):
-                # routes through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
+                    marker_triggered = prompt_marker_seen
+                    prompt_marker_seen = False
+                    if self._active_prompt_request_id == req_id:
+                        self._active_prompt_request_id = None
+                    try:
+                        response = fut.result()
+                    except Exception as exc:
+                        if marker_triggered and not self._queue.empty():
+                            prompt_wait_declined = True
+                            continue
+                        logger.exception("ACP process response retrieval failed")
+                        self._reset_session_state()
+                        yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
+                        return
+                    error_msg = _prompt_response_error_message(response)
+                    if error_msg is not None:
+                        self._post_prompt_wait_active = False
+                        self._post_prompt_deadline = None
+                        if marker_triggered and not self._queue.empty():
+                            prompt_wait_declined = True
+                            continue
+                        if "Session not found" in error_msg:
+                            self._reset_session_state()
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+                    if (
+                        not prompt_wait_declined
+                        and bg_work is not None
+                        and stop_reason == "end_turn"
+                        and not cancel_event.is_set()
+                        and bg_work.has_live()
+                    ):
+                        prompt_result = result if isinstance(result, dict) else {}
+                        if self._post_prompt_deadline is None:
+                            self._post_prompt_deadline = self._now() + _AGY_BACKGROUND_WAIT_SECONDS
+                        bg_deadline = self._post_prompt_deadline
+                        self._post_prompt_wait_active = True
+                        _notify_turn_progress()
+                        settle_deadline = None
+                        continue
+                    self._post_prompt_wait_active = False
+                    self._post_prompt_deadline = None
+                    if marker_triggered and not self._queue.empty():
+                        prompt_wait_declined = True
+                        continue
+                    usage = (
+                        self._usage_with_active_model(result) if isinstance(result, dict) else None
+                    )
+                    if self._active_mode and self._active_mode != reported_mode:
+                        yield SessionModeChanged(
+                            mode=self._active_mode,
+                            requested_mode=requested_mode,
+                            selection_id=mode_selection,
+                        )
+                    yield TurnComplete(response="".join(accumulated_text), usage=usage)
+                    return
 
-            # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+                if prompt_result is not None:
+                    if cancel_event.is_set():
+                        yield TurnCancelled(reason="user_cancelled", phase="tool")
+                        return
+                    now = self._now()
+                    live = bg_work is not None and bg_work.has_live()
+                    if bg_deadline is not None and now >= bg_deadline:
+                        if live:
+                            bound_text = _format_wait_bound(_AGY_BACKGROUND_WAIT_SECONDS)
+                            active_items = bg_work.live_keys() if bg_work is not None else []
+                            logger.warning(
+                                "acp[%s] background wait reached %s bound with active work: %s",
+                                self._config.name,
+                                bound_text,
+                                ", ".join(active_items) or "unknown",
+                            )
+                            prefix = (
+                                "\n\n"
+                                if accumulated_text and not accumulated_text[-1].endswith("\n\n")
+                                else ""
+                            )
+                            label = (
+                                f"{prefix}[Antigravity background work still running after "
+                                f"{bound_text}; turn settled at the {bound_text} wait limit.]"
+                            )
+                            accumulated_text.append(label)
+                            yield TextChunk(text=label)
+                        break
+                    if self._queue.empty():
+                        if not live:
+                            if self._is_stdout_closed():
+                                break
+                            if settle_deadline is None:
+                                settle_deadline = min(
+                                    bg_deadline if bg_deadline is not None else now,
+                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                                )
+                            if now >= settle_deadline:
+                                break
+                        elif self._is_stdout_closed():
+                            self._reset_session_state()
+                            yield ExecutorError(
+                                message=(
+                                    "ACP subprocess closed stdout while waiting for "
+                                    "background work"
+                                ),
+                                retryable=True,
+                            )
+                            return
+                    target_deadline = (
+                        bg_deadline
+                        if live or settle_deadline is None
+                        else min(bg_deadline, settle_deadline)
+                        if bg_deadline is not None
+                        else settle_deadline
+                    )
+                    remaining = (target_deadline - now) if target_deadline is not None else 0.0
+                    notification = await self._await_queue_item(
+                        timeout=remaining,
+                        cancel_event=cancel_event,
+                    )
+                    if notification is None:
+                        continue
+                else:
+                    if not self._queue.empty():
+                        notification = self._queue.get_nowait()
+                    else:
+                        if self._is_stdout_closed() and not fut.done():
+                            self._reset_session_state()
+                            yield ExecutorError(
+                                message="ACP subprocess closed stdout", retryable=True
+                            )
+                            return
+                        now = self._now()
+                        effective_deadline = (
+                            max(deadline, max(running_tool_deadlines.values()))
+                            if running_tool_deadlines
+                            else deadline
+                        )
+                        remaining = effective_deadline - now
+                        if remaining <= 0:
+                            self._active_prompt_request_id = None
+                            self._turn_prompt_id = None
+                            yield ExecutorError(
+                                message="Timeout waiting for ACP response", retryable=True
+                            )
+                            return
+                        notification = await self._await_queue_item(
+                            timeout=remaining,
+                            prompt_fut=fut,
+                        )
+                        if notification is None:
+                            continue
+
+                if notification.get("_omnigent_prompt_done") == req_id:
+                    prompt_marker_seen = True
+                    continue
+
+                if notification.get("type") == "error":
+                    yield ExecutorError(
+                        message=str(notification.get("message") or "ACP reader error"),
+                        retryable=True,
+                    )
+                    return
+
+                method = notification.get("method", "")
+                params = notification.get("params", {})
+
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(params, dict):
+                    update = params.get("update", {})
+                    if isinstance(update, dict):
+                        notif_session_id = params.get("sessionId")
+                        if bg_work is not None:
+                            bg_work.observe(notif_session_id, update)
+                        update_type = update.get("sessionUpdate")
+                        if notif_session_id == session_id and update_type in (
+                            _UPDATE_TOOL_CALL,
+                            _UPDATE_TOOL_CALL_UPDATE,
+                        ):
+                            call_id, status = update.get("toolCallId"), update.get("status")
+                            if isinstance(call_id, str) and call_id:
+                                if status == _TOOL_STATUS_IN_PROGRESS or (
+                                    status is None and call_id in running_tool_deadlines
+                                ):
+                                    running_tool_deadlines[call_id] = self._now() + tool_window
+                                    _notify_turn_progress()
+                                elif status in _INACTIVE_TOOL_STATUSES:
+                                    running_tool_deadlines.pop(call_id, None)
+                        elif (
+                            bg_work is not None
+                            and bg_work.is_known_session(notif_session_id)
+                            and update_type == "subagent_update"
+                            and isinstance(update.get("sessionId"), str)
+                            and update["sessionId"]
+                        ):
+                            state = update.get("state")
+                            if isinstance(state, dict) and isinstance(state.get("state"), str):
+                                sub_key = f"subagent:{update['sessionId']}"
+                                if state["state"] in _INACTIVE_SUBAGENT_STATES:
+                                    running_tool_deadlines.pop(sub_key, None)
+                                else:
+                                    running_tool_deadlines[sub_key] = self._now() + tool_window
+                                    _notify_turn_progress()
+                        in_phase2 = prompt_result is not None
+                        if in_phase2:
+                            wire_prompt_id = req_id if self._turn_accepts_permissions else None
+                        elif (
+                            not prompt_wait_declined
+                            and not cancel_event.is_set()
+                            and self._cancel_grace_deadline is None
+                            and not _prompt_fut_is_terminal_abort(fut)
+                            and (
+                                self._post_prompt_deadline is None
+                                or self._now() < self._post_prompt_deadline
+                            )
+                        ):
+                            wire_prompt_id = req_id
+                        else:
+                            wire_prompt_id = None
+                        events = self._handle_session_update(
+                            update,
+                            update_session_id=notif_session_id,
+                            turn_prompt_id=wire_prompt_id,
+                        )
+                        if self._pending_read_backfills:
+                            await self._resolve_agy_read_backfills(
+                                session_id,
+                                notif_session_id,
+                                events,
+                                turn_prompt_id=wire_prompt_id,
+                                deadline=bg_deadline,
+                                cancel_event=cancel_event,
+                                prompt_fut=fut,
+                                phase2=in_phase2,
+                            )
+                        for event in events:
+                            if isinstance(event, TextChunk):
+                                accumulated_text.append(event.text)
+                            yield event
+                        if prompt_result is not None:
+                            if bg_work is not None and bg_work.has_live():
+                                settle_deadline = None
+                            elif (
+                                update_type
+                                in (
+                                    _UPDATE_AGENT_MESSAGE_CHUNK,
+                                    _UPDATE_AGENT_THOUGHT_CHUNK,
+                                )
+                                or settle_deadline is not None
+                            ):
+                                now = self._now()
+                                settle_deadline = min(
+                                    bg_deadline if bg_deadline is not None else now,
+                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                                )
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (session/request_permission / fs/*):
+                    # routes through policy + elicitation, bounded by turn lifetime.
+                    completed = await self._run_bounded_agent_request(
+                        notification,
+                        deadline=bg_deadline,
+                        cancel_event=cancel_event,
+                        prompt_fut=fut,
+                        phase2=prompt_result is not None,
+                    )
+                    if not completed:
+                        continue
+                    now = self._now()
+                    if self._denied_turn_tools:
+                        req_session_id = (
+                            params.get("sessionId") if isinstance(params, dict) else None
+                        )
+                        for denied_id in self._denied_turn_tools:
+                            running_tool_deadlines.pop(denied_id, None)
+                            if bg_work is not None:
+                                bg_work.drop_tool(req_session_id, denied_id)
+                            if reader_bg_work is not None:
+                                reader_bg_work.drop_tool(req_session_id, denied_id)
+                        self._denied_turn_tools.clear()
+                    if running_tool_deadlines:
+                        refreshed = now + tool_window
+                        for call_id in running_tool_deadlines:
+                            running_tool_deadlines[call_id] = refreshed
+                        _notify_turn_progress()
+                    if prompt_result is not None and settle_deadline is not None:
+                        settle_deadline = min(
+                            bg_deadline if bg_deadline is not None else now,
+                            now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                        )
+
+                # Inbound message = progress; reset the idle deadline.
+                deadline = self._now() + _PROMPT_TIMEOUT_SECONDS
+
+            usage = self._usage_with_active_model(prompt_result)
+            if self._active_mode and self._active_mode != reported_mode:
+                yield SessionModeChanged(
+                    mode=self._active_mode,
+                    requested_mode=requested_mode,
+                    selection_id=mode_selection,
+                )
+            yield TurnComplete(response="".join(accumulated_text), usage=usage)
+        finally:
+            if self._active_prompt_request_id == req_id and self._cancel_grace_deadline is None:
+                self._active_prompt_request_id = None
+            if self._turn_prompt_id == req_id:
+                self._turn_prompt_id = None
+            self._post_prompt_wait_active = False
+            self._post_prompt_deadline = None
+            self._reader_agy_bg_work = None
+            self._denied_turn_tools.clear()
+            if self._turn_cancel_event is cancel_event:
+                self._turn_cancel_event = None
+            if self._turn_wake_event is wake_event:
+                self._turn_wake_event = None
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
@@ -3004,6 +5357,8 @@ class AcpExecutor(Executor):
         """
         if self._proc is None or self._proc.returncode is not None or self._session_id is None:
             return False
+        if self._turn_cancel_event is not None:
+            self._turn_cancel_event.set()
         try:
             await self._send(
                 {
@@ -3060,7 +5415,14 @@ class AcpExecutor(Executor):
                     )
         self._cancel_grace_deadline = None
         self._active_prompt_request_id = None
+        self._turn_prompt_id = None
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = None
+        if self._turn_cancel_event is not None:
+            self._turn_cancel_event.set()
         self._reset_session_state()
+        self._close_workspace_fd()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
@@ -3078,16 +5440,60 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._os_environment.close()
             self._os_environment = None
-        if self._proc:
+        proc = self._proc
+        if proc is not None:
             with contextlib.suppress(Exception):
-                self._proc.stdin.close()  # type: ignore[union-attr]
+                proc.stdin.close()  # type: ignore[union-attr]
+            reap_task = self._windows_reap_task
+            if reap_task is not None and reap_task.done():
+                self._windows_reap_task = None
+                reap_task = None
+
+            async def _reap_windows_once() -> None:
+                nonlocal reap_task
+                if reap_task is None:
+                    reap_task = asyncio.create_task(asyncio.to_thread(_proc.kill_tree, proc))
+                    self._windows_reap_task = reap_task
+                await asyncio.shield(reap_task)
+                if self._windows_reap_task is reap_task and reap_task.done():
+                    self._windows_reap_task = None
+
             try:
-                # Tree-aware: the handle is the sandbox launcher, not the
-                # agent it forked. A bare terminate() orphans the agent.
-                _proc.terminate_tree(self._proc)
-                await asyncio.wait_for(self._proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS)
-            except Exception:  # noqa: BLE001
-                with contextlib.suppress(Exception):
-                    _proc.kill_tree(self._proc)
+                if IS_WINDOWS and reap_task is not None:
+                    with contextlib.suppress(Exception):
+                        await _reap_windows_once()
+                    if reap_task.done():
+                        reap_task = None
+                if proc.returncode is None:
+                    try:
+                        # Tree-aware: the handle is the sandbox launcher, not the
+                        # agent it forked. A bare terminate() orphans the agent.
+                        _proc.terminate_tree(proc)
+                        await asyncio.wait_for(
+                            proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS
+                        )
+                        if IS_WINDOWS:
+                            await _reap_windows_once()
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(BaseException):
+                            if IS_WINDOWS:
+                                await _reap_windows_once()
+                            else:
+                                _proc.kill_tree(proc)
+                        raise
+                    except Exception:  # noqa: BLE001
+                        with contextlib.suppress(Exception):
+                            if IS_WINDOWS:
+                                await _reap_windows_once()
+                            else:
+                                _proc.kill_tree(proc)
+                elif IS_WINDOWS and _proc.has_unresolved_identities(proc):
+                    with contextlib.suppress(Exception):
+                        await _reap_windows_once()
             finally:
-                self._proc = None
+                reap_in_flight = reap_task is not None and not reap_task.done()
+                if not (IS_WINDOWS and (reap_in_flight or _proc.has_unresolved_identities(proc))):
+                    self._proc = None
+                    if self._windows_reap_task is not None and self._windows_reap_task.done():
+                        self._windows_reap_task = None
+        self._cleanup_agy_runtime_temp_dir()

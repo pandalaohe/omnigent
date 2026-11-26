@@ -14,7 +14,7 @@ from typing import Any
 import httpcore
 import httpx
 
-from omnigent.permission_tiers import Verdict
+from omnigent.permission_tiers import Verdict, format_denial_reason
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -60,6 +60,7 @@ async def _evaluate_policy_via_omnigent(
     data: dict[str, Any],
     on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
     acp_tier: Verdict | None = None,
+    acp_tier_reason: str | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -111,7 +112,9 @@ async def _evaluate_policy_via_omnigent(
     _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
     verdict_action = _default_action
     verdict_reason: str | None = (
-        f"Omnigent policy evaluation unavailable; failing closed for {phase}."
+        format_denial_reason(
+            "policy", f"Omnigent policy evaluation unavailable; failing closed for {phase}."
+        )
         if _fail_closed
         else None
     )
@@ -156,7 +159,9 @@ async def _evaluate_policy_via_omnigent(
             )
         )
         if acp_tier == Verdict.DENY:
-            verdict_reason = "The host permission tier denied the ACP tool call."
+            verdict_reason = acp_tier_reason or format_denial_reason(
+                "permission mode", "The host permission tier denied the ACP tool call."
+            )
         elif ap_resp is None:
             _logger.warning(
                 "AP policy evaluate failed for %s; defaulting to %s: %s",
@@ -174,6 +179,17 @@ async def _evaluate_policy_via_omnigent(
             verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
+            if verdict_action == "POLICY_ACTION_DENY" and acp_tier is not None:
+                deciding_policy = result.get("deciding_policy")
+                verdict_reason = format_denial_reason(
+                    "policy",
+                    verdict_reason if isinstance(verdict_reason, str) else "",
+                    detail=(
+                        deciding_policy
+                        if isinstance(deciding_policy, str) and deciding_policy
+                        else None
+                    ),
+                )
             ack = result.get("permission_tier_finish")
             if (
                 phase == "PHASE_TOOL_RESULT"
@@ -208,10 +224,10 @@ async def _evaluate_policy_via_omnigent(
         acp_tier is not None
         or (isinstance(verdict_data, dict) and "_omnigent_acp_tier" in verdict_data)
     ):
-        # An independent policy can veto a call, but cannot forge a host grant.
+        # An independent policy can veto a call, but cannot forge a host grant or tier tag.
         verdict_data = dict(verdict_data) if isinstance(verdict_data, dict) else {}
         verdict_data.pop("_omnigent_acp_tier", None)
-        if acp_tier in (Verdict.ALLOW, Verdict.ASK):
+        if acp_tier in (Verdict.ALLOW, Verdict.ASK, Verdict.DENY):
             verdict_data["_omnigent_acp_tier"] = acp_tier.value.lower()
     if (
         phase == "PHASE_TOOL_RESULT"

@@ -4659,3 +4659,155 @@ async def test_read_resident_inventory_cancellation_propagates(resident_reader, 
         assert not entry.process.killed
     finally:
         await _cancel_pending(read)
+
+
+@pytest.mark.asyncio
+async def test_spawn_harness_process_sets_create_no_window_on_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    from omnigent.inner import _proc
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    manager = pm_mod.HarnessProcessManager(tmp_parent=tmp_path)
+    calls: list[dict[str, object]] = []
+
+    async def _fake_exec(*args: object, **kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        return SimpleNamespace(pid=4242, returncode=None)
+
+    monkeypatch.setattr(pm_mod.asyncio, "create_subprocess_exec", _fake_exec)
+
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    await manager._spawn_harness_process(["--harness", "codex"], {})
+    assert "creationflags" not in calls[0]
+
+    no_window = 0x08000000
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(stdlib_subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    await manager._spawn_harness_process(["--harness", "codex"], {})
+    assert calls[1]["creationflags"] == no_window
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_windows", [False, True])
+async def test_close_entry_runs_windows_survivor_reap_after_leader_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_windows: bool
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    manager = pm_mod.HarnessProcessManager(tmp_parent=tmp_path)
+
+    class _QuickExitProc:
+        pid = 51234
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    proc = _QuickExitProc()
+    terminated: list[object] = []
+    killed: list[object] = []
+    monkeypatch.setattr(pm_mod, "IS_WINDOWS", is_windows)
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", terminated.append)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", killed.append)
+
+    entry = pm_mod._SubprocessEntry(
+        process=proc,
+        client=SimpleNamespace(aclose=AsyncMock()),  # type: ignore[arg-type]
+        endpoint=pm_mod._HarnessEndpoint(host="127.0.0.1", port=51234),
+        harness="codex",
+    )
+    assert await manager._close_entry(entry) is True
+    assert terminated == [proc]
+    assert killed == ([proc] if is_windows else [])
+
+
+@pytest.mark.asyncio
+async def test_close_entry_windows_retains_unresolved_survivors_and_deduplicates_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import threading
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    manager = pm_mod.HarnessProcessManager(tmp_parent=tmp_path)
+    record_path = tmp_path / "conv-51235.process.json"
+    record_path.write_text('{"pid": 51235, "create_time": 1.0}', encoding="utf-8")
+
+    class _QuickExitProc:
+        pid = 51235
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    proc = _QuickExitProc()
+    attempts = 0
+    unresolved = True
+
+    def _fake_kill_tree(_p: object) -> None:
+        nonlocal attempts, unresolved
+        attempts += 1
+        if attempts >= 2:
+            unresolved = False
+
+    monkeypatch.setattr(pm_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda _p: None)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", _fake_kill_tree)
+    monkeypatch.setattr(pm_mod._proc, "has_unresolved_identities", lambda _p: unresolved)
+
+    entry = pm_mod._SubprocessEntry(
+        process=proc,
+        client=SimpleNamespace(aclose=AsyncMock()),  # type: ignore[arg-type]
+        endpoint=pm_mod._HarnessEndpoint(host="127.0.0.1", port=51235),
+        harness="codex",
+        process_record_path=record_path,
+    )
+    manager._closing_entries[entry.incarnation_id] = entry
+    # First close retains the entry and process record while survivors remain.
+    assert await manager._close_entry(entry) is False
+    assert record_path.exists()
+    assert entry.incarnation_id in manager._closing_entries
+    # Retry runs kill_tree even though the leader has already exited.
+    assert await manager._close_entry(entry) is True
+    assert attempts == 2
+    assert not record_path.exists()
+    assert entry.incarnation_id not in manager._closing_entries
+
+    # Cancellation during prompt-exit reap awaits the in-flight worker instead of starting two.
+    proc2 = _QuickExitProc()
+    started = asyncio.Event()
+    release = threading.Event()
+    worker_calls = 0
+    loop = asyncio.get_running_loop()
+
+    def _blocking_kill_tree(_p: object) -> None:
+        nonlocal worker_calls
+        worker_calls += 1
+        loop.call_soon_threadsafe(started.set)
+        release.wait(timeout=2.0)
+
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", _blocking_kill_tree)
+    monkeypatch.setattr(pm_mod._proc, "has_unresolved_identities", lambda _p: False)
+    entry2 = pm_mod._SubprocessEntry(
+        process=proc2,
+        client=SimpleNamespace(aclose=AsyncMock()),  # type: ignore[arg-type]
+        endpoint=pm_mod._HarnessEndpoint(host="127.0.0.1", port=51236),
+        harness="codex",
+    )
+    close_task = asyncio.create_task(manager._close_entry(entry2))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    close_task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(close_task, timeout=2.0)
+    assert worker_calls == 1

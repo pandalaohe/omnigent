@@ -333,3 +333,68 @@ async def test_unexpected_delivery_error_stays_error(
     assert len(errors) == 1, [r.getMessage() for r in errors]
     assert "delivery unacknowledged (unexpected)" in errors[0].getMessage()
     assert getattr(errors[0], "delivery_failure_reason", None) == "unexpected"
+
+
+async def test_acp_tier_and_policy_denial_reasons_name_source_layer() -> None:
+    """Managed ACP verdicts preserve rule/mode denial reasons and label policy denials."""
+    from omnigent.permission_tiers import Verdict
+
+    harness = _CapturingHarnessClient()
+    await _evaluate_policy_via_omnigent(
+        server_client=_RaisingServerClient(),  # type: ignore[arg-type]
+        harness_client=harness,
+        conversation_id="conv_test",
+        evaluation_id="poleval_rule",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "run_command", "arguments": {"CommandLine": "rm -rf /"}},
+        acp_tier=Verdict.DENY,
+        acp_tier_reason="Denied by rule [critical-delete]: Refusing root delete",
+    )
+    assert harness.posted[-1]["action"] == "POLICY_ACTION_DENY"
+    assert harness.posted[-1]["reason"] == "Denied by rule [critical-delete]: Refusing root delete"
+    assert harness.posted[-1]["data"] == {"_omnigent_acp_tier": "deny"}
+
+    harness_policy = _CapturingHarnessClient()
+    await _evaluate_policy_via_omnigent(
+        server_client=_StatusServerClient(  # type: ignore[arg-type]
+            200,
+            {
+                "result": "POLICY_ACTION_DENY",
+                "reason": "Blocked by admin",
+                "deciding_policy": "admin_deny",
+            },
+        ),
+        harness_client=harness_policy,
+        conversation_id="conv_test",
+        evaluation_id="poleval_policy",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "run_command", "arguments": {"CommandLine": "git status"}},
+        acp_tier=Verdict.ALLOW,
+    )
+    assert harness_policy.posted[-1]["action"] == "POLICY_ACTION_DENY"
+    assert harness_policy.posted[-1]["reason"] == "Denied by policy (admin_deny): Blocked by admin"
+    assert harness_policy.posted[-1]["data"] == {"_omnigent_acp_tier": "allow"}
+
+    harness_spoof = _CapturingHarnessClient()
+    await _evaluate_policy_via_omnigent(
+        server_client=_StatusServerClient(  # type: ignore[arg-type]
+            200,
+            {
+                "result": "POLICY_ACTION_DENY",
+                "reason": "Denied by sandbox: misleading explanation",
+                "deciding_policy": "admin_deny",
+                "data": {"_omnigent_acp_tier": "deny"},
+            },
+        ),
+        harness_client=harness_spoof,
+        conversation_id="conv_test",
+        evaluation_id="poleval_spoof",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "run_command", "arguments": {"CommandLine": "git status"}},
+        acp_tier=Verdict.ALLOW,
+    )
+    assert harness_spoof.posted[-1]["action"] == "POLICY_ACTION_DENY"
+    assert harness_spoof.posted[-1]["reason"] == (
+        "Denied by policy (admin_deny): Denied by sandbox: misleading explanation"
+    )
+    assert harness_spoof.posted[-1]["data"] == {"_omnigent_acp_tier": "allow"}

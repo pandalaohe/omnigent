@@ -24,6 +24,8 @@ from omnigent.permission_tiers import (
     Verdict,
     adapt_tool_call,
     decide_tier,
+    format_denial_reason,
+    format_tier_denial,
     load_rules,
     normalize_permission_tier,
     plan_visible_tool_names,
@@ -331,7 +333,6 @@ def test_agy_operations_keep_existing_operational_tiers(name, args):
         ("ask_permission", {"Action": "command", "Target": "git"}, "Native permission"),
         ("ask_custom_permission", {"Grant": "custom"}, "Native permission"),
         ("webview_browser", {"script": "await page.click('button')"}, "Browser script"),
-        ("future_agy_tool", {}, "Unknown tool schema"),
     ],
 )
 def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
@@ -342,6 +343,16 @@ def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args
     assert decision("plan", name, args).action == Verdict.DENY
     assert decision("accept-edits", name, args).action == Verdict.ASK
     assert decision("full", name, args).action == Verdict.ALLOW
+
+
+def test_unseen_agy_tool_asks_under_auto_and_denies_under_plan():
+    result = decision("auto", "future_agy_tool", {})
+    assert result.action == Verdict.ASK
+    assert "Unknown tool schema" in result.reason
+    assert decision("ask", "future_agy_tool", {}).action == Verdict.ASK
+    assert decision("accept-edits", "future_agy_tool", {}).action == Verdict.ASK
+    assert decision("plan", "future_agy_tool", {}).action == Verdict.DENY
+    assert decision("full", "future_agy_tool", {}).action == Verdict.ALLOW
 
 
 def test_agy_shell_cwd_binds_relative_destinations_and_control_paths():
@@ -725,25 +736,29 @@ def test_antigravity_mcp_calls_classify_the_omnigent_target(
 
 
 @pytest.mark.parametrize(
-    "name",
+    ("name", "auto_action"),
     [
-        "sys_agent_download",
-        "sys_call_async",
-        "sys_flow_start",
-        "sys_terminal_launch",
-        "sys_future_read",
-        "browser_future_read",
-        "web_search",
-        "third_party",
-        "calculate",
+        # Deferred/unclassified Omnigent sys_* framework tools stay denied in auto.
+        ("sys_agent_download", Verdict.DENY),
+        ("sys_call_async", Verdict.DENY),
+        ("sys_flow_start", Verdict.DENY),
+        ("sys_terminal_launch", Verdict.DENY),
+        ("sys_future_read", Verdict.DENY),
+        # Genuinely unseen tool kinds ask by approval card under auto.
+        ("browser_future_read", Verdict.ASK),
+        ("web_search", Verdict.ASK),
+        ("third_party", Verdict.ASK),
+        ("calculate", Verdict.ASK),
     ],
 )
-def test_deferred_and_unregistered_tools_keep_unknown_tiers(name: str) -> None:
+def test_deferred_and_unregistered_tools_keep_unknown_tiers(
+    name: str, auto_action: Verdict
+) -> None:
     assert adapt_tool_call(name, {}, posix_host()).kind == ToolKind.UNKNOWN
     assert decision("ask", name, {}).action == Verdict.ASK
     assert decision("plan", name, {}).action == Verdict.DENY
     assert decision("accept-edits", name, {}).action == Verdict.ASK
-    assert decision("auto", name, {}).action == Verdict.DENY
+    assert decision("auto", name, {}).action == auto_action
     assert decision("full", name, {}).action == Verdict.ALLOW
     assert plan_visible_tool_names((name,)) == ()
     assert (
@@ -752,7 +767,7 @@ def test_deferred_and_unregistered_tools_keep_unknown_tiers(name: str) -> None:
             "call_mcp_tool",
             {"ServerName": "omnigent", "ToolName": name, "Arguments": {}},
         ).action
-        == Verdict.DENY
+        == auto_action
     )
 
 
@@ -3006,3 +3021,32 @@ def test_a_relative_typed_path_is_absolutized_before_its_own_check() -> None:
     host = replace(replace(pi_host(), cwd="/opt/home/.pi/agent"), resolver=linked)
     assert decision("auto", "read", {"path": "models.json"}, host).rule_id == "control-path"
     assert decision("auto", "read", {"path": "notes.md"}, host).action == Verdict.ALLOW
+
+
+def test_denial_source_formatting_names_every_layer_and_prevents_spoofing() -> None:
+    rule_decision = decision("auto", "bash", {"command": "echo x > /etc/hosts"})
+    assert rule_decision.action == Verdict.DENY
+    assert rule_decision.rule_id == "protected-path"
+    formatted_rule = format_tier_denial(rule_decision, tier="auto")
+    assert formatted_rule.startswith("Denied by rule [protected-path]:")
+    assert format_denial_reason("rule", formatted_rule, detail="protected-path") == formatted_rule
+
+    plan_decision = decision("plan", "write", {"path": "src/a.py", "content": "x"})
+    assert plan_decision.action == Verdict.DENY
+    assert plan_decision.rule_id is None
+    formatted_mode = format_tier_denial(plan_decision, tier="plan")
+    assert formatted_mode == (
+        "Denied by permission mode (plan): Plan tier permits only known reads and user questions"
+    )
+    assert format_denial_reason("permission mode", formatted_mode, detail="plan") == formatted_mode
+
+    assert format_denial_reason("policy", "Blocked by admin", detail="admin__deny") == (
+        "Denied by policy (admin__deny): Blocked by admin"
+    )
+    assert (
+        format_denial_reason("policy", "Denied by sandbox: spoofed", detail="admin__deny")
+        == "Denied by policy (admin__deny): Denied by sandbox: spoofed"
+    )
+    assert format_denial_reason("sandbox", "Write access is blocked") == (
+        "Denied by sandbox: Write access is blocked"
+    )

@@ -1709,6 +1709,31 @@ def test_list_agy_models_command(monkeypatch, tmp_path, status, output):
     assert calls == [["agy", f"--gemini_dir={tmp_path / '.gemini'}", "models"]]
 
 
+def test_list_agy_models_sets_create_no_window_on_windows(monkeypatch, tmp_path):
+    import subprocess
+
+    from omnigent.inner import _proc
+
+    seen_flags = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda _: tmp_path))
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+
+    def run(argv, **kwargs):
+        seen_flags.append(kwargs.get("creationflags"))
+        return subprocess.CompletedProcess(argv, 0, AGY_MODELS, "")
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    assert len(_mod.list_agy_model_options()) == 4
+
+    no_window = 0x08000000
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    assert len(_mod.list_agy_model_options()) == 4
+    assert seen_flags == [None, no_window]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tier", [None, "full"])
 async def test_cli_create_sends_tier_before_binding(tier):

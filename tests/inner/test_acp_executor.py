@@ -50,6 +50,7 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
 )
@@ -1340,7 +1341,7 @@ async def test_managed_policy_denial_does_not_select_a_user_reject_option() -> N
     ex._elicitation_choice_handler.assert_not_awaited()
     reply = ex._send.await_args.args[0]
     assert "result" not in reply
-    assert reply["error"]["message"] == "Omnigent did not authorize this tool call."
+    assert reply["error"]["message"] == "Denied by policy: Omnigent policy denied this tool call."
 
 
 @pytest.mark.asyncio
@@ -1435,19 +1436,19 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "kind", "expected_tool", "allowed"),
+    ("case", "kind", "expected_tool", "outcome"),
     [
-        ("command", None, "run_command", True),
-        ("command", "other", "run_command", True),
-        ("protected-write", "other", "write_to_file", False),
-        ("workspace-write", "edit", "write_to_file", True),
-        ("unknown", "other", "unknown", False),
-        ("ambiguous", "other", None, False),
-        ("opencode", "other", "unknown", False),
+        ("command", None, "run_command", "allow"),
+        ("command", "other", "run_command", "allow"),
+        ("protected-write", "other", "write_to_file", "deny"),
+        ("workspace-write", "edit", "write_to_file", "allow"),
+        ("unknown", "other", "unknown", "ask"),
+        ("ambiguous", "other", None, "deny"),
+        ("opencode", "other", "unknown", "ask"),
     ],
 )
 async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
-    case: str, kind: str | None, expected_tool: str | None, allowed: bool
+    case: str, kind: str | None, expected_tool: str | None, outcome: str
 ) -> None:
     from omnigent.permission_tiers import Verdict, adapt_tool_call, decide_tier, load_rules
     from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
@@ -1475,7 +1476,7 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     ex = AcpExecutor(AcpAgentConfig(command=launch, host_permission_tier=True))
     ex._session_id = "s1"
     ex._active_prompt_request_id = 1
-    ex._elicitation_handler = AsyncMock()
+    ex._elicitation_handler = AsyncMock(return_value=True)
     ex._send = AsyncMock()
     decisions = []
 
@@ -1510,7 +1511,7 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     sent = ex._send.await_args
     assert sent is not None
     reply = sent.args[0]
-    if allowed:
+    if outcome in ("allow", "ask"):
         assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
     else:
         assert reply["error"]["code"] == -32000
@@ -1519,10 +1520,15 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     else:
         ((tool_name, decision),) = decisions
         assert tool_name == expected_tool
-        assert decision.action == (Verdict.ALLOW if allowed else Verdict.DENY)
+        expected_verdict = {
+            "allow": Verdict.ALLOW,
+            "ask": Verdict.ASK,
+            "deny": Verdict.DENY,
+        }[outcome]
+        assert decision.action == expected_verdict
         if case == "protected-write":
             assert decision.rule_id == "protected-path"
-    ex._elicitation_handler.assert_not_awaited()
+    assert ex._elicitation_handler.await_count == (1 if outcome == "ask" else 0)
 
 
 def _pending_acp_permission(
@@ -1793,7 +1799,7 @@ async def test_managed_agy_permission_rejects_mixed_reads_in_plan(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", [{"Opaque": True}, {"Path": "note.txt", "Action": "list"}])
 @pytest.mark.parametrize(
-    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", False), ("plan", False)]
+    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", True), ("plan", False)]
 )
 async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
     tier, asks, arguments, windows_acp_permission_executor
@@ -1805,6 +1811,207 @@ async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
     assert policy_call is not None
     assert policy_call.args[1]["name"] == "unknown"
     assert ex._elicitation_handler.await_count == (1 if asks else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_prefix"),
+    [
+        ("rule", "Denied by rule [protected-path]:"),
+        ("plan-mode", "Denied by permission mode (plan):"),
+        ("policy", "Denied by policy (admin_block):"),
+        ("policy-spoof", "Denied by policy: Denied by sandbox: misleading"),
+        ("unbound", "Denied by permission mode (acp):"),
+        ("malformed-execute", "Denied by permission mode (acp):"),
+        ("non-string-kind", "Denied by permission mode (acp):"),
+        ("daemon", "Denied by permission mode (acp):"),
+    ],
+)
+async def test_managed_acp_denial_errors_name_source_layer(
+    case: str, expected_prefix: str
+) -> None:
+    from omnigent.permission_tiers import (
+        Verdict,
+        adapt_tool_call,
+        decide_tier,
+        format_tier_denial,
+        load_rules,
+    )
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import windows_host
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    ex._send = AsyncMock()
+
+    kind: object
+    if case == "rule":
+        arguments: dict[str, object] = {
+            "Path": r"C:\Windows\System32\drivers\etc\hosts",
+            "Content": "x",
+            "Overwrite": True,
+        }
+        kind = "edit"
+        tier = "auto"
+    elif case == "plan-mode":
+        arguments = {"CommandLine": "omni --version"}
+        kind = "execute"
+        tier = "plan"
+    elif case == "malformed-execute":
+        arguments = {}
+        kind = "execute"
+        tier = "auto"
+    elif case == "non-string-kind":
+        arguments = {}
+        kind = ["execute"]
+        tier = "auto"
+    elif case == "daemon":
+        arguments = {"CommandLine": "omni --version", "IsDaemon": True}
+        kind = "execute"
+        tier = "auto"
+    else:
+        arguments = {"CommandLine": "omni --version"}
+        kind = "execute"
+        tier = "auto"
+
+    call = {"toolCallId": "tool-1", "kind": kind, "rawInput": arguments}
+    if case != "unbound":
+        ex._note_permission_update(
+            "s1", {"sessionUpdate": "tool_call", "status": "pending", **call}
+        )
+
+    async def evaluate(_phase, data):
+        if case == "policy":
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Denied by policy (admin_block): Blocked by admin policy.",
+            )
+        if case == "policy-spoof":
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Denied by sandbox: misleading",
+            )
+        intent = adapt_tool_call(data["name"], data["arguments"], windows_host())
+        decision = decide_tier(tier, intent, load_rules())
+        assert decision.action == Verdict.DENY
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_DENY",
+            reason=format_tier_denial(decision, tier=tier),
+            data={"_omnigent_acp_tier": "deny"},
+        )
+
+    ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+    await ex._respond_to_agent_request(
+        {
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": call,
+                "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+            },
+        }
+    )
+    reply = ex._send.await_args.args[0]
+    assert reply["error"]["code"] == -32000
+    assert reply["error"]["message"].startswith(expected_prefix), reply["error"]["message"]
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_acp_policy_proxy_to_executor_denial_handoff() -> None:
+    """Runner policy_proxy emits the deny marker so AcpExecutor preserves attribution."""
+    from omnigent.permission_tiers import Verdict
+    from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.runner.test_runner_policy import (
+        _CapturingHarnessClient,
+        _RaisingServerClient,
+        _StatusServerClient,
+    )
+
+    async def run_handoff(
+        *,
+        server_client: object,
+        acp_tier: Verdict,
+        acp_tier_reason: str | None = None,
+    ) -> str:
+        ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio", host_permission_tier=True))
+        ex._session_id = "s1"
+        ex._active_prompt_request_id = 1
+        ex._elicitation_handler = AsyncMock(return_value=False)
+        ex._send = AsyncMock()
+        call = {
+            "toolCallId": "tool-handoff",
+            "kind": "execute",
+            "rawInput": {"CommandLine": "omni --version"},
+        }
+        ex._note_permission_update(
+            "s1", {"sessionUpdate": "tool_call", "status": "pending", **call}
+        )
+
+        async def evaluate(phase: str, data: dict[str, object]) -> PolicyVerdictPayload:
+            harness = _CapturingHarnessClient()
+            eval_data = dict(data)
+            eval_data.pop("_omnigent_acp_call", None)
+            await _evaluate_policy_via_omnigent(
+                server_client=server_client,  # type: ignore[arg-type]
+                harness_client=harness,
+                conversation_id="s1",
+                evaluation_id="eval-handoff",
+                phase=phase,
+                data=eval_data,
+                acp_tier=acp_tier,
+                acp_tier_reason=acp_tier_reason,
+            )
+            posted = harness.posted[-1]
+            return PolicyVerdictPayload(
+                action=posted["action"],
+                reason=posted.get("reason"),
+                data=posted.get("data"),
+            )
+
+        ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+        await ex._respond_to_agent_request(
+            {
+                "id": 11,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": call,
+                    "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+                },
+            }
+        )
+        reply = ex._send.await_args.args[0]
+        assert reply["error"]["code"] == -32000
+        return str(reply["error"]["message"])
+
+    plan_reason = (
+        "Denied by permission mode (plan): Plan tier permits only known reads and user questions"
+    )
+    plan_msg = await run_handoff(
+        server_client=_RaisingServerClient(),
+        acp_tier=Verdict.DENY,
+        acp_tier_reason=plan_reason,
+    )
+    assert plan_msg == plan_reason
+
+    spoof_msg = await run_handoff(
+        server_client=_StatusServerClient(
+            200,
+            {
+                "result": "POLICY_ACTION_DENY",
+                "reason": "Denied by sandbox: forged",
+                "deciding_policy": "admin_deny",
+                "data": {"_omnigent_acp_tier": "deny"},
+            },
+        ),
+        acp_tier=Verdict.ALLOW,
+    )
+    assert spoof_msg == "Denied by policy (admin_deny): Denied by sandbox: forged"
 
 
 @pytest.mark.asyncio
@@ -4372,3 +4579,3270 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Antigravity ACP: read_file body backfill, tool-field normalization, interaction_* cards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_read_file_fills_missing_body_from_workspace(tmp_path: Path) -> None:
+    """Completed AG ACP read_file with no content/rawOutput backfills the workspace file body."""
+    target = tmp_path / "notes" / "probe.txt"
+    target.parent.mkdir()
+    target.write_text("W2F_FIXTURE_OK\nsecond line\n", encoding="utf-8")
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"), cwd=str(tmp_path))
+    raw_input = {"Path": str(target)}
+    started = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_read_1",
+            "name": "read_file",
+            "kind": "read",
+            "status": "in_progress",
+            "title": "File notes/probe.txt",
+            "locations": [{"path": str(target)}],
+            "rawInput": raw_input,
+        }
+    )
+    assert len(started) == 1
+    req = started[0]
+    assert isinstance(req, ToolCallRequest)
+    assert req.name == "read"
+    assert req.args == {"path": str(target)}
+
+    done = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_read_1",
+            "name": "read_file",
+            "kind": "read",
+            "status": "completed",
+            "title": f"File {target}",
+            "locations": [{"path": str(target)}],
+            "rawInput": raw_input,
+        }
+    )
+    assert len(done) == 1
+    comp = done[0]
+    assert isinstance(comp, ToolCallComplete)
+    assert comp.name == "read"
+    assert comp.status is ToolCallStatus.SUCCESS
+    assert comp.result == "W2F_FIXTURE_OK\nsecond line\n"
+    assert comp.metadata == {"call_id": "call_read_1"}
+
+
+def test_agy_acp_read_file_honors_line_range_and_byte_offset(tmp_path: Path) -> None:
+    """AG ACP read_file backfill respects StartLine, EndLine, and ByteOffset."""
+    target = tmp_path / "sample.txt"
+    target.write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"), cwd=str(tmp_path))
+
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r1",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "sample.txt", "StartLine": 2, "EndLine": 4},
+        }
+    )
+    done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r1", "status": "completed"}
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].result == "line2\nline3\nline4\n"
+
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r2",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "sample.txt", "StartLine": 2, "EndLine": 3, "ByteOffset": 6},
+        }
+    )
+    done_offset = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r2", "status": "completed"}
+    )
+    assert isinstance(done_offset[0], ToolCallComplete)
+    assert done_offset[0].result == "line3\n"
+
+    # Inverted range and boolean line numbers fail closed (no backfill).
+    for idx, bad_args in enumerate(
+        [
+            {"Path": "sample.txt", "StartLine": 4, "EndLine": 2},
+            {"Path": "sample.txt", "StartLine": True},
+        ]
+    ):
+        cid = f"bad_{idx}"
+        ex._handle_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": cid,
+                "name": "read_file",
+                "kind": "read",
+                "rawInput": bad_args,
+            }
+        )
+        bad_done = ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "completed"}
+        )
+        assert isinstance(bad_done[0], ToolCallComplete)
+        assert bad_done[0].result is None
+
+
+def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
+    """Backfill preserves output and blocks outside, symlink, binary, failed, and non-AG reads."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("SECRET_OUTSIDE\n", encoding="utf-8")
+    inside = workspace / "inside.txt"
+    inside.write_text("INSIDE_BODY\n", encoding="utf-8")
+    binary = workspace / "blob.bin"
+    binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    large = workspace / "large.txt"
+    large.write_text("a" * 80_000, encoding="utf-8")
+    escape_link = workspace / "escape.txt"
+    escape_link.symlink_to(outside)
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"), cwd=str(workspace))
+
+    def _run_read(
+        executor: AcpExecutor,
+        cid: str,
+        path: str,
+        *,
+        status: str = "completed",
+        content: object = None,
+        raw_output: object = None,
+    ) -> ToolCallComplete:
+        executor._handle_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": cid,
+                "name": "read_file",
+                "kind": "read",
+                "rawInput": {"Path": path},
+            }
+        )
+        update: dict[str, object] = {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": cid,
+            "status": status,
+        }
+        if content is not None:
+            update["content"] = content
+        if raw_output is not None:
+            update["rawOutput"] = raw_output
+        events = executor._handle_session_update(update)
+        assert len(events) == 1 and isinstance(events[0], ToolCallComplete)
+        return events[0]
+
+    # Agent-provided content is preserved untouched.
+    agent_content = [{"type": "content", "content": {"type": "text", "text": "FROM_AGENT"}}]
+    assert _run_read(ex, "c_agent", str(inside), content=agent_content).result == agent_content
+    # Failed read does not backfill.
+    assert _run_read(ex, "c_fail", str(inside), status="failed").result is None
+    # Outside workspace and symlink escape are refused.
+    assert _run_read(ex, "c_out", str(outside)).result is None
+    assert _run_read(ex, "c_sym", str(escape_link)).result is None
+    # Binary file returns None.
+    assert _run_read(ex, "c_bin", str(binary)).result is None
+    # Embedded NUL and malformed file:// URI fail closed cleanly (never raise ValueError).
+    assert _run_read(ex, "c_nul", str(inside) + "\x00.txt").result is None
+    assert _run_read(ex, "c_bad_uri", "file://[").result is None
+
+    # Dual path fields (AbsolutePath + Path) are rejected unambiguously before policy or disk read.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_dual",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"AbsolutePath": str(inside), "Path": str(inside)},
+        }
+    )
+    dual_done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c_dual", "status": "completed"}
+    )[0]
+    assert isinstance(dual_done, ToolCallComplete) and dual_done.result is None
+
+    # POSIX FIFO does not block and fails closed (not a regular file).
+    if hasattr(os, "mkfifo"):
+        fifo_path = workspace / "pipe.fifo"
+        os.mkfifo(fifo_path)
+        assert _run_read(ex, "c_fifo", str(fifo_path)).result is None
+
+    # Exact 64 KiB boundary splitting a 3-byte UTF-8 character decodes cleanly without error.
+    utf8_edge = workspace / "utf8_edge.txt"
+    utf8_edge.write_bytes(b"a" * (64 * 1024 - 1) + "中".encode() + b"tail")
+    utf8_res = _run_read(ex, "c_utf8", str(utf8_edge)).result
+    assert isinstance(utf8_res, str)
+    assert utf8_res == ("a" * (64 * 1024 - 1)) + "\n...[truncated]"
+
+    # Completion cannot supply or swap paths; orphan and bridge completions never backfill.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_swap",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(workspace / "missing.txt")},
+        }
+    )
+    swapped = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c_swap",
+            "status": "completed",
+            "rawInput": {"Path": str(inside)},
+            "locations": [{"path": str(inside)}],
+        }
+    )[0]
+    assert isinstance(swapped, ToolCallComplete) and swapped.result is None
+
+    orphan = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c_orphan",
+            "name": "read_file",
+            "kind": "read",
+            "status": "completed",
+            "rawInput": {"Path": str(inside)},
+        }
+    )[0]
+    assert isinstance(orphan, ToolCallComplete) and orphan.result is None
+
+    ex._bridge_tool_aliases = frozenset({"read_file"})
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_bridge",
+            "title": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(inside)},
+        }
+    )
+    bridge_done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c_bridge", "status": "completed"}
+    )[0]
+    assert isinstance(bridge_done, ToolCallComplete) and bridge_done.result is None
+    ex._bridge_tool_aliases = frozenset()
+
+    # Large file is capped cleanly.
+    large_res = _run_read(ex, "c_large", str(large)).result
+    assert isinstance(large_res, str)
+    assert large_res.endswith("\n...[truncated]")
+    assert len(large_res) < 70_000
+
+    # Forked os_env skips direct disk read.
+    forked_ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp"),
+        cwd=str(workspace),
+        os_env=OSEnvSpec(type="caller_process", fork=True),
+    )
+    assert _run_read(forked_ex, "c_fork", str(inside)).result is None
+
+    # Non-AG ACP agent never backfills from disk.
+    non_ag = AcpExecutor(AcpAgentConfig(command="opencode acp"), cwd=str(workspace))
+    assert _run_read(non_ag, "c_non_ag", str(inside)).result is None
+
+
+@pytest.mark.asyncio
+async def test_managed_agy_permission_binds_read_file_path_and_rejects_mixed(
+    windows_acp_permission_executor,
+) -> None:
+    """Managed AG ACP binds read_file(Path) and still rejects mixed or malformed shapes."""
+    for tier in ("auto", "plan"):
+        ex = windows_acp_permission_executor(tier)
+        params = _pending_acp_permission(
+            ex, {"Path": r"tmp\probe.txt", "StartLine": 1, "EndLine": 10}, "read"
+        )
+        assert await ex._decide_permission(params) == (True, "once")
+        policy_call = ex._policy_evaluator.await_args
+        assert policy_call is not None
+        assert policy_call.args[1]["name"] == "read_file"
+        assert policy_call.args[1]["arguments"]["Path"] == r"tmp\probe.txt"
+
+    for denied_args in (
+        {"Path": r"C:\work\control\policy.json"},
+        {"AbsolutePath": r"C:\work\control\policy.json"},
+    ):
+        ex_denied = windows_acp_permission_executor("auto")
+        params_denied = _pending_acp_permission(ex_denied, denied_args, "read")
+        assert await ex_denied._decide_permission(params_denied) == (False, None)
+        ex_denied._policy_evaluator.assert_awaited_once()
+        ex_denied._elicitation_handler.assert_not_awaited()
+
+    for bad_args in (
+        {"Path": ""},
+        {"Path": r"tmp\probe.txt", "StartLine": True},
+        {"Path": r"tmp\probe.txt", "Content": "injected"},
+        {"Path": r"tmp\probe.txt", "CommandLine": "whoami"},
+        {"Path": r"tmp\probe.txt", "AbsolutePath": r"tmp\other.txt"},
+        {"Path": r"tmp\probe.txt", "UnknownKey": 1},
+    ):
+        ex_bad = windows_acp_permission_executor("auto")
+        params_bad = _pending_acp_permission(ex_bad, bad_args, "read")
+        assert await ex_bad._decide_permission(params_bad) == (False, None)
+        ex_bad._policy_evaluator.assert_not_awaited()
+
+
+def test_agy_acp_normalizes_tool_fields_and_preserves_bridge_and_non_ag() -> None:
+    """AG ACP tool calls normalize names, args, and shell rawOutput to Omnigent's shared shape."""
+    ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio"))
+
+    # Shell command with PascalCase inputs and dict rawOutput.
+    shell_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh1",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "cat probe.txt",
+            "rawInput": {"CommandLine": "cat probe.txt", "Cwd": "/opt/work/project"},
+        }
+    )
+    assert isinstance(shell_start[0], ToolCallRequest)
+    assert shell_start[0].name == "shell"
+    assert shell_start[0].args == {"command": "cat probe.txt", "cwd": "/opt/work/project"}
+
+    shell_done = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sh1",
+            "status": "completed",
+            "rawOutput": {
+                "commandLine": "cat probe.txt",
+                "workingDir": "/opt/work/project",
+                "exitCode": 0,
+                "exit_code": 0,
+                "combinedOutput": "after\n",
+                "formatted_output": "after\n",
+            },
+        }
+    )
+    assert isinstance(shell_done[0], ToolCallComplete)
+    assert shell_done[0].name == "shell"
+    assert shell_done[0].result == "after\n"
+
+    # Non-zero exit code is preserved as `[exit code: N]`.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh2",
+            "kind": "execute",
+            "title": "Run command",
+            "rawInput": {"command_line": "test -f missing.txt", "working_dir": "/opt/work"},
+        }
+    )
+    shell_nz = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sh2",
+            "status": "completed",
+            "rawOutput": {"combined_output": "", "exit_code": 1},
+        }
+    )
+    assert isinstance(shell_nz[0], ToolCallComplete)
+    assert shell_nz[0].result == "[exit code: 1]"
+
+    # Edit with TargetFile / TargetContent / ReplacementContent and Edits list.
+    edit_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "ed1",
+            "kind": "edit",
+            "title": "Run edit_file?",
+            "rawInput": {
+                "TargetFile": "file:///opt/work/app.py",
+                "TargetContent": "old = 1",
+                "ReplacementContent": "new = 2",
+            },
+        }
+    )
+    assert isinstance(edit_start[0], ToolCallRequest)
+    assert edit_start[0].name == "edit"
+    assert edit_start[0].args == {
+        "path": "/opt/work/app.py",
+        "oldText": "old = 1",
+        "newText": "new = 2",
+    }
+
+    # Write with Path + Content + Overwrite.
+    write_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "wr1",
+            "name": "write_to_file",
+            "kind": "edit",
+            "title": "File notes.txt",
+            "rawInput": {"Path": "/D:/work/notes.txt", "Content": "hello\n", "Overwrite": True},
+        }
+    )
+    assert isinstance(write_start[0], ToolCallRequest)
+    assert write_start[0].name == "write"
+    assert write_start[0].args == {
+        "path": "D:/work/notes.txt",
+        "content": "hello\n",
+        "Overwrite": True,
+    }
+
+    # Multi-edit list, search, list, and web tools.
+    multi_edit = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "ed2",
+            "name": "edit_file",
+            "kind": "edit",
+            "rawInput": {
+                "Path": "/opt/work/a.py",
+                "Edits": [{"Target": "x", "Replacement": "y"}],
+            },
+        }
+    )
+    assert isinstance(multi_edit[0], ToolCallRequest)
+    assert multi_edit[0].name == "edit"
+    assert multi_edit[0].args == {
+        "path": "/opt/work/a.py",
+        "edits": [{"oldText": "x", "newText": "y"}],
+    }
+
+    search_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "s1",
+            "name": "grep_search",
+            "rawInput": {"Query": "needle", "SearchPath": "/opt/work"},
+        }
+    )[0]
+    assert isinstance(search_req, ToolCallRequest)
+    assert search_req.name == "grep"
+    assert search_req.args == {"pattern": "needle", "path": "/opt/work"}
+
+    web_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "w1",
+            "name": "search_web",
+            "rawInput": {"Query": "acp protocol"},
+        }
+    )[0]
+    assert isinstance(web_req, ToolCallRequest)
+    assert web_req.name == "web_search"
+    assert web_req.args == {"query": "acp protocol"}
+
+    # Empty write content and empty edit replacement are preserved as empty strings.
+    empty_write = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "w_empty",
+            "name": "write_file",
+            "kind": "edit",
+            "rawInput": {"Path": "/opt/work/empty.txt", "Content": ""},
+        }
+    )[0]
+    assert isinstance(empty_write, ToolCallRequest)
+    assert empty_write.name == "write"
+    assert empty_write.args == {"path": "/opt/work/empty.txt", "content": ""}
+
+    delete_edit = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "e_empty",
+            "name": "edit_file",
+            "kind": "edit",
+            "rawInput": {
+                "Path": "/opt/work/a.py",
+                "TargetContent": "remove me",
+                "ReplacementContent": "",
+            },
+        }
+    )[0]
+    assert isinstance(delete_edit, ToolCallRequest)
+    assert delete_edit.name == "edit"
+    assert delete_edit.args == {
+        "path": "/opt/work/a.py",
+        "oldText": "remove me",
+        "newText": "",
+    }
+
+    # Unmanaged bare permission fallback keeps original raw title and rawInput for policy rules.
+    raw_shell = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh_fallback",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "Run dangerous",
+            "rawInput": {"CommandLine": "rm -rf /tmp/x"},
+        }
+    )[0]
+    assert isinstance(raw_shell, ToolCallRequest) and raw_shell.name == "shell"
+    assert ex._extract_tool_call({"toolCall": {"toolCallId": "sh_fallback"}}) == (
+        "Run dangerous",
+        {"CommandLine": "rm -rf /tmp/x"},
+    )
+
+    # Bridged Omnigent MCP tool stays untouched so dispatch correlation keeps working.
+    ex._bridge_tool_aliases = frozenset(
+        {"sys_session_get_info", "mcp_omnigent_sys_session_get_info"}
+    )
+    bridge_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "mcp1",
+            "title": "sys_session_get_info",
+            "rawInput": {"Path": "keep-raw"},
+        }
+    )[0]
+    assert isinstance(bridge_req, ToolCallRequest)
+    assert bridge_req.name == "sys_session_get_info"
+    assert bridge_req.args == {"Path": "keep-raw"}
+    assert "internally_executed" not in bridge_req.metadata
+
+    # Non-AG ACP agent keeps its original tool name and rawInput unchanged.
+    other = AcpExecutor(AcpAgentConfig(command="opencode acp"))
+    other_req = other._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "o1",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "Custom Shell",
+            "rawInput": {"CommandLine": "ls"},
+        }
+    )[0]
+    assert isinstance(other_req, ToolCallRequest)
+    assert other_req.name == "Custom Shell"
+    assert other_req.args == {"CommandLine": "ls"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_tier", [False, True], ids=["unmanaged", "managed"])
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+async def test_agy_acp_interaction_routes_to_question_card(
+    host_tier: bool, permission_mode: str
+) -> None:
+    """AG ACP interaction_* requests route to ask_user_question cards and never auto-approve."""
+    from omnigent.server.schemas import ElicitationResult
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agy acp --stdio",
+            host_permission_tier=host_tier,
+            permission_mode=permission_mode,
+        )
+    )
+    ex._session_id = "session-1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    ex._policy_evaluator = AsyncMock()
+    ex._elicitation_handler = AsyncMock()
+    ex._elicitation_choice_handler = AsyncMock()
+
+    captured_params = []
+
+    async def fake_form(elicit_id: str, params) -> ElicitationResult:
+        captured_params.append((elicit_id, params))
+        return ElicitationResult(action="accept", content={"interaction_9960062f": "Needs review"})
+
+    ex._form_elicitation_handler = fake_form
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "interaction_9960062f",
+                "status": "pending",
+                "title": "Which result label should be used for the verification?",
+                "rawInput": {},
+            },
+            "options": [
+                {"optionId": "1", "name": "Verified", "kind": "allow_once"},
+                {"optionId": "2", "name": "Needs review", "kind": "allow_once"},
+            ],
+        },
+    }
+    await ex._respond_to_agent_request(request)
+
+    assert len(captured_params) == 1
+    _elicit_id, params = captured_params[0]
+    assert params.phase == "agy_ask_question"
+    assert params.policy_name == "agy_acp_ask_question"
+    assert params.model_extra["ask_user_question"] == {
+        "questions": [
+            {
+                "id": "interaction_9960062f",
+                "header": "Question",
+                "question": "Which result label should be used for the verification?",
+                "options": [{"label": "Verified"}, {"label": "Needs review"}],
+                "multiSelect": False,
+                "isOther": False,
+            }
+        ]
+    }
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+    reply = ex._send.await_args.args[0]
+    assert reply == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {"outcome": {"outcome": "selected", "optionId": "2"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_interaction_edge_cases_and_anti_spoofing(
+    windows_acp_permission_executor,
+) -> None:
+    """Verify reject_once selection, duplicate labels, dismiss, missing handler, and spoofing."""
+    from omnigent.server.schemas import ElicitationResult
+
+    def _make_req(
+        call_id: str, options: list[dict[str, object]], **tool_extra: object
+    ) -> dict[str, object]:
+        return {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {
+                    "toolCallId": call_id,
+                    "status": "pending",
+                    "title": "Pick one",
+                    "rawInput": {},
+                    **tool_extra,
+                },
+                "options": options,
+            },
+        }
+
+    # 1. Selecting a reject_once option still returns selected (not cancelled).
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(
+            action="accept", content={"interaction_reject": "Do not trust"}
+        )
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_reject",
+            [{"optionId": "deny", "name": "Do not trust", "kind": "reject_once"}],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "deny"}
+    }
+
+    # 2. Duplicate labels disambiguate; ambiguous raw label fails closed to cancelled.
+    seen_labels: list[list[str]] = []
+
+    async def pick_second(_eid: str, params) -> ElicitationResult:
+        opts = [
+            o["label"] for o in params.model_extra["ask_user_question"]["questions"][0]["options"]
+        ]
+        seen_labels.append(opts)
+        return ElicitationResult(action="accept", content={"interaction_dup": opts[1]})
+
+    ex._form_elicitation_handler = pick_second
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_dup",
+            [
+                {"optionId": "1", "name": "Same", "kind": "allow_once"},
+                {"optionId": "2", "name": "Same", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert seen_labels == [["Same (1)", "Same (2)"]]
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "2"}
+    }
+
+    # 2b. Label equal to another option's optionId resolves strictly by label, never raw ID.
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(
+            action="accept", content={"interaction_collide": "opt_allow"}
+        )
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_collide",
+            [
+                {"optionId": "opt_allow", "name": "Approve", "kind": "allow_once"},
+                {"optionId": "opt_deny", "name": "opt_allow", "kind": "reject_once"},
+            ],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "opt_deny"}
+    }
+
+    # 2c. Generated label colliding with a third option's label is disambiguated again.
+    seen_triple: list[list[str]] = []
+
+    async def pick_third(_eid: str, params) -> ElicitationResult:
+        opts = [
+            o["label"] for o in params.model_extra["ask_user_question"]["questions"][0]["options"]
+        ]
+        seen_triple.append(opts)
+        return ElicitationResult(action="accept", content={"interaction_triple": opts[2]})
+
+    ex._form_elicitation_handler = pick_third
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_triple",
+            [
+                {"optionId": "1", "name": "Same", "kind": "allow_once"},
+                {"optionId": "2", "name": "Same", "kind": "allow_once"},
+                {"optionId": "3", "name": "Same (1)", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert len(seen_triple) == 1 and len(set(seen_triple[0])) == 3
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "3"}
+    }
+
+    # 2d. Call acquiring tool rawInput or going terminal while card is open cancels on reply.
+    async def mutate_while_open(_eid: str, _params) -> ElicitationResult:
+        ex._note_agy_interaction_activity(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "interaction_mutated",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "whoami"},
+            },
+        )
+        return ElicitationResult(action="accept", content={"interaction_mutated": "Yes"})
+
+    ex._form_elicitation_handler = mutate_while_open
+    await ex._respond_to_agent_request(
+        _make_req("interaction_mutated", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    async def finish_while_open(_eid: str, _params) -> ElicitationResult:
+        ex._note_agy_interaction_activity(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "interaction_gone",
+                "status": "completed",
+            },
+        )
+        return ElicitationResult(action="accept", content={"interaction_gone": "Yes"})
+
+    ex._form_elicitation_handler = finish_while_open
+    await ex._respond_to_agent_request(
+        _make_req("interaction_gone", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # 2e. Already-tainted or stale question-shaped request under bypassPermissions cancels
+    # (never falls through to ordinary permission auto-approval).
+    bypass_ex = AcpExecutor(AcpAgentConfig(command="agy acp", permission_mode="bypassPermissions"))
+    bypass_ex._session_id = "s1"
+    bypass_ex._active_prompt_request_id = 1
+    bypass_ex._send = AsyncMock()
+    bypass_ex._form_elicitation_handler = AsyncMock()
+    bypass_ex._tainted_interaction_calls.add("interaction_tainted")
+    await bypass_ex._respond_to_agent_request(
+        _make_req("interaction_tainted", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # Without an active prompt, or during stale-queue drain even after a prior timeout left
+    # _active_prompt_request_id populated, unmanaged questions cancel without opening a card.
+    bypass_ex._active_prompt_request_id = None
+    await bypass_ex._respond_to_agent_request(
+        _make_req("interaction_stale", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    bypass_ex._active_prompt_request_id = 42
+    await bypass_ex._queue.put(
+        _make_req("interaction_drain", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    await bypass_ex._drain_stale_queue()
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._active_prompt_request_id is None
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # 3. Decline / no handler / duplicate optionId fail closed to cancelled.
+    ex._form_elicitation_handler = AsyncMock(return_value=ElicitationResult(action="decline"))
+    await ex._respond_to_agent_request(
+        _make_req("interaction_decline", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    ex._form_elicitation_handler = None
+    await ex._respond_to_agent_request(
+        _make_req("interaction_headless", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(action="accept", content={"interaction_bad": "1"})
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_bad",
+            [
+                {"optionId": "1", "name": "A", "kind": "allow_once"},
+                {"optionId": "1", "name": "B", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+    ex._form_elicitation_handler.assert_not_awaited()
+
+    # 4. Spoofed interaction_* with command rawInput or execute kind must not open a question card.
+    managed = windows_acp_permission_executor("auto")
+    managed._session_id = "s1"
+    managed._active_prompt_request_id = 1
+    managed._send = AsyncMock()
+    managed._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(action="accept", content={"interaction_spoof": "Allow"})
+    )
+    await managed._respond_to_agent_request(
+        _make_req(
+            "interaction_spoof",
+            [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+            kind="execute",
+            rawInput={"CommandLine": "rm -rf /"},
+        )
+    )
+    managed._form_elicitation_handler.assert_not_awaited()
+    assert managed._send.await_args.args[0]["error"]["code"] == -32000
+
+    # 5. Non-AG ACP agent with interaction_* keeps regular permission path.
+    non_ag = AcpExecutor(AcpAgentConfig(command="opencode acp"))
+    non_ag._session_id = "s1"
+    non_ag._send = AsyncMock()
+    non_ag._form_elicitation_handler = AsyncMock()
+    non_ag._elicitation_handler = AsyncMock(return_value=True)
+    await non_ag._respond_to_agent_request(
+        _make_req("interaction_other", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    non_ag._form_elicitation_handler.assert_not_awaited()
+    non_ag._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable wrapper script")
+@pytest.mark.asyncio
+async def test_agy_acp_fake_agent_e2e_read_file_and_interaction_card(tmp_path: Path) -> None:
+    """Fake AG ACP subprocess proves read_file body, normalized fields, and interaction_* cards."""
+    from omnigent.server.schemas import ElicitationResult
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe = workspace / "probe.txt"
+    probe.write_text("FAKE_AG_BODY_LINE\n", encoding="utf-8")
+
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"probe_path = {str(probe)!r}\n"
+        "def send(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "def upd(u):\n"
+        "    send({'jsonrpc': '2.0', 'method': 'session/update',\n"
+        "          'params': {'sessionId': 'ag-s1', 'update': u}})\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "              'result': {'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'sessionId': 'ag-s1'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        prompt_id = msg['id']\n"
+        "        upd({'sessionUpdate': 'tool_call', 'toolCallId': 'call_r',\n"
+        "             'name': 'read_file', 'kind': 'read', 'status': 'in_progress',\n"
+        "             'title': 'File probe.txt', 'rawInput': {'Path': probe_path}})\n"
+        "        upd({'sessionUpdate': 'tool_call_update', 'toolCallId': 'call_r',\n"
+        "             'name': 'read_file', 'kind': 'read', 'status': 'completed',\n"
+        "             'title': 'File probe.txt', 'rawInput': {'Path': probe_path}})\n"
+        "        send({\n"
+        "            'jsonrpc': '2.0', 'id': 99, 'method': 'session/request_permission',\n"
+        "            'params': {\n"
+        "                'sessionId': 'ag-s1',\n"
+        "                'toolCall': {\n"
+        "                    'toolCallId': 'interaction_e2e', 'status': 'pending',\n"
+        "                    'title': 'Pick label?', 'rawInput': {},\n"
+        "                },\n"
+        "                'options': [\n"
+        "                    {'optionId': 'opt_a', 'name': 'Alpha', 'kind': 'allow_once'},\n"
+        "                    {'optionId': 'opt_b', 'name': 'Beta', 'kind': 'allow_once'},\n"
+        "                ],\n"
+        "            },\n"
+        "        })\n"
+        "        reply = json.loads(sys.stdin.readline())\n"
+        "        chosen = reply.get('result', {}).get('outcome', {}).get('optionId')\n"
+        "        upd({'sessionUpdate': 'agent_message_chunk',\n"
+        "             'content': {'type': 'text', 'text': f'chosen={chosen}'}})\n"
+        "        send({'jsonrpc': '2.0', 'id': prompt_id,\n"
+        "              'result': {'stopReason': 'end_turn'}})\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([str(fake_agy), "acp"]), omnigent_mcp=False),
+        cwd=str(workspace),
+    )
+    seen_cards = []
+
+    async def fake_form(elicit_id: str, params) -> ElicitationResult:
+        seen_cards.append((elicit_id, params))
+        return ElicitationResult(action="accept", content={"interaction_e2e": "Beta"})
+
+    ex._form_elicitation_handler = fake_form
+    events: list[ExecutorEvent] = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "check"}], [], ""):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    comps = [e for e in events if isinstance(e, ToolCallComplete)]
+    texts = "".join(e.text for e in events if isinstance(e, TextChunk))
+    assert len(reqs) == 1 and reqs[0].name == "read" and reqs[0].args == {"path": str(probe)}
+    assert len(comps) == 1 and comps[0].name == "read" and comps[0].result == "FAKE_AG_BODY_LINE\n"
+    assert len(seen_cards) == 1 and seen_cards[0][1].phase == "agy_ask_question"
+    assert texts == "chosen=opt_b"
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorization(
+    tmp_path: Path,
+) -> None:
+    """Policy/tier denials block disk backfill; authorized reads backfill only the bound path."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    allowed_file = tmp_path / "ok.txt"
+    allowed_file.write_text("ALLOWED_CONTENT\n", encoding="utf-8")
+    secret_file = tmp_path / "control.json"
+    secret_file.write_text("BLOCKED_CONTENT\n", encoding="utf-8")
+
+    def _make_managed(verdict_fn):
+        ex = AcpExecutor(
+            AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True),
+            cwd=str(tmp_path),
+        )
+        ex._session_id = "s1"
+        ex._active_prompt_request_id = 1
+        ex._policy_evaluator = AsyncMock(side_effect=verdict_fn)
+        return ex
+
+    async def _eval(_phase: str, data: dict[str, object]) -> PolicyVerdictPayload:
+        path = str(data.get("arguments", {}).get("Path", ""))
+        if path.endswith("control.json"):
+            return PolicyVerdictPayload(action="POLICY_ACTION_DENY")
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+
+    ex = _make_managed(_eval)
+
+    # Policy-denied file inside workspace is never backfilled.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_denied",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(secret_file)},
+        },
+        update_session_id="s1",
+    )
+    events_denied = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_denied", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_denied)
+    assert isinstance(events_denied[0], ToolCallComplete) and events_denied[0].result is None
+
+    # Policy-allowed file inside workspace is backfilled for the active session.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_ok",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_ok = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_ok", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_ok)
+    assert isinstance(events_ok[0], ToolCallComplete)
+    assert events_ok[0].result == "ALLOWED_CONTENT\n"
+
+    # Missing sessionId on start fails closed when a session is active (policy & direct paths).
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_no_sess",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        }
+    )
+    events_no_sess = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_no_sess", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_no_sess)
+    assert isinstance(events_no_sess[0], ToolCallComplete) and events_no_sess[0].result is None
+
+    direct_ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"), cwd=str(tmp_path))
+    direct_ex._session_id = "s1"
+    direct_ex._active_prompt_request_id = 1
+    direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_direct_mismatch",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    direct_done = direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_direct_mismatch",
+            "status": "completed",
+        },
+        update_session_id="s_other",
+    )
+    assert isinstance(direct_done[0], ToolCallComplete) and direct_done[0].result is None
+
+    # Live subprocess without a startup workspace anchor fails closed instead of reopening by path.
+    direct_ex._proc = Mock(returncode=None)
+    direct_ex._workspace_dir_fd = None
+    direct_ex._workspace_win_handle = None
+    direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_unanchored",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    unanchored_done = direct_ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_unanchored", "status": "completed"},
+        update_session_id="s1",
+    )
+    assert isinstance(unanchored_done[0], ToolCallComplete) and unanchored_done[0].result is None
+
+    # Cross-session update never backfills.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_wrong_sess",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_wrong = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_wrong_sess", "status": "completed"},
+        update_session_id="s_other",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s_other", events_wrong)
+    assert isinstance(events_wrong[0], ToolCallComplete) and events_wrong[0].result is None
+
+    # Explicit permission denial prevents backfill even if a completion later arrives.
+    ex._denied_permission_calls.add("r_perm_denied")
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_perm_denied",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_perm_denied = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_perm_denied",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_perm_denied)
+    assert isinstance(events_perm_denied[0], ToolCallComplete)
+    assert events_perm_denied[0].result is None
+
+    # Foreign-session tool_call start is not cached for backfill in the active session.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_foreign_start",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s_foreign",
+    )
+    events_foreign = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_foreign_start",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_foreign)
+    assert isinstance(events_foreign[0], ToolCallComplete) and events_foreign[0].result is None
+
+    # Dual path fields (AbsolutePath + Path) never allow policy/reader mismatch.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_dual_policy",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"AbsolutePath": str(allowed_file), "Path": str(secret_file)},
+        },
+        update_session_id="s1",
+    )
+    events_dual = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_dual_policy",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_dual)
+    assert isinstance(events_dual[0], ToolCallComplete) and events_dual[0].result is None
+
+    # ASK verdict from policy also blocks silent backfill.
+    async def _ask_only(_phase: str, _data: dict[str, object]) -> PolicyVerdictPayload:
+        return PolicyVerdictPayload(action="POLICY_ACTION_ASK")
+
+    ex_ask = _make_managed(_ask_only)
+    ex_ask._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_ask",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_ask = ex_ask._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_ask", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex_ask._resolve_agy_read_backfills("s1", "s1", events_ask)
+    assert isinstance(events_ask[0], ToolCallComplete) and events_ask[0].result is None
+    ex_ask._policy_evaluator.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_executor_adapter_wires_form_elicitation_round_trip() -> None:
+    """ExecutorAdapter.run_turn auto-wires _form_elicitation_handler for AG interaction_* cards."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, ElicitationResult
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    adapter = ExecutorAdapter(executor_factory=lambda: ex)
+
+    seen_params = []
+
+    class _FakeFormCtx(_RecordingCtx):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_id = "sess_1"
+            self.cancelled = asyncio.Event()
+            self.completed = False
+
+        async def elicit(self, elicitation_id: str, params) -> ElicitationResult:
+            seen_params.append((elicitation_id, params))
+            return ElicitationResult(action="accept", content={"interaction_adp": "Verified"})
+
+        def complete(self) -> None:
+            self.completed = True
+
+    async def fake_run_turn(*_args: object, **_kwargs: object):
+        assert ex._form_elicitation_handler == adapter._stable_form_elicitation_handler
+        await ex._respond_to_agent_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {
+                        "toolCallId": "interaction_adp",
+                        "status": "pending",
+                        "title": "Confirm label?",
+                        "rawInput": {},
+                    },
+                    "options": [
+                        {"optionId": "v1", "name": "Verified", "kind": "allow_once"},
+                        {"optionId": "v2", "name": "Retry", "kind": "reject_once"},
+                    ],
+                },
+            }
+        )
+        yield TurnComplete(response="ok")
+
+    ex.run_turn = fake_run_turn  # type: ignore[method-assign]
+    ctx = _FakeFormCtx()
+    request = CreateResponseRequest(model="agy", input=[{"role": "user", "content": "hi"}])
+    await adapter.run_turn(request, ctx)  # type: ignore[arg-type]
+
+    assert len(seen_params) == 1
+    assert seen_params[0][1].phase == "agy_ask_question"
+    assert ex._send.await_args.args[0] == {
+        "jsonrpc": "2.0",
+        "id": 15,
+        "result": {"outcome": {"outcome": "selected", "optionId": "v1"}},
+    }
+
+
+# ---------------------------------------------------------------------------
+# ACP tool-active idle pause & Antigravity 30-minute background wrapup
+# ---------------------------------------------------------------------------
+
+
+class _FakeAcpClock:
+    """Deterministic virtual clock for ACP timeout and background-wait tests."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self._executor: AcpExecutor | None = None
+
+    def __call__(self) -> float:
+        return self.now
+
+    def bind(self, executor: AcpExecutor) -> None:
+        self._executor = executor
+
+    async def settle(self) -> None:
+        for _ in range(8):
+            await asyncio.sleep(0)
+
+    async def advance(self, seconds: float) -> None:
+        # Process items queued before this tick at the prior timestamp first.
+        await self.settle()
+        self.now += seconds
+        if self._executor is not None:
+            self._executor._wake_turn()
+        await self.settle()
+
+
+def _acp_update_frame(session_id: str, update: dict[str, object]) -> dict[str, object]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"sessionId": session_id, "update": update},
+    }
+
+
+@pytest.mark.asyncio
+async def test_acp_idle_timer_pauses_and_refreshes_during_long_tool_run() -> None:
+    """Active tools pause the 300s idle timer and refresh their window on progress."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "build"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make all"},
+            },
+        )
+    )
+    await clock.advance(600.0)  # Well past 300s prompt idle timeout.
+    assert not task.done()
+
+    # Streaming progress on the active tool refreshes the 3600s silent-tool cap.
+    await clock.advance(2900.0)  # 3500s total.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-1",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "still going"}}
+                ],
+            },
+        )
+    )
+    await clock.advance(700.0)  # 4200s total (> 3600s from start), still alive.
+    assert not task.done()
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-1",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        )
+    )
+    await clock.advance(250.0)  # Under 300s post-tool idle window.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Build complete."},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.status is ToolCallStatus.SUCCESS for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Build complete."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["cancelled-tool", "slow-approval"])
+async def test_acp_idle_timer_cancelled_tool_and_slow_approval(scenario: str) -> None:
+    """Cancelled tools release the pause; slow human approvals do not burn the tool window."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    async def slow_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        await clock.advance(4000.0)  # Human takes >1h to click Allow.
+        return True
+
+    ex._send = send  # type: ignore[assignment]
+    ex._elicitation_handler = slow_elicit  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    await clock.advance(10.0)
+
+    if scenario == "cancelled-tool":
+        ex._queue.put_nowait(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "cmd-1",
+                    "status": "cancelled",
+                },
+            )
+        )
+        await clock.advance(301.0)
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], ExecutorError)
+        assert events[-1].message == "Timeout waiting for ACP response"
+        return
+
+    ex._queue.put_nowait(
+        {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "cmd-1", "title": "run_command"},
+                "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+            },
+        }
+    )
+    await clock.advance(1000.0)  # Still within fresh 3600s window after approval.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {"sessionUpdate": "tool_call_update", "toolCallId": "cmd-1", "status": "completed"},
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_background_work_reports_before_turn_settles() -> None:
+    """After agy's prompt returns, active background work reports before TurnComplete."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "start build"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-cmd",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "pytest -q", "IsDaemon": False},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Running in background.\n"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result(
+        {"result": {"stopReason": "end_turn", "usage": {"totalTokens": 12}}}
+    )
+
+    # 20 minutes pass while the background command is still running — turn stays open.
+    await clock.advance(1200.0)
+    assert not task.done()
+    assert not any(isinstance(ev, TurnComplete) for ev in events)
+
+    # Background command completes and agy streams its follow-up summary + usage_update.
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bg-cmd",
+                "status": "completed",
+                "rawOutput": "42 passed",
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Background build passed: 42 tests."},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame("s1", {"sessionUpdate": "usage_update", "size": 128000})
+    )
+    await clock.advance(2.0)
+    assert not task.done()
+    await clock.advance(2.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert any(
+        isinstance(ev, ToolCallComplete)
+        and ev.metadata == {"call_id": "bg-cmd"}
+        and ev.status is ToolCallStatus.SUCCESS
+        for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Running in background.\nBackground build passed: 42 tests."
+    assert events[-1].usage == {"total_tokens": 12}
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_background_work_settles_labelled_at_30_min_bound() -> None:
+    """An agy turn whose background work never finishes settles labelled at 30 minutes."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "long job"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-long",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "sleep 3600"},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Job started."},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+
+    await clock.advance(1799.0)
+    assert not task.done()
+    await clock.advance(1.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert not any(isinstance(ev, ExecutorError) for ev in events)
+    assert isinstance(events[-1], TurnComplete)
+    assert "30 minutes" in (events[-1].response or "")
+    assert "still running" in (events[-1].response or "")
+    assert any(isinstance(ev, TextChunk) and "30 minutes" in ev.text for ev in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["daemon", "denied", "non-agy", "cancelled-stop"])
+async def test_agy_post_prompt_wait_skips_daemons_denied_non_agy_and_cancelled(case: str) -> None:
+    """Daemons, denied tools, non-AG agents, and non-end_turn stops settle immediately."""
+    clock = _FakeAcpClock()
+    command = "gemini --experimental-acp" if case == "non-agy" else "agy acp"
+    ex = AcpExecutor(AcpAgentConfig(command=command, omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._elicitation_handler = AsyncMock(return_value=False)
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") != "session/prompt":
+            return
+        raw_input: dict[str, object] = {"CommandLine": "npm run dev"}
+        if case == "daemon":
+            raw_input["IsDaemon"] = True
+        ex._queue.put_nowait(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "pending" if case == "denied" else "in_progress",
+                    "rawInput": raw_input,
+                },
+            )
+        )
+        if case == "denied":
+            ex._queue.put_nowait(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "s1",
+                        "toolCall": {"toolCallId": "bg-1", "title": "run_command"},
+                        "options": [
+                            {"optionId": "once", "kind": "allow_once", "name": "Allow"},
+                            {"optionId": "no", "kind": "reject_once", "name": "Deny"},
+                        ],
+                    },
+                }
+            )
+        stop = "cancelled" if case == "cancelled-stop" else "end_turn"
+        ex._pending[message["id"]].set_result({"result": {"stopReason": stop}})  # type: ignore[index]
+
+    ex._send = send  # type: ignore[assignment]
+    events = await asyncio.wait_for(
+        _collect_events(ex.run_turn([{"role": "user", "content": "go"}], [], "")),
+        timeout=2.0,
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert "still running" not in (events[-1].response or "")
+
+
+async def _collect_events(stream) -> list[ExecutorEvent]:
+    return [ev async for ev in stream]
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_subagent_and_managed_permission_binding() -> None:
+    """Post-prompt subagent work keeps the turn open and binds managed host-tier permissions."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    perm_replied = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+        elif message.get("id") == 201:
+            perm_replied.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+    reply_seen = asyncio.Event()
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "delegate"}], [], ""):
+            events.append(ev)
+            if isinstance(ev, TextChunk) and "Subagent finished." in ev.text:
+                reply_seen.set()
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child-1",
+                    "state": {"state": "running"},
+                },
+            )
+        )
+        feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}})
+        await clock.advance(600.0)
+        assert not task.done()
+
+        # Post-prompt permission request in the still-open AG turn binds cleanly.
+        cmd_input = {"CommandLine": "omni --version"}
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "post-cmd",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 201,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "post-cmd", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(perm_replied.wait(), timeout=2.0)
+        await clock.advance(5.0)
+        perm_replies = [m for m in sent if m.get("id") == 201]
+        assert perm_replies == [
+            {
+                "jsonrpc": "2.0",
+                "id": 201,
+                "result": {"outcome": {"outcome": "selected", "optionId": "once"}},
+            }
+        ]
+
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "post-cmd",
+                    "status": "completed",
+                },
+            )
+        )
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child-1",
+                    "state": {"state": "idle"},
+                },
+            )
+        )
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Subagent finished."},
+                },
+            )
+        )
+        # No usage_update: settles after the 3s quiet settle grace on virtual clock.
+        await asyncio.wait_for(reply_seen.wait(), timeout=2.0)
+        await clock.advance(2.0)
+        assert not task.done()
+        await clock.advance(2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Subagent finished."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["interrupt", "eof"])
+async def test_agy_post_prompt_interrupt_and_eof_exit_promptly(exit_mode: str) -> None:
+    """User Stop or subprocess EOF during AG background wait exits immediately."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "sleep 600"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(10.0)
+    assert not task.done()
+
+    if exit_mode == "interrupt":
+        assert await ex.interrupt_session("s1") is True
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnCancelled)
+    else:
+        ex._stdout_eof_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], ExecutorError)
+        assert "closed stdout" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_agy_fake_acp_subprocess_background_wrapup_end_to_end(tmp_path: Path) -> None:
+    """Fake-agy ACP subprocess over stdio reports post-prompt background work before settling."""
+    script = tmp_path / "fake_agy.py"
+    script.write_text(
+        """
+import json, sys, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"protocolVersion": 1, "agentCapabilities": {}},
+        })
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "agy-e2e"}})
+    elif method == "session/prompt":
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-e2e",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "echo hi"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Started.\\n"},
+                },
+            },
+        })
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
+        time.sleep(0.05)
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bg-e2e",
+                    "status": "completed",
+                    "rawOutput": "hi",
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Finished: hi"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {"sessionUpdate": "usage_update", "size": 64000},
+            },
+        })
+""".lstrip(),
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command=f"{shlex.quote(str(wrapper))} acp", name="Fake AG", omnigent_mcp=False
+        ),
+        cwd=str(tmp_path),
+    )
+    try:
+        events = await asyncio.wait_for(
+            _collect_events(ex.run_turn([{"role": "user", "content": "run bg"}], [], "")),
+            timeout=10.0,
+        )
+    finally:
+        await ex.close()
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "bg-e2e"} for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Started.\nFinished: hi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["rpc-error", "cancelled-stop", "interrupted-inflight"])
+async def test_agy_managed_permission_rejected_after_failed_cancelled_or_interrupted_prompt(
+    case: str,
+) -> None:
+    """Host-tier permissions never bind or grant after prompt error, cancel stop, or Stop."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    policy_entered = asyncio.Event()
+    release_policy = asyncio.Event()
+
+    async def evaluate_policy(*_args, **_kwargs) -> PolicyVerdictPayload:
+        policy_entered.set()
+        if case == "interrupted-inflight":
+            await release_policy.wait()
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+
+    ex._policy_evaluator = evaluate_policy  # type: ignore[assignment]
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        cmd_input = {"CommandLine": "omni --version"}
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cmd-perm",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 301,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "cmd-perm", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        if case == "rpc-error":
+            feed(
+                {
+                    "jsonrpc": "2.0",
+                    "id": prompt_id[0],
+                    "error": {"code": -32000, "message": "prompt failed"},
+                }
+            )
+        elif case == "cancelled-stop":
+            feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "cancelled"}})
+        else:
+            await asyncio.wait_for(policy_entered.wait(), timeout=2.0)
+            assert await ex.interrupt_session("s1") is True
+            release_policy.set()
+            feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "cancelled"}})
+
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        release_policy.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    perm_replies = [m for m in sent if m.get("id") == 301]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 301,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+    if case == "rpc-error":
+        assert isinstance(events[-1], ExecutorError)
+    else:
+        assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_burst_completion_behind_prompt_response_not_dropped() -> None:
+    """Fast background completion queued right behind end_turn is delivered before TurnComplete."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "burst"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        burst = [
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-burst",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "echo fast"},
+                },
+            ),
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bg-burst",
+                    "status": "completed",
+                    "rawOutput": "fast",
+                },
+            ),
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Burst done."},
+                },
+            ),
+            _acp_update_frame("s1", {"sessionUpdate": "usage_update", "size": 32000}),
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await clock.settle()
+        await clock.advance(3.5)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "bg-burst"}
+        for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Burst done."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_mode", ["deadline", "interrupt"])
+async def test_agy_post_prompt_bounded_request_aborts_on_deadline_and_interrupt(
+    abort_mode: str,
+) -> None:
+    """An unanswered post-prompt permission request never exceeds the 30m bound or delays Stop."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    elicit_started = asyncio.Event()
+    never_answered = asyncio.Event()
+
+    async def hanging_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        elicit_started.set()
+        await never_answered.wait()
+        return True
+
+    ex._elicitation_handler = hanging_elicit  # type: ignore[assignment]
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(60.0)
+    assert not task.done()
+
+    ex._queue.put_nowait(
+        {
+            "jsonrpc": "2.0",
+            "id": 401,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "bg-perm", "title": "run_command"},
+                "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+            },
+        }
+    )
+    await asyncio.wait_for(elicit_started.wait(), timeout=2.0)
+
+    if abort_mode == "deadline":
+        await clock.advance(1740.0)  # Reaches exact 1800s post-prompt bound.
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnComplete)
+        assert "30 minutes" in (events[-1].response or "")
+        assert "still running" in (events[-1].response or "")
+    else:
+        assert await ex.interrupt_session("s1") is True
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnCancelled)
+
+    perm_replies = [m for m in sent if m.get("id") == 401]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 401,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acp_close_during_foreground_prompt_exits_without_spinning() -> None:
+    """Closing the executor during a foreground prompt fails fast instead of spinning."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="example-agent", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    proc = Mock(spec=asyncio.subprocess.Process, returncode=None, stdout=stdout)
+    proc.stdin = Mock()
+    proc.stdin.close = Mock()
+    proc.wait = AsyncMock(return_value=0)
+    ex._proc = proc
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    prompt_sent = asyncio.Event()
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+    await clock.settle()
+    assert not task.done()
+
+    await ex.close()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(events[-1], ExecutorError)
+    assert "closed stdout" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_acp_tool_progress_resets_harness_idle_watchdog_through_adapter() -> None:
+    """Statusless tool_call_update refreshes TurnContext's idle watchdog via ExecutorAdapter."""
+    from omnigent.db.utils import generate_task_id
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    adapter = ExecutorAdapter(lambda: ex, session_key="stub")
+    watchdog_resets = 0
+
+    def reset_watchdog() -> None:
+        nonlocal watchdog_resets
+        watchdog_resets += 1
+
+    ctx = TurnContext(
+        response_id=generate_task_id(),
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    ctx._reset_idle_watchdog = reset_watchdog
+    adapter._in_flight[ctx.response_id] = ctx
+
+    task = asyncio.create_task(
+        adapter.run_turn(CreateResponseRequest(model="agent", input="build"), ctx)
+    )
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-long",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make all"},
+            },
+        )
+    )
+    await clock.settle()
+    resets_before_progress = watchdog_resets
+    queue_size_before = ctx._event_queue.qsize()
+
+    # Statusless progress emits no SSE event, yet must still refresh the harness watchdog.
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-long",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "compiling..."}}
+                ],
+            },
+        )
+    )
+    await clock.settle()
+    assert ctx._event_queue.qsize() == queue_size_before
+    assert watchdog_resets > resets_before_progress
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-long",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_agy_foreground_request_and_blocked_abort_send_respect_30m_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight Phase 1 requests and backpressured abort sends still obey the 30m bound."""
+    monkeypatch.setattr(acp_executor_module, "_ABORT_REPLY_TIMEOUT_SECONDS", 0.05)
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    elicit_started = asyncio.Event()
+    never_answered = asyncio.Event()
+    abort_attempted = asyncio.Event()
+
+    async def hanging_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        elicit_started.set()
+        await never_answered.wait()
+        return True
+
+    ex._elicitation_handler = hanging_elicit  # type: ignore[assignment]
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+            return
+        if message.get("id") == 450:
+            abort_attempted.set()
+            await never_answered.wait()  # Simulate stdin backpressure on abort delivery.
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "make"},
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 450,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "fg-perm", "title": "run_command"},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(elicit_started.wait(), timeout=2.0)
+
+        # Prompt ends while the Phase 1 permission request is still awaiting.
+        feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}})
+        await clock.advance(1800.0)
+        await asyncio.wait_for(abort_attempted.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        never_answered.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert "30 minutes" in (events[-1].response or "")
+    assert "still running" in (events[-1].response or "")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_acp_turn_drains_trailing_text_after_prompt_response() -> None:
+    """Ordinary ACP turns still drain trailing queued chunks after the prompt response arrives."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="example-agent", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        burst = [
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "trailing text"},
+                },
+            ),
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "trailing text"
+
+
+@pytest.mark.asyncio
+async def test_agy_entering_background_wait_refreshes_harness_idle_watchdog() -> None:
+    """Transitioning into AG post-prompt background wait refreshes the harness idle watchdog."""
+    from omnigent.db.utils import generate_task_id
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    adapter = ExecutorAdapter(lambda: ex, session_key="stub")
+    watchdog_resets = 0
+
+    def reset_watchdog() -> None:
+        nonlocal watchdog_resets
+        watchdog_resets += 1
+
+    ctx = TurnContext(
+        response_id=generate_task_id(),
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    ctx._reset_idle_watchdog = reset_watchdog
+    adapter._in_flight[ctx.response_id] = ctx
+
+    task = asyncio.create_task(
+        adapter.run_turn(CreateResponseRequest(model="agent", input="bg"), ctx)
+    )
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-watchdog",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    await clock.settle()
+    resets_before_end_turn = watchdog_resets
+
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(1.0)
+    assert not task.done()
+    assert watchdog_resets > resets_before_end_turn
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bg-watchdog",
+                "status": "completed",
+            },
+        )
+    )
+    await clock.advance(5.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_agy_malformed_error_prompt_response_never_reopens_managed_permissions() -> None:
+    """A malformed response with non-dict error and end_turn fails closed on permissions."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        cmd_input = {"CommandLine": "omni --version"}
+        burst = [
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "sleep 60"},
+                },
+            ),
+            {
+                "jsonrpc": "2.0",
+                "id": prompt_id[0],
+                "error": "malformed error string",
+                "result": {"stopReason": "end_turn"},
+            },
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cmd-after-malformed",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            ),
+            {
+                "jsonrpc": "2.0",
+                "id": 501,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "cmd-after-malformed", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            },
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    perm_replies = [m for m in sent if m.get("id") == 501]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 501,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+    assert isinstance(events[-1], ExecutorError)
+    assert "malformed error string" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_usage_update_keeps_quiet_settle_for_trailing_text() -> None:
+    """A usage_update does not cut off trailing text arriving within the 3s quiet-settle grace."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    prompt_sent = asyncio.Event()
+    first_seen = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "check"}], [], ""):
+            events.append(ev)
+            if isinstance(ev, TextChunk) and "First" in ev.text:
+                first_seen.set()
+
+    def feed(*frames: dict[str, object]) -> None:
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in frames))
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-u",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                },
+            ),
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bg-u",
+                    "status": "completed",
+                    "rawOutput": "ok",
+                },
+            ),
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "First"},
+                },
+            ),
+            _acp_update_frame("s1", {"sessionUpdate": "usage_update", "size": 64000}),
+        )
+        await asyncio.wait_for(first_seen.wait(), timeout=2.0)
+        await clock.advance(1.0)
+        assert not task.done()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": " Second"},
+                },
+            )
+        )
+        await clock.settle()
+        await clock.advance(3.5)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "First Second"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("managed", "reply_kind", "expect_body"),
+    [
+        (False, "end_turn", True),
+        (True, "end_turn", True),
+        (True, "rpc_error", False),
+        (True, "cancelled", False),
+    ],
+)
+async def test_agy_buffered_prompt_reply_preserves_read_file_backfill(
+    tmp_path: Path,
+    managed: bool,
+    reply_kind: str,
+    expect_body: bool,
+) -> None:
+    """Buffered tool_call + completion + prompt end_turn preserves AG read_file body backfill."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    target = tmp_path / "note.txt"
+    target.write_text("hello from disk\n", encoding="utf-8")
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agy acp --stdio",
+            host_permission_tier=managed,
+            omnigent_mcp=False,
+        ),
+        cwd=str(tmp_path),
+    )
+    ex._anchor_workspace_fd()
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    if managed:
+        ex._policy_evaluator = AsyncMock(
+            return_value=PolicyVerdictPayload(
+                action="POLICY_ACTION_ALLOW",
+                data={"_omnigent_acp_tier": "allow"},
+            )
+        )
+
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "read note"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+        if reply_kind == "rpc_error":
+            prompt_reply: dict[str, object] = {
+                "jsonrpc": "2.0",
+                "id": prompt_id[0],
+                "error": {"code": -32000, "message": "prompt failed"},
+            }
+        else:
+            prompt_reply = {
+                "jsonrpc": "2.0",
+                "id": prompt_id[0],
+                "result": {"stopReason": reply_kind},
+            }
+        burst = [
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "read-1",
+                    "title": "read_file",
+                    "kind": "read",
+                    "status": "in_progress",
+                    "rawInput": {"Path": str(target)},
+                },
+            ),
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "read-1",
+                    "status": "completed",
+                },
+            ),
+            prompt_reply,
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+        ex._close_workspace_fd()
+
+    completions = [
+        ev
+        for ev in events
+        if isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "read-1"}
+    ]
+    assert len(completions) == 1
+    if expect_body:
+        assert "hello from disk" in str(completions[0].result)
+    else:
+        assert completions[0].result in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_acp_phase1_permission_aborts_on_prompt_error_without_waiting_for_policy() -> None:
+    """A Phase 1 prompt error cancels an in-flight permission policy await immediately."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False)
+    )
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    policy_entered = asyncio.Event()
+    never_returns = asyncio.Event()
+
+    async def hanging_policy(*_args, **_kwargs) -> PolicyVerdictPayload:
+        policy_entered.set()
+        await never_returns.wait()
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"}
+        )
+
+    ex._policy_evaluator = hanging_policy  # type: ignore[assignment]
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+        cmd_input = {"CommandLine": "omni --version"}
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cmd-hang",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 601,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "cmd-hang", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(policy_entered.wait(), timeout=2.0)
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": prompt_id[0],
+                "error": {"code": -32000, "message": "prompt failed"},
+            }
+        )
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        never_returns.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    perm_replies = [m for m in sent if m.get("id") == 601]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 601,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+    assert isinstance(events[-1], ExecutorError)
+    assert "prompt failed" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_acp_phase2_read_backfill_policy_aborts_at_deadline_without_reading_disk(
+    tmp_path: Path,
+) -> None:
+    """A Phase 2 read_file backfill policy await cannot outlive the 30m deadline or read disk."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    target = tmp_path / "secret.txt"
+    target.write_text("late-disk-body\n", encoding="utf-8")
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        cwd=str(tmp_path),
+        clock=clock,
+    )
+    clock.bind(ex)
+    ex._anchor_workspace_fd()
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    policy_entered = asyncio.Event()
+    never_returns = asyncio.Event()
+
+    async def hanging_policy(*_args, **_kwargs) -> PolicyVerdictPayload:
+        policy_entered.set()
+        await never_returns.wait()
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_ALLOW", data={"_omnigent_acp_tier": "allow"}
+        )
+
+    ex._policy_evaluator = hanging_policy  # type: ignore[assignment]
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "bg read"}], [], ""):
+            events.append(ev)
+
+    def feed(*frames: dict[str, object]) -> None:
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in frames))
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-job",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                },
+            ),
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+        )
+        await clock.advance(60.0)
+        assert not task.done()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "late-read",
+                    "title": "read_file",
+                    "kind": "read",
+                    "status": "in_progress",
+                    "rawInput": {"Path": str(target)},
+                },
+            ),
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "late-read",
+                    "status": "completed",
+                },
+            ),
+        )
+        await asyncio.wait_for(policy_entered.wait(), timeout=2.0)
+        await clock.advance(1745.0)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        never_returns.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+        ex._close_workspace_fd()
+
+    completions = [
+        ev
+        for ev in events
+        if isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "late-read"}
+    ]
+    assert len(completions) == 1
+    assert completions[0].result in (None, "")
+    assert isinstance(events[-1], TurnComplete)
+    assert "30 minutes" in (events[-1].response or "")
+
+
+@pytest.mark.asyncio
+async def test_acp_windows_close_reaps_survivors_after_prompt_launcher_exit_and_retains_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, close() runs survivor reaping off-loop even when launcher exits promptly."""
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False))
+    proc = Mock(spec=asyncio.subprocess.Process, returncode=None, pid=4242)
+    proc.stdin = Mock()
+    proc.stdin.close = Mock()
+
+    async def prompt_exit() -> int:
+        proc.returncode = 0
+        return 0
+
+    proc.wait = AsyncMock(side_effect=prompt_exit)
+    ex._proc = proc
+
+    calls: list[str] = []
+    unresolved = [True]
+
+    def fake_terminate(target: object) -> None:
+        assert target is proc
+        calls.append("terminate")
+
+    def fake_kill(target: object) -> None:
+        assert target is proc
+        calls.append("kill")
+        if calls.count("kill") >= 2:
+            unresolved[0] = False
+
+    def fake_has_unresolved(target: object) -> bool:
+        assert target is proc
+        return unresolved[0]
+
+    monkeypatch.setattr(acp_executor_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(acp_executor_module._proc, "terminate_tree", fake_terminate)
+    monkeypatch.setattr(acp_executor_module._proc, "kill_tree", fake_kill)
+    monkeypatch.setattr(
+        acp_executor_module._proc, "has_unresolved_identities", fake_has_unresolved
+    )
+
+    await ex.close()
+    assert calls == ["terminate", "kill"]
+    # Unresolved identities retain self._proc for a retry close().
+    assert ex._proc is proc
+
+    await ex.close()
+    assert calls == ["terminate", "kill", "kill"]
+    assert ex._proc is None

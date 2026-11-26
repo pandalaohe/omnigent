@@ -4773,6 +4773,8 @@ class TestCodexExecutor(unittest.TestCase):
 
             class TimedEvents(asyncio.Queue):
                 async def get(queue_self):
+                    if not events:
+                        return await super().get()
                     await asyncio.sleep(0)
                     self.assertEqual(session.active_turn_id, "turn-1")
                     clock.now, message = events.pop(0)
@@ -4799,6 +4801,7 @@ class TestCodexExecutor(unittest.TestCase):
                     codex_executor_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
                 ),
                 patch.object(codex_executor_module, "_TURN_EVENT_WARN_SECONDS", 3.0),
+                patch.object(codex_executor_module, "_TURN_COMPLETED_DRAIN_SECONDS", 0.01),
                 patch.object(codex_executor_module.logger, "warning", side_effect=record_warning),
             ):
                 output = [
@@ -13202,3 +13205,68 @@ async def test_disabled_mcp_restarts_plan_from_original_baseline(disabled_mcp_se
         ("base=true",),
     ]
     assert harness.session._codex_config_overrides == ["base=true"]
+
+
+@pytest.mark.asyncio
+async def test_codex_windows_subprocesses_set_create_no_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess as stdlib_subprocess
+    from types import SimpleNamespace
+
+    from omnigent.inner import _proc, codex_executor
+
+    no_window = 0x08000000
+    new_group = 0x00000200
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_CREATE_NEW_PROCESS_GROUP", new_group)
+    monkeypatch.setattr(stdlib_subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+
+    async_spawns: list[dict[str, object]] = []
+
+    async def _fake_async_exec(*args: object, **kwargs: object) -> object:
+        async_spawns.append(dict(kwargs))
+        return SimpleNamespace(
+            communicate=AsyncMock(return_value=(b"codex-cli 0.146.0\n", b"")),
+            kill=Mock(),
+            wait=AsyncMock(return_value=0),
+            returncode=0,
+        )
+
+    monkeypatch.setattr(
+        codex_executor,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=_fake_async_exec,
+            subprocess=asyncio.subprocess,
+            wait_for=asyncio.wait_for,
+        ),
+    )
+
+    version = await codex_executor._codex_cli_version_text("/opt/work/bin/codex")
+    assert version == "0.146.0"
+    assert async_spawns[0]["creationflags"] == no_window
+
+    await codex_executor._create_subprocess_exec("/opt/work/bin/codex", **_proc.spawn_kwargs())
+    assert async_spawns[1]["creationflags"] == new_group | no_window
+
+    sync_flags: list[object] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> stdlib_subprocess.CompletedProcess[object]:
+        sync_flags.append(kwargs.get("creationflags"))
+        payload = {"models": [{"slug": "gpt-5.4", "supported_in_api": True}]}
+        raw = json.dumps(payload)
+        stdout: object = raw if kwargs.get("text") else raw.encode("utf-8")
+        return stdlib_subprocess.CompletedProcess(
+            argv, 0, stdout=stdout, stderr="" if kwargs.get("text") else b""
+        )
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _fake_run)
+    catalog = codex_executor._probe_codex_model_catalog(
+        "/opt/work/bin/codex", tmp_path, timeout=5.0
+    )
+    assert catalog is not None
+    codex_executor.write_required_brokered_model_catalog(
+        tmp_path / "out", codex_path="/opt/work/bin/codex"
+    )
+    assert sync_flags == [no_window, no_window]
