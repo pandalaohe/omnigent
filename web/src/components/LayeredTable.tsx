@@ -307,7 +307,7 @@ export function LayeredTable({
 
   function renderRow(row: LayeredTableRow) {
     return (
-      <tr key={row.id} className="[&:last-child>*]:border-b-0">
+      <tr key={`row:${row.id}`} className="[&:last-child>*]:border-b-0">
         <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
           <div className="flex size-full min-w-0 items-stretch">
             <div className="min-w-0 flex-1">
@@ -380,7 +380,7 @@ export function LayeredTable({
 
   function renderDetailRow(row: { id: string; content: ReactNode }) {
     return (
-      <tr key={row.id} className="[&:last-child>*]:border-b-0">
+      <tr key={`detail:${row.id}`} className="[&:last-child>*]:border-b-0">
         <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
           {row.content}
         </th>
@@ -486,7 +486,7 @@ export function LayeredTable({
             {[
               ...topRows.map(renderRow),
               foldedCount > 0 && (
-                <tr key="layered-fold" className="[&:last-child>*]:border-b-0">
+                <tr key="fold" className="[&:last-child>*]:border-b-0">
                   <td colSpan={columns.length + 1} className={cn(LEVEL_CELL, "bg-muted/40")}>
                     <button
                       type="button"

@@ -653,7 +653,6 @@ export function AgentDefaultsTable({
         </HelpTip>
       </div>
       <LayeredTable
-        key={field}
         label={`${FIELDS.find((item) => item.value === field)?.label} defaults`}
         cornerLabel={field === "permission" ? "All agents" : "Agent"}
         cornerDetail={

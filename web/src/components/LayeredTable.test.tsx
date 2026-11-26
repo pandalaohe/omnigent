@@ -456,6 +456,7 @@ describe("LayeredTable and LayeredEditor", () => {
 
   it("keeps a marked row or a configured cell on any listed host on top and folds detail rows", async () => {
     const user = userEvent.setup();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     render(
       <LayeredTable
         label="Read-only layers"
@@ -463,12 +464,12 @@ describe("LayeredTable and LayeredEditor", () => {
         readOnly
         foldUnconfiguredBy={["desktop", "laptop"]}
         rows={[
-          { id: "plain", label: "Plain" },
+          { id: "fold", label: "Plain" },
           { id: "marked", label: "Marked", mark: true },
           { id: "reported", label: "Reported" },
           { id: "remote", label: "Remote" },
         ]}
-        detailRows={[{ id: "custom", content: <span>Custom agent</span> }]}
+        detailRows={[{ id: "marked", content: <span>Custom agent</span> }]}
         columns={[{ id: "desktop", label: "Desktop" }]}
         renderCell={(row, col) => ({
           content: row,
@@ -489,9 +490,11 @@ describe("LayeredTable and LayeredEditor", () => {
       "layered-row-reported",
       "layered-row-remote",
       "Not configured (2)",
-      "layered-row-plain",
+      "layered-row-fold",
       "Custom agent",
     ]);
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
   });
 
   it("displays the normalized runtime value rather than the stored seconds", () => {
