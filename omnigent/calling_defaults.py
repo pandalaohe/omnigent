@@ -350,6 +350,8 @@ def _field_normalizer(
         if value is None:
             return None
         if field == "permission":
+            from omnigent.acp_cli_harnesses import is_acp_harness
+
             if harness in {"pi", "pi-native", "antigravity-native"}:
                 try:
                     return normalize_permission_tier(value, harness=harness, legacy=True)
@@ -361,9 +363,7 @@ def _field_normalizer(
                     for row in permission_options(host_id, harness)
                     if row.get("value")
                 )
-                if permission_options
-                and harness
-                and (harness == "acp" or harness.startswith("acp:"))
+                if permission_options and harness is not None and is_acp_harness(harness)
                 else mode_values(harness, field, "default")
             )
             return value if value in values else None
@@ -770,14 +770,14 @@ def validate_project_calling_defaults(value: object) -> dict:
                 if "model" in entry:
                     clean_entry["model"] = _require_model(entry["model"], f"{base}.model")
                 if "effort" in entry:
+                    from omnigent.acp_cli_harnesses import is_acp_harness
+
                     effort = entry["effort"]
                     try:
                         validate_effort(
                             effort,
                             base,
-                            None
-                            if harness == "acp" or harness.startswith("acp:")
-                            else EFFORT_VALUES,
+                            None if is_acp_harness(harness) else EFFORT_VALUES,
                         )
                     except ValueError as exc:
                         raise _invalid(f"{base}.effort: {exc}") from exc

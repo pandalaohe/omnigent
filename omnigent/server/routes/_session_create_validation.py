@@ -62,19 +62,22 @@ def session_acp_harness(
     conversation: Conversation, agent_store: AgentStore | None, agent_cache: AgentCache | None
 ) -> str | None:
     """Keep the configured ACP namespace when selecting a host-owned catalog."""
+    from omnigent.acp_cli_harnesses import is_acp_harness
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
 
     harness = _resolve_harness_impl(
         conversation, agent_store=agent_store, agent_cache=agent_cache, preserve_acp_namespace=True
     )
-    return harness if harness and (harness == "acp" or harness.startswith("acp:")) else None
+    return harness if is_acp_harness(harness) else None
 
 
 async def cached_acp_permission_options(
     request: Request | None, host_id: str | None, harness: str | None
 ) -> list[dict[str, str]]:
     """Read only the selected host's advertisement; an older host offers no modes."""
-    if not harness or not (harness == "acp" or harness.startswith("acp:")) or not host_id:
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
+    if not is_acp_harness(harness) or not host_id:
         return []
     state = getattr(getattr(request, "app", None), "state", None)
     store = getattr(state, "host_model_catalog_cache_store", None)
@@ -797,13 +800,13 @@ def validate_session_model_metadata(
     # metadata create path.
     validated_effort: str | None = None
     if reasoning_effort is not None:
+        from omnigent.acp_cli_harnesses import is_acp_harness
+
         try:
             validated_effort = validate_effort(
                 reasoning_effort,
                 "session metadata",
-                None
-                if harness == "acp" or (harness and harness.startswith("acp:"))
-                else EFFORT_VALUES,
+                None if is_acp_harness(harness) else EFFORT_VALUES,
             )
         except ValueError as exc:
             raise OmnigentError(

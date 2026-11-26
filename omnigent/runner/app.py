@@ -16308,6 +16308,14 @@ def _build_spawn_env_from_spec(
         acp_default_model = _acp_launch_model(policy_spec)
         validate_acp_model(policy_spec, acp_default_model)
         validate_acp_model(policy_spec, model_override)
+    elif harness in ACP_CLI_HARNESSES:
+        base_model = getattr(spec.executor, "model", None)
+        if (
+            isinstance(base_model, str)
+            and base_model.strip()
+            and not base_model.startswith(("databricks-", "databricks/"))
+        ):
+            acp_default_model = base_model.strip()
     try:
         from omnigent.runtime.workflow import (
             _build_acp_cli_spawn_env,
@@ -16364,6 +16372,7 @@ def _build_spawn_env_from_spec(
             env = _build_acp_cli_spawn_env(
                 effective_spec, harness=harness, cwd=cwd, workdir=workdir, session_id=session_id
             )
+            env["HARNESS_ACP_DEFAULT_MODEL"] = acp_default_model or ""
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:

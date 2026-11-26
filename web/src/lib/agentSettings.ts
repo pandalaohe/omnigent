@@ -12,6 +12,7 @@ export function agentPresentOnHost(harness: string, host: Host | undefined): boo
 }
 
 export function agentProductHarness(harness: string, capabilities?: HarnessCapabilityMap): string {
+  if (harness === "ag-acp") return "antigravity-native";
   const parent = callingDefaultParent(harness, capabilities);
   if (parent) return parent;
   const key = capabilities?.[harness]?.native_agent_key;

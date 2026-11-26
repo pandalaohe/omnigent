@@ -167,7 +167,12 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     capability = harness_capabilities().get(canonical_harness or "")
     builtin = agent.session_id is None and agent.id == builtin_agent_id(agent.name)
     declared_product = product_agent_harnesses().get(agent.name) if builtin else None
-    product_of = declared_product if declared_product == canonical_harness else None
+    if declared_product == canonical_harness:
+        product_of = declared_product
+    elif builtin and harness == f"acp:{agent.name}":
+        product_of = harness
+    else:
+        product_of = None
     return AgentObject(
         id=agent.id,
         name=agent.name,

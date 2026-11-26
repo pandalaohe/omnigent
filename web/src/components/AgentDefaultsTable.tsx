@@ -130,6 +130,7 @@ function AgentLayerEditor({
   from,
   options,
   header,
+  acpHarness,
   startOnlyEffort,
   hostWins,
   skipped,
@@ -150,6 +151,7 @@ function AgentLayerEditor({
   from: string;
   options: readonly PermissionOption[];
   header: boolean;
+  acpHarness?: boolean;
   startOnlyEffort?: boolean;
   hostWins?: boolean;
   skipped: (value: string) => string[];
@@ -306,7 +308,7 @@ function AgentLayerEditor({
           </Select>
         )}
       </div>
-      {field === "permission" && harness.startsWith("acp:") && value && (
+      {field === "permission" && acpHarness && value && (
         <p className="text-sm text-muted-foreground">
           {options.find((option) => option.value === value)?.description ??
             "Sets the agent's own mode. What it covers is up to the agent."}
@@ -561,9 +563,12 @@ export function AgentDefaultsTable({
         }
         options={options}
         header={header}
+        acpHarness={
+          row.startsWith("acp:") || capabilities?.[row]?.integration_mode === "acp-subprocess"
+        }
         startOnlyEffort={
           field === "effort" &&
-          row.startsWith("acp:") &&
+          (row.startsWith("acp:") || capabilities?.[row]?.integration_mode === "acp-subprocess") &&
           models(row, col === "*" ? undefined : col).some(
             (model) => (model.start_efforts?.length ?? 0) > 0 && !model.efforts?.length,
           )

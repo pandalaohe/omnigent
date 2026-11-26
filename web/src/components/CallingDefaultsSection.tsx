@@ -54,7 +54,9 @@ import {
 import { relativeTime } from "@/lib/relativeTime";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { agentRootName } from "@/lib/forkHarness";
 import { harnessReadinessOnHost } from "@/lib/harnessSetup";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { setProjectHostAgent, useProjectHostAgents } from "@/lib/projectHostAgents";
 import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 
@@ -191,6 +193,11 @@ export function CallingDefaultsSection() {
   const agentIds = Object.fromEntries(
     harnesses.map((harness) => [harness, harnessSettingsBadgeId(harness, registry.legacyProducts)]),
   );
+  const seededProductNames = new Set(
+    Object.values(registry.legacyProducts)
+      .map((item) => item.name)
+      .filter((name): name is string => typeof name === "string" && name.length > 0),
+  );
   const detailRows = agentDetailsAvailable
     ? [
         ...registry.installedServerAgents.map((agent) => ({
@@ -199,7 +206,10 @@ export function CallingDefaultsSection() {
           harness: agent.harness,
           integration_mode: agent.integration_mode,
         })),
-        ...(installedAgents.data?.data ?? []),
+        ...(installedAgents.data?.data ?? []).filter((agent) => {
+          const root = agentRootName(agent.name);
+          return !nativeCodingAgentForAgentName(root) && !seededProductNames.has(root);
+        }),
       ].map(({ id, name, harness, integration_mode }) => {
         const kind = nonNativeAgentKind(
           harness,

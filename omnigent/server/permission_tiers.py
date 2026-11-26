@@ -49,7 +49,9 @@ PERMISSION_LABEL_KEYS = frozenset(
 
 
 def is_acp_permission_harness(harness: str | None) -> bool:
-    return harness is not None and (harness == "acp" or harness.startswith("acp:"))
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
+    return is_acp_harness(harness)
 
 
 def configured_acp_default_tier(

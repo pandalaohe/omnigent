@@ -5090,8 +5090,6 @@ async def _prepare_claude_terminal_via_daemon(
         if session_id is not None:
             record_startup_event("session_resolved", session_id=session_id)
         if session_id is None:
-            if session_bundle is None:
-                raise click.ClickException("Creating a Claude session requires a session bundle.")
             # Session creation (POST /v1/sessions, ~2s), daemon tunnel
             # start (~2s), and host-online polling (~0.2s) are mutually
             # independent — run all three concurrently so they collapse to
@@ -5568,8 +5566,6 @@ async def _prepare_claude_terminal(
         if session_id is not None:
             record_startup_event("session_resolved", session_id=session_id)
         if session_id is None:
-            if session_bundle is None:
-                raise click.ClickException("Creating a Claude session requires a session bundle.")
             _mark_startup_step(
                 startup_profiler,
                 "creating claude session",
@@ -7233,14 +7229,19 @@ def _preflight_local_tools(command: str) -> None:
 
 async def _create_claude_session(
     client: httpx.AsyncClient,
-    bundle: bytes,
+    bundle: bytes | None = None,
     *,
     bridge_id: str | None,
     claude_args: tuple[str, ...] = (),
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """
-    Create a bundled terminal-first Claude session.
+    Create a terminal-first Claude session bound to the built-in Claude Code agent.
+
+    Binds the deterministic server-seeded ``claude-native-ui`` built-in agent
+    id via JSON ``POST /v1/sessions`` so CLI launches do not mint duplicate
+    user-scope ``claude-native-ui`` agents. Falls back to uploading *bundle*
+    only when an unseeded/legacy server responds with 404.
 
     Leaves ``title`` unset so the server's generic seed helper
     populates it from the first forwarded user message — the same
@@ -7250,7 +7251,8 @@ async def _create_claude_session(
     real title lands, so no server-side placeholder is needed.
 
     :param client: HTTP client pointed at the Omnigent server.
-    :param bundle: Gzipped Claude wrapper agent bundle.
+    :param bundle: Optional gzipped Claude wrapper agent bundle used only as
+        a fallback when the server does not have the built-in seeded.
     :param bridge_id: Opaque bridge id to write on the session labels,
         e.g. ``"bridge_abc123"``. ``None`` omits the label so every
         consumer keys the bridge dir by the session id instead — the
@@ -7269,6 +7271,8 @@ async def _create_claude_session(
     :returns: New session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
+    from omnigent.db.utils import builtin_agent_id
+
     labels = dict(_SESSION_LABELS)
     if bridge_id is not None:
         labels[BRIDGE_ID_LABEL_KEY] = bridge_id
@@ -7279,20 +7283,31 @@ async def _create_claude_session(
     effort = resolve_launch_effort_level(claude_args)
     if effort is not None:
         metadata["reasoning_effort"] = effort
+    used_multipart = False
     resp = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("claude-native-ui.tar.gz", bundle, "application/gzip")},
+        json={"agent_id": builtin_agent_id(_AGENT_NAME), **metadata},
         timeout=120.0,
     )
+    if resp.status_code == 404 and bundle is not None:
+        used_multipart = True
+        resp = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={"bundle": ("claude-native-ui.tar.gz", bundle, "application/gzip")},
+            timeout=120.0,
+        )
     if resp.status_code >= 400:
         raise click.ClickException(
             f"Claude session creation failed ({resp.status_code}): {error_text(resp)}"
         )
     body = resp.json()
-    session_id = body.get("session_id")
+    session_id = body.get("session_id") if used_multipart else body.get("id")
     if not isinstance(session_id, str) or not session_id:
-        raise click.ClickException("Claude session creation response did not include session_id.")
+        expected_field = "session_id" if used_multipart else "id"
+        raise click.ClickException(
+            f"Claude session creation response did not include {expected_field}."
+        )
     record_startup_event("session_resolved", session_id=session_id)
     return session_id
 

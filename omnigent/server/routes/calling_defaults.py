@@ -25,6 +25,7 @@ from typing import Any
 from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, is_acp_harness
 from omnigent.calling_defaults import (
     check_calling_defaults,
     load_master,
@@ -262,7 +263,7 @@ def create_calling_defaults_router(
                     continue
                 syncs.append(
                     await_acp_catalog(host.host_id, conn, harness, manual=True)
-                    if canonicalize_harness(harness) == "acp"
+                    if canonicalize_harness(harness) == "acp" or is_acp_harness(harness)
                     else _sync_pair(
                         host_registry=host_registry,
                         host_conn=conn,
@@ -356,9 +357,9 @@ def create_calling_defaults_router(
                 await_acp_catalog(host.host_id, conn, harness)
                 for host in hosts
                 if (conn := host_registry.get(host.host_id)) is not None
-                for harness, ready in (host.configured_harnesses or {}).items()
-                if harness.startswith("acp:")
-                and ready is not False
+                for harness, _ready in (host.configured_harnesses or {}).items()
+                if (harness.startswith("acp:") or harness in ACP_CLI_HARNESSES)
+                and _harness_configured(host, harness)
                 and (host.host_id, harness) not in known
             )
         )
@@ -536,7 +537,9 @@ def create_calling_defaults_router(
     acp_sync_limit = asyncio.Semaphore(_SYNC_CONCURRENCY)
 
     def acp_catalog_expired(record: dict[str, Any]) -> bool:
-        if canonicalize_harness(record["harness"]) != "acp":
+        if canonicalize_harness(record["harness"]) != "acp" and not is_acp_harness(
+            record["harness"]
+        ):
             return False
         fetched_at = record["fetched_at"]
         return fetched_at is None or now_epoch() - fetched_at >= 300
@@ -573,8 +576,12 @@ def create_calling_defaults_router(
         row = _catalog_row(record, host_registry)
         if acp_catalog_expired(record):
             row.stale = True
-            if conn := host_registry.get(row.host_id):
-                start_acp_catalog_refresh(row.host_id, conn, row.harness)
+            conn = host_registry.get(row.host_id)
+            if conn is not None:
+                readiness = conn.hello.configured_harnesses
+                value = readiness.get(row.harness) if readiness else None
+                if value is None or value is True:
+                    start_acp_catalog_refresh(row.host_id, conn, row.harness)
         return row
 
     async def await_acp_catalog(

@@ -192,6 +192,13 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost("acp:orion", hostWith(null))).toBe(null);
   });
 
+  it("treats a missing dynamic ACP slug as unconfigured on hosts reporting concrete ACP slugs", () => {
+    const hdsHost = hostWith({ acp: true, "acp:ag": true });
+    expect(harnessUnavailableReasonOnHost("acp:hermes-fn", hdsHost)).toBe("unconfigured");
+    expect(harnessReadinessOnHost("acp:hermes-fn", hdsHost).reason).toBe("unconfigured");
+    expect(harnessUnavailableReasonOnHost("acp:ag", hdsHost)).toBe(null);
+  });
+
   it("honors an explicit dynamic ACP readiness result", () => {
     expect(harnessUnavailableReasonOnHost("acp:orion", hostWith({ "acp:orion": false }))).toBe(
       "unconfigured",

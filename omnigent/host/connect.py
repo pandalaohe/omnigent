@@ -4861,7 +4861,9 @@ class HostProcess:
                     error=None if rows is not None else "no current cached model catalog",
                 )
             if source is not None:
-                if harness == "acp" or harness.startswith("acp:"):
+                from omnigent.acp_cli_harnesses import is_acp_harness
+
+                if is_acp_harness(harness):
                     from omnigent.models.model_source import ModelSource, _source_catalog
 
                     _, _, entry = _source_catalog(harness, ModelSource(lane="agent"))
@@ -4869,7 +4871,7 @@ class HostProcess:
                 refresh = frame.refresh if frame.refresh in ("auto", "force") else "none"
                 rows = await fetch_model_source(harness, source, refresh=refresh)
                 permissions = []
-                if source.lane == "agent" or harness == "acp" or harness.startswith("acp:"):
+                if source.lane == "agent" or is_acp_harness(harness):
                     from omnigent.inner.acp_harness import probe_acp_model_options
                     from omnigent.models.model_catalog_store import read_catalog
                     from omnigent.models.model_source import ModelSource, _source_catalog
@@ -6648,7 +6650,7 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
-        from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, is_antigravity_acp_command
         from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
         from omnigent.host.restart import supervisor_kind
         from omnigent.onboarding.acp_auth import acp_agents
@@ -6670,6 +6672,33 @@ class HostProcess:
         }
         if acp_entries and f"acp:{acp_entries[0].slug}" in agy_acp_harnesses:
             agy_acp_harnesses.add("acp")
+        configured_map = self._configured_harnesses or {}
+        if any(configured_map.get(name) is True for name in ACP_CLI_HARNESSES):
+            from omnigent._platform import resolve_cli_binary
+            from omnigent._windows_launcher import join_command_argv
+            from omnigent.harness_startup_config import (
+                config_harness_path_override,
+                resolve_harness_path,
+            )
+            from omnigent.onboarding.provider_config import load_config
+
+            def _builtin_agy_acp_harnesses() -> set[str]:
+                cfg = load_config()
+                matched: set[str] = set()
+                for harness_name, row in ACP_CLI_HARNESSES.items():
+                    if configured_map.get(harness_name) is not True:
+                        continue
+                    executable = (
+                        resolve_harness_path(harness_name)
+                        or config_harness_path_override(harness_name, cfg)
+                        or resolve_cli_binary(row.binary)
+                        or row.binary
+                    )
+                    if is_antigravity_acp_command(join_command_argv([executable, *row.args])):
+                        matched.add(harness_name)
+                return matched
+
+            agy_acp_harnesses.update(await asyncio.to_thread(_builtin_agy_acp_harnesses))
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,

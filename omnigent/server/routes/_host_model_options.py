@@ -63,11 +63,13 @@ async def record_host_model_options(
     fetched_at: int,
 ) -> None:
     """Record a host response while keeping the last good ACP catalog on an empty probe."""
+    from omnigent.acp_cli_harnesses import is_acp_harness
+
     models = result.get("models")
     error = result.get("error")
     if result.get("status") == "ok" and isinstance(models, list):
         payload = [row for row in models if isinstance(row, dict)]
-        if payload or not (harness == "acp" or harness.startswith("acp:")):
+        if payload or not is_acp_harness(harness):
             await asyncio.to_thread(
                 catalog_store.upsert,
                 host_id,

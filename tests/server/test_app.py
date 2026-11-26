@@ -1711,6 +1711,116 @@ def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
     assert seeded == set(ACP_CLI_HARNESSES), "catalog rows are host-independent and always seed"
 
 
+def test_ensure_default_acp_agents_seeds_ag_acp_with_spawn(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Builtin ag-acp seeds at its deterministic id with spawn=True."""
+    from omnigent.db.utils import builtin_agent_id
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    ag_acp = seed_stores.agent_store.get_by_name("ag-acp")
+    assert ag_acp is not None
+    assert ag_acp.id == builtin_agent_id("ag-acp")
+    loaded = seed_stores.agent_cache.load(ag_acp.id, ag_acp.bundle_location, expand_env=True)
+    assert loaded.spec.executor.harness_kind == "ag-acp"
+    assert loaded.spec.spawn is True
+
+    grok = seed_stores.agent_store.get_by_name("grok")
+    assert grok is not None
+    grok_loaded = seed_stores.agent_cache.load(grok.id, grok.bundle_location, expand_env=True)
+    assert grok_loaded.spec.spawn is False
+
+
+def test_ensure_remote_acp_agents_seeds_deterministic_builtin_and_guards_collisions(
+    seed_stores: _SeedStores,
+) -> None:
+    """Host-reported acp:<slug> entries are create-only, collision-safe, and workspace-scoped."""
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.db.utils import builtin_agent_id
+
+    # Seed a non-ACP built-in, an operator-authored ACP built-in, and a custom template.
+    server_app._ensure_builtin_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        name="polly",
+        bundle_bytes=server_app._build_acp_bundle(harness="codex", name="polly"),
+    )
+    operator_bundle = server_app._build_acp_bundle(harness="acp:op-acp", name="op-acp", spawn=True)
+    server_app._ensure_builtin_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        name="op-acp",
+        bundle_bytes=operator_bundle,
+    )
+    operator_before = seed_stores.agent_store.get_by_name("op-acp")
+    assert operator_before is not None
+    seed_stores.agent_store.create("11111111111111111111111111111111", "custom-tpl", "tpl/hash")
+
+    seeded = server_app._ensure_remote_acp_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        {
+            "acp:hermes-fn": True,
+            "acp:op-acp": True,
+            "acp:offline-one": False,
+            "acp:../bad": True,
+            "acp:ag-acp": True,
+            "acp:polly": True,
+            "acp:custom-tpl": True,
+            "codex": True,
+        },
+    )
+
+    assert seeded == ["hermes-fn", "op-acp"]
+    row = seed_stores.agent_store.get_by_name("hermes-fn")
+    assert row is not None
+    assert row.id == builtin_agent_id("hermes-fn")
+    assert row.session_id is None
+    loaded = seed_stores.agent_cache.load(row.id, row.bundle_location, expand_env=True)
+    assert loaded.spec.executor.harness_kind == "acp:hermes-fn"
+
+    # Existing operator-authored ACP built-in must NOT be overwritten (create-only).
+    operator_after = seed_stores.agent_store.get_by_name("op-acp")
+    assert operator_after is not None
+    assert operator_after.bundle_location == operator_before.bundle_location
+    assert operator_after.version == operator_before.version
+    operator_loaded = seed_stores.agent_cache.load(
+        operator_after.id, operator_after.bundle_location, expand_env=True
+    )
+    assert operator_loaded.spec.spawn is True
+
+    assert seed_stores.agent_store.get_by_name("offline-one") is None
+    assert seed_stores.agent_store.get_by_name("ag-acp") is None
+    polly = seed_stores.agent_store.get_by_name("polly")
+    assert polly is not None
+    polly_loaded = seed_stores.agent_cache.load(polly.id, polly.bundle_location, expand_env=True)
+    assert polly_loaded.spec.executor.harness_kind == "codex"
+    tpl = seed_stores.agent_store.get_by_name("custom-tpl")
+    assert tpl is not None and tpl.id == "11111111111111111111111111111111"
+
+    # Same slug seeds independently in another workspace.
+    with workspace_scope(2):
+        assert seed_stores.agent_store.get_by_name("hermes-fn") is None
+        ws2_seeded = server_app._ensure_remote_acp_agents(
+            seed_stores.agent_store,
+            seed_stores.artifact_store,
+            seed_stores.agent_cache,
+            {"acp:hermes-fn": True},
+        )
+        assert ws2_seeded == ["hermes-fn"]
+        ws2_row = seed_stores.agent_store.get_by_name("hermes-fn")
+        assert ws2_row is not None and ws2_row.id == builtin_agent_id("hermes-fn")
+
+
 def test_ensure_default_acp_agents_survives_unreadable_config(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:

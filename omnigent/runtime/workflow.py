@@ -1794,6 +1794,19 @@ def _build_acp_cli_spawn_env(
         # Omnigent MCP server.
         "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
+    if row.init_timeout_s is not None:
+        env["HARNESS_ACP_INIT_TIMEOUT_S"] = str(row.init_timeout_s)
+    if row.permission_concepts:
+        env["HARNESS_ACP_PERMISSION_CONCEPTS"] = json.dumps(dict(row.permission_concepts))
+    # Forward an explicit model selection (e.g. calling defaults or session
+    # override) without pulling defaults from unrelated acp.agents[] entries.
+    explicit_model = getattr(spec.executor, "model", None)
+    if (
+        isinstance(explicit_model, str)
+        and explicit_model.strip()
+        and not explicit_model.startswith(("databricks-", "databricks/"))
+    ):
+        env["HARNESS_ACP_MODEL"] = explicit_model.strip()
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
