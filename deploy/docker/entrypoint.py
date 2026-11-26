@@ -346,6 +346,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     )
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
     from omnigent.stores.peer_message_store.sqlalchemy_store import (
         SqlAlchemyPeerMessageStore,
     )
@@ -379,6 +380,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     peer_message_store = SqlAlchemyPeerMessageStore(database_url)
     user_preferences_store = SqlAlchemyUserPreferencesStore(database_url)
     host_model_catalog_cache_store = HostModelCatalogCacheStore(database_url)
+    memory_store = SqlAlchemyMemoryStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -506,6 +508,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
         peer_message_store=peer_message_store,
+        memory_store=memory_store,
         auth_provider=auth_provider,
         account_store=account_store,
         user_preferences_store=user_preferences_store,

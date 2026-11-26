@@ -1688,7 +1688,7 @@ async def _send_hello(
         return
 
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
-    from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME, CAP_MCP_REGISTRY, CAP_TCP_EGRESS
     from omnigent.inner.claude_sdk_executor import claude_peer_receipts_supported
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -1719,6 +1719,7 @@ async def _send_hello(
                     CONTEXT_INVENTORY_V2,
                     CAP_TCP_EGRESS,
                     CAP_SIDE_CHAT_SETTINGS,
+                    CAP_CODEX_SIDE_CHAT_RESUME,
                     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],

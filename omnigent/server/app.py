@@ -153,6 +153,7 @@ from omnigent.server.routes.global_instructions import create_global_instruction
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
+from omnigent.server.routes.memory import create_memory_router
 from omnigent.server.routes.model_connections import create_model_connections_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
@@ -215,7 +216,6 @@ from omnigent.server.server_config import (
     PickerCuration,
 )
 from omnigent.server.session_collab import session_peer_enabled
-from omnigent.server.session_mcp_selection import SessionMcpSelection
 from omnigent.server.session_retention import SessionRetention
 from omnigent.server.telemetry_settings import TelemetryStatus
 from omnigent.server.user_preferences_store import (
@@ -247,6 +247,7 @@ from omnigent.stores.global_instructions_store import GlobalInstructionsStore
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.inbox_item_store import InboxItemStore
+from omnigent.stores.memory_store import MemoryStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -489,6 +490,8 @@ class ServerInfoResponse(BaseModel):
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
+    # ``/v1/memory`` is mounted and enabled; the runner offers the memory_* tools only then.
+    memory: bool = False
     branding: BrandingInfo
     # Attachment size limits the web client enforces before uploading (bytes;
     # ``None`` = unlimited). Deployment settings plus the fixed inline caps;
@@ -2080,7 +2083,7 @@ def create_app(
     user_inbox: DeploymentGate | None = None,
     proactive_agent: DeploymentGate | None = None,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
-    session_mcp_selection: SessionMcpSelection | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -2126,6 +2129,7 @@ def create_app(
         ``automations`` release feature disables both schedulers and all
         automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
+    :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
@@ -2151,9 +2155,6 @@ def create_app(
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
-    :param session_mcp_selection: How sessions the server creates for an owner
-        (scheduled-task fires and the workers a session starts) record their MCP
-        services. ``None`` uses the MCP registry's labels.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -3416,7 +3417,6 @@ def create_app(
         )
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
-    app.state.session_mcp_selection = session_mcp_selection
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
 
@@ -3524,6 +3524,13 @@ def create_app(
     app.state.inbox_items_enabled_for = inbox_items_enabled_for
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
+
+    app.state.memory_available = lambda: (
+        memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
+    )
+    app.state.memory_search_available = lambda: (
+        app.state.memory_available() and memory_store is not None and memory_store.supports_search
+    )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.
@@ -4979,6 +4986,7 @@ def create_app(
                 "session_settings_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
+                "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
                 "usage_board_enabled": agent_quota_service.usage_enabled,
                 "task_board_enabled": task_board_enabled(resolved_server_config),
@@ -5831,6 +5839,17 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if memory_store is not None:
+        app.include_router(
+            create_memory_router(
+                memory_store,
+                auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["memory"],
         )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server

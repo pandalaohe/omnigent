@@ -190,6 +190,7 @@ try:
     )
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
     from omnigent.stores.peer_message_store.sqlalchemy_store import (
         SqlAlchemyPeerMessageStore,
     )
@@ -259,6 +260,7 @@ try:
     project_repository_store = SqlAlchemyProjectRepositoryStore(DB_URI)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(DB_URI)
     peer_message_store = SqlAlchemyPeerMessageStore(DB_URI)
+    memory_store = SqlAlchemyMemoryStore(DB_URI)
     host_store = HostStore(DB_URI)
     host_model_catalog_cache_store = HostModelCatalogCacheStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
@@ -361,6 +363,7 @@ try:
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
         peer_message_store=peer_message_store,
+        memory_store=memory_store,
         host_store=host_store,
         host_model_catalog_cache_store=host_model_catalog_cache_store,
         scheduled_task_store=scheduled_task_store,

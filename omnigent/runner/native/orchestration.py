@@ -107,6 +107,7 @@ from omnigent.native.native_terminal_generation import (
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
+from omnigent.runner.memory_guidance import memory_startup_guidance
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -3813,6 +3814,14 @@ async def _auto_create_pi_terminal(
     )
 
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    raw_instructions = raw_author_instructions(pi_spec) if pi_spec is not None else None
+    context_files = True
+    system_prompt_mode = "append"
+    if pi_spec is not None:
+        context_files = pi_spec.executor.config.get("context_files", True)
+        system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+        if system_prompt_mode == "replace" and raw_instructions is None:
+            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
     startup_instructions = (
         "\n\n".join(
             part.text
@@ -3888,6 +3897,13 @@ async def _auto_create_pi_terminal(
             session_id,
             exc_info=True,
         )
+    memory_guidance = await memory_startup_guidance(
+        server_client, session_id, agent_spec, workspace=launch_config.workspace
+    )
+    if memory_guidance:
+        startup_instructions = "\n\n".join(
+            part for part in (startup_instructions, memory_guidance) if part
+        )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
@@ -3924,14 +3940,6 @@ async def _auto_create_pi_terminal(
     from omnigent.usage_export.runtime import register_pi_native_sessions
 
     register_pi_native_sessions(session_dir, session_id)
-    raw_instructions = raw_author_instructions(pi_spec) if pi_spec is not None else None
-    context_files = True
-    system_prompt_mode = "append"
-    if pi_spec is not None:
-        context_files = pi_spec.executor.config.get("context_files", True)
-        system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
-        if system_prompt_mode == "replace" and raw_instructions is None:
-            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
     instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
@@ -7137,22 +7145,15 @@ async def _auto_create_codex_terminal(
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     from omnigent.runner.app import get_session_peer_messaging_enabled
 
-    _peer_messaging_enabled = get_session_peer_messaging_enabled(session_id)
-    _codex_developer_instructions = (
-        "\n\n".join(
-            x
-            for x in [
-                _native_startup_instructions_from_spec(
-                    agent_spec,
-                    global_instructions=global_instructions,
-                    has_parent=launch_config.parent_session_id is not None,
-                    peer_messaging_enabled=_peer_messaging_enabled,
-                ),
-                _codex_routing_note,
-            ]
-            if x
-        )
-        or None
+    _codex_developer_instructions = await _native_startup_instructions(
+        agent_spec,
+        server_client,
+        session_id,
+        _codex_routing_note,
+        workspace=workspace,
+        global_instructions=global_instructions,
+        has_parent=launch_config.parent_session_id is not None,
+        peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -9344,6 +9345,90 @@ def _opencode_session_instructions(
     return build_instructions_nullable(spec, None, [], framework_instructions=global_framework)
 
 
+async def _native_startup_instructions(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    *launch_notes: str | None,
+    workspace: str | Path | None = None,
+    global_instructions: str | None = None,
+    has_parent: bool = False,
+    peer_messaging_enabled: bool = False,
+) -> str | None:
+    """
+    Compose a native harness's startup instructions, including long-term memory.
+
+    Joins :func:`_native_startup_instructions_from_spec`, any launch notes (e.g.
+    the routed spawn note), and the memory guidance, skipping empty parts.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server, used to
+        fetch the memory index.
+    :param session_id: The session being launched.
+    :param launch_notes: Additional framework notes, in order; ``None`` skipped.
+    :param workspace: The session's working directory, which names its project
+        in the memory guidance.
+    :param global_instructions: Server-held instructions for the session.
+    :param has_parent: Whether this is a child session.
+    :param peer_messaging_enabled: Whether this session may message peers.
+    :returns: The joined text, or None when there is none.
+    """
+    parts = [
+        _native_startup_instructions_from_spec(
+            agent_spec,
+            global_instructions=global_instructions,
+            has_parent=has_parent,
+            peer_messaging_enabled=peer_messaging_enabled,
+        ),
+        *launch_notes,
+        await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
+    ]
+    return "\n\n".join(part for part in parts if part) or None
+
+
+# Claude Code's own setting for its machine-local auto memory.
+_CLAUDE_AUTO_MEMORY_OFF_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+# A slow server must not delay the launch.
+_CLAUDE_AUTO_MEMORY_CHECK_SECONDS = 5.0
+
+
+async def _claude_auto_memory_env(
+    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+) -> dict[str, str]:
+    """
+    Turn Claude Code's own auto memory off when the session has Omnigent memory.
+
+    Two memory systems would keep separate, possibly conflicting notes, and
+    Claude Code's stays on the host, so a sandboxed session would lose it. It is
+    turned off only when the agent has the memory tools and the server confirms
+    memory is on, so a session never loses both. A value already set in the
+    runner's environment is kept.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server.
+    :returns: ``{"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}`` when Omnigent memory
+        is on, otherwise ``{}``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if (
+        spec is None
+        or not spec.tool_groups.memory
+        or server_client is None
+        or _CLAUDE_AUTO_MEMORY_OFF_ENV in os.environ
+    ):
+        return {}
+    from omnigent.runner.tool_dispatch import _server_has_memory
+
+    try:
+        has_memory = await asyncio.wait_for(
+            _server_has_memory(server_client), timeout=_CLAUDE_AUTO_MEMORY_CHECK_SECONDS
+        )
+    except Exception:
+        _logger.debug("memory availability unknown; leaving Claude auto memory on", exc_info=True)
+        return {}
+    return {_CLAUDE_AUTO_MEMORY_OFF_ENV: "1"} if has_memory else {}
+
+
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
     """
     Read the cursor-agent model id to launch the native TUI with, from a spec.
@@ -10932,16 +11017,12 @@ async def _auto_create_claude_terminal(
     _pre_wipe_bridge_dir = _bridge_dir_for_bridge_id(bridge_id)
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_pre_wipe_bridge_dir)
     _pre_wipe_bridge_is_current = _read_active_sid_pre_wipe(_pre_wipe_bridge_dir) == session_id
-    # Resolved once here and reused below (env_spec) so the bridge's own
-    # sys_os_* tools and the terminal process see the same sandbox — the
-    # agent's declared os_env.sandbox, already overridden by any
-    # enforce_sandbox/force_sandbox policy verdict upstream.
+    # The terminal uses the session's effective policy sandbox.
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     bridge_dir = prepare_bridge_dir(
         session_id,
         bridge_id=bridge_id,
         workspace=Path(workspace),
-        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
     if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
         await asyncio.to_thread(_write_csid, bridge_dir, _pre_wipe_claude_sid)
@@ -11600,20 +11681,16 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         fast_mode=CLAUDE_FAST_MODE_SETTINGS.get(launch_metadata.speed_tier or ""),
         subagent_router_dir=subagent_router_dir,
-        append_system_prompt="\n\n".join(
-            x
-            for x in [
-                _native_startup_instructions_from_spec(
-                    agent_spec,
-                    global_instructions=global_instructions,
-                    has_parent=is_child_session,
-                    peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
-                ),
-                routed_spawn_note,
-            ]
-            if x
-        )
-        or None,
+        append_system_prompt=await _native_startup_instructions(
+            agent_spec,
+            server_client,
+            session_id,
+            routed_spawn_note,
+            workspace=workspace,
+            global_instructions=global_instructions,
+            has_parent=is_child_session,
+            peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
+        ),
         allowed_tools=routed_spawn_tools,
         disallowed_tools=("AskUserQuestion",) if is_child_session else (),
         # Config args are prepended after augmentation; augment only checks them for a prompt flag.
@@ -11645,13 +11722,12 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+    claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-    # so the terminal process and the bridge's sys_os_* tools agree.
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",
@@ -11669,6 +11745,7 @@ async def _auto_create_claude_terminal(
                 client_surface=resource_registry.client_surface(session_id),
             ),
             **claude_terminal_relay_env(bridge_dir),
+            **claude_auto_memory_env,
         },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers

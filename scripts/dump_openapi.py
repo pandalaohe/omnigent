@@ -372,6 +372,7 @@ def _build_app_with_stub_stores() -> Any:
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
     from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
     from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
@@ -413,6 +414,7 @@ def _build_app_with_stub_stores() -> Any:
         proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
         # The release feature is off by default; the spec documents the routes anyway.
         proactive_agent=True,
+        memory_store=SqlAlchemyMemoryStore(db_uri),
     )
 
 

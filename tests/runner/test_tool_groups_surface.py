@@ -12,7 +12,7 @@ from omnigent.runner.tool_dispatch import (
     _ungranted_tool_reason,
     build_native_relay_tool_schemas,
 )
-from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+from omnigent.spec.types import MEMORY_TOOL_NAMES, AgentSpec, ToolGroupsConfig
 from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.manager import ToolManager
 
@@ -23,6 +23,7 @@ _ALL_OFF = ToolGroupsConfig(
     policies=False,
     agent_discovery=False,
     journal=False,
+    memory=False,
 )
 
 
@@ -43,6 +44,7 @@ def _gated() -> frozenset[str]:
         "browser_fill_saved_login",
         "sys_reminder_set",
         *JOURNAL_TOOL_NAMES,
+        *MEMORY_TOOL_NAMES,
         *ADVANCED_BROWSER_TOOL_NAMES,
     } <= gated
     return gated

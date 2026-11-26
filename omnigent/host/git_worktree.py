@@ -1367,12 +1367,15 @@ def remove_worktree(
         remaining time, which can outlast the metadata bound on a large
         worktree, and every other command keeps its own bound within it.
         ``None`` gives each command :data:`_GIT_TIMEOUT_S`.
-    :raises WorktreeError: If the worktree path is missing/invalid, a
-        git command fails, or ``deadline`` passes.
+    :raises WorktreeError: If the branch name or worktree path is invalid,
+        a git command fails, or ``deadline`` passes.
     """
 
     def bound(cap: float | None) -> float | None:
         return None if deadline is None else _rollback_timeout(deadline, cap)
+
+    if delete_branch and branch is not None:
+        validate_branch_name(branch)
 
     if not Path(worktree_path).exists():
         raise WorktreeError(f"worktree path does not exist: {worktree_path}")
@@ -1450,7 +1453,7 @@ def remove_worktree(
         ):
             raise WorktreeError("worktree changed during archive cleanup")
     remove_result = _run_git(
-        ["worktree", "remove", *([] if safe_only else ["--force"]), root.stdout.strip()],
+        ["worktree", "remove", *([] if safe_only else ["--force"]), "--", root.stdout.strip()],
         cwd=main_repo,
         timeout=bound(None),
     )
@@ -1458,7 +1461,9 @@ def remove_worktree(
         raise _git_error("git worktree remove failed", remove_result)
     if delete_branch and branch is not None:
         branch_result = _run_git(
-            ["branch", "-D", branch], cwd=main_repo, timeout=bound(_GIT_TIMEOUT_S)
+            ["branch", "-D", "--end-of-options", branch],
+            cwd=main_repo,
+            timeout=bound(_GIT_TIMEOUT_S),
         )
         if branch_result.returncode != 0:
             raise _git_error("git branch -D failed", branch_result)

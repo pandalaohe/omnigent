@@ -2409,7 +2409,7 @@ async def test_content_search_limits_errors_and_hidden_files(
 
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
-    """Exercise the sandbox script with controlled executables and a short deadline."""
+    """Exercise the sandbox script with controlled executables and a bounded timeout."""
     from omnigent.runner.content_search import _SEARCH_SCRIPT
 
     if mode != "missing":

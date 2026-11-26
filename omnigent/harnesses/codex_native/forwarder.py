@@ -3271,6 +3271,12 @@ async def supervise_forwarder(
             )
         except Exception:
             _logger.warning("Codex Goal startup reconciliation failed", exc_info=True)
+        side_chat.register_side_chat_forwarder(
+            bridge_dir,
+            codex_client=client,
+            ap_client=ap_client,
+            forwarder_state=forwarder_state,
+        )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -3420,6 +3426,7 @@ async def supervise_forwarder(
             stream_error = exc
             raise
         finally:
+            side_chat.unregister_side_chat_forwarder(bridge_dir, client)
             # Stop producers before draining their output while the HTTP client is open.
             background_tasks = [
                 subscribe_task,
@@ -3657,6 +3664,8 @@ async def _drive_side_chat_requests(
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
+                            ap_client=ap_client,
+                            parent_session_id=target.session_id,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
                             developer_instructions=_side_chat_developer_instructions(bridge_dir),
@@ -3757,6 +3766,8 @@ async def _maybe_rotate_session_on_thread_started(
     """
     new_thread_id = _thread_id_from_started_event(event)
     if new_thread_id is None or new_thread_id == target.thread_id:
+        return False
+    if forwarder_state is not None and forwarder_state.session_for_child_thread(new_thread_id):
         return False
     # A Codex AgentControl child thread emits ``thread/started`` when it
     # begins. That event must not rotate the parent Omnigent session — the child
@@ -9360,6 +9371,8 @@ async def _register_child_session(
     nickname = item.get("agent_nickname")
     if isinstance(nickname, str) and nickname:
         data["agent_nickname"] = nickname
+    if isinstance(item.get("parent_item_id"), str):
+        data["parent_item_id"] = item["parent_item_id"]
     response = await _post_session_event(
         client,
         parent_session_id,

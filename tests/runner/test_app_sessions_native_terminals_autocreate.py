@@ -92,7 +92,7 @@ from omnigent.runtime.prompt import (
     WORKSPACE_IMAGE_INSTRUCTION,
     child_session_question_instruction,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY, SUCCEEDS_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.managed_mcp import expand_entry_value
@@ -346,25 +346,32 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction_spec", "env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset", "memory_guidance"),
     [
-        ("missing", None, []),
-        ("missing-lifecycle", None, []),
-        ("dead", None, []),
-        ("conpty-live", None, []),
-        ("conpty-exited", None, []),
-        ("posix-final", None, []),
+        ("missing", None, [], None),
+        ("missing-lifecycle", None, [], None),
+        ("dead", None, [], None),
+        ("conpty-live", None, [], None),
+        ("conpty-exited", None, [], None),
+        ("posix-final", None, [], None),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+            None,
         ),
-        ("empty", None, []),
-        ("raw", None, []),
-        ("resolved", None, []),
-        ("resolved-replace", None, []),
-        ("sdk-missing-replace", None, []),
-        ("resolved-sdk-empty-replace", None, []),
+        ("empty", None, [], None),
+        ("raw", None, [], None),
+        ("resolved", None, [], None),
+        ("resolved-replace", None, [], None),
+        ("sdk-missing-replace", None, [], None),
+        ("resolved-sdk-empty-replace", None, [], None),
+        # Memory guidance follows the startup instructions in both prompt modes,
+        # and replace mode still refuses to launch without author instructions.
+        ("resolved", None, [], "MEMORY GUIDANCE"),
+        ("resolved-replace", None, [], "MEMORY GUIDANCE"),
+        ("sdk-missing-replace", None, [], "MEMORY GUIDANCE"),
+        ("resolved-sdk-empty-replace", None, [], "MEMORY GUIDANCE"),
     ],
 )
 @pytest.mark.parametrize("permission_tier", ["full", "ask"])
@@ -377,6 +384,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     permission_tier: str,
     instruction_spec: str,
     has_parent: bool,
+    memory_guidance: str | None,
 ) -> None:
     """Launch a required terminal with session-local authored instructions.
 
@@ -389,6 +397,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.runner.app as runner_app_mod
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _memory_guidance(*_args: Any, workspace: Any = None) -> str | None:
+        return memory_guidance
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration.memory_startup_guidance", _memory_guidance
+    )
     if env_denylist is None:
         monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
     else:
@@ -537,7 +552,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         return bootstrap
 
     seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", permission_tier)
-    instructions = "  Follow the authored role. π\nKeep this whitespace.  "
+    instructions = "  Follow the authored role. π\nKeep this whitespace.\r\nExactly.  "
     reject_replace = instruction_spec in ("sdk-missing-replace", "resolved-sdk-empty-replace")
     authored_instructions: str | None = instructions
     if instruction_spec == "sdk-missing-replace":
@@ -638,8 +653,14 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         child_session_question_instruction(False)
     ) == int(has_parent)
     assert config["startupInstructions"].count(WORKSPACE_IMAGE_INSTRUCTION) == 1
+    assert instructions not in config["startupInstructions"]
+    if memory_guidance is not None:
+        assert config["startupInstructions"].count(memory_guidance) == 1
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    # Pi uses its own shell and file tools, so the extension gets no relayed
+    # sys_os_* that would be a second route to the workspace.
+    assert not {name for name in tool_names if name.startswith("sys_os_")}
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     task = runner_app_mod._AUTO_FORWARDER_TASKS.pop("47f049b9d13df4db397c7f46859b825f")
@@ -650,7 +671,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     args = captured["spec"].args
     assert args[-2:] == ["--append-system-prompt", "User addition"]
-    if instruction_spec in {"raw", "resolved", "resolved-replace"}:
+    authored = (
+        instructions if instruction_spec in {"raw", "resolved", "resolved-replace"} else None
+    )
+    if authored:
         assert args.count("--append-system-prompt") == 2
         prompt_flag = (
             "--system-prompt"
@@ -661,7 +685,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         assert ("--no-context-files" in args) is (instruction_spec == "resolved-replace")
         if instruction_spec == "resolved-replace":
             assert args[args.index("--append-system-prompt") + 1] == ""
-        assert instructions_path.read_text() == instructions
+        assert instructions_path.read_bytes() == authored.encode("utf-8")
     else:
         assert args.count("--append-system-prompt") == 1
         assert not instructions_path.exists()
@@ -2920,6 +2944,94 @@ async def test_auto_create_claude_terminal_child_question_policy(
         assert child_line not in prompt
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "preset", "expected"),
+    [
+        (True, True, None, "1"),
+        (False, True, None, None),
+        (True, False, None, None),
+        (True, True, "0", None),
+    ],
+    ids=["memory-on", "server-memory-off", "agent-memory-off", "already-set"],
+)
+async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigent_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    preset: str | None,
+    expected: str | None,
+) -> None:
+    """With Omnigent memory on, Claude Code launches with its own auto memory off.
+
+    Only when the server confirms memory is on, so a session never loses both, and
+    an explicit value in the runner's environment wins.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if preset is None:
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", preset)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": server_memory})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    await _auto_create_claude_terminal(
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    assert captured["spec"].env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == expected
 
 
 @pytest.mark.asyncio

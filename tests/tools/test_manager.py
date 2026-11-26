@@ -196,6 +196,13 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # unconditionally (it has no cross-session function). Schema-only;
         # runner-dispatched.
         "ask_user_async",
+        # Long-term memory tools are always auto-registered unless the spec
+        # sets ``tool_groups.memory: false``. Runner-dispatched to ``/v1/memory``.
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_write",
+        "memory_delete",
     }
     | ADVANCED_BROWSER_TOOL_NAMES
 )

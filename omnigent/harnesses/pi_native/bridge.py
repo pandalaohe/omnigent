@@ -780,8 +780,8 @@ def _atomic_json(path: Path, payload: _JsonObject) -> None:
 def _atomic_text(path: Path, text: str) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
