@@ -590,6 +590,8 @@ async def test_sdk_wait_receives_parent_verdict_and_cancellation(tree, label, de
     "command,allow_once,schema,expected",
     [
         ("echo ready", "Allow", True, "answer"),
+        ("git -C ./missing reset --hard", "Allow", True, "note_only"),
+        ("[IO.File]::Delete('report.txt')", "Allow", True, "note_only"),
         ("rm -rf /etc", "Allow", True, "note_only"),
         (None, "Allow", True, "note_only"),
         ("echo ready", None, True, "note_only"),
@@ -717,6 +719,7 @@ async def test_acp_permission_offers_parent_once_or_preserves_user_choices(tree,
             if decision == "approve"
             else (False, None)
         )
+        assert not adapter._current_ctx.cancelled.is_set()
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

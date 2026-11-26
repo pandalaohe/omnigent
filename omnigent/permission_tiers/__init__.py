@@ -147,6 +147,7 @@ class ToolIntent:
     target_text: str = ""
     recursive_read_paths: tuple[str, ...] = ()
     command_read_only: bool = False
+    command_uncertain: bool = False
     unbound_write: bool = False
     native_status: NativeSupportStatus | None = None
     unseen_tool: bool = False
@@ -808,6 +809,9 @@ def _adapt_unbound_call(
                 status="unknown" if reason else "ok",
                 detail=reason or "user-extension",
             )
+        if name == "update_steps":
+            # AG's native progress tool updates only the current turn's checklist.
+            return ToolIntent(ToolKind.OTHER, name, digest, context, detail="framework-control")
         if name == "call_mcp_tool":
             _validate_agy_argument_keys(name, arguments)
             server = _required_text(arguments, "ServerName")
@@ -886,6 +890,8 @@ def _adapt_unbound_call(
         if name in _EXEC_COMMAND:
             target = None
             if name == "run_command":
+                if context.platform == "windows":
+                    context = replace(context, shell="pwsh")
                 if arguments.get("RunPersistent") or arguments.get("RequestedTerminalID"):
                     return ToolIntent(
                         ToolKind.UNKNOWN,
@@ -900,6 +906,13 @@ def _adapt_unbound_call(
                     if target.kind != "directory":
                         raise ValueError("Command Cwd must be a confirmed directory")
                     context = replace(context, cwd=target.path)
+                    if context.platform == "windows":
+                        drive = ntpath.splitdrive(target.path)[0]
+                        if len(drive) == 2:
+                            context = replace(
+                                context,
+                                drive_cwds={**context.drive_cwds, drive.upper(): target.path},
+                            )
             return ToolIntent(
                 ToolKind.EXEC,
                 name,
@@ -1011,8 +1024,14 @@ def adapt_tool_call(
             raise ValueError("Workspace cannot be confirmed")
         controls = tuple(_resolve(path, context).path for path in context.control_paths)
         exact, prefixes = _protected_paths(context)
+        agy_powershell = bool(
+            intent.command and intent.name == "run_command" and context.platform == "windows"
+        )
+        version_query = agy_powershell and is_powershell_version_query(intent.command)
         paths, recursive_paths = (
-            _command_paths(intent.command, intent.context) if intent.command else ((), ())
+            _command_paths(intent.command, intent.context, agy_powershell=agy_powershell)
+            if intent.command and not version_query
+            else ((), ())
         )
         bound = replace(
             intent,
@@ -1022,6 +1041,9 @@ def adapt_tool_call(
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
             command_paths=paths,
             recursive_read_paths=recursive_paths,
+            command_uncertain=agy_powershell
+            and not version_query
+            and bool(re.search(r"[$`]|\[[\w.]+\]::", intent.command)),
         )
         if not intent.command:
             return bound
@@ -1834,6 +1856,22 @@ def _windows_path_operands(
     ]
 
 
+def is_powershell_version_query(command: str) -> bool:
+    """Recognize an isolated read of PowerShell's built-in version metadata."""
+    return (
+        re.fullmatch(
+            r"\s*\$PSVersionTable(?:\.PSVersion(?:\.ToString\(\))?)?\s*",
+            command,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+class _UnresolvedWindowsVariable(ValueError):
+    """A shell operand depends on a value unavailable to the host policy."""
+
+
 _WINDOWS_SHELL_TOKENS = (
     r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|&&|\|\||\|&|[;&|<>()\n]|"
     r"""(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+"""
@@ -1847,6 +1885,7 @@ def _windows_command_paths(
     *,
     posix_executor: bool,
     assigned: frozenset[str] = frozenset(),
+    agy_powershell: bool = False,
 ) -> tuple[str, ...]:
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
@@ -1944,6 +1983,47 @@ def _windows_command_paths(
             if shell in _HEREDOC_SHELLS:
                 candidates.extend(segment[option_index + 2 :])
         else:
+            if agy_powershell and _command_name(context.shell) == "pwsh":
+                candidates.extend(
+                    option[1]
+                    for token in segment
+                    if (
+                        option := re.fullmatch(
+                            r"-(?:path|literalpath|filepath|destination):(.+)", token, re.I
+                        )
+                    )
+                )
+                if (
+                    len(segment) == 3
+                    and segment[0].lower() in ("git", "git.exe")
+                    and segment[1] == "show"
+                    and re.fullmatch(r"[A-Za-z0-9_][\w./~^@{}-]+:[^:]+", segment[2])
+                ):
+                    # A git tree object is addressed within the repository, not as an OS path.
+                    candidates.append(segment[0])
+                    continue
+                if (
+                    len(segment) == 6
+                    and segment[0].casefold() == "where-object"
+                    and raw_segment[1] == "{"
+                    and re.fullmatch(r"\$_(?:\.\w+)?", raw_segment[2])
+                    and segment[3].casefold() in ("-match", "-notmatch", "-eq", "-ne", "-like")
+                    and raw_segment[4].startswith(("'", '"'))
+                    and raw_segment[5] == "}"
+                ):
+                    candidates.append(segment[0])
+                    continue
+                # In expression position, a bare .NET member has no filesystem operand.
+                # The complete command still requires approval.
+                static_member = r"\[[\w.]+\]::\w+"
+                if re.fullmatch(static_member, raw_segment[0]):
+                    if (
+                        len(raw_segment) == 3
+                        and raw_segment[1] == "="
+                        and re.fullmatch(static_member, raw_segment[2])
+                    ):
+                        continue
+                    segment, raw_segment = segment[1:], raw_segment[1:]
             candidates.extend(
                 _windows_path_operands(
                     segment, raw_segment, context.shell, posix_executor=posix_executor
@@ -1951,9 +2031,23 @@ def _windows_command_paths(
             )
     for token in candidates:
         if token:
-            expanded = _expand_trusted(token, context, assigned)
+            try:
+                expanded = _expand_trusted(token, context, assigned)
+            except _UnresolvedWindowsVariable:
+                if not agy_powershell or "$" not in token:
+                    raise
+                expanded = None
             if expanded is None:
-                raise ValueError(f"Unresolved Windows path variable: {token}")
+                if agy_powershell and re.search(r"[$`]", token):
+                    if _DEVICE.match(token):
+                        raise ValueError("Windows device path")
+                    without_scope = re.sub(
+                        r"\$(?:env|global|local|private|script|using):", "$", token, flags=re.I
+                    )
+                    if ":" in ntpath.splitdrive(without_scope)[1]:
+                        raise ValueError("Windows alternate data stream")
+                    continue
+                raise _UnresolvedWindowsVariable(f"Unresolved Windows path variable: {token}")
             token = expanded
             paths.append(_resolve(token, context).path)
     return tuple(paths)
@@ -2128,14 +2222,23 @@ def _wrapped_command(
 
 
 def _command_paths(
-    command: str, context: TrustedHostContext, *, powershell: bool = False, depth: int = 0
+    command: str,
+    context: TrustedHostContext,
+    *,
+    powershell: bool = False,
+    depth: int = 0,
+    agy_powershell: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
     if context.platform == "windows":
         return _windows_command_paths(
-            command, context, depth, posix_executor=_windows_posix(context)
+            command,
+            context,
+            depth,
+            posix_executor=_windows_posix(context),
+            agy_powershell=agy_powershell,
         ), ()
     command = command.replace("\\\n", "")
     tokens, _raw = _write_tokens(command, windows=powershell)
@@ -2536,7 +2639,7 @@ def _expand_trusted(
             if dialect in ("cmd", "pwsh", "powershell"):
                 name = name.upper()
             if name in assigned or not values.get(name):
-                raise ValueError(f"Unknown Windows path variable: {name}")
+                raise _UnresolvedWindowsVariable(f"Unknown Windows path variable: {name}")
             return values[name]
 
         expanded = pattern.sub(windows_expand, token)
@@ -2571,7 +2674,12 @@ def _bound_targets(
     if windows_posix and re.match(r"^(?:~|\$HOME|\$\{HOME\})(?:/|$)", token):
         # MSYS can use a home different from the Windows host context.
         return None
-    expanded = _expand_trusted(token, context, assigned)
+    try:
+        expanded = _expand_trusted(token, context, assigned)
+    except _UnresolvedWindowsVariable:
+        if _command_name(context.shell) == "pwsh":
+            return None
+        raise
     if expanded is None:
         return None
     if context.platform == "windows":
@@ -3312,6 +3420,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 )
             return TierDecision(
                 Verdict.ASK, intent.detail or "Unknown tool needs one-time approval"
+            )
+        if intent.command_uncertain:
+            return TierDecision(
+                Verdict.ASK, "PowerShell expansion or script needs one-time approval"
             )
         if tier == "ask":
             return TierDecision(Verdict.ASK, "This tool call needs one-time approval")

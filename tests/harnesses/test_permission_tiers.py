@@ -1578,6 +1578,45 @@ def test_windows_live_data_and_environment(shell, command):
 
 
 @pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW),
+        ("git show HEAD:docs/readme.md", Verdict.ALLOW),
+        ('$a = Get-Location\n$n = (Get-ChildItem -Name).Count\n"$a has $n entries"', Verdict.ASK),
+        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ASK),
+        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ASK),
+        ('Get-Content "$env:UNKNOWN/file.txt"', Verdict.ASK),
+        ('Get-Content "$env:UNKNOWN/file.txt:stream"', Verdict.DENY),
+        (r"$a = Get-Date; Set-Content C:\Windows\report.txt x", Verdict.DENY),
+        (r'$a = Get-Date; Set-Content "C:\Windows\$a" x', Verdict.DENY),
+        (r"$a = Get-Date; Get-Content C:\work\control\tier", Verdict.DENY),
+        ("Get-Content data.txt:stream", Verdict.DENY),
+        ("Get-Content -LiteralPath:[Console]::OutputEncoding", Verdict.DENY),
+        ('Get-Content "unterminated', Verdict.DENY),
+    ],
+)
+def test_windows_ag_command_distinguishes_powershell_data_and_path_operands(command, expected):
+    host = windows_host(shell="cmd")
+    assert decision("auto", "run_command", {"CommandLine": command}, host).action == expected
+
+
+def test_windows_ag_cwd_rebinds_drive_relative_command_paths():
+    host = windows_host(shell="cmd")
+
+    def resolve(path):
+        return ResolvedPath(path, "directory") if path == r"C:\Windows" else host.resolver(path)
+
+    result = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": "Set-Content C:report.txt x", "Cwd": r"C:\Windows"},
+        replace(host, resolver=resolve),
+    )
+    assert result.rule_id == "protected-path"
+    assert r"C:\Windows\report.txt" in result.reason
+
+
+@pytest.mark.parametrize(
     "command",
     [
         'start=$(date +%s); sleep 615; echo "OMNIGENT_LONG_TOOL_OK $(( $(date +%s) - start ))s"',

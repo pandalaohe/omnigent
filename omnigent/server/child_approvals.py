@@ -533,6 +533,8 @@ def floor(params: Mapping[str, Any]) -> Literal["clear", "user_only"]:
         return "clear"
     if not isinstance(command, str) or not command.strip():
         return "user_only"
+    if params.get("phase") == "acp_permission" and re.search(r"\[[\w.]+\]::", command):
+        return "user_only"
     return "user_only" if _command_is_user_only(command) else "clear"
 
 
