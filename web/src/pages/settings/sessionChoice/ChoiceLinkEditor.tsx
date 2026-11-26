@@ -17,6 +17,8 @@ import type { ChoiceDrainTag } from "./choiceDrainLocks";
 import { guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 import { splitModelId } from "@/lib/modelReference";
+import { LINK_PERMISSION_CHOICES, SESSION_CHOICE_ENTRY } from "../search/catalog/general";
+import { settingsControlProps } from "../search/settingsControl";
 
 export const CHOICE_SELECT =
   "h-8 min-w-0 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -190,7 +192,7 @@ export function ChoiceLinkEditor({
       <label className="flex min-w-0 flex-col gap-1 text-xs">
         Permission tier
         <select
-          aria-label="Link permission tier"
+          {...settingsControlProps(SESSION_CHOICE_ENTRY, "linkPermission")}
           className={CHOICE_SELECT}
           value={link.permissionTier ?? ""}
           onChange={(e) => {
@@ -200,11 +202,11 @@ export function ChoiceLinkEditor({
             onChange(next);
           }}
         >
-          <option value="">Host default</option>
-          <option value="ask">Ask</option>
-          <option value="plan">Plan</option>
-          <option value="accept-edits">Accept edits</option>
-          <option value="auto">Auto</option>
+          {LINK_PERMISSION_CHOICES.map(({ value, label }) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
         </select>
       </label>
       {variants.length > 1 && (

@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { LayeredLevel } from "@/lib/layeredValues";
 import { cn } from "@/lib/utils";
+import { AGENT_CALLING_DEFAULTS_ENTRY } from "@/pages/settings/search/catalog/harnesses";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 
 export interface LayeredTableRow {
   id: string;
@@ -490,6 +492,9 @@ export function LayeredTable({
                   <td colSpan={columns.length + 1} className={cn(LEVEL_CELL, "bg-muted/40")}>
                     <button
                       type="button"
+                      {...settingsControlProps(AGENT_CALLING_DEFAULTS_ENTRY, "fold", {
+                        runtime: String(foldedCount),
+                      })}
                       aria-expanded={unfolded}
                       data-testid="layered-fold-toggle"
                       className="sticky left-0 flex min-h-11 w-fit items-center gap-1.5 px-2.5 text-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"

@@ -183,6 +183,8 @@ export interface SettingsOwnership {
   };
   /** Props for the overlay content its control opens; none outside an owner. */
   overlay: () => { "data-settings-overlay-owner"?: string };
+  /** Props for an option named from runtime data in the owner's overlay. */
+  runtimeChoice: () => { "data-settings-runtime-choice"?: string };
 }
 
 /** What a shared component's controls are named and found as, from the Settings site around it. */
@@ -194,6 +196,7 @@ export function useSettingsOwnership(): SettingsOwnership {
         control: (options) => ({ ...options?.outside }),
         labelIds: (outside) => outside,
         overlay: () => ({}),
+        runtimeChoice: () => ({}),
       };
     }
     const { entry, part } = owner;
@@ -219,6 +222,7 @@ export function useSettingsOwnership(): SettingsOwnership {
         descriptionId: settingsDescriptionId(entry),
       }),
       overlay: () => settingsOverlayProps(entry, part),
+      runtimeChoice: () => (part === undefined ? {} : settingsRuntimeChoiceProps(entry, part)),
     };
   }, [owner]);
 }

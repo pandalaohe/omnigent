@@ -3,6 +3,8 @@ import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { SettingsCustomAgentsSection } from "./SettingsCustomAgentsSection";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+import { AGENT_CALLING_DEFAULTS_ENTRY } from "./search/catalog/harnesses";
+import { SettingsItem } from "./search/SettingsItem";
 
 export function SettingsAgentsSection() {
   const { harness, agentId } = useSettingsRoute();
@@ -17,11 +19,13 @@ export function SettingsAgentsSection() {
         <section
           id="agent-settings-table"
           hidden={viewingDetail}
-          className="min-w-0 space-y-5"
+          className="min-w-0"
           aria-label="Agents"
         >
-          <h1 className="settings-page-title text-2xl font-medium">Agents</h1>
-          <CallingDefaultsSection />
+          <SettingsItem entry={AGENT_CALLING_DEFAULTS_ENTRY} className="min-w-0 space-y-5">
+            <h1 className="settings-page-title text-2xl font-medium">Agents</h1>
+            <CallingDefaultsSection />
+          </SettingsItem>
         </section>
       )}
       {harness ? <SettingsHarnessesSection /> : <SettingsCustomAgentsSection />}

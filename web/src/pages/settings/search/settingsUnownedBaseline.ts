@@ -1606,10 +1606,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     reason: FORK_CONTROL_REASON,
   },
   "src/pages/settings/sessionChoice/ChoiceLimitRules.tsx › RuleFields › Input": {
-    count: 2,
-    reason: FORK_CONTROL_REASON,
-  },
-  "src/pages/settings/sessionChoice/ChoiceLimitRules.tsx › RuleFields › datalist": {
     count: 1,
     reason: FORK_CONTROL_REASON,
   },
@@ -1618,11 +1614,11 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     reason: FORK_CONTROL_REASON,
   },
   "src/pages/settings/sessionChoice/ChoiceLimitRules.tsx › RuleFields › option": {
-    count: 12,
+    count: 5,
     reason: FORK_CONTROL_REASON,
   },
   "src/pages/settings/sessionChoice/ChoiceLimitRules.tsx › RuleFields › select": {
-    count: 4,
+    count: 2,
     reason: FORK_CONTROL_REASON,
   },
   "src/pages/settings/sessionChoice/ChoiceLinkEditor.tsx › ChoiceChainEditor › Button": {

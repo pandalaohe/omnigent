@@ -13,6 +13,13 @@ import {
   type CallingDefaultsCatalogRow,
 } from "@/lib/callingDefaultsApi";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
+import { SESSION_CHOICE_ENTRY } from "../search/catalog/general";
+import { settingsControlProps } from "../search/settingsControl";
+import {
+  SettingsOwner,
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "../search/settingsOwnership";
 import { CHOICE_SELECT } from "./ChoiceLinkEditor";
 import { ChoiceCandidateCheck } from "./ChoiceCandidateCheck";
 import { limitRuleErrors, moveLimitRule, replaceLimitRules } from "./choiceLimitEdits";
@@ -57,27 +64,32 @@ function ScopeFields({
       <label className="grid min-w-0 gap-1 text-sm">
         Agent
         {agentOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
-          <Combobox
-            mode="select"
-            options={[
-              ...(scope.agent && !agent
-                ? [{ key: scope.agent, label: `${scope.agent} (unavailable)` }]
-                : []),
-              ...agentOptions.map((item) => ({
-                key: item.id,
-                label: item.display_name,
-                description: item.name,
-              })),
-            ]}
-            value={scope.agent}
-            onValueChange={(value) => onChange({ ...scope, agent: value })}
-            placeholder="Choose an agent"
-            aria-label={`${labelPrefix} agent`}
-            className="h-auto w-full rounded-none! bg-transparent p-0"
-          />
+          <SettingsOwner entry={SESSION_CHOICE_ENTRY} part="scopeAgent">
+            <Combobox
+              mode="select"
+              options={[
+                ...(scope.agent && !agent
+                  ? [{ key: scope.agent, label: `${scope.agent} (unavailable)` }]
+                  : []),
+                ...agentOptions.map((item) => ({
+                  key: item.id,
+                  label: item.display_name,
+                  description: item.name,
+                })),
+              ]}
+              value={scope.agent}
+              onValueChange={(value) => onChange({ ...scope, agent: value })}
+              placeholder="Choose an agent"
+              aria-label={`${labelPrefix} agent`}
+              settingsRuntimeName={labelPrefix}
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          </SettingsOwner>
         ) : (
           <select
-            aria-label={`${labelPrefix} agent`}
+            {...settingsControlProps(SESSION_CHOICE_ENTRY, "scopeAgent", {
+              runtime: labelPrefix,
+            })}
             className={CHOICE_SELECT}
             value={scope.agent}
             onChange={(e) => onChange({ ...scope, agent: e.target.value })}
@@ -102,32 +114,37 @@ function ScopeFields({
       <label className="grid min-w-0 gap-1 text-sm">
         Host
         {hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
-          <Combobox
-            mode="select"
-            options={[
-              { key: "__all__", label: "All hosts" },
-              ...(scope.host && !hostOptions.some((item) => item.host_id === scope.host)
-                ? [{ key: scope.host, label: `${scope.host} (unavailable)` }]
-                : []),
-              ...hostOptions.map((item) => ({
-                key: item.host_id,
-                label: item.name,
-                description: item.status === "online" ? undefined : "Offline",
-              })),
-            ]}
-            value={scope.host ?? "__all__"}
-            onValueChange={(value) => {
-              const next = { ...scope };
-              if (value !== "__all__") next.host = value;
-              else Reflect.deleteProperty(next, "host");
-              onChange(next);
-            }}
-            aria-label={`${labelPrefix} host`}
-            className="h-auto w-full rounded-none! bg-transparent p-0"
-          />
+          <SettingsOwner entry={SESSION_CHOICE_ENTRY} part="scopeHost">
+            <Combobox
+              mode="select"
+              options={[
+                { key: "__all__", label: "All hosts" },
+                ...(scope.host && !hostOptions.some((item) => item.host_id === scope.host)
+                  ? [{ key: scope.host, label: `${scope.host} (unavailable)` }]
+                  : []),
+                ...hostOptions.map((item) => ({
+                  key: item.host_id,
+                  label: item.name,
+                  description: item.status === "online" ? undefined : "Offline",
+                })),
+              ]}
+              value={scope.host ?? "__all__"}
+              onValueChange={(value) => {
+                const next = { ...scope };
+                if (value !== "__all__") next.host = value;
+                else Reflect.deleteProperty(next, "host");
+                onChange(next);
+              }}
+              aria-label={`${labelPrefix} host`}
+              settingsRuntimeName={labelPrefix}
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          </SettingsOwner>
         ) : (
           <select
-            aria-label={`${labelPrefix} host`}
+            {...settingsControlProps(SESSION_CHOICE_ENTRY, "scopeHost", {
+              runtime: labelPrefix,
+            })}
             className={CHOICE_SELECT}
             value={scope.host ?? ""}
             onChange={(e) => {
@@ -157,7 +174,9 @@ function ScopeFields({
       <label className="grid min-w-0 gap-1 text-sm">
         Model
         <Input
-          aria-label={`${labelPrefix} model`}
+          {...settingsControlProps(SESSION_CHOICE_ENTRY, "scopeModel", {
+            runtime: labelPrefix,
+          })}
           list={listId}
           placeholder="All models"
           value={scope.model ?? ""}
@@ -168,9 +187,13 @@ function ScopeFields({
             onChange(next);
           }}
         />
-        <datalist id={listId}>
+        <datalist id={listId} {...settingsOverlayProps(SESSION_CHOICE_ENTRY, "scopeModel")}>
           {models.map((model) => (
-            <option key={model} value={model} />
+            <option
+              key={model}
+              value={model}
+              {...settingsRuntimeChoiceProps(SESSION_CHOICE_ENTRY, "scopeModel")}
+            />
           ))}
         </datalist>
         <span className="break-words text-muted-foreground">{scope.model ?? "All models"}</span>
@@ -205,7 +228,12 @@ function GroupRuleFields({
       {hasReserveFields && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-2 text-xs text-muted-foreground">
           <span>Clear reserve fields before adding another member.</span>
-          <Button size="sm" variant="outline" onClick={clearReserveFields}>
+          <Button
+            {...settingsControlProps(SESSION_CHOICE_ENTRY, "clearReserve")}
+            size="sm"
+            variant="outline"
+            onClick={clearReserveFields}
+          >
             Clear reserve fields
           </Button>
         </div>
@@ -220,6 +248,9 @@ function GroupRuleFields({
               </span>
               {members.length > 1 && (
                 <Button
+                  {...settingsControlProps(SESSION_CHOICE_ENTRY, "removeMember", {
+                    runtime: String(memberIndex + 1),
+                  })}
                   size="sm"
                   variant="ghost"
                   onClick={() => updateMembers(members.filter((_, idx) => idx !== memberIndex))}
@@ -239,6 +270,7 @@ function GroupRuleFields({
           </div>
         ))}
         <Button
+          {...settingsControlProps(SESSION_CHOICE_ENTRY, "addMember")}
           size="sm"
           variant="outline"
           disabled={hasReserveFields}
@@ -250,7 +282,7 @@ function GroupRuleFields({
       <label className="flex flex-wrap items-center gap-2 text-sm">
         Max running
         <Input
-          aria-label="Group max running"
+          {...settingsControlProps(SESSION_CHOICE_ENTRY, "groupMaximum")}
           type="number"
           className="h-9 w-28"
           min={1}
@@ -537,6 +569,7 @@ export function ChoiceLimitRules({
                 Add rule
               </Button>
               <Button
+                {...settingsControlProps(SESSION_CHOICE_ENTRY, "addGroup")}
                 variant="outline"
                 size="sm"
                 onClick={() => {

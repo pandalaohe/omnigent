@@ -476,7 +476,18 @@ export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
   },
 });
 
+export const AGENT_CALLING_DEFAULTS_ENTRY = settingsEntry({
+  id: "agent-calling-defaults",
+  section: "agents",
+  label: "Agents",
+  description: "Review agent settings across hosts, including agents without explicit settings.",
+  parts: { fold: "Not configured" },
+  nameTemplates: { fold: { before: "Not configured (", after: ")" } },
+  presence: { fold: { states: ["unconfigured rows"] } },
+});
+
 export const HARNESS_SETTINGS: readonly SettingsEntry[] = [
+  AGENT_CALLING_DEFAULTS_ENTRY,
   HARNESSES_GRID_ENTRY,
   ...HARNESS_CARD_ENTRIES.entries,
   ...HARNESS_DETAIL_ENTRIES.entries,

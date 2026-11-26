@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useCommandState } from "cmdk";
+import { useSettingsOwnership } from "@/pages/settings/search/settingsOwnership";
 
 import { Command, CommandItem, CommandList } from "./command";
 import { Input } from "./input";
@@ -24,6 +25,7 @@ interface ComboboxProps {
   onPick?: (option: ComboboxOption) => void;
   placeholder?: string;
   "aria-label": string;
+  settingsRuntimeName?: string;
   emptyText?: (typed: string) => string;
   maxRendered?: number;
   autoOpen?: boolean;
@@ -57,11 +59,13 @@ export function Combobox({
   onPick,
   placeholder,
   "aria-label": label,
+  settingsRuntimeName,
   emptyText,
   maxRendered = 50,
   autoOpen = false,
   className,
 }: ComboboxProps) {
+  const settings = useSettingsOwnership();
   const selectedLabel =
     mode === "editable" ? value : (options.find((o) => o.key === value)?.label ?? "");
   const [typed, setTyped] = useState(selectedLabel);
@@ -137,7 +141,13 @@ export function Combobox({
           <Input
             ref={input}
             role="combobox"
-            aria-label={label}
+            {...(settingsRuntimeName === undefined
+              ? { "aria-label": label }
+              : settings.control({
+                  name: { runtime: settingsRuntimeName },
+                  title: "",
+                  outside: { "aria-label": label },
+                }))}
             aria-autocomplete="list"
             aria-expanded={open}
             aria-controls={open ? listId : undefined}
@@ -184,6 +194,7 @@ export function Combobox({
           />
         </PopoverAnchor>
         <PopoverContent
+          {...(settingsRuntimeName !== undefined ? settings.overlay() : {})}
           align="start"
           className="w-[var(--radix-popover-trigger-width)] min-w-48 gap-0 p-0"
           onOpenAutoFocus={(event) => event.preventDefault()}
@@ -198,6 +209,7 @@ export function Combobox({
             <CommandList>
               {visible.map((option) => (
                 <CommandItem
+                  {...(settingsRuntimeName !== undefined ? settings.runtimeChoice() : {})}
                   key={option.key}
                   value={option.key}
                   disabled={option.disabled}
@@ -211,7 +223,11 @@ export function Combobox({
                 </CommandItem>
               ))}
               {custom && (
-                <CommandItem value={customKey} onSelect={() => finish(typed)}>
+                <CommandItem
+                  {...(settingsRuntimeName !== undefined ? settings.runtimeChoice() : {})}
+                  value={customKey}
+                  onSelect={() => finish(typed)}
+                >
                   Use &quot;{typed}&quot; as typed
                 </CommandItem>
               )}

@@ -41,9 +41,12 @@ import {
 } from "@/test/settingsPageSteps";
 
 import { SECTION_CATALOGS, SETTINGS_ENTRIES } from "./catalog";
+import { SESSION_CHOICE_ENTRY } from "./catalog/general";
 import type { SettingsEntry } from "./catalog/types";
+import { EMPTY_CHOICE } from "../sessionChoice/sessionChoiceData";
 import { UNOWNED_CONTROLS } from "./settingsUnownedBaseline";
 import {
+  AGENT_CALLING_DEFAULTS_ENTRY,
   HARNESS_CARD_ENTRIES,
   FIX_DIALOG_PARTS,
   HARNESS_CREDENTIAL_ENTRIES,
@@ -1307,22 +1310,38 @@ async function auditScenario(
       });
     }
     await waitUntilSettled({ client, routes });
+    const agentOverview = sectionId === "agents" && path === `/settings/${section}`;
+    if (agentOverview) {
+      // Audit the agent rows that were visible before the table gained its fold.
+      const fold = screen.getByRole("button", { name: /^Not configured \(\d+\)$/ });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      await userEvent.click(fold);
+    }
     observeRendered(entries, observedRows, observedParts);
     for (const [id, reason] of Object.entries(hides)) {
       if (document.querySelector(rowSelector(id))) {
         problems.push(`${where}: ${id} renders, though the scenario hides it (${reason})`);
       }
     }
-    const catalog =
+    const sectionCatalog =
       section === "custom-agents"
-        ? SECTION_CATALOGS.agents.filter((entry) => entry.id.startsWith("custom-agent"))
+        ? SECTION_CATALOGS.agents.filter(
+            (entry) =>
+              entry.id.startsWith("custom-agent") || entry.id === AGENT_CALLING_DEFAULTS_ENTRY.id,
+          )
         : section === "harnesses"
           ? SECTION_CATALOGS.agents.filter((entry) => !entry.id.startsWith("custom-agent"))
           : SECTION_CATALOGS[section];
+    const catalog = sectionCatalog.filter(
+      (entry) => entry.id !== AGENT_CALLING_DEFAULTS_ENTRY.id || agentOverview,
+    );
     const expected = catalog.filter((entry) => !(entry.id in hides));
     const drivenStates = new Map(
       Object.entries(states).map(([id, driven]) => [id, new Set(driven)]),
     );
+    if (agentOverview) {
+      drivenStates.set(AGENT_CALLING_DEFAULTS_ENTRY.id, new Set(["unconfigured rows"]));
+    }
     audits.push({
       section: sectionId,
       scenario,
@@ -1514,6 +1533,91 @@ describe("every Settings section, rendered by the real page", () => {
     ALL_AUDITS.problems.push(...own.problems);
     expect(own.problems).toEqual([]);
   }, 120_000);
+
+  it("owns the controls inside the session choice editor", async () => {
+    resetScenario();
+    const routes = settingsRouteTable([
+      ...ROUTES,
+      {
+        url: "/v1/me/session-choice",
+        body: {
+          revision: "limits",
+          capabilities: { documentVersions: [1, 2], limitRules: true, effectiveLimits: true },
+          settings: {
+            ...EMPTY_CHOICE,
+            schemaVersion: 2,
+            presets: [{ id: "audit-preset", name: "Audit preset", links: [{ agent: "" }] }],
+            limitRules: [
+              {
+                id: "audit-group",
+                members: [{ agent: "" }],
+                maxRunning: 2,
+                reserve: { pct: 10 },
+              },
+            ],
+          },
+        },
+      },
+      {
+        url: "/v1/me/session-choice/meters?host_id=host_1",
+        body: { meters: [], running: {}, floors: {} },
+      },
+      hostsRoute([
+        harnessHost(),
+        ...Array.from({ length: 5 }, (_, index) =>
+          harnessHost({ host_id: `host_${index + 2}`, name: `Machine ${index + 2}` }),
+        ),
+      ]),
+      { url: "/v1/me/usage/lines?running=1", body: { tiles: {} } },
+    ]);
+    vi.stubGlobal("fetch", routes.fetch);
+    renderSettingsPage("/settings/general#session-choice");
+    await userEvent.click(await screen.findByRole("button", { name: "Audit preset" }));
+    await userEvent.click(screen.getByRole("button", { name: /^Rule 1 · Group cap/ }));
+    const row = document.querySelector(rowSelector(SESSION_CHOICE_ENTRY.id))!;
+    const editor = within(row as HTMLElement);
+    const entries = new Map(SETTINGS_ENTRIES.map((entry) => [entry.id, entry]));
+    const choiceEntries = new Map([[SESSION_CHOICE_ENTRY.id, SESSION_CHOICE_ENTRY]]);
+    const editing = [
+      "session choice open",
+      "editing a link",
+      "editing a group",
+      "editing a limit scope",
+    ];
+    function auditEditor(state: string) {
+      // The broad General snapshots keep their existing closed editor. Here the declared
+      // parts must each render in the right row and state alongside the legacy controls.
+      const findings = auditSettingsDomFindings({
+        roots: [row.parentElement!],
+        entries,
+        expected: [SESSION_CHOICE_ENTRY],
+        drivenStates: new Map([[SESSION_CHOICE_ENTRY.id, new Set([...editing, state])]]),
+      });
+      expect(
+        findings.filter(
+          (finding) =>
+            finding.kind === "problem" &&
+            (finding.element
+              ? row.contains(finding.element)
+              : finding.message.includes(SESSION_CHOICE_ENTRY.id)),
+        ),
+      ).toEqual([]);
+      observeRendered(choiceEntries, ALL_AUDITS.observedRows, ALL_AUDITS.observedParts);
+    }
+    auditEditor("group has reserve fields");
+    await userEvent.click(editor.getByRole("button", { name: "Clear reserve fields" }));
+    await userEvent.click(editor.getByRole("button", { name: "+ Add member" }));
+    auditEditor("group has several members");
+    const host = editor.getByRole("combobox", { name: "Member 1 host" });
+    expect(host).toHaveAttribute("data-settings-control", "session-choice:scopeHost");
+    await userEvent.click(host);
+    const option = await screen.findByRole("option", { name: "All hosts" });
+    expect(option).toHaveAttribute("data-settings-runtime-choice", "session-choice:scopeHost");
+    expect(option.closest("[data-settings-overlay-owner]")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "session-choice:scopeHost",
+    );
+  }, 30_000);
 
   it("finds an owner for every control it renders, and shows every row and part somewhere", () => {
     const { audits, observedRows, observedParts } = ALL_AUDITS;

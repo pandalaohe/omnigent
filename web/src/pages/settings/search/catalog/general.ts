@@ -221,11 +221,63 @@ export const GLOBAL_SHORTCUT_ENTRIES = settingsEntryFamily({
     shortcut === "show" ? GLOBAL_SHORTCUT_ENTRY : FLOATING_COMPOSER_SHORTCUT_ENTRY,
 });
 
+export const LINK_PERMISSION_CHOICES = [
+  { value: "", label: "Host default" },
+  { value: "ask", label: "Ask" },
+  { value: "plan", label: "Plan" },
+  { value: "accept-edits", label: "Accept edits" },
+  { value: "auto", label: "Auto" },
+] as const;
+
+const EDITING_LIMIT_SCOPE = { states: ["editing a limit scope"] } as const;
+
+export const SESSION_CHOICE_ENTRY = settingsEntry({
+  id: "session-choice",
+  section: "general",
+  label: "Session choice",
+  description: "Choose agents, permission tiers and running limits for new sessions.",
+  parts: {
+    linkPermission: "Link permission tier",
+    addGroup: "Add group cap",
+    addMember: "+ Add member",
+    removeMember: "Remove member",
+    clearReserve: "Clear reserve fields",
+    groupMaximum: "Group max running",
+    scopeAgent: "Limit scope agent",
+    scopeHost: "Limit scope host",
+    scopeModel: "Limit scope model",
+  },
+  partChoices: { linkPermission: LINK_PERMISSION_CHOICES.map((choice) => choice.label) },
+  nameTemplates: {
+    removeMember: { before: "Remove member " },
+    scopeAgent: { before: "", after: " agent" },
+    scopeHost: { before: "", after: " host" },
+    scopeModel: { before: "", after: " model" },
+  },
+  overlays: {
+    scopeAgent: { runtimeChoices: {} },
+    scopeHost: { runtimeChoices: {} },
+    scopeModel: { runtimeChoices: {} },
+  },
+  presence: {
+    linkPermission: { states: ["editing a link"] },
+    addGroup: { states: ["session choice open"] },
+    addMember: { states: ["editing a group"] },
+    removeMember: { states: ["group has several members"] },
+    clearReserve: { states: ["group has reserve fields"] },
+    groupMaximum: { states: ["editing a group"] },
+    scopeAgent: EDITING_LIMIT_SCOPE,
+    scopeHost: EDITING_LIMIT_SCOPE,
+    scopeModel: EDITING_LIMIT_SCOPE,
+  },
+});
+
 export const GENERAL_SETTINGS = [
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
+  SESSION_CHOICE_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_IN_DESKTOP_APP_ENTRY,

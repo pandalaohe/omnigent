@@ -149,6 +149,7 @@ import {
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   PROACTIVE_AGENT_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
+  SESSION_CHOICE_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
 } from "@/pages/settings/search/catalog/general";
@@ -2695,13 +2696,17 @@ function GeneralSection() {
           <div className="mt-4 border-t border-border pt-4">
             <OpenAtLatestSetting />
           </div>
-          <ExpandableSettings
-            id="session-choice"
-            title="Session choice"
-            className="mt-4 border-t border-border pt-4"
-          >
-            <SessionChoiceSettings />
-          </ExpandableSettings>
+          <SettingsItem entry={SESSION_CHOICE_ENTRY} className="mt-4 border-t border-border pt-4">
+            <ExpandableSettings
+              id={SESSION_CHOICE_ENTRY.id}
+              title={SESSION_CHOICE_ENTRY.label}
+              aliases={Object.keys(SESSION_CHOICE_ENTRY.parts).map(
+                (part) => `#${SESSION_CHOICE_ENTRY.id}:${part}`,
+              )}
+            >
+              <SessionChoiceSettings />
+            </ExpandableSettings>
+          </SettingsItem>
           {sessionCollabEnabled && (
             <ExpandableSettings
               id="session-collab"
