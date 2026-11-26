@@ -22,7 +22,11 @@ from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
 from omnigent.server.schemas import ChildSessionSummary
-from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, pinned_label_key
+from omnigent.stores.conversation_store import (
+    ARTIFACT_LINK_KEY_LABEL,
+    muted_label_key,
+    pinned_label_key,
+)
 
 
 def _child(labels: dict[str, str], *, live_status: str | None = None) -> Conversation:
@@ -47,6 +51,8 @@ def test_child_summary_strips_per_user_pin_keys_and_artifact_secret() -> None:
             pinned_label_key("alice@example.com"): "1721760000000",
             pinned_label_key("bob@example.com"): "1721760001000",
             ARTIFACT_LINK_KEY_LABEL: "signing-secret",
+            muted_label_key("alice@example.com"): "1",
+            muted_label_key("bob@example.com"): "1",
             "omni_project": "Moonshot",
         }
     )
@@ -54,6 +60,7 @@ def test_child_summary_strips_per_user_pin_keys_and_artifact_secret() -> None:
     # No pin key of any kind survives — not the canonical one, not a per-user one.
     assert not any(k.startswith("omnigent.pinned") for k in summary.labels)
     assert ARTIFACT_LINK_KEY_LABEL not in summary.labels
+    assert not any(k.startswith("omnigent.muted") for k in summary.labels)
     # Unrelated labels are preserved.
     assert summary.labels.get("omni_project") == "Moonshot"
 

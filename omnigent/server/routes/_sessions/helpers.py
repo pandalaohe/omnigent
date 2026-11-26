@@ -152,6 +152,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     effective_admin,
+    env_var_is_truthy,
 )
 from omnigent.server.host_registry import (
     HostConnection,
@@ -375,6 +376,7 @@ from omnigent.stores.conversation_store import (
     ARTIFACT_LINK_KEY_LABEL,
     CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -2429,6 +2431,8 @@ def _publish_input_consumed(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    *,
+    delivery_confirmed: bool = True,
 ) -> None:
     """
     Publish a ``session.input.consumed`` event for a just-persisted
@@ -2447,6 +2451,8 @@ def _publish_input_consumed(
         web message mirrored back from the transcript), that entry's
         id, e.g. ``"pending_a1b2c3"`` — so clients drop the optimistic
         bubble by id. ``None`` when nothing was drained.
+    :param delivery_confirmed: False when settlement only clears a pending
+        entry and cannot confirm delivery of its original input.
 
     Hidden context items (``is_meta``, e.g. injected skill text or a
     Claude background-task notification) are published too, flagged in
@@ -2455,7 +2461,7 @@ def _publish_input_consumed(
     resumes on it starts a new bubble.
     """
     item_data = item.data.model_dump() if item.data is not None else {}
-    if item.type == "message" and item.status == "failed":
+    if item.type == "message" and (not delivery_confirmed or item.status == "failed"):
         item_data["delivery_confirmed"] = False
     event = SessionInputConsumedEvent(
         type="session.input.consumed",
@@ -3266,6 +3272,14 @@ def _record_native_hours(
     )
 
 
+HIDE_COST_ENV_VAR = "OMNIGENT_HIDE_COST"
+
+
+def cost_display_hidden() -> bool:
+    """Whether the operator hides USD cost from session views."""
+    return env_var_is_truthy(HIDE_COST_ENV_VAR)
+
+
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
@@ -3274,12 +3288,17 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     the UI) is distinct from a priced ``$0.00``. The cost-budget policy is
     unaffected — it reads the value with a ``0.0`` default.
 
+    Operators whose catalog and harness costs are both non-authoritative set
+    ``OMNIGENT_HIDE_COST=1`` to report sessions as unpriced in the session view
+    (snapshot, ``session.usage`` events, per-model breakdown). Token counts, the
+    stored cost budget policies read, and the ``/v1/usage`` report are kept.
+
     :param usage: A conversation's ``session_usage`` dict, e.g.
         ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (priced) or
         ``{"input_tokens": 1200}`` (unpriced — no cost key).
     :returns: The cumulative cost in USD when priced, else ``None``.
     """
-    if "total_cost_usd" not in usage:
+    if "total_cost_usd" not in usage or cost_display_hidden():
         return None
     try:
         return float(usage["total_cost_usd"])
@@ -4461,6 +4480,8 @@ def _publish_external_conversation_item(
     item: ConversationItem,
     cleared_pending_id: str | None = None,
     message_id: str | None = None,
+    *,
+    delivery_confirmed: bool = True,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -4480,11 +4501,17 @@ def _publish_external_conversation_item(
         — because it also folds the entry's file blocks into the durable
         item before append.
     :param message_id: Optional live-preview stream finalized by this item.
+    :param delivery_confirmed: Whether a cleared pending entry was confirmed delivered.
     :returns: None.
     """
     if item.type == "message" and isinstance(item.data, MessageData):
         if item.data.role == "user":
-            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
+            _publish_input_consumed(
+                session_id,
+                item,
+                cleared_pending_id=cleared_pending_id,
+                delivery_confirmed=delivery_confirmed,
+            )
             return
         if item.data.is_meta:
             # Hidden context on a non-user message has no live rendering
@@ -14021,6 +14048,14 @@ def _reject_server_reserved_label_seed(
             f"label {touched_key!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Mutes are per-user the same way.
+    suffixed_mute = next((k for k in labels if k.startswith(f"{MUTED_LABEL_KEY}.")), None)
+    if suffixed_mute is not None:
+        raise OmnigentError(
+            f"label {suffixed_mute!r} is server-derived; set the bare "
+            f"{MUTED_LABEL_KEY!r} key to mute for yourself",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Sandbox lifecycle labels are written only by server internals and re-read
     # across a relaunch to rebuild the runner Pod (e.g. the repository it
     # re-clones). A client seed here would forge that reconstruction state, so
@@ -15257,7 +15292,11 @@ def _child_session_summary_from_conversation(
     # keys so a shared child's summary never exposes another viewer's pin.
     # ``drop_server_secret_labels`` keeps the artifact-link secret server-side.
     raw_labels = drop_server_secret_labels(conv.labels)
-    raw_labels = {k: v for k, v in raw_labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    raw_labels = {
+        k: v
+        for k, v in raw_labels.items()
+        if not k.startswith((f"{PINNED_LABEL_KEY}.", f"{MUTED_LABEL_KEY}."))
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None
@@ -16624,6 +16663,7 @@ __all__ = [
     "cancel_managed_launch_tasks",
     "cleanup_worktree",
     "configure_elicitation_source_resolver",
+    "cost_display_hidden",
     "effective_host_id",
     "effective_worktree",
     "elicitation_source",

@@ -231,6 +231,12 @@ async def test_authored_framework_notice_is_rejected(
     assert snapshot["pending_inputs"] == []
 
 
+@pytest.fixture(autouse=True)
+def _show_cost_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cost-display assertions independent of a host ``OMNIGENT_HIDE_COST``."""
+    monkeypatch.delenv("OMNIGENT_HIDE_COST", raising=False)
+
+
 @pytest.mark.parametrize("snapshot_source", ["transcript", "transcript_degraded", "hook_fallback"])
 async def test_compaction_snapshot_source_survives_server_parse(
     client: httpx.AsyncClient, snapshot_source: str
@@ -4730,9 +4736,11 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
         pending_inputs.reset_for_tests()
 
 
+@pytest.mark.parametrize("confirmed", [True, False], ids=["exact", "fifo"])
 async def test_external_user_message_drain_publishes_cleared_pending_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool,
 ) -> None:
     """
     Draining a pending entry publishes its id on session.input.consumed.
@@ -4756,6 +4764,7 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
     pid = pending_inputs.record(
         session["id"], [{"type": "input_text", "text": "hi there"}], stable_id=web_id
     )
+    mirror_text = "hi there" if confirmed else "another terminal input"
     try:
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
@@ -4766,7 +4775,7 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
                     "item_type": "message",
                     "item_data": {
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "hi there"}],
+                        "content": [{"type": "input_text", "text": mirror_text}],
                         "web_stable_id": "b" * 32,
                     },
                     "response_id": "native_turn_1",
@@ -4779,13 +4788,16 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
         assert len(consumed) == 1, f"expected one consumed event, got {published}"
         # The drained entry's id is echoed so the client drops that bubble by id.
         assert consumed[0]["data"]["cleared_pending_id"] == pid
+        payload = consumed[0]["data"]["data"]
+        assert (payload.get("delivery_confirmed") is not False) == confirmed
         mirror_id = consumed[0]["data"]["item_id"]
         assert mirror_id != web_id
-        assert consumed[0]["data"]["data"]["web_stable_id"] == web_id
+        assert payload.get("web_stable_id") == (web_id if confirmed else None)
         items = await client.get(f"/v1/sessions/{session['id']}/items")
         assert items.status_code == 200, items.text
         [mirror] = [item for item in items.json()["data"] if item["id"] == mirror_id]
-        assert mirror["web_stable_id"] == web_id
+        assert mirror.get("web_stable_id") == (web_id if confirmed else None)
+        assert mirror["content"] == [{"type": "input_text", "text": mirror_text}]
         # And the entry is gone from the index.
         assert pending_inputs.snapshot_for(session["id"]) == []
     finally:
@@ -11901,9 +11913,12 @@ async def test_external_session_usage_event_carries_priced_cost(
     assert published[0][1]["total_cost_usd"] == 0.42
 
 
+@pytest.mark.parametrize("hide_cost", [False, True])
 async def test_external_session_usage_event_carries_token_breakdown(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    hide_cost: bool,
 ) -> None:
     """
     A native ``session.usage`` event carries the per-bucket token breakdown.
@@ -11911,8 +11926,11 @@ async def test_external_session_usage_event_carries_token_breakdown(
     The web token-breakdown rows read these cumulative subtree counts off the
     broadcast so they update live alongside the USD cost. The buckets are
     persisted from the ``cumulative_*`` fields, then surfaced under their
-    canonical keys (``input_tokens`` etc.).
+    canonical keys (``input_tokens`` etc.). With ``OMNIGENT_HIDE_COST`` the
+    cost stays persisted but is replaced by ``cost_hidden`` for clients.
     """
+    if hide_cost:
+        monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
@@ -11937,6 +11955,21 @@ async def test_external_session_usage_event_carries_token_breakdown(
     # The per-model breakdown rides the broadcast, keyed by the event's model.
     assert event["usage_by_model"]["test-model"]["input_tokens"] == 1000
     assert event["usage_by_model"]["test-model"]["output_tokens"] == 500
+    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == 0.42
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["usage_by_model"]["test-model"]["input_tokens"] == 1000
+    if hide_cost:
+        assert event["cost_hidden"] is True
+        assert "total_cost_usd" not in event
+        assert "total_cost_usd" not in event["usage_by_model"]["test-model"]
+        assert snapshot["cost_hidden"] is True
+        assert snapshot["total_cost_usd"] is None
+        assert snapshot["usage_by_model"]["test-model"].get("total_cost_usd") is None
+    else:
+        assert "cost_hidden" not in event
+        assert event["total_cost_usd"] == 0.42
+        assert snapshot.get("cost_hidden") is None
+        assert snapshot["total_cost_usd"] == 0.42
 
 
 async def test_external_session_usage_unpriced_omits_cost(

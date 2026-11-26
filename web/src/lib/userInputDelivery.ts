@@ -1,7 +1,12 @@
 // How a user message's delivery is judged: whether the runner refused a send,
 // read from a session snapshot when its POST got no answer.
-import { getSessionSlim } from "@/lib/sessionsApi";
+import { getSessionSlim, type PostEventResponse } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+
+/** A persisted message that was never forwarded can't reach the runner. */
+export function postDeliveredInput(response: PostEventResponse): boolean {
+  return !response.denied && !(response.queued && response.forwarded === false);
+}
 
 /**
  * Whether a session snapshot records the runner refusing the send `stableId`.
@@ -30,14 +35,18 @@ export function snapshotRefusesSend(session: Session, stableId: string): boolean
  *
  * @param sessionId - The session the send was posted to.
  * @param stableId - The send's stable id.
+ * @param signal - Aborts the snapshot read.
  * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
  */
 export async function sendVerdictFromServer(
   sessionId: string,
   stableId: string,
+  signal?: AbortSignal,
 ): Promise<"refused" | "delivered" | null> {
   try {
-    const session = await getSessionSlim(sessionId);
+    const session = await (signal
+      ? getSessionSlim(sessionId, { signal })
+      : getSessionSlim(sessionId));
     return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
   } catch {
     return null;

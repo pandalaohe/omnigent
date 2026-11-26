@@ -1,3 +1,4 @@
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   cleanupDictation,
@@ -16,14 +17,14 @@ interface Take {
   revision: number;
   draftRevision: number | undefined;
   scope: string;
-  field: HTMLTextAreaElement | null;
+  field: ComposerTextTarget | null;
 }
 
 /** Observe only dictation writes; any other draft revision invalidates the take. */
 export function useComposerVoiceCleanup(
   draft: string,
   setDraft: (value: string) => void,
-  inputRef: RefObject<HTMLTextAreaElement | null>,
+  inputRef: RefObject<ComposerTextTarget | null>,
   scope: string,
   getDraftRevision?: () => number,
 ) {

@@ -1,4 +1,8 @@
 import { type RefObject, useLayoutEffect, useRef } from "react";
+import {
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 /**
  * Cache scrollTop of all ancestor elements up to document.documentElement.
@@ -155,8 +159,13 @@ function measureTextarea(
  * ``onGrowth`` reports how much taller than its resting height the box now is
  * for callers that need to coordinate nearby controls with the resized input.
  */
+function revealAfterComposition(event: Event) {
+  const target = event.currentTarget;
+  if (target instanceof HTMLTextAreaElement) revealEndCaret(target);
+}
+
 export function useAutoGrowTextarea(
-  ref: RefObject<HTMLTextAreaElement | null>,
+  ref: RefObject<ComposerTextTarget | null>,
   value: string,
   maxRows = 10,
   onGrowth?: (px: number) => void,
@@ -171,11 +180,14 @@ export function useAutoGrowTextarea(
   });
 
   const prevValueRef = useRef(value);
+  // The textarea last measured, so a newly mounted one is measured exactly once.
+  const measuredRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Re-measure on content / maxRows change.
   useLayoutEffect(() => {
+    // Only a textarea measures itself; other engines size their own input.
     const ta = ref.current;
-    if (!ta) return;
+    if (!ta || !isComposerTextarea(ta)) return;
     const prev = prevValueRef.current;
     prevValueRef.current = value;
 
@@ -184,32 +196,47 @@ export function useAutoGrowTextarea(
     const isAppend = prev !== "" && value.startsWith(prev);
     const testForHeightReduction = !isAppend;
 
-    measureTextarea(ta, maxRows, onGrowthRef.current, testForHeightReduction);
+    // A newly mounted textarea tests for reduction, so it drops the default rows height.
+    const isNewTextarea = ta !== measuredRef.current;
+    measuredRef.current = ta;
+    measureTextarea(ta, maxRows, onGrowthRef.current, testForHeightReduction || isNewTextarea);
     // A capped draft can gain a line while its saved scroll offset stays put.
     if (prev !== value) revealEndCaret(ta);
   }, [ref, value, maxRows]);
 
-  // Install one observer per element (not per keystroke — value isn't a dep)
-  // so the box recovers once layout settles after a 0-height mount.
-  // Setting height in measureTextarea converges (auto → fixed → same fixed),
-  // so the observer settles rather than looping. Guarded for environments (jsdom)
-  // without ResizeObserver.
+  // One observer per element, so a 0-height mount recovers once layout settles. Newly
+  // mounted textareas are measured at once; measureTextarea converges, so this settles.
+  // Guarded for environments (jsdom) without ResizeObserver.
+  const observedRef = useRef<HTMLTextAreaElement | null>(null);
+  const observerRef = useRef<ResizeObserver | null>(null);
   useLayoutEffect(() => {
-    const ta = ref.current;
+    const target = ref.current;
+    const ta = target && isComposerTextarea(target) ? target : null;
+    if (ta === observedRef.current) return;
+    observedRef.current?.removeEventListener("compositionend", revealAfterComposition);
+    observedRef.current = ta;
+    observerRef.current?.disconnect();
+    observerRef.current = null;
     if (!ta) return;
-    // IME commits can leave the value unchanged, skipping the value effect.
-    const onCompositionEnd = () => revealEndCaret(ta);
-    ta.addEventListener("compositionend", onCompositionEnd);
-    const observer =
-      typeof ResizeObserver === "undefined"
-        ? undefined
-        : new ResizeObserver(() =>
-            measureTextarea(ta, maxRowsRef.current, onGrowthRef.current, true),
-          );
-    observer?.observe(ta);
-    return () => {
-      ta.removeEventListener("compositionend", onCompositionEnd);
-      observer?.disconnect();
-    };
-  }, [ref]);
+    if (ta !== measuredRef.current) {
+      measuredRef.current = ta;
+      measureTextarea(ta, maxRowsRef.current, onGrowthRef.current, true);
+    }
+    ta.addEventListener("compositionend", revealAfterComposition);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() =>
+      measureTextarea(ta, maxRowsRef.current, onGrowthRef.current, true),
+    );
+    ro.observe(ta);
+    observerRef.current = ro;
+  });
+  useLayoutEffect(
+    () => () => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      observedRef.current?.removeEventListener("compositionend", revealAfterComposition);
+      observedRef.current = null;
+    },
+    [],
+  );
 }

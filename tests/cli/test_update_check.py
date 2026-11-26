@@ -516,6 +516,7 @@ from omnigent.update_check import (  # noqa: E402
 # uv upgrade commands pin the interpreter omnigent is running under, so
 # expectations derive the flag instead of hardcoding a python version.
 _UV_PY = _uv_python_pin()
+_UV_INSTALL = f"uv tool install --reinstall-package omnigent --link-mode copy{_UV_PY}"
 
 
 @pytest.fixture(autouse=True)
@@ -700,9 +701,7 @@ def test_read_wheel_info_preserves_requested_revision(
     expected = f"git+{source}" + (f"@{revision}" if revision else "")
     assert info.vcs_url == expected
     assert info.commit_sha == _FAKE_COMMIT
-    assert _build_upgrade_suggestion(info).command == (
-        f"uv tool install --reinstall-package omnigent{_UV_PY} {expected}"
-    )
+    assert _build_upgrade_suggestion(info).command == (f"{_UV_INSTALL} {expected}")
     from omnigent.update_check import _split_vcs_url
 
     assert _split_vcs_url(info.vcs_url) == (source, revision)
@@ -770,7 +769,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     Reproduces the SSH-redaction bug: uv recorded the SSH install URL with the
     user redacted to ``****``. We assert the repair survives all the
     way through ``_build_upgrade_suggestion`` into a runnable
-    ``uv tool install --reinstall-package omnigent git+ssh://git@…`` command. If the
+    package-scoped uv reinstall command with copy mode. If the
     repair were dropped, ``info.vcs_url`` (and therefore the suggested
     command) would still contain ``****@`` and the user would hit
     ``Permission denied (publickey)`` when they confirmed the prompt.
@@ -802,10 +801,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     # The command the user sees and (on confirm) we run is the repaired,
     # runnable form — not the broken ``****@`` URL.
     assert suggestion.runnable is True
-    assert (
-        suggestion.command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
-    )
+    assert suggestion.command == f"{_UV_INSTALL} git+ssh://git@github.com/omnigent-ai/omnigent.git"
 
 
 def test_read_wheel_info_editable_install_is_marked(
@@ -903,12 +899,12 @@ def test_read_wheel_info_handles_corrupt_direct_url(
         (
             "uv",
             _FAKE_GIT_URL,
-            f"uv tool install --reinstall-package omnigent{_UV_PY} {_FAKE_GIT_URL}",
+            f"{_UV_INSTALL} {_FAKE_GIT_URL}",
             True,
         ),
         # uv + registry install — ``uv tool upgrade`` resolves from the
         # configured index. The user doesn't need to remember the spec.
-        ("uv", None, "uv tool upgrade omnigent", True),
+        ("uv", None, "uv tool upgrade --reinstall --link-mode copy omnigent", True),
         # pip + git install — pip's ``--force-reinstall`` re-pulls the
         # spec; plain ``pip install`` would no-op because the version
         # tag (or HEAD) is the same string.
@@ -1533,11 +1529,13 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         )
 
     # Default (no pre) is unchanged.
-    assert _build_upgrade_suggestion(_info("uv")).command == "uv tool upgrade omnigent"
+    assert _build_upgrade_suggestion(_info("uv")).command == (
+        "uv tool upgrade --reinstall --link-mode copy omnigent"
+    )
     # uv / pip registry installs get the right flag appended.
     assert (
         _build_upgrade_suggestion(_info("uv"), allow_prerelease=True).command
-        == "uv tool upgrade omnigent --prerelease allow"
+        == "uv tool upgrade --reinstall --link-mode copy omnigent --prerelease allow"
     )
     # pip pins the upgrade to the running interpreter (``<python> -m pip``)
     # so it can't land in some other env whose ``pip`` shadows ours on PATH.
@@ -1550,7 +1548,7 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         _build_upgrade_suggestion(
             _info("uv", vcs_url="git+https://x/omnigent.git"), allow_prerelease=True
         ).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} "
+        == f"{_UV_INSTALL} "
         "git+https://x/omnigent.git --prerelease allow"
     )
 
@@ -1588,16 +1586,18 @@ def _make_info(
 
 def test_build_upgrade_suggestion_preserves_uv_tool_extras() -> None:
     """uv tool installs with extras use a package-scoped reinstall to keep them."""
-    # No extras → plain uv tool upgrade.
-    assert _build_upgrade_suggestion(_make_info("uv")).command == "uv tool upgrade omnigent"
+    # No extras → uv tool upgrade with dependency relinking.
+    assert _build_upgrade_suggestion(_make_info("uv")).command == (
+        "uv tool upgrade --reinstall --link-mode copy omnigent"
+    )
     # With extras → reinstall with the PEP 508 spec.
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("all",))).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]"
+        == f"{_UV_INSTALL} omnigent[all]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("server", "all"))).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all,server]"
+        == f"{_UV_INSTALL} omnigent[all,server]"
     )
 
 
@@ -1605,13 +1605,13 @@ def test_build_upgrade_suggestion_uv_target_version() -> None:
     """A pinned target version uses a package-scoped reinstall with the spec."""
     assert (
         _build_upgrade_suggestion(_make_info("uv"), target_version="0.2.0").command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent==0.2.0"
+        == f"{_UV_INSTALL} omnigent==0.2.0"
     )
     assert (
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), target_version="0.2.0"
         ).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent==0.2.0[all]"
+        == f"{_UV_INSTALL} omnigent==0.2.0[all]"
     )
 
 
@@ -1621,11 +1621,11 @@ def test_build_upgrade_suggestion_extra_overrides_win() -> None:
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), extra_overrides=("server",)
         ).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all,server]"
+        == f"{_UV_INSTALL} omnigent[all,server]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv"), extra_overrides=("all",)).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]"
+        == f"{_UV_INSTALL} omnigent[all]"
     )
 
 
@@ -1643,11 +1643,11 @@ def test_build_upgrade_suggestion_vcs_preserves_extras() -> None:
     git_url = "git+https://github.com/example-org/omnigent.git"
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url)).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} {git_url}"
+        == f"{_UV_INSTALL} {git_url}"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url, extras=("all",))).command
-        == f"uv tool install --reinstall-package omnigent{_UV_PY} {git_url}#egg=omnigent[all]"
+        == f"{_UV_INSTALL} {git_url}#egg=omnigent[all]"
     )
 
 
@@ -1941,7 +1941,7 @@ def test_upgrade_command_for_installed(
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
     suggestion = upgrade_command_for_installed()
     assert suggestion is not None
-    assert suggestion.command == "uv tool upgrade omnigent"
+    assert suggestion.command == "uv tool upgrade --reinstall --link-mode copy omnigent"
     assert suggestion.runnable is True
 
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
@@ -2172,12 +2172,16 @@ def test_run_upgrade_command_invokes_subprocess(
     from omnigent.update_check import _run_upgrade_command
 
     captured_args: list[list[str]] = []
+    captured_env: list[dict[str, str] | None] = []
 
     class _FakeResult:
         returncode = 7  # arbitrary value to prove it propagates
 
-    def _fake_run(args: list[str], check: bool = False) -> _FakeResult:
+    def _fake_run(
+        args: list[str], check: bool = False, env: dict[str, str] | None = None
+    ) -> _FakeResult:
         captured_args.append(args)
+        captured_env.append(env)
         # Loud failure if anyone ever flips us to shell=True.
         assert isinstance(args, list)
         assert check is False
@@ -2186,7 +2190,12 @@ def test_run_upgrade_command_invokes_subprocess(
     monkeypatch.setattr(_subprocess, "run", _fake_run)
 
     console = Console(stderr=True)
-    code = _run_upgrade_command("uv tool install --reinstall omnigent[all]", console)
+    code = _run_upgrade_command(
+        "uv tool install --reinstall-package omnigent --link-mode copy omnigent[all]", console
+    )
+    upgrade_code = _run_upgrade_command(
+        "uv tool upgrade --reinstall --link-mode copy omnigent", console
+    )
 
     # shlex.split tokenization is the contract — a single
     # whitespace-joined string would let an installer interpret
@@ -2196,17 +2205,23 @@ def test_run_upgrade_command_invokes_subprocess(
             "uv",
             "tool",
             "install",
-            "--reinstall",
+            "--reinstall-package",
+            "omnigent",
+            "--link-mode",
+            "copy",
             "omnigent[all]",
-        ]
+        ],
+        ["uv", "tool", "upgrade", "--reinstall", "--link-mode", "copy", "omnigent"],
     ]
+    assert all(env is not None and env["UV_LINK_MODE"] == "copy" for env in captured_env)
     # The exit code must propagate unchanged so the caller's
     # success/failure branching works.
-    assert code == 7
+    assert code == upgrade_code == 7
     err = _strip_rich_panel(capsys.readouterr().err)
     # User-visible "Running:" status so they know what's executing.
     assert "Running:" in err
-    assert "uv tool install --reinstall" in err
+    assert "uv tool install --reinstall-package omnigent --link-mode copy" in err
+    assert "uv tool upgrade --reinstall --link-mode copy" in err
 
 
 def test_run_upgrade_command_returns_minus_one_when_binary_missing(
@@ -2232,7 +2247,7 @@ def test_run_upgrade_command_returns_minus_one_when_binary_missing(
     monkeypatch.setattr(_subprocess, "run", _raise)
 
     console = Console(stderr=True)
-    code = _run_upgrade_command("uv tool upgrade omnigent", console)
+    code = _run_upgrade_command("uv tool upgrade --reinstall --link-mode copy omnigent", console)
 
     # -1 distinguishes "couldn't start" from "ran and exited
     # non-zero" — the latter would be the subprocess's own code.
@@ -2547,7 +2562,7 @@ def test_cli_upgrade_dry_run_uv_tool_with_extras(
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade", "--dry-run"])
     assert result.exit_code == 0
-    assert f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]" in result.output
+    assert f"{_UV_INSTALL} omnigent[all]" in result.output
     assert "Would run:" in result.output
 
 

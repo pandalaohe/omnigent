@@ -763,6 +763,7 @@ def test_windows_web_ui_build_cannot_block_the_install(
         code = first_exit if len(calls) == 1 else 0
         return subprocess.CompletedProcess(args, code)
 
+    monkeypatch.delenv("OMNIGENT_SKIP_WEB_UI", raising=False)
     monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
     monkeypatch.setattr("omnigent.update_check._web_ui_bundled", lambda: bundled)
     monkeypatch.setattr("omnigent.update_check._installed_cli_imports", lambda: True)
@@ -770,6 +771,7 @@ def test_windows_web_ui_build_cannot_block_the_install(
     assert _run_upgrade_command("uv tool install --reinstall omnigent", Console()) == (
         first_exit if not bundled else 0
     )
+    assert all(env is not None and env.get("UV_LINK_MODE") == "copy" for env in calls)
     skip = [env is not None and env.get("OMNIGENT_SKIP_WEB_UI") == "true" for env in calls]
     if not bundled:
         assert skip == [True]

@@ -5,7 +5,7 @@
 // without a backend.
 
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +20,14 @@ import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 import type { RegistryItem } from "@/hooks/useAgentRegistry";
 import { AgentDefaultsTable } from "@/components/AgentDefaultsTable";
 import { readAgentBadgePreferences, writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
+import {
+  HARNESS_PLUGIN_ENTRIES,
+  HARNESS_SKILL_ENTRIES,
+  MCP_SERVER_LIST_ENTRIES,
+} from "./search/catalog/harnesses";
+import { settingsItemPath } from "./search/settingsControl";
 import { useSettingsOverlayParts } from "./search/settingsOwnership";
+import { SETTINGS_HIGHLIGHT_ATTRIBUTE } from "./search/settingsReveal";
 
 vi.mock("@/components/CallingDefaultsSection", () => ({
   CallingDefaultsSection: () => <div data-testid="calling-defaults-section">Master defaults</div>,
@@ -249,6 +256,16 @@ vi.mock("./HarnessFixDialog", () => ({
   },
 }));
 
+/** Navigates the rendered router, as a search result picked while the page is open does. */
+let navigateTo: (path: string) => void = () => {
+  throw new Error("renderHarnesses hasn't rendered");
+};
+function NavigateProbe() {
+  const navigate = useNavigate();
+  navigateTo = (path) => void navigate(path);
+  return null;
+}
+
 function renderHarnesses(harness?: string, search = "", base = "/settings/harnesses") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -256,6 +273,7 @@ function renderHarnesses(harness?: string, search = "", base = "/settings/harnes
       <TooltipProvider>
         <MemoryRouter initialEntries={[`${base}${harness ? `/${harness}` : ""}${search}`]}>
           <SettingsHarnessesSection />
+          <NavigateProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -490,6 +508,13 @@ describe("Harnesses grid catalog rows", () => {
     );
     expect(cursorCard).toHaveAttribute("data-settings-control", "harness-cursor-native:open");
     expect(cursorCard).toHaveAccessibleName("Cursor");
+    // The link is named by its harness, as the card's open part, and nothing overrides that name.
+    expect(cursorCard).toHaveAttribute("aria-label", "Cursor");
+    // Its status and description stay available to screen readers as its description.
+    expect(cursorCard).toHaveAccessibleDescription(
+      expect.stringContaining("An AI editor with agents"),
+    );
+
     expect(screen.getByRole("button", { name: "Cursor settings" })).toHaveAttribute(
       "data-settings-control",
       "harness-cursor-native:settings",
@@ -782,7 +807,7 @@ describe("Harness details", () => {
     expect(screen.getByText("2 skills · 1 MCP")).toBeTruthy();
     expect(screen.getByText("lint")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Plugins" }));
     expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
       "true",
     );
@@ -1379,7 +1404,7 @@ it("shows installed plugin metadata and disabled bundled servers", () => {
   expect(screen.getByText(/v1\.2\.3 · market · Disabled/)).toBeTruthy();
   selectTab("MCPs · 1");
   expect(screen.getByTestId("catalog-row-bundled")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to Plugins" }));
   expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
     "true",
   );
@@ -1408,7 +1433,7 @@ it("opens skill markdown only on demand and returns to Skills", () => {
   expect(screen.getByRole("link", { name: "docs" }).getAttribute("href")).toBe(
     "https://example.test/docs",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to Skills" }));
   expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
     "true",
   );
@@ -1423,7 +1448,7 @@ it("opens a namespaced plugin skill and returns to that plugin", () => {
   fireEvent.click(screen.getByTestId("catalog-row-lint"));
   expect(contentLookup).toEqual([ONLINE.host_id, "claude-native", "toolkit:lint"]);
   expect(screen.getByText(/Contents truncated/)).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "toolkit" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to toolkit" }));
   expect(screen.getByRole("heading", { name: "toolkit" })).toBeTruthy();
 });
 
@@ -1622,7 +1647,7 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", asyn
   selectTab("Plugins · 2");
   fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
   selectTab("MCPs · 1");
-  const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+  const toggle = screen.getByRole("switch", { name: "Enable MCP server: docs for claude" });
   expect(toggle).toHaveAttribute("aria-checked", "true");
   expect(screen.queryByText("toolkit plugin · host")).toBeNull();
   const row = screen.getByTestId("catalog-row-docs");
@@ -1684,10 +1709,9 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
-    "aria-checked",
-    "false",
-  );
+  expect(
+    screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }),
+  ).toHaveAttribute("aria-checked", "false");
 });
 
 it("keeps old-host and unsupported harness rows without a switch", () => {
@@ -1706,16 +1730,82 @@ it.each([false, true])("renders MCP enabled=%s and suppresses off probes", (enab
     },
   };
   renderHarnesses("claude-native");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
-    "aria-checked",
-    String(enabled),
-  );
+  expect(
+    screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }),
+  ).toHaveAttribute("aria-checked", String(enabled));
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   if (!enabled) {
     expect(screen.getByText("Off")).toBeInTheDocument();
     expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
     expect(screen.getByTestId("catalog-row-docs")).toHaveClass("opacity-50");
   } else expect(mcpLookups).toContainEqual(["h1", "claude", "docs", undefined, true]);
+});
+
+it.each(["claude-native", "codex-native"] as const)(
+  "reveals %s's MCP servers tab for a search result in its MCP list",
+  async (harness) => {
+    hosts = [ONLINE];
+    const page = `/settings/agents/${harness}`;
+    const path = settingsItemPath(MCP_SERVER_LIST_ENTRIES.entry(harness), "enabled");
+    expect(path.startsWith(`${page}#`)).toBe(true);
+    renderHarnesses(harness, path.slice(page.length));
+    const tab = screen.getByRole("tab", { name: /^MCP servers/ });
+    await waitFor(() => expect(tab).toHaveFocus());
+    expect(tab.closest("[data-settings-item]")).toHaveAttribute(SETTINGS_HIGHLIGHT_ATTRIBUTE);
+  },
+);
+
+describe("a search result picked while its harness page is open", () => {
+  const pick = (path: string) => act(() => navigateTo(path));
+
+  it("switches from Skills to the MCP servers tab for an MCP list result", async () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native", "?tab=skills");
+    expect(screen.getByRole("tab", { name: /^Skills/ })).toHaveAttribute("aria-selected", "true");
+    pick(settingsItemPath(MCP_SERVER_LIST_ENTRIES.entry("claude-native"), "enabled"));
+    const tab = screen.getByRole("tab", { name: /^MCP servers/ });
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(tab).toHaveFocus());
+    expect(tab.closest("[data-settings-item]")).toHaveAttribute(SETTINGS_HIGHLIGHT_ATTRIBUTE);
+  });
+
+  it("leaves an open plugin's page for an MCP list result", async () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+    selectTab("Plugins · 1");
+    fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+    expect(screen.getByRole("heading", { name: "toolkit" })).toBeTruthy();
+    pick(settingsItemPath(MCP_SERVER_LIST_ENTRIES.entry("claude-native")));
+    const tab = await screen.findByRole("tab", { name: /^MCP servers/ });
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(tab).toHaveFocus());
+  });
+
+  it.each([
+    ["a plugin", HARNESS_PLUGIN_ENTRIES.entry("claude-native"), /^Plugins/],
+    ["a skill", HARNESS_SKILL_ENTRIES.entry("claude-native"), /^Skills/],
+  ])("switches to the tab %s result is revealed through", async (_kind, entry, name) => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native", "?tab=settings");
+    pick(settingsItemPath(entry));
+    const tab = screen.getByRole("tab", { name });
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(tab).toHaveFocus());
+  });
+
+  it("leaves later tab clicks to the user", async () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native", "?tab=settings");
+    pick(settingsItemPath(MCP_SERVER_LIST_ENTRIES.entry("claude-native")));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /^MCP servers/ })).toHaveFocus());
+    selectTab("Skills · 1");
+    expect(screen.getByRole("tab", { name: "Skills · 1" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    selectTab("Plugins · 1");
+    expect(screen.getByRole("tab", { name: /^Plugins/ })).toHaveAttribute("aria-selected", "true");
+  });
 });
 
 it("locks managed MCP switches", () => {
@@ -1728,7 +1818,7 @@ it("locks managed MCP switches", () => {
     },
   };
   renderHarnesses("claude-native");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeDisabled();
+  expect(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" })).toBeDisabled();
   expect(setEnabled).not.toHaveBeenCalled();
 });
 
@@ -1774,7 +1864,7 @@ it.each([false, true])(
     client.setQueryData(["host-mcp-servers", "h1"], [server]);
     fireEvent.click(screen.getByTestId("catalog-row-docs"));
     expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "true");
-    const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+    const toggle = screen.getByRole("switch", { name: "Enable MCP server: docs for claude" });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
     expect(toggle).toBeDisabled();
@@ -1809,7 +1899,7 @@ it("retains the enablement switch when tool discovery is unavailable", () => {
   renderHarnesses("claude-native");
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeEnabled();
+  expect(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" })).toBeEnabled();
 });
 
 it.each([
@@ -1829,7 +1919,7 @@ it.each([
   };
   setEnabled.mockRejectedValue(error);
   renderHarnesses("claude-native");
-  fireEvent.click(screen.getByRole("switch", { name: "Enable docs for claude" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }));
   await waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
 });
 

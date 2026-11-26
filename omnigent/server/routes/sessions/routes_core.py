@@ -393,6 +393,7 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     CONTINUED_TO_LABEL_KEY,
     DELETION_CLAIM_STALE_AFTER_S,
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -402,6 +403,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationUpdateResult,
     _may_collate_to,
+    muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
     touched_label_key,
@@ -6559,6 +6561,11 @@ def register_core_routes(
         tool_settings = ORCHESTRATION_SOURCE_HEADER in request.headers and bool(
             {"model_override", "reasoning_effort"} & body.model_fields_set
         )
+        set_nest = "nest_source_id" in body.model_fields_set
+        if set_nest and body.model_fields_set != {"nest_source_id"}:
+            raise OmnigentError(
+                "Move a session separately from other updates", code=ErrorCode.INVALID_INPUT
+            )
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
@@ -6566,15 +6573,19 @@ def register_core_routes(
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
-        pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
-            PINNED_LABEL_KEY
-        }
-        if pin_only:
+        # Mute is a per-viewer preference like a pin, so it needs only READ too.
+        viewer_preference_only = (
+            body.model_fields_set == {"labels"}
+            and bool(body.labels)
+            and set(body.labels) <= {PINNED_LABEL_KEY, MUTED_LABEL_KEY}
+        )
+        if viewer_preference_only:
             required_level = LEVEL_READ
         elif (
             body.archived is not None
             or body.archive_locked is not None
             or set_project
+            or set_nest
             or set_launch_args
             or tool_settings
         ):
@@ -7254,6 +7265,8 @@ def register_core_routes(
         # through to the delete-clear loop below under the per-user key.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+        if MUTED_LABEL_KEY in labels_to_set:
+            labels_to_set[muted_label_key(user_id)] = labels_to_set.pop(MUTED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -7887,6 +7900,31 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if set_nest:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Moving sessions requires an owner", code=ErrorCode.FORBIDDEN)
+            if body.nest_source_id is not None and not request.app.state.feature_flags.enabled(
+                Feature.SIBLING_SESSIONS
+            ):
+                raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
+            for participant_id in dict.fromkeys([session_id, body.nest_source_id]):
+                if participant_id is None:
+                    continue
+                await asyncio.to_thread(
+                    require_owned_session,
+                    participant_id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                )
+            await asyncio.to_thread(
+                conversation_store.set_session_nest,
+                session_id,
+                body.nest_source_id,
+                user_id=user_id,
+            )
         settings_write = bool({"reasoning_effort", "model_override"} & body.model_fields_set)
         defer_archive = body.archived is not None and settings_write
         if body.archived is not None and set_project and not defer_archive:
@@ -8531,6 +8569,7 @@ def register_core_routes(
         for _clear_key in (
             PROJECT_LABEL_KEY,
             pinned_label_key(user_id),
+            muted_label_key(user_id),
             LAUNCHED_MODEL_LABEL,
         ):
             if labels_to_set.get(_clear_key) == "":

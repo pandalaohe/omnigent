@@ -4,7 +4,7 @@
 // crashing on `options.map`.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
@@ -1002,5 +1002,25 @@ describe("AskUserQuestionForm — keyboard", () => {
     for (const literal of hintLiterals) {
       expect(card().textContent).not.toContain(literal);
     }
+  });
+});
+
+describe("AskUserQuestionForm — disabled Submit", () => {
+  it("names the unanswered question that keeps Submit disabled", async () => {
+    const [first, second] = questionsOf(TWO_QUESTIONS);
+    renderKeyboardForm([{ ...first!, header: "First", isOther: false }, second!]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Answer question 1 (First) to submit"),
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    fireEvent.click(screen.getByLabelText(TWO_QUESTIONS[0]!.options![0]!.label));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+    expect(screen.queryByRole("group", { name: "Submit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 });

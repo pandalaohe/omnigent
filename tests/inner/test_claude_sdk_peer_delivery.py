@@ -191,6 +191,57 @@ async def test_actual_can_use_tool_await_blocks_peer_reservation() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("approval", ["policy", "claude"])
+async def test_bash_approval_blocks_peer_reservation(approval: str) -> None:
+    executor = ClaudeSDKExecutor(permission_mode="default")
+    slot = executor._query_slot("run")
+    slot.busy = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def approve(_name, _arguments):
+        entered.set()
+        await release.wait()
+        return True
+
+    action = "POLICY_ACTION_ASK" if approval == "policy" else "POLICY_ACTION_ALLOW"
+    executor._policy_evaluator = AsyncMock(return_value=SimpleNamespace(action=action, reason=""))
+    executor._policy_elicitation_handler = approve
+    executor._elicitation_handler = approve
+    options = SimpleNamespace(
+        hooks={},
+        permission_mode="default",
+        can_use_tool=executor._can_use_tool_gate,
+    )
+    executor._install_bash_policy_hook(
+        cast(Any, SimpleNamespace(HookMatcher=SimpleNamespace)), options, "run"
+    )
+    gate = options.hooks["PreToolUse"][0].hooks[0]
+    tool_input = {"command": "pwd"}
+    payload = {"tool_input": tool_input}
+    if approval == "policy":
+        pending = asyncio.create_task(gate(payload, "tool-1", {}))
+    else:
+        assert await gate(payload, "tool-1", {}) == {}
+        pending = asyncio.create_task(
+            options.can_use_tool("Bash", tool_input, SimpleNamespace(tool_use_id="tool-1"))
+        )
+    report = AsyncMock()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with patch(
+            "omnigent.inner.claude_sdk_executor.claude_peer_receipts_supported", return_value=True
+        ):
+            await executor.submit_peer_message("run", _delivery(1), report)
+        assert report.call_args.args[0].outcome == "refused"
+    finally:
+        release.set()
+        await pending
+    assert slot.permission_waits == 0
+    executor._policy_evaluator.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_hook_excludes_subagent_maintenance_and_pending_permission() -> None:
     executor = ClaudeSDKExecutor()
     slot = executor._query_slot("run")

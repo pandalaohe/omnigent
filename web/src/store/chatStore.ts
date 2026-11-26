@@ -116,6 +116,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { provesNotDelivered } from "@/lib/sendRefusal";
 import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
@@ -135,6 +136,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -197,7 +199,12 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
-import { downloadSessionFile, uploadFile, type FileUploadProgress } from "@/lib/filesApi";
+import {
+  deleteSessionFile,
+  downloadSessionFile,
+  uploadFile,
+  type FileUploadProgress,
+} from "@/lib/filesApi";
 import { attachmentFilename, attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { mentionItemPath, mentionMarkerFor } from "@/lib/composerMentions";
 import { insertIntoQuestionCard } from "@/lib/questionCardInput";
@@ -208,7 +215,11 @@ import {
   legacyComposerParts,
   type ComposerDraftPart,
 } from "@/lib/composerContent";
-import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
+import {
+  postDeliveredInput,
+  sendVerdictFromServer,
+  snapshotRefusesSend,
+} from "@/lib/userInputDelivery";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl, supportsSdkEffortReset } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
@@ -297,7 +308,47 @@ export interface SendOptions {
    * parent transcript/composer. The optimistic bubble is still rolled back and
    * status still settles.
    */
-  onError?: (message: string) => void;
+  onError?: (message: string, refused?: boolean) => void;
+  /** Fires when policy denies the input, so a caller can tell denial from acceptance. */
+  onDenied?: () => void;
+  /**
+   * Once aborted, a send still waiting to post, uploading, or awaiting its POST's answer
+   * stops waiting and fails (through `onError`); a POST already out still runs.
+   */
+  signal?: AbortSignal;
+  /** Fires when a POST still out as `signal` aborted is then accepted after all. */
+  onAcceptedLate?: () => void;
+  /**
+   * Not the composer's message (the Browser design tools' outbox): the composer's retry state
+   * and reload recovery are left alone, and `onError` fires only once the failure is known,
+   * with `refused` when the server's answer shows the runner never got it.
+   */
+  external?: boolean;
+  /** An external send resending one the server refused, so an item under its id proves nothing. */
+  retriesRefused?: boolean;
+  /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
+  beforePost?: () => Promise<string | null>;
+}
+
+// Who hears of each send the runner takes, by its committed item's id and by the pending
+// input it drained: the design outbox, whose sends' failures may turn out to have arrived.
+const deliveredSendListeners = new Set<(id: string) => void>();
+
+/** Hear of every send the runner takes (see `deliveredSendListeners`). */
+export function onSendDelivered(listener: (id: string) => void): () => void {
+  deliveredSendListeners.add(listener);
+  return () => deliveredSendListeners.delete(listener);
+}
+
+/** `work`, or a rejection once `signal` aborts; the work itself runs on. */
+function unlessAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 function followSupersededSession(sessionId: string, target?: string): void {
@@ -714,6 +765,8 @@ export interface PendingUserMessage {
   sendingSinceMs?: number;
   /** The native agent accepted this input; a running turn may still hold it queued. */
   received?: boolean;
+  /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
+  replayed?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -1764,7 +1817,7 @@ function nativeSandboxLaunching(state: ConversationState): boolean {
 const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
 
 /** Whether a message sent now is held locally for startup rather than posted. */
-function wouldHoldSend(state: ConversationState): boolean {
+export function wouldHoldSend(state: ConversationState): boolean {
   // The server saves startup messages itself, so it needs no local hold.
   return (
     !state.startupPending &&
@@ -2107,7 +2160,8 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // by File identity dedupes across attempts. Keyed by session too, since a File
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
-const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
+type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
+const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
 const cancelPendingUploads = new Map<string, () => void>();
 const queuedHeadUploads = new Set<string>();
 
@@ -2201,32 +2255,23 @@ function failedAttachmentCard(
   };
 }
 
-/**
- * Upload a file to a session and return its content block, reusing a prior
- * successful upload of the same File to the same session. Deduping here means
- * a failed post (or a later file's upload failing) doesn't re-upload files
- * that already landed when the message is retried.
- */
+/** Keep new uploads private to their batch until every file succeeds. */
 async function uploadFileBlock(
   sessionId: string,
   file: File,
+  newUploads: Map<File, UploadedFileBlock>,
   signal?: AbortSignal,
   onProgress?: (progress: FileUploadProgress) => void,
-): Promise<ContentBlock> {
-  const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
+): Promise<UploadedFileBlock> {
+  const cached = newUploads.get(file) ?? uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
   signal?.throwIfAborted();
   const uploaded = await uploadFile(sessionId, file, onProgress, signal);
-  const block: ContentBlock =
+  const block: UploadedFileBlock =
     classifyAttachment(file) === "image"
       ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
       : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
-  let bySession = uploadedFileBlockCache.get(file);
-  if (bySession === undefined) {
-    bySession = new Map<string, ContentBlock>();
-    uploadedFileBlockCache.set(file, bySession);
-  }
-  bySession.set(sessionId, block);
+  newUploads.set(file, block);
   return block;
 }
 
@@ -2252,7 +2297,7 @@ async function rewindAttachmentFiles(
         if (inline) return fileFromDataUri(inline, attachment.filename);
         if (!attachment.fileId) return null;
         const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
-        const block: ContentBlock = {
+        const block: UploadedFileBlock = {
           type: attachment.type,
           file_id: attachment.fileId,
           filename: attachment.filename,
@@ -2271,6 +2316,69 @@ async function rewindAttachmentFiles(
     toast.warning(`Couldn't restore ${names} to the composer. Attach again to send.`);
   }
   return downloads.filter((file): file is File => file !== null);
+}
+
+async function uploadAttachmentBatch(
+  sessionId: string,
+  build: (upload: (file: File) => Promise<UploadedFileBlock>) => Promise<ContentBlock[]>,
+  signal?: AbortSignal,
+  onProgressForFile?: (file: File) => (progress: FileUploadProgress) => void,
+): Promise<ContentBlock[]> {
+  const newUploads = new Map<File, UploadedFileBlock>();
+  let blocks: ContentBlock[];
+  try {
+    signal?.throwIfAborted();
+    blocks = await build((file) =>
+      uploadFileBlock(sessionId, file, newUploads, signal, onProgressForFile?.(file)),
+    );
+    signal?.throwIfAborted();
+  } catch (error) {
+    await Promise.all(
+      [...newUploads.values()].map(async (block) => {
+        try {
+          await deleteSessionFile(sessionId, block.file_id);
+        } catch (cleanupError) {
+          console.warn("Couldn't remove an upload from a failed attachment batch", cleanupError);
+        }
+      }),
+    );
+    throw error;
+  }
+  for (const [file, block] of newUploads) {
+    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
+    bySession.set(sessionId, block);
+    uploadedFileBlockCache.set(file, bySession);
+  }
+  return blocks;
+}
+
+/** Upload files in the order supplied by a caller building its own message. */
+export function uploadFileBlocks(
+  sessionId: string,
+  files: readonly File[],
+): Promise<ContentBlock[]> {
+  return uploadAttachmentBatch(sessionId, async (upload) => {
+    const blocks: ContentBlock[] = [];
+    for (const file of files) {
+      // oxlint-disable-next-line no-await-in-loop
+      blocks.push(await upload(file));
+    }
+    return blocks;
+  });
+}
+
+export function uploadComposerParts(
+  sessionId: string,
+  parts: readonly ComposerDraftPart[],
+  signal?: AbortSignal,
+  onProgressForFile?: (file: File) => (progress: FileUploadProgress) => void,
+): Promise<ContentBlock[]> {
+  return uploadAttachmentBatch(
+    sessionId,
+    (upload) => composerPartsToContentBlocks(parts, upload),
+    signal,
+    onProgressForFile,
+  );
 }
 
 // Must match the message-highlight animation duration in index.css.
@@ -3013,9 +3121,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       void (async () => {
         let content: ContentBlock[];
         try {
-          content = await composerPartsToContentBlocks(orderedParts, (file) =>
-            uploadFileBlock(conversationId, file),
-          );
+          content = await uploadComposerParts(conversationId, orderedParts);
         } catch (error) {
           conversationRegistry.acquire(conversationId);
           const card = failedAttachmentCard(
@@ -3098,8 +3204,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
-    const retryId = opts?.retryingUpload ? null : (pinnedState?.pendingRetryStableId ?? null);
-    const restoredDraft = opts?.retryingUpload ? null : (pinnedState?.restoredSendDraft ?? null);
+    const retryId =
+      opts?.retryingUpload || opts?.external ? null : (pinnedState?.pendingRetryStableId ?? null);
+    const restoredDraft =
+      opts?.retryingUpload || opts?.external ? null : (pinnedState?.restoredSendDraft ?? null);
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
@@ -3121,11 +3229,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // An untouched retry of a send the server refused goes out under the id of
     // an item the transcript already holds, so that item cannot prove THIS
     // attempt was delivered: the refusal stands until a live acknowledgement.
-    const retriesRefusedSend =
-      reusableRetryId !== null &&
-      restoredDraft !== null &&
-      restoredDraft.stableId === reusableRetryId &&
-      restoredDraft.serverRefused === true;
+    const retriesRefusedSend = opts?.external
+      ? opts.retriesRefused === true
+      : reusableRetryId !== null &&
+        restoredDraft !== null &&
+        restoredDraft.stableId === reusableRetryId &&
+        restoredDraft.serverRefused === true;
     const stableId = opts?.stableId ?? reusableRetryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
@@ -3286,6 +3395,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // The run's Stop in progress, which this message ends once the session takes it.
+    const endPlanStop = supersedePlanStop(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -3299,6 +3410,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Whether this attempt reached its POST: a failure before it can't have been delivered.
+    let posting = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -3309,6 +3422,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
+      opts?.signal?.throwIfAborted();
       if (initialDraft && !initialSendPending()) return false;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
@@ -3321,7 +3435,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+      if (!compacts && sentOnScreen && senderId !== null && text.trim() && !opts?.external) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
@@ -3334,6 +3448,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (compacts) {
         // Compact controls emit turn status edges, but no user
         // message acknowledgement. Keep the send latch without a pending bubble.
+        posting = true;
         await postConversationEvent(sessionId, { type: "compact", data: {} });
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
         return true;
@@ -3354,25 +3469,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           }));
         const controller = new AbortController();
         uploadController = controller;
-        cancelPendingUploads.set(tempId, () => {
-          cancelPendingUploads.delete(tempId);
-          controller.abort();
-          forgetUnsentSend(sessionId, stableId);
-          forgetRestoredSend(sessionId);
-          write((state) => ({
-            restoredSendDraft: null,
-            pendingRetryStableId: null,
-            pendingUserMessages: state.pendingUserMessages.filter((p) => p.tempId !== tempId),
-            failedSendDraft: {
-              conversationId: sessionId,
-              text,
-              files: composerAttachments(orderedParts),
-              composerParts: opts?.composerParts,
-              replyDraft: opts?.replyDraft,
-              replaceComposer: true,
-            },
-          }));
-        });
+        const uploadSignal = opts?.signal ?? controller.signal;
+        if (!opts?.external && !opts?.signal)
+          cancelPendingUploads.set(tempId, () => {
+            cancelPendingUploads.delete(tempId);
+            controller.abort();
+            forgetUnsentSend(sessionId, stableId);
+            forgetRestoredSend(sessionId);
+            write((state) => ({
+              restoredSendDraft: null,
+              pendingRetryStableId: null,
+              pendingUserMessages: state.pendingUserMessages.filter((p) => p.tempId !== tempId),
+              failedSendDraft: {
+                conversationId: sessionId,
+                text,
+                files: composerAttachments(orderedParts),
+                composerParts: opts?.composerParts,
+                replyDraft: opts?.replyDraft,
+                replaceComposer: true,
+              },
+            }));
+          });
         if (initialDraft && ownsTurnLatch) {
           // The startup hold still belongs to Stop until POST; it no longer
           // makes an idle conversation look busy once its upload begins.
@@ -3391,24 +3508,37 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         releaseCurrentSend = undefined;
         let fileIndex = 0;
         try {
-          serverContent = await composerPartsToContentBlocks(orderedParts, (file) => {
-            fileIndex += 1;
-            const report = (progress: FileUploadProgress) => {
-              if (controller.signal.aborted) return;
-              updateProgress({
-                filename: attachmentFilename(file),
-                fileIndex,
-                fileCount: attachmentCount,
-                ...progress,
-              });
-            };
-            if (!uploadedFileBlockCache.get(file)?.has(sessionId)) {
-              report({ loaded: 0, total: null, fraction: null });
-            }
-            return uploadFileBlock(sessionId, file, controller.signal, report);
-          });
+          if (opts?.external) {
+            serverContent = await unlessAborted(
+              uploadComposerParts(sessionId, orderedParts, uploadSignal),
+              uploadSignal,
+            );
+          } else {
+            serverContent = await uploadComposerParts(
+              sessionId,
+              orderedParts,
+              uploadSignal,
+              (file) => {
+                fileIndex += 1;
+                const report = (progress: FileUploadProgress) => {
+                  if (uploadSignal.aborted) return;
+                  updateProgress({
+                    filename: attachmentFilename(file),
+                    fileIndex,
+                    fileCount: attachmentCount,
+                    ...progress,
+                  });
+                };
+                if (!uploadedFileBlockCache.get(file)?.has(sessionId)) {
+                  report({ loaded: 0, total: null, fraction: null });
+                }
+                return report;
+              },
+            );
+          }
           if (controller.signal.aborted) return false;
         } catch (error) {
+          if (opts?.external || opts?.signal?.aborted) throw error;
           if (controller.signal.aborted) return false;
           opts?.onUploadNotPosted?.();
           const card = failedAttachmentCard(error, stableId, {
@@ -3424,7 +3554,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return false;
         } finally {
           cancelPendingUploads.delete(tempId);
-          if (!controller.signal.aborted) updateProgress(undefined);
+          if (!uploadSignal.aborted) updateProgress(undefined);
         }
         if (initialDraft && !initialSendPending()) return false;
         const postChain = enterSendChain(sessionId);
@@ -3432,10 +3562,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await postChain.waitForPrior();
         if (initialDraft && !initialSendPending()) return false;
       } else {
-        serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
-          uploadFileBlock(sessionId, file),
-        );
+        serverContent = await uploadComposerParts(sessionId, orderedParts, opts?.signal);
       }
+
+      opts?.signal?.throwIfAborted();
+      const heldBack = opts?.beforePost ? await opts.beforePost() : null;
+      if (heldBack !== null) throw new Error(heldBack);
+      opts?.signal?.throwIfAborted();
 
       const postingState = setterForState(sessionId);
       const sentWhileRunning =
@@ -3466,8 +3599,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             : {}),
         };
       });
-      const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postConversationEvent(
+      posting = true;
+      const postResult = await withStillSendingMark(sessionId, tempId, () => {
+        const post = postConversationEvent(
           sessionId,
           {
             type: "message",
@@ -3477,15 +3611,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               stable_id: stableId,
             },
           },
-          { holdWhenHostOffline: !opts?.backgroundQueue },
-        ),
-      );
+          { holdWhenHostOffline: !opts?.backgroundQueue && !opts?.external },
+        );
+        // Given up on while out, it may still be accepted: the caller hears of that.
+        post.then(
+          (result) => {
+            if (opts?.signal?.aborted && postDeliveredInput(result)) opts.onAcceptedLate?.();
+          },
+          () => {},
+        );
+        return unlessAborted(post, opts?.signal);
+      });
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
       // bubble. Settle local state from the POST response instead of
       // depending on the live stream being connected.
       if (postResult.denied) {
+        opts?.onDenied?.();
         // Target the session this send posted to: the user may have navigated
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
@@ -3503,6 +3646,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3539,12 +3683,29 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // runner. A policy denial, or a native-terminal failure persisted with
       // no runner attached ({queued: true, forwarded: false}), means the
       // agent never read it.
-      return !postResult.denied && !(postResult.queued && postResult.forwarded === false);
+      const accepted = postDeliveredInput(postResult);
+      if (opts?.external && !accepted && !postResult.denied) {
+        opts.onError?.("The session's runner didn't receive the message.", true);
+      }
+      return accepted;
     } catch (err) {
       if (uploadController?.signal.aborted) return false;
       if (initialDraft && !initialDispatched && !uploadController && !initialSendPending())
         return false;
       const { message, code } = describeSendFailure(err);
+      if (opts?.external && !posting) {
+        // Never posted (held back, or its upload failed or was stopped): drop only this
+        // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
+        const target = postedSessionId ?? submitConversationId;
+        (target === null ? setActive : setterFor(target))((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          ...(!alreadyStreaming && s.sessionStatus !== "running" && s.activeResponse === null
+            ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+            : {}),
+        }));
+        opts.onError?.(message, true);
+        return false;
+      }
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -3561,8 +3722,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The host is offline and the server recorded nothing: queue the message
       // ahead of this conversation's others and send it once the host is back.
       const holdTarget = postedSessionId ?? submitConversationId;
+      // Not an external send: its outbox keeps it, and this queue is the composer's.
       const heldForHost =
-        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+        !opts?.external &&
+        err instanceof ApiError &&
+        err.code === HOST_OFFLINE_CODE &&
+        holdTarget !== null;
       if (heldForHost) {
         holdSendForHost(holdTarget, message, {
           text,
@@ -3575,6 +3740,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      // An external send hears of the failure below, once it's known.
+      if (!heldForHost && !opts?.external) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3591,6 +3758,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
       let serverRefused = answeredWithRefusal || retriesRefusedSend;
+      // What this attempt itself shows, for an external send's caller: a coded answer after
+      // forwarding (a lost runner) doesn't prove the runner never got it.
+      let refusedByServer = provesNotDelivered(err);
+      // Failing before its POST, this attempt can't have reached the runner.
+      let refusedThisAttempt = refusedByServer || !posting;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
@@ -3611,13 +3783,37 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // The server records a rejection before answering the POST, so a fresh
         // snapshot settles it; if that fetch fails too, the draft comes back
         // unsettled and the next live acknowledgement or snapshot decides.
-        const verdict = await sendVerdictFromServer(draftSessionId, stableId);
+        const verdict = await boundedSendVerdict(draftSessionId, stableId, opts?.signal);
         // The acknowledgement may have landed while that fetch was out; it
         // outranks whatever the fetch said or failed to say.
         if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
-        else if (verdict === "refused") serverRefused = true;
-        else if (verdict === "delivered") deliveredDespiteFailure = true;
-        else unsettled = true;
+        else if (verdict === "refused") {
+          serverRefused = true;
+          refusedByServer = true;
+          refusedThisAttempt = true;
+        } else if (verdict === "delivered") deliveredDespiteFailure = true;
+        else {
+          unsettled = true;
+          refusedThisAttempt = refusedByServer;
+        }
+      }
+      // A coded 5xx can be the runner's own rejection, which the server records first.
+      if (
+        opts?.external &&
+        answeredWithRefusal &&
+        !refusedThisAttempt &&
+        !retriesRefusedSend &&
+        !deliveredDespiteFailure &&
+        draftSessionId !== null &&
+        (await boundedSendVerdict(draftSessionId, stableId, opts?.signal)) === "refused" &&
+        inFlightSends.get(stableId) !== true
+      ) {
+        refusedByServer = true;
+        refusedThisAttempt = true;
+      }
+      if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+      if (!heldForHost && opts?.external && !deliveredDespiteFailure) {
+        opts.onError?.(message, refusedThisAttempt);
       }
       if (
         !callerHandlesError &&
@@ -3656,7 +3852,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       const native = failGet().isNativeTerminalSession;
       if (native && deliveredDespiteFailure) return true;
-      if (!heldForHost) opts?.onError?.(message);
       // A delivered send needs no card. One the server never answered may still
       // arrive, so its card names the send for the commit that retracts it.
       const sentText = native ? messageContentText(content) : "";
@@ -3765,6 +3960,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const endPlanStop = supersedePlanStop(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3819,6 +4015,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
@@ -6274,6 +6471,7 @@ async function bindStream(
         ...(p.stableId === undefined ? {} : { stableId: p.stableId }),
         ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
         ...(p.received ? { received: true } : {}),
+        replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       const serverPending = pendingInputsById(session.pendingInputs);
@@ -6375,11 +6573,15 @@ async function bindStream(
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
             ? state.sessionCostUsd
-            : (session.totalCostUsd ?? state.sessionCostUsd),
+            : session.costHidden
+              ? null
+              : (session.totalCostUsd ?? state.sessionCostUsd),
         sessionUsageByModel:
           state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
             ? state.sessionUsageByModel
-            : (session.usageByModel ?? state.sessionUsageByModel),
+            : session.costHidden
+              ? withoutModelCosts(session.usageByModel ?? state.sessionUsageByModel)
+              : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -6387,6 +6589,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
@@ -6396,6 +6599,16 @@ async function bindStream(
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }
+}
+
+/** Drop per-model USD while keeping token counts, once the server hides cost. */
+function withoutModelCosts(
+  usageByModel: Record<string, ModelUsage> | null,
+): Record<string, ModelUsage> | null {
+  if (usageByModel === null) return null;
+  return Object.fromEntries(
+    Object.entries(usageByModel).map(([model, usage]) => [model, { ...usage, totalCostUsd: null }]),
+  );
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -6429,16 +6642,23 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     ) {
       return;
     }
+    if (usage.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
     // A live cost/model update during the read wins independently for each field.
     entrySetter(entry)((state) => ({
       ...(revisions.cost === revisionsBeforeFetch.cost &&
       state.sessionCostUsd === before.sessionCostUsd
-        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        ? {
+            sessionCostUsd: usage.costHidden ? null : (usage.totalCostUsd ?? state.sessionCostUsd),
+          }
         : {}),
       ...(revisions.models === revisionsBeforeFetch.models &&
       state.sessionUsageByModel === before.sessionUsageByModel
-        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        ? {
+            sessionUsageByModel: usage.costHidden
+              ? withoutModelCosts(usage.usageByModel ?? state.sessionUsageByModel)
+              : (usage.usageByModel ?? state.sessionUsageByModel),
+          }
         : {}),
     }));
   } catch {
@@ -6653,8 +6873,14 @@ function reconnectStatusPatch(
     );
   }
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (session.costHidden) {
+    if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+    patch.sessionCostUsd = null;
+    patch.sessionUsageByModel = withoutModelCosts(session.usageByModel ?? s.sessionUsageByModel);
+  } else {
+    if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+    if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  }
   if (!settleTurn) return patch;
   patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
@@ -7441,6 +7667,7 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -7529,7 +7756,6 @@ async function reconcileOnReconnect(
   }
   if (stale()) return "skipped";
   cacheSessionSnapshot(session, permissionBeforeFetch, modelDisplayBeforeFetch);
-  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
     settleStatus
@@ -7660,6 +7886,7 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -9390,6 +9617,26 @@ function retractDeliveredSendDraft(
 }
 
 /**
+ * {@link sendVerdictFromServer}, bounded by a read timeout and the send's own signal.
+ *
+ * @returns `"refused"` or `"delivered"`, or `null` when the read fails, times out or aborts.
+ */
+async function boundedSendVerdict(
+  sessionId: string,
+  stableId: string,
+  signal?: AbortSignal,
+): Promise<"refused" | "delivered" | null> {
+  try {
+    return await unlessAborted(
+      withReadTimeout((timeout) => sendVerdictFromServer(sessionId, stableId, timeout)),
+      signal,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The send a previous page of this tab left unanswered, as a failed-send draft.
  *
  * `send` records each message's text before its POST and drops it once the
@@ -10296,7 +10543,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         autoCompactTokenLimit?: number | null;
         reportedContextReading?: ConversationState["reportedContextReading"];
         providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
-        sessionCostUsd?: number;
+        sessionCostUsd?: number | null;
         sessionUsageByModel?: Record<string, ModelUsage>;
       } = {};
       if (event.contextTokens !== undefined) {
@@ -10311,13 +10558,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.providerUsageLimits !== undefined) {
         patch.providerUsageLimits = event.providerUsageLimits;
       }
-      if (event.totalCostUsd !== undefined) {
+      if (event.costHidden) {
+        patch.sessionCostUsd = null;
+      } else if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;
       }
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
       }
-      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+      const costChanged = event.totalCostUsd !== undefined || event.costHidden === true;
+      const modelsChanged = event.usageByModel !== undefined || event.costHidden === true;
+      if (costChanged || modelsChanged) {
         const entry =
           sourceConversationId === null
             ? undefined
@@ -10326,25 +10577,33 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // A same-value receipt is still newer than an in-flight usage read.
           const revisions = sessionUsageRevisions.get(entry);
           sessionUsageRevisions.set(entry, {
-            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
-            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+            cost: (revisions?.cost ?? 0) + (costChanged ? 1 : 0),
+            models: (revisions?.models ?? 0) + (modelsChanged ? 1 : 0),
           });
         }
       }
+      if (event.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
       if (Object.keys(patch).length > 0) {
-        applyToConversation(() => {
-          if (event.contextWindow !== undefined || event.autoCompactTokenLimit !== undefined) {
-            // The server publishes the committed limits tuple, including clears.
-            patch.reportedContextReading = event.contextModel
-              ? {
-                  model: event.contextModel,
-                  contextWindow: event.contextWindow ?? null,
-                  autoCompactTokenLimit: event.autoCompactTokenLimit ?? null,
-                }
-              : null;
-          }
-          return patch;
-        });
+        if (event.contextWindow !== undefined || event.autoCompactTokenLimit !== undefined) {
+          // The server publishes the committed limits tuple, including clears.
+          patch.reportedContextReading = event.contextModel
+            ? {
+                model: event.contextModel,
+                contextWindow: event.contextWindow ?? null,
+                autoCompactTokenLimit: event.autoCompactTokenLimit ?? null,
+              }
+            : null;
+        }
+        applyToConversation((state) =>
+          event.costHidden
+            ? {
+                ...patch,
+                sessionUsageByModel: withoutModelCosts(
+                  event.usageByModel ?? state.sessionUsageByModel,
+                ),
+              }
+            : patch,
+        );
       }
       return;
     }
@@ -10930,6 +11189,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       break;
     }
     case "session_input_consumed": {
+      const deliveryUnconfirmed = event.data.delivery_confirmed === false;
       if (event.itemType === "error" && event.clearedPendingId !== null) {
         applyToConversation((s) => ({
           pendingUserMessages: s.pendingUserMessages.filter(
@@ -10939,6 +11199,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         break;
       }
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId && !deliveryUnconfirmed) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.
@@ -10947,7 +11211,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         ((setterForState(sourceConversationId)?.failedInputs.length ?? 0) > 0 ||
           startupReads.has(sourceConversationId))
       ) {
-        const deliveredId = event.clearedPendingId;
+        const deliveredId = deliveryUnconfirmed ? null : event.clearedPendingId;
         if (deliveredId) {
           applyToConversation((s) => ({
             failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId),
@@ -10959,11 +11223,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      const deliveryUnconfirmed = event.data.delivery_confirmed === false;
       if (!deliveryUnconfirmed && inFlightSends.has(event.itemId))
         inFlightSends.set(event.itemId, true);
-      const alias = event.webStableId;
+      const alias = deliveryUnconfirmed ? undefined : event.webStableId;
       if (alias) recordInFlightNativeDelivery(sourceConversationId, alias);
+      if (!deliveryUnconfirmed) {
+        const deliveredIds = new Set([event.itemId, event.clearedPendingId, alias]);
+        for (const listener of deliveredSendListeners) {
+          for (const id of deliveredIds) if (id) listener(id);
+        }
+      }
       applyToConversation((s) => {
         const committedIds = new Set(
           deliveryUnconfirmed ? [] : [event.itemId, ...(alias ? [alias] : [])],

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { RUNNER_LOG_RUNAWAY_LABEL_KEY } from "@/lib/runnerLogRunaway";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import {
   buildElicitationMap,
   buildRunnerLogRunawayMap,
@@ -110,6 +111,12 @@ describe("detectIdleTransitions", () => {
     expect(detectIdleTransitions(prev, [conv("a")])).toEqual([]);
   });
 
+  it("ignores a muted conversation that just finished", () => {
+    const prev = statusMap({ a: "running" });
+    const muted = { ...conv("a", "idle"), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(detectIdleTransitions(prev, [muted])).toEqual([]);
+  });
+
   it("returns only the newly-finished conversations from a mixed list", () => {
     const prev = statusMap({ a: "running", b: "running", c: "idle" });
     const result = detectIdleTransitions(prev, [
@@ -153,6 +160,11 @@ describe("detectNewElicitations", () => {
     // No previous entry -> a page load with already-pending prompts must not
     // fire, mirroring the idle fresh-load behavior.
     expect(detectNewElicitations(new Map(), [convE("a", 2)])).toEqual([]);
+  });
+
+  it("ignores a new prompt on a muted conversation", () => {
+    const muted = { ...convE("a", 1), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(detectNewElicitations(new Map([["a", 0]]), [muted])).toEqual([]);
   });
 
   it("ignores a steady elicitation count", () => {
@@ -289,6 +301,11 @@ describe("computeUnreadBadgeIds", () => {
   it("counts a session the unseen predicate flags", () => {
     const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds("a"));
     expect([...next]).toEqual(["a"]);
+  });
+
+  it("never counts a muted session, even one awaiting input", () => {
+    const muted = { ...convB("a", { pending: 1 }), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(computeUnreadBadgeIds([muted], undefined, true, unseenIds("a")).size).toBe(0);
   });
 
   it("counts a session awaiting input even when not unseen", () => {

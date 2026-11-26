@@ -37,7 +37,6 @@ class Feature(StrEnum):
     MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
     MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
     CANVAS = "canvas"
-    ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     PROJECT_ASSIGNMENTS = "project_assignments"
     SESSION_PEER_MESSAGING = "session_peer_messaging"
     SDK_PEER_STEERING = "sdk_peer_steering"
@@ -51,6 +50,7 @@ class Feature(StrEnum):
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    CHAT_COMPOSER_CODEMIRROR = "chat_composer_codemirror"
     WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_KANBAN = "project_kanban"
@@ -59,8 +59,10 @@ class Feature(StrEnum):
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
+    PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
+    FLOATING_COMPOSER = "floating_composer"
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.24.0",
         frontend_visible=False,
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIBLING_SESSIONS,
@@ -213,13 +216,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.15.0",
     ),
     FeatureDefinition(
-        feature=Feature.ARCA_SHUTDOWN_WARNINGS,
-        description="Weekday Arca shutdown warning in the web UI",
-        owner="web",
-        review_by_release="0.20.0",
-        frontend_visible=True,
-    ),
-    FeatureDefinition(
         feature=Feature.IMPORT_REVIEW,
         description="Auto-opening import review modal for a newly connected host's context",
         owner="onboarding",
@@ -280,6 +276,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Mount only the sidebar session rows near the viewport",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CHAT_COMPOSER_CODEMIRROR,
+        description="Write chat messages in a CodeMirror editor instead of the plain text box",
+        owner="web",
+        review_by_release="0.25.0",
     ),
     FeatureDefinition(
         feature=Feature.WORKFLOWS,
@@ -343,10 +345,23 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.PI_CLAUDE_PLUGINS,
+        description="Expose enabled Claude Code plugins to managed Pi sessions",
+        owner="runner",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
         feature=Feature.QUICK_PICK_PALETTE,
         description="Run the ⌘K command palette on the fuzzy-matching QuickPick list",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.FLOATING_COMPOSER,
+        description="The desktop app's floating New Agent panel, opened with Shift+Cmd+Space",
+        owner="web",
+        review_by_release="0.27.0",
     ),
 )
 

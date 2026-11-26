@@ -1,3 +1,4 @@
+import type { SettingsControlProps } from "@/pages/settings/search/settingsControl";
 import { Button } from "@/components/ui/button";
 
 type SettingsPagerProps = {
@@ -5,6 +6,8 @@ type SettingsPagerProps = {
   page: number;
   busy?: boolean;
   testIdPrefix?: string;
+  previousControl?: SettingsControlProps;
+  nextControl?: SettingsControlProps;
   onPrevious: () => void;
   onNext: () => void;
 } & ({ pageCount: number; hasNext?: never } | { pageCount?: never; hasNext: boolean });
@@ -16,6 +19,8 @@ export function SettingsPager({
   hasNext = page + 1 < (pageCount ?? 0),
   busy = false,
   testIdPrefix,
+  previousControl,
+  nextControl,
   onPrevious,
   onNext,
 }: SettingsPagerProps) {
@@ -27,6 +32,7 @@ export function SettingsPager({
         type="button"
         variant="outline"
         size="sm"
+        {...previousControl}
         data-testid={testIdPrefix && `${testIdPrefix}-previous`}
         disabled={page === 0 || busy}
         onClick={onPrevious}
@@ -40,6 +46,7 @@ export function SettingsPager({
         type="button"
         variant="outline"
         size="sm"
+        {...nextControl}
         data-testid={testIdPrefix && `${testIdPrefix}-next`}
         disabled={!hasNext || busy}
         onClick={onNext}

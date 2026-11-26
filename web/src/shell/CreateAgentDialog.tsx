@@ -481,6 +481,7 @@ function AgentFormFields({
           {...settingsFieldProps(settingsEntry, "name")}
           id="create-agent-name"
           data-testid="create-agent-name"
+          aria-required
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="my-agent"

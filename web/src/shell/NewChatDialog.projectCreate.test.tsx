@@ -75,7 +75,8 @@ import {
 import type * as SessionHostModule from "@/lib/sessionHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { discardNestedSessionDraft, type NestedSessionDraft } from "@/lib/nestedSessionDrafts";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -349,12 +350,12 @@ function setRepoIsGit(): void {
 function renderLanding(
   infoOverrides: Partial<ServerInfo> = {},
   landingProps: Parameters<typeof NewChatLandingScreen>[0] = {},
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
 ): {
   rerender: (ui: ReactNode) => void;
   unmount: () => void;
   client: QueryClient;
 } {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const info = {
     accounts_enabled: false,
     single_user: false,
@@ -960,8 +961,9 @@ describe("NewChatLandingScreen git controls on a project entry", () => {
 
 describe("NewChatLandingScreen nested agent creation", () => {
   it.each(["", "Nested task"])(
-    "preserves drafts across composer scopes: %s",
+    "resumes nested drafts across navigation and deletes only the chosen draft: %s",
     async (nestedText) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
       const drafts = [
         { source: null, text: "Standalone task", file: "standalone.txt" },
@@ -970,7 +972,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       ];
       for (const draft of drafts) {
         searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
-        renderLanding({ sibling_sessions: true });
+        renderLanding({ sibling_sessions: true }, {}, client);
         // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
         const input = await screen.findByTestId("new-chat-landing-input");
         expect(input).toHaveValue("");
@@ -982,9 +984,11 @@ describe("NewChatLandingScreen nested agent creation", () => {
         }
         cleanup();
       }
+      const parkedDrafts = client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])!;
+      expect(parkedDrafts.map((draft) => draft.source.id)).toEqual(["first", "second"]);
       for (const draft of drafts) {
         searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
-        renderLanding({ sibling_sessions: true });
+        renderLanding({ sibling_sessions: true }, {}, client);
         // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
         expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
           draft.file ? `${draft.text} [file 1] ` : draft.text,
@@ -995,6 +999,22 @@ describe("NewChatLandingScreen nested agent creation", () => {
         }
         cleanup();
       }
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual(parkedDrafts);
+
+      searchParams = new URLSearchParams("sibling=first");
+      renderLanding({ sibling_sessions: true }, {}, client);
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(nestedText);
+      act(() => {
+        discardNestedSessionDraft(client, parkedDrafts[0].key);
+      });
+      cleanup();
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual([parkedDrafts[1]]);
+      renderLanding({ sibling_sessions: true }, {}, client);
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+      expect(screen.queryByText("first.txt")).toBeNull();
+      expect(client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])?.[1].id).not.toBe(
+        parkedDrafts[0].id,
+      );
     },
   );
 
@@ -1076,8 +1096,9 @@ describe("NewChatLandingScreen nested agent creation", () => {
       });
       cleanup();
       searchParams = new URLSearchParams("sibling=source");
-      renderLanding({ sibling_sessions: true, session_bundle_workspaces: true });
+      const { client } = renderLanding({ sibling_sessions: true, session_bundle_workspaces: true });
       await screen.findByRole("heading", { name: "Add nested agent" });
+      const draftKey = client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])![0].key;
       expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
         "aria-label",
@@ -1108,9 +1129,13 @@ describe("NewChatLandingScreen nested agent creation", () => {
       }
       await waitFor(() => expect(navigateMock).toHaveBeenCalled());
       cleanup();
-      renderLanding({ sibling_sessions: true });
+      renderLanding({ sibling_sessions: true }, {}, client);
       expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+        expect.objectContaining({ key: draftKey, created: true }),
+        expect.objectContaining({ key: expect.not.stringMatching(draftKey), creating: false }),
+      ]);
       cleanup();
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });

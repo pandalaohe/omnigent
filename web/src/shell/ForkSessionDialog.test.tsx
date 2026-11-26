@@ -20,6 +20,12 @@ import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import {
+  clearRecentlyCreated,
+  recentlyCreatedSessions,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
+import type { Conversation } from "@/hooks/useConversations";
+import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
   type AvailableAgent,
@@ -269,6 +275,7 @@ function renderDialog(
   return {
     ...utils,
     invalidateSpy,
+    client,
     onClose,
     update,
     rerenderDialog: () => utils.rerender(strict()),
@@ -384,7 +391,10 @@ beforeEach(() => {
   mockHostWorktrees();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  clearRecentlyCreated();
+});
 
 describe("ForkSessionDialog", () => {
   it.each([
@@ -489,9 +499,28 @@ describe("ForkSessionDialog", () => {
   it("forks with the edited title, refreshes the list, and navigates into the fork", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
+      title: "My clone",
+      createdAt: 1_700_000_000,
+      labels: {},
+      permissionLevel: null,
+      agentId: "ag_source",
+      parentSessionId: null,
     } as unknown as Awaited<ReturnType<typeof forkSession>>);
 
-    const { invalidateSpy } = renderDialog();
+    const { client, invalidateSpy } = renderDialog();
+    const existing: Conversation = {
+      id: "conv_old",
+      object: "conversation",
+      title: "Older",
+      created_at: 1,
+      updated_at: 1,
+      labels: {},
+      permission_level: null,
+    };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [existing], first_id: "conv_old", last_id: "conv_old", has_more: false }],
+      pageParams: [undefined],
+    });
 
     openAdvanced();
     fireEvent.change(screen.getByTestId("fork-session-title-input"), {
@@ -519,6 +548,17 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     expect(toastMock).not.toHaveBeenCalled();
     expect(toastMock.success).not.toHaveBeenCalled();
+
+    const page = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0];
+    expect(page.data.map((c) => c.id)).toEqual(["conv_fork", "conv_old"]);
+    expect(page.data[0]).toMatchObject({
+      title: "My clone",
+      created_at: 1_700_000_000,
+      updated_at: 1_700_000_000,
+      agent_id: "ag_source",
+    });
+    expect(recentlyCreatedSessions.has("conv_fork")).toBe(true);
   });
 
   it("spins the submit button while the fork is in flight", async () => {

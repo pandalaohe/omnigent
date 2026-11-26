@@ -414,6 +414,9 @@ def prepare_managed_pi_agent_dir(
     resource edits and model/auth files are preserved.
     Host MCP servers are merged into the managed MCP configuration when the
     user has no entry for them; see sync_managed_pi_mcp_config.
+    With ``pi_claude_plugins`` enabled, Claude Code plugins also add their
+    skills, commands and Pi packages (see
+    :func:`omnigent.inner.pi_claude_plugins.add_claude_plugin_resources`).
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.
@@ -435,6 +438,9 @@ def prepare_managed_pi_agent_dir(
         return
     settings = _read_settings_file(agent_root / "settings.json")
     _relocate_resource_settings(settings, agent_root, managed_dir.absolute())
+    from omnigent.inner.pi_claude_plugins import add_claude_plugin_resources
+
+    settings = add_claude_plugin_resources(settings, managed_dir.absolute())
     if overlay:
         settings = _deep_merge_settings(settings, overlay)
 

@@ -25,6 +25,7 @@ import {
   useState,
 } from "react";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { QuestionDictationControls } from "@/components/QuestionDictationControls";
@@ -507,9 +508,9 @@ export function AskUserQuestionForm({
   // Every question needs at least one answer. Without this guard
   // the form submits half-filled answers and the LLM sees ``null``
   // for the missing slots.
-  const allAnswered = questions.every((q) => {
+  const firstUnansweredIndex = questions.findIndex((q) => {
     const key = questionKey(q);
-    return (
+    return !(
       answerForQuestion(
         q,
         selections[key] ?? "",
@@ -519,6 +520,12 @@ export function AskUserQuestionForm({
       (asyncTarget !== undefined && (images[key]?.length ?? 0) > 0)
     );
   });
+  const allAnswered = firstUnansweredIndex === -1;
+  // Says which question keeps Submit disabled; it can be on another page.
+  const firstUnanswered = questions[firstUnansweredIndex];
+  const submitBlockedReason = firstUnanswered
+    ? `Answer question ${firstUnansweredIndex + 1}${firstUnanswered.header ? ` (${firstUnanswered.header})` : ""} to submit`
+    : undefined;
 
   const handleSubmit = async () => {
     if (submittingRef.current) return;
@@ -719,19 +726,7 @@ export function AskUserQuestionForm({
       submitAndLeave();
       return;
     }
-    const unanswered = questions.findIndex((q) => {
-      const key = questionKey(q);
-      return (
-        answerForQuestion(
-          q,
-          selections[key] ?? "",
-          customSelected[key] ?? false,
-          customInputs[key] ?? "",
-        ) === null &&
-        (!asyncTarget || !images[key]?.length)
-      );
-    });
-    if (unanswered >= 0) goToQuestion(unanswered, true);
+    goToQuestion(firstUnansweredIndex, true);
   };
 
   const handleCardKeyUp = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -1252,17 +1247,19 @@ export function AskUserQuestionForm({
           </TooltipProvider>
         )}
         {isLast && (
-          <Button
-            size="sm"
-            onClick={(event) => void (event.detail === 0 ? submitAndLeave() : handleSubmit())}
-            disabled={!allAnswered || submitting}
-            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
-            data-testid="ask-user-question-submit"
-            componentId="question.submit"
-          >
-            <CheckIcon className="mr-1 size-3.5" />
-            Submit
-          </Button>
+          <DisabledActionTooltip reason={submitBlockedReason} label="Submit">
+            <Button
+              size="sm"
+              onClick={(event) => void (event.detail === 0 ? submitAndLeave() : handleSubmit())}
+              disabled={!allAnswered || submitting}
+              className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
+              data-testid="ask-user-question-submit"
+              componentId="question.submit"
+            >
+              <CheckIcon className="mr-1 size-3.5" />
+              Submit
+            </Button>
+          </DisabledActionTooltip>
         )}
         <Button
           size="sm"

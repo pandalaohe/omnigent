@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -888,6 +889,8 @@ class _SessionSnapshot:
         ``None`` for a hostless row (a co-located child on its parent's
         runner); the REST loader fills it, the init envelope does not carry
         it.
+    :param harness: Server-reported effective harness, or the initialization
+        envelope's override, for resource launches after reconnect.
     """
 
     ok: bool
@@ -899,6 +902,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    harness: str | None = None
     labels: Mapping[str, object] | None = None
     worktree: str | None = None
     host_id: str | None = None
@@ -4293,6 +4297,7 @@ def create_runner_app(
             wrapper_label: str | None = None
             labels: dict[str, object] | None = None
             host_id: str | None = None
+            harness: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -4326,6 +4331,9 @@ def create_runner_app(
                     wrapper_label = wrapper_label_from_labels(raw_labels)
                     if isinstance(raw_labels, Mapping):
                         labels = dict(raw_labels)
+                    raw_harness = body.get("harness")
+                    if isinstance(raw_harness, str) and raw_harness != "auto":
+                        harness = raw_harness
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -4341,6 +4349,7 @@ def create_runner_app(
                 labels=labels,
                 worktree=worktree,
                 host_id=host_id,
+                harness=harness,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -4487,6 +4496,7 @@ def create_runner_app(
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
             labels=snapshot.labels,
             worktree=snapshot.worktree,
+            harness=snapshot.harness_override,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -6716,8 +6726,11 @@ def create_runner_app(
         # sub-agent whose spec says ``claude-native`` looking native while it
         # actually ran ``claude-sdk``, so its completion was never pushed to
         # the parent inbox (the native path that owes it never ran).
-        override = _session_harness_overrides.get(conv_id)
-        if override is not None:
+        snapshot = _session_snapshot_cache.get(conv_id)
+        override = _session_harness_overrides.get(conv_id) or (
+            snapshot.harness if snapshot is not None else None
+        )
+        if override and override != "auto":
             return canonicalize_harness(override) or override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
@@ -15275,6 +15288,28 @@ def create_runner_app(
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_spec_entry(entry)
+
+    async def _terminal_model_access(session_id: str, cwd: Path) -> ClaudeModelAccess | None:
+        from omnigent.harness_aliases import is_claude_sdk_harness_name
+        from omnigent.runtime.workflow import claude_terminal_model_access
+
+        entry = await _resolve_session_spec_entry(session_id)
+        spec = _unwrap_spec_entry(entry)
+        if spec is None:
+            snapshot = await _session_snapshot(session_id)
+            if not snapshot.ok or is_claude_sdk_harness_name(_session_harness_name(session_id)):
+                raise RuntimeError("Claude SDK terminals require a resolved session spec")
+            return None
+        return await asyncio.to_thread(
+            claude_terminal_model_access,
+            spec,
+            bundle_dir=_resolved_spec_workdir(entry),
+            effective_harness=_session_harness_name(session_id),
+            cwd=cwd,
+        )
+
+    if terminal_registry is not None:
+        terminal_registry.model_access_resolver = _terminal_model_access
 
     async def _resolve_session_agent_spec_or_none(session_id: str) -> AgentSpec | None:
         """Resolve the session agent spec, tolerating resolution failure.

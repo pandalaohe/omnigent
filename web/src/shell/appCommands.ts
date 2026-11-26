@@ -20,7 +20,10 @@ import {
 } from "@/components/KeyboardShortcut";
 import type { ProjectSummary } from "@/hooks/useConversations";
 import type { UseNewSessionTargetResult } from "@/hooks/useNewSessionTarget";
-import { useNavigate } from "@/lib/routing";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useLocation, useNavigate } from "@/lib/routing";
+import { useSettingsRoute } from "@/shell/settingsNav";
+import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
 
 export interface ActionCommand {
   id: string;
@@ -56,6 +59,9 @@ export function useAppCommands({
   const navigate = useNavigate();
   const target = newSession?.target;
   const targetRoute = newSession?.route ?? "/";
+  const { inSettings } = useSettingsRoute();
+  const { pathname, search } = useLocation();
+  const mobile = useIsMobileViewport();
   return useMemo<ActionCommand[]>(
     () => [
       {
@@ -106,6 +112,11 @@ export function useAppCommands({
         run: () => navigate("/settings"),
         shortcut: settingsShortcutKeys(),
       },
+      settingsSearchCommand({
+        settingsLocation: inSettings ? { pathname, search } : null,
+        mobile,
+        navigate,
+      }),
       {
         id: "toggle-left-sidebar",
         label: "Toggle conversations sidebar",
@@ -125,6 +136,10 @@ export function useAppCommands({
     ],
     [
       navigate,
+      pathname,
+      search,
+      inSettings,
+      mobile,
       onToggleLeftSidebar,
       onToggleRightSidebar,
       projects,

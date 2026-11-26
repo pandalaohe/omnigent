@@ -24,10 +24,11 @@ from omnigent.update_check import (
 # uv upgrade commands pin the interpreter omnigent is running under, so
 # expectations derive the flag instead of hardcoding a python version.
 _UV_PY = _uv_python_pin()
+_UV_INSTALL = f"uv tool install --reinstall-package omnigent --link-mode copy{_UV_PY}"
 
 
 def _uv_registry_info() -> _InstalledWheelInfo:
-    """A registry uv-tool install → ``uv tool upgrade omnigent`` (runnable)."""
+    """A registry uv-tool install has a runnable, copy-mode upgrade command."""
     return _InstalledWheelInfo(
         install_time_epoch=0.0,
         installer="uv",
@@ -40,7 +41,7 @@ def _uv_registry_info() -> _InstalledWheelInfo:
 
 
 def _git_install_info() -> _InstalledWheelInfo:
-    """A git/VCS uv-tool install → ``uv tool install --reinstall-package omnigent git+…``."""
+    """A git/VCS uv-tool install refreshes the package using copy mode."""
     return _InstalledWheelInfo(
         install_time_epoch=0.0,
         installer="uv",
@@ -477,7 +478,7 @@ def test_upgrade_runs_installer_and_drains_first(
     assert result.exit_code == 0, result.output
     # Drain happened before the stop, before the install ran.
     assert events == ["drained", "stop(force=False)"]
-    assert ran == ["uv tool upgrade omnigent"]
+    assert ran == ["uv tool upgrade --reinstall --link-mode copy omnigent"]
     assert "Upgraded to v0.2.0" in result.output
 
 
@@ -664,7 +665,7 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
     result = CliRunner().invoke(cli, ["upgrade", "--pre"])
 
     assert result.exit_code == 0, result.output
-    assert ran == ["uv tool upgrade omnigent --prerelease allow"]
+    assert ran == ["uv tool upgrade --reinstall --link-mode copy omnigent --prerelease allow"]
 
 
 # ── ``omni update`` alias ────────────────────────────────────────────
@@ -833,10 +834,7 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
     result = CliRunner().invoke(cli, ["upgrade"])
 
     assert result.exit_code == 0, result.output
-    assert ran == [
-        f"uv tool install --reinstall-package omnigent{_UV_PY} "
-        "git+https://github.com/omnigent-ai/omnigent.git"
-    ]
+    assert ran == [f"{_UV_INSTALL} git+https://github.com/omnigent-ai/omnigent.git"]
     assert "Updated to git bbbbbbbbb" in result.output
 
 
@@ -1134,7 +1132,7 @@ def test_upgrade_git_install_dry_run_prints_without_running(
     assert result.exit_code == 0, result.output
     assert "Detected installer: uv" in result.output
     assert "Detected extras: (none)" in result.output
-    assert f"Would run: uv tool install --reinstall-package omnigent{_UV_PY}" in result.output
+    assert f"Would run: {_UV_INSTALL}" in result.output
     assert "Running:" not in result.output
 
 
@@ -1187,7 +1185,7 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
     # nightlies build from source, so a failed build would leave nothing
     # behind.
     assert (uv.command, uv.runnable) == (
-        f"uv tool install --reinstall-package omnigent{_UV_PY} {spec}",
+        f"{_UV_INSTALL} {spec}",
         True,
     )
     pipx = _build_nightly_upgrade_suggestion(info_for("pipx"), version)
@@ -1236,10 +1234,7 @@ def test_upgrade_nightly_installs_pinned_tag(
     result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
 
     assert result.exit_code == 0, result.output
-    assert ran == [
-        f"uv tool install --reinstall-package omnigent{_UV_PY} "
-        "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
-    ]
+    assert ran == [f"{_UV_INSTALL} git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"]
     assert "Upgraded to nightly v0.2.0.dev20260804" in result.output
 
 
@@ -1293,7 +1288,7 @@ def test_nightly_suggestion_preserves_and_unions_extras() -> None:
 
     assert suggestion.runnable
     assert suggestion.command == (
-        f"uv tool install --reinstall-package omnigent{_UV_PY} "
+        f"{_UV_INSTALL} "
         "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
     )
 
@@ -1345,7 +1340,7 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     assert result.exit_code == 0, result.output
     assert (
-        f"Would run: uv tool install --reinstall-package omnigent{_UV_PY} "
+        f"Would run: {_UV_INSTALL} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
     )
 
@@ -1386,7 +1381,7 @@ def test_nightly_uv_never_uses_destructive_force() -> None:
             )
             command = _build_nightly_upgrade_suggestion(info, version).command
             assert "--force" not in command, command
-            assert command.startswith(f"uv tool install --reinstall-package omnigent{_UV_PY} ")
+            assert command.startswith(f"{_UV_INSTALL} ")
             # Always the nightly tag, never the fork's recorded URL.
             assert f"git+https://github.com/omnigent-ai/omnigent@v{version}" in command
 

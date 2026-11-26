@@ -261,7 +261,7 @@ describe("createSession", () => {
       archived: false,
       status: "idle",
       createdAt: 1704067200,
-      updatedAt: 1704067200,
+      updatedAt: null,
       archivedAt: null,
       title: null,
       items: [],
@@ -274,6 +274,7 @@ describe("createSession", () => {
       lastTotalTokens: undefined,
       usageIncluded: true,
       totalCostUsd: undefined,
+      costHidden: false,
       usageByModel: null,
       llmModel: undefined,
       harness: null,
@@ -741,6 +742,8 @@ describe("forkSession", () => {
         agent_id: "agent_clone",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067260,
+        project_id: "proj_1",
         title: "Fork of My session",
         items: [],
       }),
@@ -758,6 +761,9 @@ describe("forkSession", () => {
     expect(session.id).toBe("conv_fork");
     expect(session.title).toBe("Fork of My session");
     expect(session.status).toBe("idle");
+    // The sidebar row built from this snapshot sorts and files by these.
+    expect(session.updatedAt).toBe(1704067260);
+    expect(session.projectId).toBe("proj_1");
   });
 
   it("forwards the title when provided", async () => {
@@ -1879,6 +1885,7 @@ describe("getSessionUsage", () => {
     expect(usage).toEqual({
       id: "conv with space",
       totalCostUsd: 3.5,
+      costHidden: false,
       usageByModel: {
         "model-a": {
           inputTokens: 10,
@@ -1919,6 +1926,7 @@ describe("getSessionUsage", () => {
       expect(await getSessionUsage("conv_usage_projection")).toEqual({
         id: "conv_usage_projection",
         totalCostUsd: 3.5,
+        costHidden: false,
         usageByModel: null,
       });
       expect(getSessionHost("conv_usage_projection")).toBe("host_current");
@@ -1935,6 +1943,7 @@ describe("getSessionUsage", () => {
     expect(await getSessionUsage("conv_abc")).toEqual({
       id: "conv_abc",
       totalCostUsd: cost,
+      costHidden: false,
       usageByModel: null,
     });
   });

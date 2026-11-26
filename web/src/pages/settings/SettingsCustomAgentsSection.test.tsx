@@ -10,6 +10,8 @@ import type { ManagedAgent } from "@/hooks/useCustomAgents";
 import { expectSettingsPages } from "@/test/settingsPaging";
 import { readAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 import type * as AgentsSettingsModule from "@/components/AgentsSettings";
+import { useAppCommands } from "@/shell/appCommands";
+import { clearSettingsSearchFocus } from "@/shell/settingsSearch/settingsSearchFocus";
 
 const flags = vi.hoisted(() => ({
   install: true,
@@ -84,6 +86,21 @@ let failSave: boolean;
 let failDelete: boolean;
 let inUse: boolean;
 
+/** ⌘K's "Search settings…", run from wherever the router is. */
+function SearchSettingsCommand() {
+  const commands = useAppCommands({
+    onToggleLeftSidebar: () => {},
+    onToggleRightSidebar: () => {},
+    rightSidebarShortcutEnabled: true,
+  });
+  const search = commands.find((command) => command.id === "settings-search")!;
+  return (
+    <button type="button" onClick={search.run}>
+      Run Search settings
+    </button>
+  );
+}
+
 function mount(path = "/settings/custom-agents", state?: { fromAgentsTable: boolean }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -92,6 +109,7 @@ function mount(path = "/settings/custom-agents", state?: { fromAgentsTable: bool
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: path, state }]}>
         <SettingsCustomAgentsSection />
+        <SearchSettingsCommand />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -172,7 +190,7 @@ describe("Custom agents settings", () => {
     expect(readAgentBadgePreferences().entries.a1?.label).toBe("R");
     expect(readAgentBadgePreferences().entries.a2).toBeUndefined();
     expect(await screen.findByLabelText("Instructions")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Agents" }));
     expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
   });
 
@@ -316,7 +334,9 @@ describe("Custom agents settings", () => {
     expect(within(server).getByText("Loading agents…")).toBeVisible();
     finish(response({ error: { message: "Unavailable" } }, 500));
     expect(await within(server).findByRole("alert")).toHaveTextContent("Could not load agents");
-    expect(within(server).getByRole("button", { name: "Retry" })).toBeVisible();
+    expect(
+      within(server).getByRole("button", { name: "Retry loading server agents" }),
+    ).toBeVisible();
   });
 
   it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
@@ -388,7 +408,7 @@ describe("Custom agents settings", () => {
     );
     mount("/settings/custom-agents/a1");
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not load this agent");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this agent" }));
     expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
     expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
       "/v1/agents/a1",
@@ -425,11 +445,13 @@ describe("Custom agents settings", () => {
   it("renders the list from its Settings catalog entry, with each agent's open link and paging", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
-      if (url.searchParams.get("scope") !== "user") return response(page([polly]));
+      if (url.searchParams.get("scope") !== "user")
+        return response(page([{ ...polly, builtin: false }]));
       return response(page(users, true, "a2"));
     });
     mount();
     await screen.findAllByRole("link", { name: "research" });
+    await screen.findByText("Polly description");
 
     expect(document.querySelector('[data-settings-item="custom-agents-list"]')).not.toBeNull();
     expect(screen.getByRole("searchbox", { name: "Search agents" })).toHaveAttribute(
@@ -442,17 +464,17 @@ describe("Custom agents settings", () => {
     expect(
       document.querySelector('[data-settings-region="custom-agents-list:serverAgents"]'),
     ).not.toBeNull();
-    expect(screen.getByRole("link", { name: "Create" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Create custom agent" })).toHaveAttribute(
       "data-settings-control",
       "custom-agents-list:create",
     );
     const yoursLink = screen.getAllByRole("link", { name: "research" })[0];
     expect(yoursLink.getAttribute("data-settings-row-action")).toBe("open");
     expect(
-      screen
-        .getByRole("button", { name: "Load more agents" })
+      within(screen.getByRole("navigation", { name: "Your agent pages" }))
+        .getByRole("button", { name: "Next" })
         .getAttribute("data-settings-control"),
-    ).toBe("custom-agents-list:loadMoreYours");
+    ).toBe("custom-agents-list:nextYours");
   });
 
   it("updates search results when the term or loaded pages change", async () => {
@@ -468,7 +490,7 @@ describe("Custom agents settings", () => {
     });
     mount();
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search configurations" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), {
       target: { value: " RESEARCH " },
     });
     expect(screen.queryByRole("link", { name: /Shared reviewer description/ })).toBeNull();
@@ -477,7 +499,7 @@ describe("Custom agents settings", () => {
     fireEvent.click(pager.getByRole("button", { name: "Next" }));
     expect(await screen.findByRole("link", { name: "research-later" })).toBeVisible();
     expect(screen.queryByRole("link", { name: "research" })).toBeNull();
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search configurations" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), {
       target: { value: "shared" },
     });
     expect(screen.getByRole("link", { name: /Shared reviewer description/ })).toBeVisible();
@@ -639,7 +661,7 @@ describe("editing custom agents", () => {
       return response({});
     });
     mount("/settings/custom-agents/new");
-    const name = await screen.findByRole("textbox", { name: "Name *" });
+    const name = await screen.findByRole("textbox", { name: "Name" });
     expect(document.querySelector('[data-settings-item="custom-agent-create"]')).not.toBeNull();
     expect(name).toHaveAttribute("data-settings-control", "custom-agent-create:name");
     expect(screen.getByRole("button", { name: "Harness, model, effort, speed" })).toHaveAttribute(
@@ -650,6 +672,17 @@ describe("editing custom agents", () => {
       "data-settings-control",
       "custom-agent-create:submit",
     );
+  });
+  it("marks the create page's required fields required, though their names drop the asterisk", async () => {
+    mount("/settings/custom-agents/new");
+    expect(await screen.findByRole("textbox", { name: "Name" })).toBeRequired();
+    expect(screen.getByRole("button", { name: "Harness, model, effort, speed" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save agent" })).toBeDisabled();
+    for (const field of [
+      screen.getByRole("textbox", { name: "Description" }),
+      screen.getByRole("textbox", { name: "System instructions" }),
+    ])
+      expect(field).not.toBeRequired();
   });
   it("renders the agent page from its Settings catalog entry, with Cancel owning the discard dialog", async () => {
     configResponses();
@@ -678,7 +711,7 @@ describe("editing custom agents", () => {
     configResponses();
     await openEditor();
     fireEvent.click(screen.getByRole("button", { name: "Add server" }));
-    expect(screen.getByRole("textbox", { name: "Server name" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Name for server 1" })).toBeVisible();
   });
   it.each([false, undefined])("keeps old servers read-only for edits: %s", async (edit) => {
     flags.edit = edit;
@@ -762,10 +795,10 @@ describe("editing custom agents", () => {
     expect(screen.getByLabelText("Description")).toBe(description);
     expect(description).toHaveValue("Unsaved second draft");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Custom agents" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Back to Custom agents" })).toBeVisible();
     expect(warning).toHaveTextContent("Could not refresh this agent");
 
-    fireEvent.click(within(warning).getByRole("button", { name: "Retry" }));
+    fireEvent.click(within(warning).getByRole("button", { name: "Retry loading this agent" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(screen.getByLabelText("Description")).toBe(description);
     expect(description).toHaveValue("Unsaved second draft");
@@ -789,14 +822,33 @@ describe("editing custom agents", () => {
     expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
+  it("keeps an unsaved create draft when ⌘K opens Settings search", async () => {
+    mount("/settings/custom-agents/new");
+    fireEvent.change(await screen.findByLabelText("System instructions"), {
+      target: { value: "Keep this draft." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run Search settings" }));
+    clearSettingsSearchFocus();
+    expect(screen.getByLabelText("System instructions")).toHaveValue("Keep this draft.");
+    expect(screen.queryByRole("heading", { name: "Custom agents" })).toBeNull();
+  });
+  it("keeps an unsaved edit when ⌘K opens Settings search from the agent's page", async () => {
+    configResponses();
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run Search settings" }));
+    clearSettingsSearchFocus();
+    expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
   it("confirms a dirty draft before returning to the list", async () => {
     configResponses();
     await openEditor();
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
-    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Custom agents" }));
     fireEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
-    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Custom agents" }));
     fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
     expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
     expect(

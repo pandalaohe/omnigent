@@ -35,6 +35,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.harness_aliases import is_claude_sdk_harness_name
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec
@@ -770,6 +771,7 @@ class SysTerminalLaunchTool(Tool):
                     validated.session_key,
                     terminal_spec,
                     parent_os_env=parent_os_env,
+                    model_access_factory=self._reject_unresolved_sdk_model_access,
                     # cwd_override is reserved for LLM-supplied
                     # per-call overrides (already validated against
                     # allow_cwd_override above). The §4.6
@@ -787,6 +789,11 @@ class SysTerminalLaunchTool(Tool):
             _logger.exception("sys_terminal_launch failed")
             failed = exc.instance if isinstance(exc, HostShellLaunchError) else existing
             return _terminal_tool_result({"error": f"launch failed: {exc}"}, failed)
+
+    def _reject_unresolved_sdk_model_access(self) -> None:
+        """Require session provenance for SDK containment when no resolver is installed."""
+        if is_claude_sdk_harness_name(self._spec.executor.harness_kind):
+            raise RuntimeError("Claude SDK terminals require a session model-access resolver")
 
     def _validate_launch_args(self, arguments: str) -> str | _ValidatedLaunchArgs:
         """

@@ -46,6 +46,7 @@ import {
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { installKeepWarmSessionRefresh } from "./lib/keepWarmSessionRefresh";
+import { keepsDesktopLayout } from "./lib/desktopAppLayout";
 import { isMacElectronShell, isNativeShell } from "./lib/nativeBridge";
 import {
   applyStoredUiFontSize,
@@ -225,6 +226,7 @@ function OmnigentProviders({
       ref={scopeRootRef}
       className="omnigent-app"
       data-electron-mac={isMacElectronShell() ? "true" : undefined}
+      data-desktop-app={keepsDesktopLayout() ? "true" : undefined}
       style={{ height: "100%", width: "100%" }}
     >
       <div

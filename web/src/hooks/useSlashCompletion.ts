@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from "react";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { rankedSlashCommandNames } from "@/components/SlashCommandMenu";
 import {
   eventMatchesShortcutAction,
@@ -55,7 +56,7 @@ export interface UseSlashCompletionOptions {
   builtinNames?: ReadonlySet<string>;
   /** Skill display names by prefixed command; a query may match either. */
   labels?: Readonly<Record<string, string>>;
-  textareaRef?: RefObject<HTMLTextAreaElement | null>;
+  textareaRef?: RefObject<ComposerTextTarget | null>;
   /**
    * The command prefix this surface's inventory uses ("$" for codex-native,
    * "/" otherwise). "/" always opens the menu as well.
@@ -94,7 +95,7 @@ export interface UseSlashCompletionResult {
   /** Display names the ranking matched against, for the menu to reuse. */
   labels: Readonly<Record<string, string>>;
   inline: boolean;
-  onSelectionChange: (element: HTMLTextAreaElement) => void;
+  onSelectionChange: (element: ComposerTextTarget) => void;
   complete: (cmd: string) => { text: string; caret: number };
   /** Whether the suggestions menu is open. */
   open: boolean;
@@ -265,7 +266,7 @@ export function useSlashCompletion({
     return false;
   }
 
-  function onSelectionChange(element: HTMLTextAreaElement) {
+  function onSelectionChange(element: ComposerTextTarget) {
     const next = { text: element.value, start: element.selectionStart, end: element.selectionEnd };
     setSelection((previous) =>
       previous?.text === next.text && previous.start === next.start && previous.end === next.end

@@ -58,6 +58,7 @@ const fixture = vi.hoisted(() => ({
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
   composerDisabled: false,
+  transcriptField: false,
   hostOnline: undefined as boolean | undefined,
   livenessKind: "online",
   failedChat: "",
@@ -195,12 +196,14 @@ vi.mock("@/components/chat/SideChatPane", () => ({
       <>
         <textarea
           aria-label="Message"
+          data-composer-input=""
           disabled={fixture.composerDisabled}
           onKeyDown={(event) => {
             if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
               event.preventDefault();
           }}
         />
+        {fixture.transcriptField && <textarea aria-label="Transcript field" />}
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -280,6 +283,7 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
+  fixture.transcriptField = false;
   fixture.hostOnline = undefined;
   fixture.livenessKind = "online";
   fixture.failedChat = "";
@@ -762,6 +766,7 @@ it.each(["chat", "terminal"])(
 );
 
 it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
+  fixture.transcriptField = true;
   fixture.labels = { "omnigent.ui": "terminal" };
   fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
   const layout = splitGrid(
@@ -820,6 +825,7 @@ it("cycles keyboard focus through cells and toggles the grid workspace from the 
 
 it("focuses the cell itself when its composer is not ready", () => {
   fixture.composerDisabled = true;
+  fixture.transcriptField = true;
   render(
     <MemoryRouter>
       <RearrangeableGrid
@@ -897,6 +903,9 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(first).getByText("Open citation"));
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
+  const flyoutBoundary = first.closest<HTMLElement>("[data-flyout-boundary]");
+  expect(flyoutBoundary).toBe(screen.getByTestId("session-grid"));
+  expect(flyoutBoundary).not.toContainElement(workspace);
   expect(workspace).toHaveTextContent("notes.md7agent-first");
   expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {

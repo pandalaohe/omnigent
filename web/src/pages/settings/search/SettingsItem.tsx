@@ -46,7 +46,7 @@ export function useSettingsNavigationClock() {
 }
 
 /** Reveals the row in `rowRef` when the URL names `entry`; a newer navigation cancels it. */
-function useSettingsRowReveal(
+export function useSettingsRowReveal(
   entry: SettingsEntry | undefined,
   rowRef: RefObject<HTMLElement | null>,
 ) {

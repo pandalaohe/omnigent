@@ -47,6 +47,14 @@ function uploadedFileFromResource(
   };
 }
 
+export async function deleteSessionFile(sessionId: string, fileId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
 /**
  * Upload one attachment, reporting transfer progress.
  *

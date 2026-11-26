@@ -1,3 +1,4 @@
+import { muteReadMarker } from "@/lib/sessionMute";
 // Sessions ordered by the caller's last interaction, or creation if untouched. The route is a
 // dedicated `/me` endpoint, so a server without it answers 404 — treated as a
 // capability signal (the sidebar shows a note instead of retrying).
@@ -26,12 +27,13 @@ export class RecentSessionsUnavailableError extends Error {
 }
 
 async function fetchRecentSessions(count: number): Promise<Conversation[]> {
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/me/recent-sessions?limit=${count}`, {
     headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
   });
   if (res.status === 404) throw new RecentSessionsUnavailableError();
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return applySessionTombstones((await res.json()) as ConversationsPage, true).data;
+  return applySessionTombstones((await res.json()) as ConversationsPage, readMarker, true).data;
 }
 
 /**

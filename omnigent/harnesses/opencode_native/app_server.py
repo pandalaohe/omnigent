@@ -66,9 +66,11 @@ from omnigent.harnesses.opencode_native.bridge import (
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
+    OPENCODE_SKIP_VERSION_CHECK_ENV,
     OpenCodeClient,
     OpenCodeEvent,
     OpenCodeSession,
+    opencode_version_check_skipped,
 )
 from omnigent.host.recovery import RuntimeObservation
 from omnigent.inner import _proc
@@ -138,10 +140,6 @@ _STDERR_LINE_CHARS = 16 * 1024
 _STDERR_READER_JOIN_S = 1.0
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
-
-# Escape hatch: set truthy to bypass the OpenCode CLI version gate (e.g. to
-# try an as-yet-unvalidated 3.x release). Mirrors OMNIGENT_NO_UPDATE_CHECK.
-_SKIP_VERSION_CHECK_ENV = "OMNIGENT_OPENCODE_SKIP_VERSION_CHECK"
 
 
 class OpenCodeVersionError(RuntimeError):
@@ -516,10 +514,10 @@ class OpenCodeNativeServer:
         """
         if self._verify_version:
             self.version = resolve_opencode_version(self.opencode_path)
-            if os.environ.get(_SKIP_VERSION_CHECK_ENV):
+            if opencode_version_check_skipped():
                 _logger.warning(
                     "%s set; skipping OpenCode version gate (got %s, supported >=%s,<%s)",
-                    _SKIP_VERSION_CHECK_ENV,
+                    OPENCODE_SKIP_VERSION_CHECK_ENV,
                     self.version,
                     OPENCODE_MIN_VERSION,
                     OPENCODE_MAX_VERSION_EXCLUSIVE,

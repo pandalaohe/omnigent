@@ -350,6 +350,8 @@ def create_app() -> FastAPI:
         first turn.
     """
     adapter = ExecutorAdapter(
-        executor_factory=_build_claude_sdk_executor, startup_source="claude-sdk"
+        executor_factory=_build_claude_sdk_executor,
+        executor_factory_on_thread=True,
+        startup_source="claude-sdk",
     )
     return adapter.build()

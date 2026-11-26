@@ -4684,6 +4684,7 @@ def test_read_transcript_items_since_drops_recently_added_cli_builtins(
         ("effort", "high"),
         ("clear", ""),
         ("compact", ""),
+        ("goal", "all tests pass"),
         ("model", "claude-opus-4-7"),
         ("ultrareview", ""),
     ],
@@ -4693,7 +4694,7 @@ def test_read_transcript_items_since_surfaces_cli_commands_with_kind_command(
 ) -> None:
     """
     Surfaced CLI built-ins (``/effort``, ``/clear``, ``/compact``,
-    ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
+    ``/goal``, ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
     ``kind="command"`` — the renderer uses that to switch the prefix
     label from "Skill" to "Command".
 
@@ -15220,6 +15221,8 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     capture observed while the loop was still deciding. A box-less capture
     followed by a box-present one that arrives only after the deadline
     proves the point: the box-present frame must NOT leak into the error.
+    A live-pane stub and disabled slow-boot extension keep this zero-budget
+    check focused on the error tail instead of startup recovery.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -15238,11 +15241,16 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
         return observed if calls["n"] == 1 else late_ready
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
-    with pytest.raises(RuntimeError) as excinfo:
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             str(_TEST_TMUX_SOCKET),
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     # The tail reflects what the loop observed, and the late box-present

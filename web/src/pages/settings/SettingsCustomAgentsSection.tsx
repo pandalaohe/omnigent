@@ -2,7 +2,7 @@ import { useMemo, useState, type ReactNode } from "react";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { customAgentsSettingsEnabled } from "@/lib/capabilities";
+import { customAgentControlsAvailable, customAgentsSettingsEnabled } from "@/lib/capabilities";
 import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAgentName,
@@ -41,6 +41,7 @@ import { SettingsItem } from "@/pages/settings/search/SettingsItem";
 import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 import {
   SettingsDataRegion,
+  SettingsOwner,
   settingsOverlayProps,
 } from "@/pages/settings/search/settingsOwnership";
 import { BackButton } from "./HarnessCatalog";
@@ -91,7 +92,7 @@ function InstalledAgentsSettingsSection({
 }) {
   const info = useServerInfo();
   const enabled = customAgentsSettingsEnabled(info);
-  const supported = enabled && info !== "loading" && info.agent_detail === true;
+  const supported = customAgentControlsAvailable(info);
   const { agentId } = useSettingsRoute();
   const navigate = useNavigate();
   const fromAgentsTable = useLocation().state?.fromAgentsTable === true;
@@ -133,13 +134,19 @@ function InstalledAgentsSettingsSection({
   if (!enabled) return null;
   if (!supported) return <UnsupportedServer />;
   const back = (
-    <BackButton label={returnLabel} to={returnTo} componentId="settings.custom_agents.back" />
+    <SettingsOwner entry={CUSTOM_AGENT_DETAIL_ENTRY} part="back">
+      <BackButton label={returnLabel} to={returnTo} componentId="settings.custom_agents.back" />
+    </SettingsOwner>
   );
   if (agentId === "new") {
     return (
       <SettingsItem entry={CUSTOM_AGENT_CREATE_ENTRY} className="@container">
-        {back}
-        <h1 className="mb-6 text-2xl font-medium">{CUSTOM_AGENT_CREATE_ENTRY.label}</h1>
+        <SettingsOwner entry={CUSTOM_AGENT_CREATE_ENTRY} part="back">
+          <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+        </SettingsOwner>
+        <h1 className="settings-page-title mb-6 text-2xl font-medium">
+          {CUSTOM_AGENT_CREATE_ENTRY.label}
+        </h1>
         <CreateAgentForm
           settingsEntry={CUSTOM_AGENT_CREATE_ENTRY}
           submitLabel={CUSTOM_AGENT_CREATE_ENTRY.parts.submit}
@@ -160,7 +167,11 @@ function InstalledAgentsSettingsSection({
         {detail.isError && detail.data && (
           <p role="alert" className="mb-4 text-ui">
             Could not refresh this agent.{" "}
-            <Button variant="link" onClick={() => void detail.refetch()}>
+            <Button
+              {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "retry")}
+              variant="link"
+              onClick={() => void detail.refetch()}
+            >
               Retry
             </Button>
           </p>
@@ -171,7 +182,11 @@ function InstalledAgentsSettingsSection({
           ) : (
             <p role="alert">
               Could not load this agent.{" "}
-              <Button variant="link" onClick={() => void detail.refetch()}>
+              <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "retry")}
+                variant="link"
+                onClick={() => void detail.refetch()}
+              >
                 Retry
               </Button>
             </p>
@@ -181,7 +196,7 @@ function InstalledAgentsSettingsSection({
             key={detail.data.id}
             agent={detail.data}
             owned={detail.data.user_owned}
-            editable={info.agent_config_edit === true}
+            editable={info !== "loading" && info.agent_config_edit === true}
             harness={formatHarnessLabel(detail.data.harness, labels)}
             returnLabel={returnLabel}
             returnTo={returnTo}
@@ -211,7 +226,6 @@ function InstalledAgentsSettingsSection({
           <input
             {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "search")}
             type="search"
-            {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "search")}
             placeholder="Search configurations…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -316,6 +330,7 @@ function InstalledAgentsSettingsSection({
         )}
         <ListStatus
           query={yours}
+          scope="user"
           empty={filtered.length === 0}
           emptyText={
             search || userHasPages
@@ -323,7 +338,12 @@ function InstalledAgentsSettingsSection({
               : "No custom agents yet. Create an agent to keep it available for new sessions."
           }
         />
-        <SettingsPager label="Your agent pages" {...userPager} />
+        <SettingsPager
+          label="Your agent pages"
+          previousControl={settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "previousYours")}
+          nextControl={settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "nextYours")}
+          {...userPager}
+        />
       </section>
       {(!embedded ||
         builtins.length > 0 ||
@@ -340,26 +360,27 @@ function InstalledAgentsSettingsSection({
             className="grid gap-3 @lg:grid-cols-2"
           >
             {builtins.map((agent) => (
-              <Link
-                key={agent.id}
-                data-settings-row-action="open"
-                data-settings-region-row
-                to={customAgentSettingsPath(agent.id)}
-                componentId="settings.custom_agents.review_server"
-                className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
-              >
-                <span className="flex items-center gap-3 font-medium">
-                  <BotIcon className="size-5 shrink-0" aria-hidden />
-                  <AgentNameTag agentId={agent.id} name={agent.name} harness={agent.harness} />
-                </span>
-                <span className="text-ui text-muted-foreground">
-                  {agent.description || "Server-provided agent"}
-                </span>
-              </Link>
+              <div key={agent.id} data-settings-region-row className="contents">
+                <Link
+                  data-settings-row-action="open"
+                  to={customAgentSettingsPath(agent.id)}
+                  componentId="settings.custom_agents.review_server"
+                  className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
+                >
+                  <span className="flex items-center gap-3 font-medium">
+                    <BotIcon className="size-5 shrink-0" aria-hidden />
+                    <AgentNameTag agentId={agent.id} name={agent.name} harness={agent.harness} />
+                  </span>
+                  <span className="text-ui text-muted-foreground">
+                    {agent.description || "Server-provided agent"}
+                  </span>
+                </Link>
+              </div>
             ))}
           </SettingsDataRegion>
           <ListStatus
             query={servers}
+            scope="server"
             empty={builtins.length === 0}
             emptyText={
               search || serverHasPages
@@ -367,7 +388,12 @@ function InstalledAgentsSettingsSection({
                 : "No server agents."
             }
           />
-          <SettingsPager label="Server agent pages" {...serverPager} />
+          <SettingsPager
+            label="Server agent pages"
+            previousControl={settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "previousServer")}
+            nextControl={settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "nextServer")}
+            {...serverPager}
+          />
         </section>
       )}
     </SettingsItem>
@@ -388,10 +414,12 @@ function UnsupportedServer() {
 
 function ListStatus({
   query,
+  scope,
   empty,
   emptyText,
 }: {
   query: ReturnType<typeof useCustomAgents>["query"];
+  scope: "user" | "server";
   empty: boolean;
   emptyText: string;
 }) {
@@ -401,7 +429,10 @@ function ListStatus({
       <p role="alert" className="py-4 text-ui">
         Could not load agents.{" "}
         <Button
-          {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "retry")}
+          {...settingsControlProps(
+            CUSTOM_AGENTS_LIST_ENTRY,
+            scope === "user" ? "retryYours" : "retryServer",
+          )}
           variant="link"
           onClick={() => void query.refetch()}
         >
@@ -472,7 +503,13 @@ function AgentDetail({
         />
       ) : (
         <>
-          <BackButton label={returnLabel} to={returnTo} componentId="settings.custom_agents.back" />
+          <SettingsOwner entry={CUSTOM_AGENT_DETAIL_ENTRY} part="back">
+            <BackButton
+              label={returnLabel}
+              to={returnTo}
+              componentId="settings.custom_agents.back"
+            />
+          </SettingsOwner>
           <div className="flex items-start justify-between gap-4">
             <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
               {agent.name}

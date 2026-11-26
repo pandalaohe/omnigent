@@ -1,6 +1,10 @@
 import { forwardRef, type ReactNode, type RefObject, useLayoutEffect } from "react";
 
 import { findMentionTokens } from "@/lib/composerMentions";
+import {
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 /**
  * Pill look for an inline ``@`` token in the composer mirror. Background, ring
@@ -40,25 +44,32 @@ function alignMirror(overlay: HTMLDivElement, textarea: HTMLTextAreaElement) {
   overlay.scrollTop = scrollTop;
 }
 
-/** Keep the mirror aligned after autosize, before the new draft paints. */
+/**
+ * Pin a mirror overlay to its textarea's box and scroll position while
+ * ``active``. The input area also holds the textarea's line-box descent, which
+ * would otherwise cut the mirror's scroll range short. Only a textarea has a
+ * mirror; other engines paint their own text.
+ */
 export function useComposerMirrorAlignment(
   overlayRef: RefObject<HTMLDivElement | null>,
-  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  textareaRef: RefObject<ComposerTextTarget | null>,
   active: boolean,
+  // The textarea node, passed when an engine switch can replace it so alignment re-binds.
+  textareaNode: ComposerTextTarget | null = null,
 ) {
   // A draft update can move the textarea or change its inner scroll range
   // without resizing its outer box or firing a scroll event yet.
   useLayoutEffect(() => {
     const overlay = overlayRef.current;
     const textarea = textareaRef.current;
-    if (!active || !overlay || !textarea) return;
+    if (!active || !overlay || !textarea || !isComposerTextarea(textarea)) return;
     alignMirror(overlay, textarea);
   });
 
   useLayoutEffect(() => {
     const overlay = overlayRef.current;
     const textarea = textareaRef.current;
-    if (!active || !overlay || !textarea) return;
+    if (!active || !overlay || !textarea || !isComposerTextarea(textarea)) return;
     const syncScroll = () => {
       overlay.scrollTop = textarea.scrollTop;
     };
@@ -74,7 +85,7 @@ export function useComposerMirrorAlignment(
       textarea.removeEventListener("compositionend", syncScroll);
       observer?.disconnect();
     };
-  }, [overlayRef, textareaRef, active]);
+  }, [overlayRef, textareaRef, active, textareaNode]);
 }
 
 /** Classes that hand glyph painting to the mirror; the caret stays visible. */

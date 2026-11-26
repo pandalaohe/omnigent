@@ -2,6 +2,7 @@ import { forwardRef, useMemo, type ReactNode } from "react";
 
 import { labelOf, tokenText } from "@/lib/composerTokens";
 import { findMentionTokens } from "@/lib/composerMentions";
+import type { ComposerTextHighlight } from "@/components/composer/engine/composerInput";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 
 const NO_MENTION_TOKENS: readonly string[] = [];
@@ -21,10 +22,7 @@ const TOKEN_CLASS = "text-primary";
 const ACTIVE_TOKEN_CLASS = "text-primary bg-primary/15 rounded-sm";
 const S26_CLASS = "rounded-sm bg-primary/10 text-primary";
 
-interface Span {
-  start: number;
-  end: number;
-  className: string;
+interface Span extends ComposerTextHighlight {
   testId?: string;
 }
 
@@ -74,7 +72,7 @@ function computeSpans(
   activeIndex: number | null,
   mentionTokens: readonly string[],
 ): Span[] {
-  const spans = [...tokenSpans(value, files, activeIndex), ...s26Spans(value)];
+  const spans: Span[] = composerAttachmentHighlights(value, files, activeIndex);
   spans.push(
     ...findMentionTokens(value, mentionTokens).map(({ start, end }) => ({
       start,
@@ -86,6 +84,14 @@ function computeSpans(
   const commandTint = commandSpan(value, command);
   if (commandTint) spans.push(commandTint);
   return spans.sort((a, b) => a.start - b.start);
+}
+
+export function composerAttachmentHighlights(
+  value: string,
+  files: readonly File[],
+  activeIndex: number | null,
+): ComposerTextHighlight[] {
+  return [...tokenSpans(value, files, activeIndex), ...s26Spans(value)];
 }
 
 /** Whether `value` has any live token or S26 reference — the backdrop's own

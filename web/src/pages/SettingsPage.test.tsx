@@ -42,6 +42,7 @@ import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
 import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
+import { useSettingsAvailability } from "@/pages/settings/search/useSettingsAvailability";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
@@ -87,6 +88,7 @@ const mocks = vi.hoisted(() => ({
   bootFallback: false,
   sessionTitleInstructions: false,
   projectKanban: false,
+  floatingComposer: false,
   nestedAgents: false,
   advisorAvailable: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
@@ -144,6 +146,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           features: {
             project_kanban: mocks.projectKanban,
             session_peer_messaging: mocks.sessionCollabEnabled,
+            floating_composer: mocks.floatingComposer,
           },
         },
 }));
@@ -394,6 +397,21 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
+/** Whether Settings search offers the Admin view row, read beside the page that shows it. */
+function AdminViewSearchProbe() {
+  return (
+    <span data-testid="search-offers-admin-view">
+      {String(useSettingsAvailability().adminView)}
+    </span>
+  );
+}
+
+/** Search offers Admin view exactly where the page shows its switch. */
+function expectSearchToMatchAdminViewSwitch() {
+  const shown = screen.queryByRole("switch", { name: "Admin view" }) !== null;
+  expect(screen.getByTestId("search-offers-admin-view")).toHaveTextContent(String(shown));
+}
+
 function FullLocationProbe() {
   const location = useLocation();
   return (
@@ -416,6 +434,7 @@ function renderPage(path = "/settings", navigation?: ReactNode) {
             <SettingsPage />
             <LocationProbe />
             {navigation}
+            <AdminViewSearchProbe />
           </MemoryRouter>
         </Embed>
       </TooltipProvider>
@@ -479,6 +498,7 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.projectKanban = false;
+  mocks.floatingComposer = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -709,6 +729,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+        expectSearchToMatchAdminViewSwitch();
       } finally {
         document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
       }
@@ -720,6 +741,7 @@ describe("SettingsPage", () => {
     vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
     renderPage("/settings/general");
     expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+    expectSearchToMatchAdminViewSwitch();
   });
 
   it.each([
@@ -740,6 +762,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         const control = screen.getByRole("switch", { name: "Admin view" });
+        expectSearchToMatchAdminViewSwitch();
         expect(control).toHaveAttribute("aria-checked", String(enabled));
         fireEvent.click(control);
         expect(update).toHaveBeenCalledWith(!enabled);
@@ -805,6 +828,57 @@ describe("SettingsPage", () => {
     expect(
       await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
     ).toBeInTheDocument();
+  });
+
+  it("offers the New Agent shortcut only with floating_composer on and a shell that takes its id", async () => {
+    const getGlobalShortcut = vi.fn(async (id?: string) =>
+      id === "floatingComposer"
+        ? { enabled: true, accelerator: "CommandOrControl+Shift+Space" }
+        : { enabled: false, accelerator: "Alt+Space" },
+    );
+    const shell = (floatingComposerShortcut: boolean) => {
+      const getDesktopFeatures = vi.fn(async () => ({
+        floatingComposer: true,
+        floatingComposerShortcut,
+      }));
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        setBadgeCount: vi.fn(),
+        notify: vi.fn(),
+        getGlobalShortcut,
+        setGlobalShortcut: vi.fn(),
+        getDesktopFeatures,
+      };
+      return getDesktopFeatures;
+    };
+    const newAgent = { name: "Open New Agent from anywhere" };
+
+    // An older shell would read and save "show" for any id.
+    mocks.floatingComposer = true;
+    const oldShellFeatures = shell(false);
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
+    // Let the New Agent row's own check answer before asserting it stayed away.
+    await waitFor(() => expect(oldShellFeatures).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    expect(getGlobalShortcut).not.toHaveBeenCalledWith("floatingComposer");
+    cleanup();
+
+    mocks.floatingComposer = false;
+    shell(true);
+    renderPage("/settings/general");
+    await screen.findByRole("switch", { name: "Show Omnigent from anywhere" });
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    cleanup();
+
+    mocks.floatingComposer = true;
+    shell(true);
+    renderPage("/settings/general");
+    expect(await screen.findByRole("switch", newAgent)).toBeChecked();
+    expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
   });
 
   it("offers the kanban board switch under Composer only when the server has the board", () => {
@@ -2768,6 +2842,11 @@ describe("SettingsPage", () => {
         .querySelector('[data-settings-control="always-steer:"]')
         ?.getAttribute("aria-labelledby"),
     ).toBe("settings-always-steer-label");
+  });
+
+  it("renders the General terminal clipboard row from its Settings catalog entry", () => {
+    renderPage("/settings/general");
+    expect(document.querySelector('[data-settings-item="terminal-clipboard"]')).not.toBeNull();
   });
 
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {

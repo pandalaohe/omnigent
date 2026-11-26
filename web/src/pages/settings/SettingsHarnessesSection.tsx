@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2Icon,
@@ -28,7 +28,8 @@ import { callingDefaultHarnesses, callingDefaultParent } from "@/lib/callingDefa
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -68,6 +69,7 @@ import {
   harnessFixMode,
   harnessStatus,
   type HarnessFixMode,
+  type HarnessFixResult,
 } from "@/lib/harnessFix";
 import { useSettingsRoute } from "../../shell/settingsNav";
 import {
@@ -81,16 +83,16 @@ import {
   HARNESSES_GRID_ENTRY,
   type NativeHarnessId,
   type FixOpener,
-  harnessFixOwner,
 } from "./search/catalog/harnesses";
 import { SettingsEntryLabel, SettingsItem } from "./search/SettingsItem";
 import { HIDE_UNCONFIGURED_HARNESSES_ENTRY } from "./search/catalog/appearance";
-import { SettingsOverlayOwner } from "./search/settingsOwnership";
 import {
-  type SettingsControlProps,
-  settingsControlId,
-  settingsControlProps,
-} from "./search/settingsControl";
+  SettingsOverlayOwner,
+  SettingsOwner,
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "./search/settingsOwnership";
+import { type SettingsControlProps, settingsControlProps } from "./search/settingsControl";
 
 interface HarnessEntry {
   /** Native or registered harness slug used by the host. */
@@ -204,6 +206,34 @@ export const SettingsHarnessesSection = () => {
     mode: HarnessFixMode;
     opener: FixOpener;
   } | null>(null);
+  // The fix dialog's result: record the host's new state and the notice it leaves behind.
+  const handleFixed = ({
+    configuredHarnesses,
+    credentialKind,
+    version,
+    gatewayInference,
+    harnessAccounts,
+  }: HarnessFixResult) => {
+    if (!fixTarget) return;
+    const { host: fixedHost, entry } = fixTarget;
+    applyHarnessFixResult(queryClient, fixedHost.host_id, {
+      configuredHarnesses,
+      harnessAccounts,
+      gatewayInference,
+    });
+    if (credentialKind) {
+      setCredentialKinds((current) => ({
+        ...current,
+        [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
+      }));
+    }
+    setReadyNotice({
+      harness: entry.harness,
+      hostId: fixedHost.host_id,
+      version,
+      account: harnessAccounts?.[harnessAccountKey(entry.harness)],
+    });
+  };
   const openFix = (
     entry: HarnessEntry,
     targetHost: Host,
@@ -354,12 +384,10 @@ export const SettingsHarnessesSection = () => {
           </section>
         </SettingsItem>
       )}
-      {fixTarget && (
+      {fixTarget?.opener === "setUp" && (
         <SettingsOverlayOwner
-          entry={
-            fixCatalogHarness ? harnessFixOwner(fixCatalogHarness, fixTarget.opener) : undefined
-          }
-          opener={fixTarget.opener}
+          entry={fixCatalogHarness ? HARNESS_CARD_ENTRIES.entry(fixCatalogHarness) : undefined}
+          opener="setUp"
         >
           <HarnessFixDialog
             open
@@ -368,32 +396,41 @@ export const SettingsHarnessesSection = () => {
             host={fixTarget.host}
             harness={fixTarget.entry.harness}
             harnessLabel={fixTarget.entry.name}
-            onFixed={({
-              configuredHarnesses,
-              credentialKind,
-              version,
-              gatewayInference,
-              harnessAccounts,
-            }) => {
-              const { host: fixedHost, entry } = fixTarget;
-              applyHarnessFixResult(queryClient, fixedHost.host_id, {
-                configuredHarnesses,
-                harnessAccounts,
-                gatewayInference,
-              });
-              if (credentialKind) {
-                setCredentialKinds((current) => ({
-                  ...current,
-                  [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
-                }));
-              }
-              setReadyNotice({
-                harness: entry.harness,
-                hostId: fixedHost.host_id,
-                version,
-                account: harnessAccounts?.[harnessAccountKey(entry.harness)],
-              });
-            }}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "fixAction" && (
+        <SettingsOverlayOwner
+          entry={fixCatalogHarness ? HARNESS_DETAIL_ENTRIES.entry(fixCatalogHarness) : undefined}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "credentialAction" && (
+        <SettingsOverlayOwner
+          entry={
+            fixCatalogHarness ? HARNESS_CREDENTIAL_ENTRIES.entry(fixCatalogHarness) : undefined
+          }
+          opener="credentialAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
           />
         </SettingsOverlayOwner>
       )}
@@ -482,30 +519,42 @@ function HostSelect({
             className="h-8 shrink-0 gap-1.5"
             data-testid="harness-host-select"
             componentId="settings.harnesses.host"
+            {...settingsControlProps(HARNESSES_GRID_ENTRY, "machine", {
+              runtime: selected?.name ?? "Select a host",
+            })}
           >
             <HostStatusDot online={selected?.status === "online"} />
             <span className="max-w-40 truncate">{selected?.name ?? "Select a host"}</span>
             <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-52">
-          {hosts.map((h) => {
-            const online = h.status === "online";
-            return (
-              <DropdownMenuItem
-                key={h.host_id}
-                disabled={!online}
-                onSelect={() => online && onSelect(h.host_id)}
-                data-active={h.host_id === selected?.host_id ? "true" : undefined}
-                data-testid={`harness-host-${h.host_id}`}
-                className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-              >
-                <HostStatusDot online={online} />
-                <span className="min-w-0 flex-1 truncate">{h.name}</span>
-                {!online && <span className="text-xs text-muted-foreground">Offline</span>}
-              </DropdownMenuItem>
-            );
-          })}
+        <DropdownMenuContent
+          align="start"
+          className="min-w-52"
+          {...settingsOverlayProps(HARNESSES_GRID_ENTRY, "machine")}
+        >
+          {/* One host is the selected one, so its item is checked. */}
+          <DropdownMenuRadioGroup value={selected?.host_id ?? ""}>
+            {hosts.map((h) => {
+              const online = h.status === "online";
+              return (
+                <DropdownMenuRadioItem
+                  key={h.host_id}
+                  value={h.host_id}
+                  disabled={!online}
+                  onSelect={() => online && onSelect(h.host_id)}
+                  data-active={h.host_id === selected?.host_id ? "true" : undefined}
+                  data-testid={`harness-host-${h.host_id}`}
+                  {...settingsRuntimeChoiceProps(HARNESSES_GRID_ENTRY, "machine")}
+                  className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                >
+                  <HostStatusDot online={online} />
+                  <span className="min-w-0 flex-1 truncate">{h.name}</span>
+                  {!online && <span className="text-xs text-muted-foreground">Offline</span>}
+                </DropdownMenuRadioItem>
+              );
+            })}
+          </DropdownMenuRadioGroup>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
@@ -712,6 +761,9 @@ function HarnessCard({
   const navigate = useNavigate();
   // This card is only rendered for the built-in harness catalog.
   const card = HARNESS_CARD_ENTRIES.entry(entry.harness as NativeHarnessId);
+  // The link is named by the harness; its status and description are its description.
+  const statusId = useId();
+  const descriptionId = useId();
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
@@ -719,16 +771,18 @@ function HarnessCard({
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
             <span className="truncate text-ui font-medium text-foreground">{entry.name}</span>
-            <HarnessStatusText
-              status={status}
-              enhanced={canSetup}
-              configuredCredential={
-                status.ready && canSetup
-                  ? (configuredAccountLabel(host, entry.harness) ??
-                    credentialPresentation(host, entry.harness, credentialKind).label)
-                  : undefined
-              }
-            />
+            <div id={statusId}>
+              <HarnessStatusText
+                status={status}
+                enhanced={canSetup}
+                configuredCredential={
+                  status.ready && canSetup
+                    ? (configuredAccountLabel(host, entry.harness) ??
+                      credentialPresentation(host, entry.harness, credentialKind).label)
+                    : undefined
+                }
+              />
+            </div>
           </div>
         </div>
         {(status.ready || (needsAttention && canFix && !canInstall)) && (
@@ -751,7 +805,9 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
+      <p id={descriptionId} className="line-clamp-2 text-sm text-muted-foreground">
+        {entry.description}
+      </p>
     </>
   );
   const className =
@@ -761,9 +817,8 @@ function HarnessCard({
     <SettingsItem entry={card} className="grid">
       {opensDetail ? (
         <Link
-          // Named by the harness, as its declared part is; the id lets search find the link.
-          aria-label={card.label}
-          data-settings-control={settingsControlId(card, "open")}
+          {...settingsControlProps(card, "open")}
+          aria-describedby={`${statusId} ${descriptionId}`}
           to={`${agentSettingsPath(entry.harness, host?.host_id)}${status.ready ? "" : "&tab=settings"}`}
           // Only cards that open a details page get the hover, so it reads as clickable.
           className={cn(
@@ -854,7 +909,13 @@ function HarnessDetail({
   });
   const header = (
     <>
-      <BackButton label="Agents" to="/settings/agents" />
+      {detail ? (
+        <SettingsOwner entry={detail} part="back">
+          <BackButton label="Agents" to="/settings/agents" />
+        </SettingsOwner>
+      ) : (
+        <BackButton label="Agents" to="/settings/agents" />
+      )}
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
@@ -1006,7 +1067,7 @@ function HarnessDetail({
   const inventoryPage = nativeId ? harnessInventoryPage(nativeId) : undefined;
   if (host && inventoryPage && (status.ready || canFix)) {
     return (
-      <SettingsItem entry={inventoryPage.detail}>
+      <SettingsItem entry={detail}>
         <HarnessCatalog
           header={
             <>

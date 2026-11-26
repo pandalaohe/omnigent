@@ -6,6 +6,8 @@ import { BookmarksTab } from "./BookmarksTab";
 import { ExtensionsTab } from "./ExtensionsTab";
 import { SignInTab } from "./SignInTab";
 import { AccessTab } from "./AccessTab";
+import { OPEN_LINKS_IN_APP_ENTRY } from "../search/catalog/browser";
+import { parseSettingsHash } from "../search/settingsControl";
 import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 
 const tabs = [
@@ -21,7 +23,9 @@ export function BrowserSection() {
     tabsRef = useRef<HTMLDivElement>(null),
     activeRef = useRef<HTMLButtonElement>(null);
   const requested = new URLSearchParams(location.search).get("tab");
-  const active = tabs.some(([id]) => id === requested) ? requested : "history";
+  const defaultTab =
+    parseSettingsHash(location.hash)?.id === OPEN_LINKS_IN_APP_ENTRY.id ? "access" : "history";
+  const active = tabs.some(([id]) => id === requested) ? requested : defaultTab;
   useEffect(() => {
     const list = tabsRef.current,
       tab = activeRef.current;

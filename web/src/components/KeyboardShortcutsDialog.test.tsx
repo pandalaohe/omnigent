@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import {
   KeyboardShortcutsDialog,
@@ -135,7 +136,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 
 describe("KeyboardShortcutsList settings layout", () => {
   it("groups shortcut rows into settings cards", () => {
-    render(<KeyboardShortcutsList variant="settings" />);
+    render(
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>,
+    );
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
@@ -335,10 +340,15 @@ describe("KeyboardShortcutsDialog", () => {
   });
 
   it("keeps native new-session keys and updates the Settings reference", () => {
-    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    const settingsList = () => (
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>
+    );
+    const { rerender } = render(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     isNativeShell.mockReturnValue(true);
-    rerender(<KeyboardShortcutsList variant="settings" />);
+    rerender(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
     expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
     expect(keysFor("Focus or close workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);

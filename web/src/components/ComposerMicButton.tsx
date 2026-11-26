@@ -1,6 +1,10 @@
 "use client";
 
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
+import {
+  composerTargetElement,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import { isInsideQuestionCard } from "@/hooks/useQuestionCardHotkeys";
@@ -116,7 +120,7 @@ export interface ComposerMicButtonProps {
   /** The composer's text box. macOS Dictation types into the focused field, so
    *  the desktop app's macOS fallback focuses this first; without it there is no
    *  fallback. */
-  inputRef?: RefObject<HTMLTextAreaElement | null>;
+  inputRef?: RefObject<ComposerTextTarget | null>;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -211,15 +215,18 @@ export const ComposerMicButton = ({
     segmentsRef.current.push({ text, meta, excluded });
   }, []);
   const takeInputRef = useRef<{
-    field: HTMLTextAreaElement | null;
+    field: ComposerTextTarget | null;
     value: string | undefined;
     edited: boolean;
     onEdit: () => void;
   } | null>(null);
   const releaseTakeInput = useCallback(() => {
     const target = takeInputRef.current;
-    target?.field?.removeEventListener("input", target.onEdit);
-    target?.field?.removeEventListener("change", target.onEdit);
+    if (target?.field) {
+      const element = composerTargetElement(target.field);
+      element.removeEventListener("input", target.onEdit);
+      element.removeEventListener("change", target.onEdit);
+    }
     takeInputRef.current = null;
   }, []);
   const captureTakeInput = useCallback(() => {
@@ -233,8 +240,11 @@ export const ComposerMicButton = ({
         target.edited = true;
       },
     };
-    field?.addEventListener("input", target.onEdit);
-    field?.addEventListener("change", target.onEdit);
+    if (field) {
+      const element = composerTargetElement(field);
+      element.addEventListener("input", target.onEdit);
+      element.addEventListener("change", target.onEdit);
+    }
     takeInputRef.current = target;
   }, [inputRef, releaseTakeInput]);
   const onInterimRef = useRef(onInterim);

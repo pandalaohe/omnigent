@@ -73,6 +73,7 @@ import {
   sameQuestionAnswer,
 } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
+import { subagentHandbackReport } from "./subagentHandback";
 import { readTaskActivity } from "./taskActivity";
 
 // Calls whose card asks the user a question rather than report work the
@@ -107,6 +108,7 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
   const agents = agentNamesByResponseId(items);
+  const handbacks = new Set<string>();
   const indexedAnswers = items.flatMap((item, index) => {
     if (!isMessageItem(item) || item.role !== "user") return [];
     const message = questionAnswerFromContent(item.content);
@@ -129,6 +131,16 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
         seenAnswers.push(answer);
       }
     }
+    if (isFunctionCallItem(item)) {
+      const report = handbackReportBlock(item);
+      if (report !== null) {
+        handbacks.add(item.call_id);
+        blocks.push(report);
+        continue;
+      }
+    }
+    // The handback's result only confirms delivery; the report already shows.
+    if (isFunctionCallOutputItem(item) && handbacks.has(item.call_id)) continue;
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
@@ -563,13 +575,28 @@ function assistantMessageToBlock(item: MessageItem): TextDone | HandoverNoteBloc
   };
 }
 
-function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown>;
+function parsedArguments(item: FunctionCallItem): Record<string, unknown> {
   try {
-    args = JSON.parse(item.arguments) as Record<string, unknown>;
+    return JSON.parse(item.arguments) as Record<string, unknown>;
   } catch {
-    args = {};
+    return {};
   }
+}
+
+/** A sub-agent's handback call rendered as its final answer, or ``null``. */
+function handbackReportBlock(item: FunctionCallItem): TextDone | null {
+  const report = subagentHandbackReport(item.name, parsedArguments(item));
+  if (report === null) return null;
+  return {
+    type: "text_done",
+    ctx: ctxFor(item),
+    fullText: report,
+    hasCodeBlocks: report.includes("```"),
+  };
+}
+
+function functionCallToBlock(item: FunctionCallItem): ToolGroup {
+  const args = parsedArguments(item);
   const execution: ToolExecution = {
     name: item.name,
     arguments: args,

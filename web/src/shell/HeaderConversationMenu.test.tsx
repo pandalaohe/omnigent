@@ -15,6 +15,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { menuRow } from "@/lib/mobileMenuPins";
@@ -537,6 +538,15 @@ describe("HeaderConversationMenu", () => {
     expect(
       screen.getByText("Worktree details are unavailable on this server."),
     ).toBeInTheDocument();
+  });
+
+  it("hides Mark as unread for a muted session", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
   });
 
   it("opens from the keyboard and focuses the first action", () => {

@@ -4,8 +4,10 @@
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
 import { ACCOUNT_SETTINGS } from "./account";
+import { ADMIN_SETTINGS } from "./admin";
 import { APPEARANCE_SETTINGS, HIDE_UNCONFIGURED_HARNESSES_ENTRY } from "./appearance";
 import { ARCHIVED_SETTINGS } from "./archived";
+import { OPEN_LINKS_IN_APP_ENTRY } from "./browser";
 import { CLI_SETTINGS } from "./cli";
 import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
 import { GENERAL_SETTINGS } from "./general";
@@ -32,7 +34,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   import: IMPORT_SETTINGS,
   "api-keys": [],
   account: ACCOUNT_SETTINGS,
-  admin: [],
+  admin: ADMIN_SETTINGS,
   members: MEMBERS_SETTINGS,
   policies: POLICIES_SETTINGS,
   sharing: SHARING_SETTINGS,
@@ -41,7 +43,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   updates: UPDATES_SETTINGS,
   instructions: [],
   "model-providers": [],
-  browser: [],
+  browser: [OPEN_LINKS_IN_APP_ENTRY],
 };
 
 export const SETTINGS_ENTRIES: readonly SettingsEntry[] = Object.values(SECTION_CATALOGS).flat();

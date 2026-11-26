@@ -460,6 +460,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    cost_display_hidden,
     effective_host_id,
     reconcile_orphaned_running_status,
 )
@@ -540,6 +541,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
+    MUTED_LABEL_KEY,
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -550,8 +552,10 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
     NativeRecoveryItemSkipped,
     NativeReplayConflictError,
+    SessionActivity,
     SpawnTreeUsage,
     drop_server_secret_labels,
+    muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -2760,6 +2764,8 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
       THIS viewer pinned the session, and drop every ``omnigent.pinned.*`` key.
       That keeps the per-user dimension server-side and stops other users' pins
       from bloating the payload.
+    - Mutes are per-user like pins: ``omnigent.muted`` is set iff THIS viewer
+      muted the session.
     - Sandbox repos are stored one per repo as ``omnigent.sandbox.repo.<index>``
       (avoiding the 256-char label-value cap); we present the canonical
       ``omnigent.sandbox.repo`` as the space-joined list so clients that read
@@ -2779,6 +2785,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
 
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
+    my_mute = labels.get(muted_label_key(user_id))
     repos = read_managed_repo_workspaces(labels)
     cleaned = {
         k: v
@@ -2787,11 +2794,15 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
         and not k.startswith(PROFILE_LABEL_PREFIX)
         and k != PINNED_LABEL_KEY
         and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and k != MUTED_LABEL_KEY
+        and not k.startswith(f"{MUTED_LABEL_KEY}.")
         and k != MANAGED_REPO_LABEL_KEY
         and not k.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin
+    if my_mute is not None:
+        cleaned[MUTED_LABEL_KEY] = my_mute
     if repos:
         cleaned[MANAGED_REPO_LABEL_KEY] = " ".join(repos)
     return cleaned
@@ -3118,6 +3129,8 @@ def _publish_ancestor_subtree_costs(tree: list[Conversation], session_id: str) -
         }
         if subtree_cost is not None:
             payload["total_cost_usd"] = subtree_cost
+        if cost_display_hidden():
+            payload["cost_hidden"] = True
         if usage_by_model is not None:
             payload["usage_by_model"] = usage_by_model
         event = SessionUsageEvent(**payload)
@@ -3190,7 +3203,9 @@ def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentC
             id=row.id,
             cost_usd=totals.get(row.id),
             estimated_cost_usd=(
-                estimates[row.id][1] if row.id not in totals and row.id in estimates else None
+                estimates[row.id][1]
+                if row.id not in totals and row.id in estimates and not cost_display_hidden()
+                else None
             ),
         )
         for row in tree
@@ -3493,6 +3508,7 @@ def _build_session_response(
         # back to this conversation's own usage otherwise. A priced
         # cumulative total, or None (rendered "—") when never priced.
         total_cost_usd=_priced_cost_for_display(display_usage),
+        cost_hidden=True if cost_display_hidden() else None,
         # Per-model breakdown over the same subtree usage. None (omitted)
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
@@ -4470,6 +4486,8 @@ async def _persist_external_session_usage(
         event_payload["provider_usage_limits"] = provider_usage_limits
     if subtree_cost is not None:
         event_payload["total_cost_usd"] = subtree_cost
+    if cost_display_hidden():
+        event_payload["cost_hidden"] = True
     if usage_by_model is not None:
         event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
@@ -6236,6 +6254,7 @@ async def _persist_external_conversation_item_unlocked(
                 session_id,
                 persisted_user,
                 cleared_pending_id=skipped.pending_id,
+                delivery_confirmed=False,
             )
             _publish_external_conversation_item(session_id, persisted_error)
     if drained is not None:
@@ -6276,7 +6295,11 @@ async def _persist_external_conversation_item_unlocked(
     if pending_background_title is not None and not internal_input:
         pending_background_title.schedule(expected_seed_title=conv.title)
     _publish_persisted_external_item(
-        session_id, body, persisted, cleared_pending_id=cleared_pending_id
+        session_id,
+        body,
+        persisted,
+        cleared_pending_id=cleared_pending_id,
+        delivery_confirmed=cleared_pending_id is None or delivery_confirmed,
     )
     if drains_pending_inputs and isinstance(persisted.data, MessageData):
         log_input_event(
@@ -6325,6 +6348,8 @@ def _publish_persisted_external_item(
     body: SessionEventInput,
     persisted: ConversationItem,
     cleared_pending_id: str | None = None,
+    *,
+    delivery_confirmed: bool = True,
 ) -> None:
     """Broadcast a newly persisted external item and drive any elicitation it resolves."""
     message_id = body.data.get("message_id")
@@ -6333,6 +6358,7 @@ def _publish_persisted_external_item(
         persisted,
         cleared_pending_id=cleared_pending_id,
         message_id=message_id if isinstance(message_id, str) else None,
+        delivery_confirmed=delivery_confirmed,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
 
@@ -6815,7 +6841,9 @@ async def _settle_undelivered_native_input(
             ),
         )
     pending_inputs.release(session_id, drained, delivery_confirmed=False)
-    _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+    _publish_input_consumed(
+        session_id, persisted[0], cleared_pending_id=drained.pending_id, delivery_confirmed=False
+    )
     if delivery_error is not None:
         _publish_error_event(session_id, delivery_error)
     return True
@@ -7019,7 +7047,9 @@ async def _commit_undelivered_input_content(
             item_id=persisted[0].id,
             response_id=persisted[0].response_id,
         )
-    _publish_input_consumed(session_id, persisted[0], cleared_pending_id=pending_id)
+    _publish_input_consumed(
+        session_id, persisted[0], cleared_pending_id=pending_id, delivery_confirmed=False
+    )
 
 
 def _restore_drained_inputs(
@@ -7891,6 +7921,19 @@ async def _wait_for_host_reconnect(
 
 
 _HOST_RUNNER_STARTUP_POLL_S = 1.0
+# The host forgets a dead runner before it sends that runner's exit report.
+_EXIT_REPORT_GRACE_S = 3.0
+
+
+async def _await_exit_report(
+    runner_id: str, runner_exit_reports: RunnerExitReports | None
+) -> None:
+    """Give an in-flight exit report for a runner the host has forgotten a moment to arrive."""
+    if runner_exit_reports is None:
+        return
+    deadline = time.monotonic() + _EXIT_REPORT_GRACE_S
+    while runner_exit_reports.get(runner_id) is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
 
 
 async def _wait_for_host_bound_runner_client(
@@ -8233,6 +8276,80 @@ class _SessionReboundDuringProvision(Exception):
 _SESSION_REBOUND_REASON = "session was bound to another host while its sandbox was provisioning"
 
 
+async def _stop_if_archived_while_provisioning(
+    session_id: str,
+    *,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    host_registry: HostRegistry | None,
+    sandbox_config: ManagedSandboxDeployment,
+) -> None:
+    """
+    Schedule the deferred archive teardown once a create's launch binds an archived session.
+
+    The archive's own teardown ran before the bind and found no host to stop. A failed
+    read leaves cleanup to the idle stop.
+
+    :param session_id: Session the launch just bound, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param host_registry: Live host tunnels, or ``None`` in minimal wirings.
+    :param sandbox_config: The deployment's sandbox config.
+    """
+    try:
+        activity = await asyncio.to_thread(conversation_store.get_session_activity, [session_id])
+    except Exception:  # noqa: BLE001 — the launch already succeeded; never fail it here
+        _logger.warning(
+            "Could not check whether session %s was archived while provisioning",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    row = activity.get(session_id)
+    if row is None or not row.archived:
+        return
+    _logger.info(
+        "Session %s was archived while its sandbox was provisioning; scheduling its teardown",
+        session_id,
+        extra={"session_id": session_id},
+    )
+    _spawn_archive_stop(
+        session_id,
+        conversation_store,
+        get_server_runner_router(),
+        host_registry,
+        host_store=host_store,
+        sandbox_config=sandbox_config,
+        after_turn=await _turn_may_be_running(session_id, row, conversation_store),
+    )
+
+
+async def _turn_may_be_running(
+    session_id: str, row: SessionActivity, conversation_store: ConversationStore
+) -> bool:
+    """
+    Whether an archived session's turn may still be running, as a self-archive's wait sees it.
+
+    A turn can archive its own session, leaving a turn-aware teardown pending on whichever
+    replica took the request; a plain teardown would cut that turn short. An unknown status
+    counts as running, as in :func:`_await_archived_turn_end`, unless the session has no
+    items yet: then no turn has run, so none can have archived it.
+
+    :param session_id: Session to check, e.g. ``"conv_abc123"``.
+    :param row: The session's activity row, read just before.
+    :param conversation_store: Store holding the session's items.
+    :returns: ``True`` when the teardown must wait for the turn.
+    """
+    if session_id in _session_status_cache or row.live_status is not None:
+        return _session_status_from_cache(session_id, row.live_status) == "running"
+    try:
+        page = await asyncio.to_thread(conversation_store.list_items, session_id, limit=1)
+    except Exception:  # noqa: BLE001 — unknown, so never cut a turn short
+        return True
+    return bool(page.data)
+
+
 async def _bind_and_launch_managed_runner(
     *,
     session_id: str,
@@ -8424,6 +8541,16 @@ async def _bind_and_launch_managed_runner(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
+        # A relaunch or a move starts from a message or a move of the session, and that
+        # work runs on this sandbox, so only a create's launch can have raced an archive.
+        if relaunch_host is None and held_runner_id is None:
+            await _stop_if_archived_while_provisioning(
+                session_id,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                sandbox_config=sandbox_config,
+            )
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -14671,6 +14798,8 @@ async def _relay_runner_stream_once(
                                 }
                                 if _subtree_cost is not None:
                                     _usage_payload["total_cost_usd"] = _subtree_cost
+                                if cost_display_hidden():
+                                    _usage_payload["cost_hidden"] = True
                                 if _usage_by_model is not None:
                                     _usage_payload["usage_by_model"] = _usage_by_model
                                 _usage_event = SessionUsageEvent(**_usage_payload).model_dump(
@@ -16785,7 +16914,10 @@ async def _create_session_from_existing_agent_impl(
     if body.workflow_id is not None:
         require_workflows(request)
         workflow = await load_workflow_for_run(
-            conversation_store, body.workflow_id, user_id=user_id
+            conversation_store,
+            body.workflow_id,
+            user_id=user_id,
+            permission_store=getattr(request.app.state, "permission_store", None),
         )
 
     request_fields_set = body.model_fields_set

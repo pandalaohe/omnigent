@@ -44,6 +44,12 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
 import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
+import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
+import {
+  clipDesignRequest,
+  parseDesignRequest,
+  type DesignRequest,
+} from "@/components/BrowserPane/designTools/parseDesignRequest";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
@@ -75,6 +81,11 @@ import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import {
+  splitKnownSlashCommand,
+  splitNativeShellCommand,
+  usePublishedComposerCommands,
+} from "@/components/composer/composerHighlight";
+import {
   readableSentText,
   replaceSentMentions,
   SESSION_MENTION_HINT,
@@ -105,6 +116,7 @@ import {
   type PendingUserMessage,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -673,13 +685,14 @@ export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): st
 
 /**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
- * a local send in flight.
+ * a local send in flight. Shared by the transcript's working shimmer and the
+ * composer's background-task tally, so the two surfaces never disagree.
  */
 export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
   return computeIsWorking(sessionStatus) || localSending;
 }
 
-function useAgentTurnActive(): boolean {
+export function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
   return computeIsTurnActive(sessionStatus, localSending);
@@ -1093,6 +1106,29 @@ const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOpti
   },
 };
 
+/** A user message's text as Markdown, as the bubble renders it. */
+function UserMessageMarkdown({ text, leadingCommand }: { text: string; leadingCommand?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      className="text-message"
+      breaks
+      mode="static"
+      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+      renderLocalReviewComment={renderLocalReviewComment}
+      leadingCommand={leadingCommand}
+    >
+      {text}
+    </FilePathAwareMessageResponse>
+  );
+}
+
+/** A design-tool message's card, its words rendered like any user message's. */
+function DesignRequestCard({ request }: { request: DesignRequest }) {
+  return (
+    <DesignRequestBody request={request} words={<UserMessageMarkdown text={request.request} />} />
+  );
+}
+
 /**
  * Copy a deep link to this message (``?message=<id>`` on the session URL).
  * Same confirmation UX as {@link useCopyMessage}.
@@ -1168,6 +1204,9 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
   };
 }
 
+// How a composer reply quote is serialized into the sent text (see serializeReplyDraft).
+const REPLY_QUOTE_PARAGRAPH = /(^|\n\n)> /;
+
 function PendingSendIndicator({ sinceMs }: { sinceMs?: number }) {
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
@@ -1212,8 +1251,22 @@ function UserBubble({
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const isShellCommand = bubble.shellCommand !== undefined;
-  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const published = usePublishedComposerCommands(sessionId);
+  const text =
+    bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  // The backend classifies the raw block, before sender and context wrappers
+  // are stripped for display.
+  const rawText =
+    bubble.content.length === 1 && bubble.content[0]?.type === "input_text"
+      ? bubble.content[0].text
+      : null;
+  // An optimistic `!cmd` has no shellCommand until the terminal mirror lands.
+  const isShellCommand =
+    bubble.shellCommand !== undefined ||
+    (bubble.pending === true &&
+      published?.nativeShell != null &&
+      rawText !== null &&
+      splitNativeShellCommand(rawText, published.nativeShell) !== null);
   const annotation = isShellCommand ? null : parseAnnotationMessage(text);
   const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
   const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
@@ -1249,6 +1302,22 @@ function UserBubble({
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = renderedText.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
+  const visibleText = isCollapsed
+    ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
+    : renderedText;
+  // Another session's message reaches the agent as plain input, and attachments or a reply
+  // quote make a send an ordinary message, so none of these is a command.
+  const command =
+    !isShellCommand &&
+    origin === null &&
+    published &&
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    !REPLY_QUOTE_PARAGRAPH.test(renderedText)
+      ? splitKnownSlashCommand(visibleText, published.commandNames)
+      : null;
+  // Parsed from the rendered text, so its words keep their mention pills.
+  const designRequest = isShellCommand || origin ? null : parseDesignRequest(renderedText);
   if (origin && collapsesOrigin && !originExpanded) {
     return (
       <CollapsedSessionMessage
@@ -1365,6 +1434,7 @@ function UserBubble({
                   />
                 );
               let budget = isCollapsed ? COLLAPSE_THRESHOLD : Number.POSITIVE_INFINITY;
+              let renderedTextBlock = false;
               const blocks = keyedContent.map(({ block, key }) => {
                 if (isTextBlock(block)) {
                   const full = isShellCommand
@@ -1382,17 +1452,26 @@ function UserBubble({
                         <code>{visible}</code>
                       </pre>
                     );
+                  const isFirstTextBlock = !renderedTextBlock;
+                  renderedTextBlock = true;
+                  if (designRequest) {
+                    return isFirstTextBlock ? (
+                      <DesignRequestCard
+                        key={key}
+                        request={
+                          isCollapsed
+                            ? clipDesignRequest(designRequest, COLLAPSE_THRESHOLD)
+                            : designRequest
+                        }
+                      />
+                    ) : null;
+                  }
                   return (
-                    <FilePathAwareMessageResponse
+                    <UserMessageMarkdown
                       key={key}
-                      className="text-message"
-                      breaks
-                      mode="static"
-                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                      renderLocalReviewComment={renderLocalReviewComment}
-                    >
-                      {visible}
-                    </FilePathAwareMessageResponse>
+                      text={visible}
+                      leadingCommand={isFirstTextBlock ? command?.token : undefined}
+                    />
                   );
                 }
                 if (block.type === "input_image") {
@@ -1629,7 +1708,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {

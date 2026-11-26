@@ -1964,7 +1964,7 @@ class _UpgradeSuggestion:
     """A suggested upgrade command for the user's install shape.
 
     :param command: The shell command (or prose) we display in the
-        nag panel, e.g. ``"uv tool upgrade omnigent"`` or
+        nag panel, e.g. ``"uv tool upgrade --reinstall --link-mode copy omnigent"`` or
         ``"reinstall omnigent from your original source"``.
         Always populated.
     :param runnable: ``True`` when ``command`` is a real shell
@@ -2108,7 +2108,7 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                    f"uv tool install {_UV_REINSTALL_PACKAGE} --link-mode copy{_uv_python_pin()} "
                     f"{vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
@@ -2154,12 +2154,16 @@ def _build_upgrade_suggestion(
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                    f"uv tool install {_UV_REINSTALL_PACKAGE} --link-mode copy{_uv_python_pin()} "
                     f"{registry_spec}{pre}"
                 ),
                 runnable=True,
             )
-        return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
+        # Existing uv tools can retain cache hard links across a plain upgrade.
+        return _UpgradeSuggestion(
+            command=f"uv tool upgrade --reinstall --link-mode copy {_DIST_NAME}{pre}",
+            runnable=True,
+        )
     if installer == "pipx":
         if target_version or extras:
             # ``pipx upgrade`` does not accept extras / version specs.
@@ -2285,7 +2289,7 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     ``shell=True``; the command is tokenized with ``shlex.split``.
 
     :param command: Shell-style command line, e.g.
-        ``"uv tool upgrade omnigent"``.
+        ``"uv tool upgrade --reinstall --link-mode copy omnigent"``.
     :param console: Rich console (stderr) used for the surrounding
         "Running:" / failure status lines, kept consistent with the
         panel above.
@@ -2304,17 +2308,24 @@ def _run_upgrade_command(command: str, console: Console) -> int:
 
     try:
         argv = shlex.split(command)
+        is_uv_tool = (
+            len(argv) >= 2 and argv[0].casefold() in ("uv", "uv.exe") and argv[1] == "tool"
+        )
+        env = {**os.environ, "UV_LINK_MODE": "copy"} if is_uv_tool else None
         if IS_WINDOWS:
             from omnigent.host.windows_upgrade import resolve_uv_executable, retained_install
 
             if argv and argv[0].casefold() in ("uv", "uv.exe"):
                 argv[0] = resolve_uv_executable()
-            skip_web_ui = {**os.environ, "OMNIGENT_SKIP_WEB_UI": "true"}
+            skip_web_ui = {
+                **(env if env is not None else os.environ),
+                "OMNIGENT_SKIP_WEB_UI": "true",
+            }
             bundled = _web_ui_bundled()
             if not bundled:
                 console.print("This install has no web UI, so the upgrade does not build one.")
             with retained_install(argv):
-                result = subprocess.run(argv, check=False, env=None if bundled else skip_web_ui)
+                result = subprocess.run(argv, check=False, env=env if bundled else skip_web_ui)
                 if result.returncode and bundled:
                     # A Windows web UI build failure must not block the Host upgrade.
                     console.print(
@@ -2330,7 +2341,7 @@ def _run_upgrade_command(command: str, console: Console) -> int:
                     )
                     raise InstallFailed(1)
         else:
-            result = subprocess.run(argv, check=False)
+            result = subprocess.run(argv, check=False, env=env)
     except InstallFailed as exc:
         return exc.code
     except (OSError, ValueError) as exc:
@@ -2369,7 +2380,7 @@ def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
 
     Convenience wrapper used by ``omni upgrade``: reads the installed
     distribution's metadata and maps it to the installer-appropriate
-    upgrade command (``uv tool upgrade omnigent``, ``pip install -U
+    upgrade command (``uv tool upgrade --reinstall --link-mode copy omnigent``, ``pip install -U
     omnigent``, etc.).
 
     :returns: A :class:`_UpgradeSuggestion`, or ``None`` when the

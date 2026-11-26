@@ -3115,15 +3115,16 @@ def _try_sandbox_pi(
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+    except (OSError, ImportError, NotImplementedError) as exc:
+        logger.warning("Could not apply sandbox for Pi: %s", exc)
+        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+    else:
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
         command = pi_cli_argv(str(executable))
         launcher = create_exec_launcher(command[0], sandbox)
         return SandboxedPiCli(
             launch_path=launcher, sandboxed=True, launcher_args=tuple(command[1:])
         )
-    except (OSError, ImportError, NotImplementedError) as exc:
-        logger.warning("Could not apply sandbox for Pi: %s", exc)
-        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
 
 
 def _resolve_pi_skill_args(

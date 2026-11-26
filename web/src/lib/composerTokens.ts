@@ -1,4 +1,9 @@
 import {
+  composerTargetOf,
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import {
   COMPOSER_ATTACHMENT_PLACEHOLDER,
   composerPartsFromProjection,
   composerPartsToText,
@@ -207,15 +212,21 @@ export function tokenInsertion(
  *  the resulting input event. Otherwise returns the spliced text and caret for
  *  the caller to commit to state and restore in a layout effect. */
 export function applyFieldEdit(
-  field: HTMLTextAreaElement | null,
+  field: ComposerTextTarget | null,
   text: string,
   range: { start: number; end: number },
   insert: string,
 ): { applied: boolean; text: string; caret: number } {
   const nextText = text.slice(0, range.start) + insert + text.slice(range.end);
   const caret = range.start + insert.length;
+  if (field !== null && !isComposerTextarea(field) && field.value === text) {
+    return field.insertText(insert, range.start, range.end)
+      ? { applied: true, text: nextText, caret }
+      : { applied: true, text, caret: field.selectionStart };
+  }
   if (
     field !== null &&
+    isComposerTextarea(field) &&
     field.value === text &&
     !field.disabled &&
     typeof document !== "undefined" &&
@@ -234,7 +245,7 @@ export function applyFieldEdit(
  *  the user has never focused has no meaningful caret, so the tokens go at its
  *  end. `applied` means the DOM edit already happened. */
 export function insertTokenFiles(
-  field: HTMLTextAreaElement | null,
+  field: ComposerTextTarget | null,
   text: string,
   files: readonly File[],
   useSelection: boolean,
@@ -255,7 +266,7 @@ export function insertTokenFiles(
 /** The whole-token delete a collapsed Backspace/Delete should perform at
  *  `caret`, or null when the caret is not at a live token's edge. */
 export function deleteTokenAt(
-  field: HTMLTextAreaElement | null,
+  field: ComposerTextTarget | null,
   text: string,
   caret: number,
   key: "Backspace" | "Delete",
@@ -271,15 +282,15 @@ export function deleteTokenAt(
  *  stable aria-label `ReplyDraftBlocks` gives them. */
 export function focusTokenInComposer(
   token: string,
-  tail: HTMLTextAreaElement | null,
+  tail: ComposerTextTarget | null,
   quotes: readonly { before: string }[],
 ): boolean {
-  const fields: (HTMLTextAreaElement | null)[] = [tail];
+  const fields: (ComposerTextTarget | null)[] = [tail];
   if (typeof document !== "undefined") {
     quotes.forEach((_, index) => {
       fields.push(
-        document.querySelector<HTMLTextAreaElement>(
-          `[aria-label="Reply text before quote ${index + 1}"]`,
+        composerTargetOf(
+          document.querySelector(`[aria-label="Reply text before quote ${index + 1}"]`),
         ),
       );
     });

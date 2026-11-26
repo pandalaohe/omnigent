@@ -22,6 +22,7 @@ const {
 } = require("./agentDeadline");
 const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
+const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 
@@ -756,7 +757,7 @@ function registerBrowserIpc({
     const viewId = g.registry.activeConversationId();
     if (viewId === null) return null;
     try {
-      return g.registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+      return isBrowserViewFocused(g.registry.get(viewId)) ? viewId : null;
     } catch {
       return null;
     }
@@ -1008,6 +1009,8 @@ function registerBrowserIpc({
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
   });
+
+  registerDesignToolsIpc({ ipcMain, gateRegistry });
 
   // ── Design mode (point-and-prompt) ───────────────────────────────────────
   // Enable/disable the in-page picker and signal a submit result back to the

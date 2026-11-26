@@ -59,6 +59,7 @@ import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-quer
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { exportSessionTranscript, retrySession } from "@/lib/sessionsApi";
 import { copyText } from "@/lib/clipboard";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -624,25 +625,29 @@ export function HeaderConversationMenu({
         Rename
       </DropdownMenuItem>
     )),
-    readState.explicitlyUnread || readState.unseen
-      ? menuRow("mark-unread", "Mark as read", () => (
-          <DropdownMenuItem
-            data-testid="header-mark-read-conversation"
-            className={itemClass}
-            onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
-          >
-            <MailOpenIcon className="size-3.5" /> Mark as read
-          </DropdownMenuItem>
-        ))
-      : menuRow("mark-unread", "Mark as unread", () => (
-          <DropdownMenuItem
-            data-testid="header-mark-unread-conversation"
-            className={itemClass}
-            onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-          >
-            <MailIcon className="size-3.5" /> Mark as unread
-          </DropdownMenuItem>
-        )),
+    ...(canFlagUnread(conversation)
+      ? [
+          readState.explicitlyUnread || readState.unseen
+            ? menuRow("mark-unread", "Mark as read", () => (
+                <DropdownMenuItem
+                  data-testid="header-mark-read-conversation"
+                  className={itemClass}
+                  onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
+                >
+                  <MailOpenIcon className="size-3.5" /> Mark as read
+                </DropdownMenuItem>
+              ))
+            : menuRow("mark-unread", "Mark as unread", () => (
+                <DropdownMenuItem
+                  data-testid="header-mark-unread-conversation"
+                  className={itemClass}
+                  onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+                >
+                  <MailIcon className="size-3.5" /> Mark as unread
+                </DropdownMenuItem>
+              )),
+        ]
+      : []),
     ...(surface === "row"
       ? [
           menuRow("copy-session-id", "Copy session ID", () => (

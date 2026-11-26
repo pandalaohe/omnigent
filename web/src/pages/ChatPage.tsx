@@ -18,9 +18,7 @@ import { useSkills } from "@/hooks/useSkills";
 import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import {
   type ForwardedRef,
-  type ChangeEvent,
   type FormEvent,
-  type KeyboardEvent,
   forwardRef,
   memo,
   useCallback,
@@ -49,7 +47,22 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { useComposerMirrorAlignment } from "@/components/composer/MentionTokenOverlay";
+import {
+  nativeShellHarness,
+  ownerOnlyShellHarness,
+  useComposerHighlight,
+  usePublishComposerCommands,
+} from "@/components/composer/composerHighlight";
+import {
+  COMPOSER_TAIL_INPUT_ID,
+  composerTargetElement,
+  isComposerTargetFocused,
+  isComposerTextarea,
+  type ComposerInputEvent,
+  type ComposerKeyboardEvent,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -66,6 +79,7 @@ import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { preserveStreamModelDisplay, streamModelDisplayRevisions } from "@/lib/modelReference";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import {
   serverSwitcherHiddenForSurface,
   useAppShellSidebarOpen,
@@ -99,6 +113,7 @@ import {
   derivePermissionLevel,
   isEditorLevel,
   isOwnerLevel,
+  isPermissionLevelPending,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -127,6 +142,7 @@ import {
   useChatStore,
   chatQueryClient,
 } from "@/store/chatStore";
+import { trackPlanStop } from "@/store/planStops";
 import {
   registerContinuePlan,
   registerSaveWorkflow,
@@ -169,17 +185,10 @@ import {
   harnessSupportsFileMentions,
   type MentionItem,
   mentionMarkerFor,
-  MENTION_MATCH_CAP,
   type MentionState,
-  parseMentionToken,
-  rankMentionEntries,
   recallFileMentions,
 } from "@/lib/composerMentions";
-import {
-  MENTION_SEARCH_DEBOUNCE_MS,
-  useSessionMentionEntries,
-} from "@/hooks/useSessionMentionEntries";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { hasMultipleMembers, parseSessionMembers, type SessionMember } from "@/lib/sessionMembers";
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
@@ -208,7 +217,6 @@ import {
   tokenText,
 } from "@/lib/composerTokens";
 import { composerPartsToText, type ComposerDraftPart } from "@/lib/composerContent";
-import { ComposerTokenBackdrop, hasTint } from "@/components/ComposerTokenBackdrop";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -317,12 +325,6 @@ import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
 import { isQuestionCardScrollHeld } from "@/components/ai-elements/conversation";
-import {
-  useWorkspaceAllFiles,
-  useWorkspaceDirectory,
-  useWorkspaceFileSearch,
-  type WorkspaceFile,
-} from "@/hooks/useWorkspaceChangedFiles";
 import { useComposerVoiceCleanup } from "@/hooks/useComposerVoiceCleanup";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
@@ -454,30 +456,11 @@ const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
-// Leading whitespace + the command token, so the composer overlay can tint
-// just the `/command` or `$skill` and leave args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
-
-/**
- * Split a command or skill draft for the composer highlight overlay. The token
- * is a known `commands` entry's full name (it may contain spaces or punctuation),
- * else the first `/command`-shaped word. Null for prose and paths like `/etc/hosts`.
- */
-export function splitSlashCommand(
-  value: string,
-  commands: Iterable<string> = [],
-): { before: string; token: string; after: string } | null {
-  const token =
-    matchSlashCommandInvocation(value, commands)?.command ??
-    SLASH_COMMAND_SPLIT_RE.exec(value)?.[2];
-  if (token === undefined) return null;
-  const before = /^\s*/.exec(value)?.[0] ?? "";
-  return { before, token, after: value.slice(before.length + token.length) };
+/** The draft's text as sent: a command is trimmed, anything else keeps its leading space. */
+function authoredOutgoingText(fullText: string, trimmed: string): string {
+  return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
 }
 
-// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
-// prefer the last word boundary within 10 chars of the limit so we don't
-// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 /**
  * A sent, queued or failed message as an editable composer draft: generated
  * session markers become tokens again and their tags come back with them.
@@ -531,6 +514,9 @@ function mergeRecalledDraft(
   return { text: serializeReplyDraft(replyDraft), replyDraft, mentions };
 }
 
+// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
+// prefer the last word boundary within 10 chars of the limit so we don't
+// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 function truncateTitle(raw: string, max = 60): string {
   const points = Array.from(raw);
   if (points.length <= max) return raw;
@@ -1090,6 +1076,13 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const permissionPending = isPermissionLevelPending(
+    activeSession,
+    sessionLoading,
+    activeConv,
+    urlConvId,
+    conversationsData !== undefined,
+  );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
   const {
@@ -1388,6 +1381,7 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
+      permissionPending={permissionPending}
       readOnlyReason={readOnlyReason}
       sendDisabledReason={sendDisabledReason}
       effortLevels={effortLevels}
@@ -1407,7 +1401,10 @@ export function ChatPage() {
       }
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
-      showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
+      showClaudeGoalControl={
+        shouldShowPollyClaudeGoalControl(activeSession) ||
+        shouldShowClaudeNativeGoalControl(capabilitySource)
+      }
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
@@ -1560,6 +1557,8 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
+  /** The level is still loading, so `permissionLevel`'s null doesn't mean owner yet. */
+  permissionPending?: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   /** Keeps drafting enabled while temporarily blocking submission. */
@@ -1587,7 +1586,7 @@ interface MainAgentSurfaceProps {
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
-  /** Show Polly's Claude SDK command-backed Goal control. */
+  /** Show the Claude command-backed Goal control (Claude Code native, or Polly on Claude SDK). */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
@@ -1745,6 +1744,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
+  permissionPending,
   readOnlyReason,
   sendDisabledReason,
   effortLevels,
@@ -2128,6 +2128,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             agents={agents}
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
+            permissionPending={permissionPending}
             readOnlyReason={readOnlyReason}
             sendDisabledReason={sendDisabledReason}
             effortLevels={effortLevels}
@@ -2267,6 +2268,8 @@ interface ComposerProps {
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   permissionLevel: number | null;
+  /** The level is still loading, so `permissionLevel`'s null doesn't mean owner yet. */
+  permissionPending?: boolean;
   /**
    * When non-null, the composer is forced read-only and the string is
    * shown as the textarea placeholder. Distinct from
@@ -2307,7 +2310,7 @@ interface ComposerProps {
   runnerOnline?: boolean;
   /** The session is launching or waking its runner or managed sandbox. */
   runnerStarting?: boolean;
-  /** Show Polly's Claude SDK command-backed Goal control. */
+  /** Show the Claude command-backed Goal control (Claude Code native, or Polly on Claude SDK). */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
@@ -2849,6 +2852,7 @@ function ComposerImpl(
     agents,
     selectedAgentId,
     permissionLevel,
+    permissionPending = false,
     readOnlyReason,
     sendDisabledReason = null,
     effortLevels,
@@ -2970,21 +2974,26 @@ function ComposerImpl(
   // submits the form, so it would otherwise bypass the Button entirely.
   const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const tailTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const bindTailTextarea = useCallback((element: HTMLTextAreaElement | null) => {
+  const textareaRef = useRef<ComposerTextTarget | null>(null);
+  const tailTextareaRef = useRef<ComposerTextTarget | null>(null);
+  // Held as state too, so an engine switch that replaces the tail node re-binds its mirror.
+  const [tailTextareaNode, setTailTextareaNode] = useState<ComposerTextTarget | null>(null);
+  const bindTailTextarea = useCallback((element: ComposerTextTarget | null) => {
     tailTextareaRef.current = element;
+    setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  // Highlight overlay mirroring the textarea; scroll-synced so the tinted
-  // `/skill` token stays aligned once the draft grows past the visible rows.
-  const backdropRef = useRef<HTMLDivElement>(null);
   const [tailCaret, setTailCaret] = useState<number | null>(null);
   const [hoveredFileIndex, setHoveredFileIndex] = useState<number | null>(null);
   // Caret a state-spliced insertion could not set in the DOM.
   const pendingCaretRef = useRef<{ fieldId: string | null; caret: number } | null>(null);
   // A never-focused field's selection reads as index 0, not its end.
   const focusedFieldRef = useRef(false);
+  const composerEngine = useRequestedComposerEngine();
+  // An engine switch replaces every input; keep the active one current even without focus.
+  const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
+    textareaRef.current = target;
+  }, []);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3506,9 +3515,6 @@ function ComposerImpl(
   // harness; the file listing itself stays native-only (file mentions keep
   // working exactly where they work today).
   const memberMentionEnabled = multiMemberSession;
-  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
-    enabled: mentionEnabled,
-  });
   const valueRef = useRef(fullText);
   valueRef.current = fullText;
   const replyDraftRef = useRef(storedReplyDraft);
@@ -3716,7 +3722,7 @@ function ComposerImpl(
   // details, and sends the workflow. The "+" menu offers it, and so does the
   // Tasks tab's empty state, which reaches it through the registry below.
   const canStartWorkflow = !isReadOnly && offersWorkflow(skills);
-  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow, includeShared: true });
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [workflowDialogDescription, setWorkflowDialogDescription] = useState("");
   const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
@@ -3821,6 +3827,15 @@ function ComposerImpl(
     [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
+  // Submission lowercases the first word before matching a built-in, so `/Goal` runs too. Not
+  // `/btw` or Codex's `/side`: they go out as typed to case-sensitive handlers.
+  const anyCaseBuiltinNames = useMemo(
+    () =>
+      Object.keys(offeredBuiltinCommands).filter(
+        (name) => name !== "/btw" && !(name === "/side" && usesNativeSideChatFork(sessionHarness)),
+      ),
+    [offeredBuiltinCommands, sessionHarness],
+  );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -3837,15 +3852,10 @@ function ComposerImpl(
     [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
-  // Suggest names until a space starts the arguments; exclude file paths.
-  const trimmedValue = value.trimStart();
-  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
-  // Tint only the command or skill token, leaving arguments in the default color.
-  const composerIsCommand =
-    draft.quotes.length === 0 &&
-    files.length === 0 &&
-    hasCommandPrefix &&
-    splitSlashCommand(value, slashCommandNames) !== null;
+  const nativeShell = permissionPending
+    ? null
+    : nativeShellHarness(sessionHarness, permissionLevel);
+  usePublishComposerCommands(conversationId, slashCommandNames, nativeShell);
 
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
@@ -3860,57 +3870,16 @@ function ComposerImpl(
       setPlanModeBusy(false);
     }
   };
-  // "@"-mention is a drill-down file/folder browser. The token after "@"
-  // doubles as a path: text up to the last "/" is the directory being
-  // browsed; text after it filters that directory's entries. Opening a
-  // folder rewrites the token to "<dir>/" so the menu re-lists it — that
-  // is how nested files are reached (recursion via navigation, mirroring
-  // the terminal's git-tracked walk). At any level the user can attach a
-  // single file or the whole folder.
-  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
-  // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
-  // uses the lazy per-dir hook (disabled — null path — at the root). Both
-  // return files AND directories with a ``type`` discriminator.
-  const mentionDirQuery = useWorkspaceDirectory(
-    conversationId ?? undefined,
-    mentionEnabled && mention && mentionDir ? mentionDir : null,
-  );
-  const mentionSourceEntries: WorkspaceFile[] = mentionDir
-    ? (mentionDirQuery.data ?? [])
-    : (workspaceFilesQuery.data?.data ?? []);
-  // Typing after "@" also searches the server, debounced like the palette.
-  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  // Root-level typing also finds files in unexpanded folders (files only).
-  const mentionFileSearch = useWorkspaceFileSearch(
-    composerSessionId ?? undefined,
-    mentionEnabled && mention && !mentionDir ? debouncedMentionQuery : "",
-  );
-  // Folders first, filtered by the typed segment, capped (see rankMentionEntries),
-  // then deeper search hits the cached listing doesn't already show.
-  const mentionEntries = ((): WorkspaceFile[] => {
-    if (!mentionEnabled || !mention) return [];
-    const listed = rankMentionEntries(mentionSourceEntries, mentionFilter);
-    if (mentionDir || !mentionFilter) return listed;
-    const listedPaths = new Set(listed.map((entry) => entry.path));
-    // The search ran on the debounced text; re-check hits against the live filter.
-    const needle = mentionFilter.toLowerCase();
-    const deeper = rankMentionEntries(
-      (mentionFileSearch.data?.files ?? []).filter(
-        (file) => !listedPaths.has(file.path) && file.path.toLowerCase().includes(needle),
-      ),
-      "",
-    );
-    return [...listed, ...deeper].slice(0, MENTION_MATCH_CAP);
-  })();
-
   // Sessions: this session's subagents, then sidebar-loaded rows, then search hits.
   const { children: childSessions } = useChildSessions(conversationId);
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery: debouncedMentionQuery,
-    currentSessionId: conversationId,
-    subagents: childSessions,
-  });
+  // The "@" menu's rows come from useMentionListings, shared with the grid cell composer.
+  const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
+    useMentionListings({
+      conversationId,
+      enabled: mentionEnabled,
+      mention,
+      subagents: childSessions,
+    });
   // Member rows lead the "@" menu in a 2+ member session, sharing the typed
   // filter with the file rows (roles are matched the same way) — but only
   // while the token is root-level. Once it carries a directory path ("@src/")
@@ -3920,21 +3889,9 @@ function ComposerImpl(
     memberMentionEnabled && mention && !mention.query.includes("/")
       ? filterMemberMentions(sessionMembers, mentionFilter)
       : [];
-  // True while a mention token is active but its listing hasn't resolved yet:
-  // the cold-boot root fetch, or a sub-directory's first load after drilling
-  // in. During this window ``mentionEntries`` is transiently empty (so the
-  // menu is closed), and a stray Enter must NOT fall through to ``submit`` and
-  // send the half-typed "@dir/" token as a chat message. A *settled*
-  // zero-match (e.g. "@notafile") is deliberately excluded — sending that
-  // literally is the user's intent.
-  const mentionListingPending =
-    mentionEnabled &&
-    mention != null &&
-    (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
 
-  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
-  // state and the data source above stay here; everything stateful is shared
-  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // Shared selection/chip/keyboard glue (see useMentionBrowser); the token state stays here.
+  // Sharing keeps this composer and the launcher from drifting. ``setText`` also flags the
   // draft dirty so attach/drill participate in draft persistence.
   const {
     mentionIndex,
@@ -3970,15 +3927,46 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   // Tagged items whose token is still in the draft; deleting a token untags it.
-  const liveMentions = presentMentions(
-    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
-    [draft.text, ...draft.quotes.map((quote) => quote.before)],
+  const liveMentions = useMemo(
+    () =>
+      presentMentions(composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness), [
+        draft.text,
+        ...draft.quotes.map((quote) => quote.before),
+      ]),
+    [mentionedItems, mentionedSessions, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
-  // One mirror paints both the slash-command tint and inline mention pills.
-  const mentionTokensShown =
-    draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
-  const backdropActive = composerIsCommand || mentionTokensShown || hasTint(draft.text, files);
+  const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
+  // Review comments are appended at send, which can make a bare `!` a command.
+  const outgoingClassifyText = useMemo(
+    () =>
+      buildOutgoingMessage(
+        draft,
+        authoredOutgoingText(fullText, fullText.trim()),
+        { mentions: liveMentions, reviewComments: localReviewComments },
+        files,
+      ).text,
+    [draft, fullText, liveMentions, localReviewComments, files],
+  );
+  const activeTokenIndex = tailCaret === null ? null : tokenAt(draft.text, tailCaret, files);
+  const highlight = useComposerHighlight({
+    value: draft.text,
+    commandNames: slashCommandNames,
+    anyCaseCommandNames: anyCaseBuiltinNames,
+    enabled: draft.quotes.length === 0 && files.length === 0,
+    // Files go out as separate blocks, so the message is no longer a lone `!` text.
+    shellEnabled: files.length === 0,
+    nativeShell,
+    refusedNativeShell: permissionPending
+      ? null
+      : ownerOnlyShellHarness(sessionHarness, permissionLevel),
+    classifyValue: outgoingClassifyText,
+    mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
+    attachments: { files, activeIndex: hoveredFileIndex ?? activeTokenIndex },
+    textareaRef: tailTextareaRef,
+    textareaNode: tailTextareaNode,
+    sendContext: { ...sendContext, quotes: draft.quotes },
+  });
   const hasDraft =
     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
@@ -4614,7 +4602,6 @@ function ComposerImpl(
     onGrowthRef.current?.();
   }, []);
   useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
-  useComposerMirrorAlignment(backdropRef, tailTextareaRef, backdropActive);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -4743,8 +4730,8 @@ function ComposerImpl(
     if (!textarea) return;
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
     textarea.setSelectionRange(0, 0);
-    if (textarea.parentElement)
-      textarea.parentElement.scrollTop = textarea.parentElement.scrollHeight;
+    const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
+    if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
   });
 
@@ -4796,10 +4783,10 @@ function ComposerImpl(
     if (resetNativeInputSession && textarea !== null) {
       // End the emptied text-input session so native keyboards drop predictions.
       textarea.focus({ preventScroll: true });
-      textarea.value = "";
+      if (isComposerTextarea(textarea)) textarea.value = "";
       textarea.setSelectionRange(0, 0);
       textarea.blur();
-    } else if (textarea === document.activeElement) {
+    } else if (textarea !== null && isComposerTargetFocused(textarea)) {
       tailTextareaRef.current?.focus({ preventScroll: true });
     }
     replaceText("");
@@ -4820,13 +4807,16 @@ function ComposerImpl(
       hasPendingElicitation
     )
       return;
+    if (highlight.refusal !== null) {
+      setCommandError(highlight.refusal);
+      return;
+    }
 
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
     const parts = trimmed.split(/\s+/);
     const cmd = parts[0].toLowerCase();
-    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
     const opensGenericSideChat =
       cmd === "/side" &&
       !usesNativeSideChatFork(sessionHarness) &&
@@ -4976,7 +4966,7 @@ function ComposerImpl(
     // one tool hint at the end.
     const outgoing = buildOutgoingMessage(
       draft,
-      goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd()),
+      goalMessage ?? authoredOutgoingText(fullText, trimmed),
       sendContext,
       files,
     );
@@ -5044,16 +5034,20 @@ function ComposerImpl(
     const reason = blockedReasonFor("stop the workflow");
     if (reason) toast.error(reason);
     else if (conversationId) {
+      const sessionId = conversationId;
       const message = stopPlanMessage(null);
       appendEntry(message);
       // Stop must reach the coordinator even while ordinary follow-ups are queued.
-      void sendUserMessage(conversationId, message)
-        .then((result) => {
-          if (result.denied) toast.error("A policy blocked the message.");
-        })
-        .catch((error: unknown) => {
+      void trackPlanStop(sessionId, async () => {
+        try {
+          const result = await sendUserMessage(sessionId, message);
+          if (!result.denied) return result;
+          toast.error("A policy blocked the message.");
+        } catch (error) {
           toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
-        });
+        }
+        return null;
+      });
     }
   };
 
@@ -5079,7 +5073,7 @@ function ComposerImpl(
   };
 
   const applyRecall = (
-    ta: HTMLTextAreaElement,
+    ta: ComposerTextTarget,
     recalled: ComposerDraft,
     // A queued row keeps its parts; a prompt-history entry has none.
     parts: readonly ComposerDraftPart[] = [],
@@ -5112,7 +5106,7 @@ function ComposerImpl(
       : undefined;
 
   const handleKeyDown = (
-    e: KeyboardEvent<HTMLTextAreaElement>,
+    e: ComposerKeyboardEvent,
     {
       shouldSubmitFromKeyboard,
       shouldPreferSendOverCompletion,
@@ -5245,18 +5239,19 @@ function ComposerImpl(
     }
   };
 
-  const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+  const handleTextChange = (id: string | null, e: ComposerInputEvent) => {
     voiceCleanup.invalidate();
-    slashCompletion.onSelectionChange(e.target);
-    editText(id, e.target.value);
+    const input = e.currentTarget;
+    slashCompletion.onSelectionChange(input);
+    editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
     // Sessions are taggable in every harness; files only in native ones.
     setMention(
       detectMentionAt(
-        e.target.value,
-        e.target.selectionStart ?? e.target.value.length,
+        input.value,
+        input.selectionStart ?? input.value.length,
         sessionEntries.map((session) => session.title),
       ),
     );
@@ -5264,15 +5259,12 @@ function ComposerImpl(
     resetCursor();
   };
 
-  const handleTextFocus = (id: string | null, element: HTMLTextAreaElement) => {
+  const handleTextFocus = (id: string | null, element: ComposerTextTarget) => {
     textareaRef.current = element;
     focusedFieldRef.current = true;
     focusText(id);
     dictation.noteFocus();
   };
-
-  const activeTokenIndex = tailCaret === null ? null : tokenAt(draft.text, tailCaret, files);
-  const commandToken = splitSlashCommand(draft.text, slashCommandNames)?.token ?? null;
 
   const focusToken = (index: number) => {
     const label = files[index] ? labelOf(files[index]!) : undefined;
@@ -5317,6 +5309,8 @@ function ComposerImpl(
             the header clearance down into a blank band, and here the overlays
             anchored to this form (background-task pill) float above it. */}
         <RunnerLogRunawayBanner labels={runnerLogLabels} fallbackLabels={runnerLogFallbackLabels} />
+        {/* Design tool requests still on their way to this session. */}
+        <DesignOutboxStrip conversationId={conversationId} widthClassName="mx-3 w-auto" />
         {/* Queued messages — peeks above the workspace bar like the
             sub-agent tray. Lists follow-ups held while the agent is busy;
             drains FIFO on idle. Scope to this conversation so a queue held
@@ -5470,11 +5464,21 @@ function ComposerImpl(
           "mx-auto",
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
+          highlight.cardClassName,
         )}
         data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
+        engine={composerEngine}
+        dictating={dictation.hasInterim}
+        draftKey={conversationId ?? null}
+        activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
+        onActiveInputChange={rebindActiveInput}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
+          // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
+          commandToken: highlight.input.commandToken,
+          textHighlights: highlight.input.textHighlights,
+          mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
           onChange: (e) => handleTextChange(null, e),
           onSelect: (e) => {
             slashCompletion.onSelectionChange(e.currentTarget);
@@ -5491,7 +5495,9 @@ function ComposerImpl(
             dismissMention();
           },
           onPaste,
+          onScroll: highlight.input.onScroll,
           "aria-label": "Message the agent",
+          "aria-describedby": highlight.input["aria-describedby"],
           "aria-keyshortcuts": nextFromSelected === null ? undefined : permissionCycleShortcut.aria,
           // Phones have no Esc key, so their placeholders drop the key hints.
           placeholder: composerLockedByBtw
@@ -5518,13 +5524,14 @@ function ComposerImpl(
                             : "Send a message… — @role hands a part to a member"
                           : readyPlaceholder,
           rows: 1,
+          heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
           disabled: inputDisabled,
-          "data-slash-command": composerIsCommand ? "true" : undefined,
+          "data-slash-command": highlight.input["data-slash-command"],
+          "data-shell-command": highlight.input["data-shell-command"],
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
             draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
-            // The overlay paints the glyphs; the caret stays visible.
-            backdropActive && "text-transparent caret-foreground",
+            highlight.input.className,
           ),
         }}
         slots={{
@@ -5663,16 +5670,8 @@ function ComposerImpl(
               )}
             </>
           ),
-          inputBackdrop: backdropActive ? (
-            <ComposerTokenBackdrop
-              ref={backdropRef}
-              value={draft.text}
-              mentionTokens={mentionTokens}
-              files={files}
-              command={commandToken}
-              activeIndex={hoveredFileIndex ?? activeTokenIndex}
-            />
-          ) : undefined,
+          inputBackdrop: highlight.backdrop,
+          inputHint: highlight.hint,
           attachments: (
             <>
               {/* Pending attachments — image thumbnails (click to view) + file rows. */}
@@ -6361,6 +6360,13 @@ export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
+}
+
+/** True for Claude Code native sessions; the composer sends Claude Code's built-in `/goal`. */
+export function shouldShowClaudeNativeGoalControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
 }
 
 /** True for top-level Polly sessions running on the Claude SDK harness. */

@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
-from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, pinned_label_key
+from omnigent.stores.conversation_store import (
+    ARTIFACT_LINK_KEY_LABEL,
+    muted_label_key,
+    pinned_label_key,
+)
 
 
 def test_collapses_per_repo_labels_to_the_bare_space_joined_key() -> None:
@@ -63,3 +67,11 @@ def test_drops_the_artifact_link_secret() -> None:
 
     assert ARTIFACT_LINK_KEY_LABEL not in viewer
     assert viewer == {"kept": "yes"}
+
+
+def test_collapses_the_mute_family_to_the_viewers_own_mute() -> None:
+    """Only this viewer's mute surfaces, as the bare key; another user's never leaks."""
+    labels = {muted_label_key("bob@example.com"): "1"}
+    assert _labels_for_viewer(labels, "alice@example.com") == {}
+    labels[muted_label_key("alice@example.com")] = "1"
+    assert _labels_for_viewer(labels, "alice@example.com") == {"omnigent.muted": "1"}
