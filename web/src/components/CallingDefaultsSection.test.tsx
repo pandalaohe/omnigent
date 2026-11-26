@@ -247,6 +247,7 @@ describe("CallingDefaultsSection", () => {
     ];
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    showUnconfigured();
     expect(screen.queryByRole("link", { name: "claude-native-ui details" })).toBeNull();
     expect(screen.queryByRole("link", { name: "claude-native-ui (fork a1b2) details" })).toBeNull();
     expect(screen.queryByRole("link", { name: "hermes-fn details" })).toBeNull();
@@ -312,6 +313,7 @@ describe("CallingDefaultsSection", () => {
     ]);
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    showUnconfigured();
     const detailLinks = screen
       .getAllByRole("link", { name: /details$/ })
       .map((link) => link.getAttribute("aria-label"));
