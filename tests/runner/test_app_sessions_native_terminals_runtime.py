@@ -1327,7 +1327,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            patched_external_ids.append(json["external_session_id"])
+            if "external_session_id" in json:
+                patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:
@@ -1652,7 +1653,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             del timeout
             assert url == f"/v1/sessions/{session_id}"
             assert params == {"include_usage": "false"}
-            patched_external_ids.append(json["external_session_id"])
+            if "external_session_id" in json:
+                patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeCodexAppServer:
