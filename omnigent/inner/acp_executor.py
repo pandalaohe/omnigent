@@ -456,6 +456,26 @@ def _prompt_response_error_message(response: object) -> str | None:
     return None
 
 
+_UNSET_PROMPT_ID: Any = object()
+
+
+def _prompt_fut_is_terminal_abort(fut: asyncio.Future[_AcpJsonObject] | None) -> bool:
+    """Return True when a resolved prompt future ended in error or non-end_turn stop."""
+    if fut is None or not fut.done():
+        return False
+    if fut.cancelled():
+        return True
+    try:
+        response = fut.result()
+    except Exception:  # noqa: BLE001
+        return True
+    if _prompt_response_error_message(response) is not None:
+        return True
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+    return stop_reason != "end_turn"
+
+
 class _AgyBackgroundWork:
     """Track Antigravity non-daemon tools and subagents that outlive ``session/prompt``."""
 
@@ -1612,6 +1632,8 @@ class AcpExecutor(Executor):
             self._cleanup_agy_runtime_temp_dir()
             self._close_workspace_fd()
             raise
+        if IS_WINDOWS and isinstance(self._proc.pid, int):
+            _proc.refresh_process_tree(self._proc)
         self._stdout_eof_event = _AsyncioEvent()
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -1636,6 +1658,8 @@ class AcpExecutor(Executor):
     def _turn_accepts_permissions(self) -> bool:
         if self._turn_cancel_event is not None and self._turn_cancel_event.is_set():
             return False
+        if self._cancel_grace_deadline is not None:
+            return False
         if self._is_stdout_closed():
             return False
         if self._active_prompt_request_id is not None:
@@ -1648,6 +1672,8 @@ class AcpExecutor(Executor):
 
     @property
     def _active_turn_prompt_id(self) -> int | None:
+        if self._cancel_grace_deadline is not None:
+            return None
         if self._active_prompt_request_id is not None:
             return self._active_prompt_request_id
         if self._post_prompt_wait_active and self._turn_accepts_permissions:
@@ -1660,9 +1686,10 @@ class AcpExecutor(Executor):
         *,
         deadline: float | None,
         cancel_event: asyncio.Event,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
         phase2: bool = True,
     ) -> bool:
-        """Run an agent request bounded by active background-wait deadline, cancel, and EOF."""
+        """Run an agent request bounded by turn lifetime, deadline, cancel, and EOF."""
         req_task: asyncio.Task[None] = asyncio.create_task(
             self._respond_to_agent_request(notification)
         )
@@ -1671,9 +1698,23 @@ class AcpExecutor(Executor):
                 effective_deadline = (
                     deadline if deadline is not None else self._post_prompt_deadline
                 )
-                enforce_bounds = phase2 or effective_deadline is not None
-                if enforce_bounds and (cancel_event.is_set() or self._is_stdout_closed()):
+                if (
+                    cancel_event.is_set()
+                    or self._cancel_grace_deadline is not None
+                    or self._is_stdout_closed()
+                ):
                     break
+                if not phase2 and prompt_fut is not None and prompt_fut.done():
+                    if _prompt_fut_is_terminal_abort(prompt_fut):
+                        break
+                    # When the reader already observed end_turn without entering Phase 2,
+                    # the turn is over and cannot transition; direct-queue unit tests leave
+                    # _active_prompt_request_id set and continue draining the queued request.
+                    if (
+                        not self._post_prompt_wait_active
+                        and self._active_prompt_request_id is None
+                    ):
+                        break
                 remaining = self._poll_interval_s
                 if effective_deadline is not None:
                     remaining = effective_deadline - self._now()
@@ -1681,14 +1722,15 @@ class AcpExecutor(Executor):
                         break
                 waiters: set[asyncio.Future[Any]] = {req_task}
                 extra_tasks: list[asyncio.Task[bool]] = []
-                if enforce_bounds:
-                    c_task = asyncio.create_task(cancel_event.wait())
-                    waiters.add(c_task)
-                    extra_tasks.append(c_task)
-                    if self._stdout_eof_event is not None:
-                        e_task = asyncio.create_task(self._stdout_eof_event.wait())
-                        waiters.add(e_task)
-                        extra_tasks.append(e_task)
+                c_task = asyncio.create_task(cancel_event.wait())
+                waiters.add(c_task)
+                extra_tasks.append(c_task)
+                if self._stdout_eof_event is not None:
+                    e_task = asyncio.create_task(self._stdout_eof_event.wait())
+                    waiters.add(e_task)
+                    extra_tasks.append(e_task)
+                if not phase2 and prompt_fut is not None and not prompt_fut.done():
+                    waiters.add(prompt_fut)
                 if self._turn_wake_event is not None:
                     self._turn_wake_event.clear()
                     w_task = asyncio.create_task(self._turn_wake_event.wait())
@@ -3696,7 +3738,11 @@ class AcpExecutor(Executor):
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(
-        self, update: _AcpJsonObject, *, update_session_id: object = None
+        self,
+        update: _AcpJsonObject,
+        *,
+        update_session_id: object = None,
+        turn_prompt_id: Any = _UNSET_PROMPT_ID,
     ) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
@@ -3765,7 +3811,11 @@ class AcpExecutor(Executor):
                 # Keep raw title/input for unmanaged _extract_tool_call policy fallback.
                 self._tool_names[call_id] = str(raw_title_name)
                 self._tool_inputs[call_id] = args
-                active_prompt_id = self._active_turn_prompt_id
+                active_prompt_id = (
+                    self._active_turn_prompt_id
+                    if turn_prompt_id is _UNSET_PROMPT_ID
+                    else turn_prompt_id
+                )
                 same_session = (
                     self._session_id is None
                     and active_prompt_id is None
@@ -3832,7 +3882,11 @@ class AcpExecutor(Executor):
                             )
                         if eligible:
                             if self._policy_evaluator is None:
-                                active_prompt_id = self._active_turn_prompt_id
+                                active_prompt_id = (
+                                    self._active_turn_prompt_id
+                                    if turn_prompt_id is _UNSET_PROMPT_ID
+                                    else turn_prompt_id
+                                )
                                 direct_bound = (
                                     self._session_id is None
                                     and active_prompt_id is None
@@ -3935,19 +3989,165 @@ class AcpExecutor(Executor):
             )
         return True
 
+    def _can_backfill_read(
+        self,
+        *,
+        expected_session_id: str,
+        update_session_id: object,
+        active_prompt_id: int | None,
+        explicit_prompt_binding: bool,
+        phase2: bool,
+        deadline: float | None,
+        cancel_event: asyncio.Event | None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None,
+    ) -> bool:
+        if update_session_id != expected_session_id or self._session_id != expected_session_id:
+            return False
+        if active_prompt_id is None:
+            return False
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if self._turn_cancel_event is not None and self._turn_cancel_event.is_set():
+            return False
+        if self._cancel_grace_deadline is not None:
+            return False
+        if explicit_prompt_binding and self._turn_prompt_id != active_prompt_id:
+            return False
+        effective_deadline = deadline if deadline is not None else self._post_prompt_deadline
+        if effective_deadline is not None and self._now() >= effective_deadline:
+            return False
+        if phase2:
+            return self._turn_accepts_permissions
+        if not explicit_prompt_binding and self._active_turn_prompt_id != active_prompt_id:
+            return False
+        if _prompt_fut_is_terminal_abort(prompt_fut):
+            return False
+        return True
+
+    async def _await_bounded_backfill_policy(
+        self,
+        call_id: str,
+        raw_name: str,
+        spec: _AgyReadSpec,
+        *,
+        expected_session_id: str,
+        update_session_id: object,
+        active_prompt_id: int,
+        explicit_prompt_binding: bool,
+        deadline: float | None,
+        cancel_event: asyncio.Event | None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None,
+        phase2: bool,
+    ) -> bool:
+        """Bound a backfill policy check by turn lifetime, cancel, EOF, and Phase 2 deadline."""
+        check_task: asyncio.Task[bool] = asyncio.create_task(
+            self._is_agy_read_backfill_allowed(call_id, raw_name, spec)
+        )
+        try:
+            while not check_task.done():
+                if not self._can_backfill_read(
+                    expected_session_id=expected_session_id,
+                    update_session_id=update_session_id,
+                    active_prompt_id=active_prompt_id,
+                    explicit_prompt_binding=explicit_prompt_binding,
+                    phase2=phase2,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    prompt_fut=prompt_fut,
+                ):
+                    break
+                if self._is_stdout_closed() and (
+                    phase2 or prompt_fut is None or not prompt_fut.done()
+                ):
+                    break
+                effective_deadline = (
+                    deadline if deadline is not None else self._post_prompt_deadline
+                )
+                remaining = self._poll_interval_s
+                if effective_deadline is not None:
+                    remaining = effective_deadline - self._now()
+                    if remaining <= 0:
+                        break
+                waiters: set[asyncio.Future[Any]] = {check_task}
+                extra_tasks: list[asyncio.Task[bool]] = []
+                if cancel_event is not None:
+                    c_task = asyncio.create_task(cancel_event.wait())
+                    waiters.add(c_task)
+                    extra_tasks.append(c_task)
+                if (
+                    self._turn_cancel_event is not None
+                    and self._turn_cancel_event is not cancel_event
+                ):
+                    tc_task = asyncio.create_task(self._turn_cancel_event.wait())
+                    waiters.add(tc_task)
+                    extra_tasks.append(tc_task)
+                if self._stdout_eof_event is not None and (
+                    phase2 or prompt_fut is None or not prompt_fut.done()
+                ):
+                    e_task = asyncio.create_task(self._stdout_eof_event.wait())
+                    waiters.add(e_task)
+                    extra_tasks.append(e_task)
+                if not phase2 and prompt_fut is not None and not prompt_fut.done():
+                    waiters.add(prompt_fut)
+                if self._turn_wake_event is not None:
+                    self._turn_wake_event.clear()
+                    w_task = asyncio.create_task(self._turn_wake_event.wait())
+                    waiters.add(w_task)
+                    extra_tasks.append(w_task)
+                try:
+                    await asyncio.wait(
+                        waiters,
+                        timeout=max(0.0, min(remaining, self._poll_interval_s)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in extra_tasks:
+                        if not task.done():
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
+            if check_task.done():
+                return await check_task
+            check_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await check_task
+            return False
+        except BaseException:
+            if not check_task.done():
+                check_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await check_task
+            raise
+
     async def _resolve_agy_read_backfills(
         self,
         expected_session_id: str,
         update_session_id: object,
         events: list[ExecutorEvent],
+        *,
+        turn_prompt_id: Any = _UNSET_PROMPT_ID,
+        deadline: float | None = None,
+        cancel_event: asyncio.Event | None = None,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
+        phase2: bool = False,
     ) -> None:
         """Resolve queued AG read_file backfills asynchronously with policy authorization."""
         pending = dict(self._pending_read_backfills)
         self._pending_read_backfills.clear()
-        if update_session_id != expected_session_id:
-            return
-        active_prompt_id = self._active_turn_prompt_id
-        if active_prompt_id is None:
+        explicit_prompt_binding = turn_prompt_id is not _UNSET_PROMPT_ID
+        active_prompt_id: int | None = (
+            turn_prompt_id if explicit_prompt_binding else self._active_turn_prompt_id
+        )
+        if active_prompt_id is None or not self._can_backfill_read(
+            expected_session_id=expected_session_id,
+            update_session_id=update_session_id,
+            active_prompt_id=active_prompt_id,
+            explicit_prompt_binding=explicit_prompt_binding,
+            phase2=phase2,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            prompt_fut=prompt_fut,
+        ):
             return
         for idx, event in enumerate(events):
             if not isinstance(event, ToolCallComplete):
@@ -3972,8 +4172,29 @@ class AcpExecutor(Executor):
             spec = _extract_agy_read_spec(raw_args, locations)
             if spec is None:
                 continue
-            if not already_authorized and not await self._is_agy_read_backfill_allowed(
-                call_id, raw_name, spec
+            if not already_authorized and not await self._await_bounded_backfill_policy(
+                call_id,
+                raw_name,
+                spec,
+                expected_session_id=expected_session_id,
+                update_session_id=update_session_id,
+                active_prompt_id=active_prompt_id,
+                explicit_prompt_binding=explicit_prompt_binding,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                prompt_fut=prompt_fut,
+                phase2=phase2,
+            ):
+                continue
+            if call_id in self._denied_permission_calls or not self._can_backfill_read(
+                expected_session_id=expected_session_id,
+                update_session_id=update_session_id,
+                active_prompt_id=active_prompt_id,
+                explicit_prompt_binding=explicit_prompt_binding,
+                phase2=phase2,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                prompt_fut=prompt_fut,
             ):
                 continue
             backfilled = _read_agy_file_body(
@@ -4780,8 +5001,6 @@ class AcpExecutor(Executor):
             prompt_result: _AcpJsonObject | None = None
             bg_deadline: float | None = None
             settle_deadline: float | None = None
-            post_work_reply_seen = False
-            reply_closed = False
             prompt_marker_seen = False
             prompt_wait_declined = False
 
@@ -4835,8 +5054,6 @@ class AcpExecutor(Executor):
                         self._post_prompt_wait_active = True
                         _notify_turn_progress()
                         settle_deadline = None
-                        post_work_reply_seen = False
-                        reply_closed = False
                         continue
                     self._post_prompt_wait_active = False
                     self._post_prompt_deadline = None
@@ -4885,8 +5102,6 @@ class AcpExecutor(Executor):
                         break
                     if self._queue.empty():
                         if not live:
-                            if reply_closed:
-                                break
                             if settle_deadline is None:
                                 settle_deadline = min(
                                     bg_deadline if bg_deadline is not None else now,
@@ -4998,12 +5213,33 @@ class AcpExecutor(Executor):
                                 else:
                                     running_tool_deadlines[sub_key] = self._now() + tool_window
                                     _notify_turn_progress()
+                        in_phase2 = prompt_result is not None
+                        if in_phase2:
+                            wire_prompt_id = req_id if self._turn_accepts_permissions else None
+                        elif (
+                            not prompt_wait_declined
+                            and not cancel_event.is_set()
+                            and self._cancel_grace_deadline is None
+                            and not _prompt_fut_is_terminal_abort(fut)
+                        ):
+                            wire_prompt_id = req_id
+                        else:
+                            wire_prompt_id = None
                         events = self._handle_session_update(
-                            update, update_session_id=notif_session_id
+                            update,
+                            update_session_id=notif_session_id,
+                            turn_prompt_id=wire_prompt_id,
                         )
                         if self._pending_read_backfills:
                             await self._resolve_agy_read_backfills(
-                                session_id, notif_session_id, events
+                                session_id,
+                                notif_session_id,
+                                events,
+                                turn_prompt_id=wire_prompt_id,
+                                deadline=bg_deadline,
+                                cancel_event=cancel_event,
+                                prompt_fut=fut,
+                                phase2=in_phase2,
                             )
                         for event in events:
                             if isinstance(event, TextChunk):
@@ -5012,22 +5248,14 @@ class AcpExecutor(Executor):
                         if prompt_result is not None:
                             if bg_work is not None and bg_work.has_live():
                                 settle_deadline = None
-                                post_work_reply_seen = False
-                                reply_closed = False
-                            elif update_type in (
-                                _UPDATE_AGENT_MESSAGE_CHUNK,
-                                _UPDATE_AGENT_THOUGHT_CHUNK,
-                            ):
-                                post_work_reply_seen = True
-                                reply_closed = False
-                                now = self._now()
-                                settle_deadline = min(
-                                    bg_deadline if bg_deadline is not None else now,
-                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                            elif (
+                                update_type
+                                in (
+                                    _UPDATE_AGENT_MESSAGE_CHUNK,
+                                    _UPDATE_AGENT_THOUGHT_CHUNK,
                                 )
-                            elif update_type == _UPDATE_USAGE and post_work_reply_seen:
-                                reply_closed = True
-                            elif settle_deadline is not None:
+                                or settle_deadline is not None
+                            ):
                                 now = self._now()
                                 settle_deadline = min(
                                     bg_deadline if bg_deadline is not None else now,
@@ -5035,11 +5263,12 @@ class AcpExecutor(Executor):
                                 )
                 elif notification.get("id") is not None and notification.get("method"):
                     # Server-initiated request (session/request_permission / fs/*):
-                    # routes through policy + elicitation. Bounded once post-prompt wait starts.
+                    # routes through policy + elicitation, bounded by turn lifetime.
                     completed = await self._run_bounded_agent_request(
                         notification,
                         deadline=bg_deadline,
                         cancel_event=cancel_event,
+                        prompt_fut=fut,
                         phase2=prompt_result is not None,
                     )
                     if not completed:
@@ -5079,7 +5308,7 @@ class AcpExecutor(Executor):
                 )
             yield TurnComplete(response="".join(accumulated_text), usage=usage)
         finally:
-            if self._active_prompt_request_id == req_id:
+            if self._active_prompt_request_id == req_id and self._cancel_grace_deadline is None:
                 self._active_prompt_request_id = None
             if self._turn_prompt_id == req_id:
                 self._turn_prompt_id = None
@@ -5184,17 +5413,46 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._os_environment.close()
             self._os_environment = None
-        if self._proc:
+        proc = self._proc
+        if proc is not None:
             with contextlib.suppress(Exception):
-                self._proc.stdin.close()  # type: ignore[union-attr]
+                proc.stdin.close()  # type: ignore[union-attr]
+            reap_task: asyncio.Task[None] | None = None
+
+            async def _reap_windows_once() -> None:
+                nonlocal reap_task
+                if reap_task is None:
+                    reap_task = asyncio.create_task(asyncio.to_thread(_proc.kill_tree, proc))
+                await asyncio.shield(reap_task)
+
             try:
-                # Tree-aware: the handle is the sandbox launcher, not the
-                # agent it forked. A bare terminate() orphans the agent.
-                _proc.terminate_tree(self._proc)
-                await asyncio.wait_for(self._proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS)
-            except Exception:  # noqa: BLE001
-                with contextlib.suppress(Exception):
-                    _proc.kill_tree(self._proc)
+                if proc.returncode is None:
+                    try:
+                        # Tree-aware: the handle is the sandbox launcher, not the
+                        # agent it forked. A bare terminate() orphans the agent.
+                        _proc.terminate_tree(proc)
+                        await asyncio.wait_for(
+                            proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS
+                        )
+                        if IS_WINDOWS:
+                            await _reap_windows_once()
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(BaseException):
+                            if IS_WINDOWS:
+                                await _reap_windows_once()
+                            else:
+                                _proc.kill_tree(proc)
+                        raise
+                    except Exception:  # noqa: BLE001
+                        with contextlib.suppress(Exception):
+                            if IS_WINDOWS:
+                                await _reap_windows_once()
+                            else:
+                                _proc.kill_tree(proc)
+                elif IS_WINDOWS and _proc.has_unresolved_identities(proc):
+                    with contextlib.suppress(Exception):
+                        await _reap_windows_once()
             finally:
-                self._proc = None
+                if not (IS_WINDOWS and _proc.has_unresolved_identities(proc)):
+                    self._proc = None
         self._cleanup_agy_runtime_temp_dir()
