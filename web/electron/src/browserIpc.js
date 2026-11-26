@@ -12,6 +12,15 @@ const { captureCredentialSafePage } = require("./browserCredentialWatch");
 const { buildBrowserActionScriptForExecution } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
+const { agentInputInFlight, watchDocumentChange } = require("./browserInput");
+const { checkAgentPage, performAgentBrowserAction, viewTitle } = require("./agentBrowserActions");
+const {
+  beforeAgentDeadline,
+  PAGE_TIMEOUT_ERROR,
+  pastAgentDeadline,
+  takeAgentDeadline,
+} = require("./agentDeadline");
+const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
@@ -332,12 +341,24 @@ function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestur
  * fresh stamp proves genuine interaction — the gesture gate the console handler
  * requires before honoring a submit marker.
  *
+ * Agent actions send input through the DevTools protocol, which fires
+ * input-event too. Input while `isAgentInput()` holds is the agent's, not
+ * the user's: it never stamps, and it voids an earlier stamp so a submit the
+ * agent's input set off can't ride the user's last click.
+ *
  * @param {{ lastGestureAt: number }} gestureState
+ * @param {() => boolean} [isAgentInput]
  * @returns {(event: unknown, input: { type?: string }) => void}
  */
-function makeDesignModeInputHandler(gestureState) {
+function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
   return (_event, input) => {
     const type = input && input.type;
+    // Any input of the agent's voids the stamp, a mouse move included: the
+    // page's handler for it could otherwise submit on the user's last click.
+    if (isAgentInput()) {
+      gestureState.lastGestureAt = 0;
+      return;
+    }
     // mouseDown = click-to-select; keyDown = Enter-to-submit; rawKeyDown = pre-IME.
     if (type === "mouseDown" || type === "keyDown" || type === "rawKeyDown") {
       gestureState.lastGestureAt = Date.now();
@@ -363,6 +384,9 @@ function makeDesignModeInputHandler(gestureState) {
  *        it in the allowlist.
  * @param {(event: Electron.IpcMainInvokeEvent) => (object | null)} [deps.getWindowForEvent]
  *        The shell window that owns the sender, used to parent native dialogs.
+ * @param {(event: Electron.IpcMainInvokeEvent) => boolean} [deps.showsServerForEvent]
+ *        Whether the sender's window still shows its server's page. Pushes to a
+ *        window that navigated to a foreign page are dropped at send time.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -373,8 +397,14 @@ function registerBrowserIpc({
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
   confirmAgentNavigation = async () => null,
+  // The window with a tab's one page (browserTabs.js).
+  routeViewForEvent = () => null,
+  whileOpeningView = (handler) => handler, // the page's window while it opens
+  refuseCloseForEvent = (_event, args) =>
+    pastAgentDeadline(args) ? { ok: false, removed: false, expired: true } : null,
   // Injected so native dialogs can be parented to the sender's window.
   getWindowForEvent = () => null,
+  showsServerForEvent = () => true,
   chromeCookieStore = chromeCookieStoreModule,
   // Injected so the macOS-only guard is testable on any CI platform.
   platform = process.platform,
@@ -416,14 +446,24 @@ function registerBrowserIpc({
    *  url/nav-state pings back to exactly the renderer that drives the view. */
   const senderFor = (event) => (channel, payload) => {
     try {
+      if (!showsServerForEvent(event)) return;
       event.sender.send(channel, payload);
     } catch {
       /* window torn down */
     }
   };
+  const viewGate = (event, viewId, purpose) =>
+    routedGate(
+      gateRegistry(event),
+      () => routeViewForEvent(event, viewId, purpose),
+      senderFor(event),
+    );
 
-  async function withAgentView(event, args) {
-    const gated = gateRegistry(event);
+  // `deadline` carries the caller's `deadlineAt`: past it, nothing runs, so an
+  // expired call can't revoke (and blank) a page the agent no longer waits on.
+  async function withAgentView(event, args, deadline = args) {
+    if (pastAgentDeadline(deadline)) return { error: PAGE_TIMEOUT_ERROR };
+    const gated = viewGate(event, args?.conversationId, "agent");
     if (gated.error) return gated;
     const entry = gated.registry.get(args?.conversationId);
     if (!entry) return { error: "No browser view" };
@@ -443,38 +483,127 @@ function registerBrowserIpc({
         opts.sourceHostId !== context.sourceHostId ||
         currentContext?.hostIsThisMachine !== true
       ) {
+        // A tab check (browser_tabs list / select) only reads: it refuses the
+        // tab but leaves its page, which may still hold the user's work.
+        if (args?.action === "check_page") {
+          return { error: "this tab shows a page from this session's previous host" };
+        }
         await gated.registry.revokeAgentView(args.conversationId);
         return { error: "Session host changed; the previous browser page is no longer available" };
       }
     }
-    return { entry, registry: gated.registry };
+    return { ...gated, entry };
+  }
+
+  function pageAgentContext(event, entry, opts, actionSourceHost) {
+    const sourceHostId = actionSourceHost ?? opts?.sourceHostId ?? null;
+    const current = getAgentContextForEvent(event, { ...opts, sourceHostId, agent: true });
+    const previous = entry.agentContext;
+    // Only an approval already held by main for this session's host can carry forward.
+    return current &&
+      sourceHostId !== null &&
+      previous?.sourceHostId === sourceHostId &&
+      previous.serverOrigin === current.serverOrigin &&
+      previous.userNavigation !== true &&
+      previous.allowOnce
+      ? { ...current, allowOnce: previous.allowOnce }
+      : current;
+  }
+
+  const isCurrentAgentView = (event, gated, viewId) =>
+    showsServerForEvent(event) &&
+    viewGate(event, viewId, "agent").registry === gated.registry &&
+    gated.registry.get(viewId) === gated.entry &&
+    !gated.entry.agentContext?.revoked;
+
+  function watchAgentPage(event, gated, viewId) {
+    const wc = gated.entry.view.webContents;
+    const frame = wc.mainFrame;
+    const url = wc.getURL();
+    const unwatch = watchDocumentChange(wc);
+    return {
+      unwatch,
+      assertCurrentPage() {
+        if (
+          !isCurrentAgentView(event, gated, viewId) ||
+          wc.isDestroyed?.() ||
+          wc.mainFrame !== frame ||
+          wc.getURL() !== url ||
+          wc.isLoadingMainFrame?.() ||
+          unwatch.changed()
+        ) {
+          throw new Error("this tab's page changed while it was checked; try again");
+        }
+      },
+    };
+  }
+
+  async function authorizeAgentPage(gated, viewId, context, deadlineAt, assertCurrentPage) {
+    const result = await checkAgentPage(
+      gated.registry,
+      gated.entry,
+      viewId,
+      context,
+      deadlineAt,
+      assertCurrentPage,
+    );
+    if (result?.refused) {
+      if (!context?.sourceHostId)
+        return "Current session host is required to read this browser view";
+      return `this tab shows a page agents in this session can't open (${result.error})`;
+    }
+    return result?.error;
   }
 
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
-    const g = gateRegistry(event);
-    if (g.error) return { ok: false, error: g.error };
+  const openOrNavigate = async (event, args, purpose, sender) => {
+    const userNavigation = purpose === "user";
+    const g = routedGate(
+      sender,
+      () => routeViewForEvent(event, args?.conversationId, purpose),
+      senderFor(event),
+    );
+    if (g.error) return { ok: false, error: g.error, ...(g.elsewhere ? { elsewhere: true } : {}) };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    // Past its deadline the call changes nothing: it must not take over a
+    // pending navigation's place or clear the page.
+    if (pastAgentDeadline(opts)) {
+      return { ok: false, created: false, superseded: false, error: PAGE_TIMEOUT_ERROR };
+    }
     const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
-    const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
-    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
+    const cancelled = {
+      ok: false,
+      created: false,
+      error: "navigation superseded or closed",
+      // Whether a newer navigation took the view (components/BrowserPane/agentTools keeps its tab).
+      get superseded() {
+        return !isCurrentNavigation();
+      },
+    };
+    // A forwarded agent navigation also ends at its caller's deadline.
+    const isCurrent = () =>
+      isCurrentNavigation() && isPinnedOriginSender(event) && !pastAgentDeadline(opts);
     const agent = true;
     // Renderer flags do not establish user intent.
     // The first-party renderer supplies the source-session host; main owns
     // the target and eligibility. Caller exception flags never establish identity.
-    const userNavigation = consumeUserNavigation(event);
     const navigationContext = () => {
       const context = getAgentContextForEvent(event, opts);
       return userNavigation ? { ...context, userNavigation: true } : context;
     };
     let agentContext = navigationContext();
-    const options = { force: !!opts?.force, agent, agentContext };
-    let activeRegistry = g.registry;
+    const options = {
+      force: !!opts?.force,
+      agent,
+      agentContext,
+      ...(opts?.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+    };
+    const activeRegistry = g.registry;
 
     const finish = (r) => {
       // On first creation, wire nav listeners here (not in the registry factory,
@@ -483,7 +612,7 @@ function registerBrowserIpc({
         attachNavListeners({
           conversationId,
           webContents: r.entry.view.webContents,
-          send: senderFor(event),
+          send: g.send,
         });
       }
       // Strip the non-serializable `entry` before it crosses the IPC boundary.
@@ -500,12 +629,14 @@ function registerBrowserIpc({
       return {
         ok: r.ok,
         created: r.created ?? false,
+        ...(r.superseded === true ? { superseded: true } : {}),
         ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
         error: hint ? `${r.error} ${hint}` : r.error,
       };
     };
 
     const navigate = async (registry, context = agentContext) => {
+      if (!isCurrent()) return cancelled;
       if (registry.needsAgentViewRevocation?.(registry.get(conversationId), context)) {
         const cleared = await registry.revokeAgentView(conversationId, isCurrent);
         if (!isCurrent()) return cancelled;
@@ -540,15 +671,11 @@ function registerBrowserIpc({
         recovered = false;
       }
       if (recovered) {
-        const refreshed = gateRegistry(event);
+        const refreshed = viewGate(event, conversationId, purpose);
         if (refreshed.error || refreshed.registry !== activeRegistry || !isCurrent())
           return cancelled;
-        if (!refreshed.error && refreshed.registry === activeRegistry && isCurrent()) {
-          activeRegistry = refreshed.registry;
-          agentContext = navigationContext();
-          options.agentContext = agentContext;
-          r = await navigate(activeRegistry);
-        }
+        agentContext = navigationContext();
+        r = await navigate(activeRegistry);
       }
     }
     // Only an internal-class refusal on an agent call is promptable; every
@@ -571,7 +698,7 @@ function registerBrowserIpc({
         if (choice === "always" || choice === "once") {
           // The prompt can span a server switch (same registry, new pinned
           // origin); never retry the old server's answer under the new policy.
-          const regate = gateRegistry(event);
+          const regate = viewGate(event, conversationId, purpose);
           const serverOrigin = getAgentContextForEvent(event, opts)?.serverOrigin;
           if (
             regate.error ||
@@ -598,6 +725,13 @@ function registerBrowserIpc({
           pendingPromptNavigations.get(activeRegistry)?.delete(conversationId);
       }
     })();
+  };
+  const openWithReservation = whileOpeningView(openOrNavigate);
+  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+    const sender = gateRegistry(event);
+    if (sender.error) return { ok: false, error: sender.error };
+    const purpose = consumeUserNavigation(event) ? "user" : "agent";
+    return openWithReservation(event, args, purpose, sender);
   });
 
   // Attach the named conversation's view to the host window (detaching the
@@ -680,8 +814,23 @@ function registerBrowserIpc({
     const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
     const { entry } = g;
+    let page;
     try {
-      const image = await captureCredentialSafePage(entry.view.webContents);
+      page = watchAgentPage(event, g, args.conversationId);
+      const deadlineAt = args?.deadlineAt;
+      const error = await authorizeAgentPage(
+        g,
+        args.conversationId,
+        pageAgentContext(event, entry, args?.opts),
+        deadlineAt,
+        page.assertCurrentPage,
+      );
+      if (error) return { ok: false, error };
+      const image = await beforeAgentDeadline(
+        captureCredentialSafePage(entry.view.webContents, undefined, page.assertCurrentPage),
+        deadlineAt,
+      );
+      page.assertCurrentPage();
       const png = image.toPNG();
       if (image.isEmpty() || png.length === 0) {
         return {
@@ -698,21 +847,61 @@ function registerBrowserIpc({
         error: e && e.message ? e.message : String(e),
         noSurface: g.registry.activeConversationId() !== args.conversationId,
       };
+    } finally {
+      page?.unwatch();
     }
   });
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = await withAgentView(event, args);
+    const g = await withAgentView(event, args, legacy ? undefined : args?.params);
     if (g.error) return { ok: false, error: g.error };
     const { entry } = g;
+    const { conversationId } = args ?? {};
+    let page;
     try {
-      const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      page = watchAgentPage(event, g, conversationId);
+      const { action, params: sent } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      const { deadlineAt, params } = takeAgentDeadline(sent); // the caller's, not the action's
+      const getContext = (sourceHostId) => pageAgentContext(event, entry, args?.opts, sourceHostId);
+      const sourceHostId = params?.provenance?.sourceHostId;
+      const context = getContext(typeof sourceHostId === "string" ? sourceHostId : undefined);
+      if (action !== "check_page") {
+        const error = await authorizeAgentPage(
+          g,
+          conversationId,
+          context,
+          deadlineAt,
+          page.assertCurrentPage,
+        );
+        if (error) return { ok: false, error };
+      }
+      // The agent browser tools (trusted input, history, selects).
+      const agent = await performAgentBrowserAction(
+        g.registry,
+        entry,
+        conversationId,
+        action,
+        params,
+        {
+          agentContextFor: getContext,
+          deadlineAt,
+          assertCurrentPage: page.assertCurrentPage,
+        },
+      );
+      if (agent) return agent;
       const js = buildBrowserActionScriptForExecution(action, params);
-      const result = await entry.view.webContents.executeJavaScript(js, false);
+      page.assertCurrentPage();
+      const result = await beforeAgentDeadline(
+        entry.view.webContents.executeJavaScript(js, false),
+        deadlineAt,
+      );
+      page.assertCurrentPage();
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
+    } finally {
+      page?.unwatch();
     }
   }
   ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
@@ -729,7 +918,7 @@ function registerBrowserIpc({
     if (g.error) return { exists: false };
     const { conversationId } = args ?? {};
     const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
-    if (!entry) return { exists: false };
+    if (!entry) return viewElsewhere(viewGate(event, conversationId, "close"), conversationId);
     const webContents = entry.view.webContents;
     const url = webContents.getURL();
     // A new view has no committed URL while its first navigation is loading.
@@ -742,7 +931,7 @@ function registerBrowserIpc({
       exists: true,
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       url,
-      title: webContents.getTitle(),
+      title: viewTitle(webContents), // "" once the page is gone
       ...(pendingUrl ? { pendingUrl } : {}),
       ...readNavState(webContents),
     };
@@ -750,8 +939,10 @@ function registerBrowserIpc({
 
   // Destroy the conversation's view (explicit close — unmount only detaches).
   ipcMain.handle("omnigent:browser-close", (event, args) => {
-    const g = gateRegistry(event);
+    const g = viewGate(event, args?.conversationId, "close");
     if (g.error) return { ok: false, error: g.error };
+    const refused = refuseCloseForEvent(event, args); // an agent's late or superseded close
+    if (refused) return refused;
     const { conversationId, reason } = args ?? {};
     const r = g.registry.close(conversationId, reason);
     if (r.ok) {
@@ -845,7 +1036,10 @@ function registerBrowserIpc({
         nonce,
         gestureState,
       );
-      const inputHandler = makeDesignModeInputHandler(gestureState);
+      const webContents = entry.view.webContents;
+      const inputHandler = makeDesignModeInputHandler(gestureState, () =>
+        agentInputInFlight(webContents),
+      );
       entry.designModeListener = consoleHandler;
       entry.designModeInputListener = inputHandler;
       entry.designModeWebContents = entry.view.webContents;

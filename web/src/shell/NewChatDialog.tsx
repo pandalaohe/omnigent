@@ -140,6 +140,7 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
+import { timezoneRequestHeaders } from "@/lib/timezones";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { randomUUID } from "@/lib/randomUUID";
@@ -4371,6 +4372,12 @@ function NewChatLandingContent({
         : codexEffortLevelsForModel(models, model),
     [sandboxSessionCatalog, previewHarness],
   );
+  // With no sandbox catalog for the harness, a bare launch runs the harness's own default.
+  const sandboxUsesHarnessDefault =
+    sandboxSelected &&
+    info !== "loading" &&
+    !sandboxCatalogError &&
+    (!sandboxPreviewEnabled || sandboxModels.data?.status === "unconfigured");
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -5191,6 +5198,9 @@ function NewChatLandingContent({
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  // Smart Routing owns the model while it is on, so the menu keeps
+  // "Models unavailable" and offers no harness Default row.
+  const sandboxOffersHarnessDefault = sandboxUsesHarnessDefault && !routingOn;
   const modelSection: ComposerConfigSection | undefined =
     sandboxHasModelCatalog ||
     supportsModelPicker ||
@@ -5249,11 +5259,13 @@ function NewChatLandingContent({
               {pickerModelsLoading && pickerModelOptions.length === 0 && (
                 <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
               )}
-              {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                <div className="px-2 py-1 text-xs text-muted-foreground">
-                  {pickerModelsError?.message ?? "Models unavailable"}
-                </div>
-              )}
+              {!pickerModelsLoading &&
+                pickerModelOptions.length === 0 &&
+                !sandboxOffersHarnessDefault && (
+                  <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                    {pickerModelsError?.message ?? "Models unavailable"}
+                  </div>
+                )}
               {!pickerModelsLoading &&
                 pickerModelOptions.length === 0 &&
                 genericModelHarness !== null && (
@@ -5278,6 +5290,7 @@ function NewChatLandingContent({
               (!sandboxInferenceConfigured &&
                 (sdkHarness !== null ||
                   genericModelHarness !== null ||
+                  sandboxOffersHarnessDefault ||
                   (pickerModelOptions.length > 0 &&
                     !pickerModelOptions.some((option) => option.isDefault)))))
               ? [
@@ -7974,6 +7987,7 @@ function NewChatLandingContent({
             ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...PERMISSION_TIERS_PROTOCOL_HEADERS,
             ...backgroundSessionTitlesRequestHeaders(),
+            ...timezoneRequestHeaders(),
           },
           body: createForm ?? createPayload,
         });

@@ -54,6 +54,8 @@ from omnigent.tools.builtins import (
     SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -230,6 +232,7 @@ class ToolManager:
         self._register_instruction_layer_tools()
         self._register_scheduled_task_tools()
         self._register_journal_tools()
+        self._register_user_inbox_tools()
         self._register_browser_tools()
         # The artifact-relay panel tool is framework-owned too: always
         # auto-registered so any agent can open a file in the user's web
@@ -334,6 +337,13 @@ class ToolManager:
 
         for tool_class in JOURNAL_TOOLS:
             self._tools[tool_class.name()] = tool_class()
+
+    def _register_user_inbox_tools(self) -> None:
+        """Register the owner-Inbox tools for agents that opt in."""
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -747,6 +757,11 @@ class ToolManager:
 
         for _cls in BROWSER_TOOL_CLASSES:
             self._tools[_cls.name()] = _cls()
+        # The advanced browser tools, and click / type with their trusted-input options.
+        # Imported here: the tool classes build on this module's registry.
+        from omnigent.tools.builtins.browser_advanced import register_browser_agent_tools
+
+        register_browser_agent_tools(self._tools)
 
     def _register_panel_tools(self) -> None:
         """

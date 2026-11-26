@@ -54,11 +54,12 @@ async function passwordIsShowing(wc) {
   return !states ? "unknown" : states.some((state) => state.showing) ? "yes" : "no";
 }
 
-async function captureCredentialSafePage(wc, rect) {
+async function captureCredentialSafePage(wc, rect, assertCurrentPage = () => {}) {
   const error =
     "Cannot capture this page while a password is visible or its protection is unavailable.";
   const before = await readCredentialState(wc);
   if (!before || before.some((state) => state.showing)) throw new Error(error);
+  assertCurrentPage();
   const image = await (rect ? wc.capturePage(rect) : wc.capturePage());
   const after = await readCredentialState(wc);
   if (

@@ -62,6 +62,7 @@ from omnigent.entities.subagent_terminal import (
     TERMINAL_IDENTITY_LABEL_PREFIX,
     TurnIdentity,
 )
+from omnigent.entities.workflow_questions import workflow_answer_input_id
 from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError, WrongReplicaError
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
@@ -2248,7 +2249,10 @@ def register_events_routes(
                         "queued": False,
                         "timer_delivery": "held" if receipt.phase == "moved" else "dropped",
                     }
+        answer_id = None
+        receipt = None
         if body.type == "message":
+            answer_id = body.data.pop("workflow_answer", None)
             for key in (
                 "auto_retry",
                 "retry_guard",
@@ -2259,6 +2263,7 @@ def register_events_routes(
                 "_final_wake",
                 "_runtime_notice",
                 "input_admission_deadline",
+                "workflow_answer_digest",
             ):
                 body.data.pop(key, None)
             retry_guard = active_retry_dispatch()
@@ -2266,6 +2271,16 @@ def register_events_routes(
                 body.data["auto_retry"] = retry_guard.metadata.model_dump(mode="json")
             service = getattr(request.app.state, "subagent_retry_admission", None)
             stable_input = body.data.get("stable_id")
+            workflow_answer = (
+                isinstance(answer_id, str)
+                and answer_id.startswith("elicit_journal_")
+                and len(answer_id) == len("elicit_journal_") + 32
+                and stable_input == workflow_answer_input_id(answer_id)
+                and body.data.get("role") == "user"
+                and _has_runner_created_by_authority(request, conv)
+            )
+            if workflow_answer:
+                body.data["workflow_answer"] = True
             if service is not None and isinstance(stable_input, str):
                 receipt = await asyncio.to_thread(service.journal.get_input, stable_input)
                 final_input = active_final_dispatch()
@@ -2274,9 +2289,11 @@ def register_events_routes(
                 ) or (final_input is not None and final_input.input_id == stable_input)
                 if receipt is not None and receipt.kind in {"retry", "wake"} and not trusted_input:
                     raise HTTPException(409, "Input identity is reserved for system delivery")
-            if (conv.parent_conversation_id or active_final_dispatch() is not None) and getattr(
-                request.app.state, "subagent_retry_admission", None
-            ) is not None:
+            if service is not None and (
+                conv.parent_conversation_id
+                or active_final_dispatch() is not None
+                or workflow_answer
+            ):
                 body.data["_input_admission_required"] = True
                 if isinstance(request, Request) and getattr(
                     request.state, "runtime_notice", False
@@ -2662,6 +2679,26 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        if body.type == "message" and body.data.get("workflow_answer") is True:
+            # The admission journal must prove it consumed this exact workflow
+            # answer under the effective actor, even before a native mirror arrives.
+            digest = hashlib.sha256(
+                json.dumps(
+                    [answer_id, created_by, body.data.get("content")],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            body.data["workflow_answer_digest"] = digest
+            if receipt is not None:
+                if (
+                    receipt.target_id != session_id
+                    or receipt.kind != "human"
+                    or receipt.payload.get("workflow_answer_digest") != digest
+                ):
+                    raise HTTPException(409, "Input identity already names a different delivery")
+                if receipt.state == "accepted":
+                    return {"queued": True, "forwarded": True}
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent

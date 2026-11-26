@@ -3848,6 +3848,7 @@ async def _auto_create_pi_terminal(
             build_native_relay_tool_schemas,
             filter_workflow_tool_schemas,
         )
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
 
         pi_tools = build_native_relay_tool_schemas(
             pi_spec,
@@ -3857,6 +3858,9 @@ async def _auto_create_pi_terminal(
         pi_tools = filter_workflow_tool_schemas(
             pi_tools, enabled=await server_workflows_enabled(server_client)
         )
+        pi_tools = await filter_native_relay_browser_tools(
+            pi_tools, session_id=session_id, server_client=server_client
+        )
         if server_client is not None and pi_spec is not None:
             registry_servers = [
                 server for server in pi_spec.mcp_servers if server.transport == "registry"
@@ -3865,7 +3869,7 @@ async def _auto_create_pi_terminal(
                 registry_spec = dataclasses.replace(pi_spec, mcp_servers=registry_servers)
                 mcp = await ProxyMcpManager(session_id, server_client).schemas_for(registry_spec)
                 pi_tools.extend(mcp.schemas)
-    except Exception:
+    except Exception:  # tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s",
             session_id,

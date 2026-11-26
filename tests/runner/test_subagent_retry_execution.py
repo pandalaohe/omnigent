@@ -549,6 +549,69 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 
 @pytest.mark.asyncio
+async def test_workflow_answer_replay_keeps_first_admission_deadline():
+    waiting, release = asyncio.Event(), asyncio.Event()
+    session_id, input_id = "workflow-replay", "a" * 32
+    digest, deadline = "b" * 64, time.time() + 30
+    claim = InputExecutionClaimEvent(
+        claim_id="workflow",
+        claim=InputExecutionClaim(
+            input_id=input_id, turn_id="resp_multiturn", admission_deadline=deadline
+        ),
+    )
+    frames = _sse_text_turn("done")
+    frames.insert(1, "event: input.execution.claim\ndata: " + claim.model_dump_json() + "\n\n")
+
+    class Harness(_ScriptedHarnessClient):
+        @contextlib.asynccontextmanager
+        async def stream(self, *args, **kwargs):
+            async with super().stream(*args, **kwargs) as response:
+                original = response.aiter_text
+
+                async def hold_before_admission():
+                    async for frame in original():
+                        if frame == frames[1]:
+                            waiting.set()
+                            await release.wait()
+                        yield frame
+
+                response.aiter_text = hold_before_admission
+                yield response
+
+    harness = Harness(frames)
+    server = _ScriptedAdmissionServer(input_id)
+    app = create_runner_app(process_manager=_FakeProcessManager(harness), server_client=server)
+    events = f"/v1/sessions/{session_id}/events"
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test",
+        "content": [{"type": "input_text", "text": "The user's answer."}],
+        "stable_id": input_id,
+        "input_id": input_id,
+        "input_admission_required": True,
+        "input_admission_deadline": deadline,
+        "workflow_answer": True,
+        "workflow_answer_digest": digest,
+    }
+    async with _runner_test_client(app) as client:
+        first = asyncio.create_task(client.post(events + "?stream=true", json=body))
+        try:
+            await asyncio.wait_for(waiting.wait(), 3)
+            replay = await client.post(
+                events, json={**body, "input_admission_deadline": deadline + 5}
+            )
+            assert replay.status_code == 202 and replay.json()["status"] == "duplicate"
+            changed = await client.post(events, json={**body, "workflow_answer_digest": "c" * 64})
+            assert changed.status_code == 409
+        finally:
+            release.set()
+            assert (await asyncio.wait_for(first, 5)).status_code == 200
+    assert [entry.admission_deadline for entry in server.claims] == [deadline]
+    assert [entry.workflow_answer_digest for entry in server.claims] == [digest]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
 @pytest.mark.parametrize("opening", ["accepted", "notice", "sender"])
 # A steered input's refusal in the same response must not change the opener's outcome.

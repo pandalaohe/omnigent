@@ -143,6 +143,7 @@ from omnigent.runtime.policies.builder import (
     ancestor_ids_from_tree,
     load_session_tree,
     load_session_usage,
+    load_session_usage_and_tree,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
@@ -530,6 +531,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -3050,6 +3052,31 @@ def _publish_subtree_cost_to_ancestors(
         conv_store,
         conv.root_conversation_id if conv is not None else None,
     )
+    _publish_ancestor_subtree_costs(tree, session_id)
+
+
+def _publish_ancestor_subtree_costs(tree: list[Conversation], session_id: str) -> None:
+    """
+    Publish each ancestor's subtree cost from an already-loaded spawn tree.
+
+    The store-free half of :func:`_publish_subtree_cost_to_ancestors`, for a
+    usage flush that has just loaded this session's tree to sum its own
+    subtree: reusing that tree keeps a flush to one tree load, which dominates
+    its cost on a large spawn tree. Whether the session has ancestors at all
+    is read from *tree*, never from a row the caller holds, because a stale
+    row can name a parent the session no longer has. A top-level session
+    publishes nothing.
+
+    Sync (sums the tree once per ancestor + SSE fan-out); call via
+    :func:`asyncio.to_thread`.
+
+    :param tree: The session's spawn tree as returned by
+        :func:`load_session_tree` or :func:`load_session_usage_and_tree`,
+        which verify that it is the tree the session currently belongs to.
+    :param session_id: The session whose usage just changed, e.g.
+        ``"conv_child123"``.
+    :returns: None.
+    """
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
@@ -3546,8 +3573,8 @@ def _accumulate_session_usage(
     conversation_store: ConversationStore,
 ) -> float | None:
     """
-    Increment the session's cumulative token counters from a
-    ``response.completed`` event's usage data.
+    Increment the session's cumulative token counters from a terminal
+    response event's usage data (completed, failed, cancelled or incomplete).
 
     Called synchronously from the relay loop. Builds a usage delta from
     the response's ``usage`` field and atomically applies it to the
@@ -3568,8 +3595,8 @@ def _accumulate_session_usage(
     (its presence is what distinguishes a priced ``$0.00`` from
     "unpriced"; see :func:`_priced_cost_for_display`).
 
-    :param resp_obj: The ``response`` dict from the
-        ``response.completed`` SSE event.
+    :param resp_obj: The ``response`` dict from a terminal
+        response SSE event.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store for reading and writing
@@ -4186,12 +4213,12 @@ async def _persist_external_session_usage(
     :param conversation_store: Store used to upsert the labels.
     :param conv: The session's already-loaded conversation row, when the
         caller holds one (the events route's access check reads it). Supplies
-        the tree root to the subtree roll-up and the ancestor publish — both
-        read-only, and both verify a supplied root against the tree it
-        produces — so those steps don't re-read the row. NOT passed to the
-        own-usage persist: its monotonic-clamp baseline must be a fresh read
-        (see :func:`_persist_native_cumulative_usage`). ``None`` makes each
-        step resolve the row itself.
+        the tree root to the one tree load the subtree roll-up and the
+        ancestor publish share — read-only, and it verifies a supplied root
+        against the tree it produces — so that load doesn't re-read the row.
+        NOT passed to the own-usage persist: its monotonic-clamp baseline must
+        be a fresh read (see :func:`_persist_native_cumulative_usage`).
+        ``None`` makes each step resolve the row itself.
     :param user_id: The flush POST's authenticated caller, hashed into the
         usage telemetry event. ``None`` falls back to the ambient request user.
     :param host_installation_id: Installation ID of the machine that posted the
@@ -4398,8 +4425,8 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush. The
     # caller's row supplies the root so the tree scan needs no extra row read.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
+    subtree_usage, tree = await asyncio.to_thread(
+        load_session_usage_and_tree,
         session_id,
         conversation_store,
         root_conversation_id=conv.root_conversation_id if conv is not None else None,
@@ -4429,14 +4456,9 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
-    await asyncio.to_thread(
-        _publish_subtree_cost_to_ancestors,
-        conversation_store,
-        session_id,
-        conv,
-    )
+    # Reuses the tree summed above, so a flush loads it once. No-op for a
+    # top-level session (no ancestors). Threaded: it sums the tree per ancestor.
+    await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
 
 
@@ -10134,6 +10156,9 @@ def _build_native_terminal_message_event(
     raw_stable_id = body.data.get("stable_id")
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
+        if body.data.get("workflow_answer") is True:
+            event["workflow_answer"] = True
+            event["workflow_answer_digest"] = body.data["workflow_answer_digest"]
     if body.data.get("_input_admission_required") is True:
         event["input_admission_required"] = True
         event["input_id"] = event.get("stable_id") or uuid.uuid4().hex
@@ -10999,6 +11024,8 @@ async def _forward_event_to_runner(
             and persisted_items[0].deduplicated
             and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
         ):
+            if body.data.get("workflow_answer") is True:
+                raise HTTPException(409, "Input identity already names a different delivery")
             # A persisted retry may still need forwarding if the first attempt
             # failed before reaching the runner. A different body under the id
             # (a pre-adoption web bundle resending an edited restored draft) is a
@@ -11065,6 +11092,8 @@ async def _forward_event_to_runner(
                     extra={"session_id": session_id},
                 )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
     # POST handler expects the harness event shape, not the
@@ -11093,6 +11122,7 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
     }
     runner_body.pop("workflow_run_id", None)
     if body.workflow_run_id is not None:
@@ -12360,11 +12390,15 @@ async def _dispatch_session_event_to_runner_impl(
                         and isinstance(settled.data, ErrorData)
                         and (settled.data.code == "native_input_delivery_uncertain")
                     ):
-                        return _SessionEventDispatchResult(item_id=settled.id, pending_id=None)
+                        return _SessionEventDispatchResult(
+                            item_id=settled.id,
+                            pending_id=None,
+                            forwarded=body.data.get("workflow_answer") is not True,
+                        )
                 if repeated_pending_id is not None:
-                    # A client retry of a send the runner already received (its
-                    # response was lost in flight). Forwarding it again would run
-                    # the prompt twice; answer with the queued entry it already has.
+                    # Keep one native send for this pending id. A workflow
+                    # replay needs the receiver's durable admission, which is
+                    # checked before this dispatch path.
                     _logger.info(
                         "Native message %s is already queued for session=%s; not forwarding again",
                         repeated_pending_id,
@@ -12380,7 +12414,9 @@ async def _dispatch_session_event_to_runner_impl(
                         ),
                     )
                     return _SessionEventDispatchResult(
-                        item_id=None, pending_id=repeated_pending_id
+                        item_id=None,
+                        pending_id=repeated_pending_id,
+                        forwarded=body.data.get("workflow_answer") is not True,
                     )
             if startup_input is not None and not await startup_input.claim(
                 conversation_store, session_id
@@ -14326,11 +14362,9 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 conversation_store,
                             )
-                    if evt_type == "response.completed":
-                        # Persist the turn's usage (cost + token buckets) so
-                        # policy callables can read
-                        # event["context"]["usage"]["total_cost_usd"] and the
-                        # subtree roll-up below sees the new totals.
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        # Persist every terminal turn's usage (failed/stopped turns also made
+                        # model calls) for policy callables and the subtree roll-up below.
                         await asyncio.to_thread(
                             _accumulate_session_usage,
                             event.get("response", {}),
@@ -14372,6 +14406,7 @@ async def _relay_runner_stream_once(
                                 ),
                             )
                         )
+                        _context_payload: dict[str, Any] = {}
                         if evt_type == "response.completed":
                             _context_payload = await asyncio.to_thread(
                                 persist_context_reading,
@@ -14379,6 +14414,7 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 _resp_usage,
                             )
+                        if evt_type == "response.completed" or _resp_usage:
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
                             # over the spawn subtree. The session's own event
@@ -14395,22 +14431,13 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window ride on the
                             # same event so the ring updates live. Threaded: store
                             # reads + SSE fan-out.
-                            # One row read serves both the subtree sum and
-                            # the ancestor publish below (each would
-                            # otherwise re-derive the tree root itself).
-                            _usage_conv = await asyncio.to_thread(
-                                conversation_store.get_conversation,
-                                session_id,
-                            )
-                            _subtree_usage = await asyncio.to_thread(
-                                load_session_usage,
+                            # One tree load (which resolves the root with one
+                            # row read) serves both the subtree sum and the
+                            # ancestor publish below.
+                            _subtree_usage, _usage_tree = await asyncio.to_thread(
+                                load_session_usage_and_tree,
                                 session_id,
                                 conversation_store,
-                                root_conversation_id=(
-                                    _usage_conv.root_conversation_id
-                                    if _usage_conv is not None
-                                    else None
-                                ),
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -14436,10 +14463,9 @@ async def _relay_runner_stream_once(
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:
                                     await asyncio.to_thread(
-                                        _publish_subtree_cost_to_ancestors,
-                                        conversation_store,
+                                        _publish_ancestor_subtree_costs,
+                                        _usage_tree,
                                         session_id,
-                                        _usage_conv,
                                     )
 
                     failed_response = event.get("response")
@@ -16461,6 +16487,7 @@ async def _create_session_from_existing_agent_impl(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
+    launched_by_scheduled_task_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
@@ -16499,6 +16526,8 @@ async def _create_session_from_existing_agent_impl(
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP
         services of its own starts with the source's.
+    :param launched_by_scheduled_task_id: The automation whose run's tree that source
+        is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
         the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
@@ -16510,6 +16539,15 @@ async def _create_session_from_existing_agent_impl(
         server_sandbox_providers,
         session_creation_source_tier,
     )
+    from omnigent.server.session_journal import initialize_workflow_plan, load_workflow_for_run
+    from omnigent.server.workflows import require_workflows
+
+    workflow = None
+    if body.workflow_id is not None:
+        require_workflows(request)
+        workflow = await load_workflow_for_run(
+            conversation_store, body.workflow_id, user_id=user_id
+        )
 
     request_fields_set = body.model_fields_set
     explicit_project_label = "omni_project" in (body.labels or {})
@@ -16667,9 +16705,11 @@ async def _create_session_from_existing_agent_impl(
     _strip_succession_operation_labels(body.labels)
     _reject_reserved_cost_control_label_seed(body.labels)
     from omnigent.server.permission_tiers import strip_creation_permission_labels
+    from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
     strip_creation_permission_labels(body.labels)
-    _reject_server_reserved_label_seed(body.labels)
+    _reject_server_reserved_label_seed(body.labels, at_creation=True)
+    apply_browser_agent_tools_creation_labels(body.labels, request.headers)
 
     agent = await validate_session_agent(
         user_id=user_id,
@@ -17743,6 +17783,8 @@ async def _create_session_from_existing_agent_impl(
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
+    if launched_by_scheduled_task_id is not None:
+        initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(inherited_mcp_labels or mcp_selection.labels)
     initial_labels.update(automation_permission_labels)
     if defer_host_preparation and inherited_runner_id is None:
@@ -17941,6 +17983,14 @@ async def _create_session_from_existing_agent_impl(
                 harness_override=harness_override,
                 **snapshot_kwargs,
             )
+            if workflow is not None:
+                try:
+                    await initialize_workflow_plan(
+                        conversation_store, conv, workflow, user_id=user_id
+                    )
+                except Exception:
+                    await conversation_store.delete_conversation(conv.id)
+                    raise
             if body.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 

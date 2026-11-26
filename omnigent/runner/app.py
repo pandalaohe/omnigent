@@ -140,6 +140,8 @@ from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
 from omnigent.runner.journal_tools import (
+    answer_arrives_as_message,
+    cancel_session_questions,
     invalidate_server_workflow_flag,
     server_workflows_enabled,
     workflow_run_is_current,
@@ -762,6 +764,9 @@ _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 # on the way; releasing the harness before it lands severs the stream carrying
 # it, so the wait is longer. The pane is already gone, so nothing else waits.
 _EXPECTED_CLOSE_RELEASE_GRACE_S = 15.0
+# How long an interrupted in-process turn may take to relay its own terminal,
+# which carries its usage, before the cancel floor; within the server's 5s stop deadline.
+_INTERRUPTED_TURN_SETTLE_GRACE_S = 1.0
 # Display names for the terminals whose exits the runner describes to people.
 _TERMINAL_DISPLAY_NAMES = {"claude": "Claude Code"}
 
@@ -2798,7 +2803,7 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
-    _input_execution_claims: dict[tuple[str, str], tuple[object, float, str]] = {}
+    _input_execution_claims: dict[tuple[str, str], tuple[object, float, str, str | None]] = {}
     _pending_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     _abandoned_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     # Refused receiver claims of live turns: (session id, turn id, input id).
@@ -2877,7 +2882,12 @@ def create_runner_app(
             _abandoned_input_executions.pop(key, None)
             _pending_input_executions.pop(key, None)
             expected = _input_execution_claims.get(key)
-            if expected == (claim.retry, claim.admission_deadline, claim.kind):
+            if expected == (
+                claim.retry,
+                claim.admission_deadline,
+                claim.kind,
+                claim.workflow_answer_digest,
+            ):
                 _input_execution_claims.pop(key, None)
         return True
 
@@ -2967,7 +2977,9 @@ def create_runner_app(
             and frame.claim.admission_deadline == expected[1]
             and frame.claim.turn_id == _live_response_id.get(session_id)
         ):
-            claim = frame.claim.model_copy(update={"kind": expected[2]})
+            claim = frame.claim.model_copy(
+                update={"kind": expected[2], "workflow_answer_digest": expected[3]}
+            )
             _pending_input_executions[key] = claim
             while True:
                 try:
@@ -6360,6 +6372,7 @@ def create_runner_app(
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
+        await cancel_session_questions(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         _turn_occurrences.pop(session_id, None)
@@ -7713,24 +7726,62 @@ def create_runner_app(
         body["input_admission_deadline"] = deadline
         input_id = body.get("input_id")
         if isinstance(input_id, str) and input_id:
-            _input_execution_claims[(conv_id, input_id)] = (None, deadline, "ordinary")
+            _input_execution_claims[(conv_id, input_id)] = (
+                None,
+                deadline,
+                "ordinary",
+                body.get("workflow_answer_digest"),
+            )
 
-    def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
-        """Whether a forward repeats a message that is still queued or running.
+    def _message_replay(conv_id: str, body: Mapping[str, Any]) -> str | None:
+        """Classify a repeated forward that is still queued or running.
 
         The server re-forwards a message under the same pending id when an
         earlier forward timed out on its side; the runner may still hold that
         earlier forward, so taking the repeat would deliver the message twice.
         """
+        if body.get("workflow_answer") is True:
+            stable_id = body.get("stable_id")
+            if isinstance(stable_id, str):
+                original = next(
+                    (
+                        queued
+                        for queued in _session_message_buffers.get(conv_id, ())
+                        if queued.get("stable_id") == stable_id
+                    ),
+                    None,
+                )
+                active_match = (
+                    conv_id in _active_turns
+                    and _turn_identities.get(conv_id, {}).get("input_id") == stable_id
+                )
+                if original is not None or active_match:
+                    expectation = (
+                        _input_execution_claims.get((conv_id, stable_id))
+                        if original is None
+                        else None
+                    )
+                    original_digest = (
+                        expectation[3]
+                        if expectation is not None
+                        else (original or _turn_message_bodies.get(conv_id, {})).get(
+                            "workflow_answer_digest"
+                        )
+                    )
+                    return (
+                        "duplicate"
+                        if original_digest == body.get("workflow_answer_digest")
+                        else "input_identity_conflict"
+                    )
         pending_id = body.get("pending_id")
         if not isinstance(pending_id, str):
-            return False
-        if conv_id in _active_turns and pending_id in _turn_pending_ids.get(conv_id, ()):
-            return True
-        return any(
+            return None
+        if (conv_id in _active_turns and pending_id in _turn_pending_ids.get(conv_id, ())) or any(
             queued.get("pending_id") == pending_id
             for queued in _session_message_buffers.get(conv_id, ())
-        )
+        ):
+            return "duplicate"
+        return None
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -8035,6 +8086,24 @@ def create_runner_app(
                     "this turn; this note is runtime-generated.]"
                 )
         return "\n".join(note_lines) if note_lines else None
+
+    def _settle_stop_without_turn(conv_id: str) -> None:
+        """Publish ``idle`` after a stop that found no turn, so a stale server ``running`` clears.
+
+        Skipped while work remains (a turn, an in-flight response or a buffered message), after a
+        failed setup, and for sessions this runner never initialized.
+        """
+        if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+            return
+        if process_manager is not None and process_manager.has_active_turn(conv_id):
+            return
+        if _native_pane_status.get(conv_id) == "failed":
+            return
+        known = conv_id in _session_start_cache or (
+            process_manager is not None and process_manager.has_session(conv_id)
+        )
+        if known:
+            _publish_turn_status(conv_id, "idle")
 
     def _on_proxy_stream_end(
         conv_id: str,
@@ -8341,7 +8410,7 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
 
-    async def _cancel_inprocess_turn(conv_id: str) -> bool:
+    async def _cancel_inprocess_turn(conv_id: str, *, settle_grace_s: float = 0.0) -> bool:
         """Request cancellation and report whether a live turn was found."""
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
         # the None sentinel — driven by the AP request's consumption of
@@ -8373,6 +8442,8 @@ def create_runner_app(
         # and direct interrupt/stop callers rely on the forwarded interrupt
         # ending proxy_stream.
         if isinstance(target, asyncio.Task):
+            if settle_grace_s > 0:
+                await asyncio.wait({target}, timeout=settle_grace_s)
             await _cancel_active_turn(conv_id, expected_task=target)
         return True
 
@@ -9959,6 +10030,14 @@ def create_runner_app(
                     }
                 )
         relay_schemas = filter_workflow_tool_schemas(relay_schemas, enabled=workflows_enabled)
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
+
+        relay_schemas = await filter_native_relay_browser_tools(
+            relay_schemas,
+            session_id=session_id,
+            server_client=server_client,
+            session_labels=session_labels,
+        )
         mcp_discovery_failed = False
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
@@ -10930,6 +11009,9 @@ def create_runner_app(
             from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
 
             _spec_tools = strip_browser_tool_schemas(_spec_tools)
+        from omnigent.tools.browser_agent_tools import filter_turn_browser_tools
+
+        _spec_tools = filter_turn_browser_tools(_spec_tools, msg_body)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
@@ -11827,7 +11909,12 @@ def create_runner_app(
                     # Queue wait and harness setup are outside the consumption attempt.
                     deadline = time.time() + _BUFFERED_INPUT_ADMISSION_TIMEOUT_S
                     event_body["input_admission_deadline"] = deadline
-                    _input_execution_claims[execution_key] = (None, deadline, "ordinary")
+                    _input_execution_claims[execution_key] = (
+                        None,
+                        deadline,
+                        "ordinary",
+                        execution[3],
+                    )
                 dispatched = True
                 async with client.stream(
                     "POST",
@@ -13007,6 +13094,7 @@ def create_runner_app(
                 )
             message_body = _TurnMessage(body, current_scheduled_run())
             message_body["conversation_id"] = conversation_id
+            execution_claim = None
             if message_body.get("input_admission_required") is True:
                 from omnigent.entities.subagent_retry import RetryExecutionGuard
 
@@ -13027,12 +13115,16 @@ def create_runner_app(
                     return JSONResponse(
                         status_code=422, content={"error": "missing_input_deadline"}
                     )
-                _input_execution_claims[(conversation_id, input_id)] = (
-                    retry_guard,
-                    deadline,
-                    "wake"
-                    if message_body.get("_final_wake") is True
-                    else ("recovery" if message_body.get("recovered") is True else "ordinary"),
+                execution_claim = (
+                    (conversation_id, input_id),
+                    (
+                        retry_guard,
+                        deadline,
+                        "wake"
+                        if message_body.get("_final_wake") is True
+                        else ("recovery" if message_body.get("recovered") is True else "ordinary"),
+                        message_body.get("workflow_answer_digest"),
+                    ),
                 )
             _apply_archive_states(
                 conversation_id,
@@ -13057,7 +13149,10 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
-                if _message_already_taken(conversation_id, message_body):
+                replay = _message_replay(conversation_id, message_body)
+                if replay == "input_identity_conflict":
+                    return JSONResponse(status_code=409, content={"error": replay})
+                if replay == "duplicate":
                     _logger.info(
                         "post_session_events: dropping repeated forward conv=%s pending_id=%s",
                         conversation_id,
@@ -13071,6 +13166,9 @@ def create_runner_app(
                             "detail": "Message already queued or running.",
                         },
                     )
+                if execution_claim is not None:
+                    key, expectation = execution_claim
+                    _input_execution_claims[key] = expectation
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     delivery_attempt = input_attributes(message_body).get("delivery_attempt_id")
@@ -13444,9 +13542,12 @@ def create_runner_app(
             if _interrupt_resp is not None:
                 await _settle_control_input(body, _interrupt_resp)
                 return _interrupt_resp
-            if await _cancel_inprocess_turn(conversation_id):
+            if await _cancel_inprocess_turn(
+                conversation_id, settle_grace_s=_INTERRUPTED_TURN_SETTLE_GRACE_S
+            ):
                 control_response = Response(status_code=204)
             else:
+                _settle_stop_without_turn(conversation_id)
                 control_response = JSONResponse(
                     status_code=200, content={"interrupted": False, "reason": "idle"}
                 )
@@ -13863,7 +13964,10 @@ def create_runner_app(
                     else:
                         _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
-            await _cancel_inprocess_turn(conversation_id)
+            if not await _cancel_inprocess_turn(
+                conversation_id, settle_grace_s=_INTERRUPTED_TURN_SETTLE_GRACE_S
+            ):
+                _settle_stop_without_turn(conversation_id)
             control_response = Response(status_code=204)
             await _settle_control_input(body, control_response)
             return control_response
@@ -14706,6 +14810,9 @@ def create_runner_app(
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
             _elicit_content = _data.get("content")
+            # A workflow question whose tool call already returned: dismissing it
+            # mustn't interrupt whatever the agent is doing by then.
+            answer_by_message = answer_arrives_as_message(str(_data.get("elicitation_id", "")))
             runner_owned_approval = pending_approvals.resolve(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
@@ -14713,7 +14820,11 @@ def create_runner_app(
             )
             # Ordinary Pi dialog rejection is an answer, not a tool denial.
             pi_dialog = str(_data.get("elicitation_id", "")).startswith("elicit_pi_")
-            if _elicit_action == "decline" and (runner_owned_approval or not pi_dialog):
+            if (
+                _elicit_action == "decline"
+                and not answer_by_message
+                and (runner_owned_approval or not pi_dialog)
+            ):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(

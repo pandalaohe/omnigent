@@ -62,6 +62,7 @@ import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useComments } from "@/hooks/useComments";
 import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -109,6 +110,7 @@ import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptV
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { ProactiveAgentSettingControl } from "@/components/ProactiveAgentSettingControl";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { ModelProvidersSection } from "@/pages/settings/ModelProvidersSection";
 import { VoiceInputSettings } from "@/components/VoiceInputSettings";
@@ -123,6 +125,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { Segmented } from "@/components/ui/segmented";
+import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -391,6 +394,7 @@ import {
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 import { cn } from "@/lib/utils";
 import {
   readBackgroundSessionTitlesEnabled,
@@ -2394,6 +2398,17 @@ function AdminViewControl() {
 }
 
 /** App-wide behavior settings. */
+/** The viewer's Omni Advisor switch, where the server offers it. */
+function ProactiveAgentGroup() {
+  const { available } = useProactiveAgentSettings();
+  if (!available) return null;
+  return (
+    <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
+      <ProactiveAgentSettingControl scope="me" />
+    </SettingsGroup>
+  );
+}
+
 function GeneralSection() {
   const info = useServerInfo();
   const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
@@ -2528,6 +2543,8 @@ function GeneralSection() {
             </ExpandableSettings>
           </SettingsGroup>
         )}
+        <ProactiveAgentGroup />
+        <BrowserAgentToolsSettingsGroup />
         {supportsGlobalShortcut() && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             <GlobalShortcutControl />

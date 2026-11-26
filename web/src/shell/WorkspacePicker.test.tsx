@@ -32,8 +32,7 @@ import {
 } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
-import { useDesktopHostId } from "./RevealInFileManager";
-import type * as RevealInFileManagerModule from "./RevealInFileManager";
+import { useDesktopHostId } from "@/lib/desktopHostId";
 import {
   WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
@@ -66,8 +65,7 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   })),
 }));
 
-vi.mock("./RevealInFileManager", async (importOriginal) => ({
-  ...(await importOriginal<typeof RevealInFileManagerModule>()),
+vi.mock("@/lib/desktopHostId", () => ({
   useDesktopHostId: vi.fn(() => null),
 }));
 

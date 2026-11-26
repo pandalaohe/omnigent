@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import RangeNotSatisfiable
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.entities.session_resources import (
@@ -150,6 +152,27 @@ async def _read_file_in_root(root: str, relative_path: str) -> str:
 
     data = await asyncio.to_thread(_read)
     return data.decode("utf-8", errors="replace")
+
+
+def _download_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Resolve one byte range; ignore malformed and multipart ranges."""
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", header.strip(), re.IGNORECASE)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else 0
+        end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if first:
+        if last and end < start:
+            return None
+    else:
+        start, end = max(0, size - end), size - 1
+    if start >= size or start > end:
+        raise RangeNotSatisfiable(size)
+    return start, min(end + 1, size)
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -2286,6 +2309,7 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        request: Request,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -2305,6 +2329,9 @@ def register_resource_routes(
                 environment_id,
                 relative_path,
                 within=within,
+                range_header=request.headers.get("range")
+                if "if-range" not in request.headers
+                else None,
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -2483,9 +2510,10 @@ def register_resource_routes(
         path: str,
         *,
         within: str | None = None,
+        range_header: str | None = None,
         follow_outward_links: bool = False,
-    ) -> StreamingResponse:
-        """Serve a file's complete bytes as an attachment.
+    ) -> Response:
+        """Serve complete or ranged file bytes from the authorized descriptor.
 
         The read path inlines content in a JSON envelope, so it caps at
         ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
@@ -2497,6 +2525,7 @@ def register_resource_routes(
         :param path: Path within the environment, or an absolute path.
         :param within: Bundle root the resolved path must fall strictly
             inside (``""`` = environment root); refused otherwise.
+        :param range_header: An optional HTTP byte range for media seeking.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``
@@ -2512,12 +2541,29 @@ def register_resource_routes(
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path, within=within)
+        media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        headers = {"Accept-Ranges": "bytes"}
+        if within is not None:
+            # The server rejects responses from runners that ignore confinement.
+            headers["X-Omnigent-Within"] = "enforced"
+        try:
+            byte_range = _download_byte_range(range_header, size) if range_header else None
+        except RangeNotSatisfiable:
+            fobj.close()
+            headers["Content-Range"] = f"bytes */{size}"
+            return Response(status_code=416, headers=headers, media_type=media_type)
+        start, end = byte_range if byte_range is not None else (0, size)
+        length = end - start
+        if byte_range is not None:
+            headers["Content-Range"] = f"bytes {start}-{end - 1}/{size}"
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -2528,8 +2574,8 @@ def register_resource_routes(
                             "Download of %s aborted: file shrank while streaming "
                             "(sent %d of %d announced bytes)",
                             resolved.name,
-                            size - remaining,
-                            size,
+                            length - remaining,
+                            length,
                         )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
@@ -2545,19 +2591,18 @@ def register_resource_routes(
             if quoted == resolved.name
             else f"attachment; filename*=utf-8''{quoted}"
         )
-        headers = {
-            "Content-Length": str(size),
-            "Content-Disposition": disposition,
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-        }
-        if within is not None:
-            # The server refuses a bundle response without this: an older
-            # runner ignores the ``within`` query and answers unconfined.
-            headers["X-Omnigent-Within"] = "enforced"
+        headers.update(
+            {
+                "Content-Length": str(length),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            }
+        )
         return StreamingResponse(
             _chunks(),
-            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            status_code=206 if byte_range is not None else 200,
+            media_type=media_type,
             headers=headers,
         )
 

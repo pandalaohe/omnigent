@@ -12,9 +12,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
+import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
@@ -22,6 +27,7 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { useArtifactOpenRequest } from "@/hooks/useArtifactOpenRequest";
 import { useChildSessions } from "@/hooks/useChildSessions";
+import { useCodexPermissionReadback } from "@/hooks/useCodexPermissionReadback";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useRunnerHealthRegistration, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
@@ -34,8 +40,16 @@ import {
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
+} from "@/lib/nativeCodingAgents";
+import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
+import { CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS } from "@/lib/codexApprovalMode";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import type { Session } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 import { retrySession } from "@/lib/sessionsApi";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -439,7 +453,28 @@ export function GridSessionPane({
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <RenderErrorBoundary name="chat" resetKey={sessionId}>
-                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+                <SideChatPane
+                  childId={sessionId}
+                  fullSession
+                  readOnly={!canEdit}
+                  gridComposer={{
+                    leading: session && (
+                      <>
+                        {/* Status only; switching hosts stays in the full-screen view. */}
+                        <HostBadge sessionId={sessionId} appearance="composer" readOnly />
+                        <GridPermissionPicker
+                          session={session}
+                          permissionLevel={permissionLevel}
+                          unreachable={
+                            liveness.kind === "host_offline" || liveness.kind === "local_stranded"
+                          }
+                          runnerOffline={runnerOnline === false}
+                        />
+                      </>
+                    ),
+                    trailing: session && <GridHarnessStatus session={session} />,
+                  }}
+                />
               </RenderErrorBoundary>
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
@@ -570,5 +605,81 @@ export function GridSessionPane({
           )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
+  );
+}
+
+/** The cell session's permission mode; its owner can switch it as in the main composer. */
+function GridPermissionPicker({
+  session,
+  permissionLevel,
+  unreachable,
+  runnerOffline,
+}: {
+  session: Session;
+  permissionLevel: number | null;
+  /** Its host is offline and a message can't wake it, as in the main composer. */
+  unreachable: boolean;
+  runnerOffline: boolean;
+}) {
+  const state = useConversationEntryState(session.id);
+  const [busy, setBusy] = useState(false);
+  const kind = permissionChipKind(session);
+  const readback = useCodexPermissionReadback(
+    session,
+    session.id,
+    kind === "codex" && (permissionLevel === null || permissionLevel >= 1),
+    runnerOffline || unreachable,
+  );
+  if (kind === null) return null;
+  const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
+  const owner = isOwnerLevel(permissionLevel);
+  return (
+    <ComposerPermissionPicker
+      label="Permission mode"
+      value={readback?.value ?? (chip.label || "Permission mode")}
+      harness={state.sessionHarness}
+      selectedValue={readback ? readback.selectedValue : chip.value}
+      options={kind === "codex" ? CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS : chip.options}
+      disabledOptions={kind === "codex" ? ["read-only", "configured"] : undefined}
+      readback={readback}
+      disabled={!owner || unreachable || busy || (kind === "codex" && (runnerOffline || !readback))}
+      disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
+      onSelect={(mode) => {
+        const store = useChatStore.getState();
+        setBusy(true);
+        (kind === "codex"
+          ? store.setCodexApprovalMode(mode, session.id)
+          : store.setClaudePermissionMode(mode, session.id)
+        )
+          .catch((error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Unable to change permissions"),
+          )
+          .finally(() => setBusy(false));
+      }}
+    />
+  );
+}
+
+/** The cell session's harness, read-only; the model is shown and switched full screen. */
+function GridHarnessStatus({ session }: { session: Session }) {
+  const agent = nativeCodingAgentForHarness(session.harness);
+  const label = agent?.displayName ?? session.agentName ?? "Session";
+  return (
+    <span
+      title={label}
+      aria-label={label}
+      data-testid="grid-harness-status"
+      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
+    >
+      <ComposerAgentIcon
+        agent={{
+          name: agent?.agentName ?? session.agentName ?? "",
+          harness: agent?.harness ?? session.harness ?? null,
+        }}
+      />
+      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
+        {label}
+      </span>
+    </span>
   );
 }

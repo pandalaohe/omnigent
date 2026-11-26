@@ -18,6 +18,7 @@ import {
 } from "@/lib/keyboardShortcutPreferences";
 
 import { CTRL_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Glyphs for the chord `isModelPickerHotkey` matches; shown in control tooltips. */
 export const MODEL_PICKER_KEYS = [CTRL_KEY, SHIFT_KEY, "M"] as const;
@@ -33,12 +34,7 @@ export function isModelPickerHotkey(e: globalThis.KeyboardEvent): boolean {
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("openModelPicker")) return false;
   if (!hasCustomShortcutBindings("openModelPicker")) {
-    // Require Ctrl+Shift, and reject Cmd (macOS) and Alt so no ⌘/⌥ variant
-    // matches: ⌘⇧M is Chrome's profile switcher, ⌥ is the minimize-all family.
-    if (!e.ctrlKey || e.metaKey || !e.shiftKey || e.altKey) return false;
-    // Match the physical key, stable across layouts and Shift's uppercasing of
-    // e.key ("m" vs "M").
-    return e.code === "KeyM";
+    return matchesShortcut(e, "model.picker");
   }
   return eventMatchesShortcutAction(e, "openModelPicker");
 }

@@ -214,6 +214,7 @@ describe("WorkflowSessionDialog", () => {
     fireEvent.click(submit());
     await waitFor(() => expect(attached).toHaveBeenCalledTimes(2));
     expect(createSession).toHaveBeenCalledOnce();
+    expect(vi.mocked(createSession).mock.calls[0]![2]?.workflowId).toBeUndefined();
     expect(attached).toHaveBeenLastCalledWith({ id: "conv_run" }, editWorkflowPlanPrompt(WORKFLOW));
     expect(navigate).not.toHaveBeenCalled();
     expect(consumePendingInitialPrompt("conv_run")).toBeNull();
@@ -223,6 +224,21 @@ describe("WorkflowSessionDialog", () => {
   it("leaves a sandbox's durable planning prompt to the server", async () => {
     setHosts([]);
     localStorage.setItem("omnigent:last-host-choice", "sandbox");
+    const settings = { modelOverride: "reasoner", reasoningEffort: "minimal" };
+    localStorage.setItem(
+      CHOICES,
+      JSON.stringify({ create: { agentId: CODEX.id, settings: { [CODEX.id]: settings } } }),
+    );
+    setSandboxModels({
+      models: [
+        {
+          id: "reasoner",
+          displayName: "Reasoner",
+          isDefault: true,
+          supportedReasoningEfforts: [{ reasoningEffort: "minimal" }, { reasoningEffort: "high" }],
+        },
+      ],
+    });
     startedSession();
     const attached = vi.fn().mockResolvedValue(undefined);
     renderDialog(
@@ -230,8 +246,10 @@ describe("WorkflowSessionDialog", () => {
       { kind: "plan", workflow: WORKFLOW },
       attached,
     );
+    expect(screen.getByRole("radio", { name: "Minimal" })).toBeChecked();
     fireEvent.click(submit());
     await waitFor(() => expect(attached).toHaveBeenCalledWith({ id: "conv_run" }, null));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject(settings);
     expect(vi.mocked(createSession).mock.calls[0]![2]?.initialInput).toMatchObject({
       type: "message",
       data: { content: [{ type: "input_text", text: editWorkflowPlanPrompt(WORKFLOW) }] },
@@ -275,6 +293,17 @@ describe("WorkflowSessionDialog", () => {
       JSON.stringify({ host_2: ["/home/you/app"] }),
     );
     localStorage.setItem("omnigent:last-agent-id", CODEX.id);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "reasoner",
+          displayName: "Reasoner",
+          isDefault: true,
+          supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }],
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useHostModelOptions>);
     vi.mocked(createSession).mockResolvedValue({ id: "conv_run" } as Awaited<
       ReturnType<typeof createSession>
     >);
@@ -292,6 +321,8 @@ describe("WorkflowSessionDialog", () => {
     );
     expect(submit()).toBeEnabled();
 
+    expect(screen.queryByRole("radio", { name: "Max" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "High" }));
     fireEvent.change(instructions, { target: { value: "Run it on the flaky suite only." } });
     fireEvent.click(submit());
 
@@ -301,6 +332,7 @@ describe("WorkflowSessionDialog", () => {
       expect.anything(),
     );
     expect(createSession).toHaveBeenCalledWith(CODEX.id, [], {
+      workflowId: WORKFLOW.id,
       hostId: "host_2",
       workspace: "/home/you/app",
       labels: nativeWrapperLabelsForAgent(CODEX),
@@ -309,7 +341,7 @@ describe("WorkflowSessionDialog", () => {
         (mode) => mode.value === CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
       )?.args,
       modelOverride: undefined,
-      reasoningEffort: undefined,
+      reasoningEffort: "high",
       title: undefined,
     });
     expect(consumePendingInitialPrompt("conv_run")).toEqual({
@@ -637,6 +669,7 @@ describe("WorkflowSessionDialog", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
     expect(createSession).toHaveBeenCalledWith(CLAUDE_CODE.id, [], {
+      workflowId: WORKFLOW.id,
       sandbox: {
         provider: "daytona",
         workspaces: ["https://github.com/example/app#main"],

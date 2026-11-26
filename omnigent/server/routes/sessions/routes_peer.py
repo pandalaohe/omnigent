@@ -89,6 +89,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
 
 if TYPE_CHECKING:
@@ -801,13 +802,17 @@ def format_peer_back_notice(
     )
 
 
-class PeerSendRequest(BaseModel):
-    """Body of ``POST /sessions/{receiver_id}/peer-messages``."""
-
+class _PeerDeliveryRequest(BaseModel):
     sender_session_id: str = Field(min_length=1)
-    text: str = Field(min_length=1, max_length=16000)
+    text: str = Field(min_length=1, max_length=SESSION_MESSAGE_MAX_CHARS)
     correlation_id: str | None = Field(default=None, min_length=1, max_length=64)
     wait_seconds: int = Field(default=0, ge=0)
+
+
+class PeerSendRequest(_PeerDeliveryRequest):
+    """Body of ``POST /sessions/{receiver_id}/peer-messages``."""
+
+    text: str = Field(min_length=1, max_length=16000)
 
 
 class PeerActionRequest(BaseModel):
@@ -1381,7 +1386,7 @@ def register_peer_routes(
             from omnigent.server.peer_sweeper import PeerSweeper
 
             request = PeerSweeper._synthetic_request(receiver_id, app_state)
-        body = PeerSendRequest(
+        body = _PeerDeliveryRequest(
             sender_session_id=sender.id,
             text=text,
             correlation_id=correlation_id,
@@ -1436,7 +1441,7 @@ def register_peer_routes(
         request: Request,
         sender: Conversation,
         receiver_id: str,
-        body: PeerSendRequest,
+        body: _PeerDeliveryRequest,
         *,
         peer_id: str | None,
         deferred_until: int | None,

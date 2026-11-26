@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import {
   eventMatchesShortcutAction,
   hasCustomShortcutBindings,
@@ -27,8 +28,7 @@ export function isViewModeToggleHotkey(
   }
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("toggleViewMode")) return false;
   if (!hasCustomShortcutBindings("toggleViewMode")) {
-    if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
-    return event.code === "Backslash";
+    return matchesShortcut(event, "view.mode", { mac: isMac });
   }
   return eventMatchesShortcutAction(event, "toggleViewMode");
 }

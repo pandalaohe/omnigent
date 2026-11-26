@@ -49,6 +49,7 @@ from omnigent.host.frames import (
     CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_LONG_SESSION_MESSAGES,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -1283,6 +1284,10 @@ def create_hosts_router(
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
+                # False also when another replica holds the tunnel: unverified.
+                "long_session_messages_supported": bool(
+                    conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
+                ),
             }
             if (
                 harness_setup_enabled
@@ -1351,6 +1356,9 @@ def create_hosts_router(
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "capabilities": list(conn.hello.capabilities) if conn else [],
+            "long_session_messages_supported": bool(
+                conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
+            ),
             "runners": [],
             "supervised": conn.hello.supervised if conn else None,
             "started_at": conn.hello.started_at if conn else None,

@@ -1,9 +1,9 @@
 import { useEffect } from "react";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
@@ -14,7 +14,8 @@ import {
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
 
-const BROWSER_NEW_SESSION_CHORD: Chord = { mod: true, shift: true, key: "o" };
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
+
 const NATIVE_NEW_SESSION_CHORD: Chord = { mod: true, alt: true, code: "KeyN" };
 
 /** Use the platform default unless the person configured a binding. */
@@ -26,7 +27,9 @@ export function isNewSessionHotkey(
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("newSession")) return false;
   if (!hasCustomShortcutBindings("newSession")) {
-    return chordMatches(native ? NATIVE_NEW_SESSION_CHORD : BROWSER_NEW_SESSION_CHORD, e, isMac);
+    return native
+      ? chordMatches(NATIVE_NEW_SESSION_CHORD, e, isMac)
+      : matchesShortcut(e, "session.new", { mac: isMac, native });
   }
   return eventMatchesShortcutAction(e, "newSession");
 }

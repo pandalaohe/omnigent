@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from alembic import command
+from packaging.version import Version
 from sqlalchemy import Engine, inspect, text
 
 from omnigent.db.cockroachdb import (
@@ -36,6 +39,14 @@ def test_cockroachdb_bootstrap_is_at_head(db_uri: str) -> None:
     assert "ix_usage_events_domain_sequence" in {
         index["name"] for index in inspect(engine).get_indexes("usage_events")
     }
+
+
+def test_cockroachdb_server_matches_matrix_version(db_uri: str) -> None:
+    engine = _crdb_engine(db_uri)
+    expected = os.environ.get("OMNIGENT_TEST_CRDB_VERSION")
+    if not expected:
+        pytest.skip("requires OMNIGENT_TEST_CRDB_VERSION from the compatibility matrix")
+    assert _crdb_server_version(engine) == Version(expected)
 
 
 def test_cockroachdb_uses_read_committed(db_uri: str) -> None:

@@ -137,6 +137,9 @@ class InputExecutionClaim(BaseModel):
     delivery_attempt_id: str | None = Field(
         default=None, min_length=1, max_length=128, exclude_if=lambda value: value is None
     )
+    workflow_answer_digest: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", exclude_if=lambda value: value is None
+    )
 
 
 class InputExecutionReceipt(BaseModel):

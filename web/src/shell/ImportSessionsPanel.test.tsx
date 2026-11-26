@@ -76,6 +76,23 @@ describe("ImportSessionsPanel", () => {
     expect(screen.queryByTestId("import-submit")).toBeNull();
   });
 
+  it("renders each row as its Settings catalog entry, in the recent-sessions mode", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    for (const id of [
+      "import-machine",
+      "import-mode",
+      "import-harness",
+      "import-recent-count",
+      "import-run",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.querySelector('[data-settings-item="import-session-id"]')).toBeNull();
+  });
+
   it("keeps a large batch compact and points to the existing session list", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
@@ -110,12 +127,10 @@ describe("ImportSessionsPanel", () => {
     renderPanel();
 
     expect(screen.getByText(/How many recent sessions/)).toHaveClass("text-ui");
-    expect(
-      screen.queryByText(/The most recent sessions you opened in the harness/),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Recent sessions you opened in the harness/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("import-limit-help"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      /The most recent sessions you opened in the harness/,
+      /Recent sessions you opened in the harness/,
     );
   });
 

@@ -9,11 +9,13 @@ const {
 } = require("../src/browserActionScript.mjs");
 const { decodeLegacyBrowserAction } = require("../src/browserLegacyAction");
 const legacy = require("./fixtures/browserActions-v0.18.json");
+const { runInPage } = require("./browserInputFakes");
 
 it("translates the frozen v0.18 relay templates into validated actions", () => {
   for (const { action, args, script } of legacy.requests) {
     assert.deepEqual(decodeLegacyBrowserAction(script), { action, params: args });
-    assert.equal(buildBrowserActionScript(action, args), script);
+    // The snapshot has changed since v0.18; its frozen text is kept to recognize it.
+    if (action !== "snapshot") assert.equal(buildBrowserActionScript(action, args), script);
   }
 });
 
@@ -154,6 +156,27 @@ it("refuses hidden-pane snapshots without invalidating the prior snapshot", () =
     }
   });
 });
+
+it("keeps saved-login values out of snapshots that report ordinary form state", () => {
+  const dom = new JSDOM(
+    '<input data-omnigent-credential aria-label="Account" value="example-login">' +
+      '<input aria-label="Search" value="example-query">',
+    { runScripts: "outside-only" },
+  );
+  try {
+    const { window } = dom;
+    window.document.documentElement.setAttribute("data-omnigent-credential-watch", "");
+    for (const el of window.document.querySelectorAll("*")) {
+      el.getBoundingClientRect = () => ({ width: 100, height: 40 });
+    }
+    const { tree } = JSON.parse(window.eval(buildBrowserActionScriptForExecution("snapshot")));
+    assert.match(tree, /textbox "\[redacted\]"/);
+    assert.match(tree, /textbox "Search" \[value="example-query"\]/);
+    assert.doesNotMatch(tree, /example-login/);
+  } finally {
+    dom.window.close();
+  }
+});
 // oxlint-enable no-underscore-dangle
 
 it("accepts text and snapshot identifiers at their size limits", () => {
@@ -169,4 +192,29 @@ it("accepts text and snapshot identifiers at their size limits", () => {
     () => buildBrowserActionScript("click", { ref: 1, snapshot_id: "x".repeat(129) }),
     /snapshot_id must/,
   );
+});
+
+it("types nothing once main's deadline passes in a focus handler, when checked live", () => {
+  const dom = new JSDOM("<input id=q>", { url: "https://example.com", runScripts: "outside-only" });
+  try {
+    const { window } = dom;
+    const input = window.document.querySelector("#q");
+    const events = [];
+    for (const event of ["input", "change"])
+      input.addEventListener(event, () => events.push(event));
+    // runActionScript puts omnigentLive in scope; here a focus handler outlives the deadline.
+    let expired = false;
+    window.omnigentLive = () => {
+      if (expired) throw new Error("expired");
+    };
+    input.addEventListener("focus", () => {
+      expired = true;
+    });
+    const live = buildBrowserActionScript("type", { selector: "#q", text: "late" }, { live: true });
+    assert.throws(() => runInPage(window, live), /expired/);
+    assert.equal(input.value, "");
+    assert.deepEqual(events, []);
+  } finally {
+    dom.window.close();
+  }
 });

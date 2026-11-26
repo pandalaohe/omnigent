@@ -17,9 +17,9 @@ import {
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
 
-/** Editor/terminal surfaces that own their own keystrokes; the chord defers. */
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
-/** True for Cmd+Alt+T on Apple platforms or Ctrl+Alt+T elsewhere. */
+/** Match the configured new-shell shortcut. */
 export function isNewShellHotkey(e: globalThis.KeyboardEvent, _isMac = isMacPlatform()): boolean {
   // AltGr reports as Ctrl+Alt on Windows/Linux, so an ordinary AltGr+T
   // keystroke on an international layout would otherwise match this chord (and
@@ -28,7 +28,7 @@ export function isNewShellHotkey(e: globalThis.KeyboardEvent, _isMac = isMacPlat
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("newShell")) return false;
   if (!hasCustomShortcutBindings("newShell")) {
-    return e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "Backquote";
+    return matchesShortcut(e, "terminal.new");
   }
   return eventMatchesShortcutAction(e, "newShell");
 }

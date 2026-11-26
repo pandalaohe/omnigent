@@ -76,6 +76,7 @@ const mocks = vi.hoisted(() => ({
   bootFallback: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
+  advisorAvailable: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -128,6 +129,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
+          proactive_agent_available: mocks.advisorAvailable,
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -442,6 +444,8 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.advisorAvailable = false;
+  mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.realContextUsage = false;
@@ -533,6 +537,43 @@ it("scrolls to legacy child check-ins after mounting the target during same-page
   fireEvent.click(screen.getByRole("button", { name: "History back" }));
   const restored = await screen.findByRole("region", { name: "Check-ins" });
   await waitFor(() => expect(scrolled).toContain(restored));
+});
+
+describe("Omni Advisor", () => {
+  it("shows a settings load failure with a retry instead of dropping the switch", async () => {
+    mocks.advisorAvailable = true;
+    const loadAdvisor = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            workspace_enabled: true,
+            user_enabled: true,
+            enabled: true,
+            can_manage_workspace: false,
+          }),
+          { status: 200 },
+        ),
+      );
+    mocks.authenticatedFetch.mockImplementation(async (path: string) => {
+      if (path === "/v1/proactive-agent/settings") return loadAdvisor();
+      return new Response(JSON.stringify({ connections: [], preferences: { settings: {} } }), {
+        status: 200,
+      });
+    });
+    renderPage();
+
+    const group = await screen.findByTestId("settings-group-proactive-agent");
+    expect(await within(group).findByRole("alert")).toHaveTextContent(
+      "Couldn’t load Omni Advisor settings.",
+    );
+    expect(within(group).queryByRole("switch")).toBeNull();
+
+    fireEvent.click(within(group).getByRole("button", { name: "Retry" }));
+    expect(await within(group).findByRole("switch", { name: "Omni Advisor" })).toBeChecked();
+    expect(loadAdvisor).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("MCP settings", () => {

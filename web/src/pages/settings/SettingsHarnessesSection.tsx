@@ -307,7 +307,6 @@ export const SettingsHarnessesSection = () => {
                     entry={entry}
                     host={selectedHost}
                     canSetup={canSetup}
-                    installable={harnessInstallableOnHost(info, entry.harness, selectedHost)}
                     credentialKind={
                       selectedHost
                         ? credentialKinds[hostHarnessKey(selectedHost.host_id, entry.harness)]
@@ -654,14 +653,12 @@ function HarnessCard({
   entry,
   host,
   canSetup,
-  installable,
   credentialKind,
   onFix,
 }: {
   entry: HarnessEntry;
   host: Host | null;
   canSetup: boolean;
-  installable: boolean;
   credentialKind?: HarnessCredentialKind;
   onFix: (mode: HarnessFixMode) => void;
 }) {
@@ -690,7 +687,7 @@ function HarnessCard({
             />
           </div>
         </div>
-        {(status.ready || (needsAttention && canFix && (mode !== "install" || !installable))) && (
+        {(status.ready || (needsAttention && canFix && mode !== "install")) && (
           <Button
             size="icon-sm"
             variant="ghost"
@@ -706,7 +703,8 @@ function HarnessCard({
             <SettingsIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
           </Button>
         )}
-        {status.needsSetup && canFix && installable && mode === "install" && (
+        {/* The fix dialog falls back to manual setup steps when one-click install isn't available. */}
+        {status.needsSetup && canFix && mode === "install" && (
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
@@ -714,7 +712,7 @@ function HarnessCard({
     </>
   );
   const className =
-    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors";
+    "flex flex-col gap-2 rounded-xl border border-border bg-card p-4 transition-colors";
   return opensDetail ? (
     <Link
       to={`${agentSettingsPath(entry.harness, host?.host_id)}${status.ready ? "" : "&tab=settings"}`}

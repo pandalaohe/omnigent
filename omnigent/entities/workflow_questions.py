@@ -28,6 +28,11 @@ def workflow_elicitation_id(session_id: str, idempotency_key: str) -> str:
     return f"elicit_journal_{hashlib.sha256(key).hexdigest()[:32]}"
 
 
+def workflow_answer_input_id(elicitation_id: str) -> str:
+    """One delivery identity for an answer across reconnects and POST retries."""
+    return hashlib.sha256(f"workflow-answer:{elicitation_id}".encode()).hexdigest()[:32]
+
+
 def _option(raw: object, where: str) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise InvalidJournalEntryError(f"{where} must be an object with a label")

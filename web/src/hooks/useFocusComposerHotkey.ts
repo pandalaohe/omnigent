@@ -9,6 +9,7 @@
 // surface that owns its own keys (xterm terminals, the Monaco editor).
 
 import { useEffect, useRef } from "react";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 import {
   eventMatchesShortcutAction,
@@ -28,10 +29,7 @@ export function isFocusComposerHotkey(e: globalThis.KeyboardEvent): boolean {
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("focusComposer")) return false;
   if (!hasCustomShortcutBindings("focusComposer")) {
-    // Require Ctrl+Shift, and reject Cmd (macOS) and Alt so no ⌘/⌥ variant matches.
-    if (!e.ctrlKey || e.metaKey || !e.shiftKey || e.altKey) return false;
-    // Match the physical key, stable across layouts and Shift's uppercasing.
-    return e.code === "KeyL";
+    return matchesShortcut(e, "composer.focus");
   }
   return eventMatchesShortcutAction(e, "focusComposer");
 }

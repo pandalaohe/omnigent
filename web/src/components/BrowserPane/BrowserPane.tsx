@@ -68,6 +68,7 @@ import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 import { BrowserActivityStatus } from "./BrowserActivityStatus";
+import { OpenElsewhereHint } from "@/components/BrowserPane/agentTools/OpenElsewhereHint";
 
 /** Renderer CSS-pixel bounds pushed to the main process (converted to window
  *  DIPs there via the host zoom factor). */
@@ -985,8 +986,10 @@ export function BrowserPane({
         <div ref={containerRef} className="ml-1 min-h-0 min-w-0 flex-1" />
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
-          Enter a URL above to get started
-          {agentBrowser ? " — the agent will open pages here too." : "."}
+          <OpenElsewhereHint viewId={conversationId}>
+            Enter a URL above to get started
+            {agentBrowser ? " — the agent will open pages here too." : "."}
+          </OpenElsewhereHint>
         </div>
       )}
       {/* DialogContent mounts SuppressBrowserView, hiding the native view. */}

@@ -12,7 +12,8 @@ import {
 import { copyText } from "@/lib/clipboard";
 import { revealFile, supportsFileReveal } from "@/lib/nativeBridge";
 import { ApiError } from "@/lib/sessionsApi";
-import { revealLabel, useDesktopHostId } from "@/shell/RevealInFileManager";
+import { useDesktopHostId } from "@/lib/desktopHostId";
+import { revealLabel } from "@/shell/RevealInFileManager";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 
 const LABELS: Record<string, string> = {

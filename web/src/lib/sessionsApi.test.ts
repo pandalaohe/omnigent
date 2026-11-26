@@ -431,6 +431,7 @@ describe("createSession", () => {
     await createSession("agent_xyz", [], {
       projectId: "proj_tests",
       hostId: "host_1",
+      workflowId: "0123456789abcdef0123456789abcdef",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
       terminalLaunchArgs: ["--permission-mode", "plan"],
@@ -445,6 +446,7 @@ describe("createSession", () => {
       project_id: "proj_tests",
       git: null,
       host_id: "host_1",
+      workflow_id: "0123456789abcdef0123456789abcdef",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
       terminal_launch_args: ["--permission-mode", "plan"],
@@ -478,6 +480,7 @@ describe("createSession", () => {
       },
       initialInput: firstMessage,
       permissionTier: "plan",
+      workflowId: "0123456789abcdef0123456789abcdef",
     });
     await createSession("agent_xyz", [], { sandbox: { provider: null, workspaces: [] } });
 
@@ -498,6 +501,7 @@ describe("createSession", () => {
       host_id: "0123456789abcdef0123456789abcdef",
       initial_input: firstMessage,
       permission_tier: "plan",
+      workflow_id: "0123456789abcdef0123456789abcdef",
     });
     // No provider leaves the choice to the server; no repositories is an empty workspace.
     expect(bodies[1]).toEqual({
@@ -2701,6 +2705,25 @@ describe("approve", () => {
 });
 
 describe("importLocalSessions", () => {
+  it("sends the browser tools mode header on the import request", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(
+        mockNdjsonResponse([
+          JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+        ]),
+      );
+      await importLocalSessions("host_1", "all", 25);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/imports/local/stream");
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("streams each session through onSession and returns the final tally", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([

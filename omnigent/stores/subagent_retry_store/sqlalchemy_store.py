@@ -427,6 +427,8 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 if (
                     receipt.target_id != child_id
                     or receipt.kind not in {"human", "control"}
+                    or receipt.payload.get("workflow_answer_digest")
+                    != claim.workflow_answer_digest
                     or (
                         original_turn != claim.turn_id
                         and not (claim.kind == "recovery" and receipt.state == "closed")
@@ -487,6 +489,9 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             previous_generation = control.generation
             control.generation += 1
             control.turn_id, control.input_id = claim.turn_id, claim.input_id
+            payload: dict[str, Any] = {"native_floor": native_floor} if native_floor else {}
+            if claim.workflow_answer_digest is not None:
+                payload["workflow_answer_digest"] = claim.workflow_answer_digest
             receipt = SqlRetryInput(
                 input_id=claim.input_id,
                 chain_id=None,
@@ -494,7 +499,7 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 kind="human" if claim.turn_id is not None else "control",
                 attempt=0,
                 state="accepted",
-                payload={"native_floor": native_floor} if native_floor else {},
+                payload=payload,
                 version=0,
                 expected_input_generation=previous_generation,
                 turn_id=claim.turn_id,
@@ -534,7 +539,14 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 kind="human",
                 attempt=0,
                 state="reserved",
-                payload={"injection": True},
+                payload={
+                    "injection": True,
+                    **(
+                        {"workflow_answer_digest": claim.workflow_answer_digest}
+                        if claim.workflow_answer_digest is not None
+                        else {}
+                    ),
+                },
                 version=0,
                 expected_input_generation=control.generation,
                 turn_id=claim.turn_id,
@@ -551,6 +563,7 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             or receipt.chain_id is not None
             or receipt.kind != "human"
             or receipt.payload.get("injection") is not True
+            or receipt.payload.get("workflow_answer_digest") != claim.workflow_answer_digest
             or receipt.turn_id != claim.turn_id
         ):
             return InputExecutionReceipt(reason="input_identity_conflict")
@@ -612,7 +625,11 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 return InputExecutionReceipt(reason="stale_runner")
             receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
             if receipt is not None:
-                if receipt.target_id != child_id:
+                if (
+                    receipt.target_id != child_id
+                    or receipt.payload.get("workflow_answer_digest")
+                    != claim.workflow_answer_digest
+                ):
                     return InputExecutionReceipt(reason="input_identity_conflict")
                 if receipt.kind == "wake" and claim.kind != "wake":
                     return InputExecutionReceipt(reason="input_identity_conflict")
@@ -678,7 +695,11 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     kind="human" if claim.turn_id is not None else "control",
                     attempt=0,
                     state="closed",
-                    payload={},
+                    payload=(
+                        {"workflow_answer_digest": claim.workflow_answer_digest}
+                        if claim.workflow_answer_digest is not None
+                        else {}
+                    ),
                     version=0,
                     expected_input_generation=None,
                     turn_id=claim.turn_id,

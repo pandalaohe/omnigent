@@ -32,6 +32,8 @@ from tests.harnesses.codex_native.app_server._support import (
 _ROUTED_TOOL_APPROVALS = {
     "sys_session_get_history": {"approval_mode": "approve"},
     "sys_standing_approval_read": {"approval_mode": "approve"},
+    "sys_scheduled_task_create": {"approval_mode": "approve"},
+    "sys_scheduled_task_update": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_handover": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
@@ -65,7 +67,7 @@ def test_standing_approval_mutations_keep_native_review() -> None:
 # codex-native session boots on. A plain session must be indistinguishable from
 # a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
 # models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
-# one framework tool approval.
+# framework tool approvals.
 #
 # Every Smart Routing session — pinned harness or auto — adds the extended
 # catalog, the spawn gate and the routed-spawn approvals, because on this arm

@@ -1459,7 +1459,9 @@ export function AgentInfoContent({
   // the owner) to know they've granted access to anyone else or made it
   // public. Mirrors the author-label gate in ChatPage.
   const viewerOwnsSession = owner != null && owner === viewerId;
-  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionId ?? null) : null);
+  const { data: ownerGrants } = usePermissions(
+    viewerOwnsSession && sessionId ? { kind: "session", id: sessionId } : null,
+  );
   const isSessionShared = isSessionSharedWithOthers(owner ?? null, viewerId, ownerGrants);
   // The sidebar row already carries the keep-warm status; this surface reads
   // it from the same cache (backfilling the row if no list holds it) rather

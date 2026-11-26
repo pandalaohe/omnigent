@@ -1169,6 +1169,96 @@ async def test_bundle_entry_does_not_require_within_header(
     assert resp.content == body
 
 
+async def test_artifact_preserves_unsatisfiable_media_ranges_and_renders_full_panel_html(
+    client: httpx.AsyncClient,
+) -> None:
+    minted = await _mint(client)
+    runner = FastAPI()
+    document = b"<html><body>Complete document</body></html>"
+
+    @runner.get(_FS_ROUTE)
+    async def download(
+        request: Request, relative_path: str, within: str | None = None
+    ) -> Response:
+        if relative_path.endswith("legacy-clip.mp4"):
+            if request.headers.get("range"):
+                return Response(
+                    status_code=416,
+                    headers={"Content-Range": "bytes */12", "X-Omnigent-Within": "enforced"},
+                )
+            return Response(
+                b"full content",
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": "attachment; filename=movie.mp4",
+                    "X-Omnigent-Within": "enforced",
+                },
+            )
+        if relative_path.endswith("clip.mp4"):
+            assert within == "reports"
+            assert request.headers["range"] == "bytes=99-"
+            return Response(
+                status_code=416,
+                media_type="video/mp4",
+                headers={"Content-Range": "bytes */12", "X-Omnigent-Within": "enforced"},
+            )
+        if relative_path.endswith("media-alias.html"):
+            assert request.headers["range"] == "bytes=0-5"
+            return Response(
+                b"sample",
+                status_code=206,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": "attachment; filename=movie.mp4",
+                    "Content-Range": "bytes 0-5/12",
+                    "X-Omnigent-Within": "enforced",
+                },
+            )
+        if request.headers.get("range"):
+            return Response(
+                status_code=416,
+                media_type="text/html",
+                headers={
+                    "Content-Range": f"bytes */{len(document)}",
+                    "X-Omnigent-Within": "enforced",
+                },
+            )
+        return Response(
+            document,
+            media_type="text/html",
+            headers={
+                "Content-Disposition": "attachment; filename=index.html",
+                "X-Omnigent-Within": "enforced",
+            },
+        )
+
+    async with _use_runner(runner):
+        too_far = await client.get(
+            f"{minted['url'].rsplit('/', 1)[0]}/clip.mp4", headers={"Range": "bytes=99-"}
+        )
+        panel = await client.get(minted["url"], headers={"Range": "bytes=0-5"})
+        base = minted["url"].rsplit("/", 1)[0]
+        legacy = await client.get(f"{base}/legacy-clip.mp4", headers={"Range": "bytes=99-"})
+        media_alias = await client.get(f"{base}/media-alias.html", headers={"Range": "bytes=0-5"})
+        panel_alias = await client.get(f"{base}/panel-alias.mp4", headers={"Range": "bytes=99-"})
+
+    assert too_far.status_code == 416
+    assert too_far.headers["content-range"] == "bytes */12"
+    assert too_far.content == b""
+    assert legacy.status_code == 416
+    assert legacy.headers["content-range"] == "bytes */12"
+    assert legacy.headers["content-type"] == "video/mp4"
+    assert legacy.content == b""
+    assert panel.status_code == 200
+    assert "Complete document" in panel.text
+    assert "content-range" not in panel.headers
+    assert media_alias.status_code == 206
+    assert media_alias.headers["content-range"] == "bytes 0-5/12"
+    assert media_alias.content == b"sample"
+    assert panel_alias.status_code == 200
+    assert "Complete document" in panel_alias.text
+
+
 async def test_runner_offline_host_without_capability_is_bad_gateway(
     client: httpx.AsyncClient,
     app: FastAPI,

@@ -22,7 +22,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   eventMatchesShortcutAction,
   hasCustomShortcutBindings,
@@ -36,6 +35,7 @@ import {
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
 import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -144,7 +144,7 @@ function isShowShortcutsHotkey(event: KeyboardEvent): boolean {
     // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
     // trigger, so require the platform command modifier and no Shift/Alt to
     // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-    return hasCommandModifier(event) && !event.altKey && !event.shiftKey && event.key === "/";
+    return matchesShortcut(event, "shortcuts.show");
   }
   return eventMatchesShortcutAction(event, "showShortcuts");
 }

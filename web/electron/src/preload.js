@@ -291,6 +291,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
       }),
+  // Main checks a socket's owner before using it, which Windows can't report.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Send one workspace API call to a session host's socket, named by the
+         * server with a token: on this machine, or over SSH. `sshTarget` is an
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
+         * Resolves `{ status, headers, body }`.
+         * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         */
+        workspaceSocketRequest: (request) =>
+          ipcRenderer.invoke("omnigent:workspace-socket-request", request),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
@@ -430,7 +445,11 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
   browserScreenshot: (conversationId, opts) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+    ipcRenderer.invoke("omnigent:browser-screenshot", {
+      deadlineAt: opts?.deadlineAt,
+      conversationId,
+      opts,
+    }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
   browserFillSavedLogin: (viewId) =>
     ipcRenderer.invoke("omnigent:browser-fill-saved-login", viewId),
@@ -439,6 +458,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.invoke("omnigent:browser-fill-approvals:revoke", key),
   browserPerformAction: (conversationId, action, params, opts) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  // The agent browser tools' per-session tab records, kept in main (browserTabs.js).
+  browserTabs: (args) => ipcRenderer.invoke("omnigent:browser-tabs", args),
+  onBrowserTabsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("omnigent:browser-tabs-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:browser-tabs-changed", listener);
+  },
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js, opts) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
@@ -447,8 +473,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} [reason]
    */
-  browserClose: (conversationId, reason) =>
-    ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  browserClose: (conversationId, reason, opts) =>
+    ipcRenderer.invoke("omnigent:browser-close", {
+      conversationId,
+      reason,
+      deadlineAt: opts?.deadlineAt,
+      expectedNavs: opts?.expectedNavs,
+    }), // deadlineAt, expectedNavs
   getBrowserAccess: () => ipcRenderer.invoke("omnigent:browser-access:get"),
   setBrowserAccess: (access) => ipcRenderer.invoke("omnigent:browser-access:set", access),
   getBrowserLoginSetting: () => ipcRenderer.invoke("omnigent:browser-login-setting:get"),

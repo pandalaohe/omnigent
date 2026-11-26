@@ -1,6 +1,10 @@
 "use strict";
 
-const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const {
+  buildBrowserActionScript,
+  buildBrowserActionScriptForExecution,
+  LEGACY_SNAPSHOT_JS,
+} = require("./browserActionScript.mjs");
 
 // v0.18's relay embeds JSON literals in fixed templates. Remove this adapter in v0.21.
 const JSON_STRING = String.raw`"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"`;
@@ -11,9 +15,9 @@ const placeholders = {
   9007199254740991: "ref",
 };
 
-function legacyPattern(action, args) {
+function legacyPattern(build, action, args) {
   const seen = new Set();
-  const parts = buildBrowserActionScript(action, args).split(
+  const parts = build(action, args).split(
     /("__legacy_selector__"|"__legacy_snapshot_id__"|"__legacy_text__"|9007199254740991)/,
   );
   const pattern = parts.map((part) => {
@@ -23,32 +27,37 @@ function legacyPattern(action, args) {
     seen.add(key);
     return `(?<${key}>${key === "ref" ? "[0-9]+" : JSON_STRING})`;
   });
-  return { action, pattern: new RegExp(`^${pattern.join("")}$`) };
+  return { build, action, pattern: new RegExp(`^${pattern.join("")}$`) };
 }
 
-const patterns = ["click", "type"].flatMap((action) =>
-  [
-    { selector: "__legacy_selector__" },
-    { ref: Number.MAX_SAFE_INTEGER },
-    { ref: Number.MAX_SAFE_INTEGER, snapshot_id: "__legacy_snapshot_id__" },
-  ].map((args) =>
-    legacyPattern(action, action === "type" ? { ...args, text: "__legacy_text__" } : args),
+const patterns = [buildBrowserActionScript, buildBrowserActionScriptForExecution].flatMap((build) =>
+  ["click", "type"].flatMap((action) =>
+    [
+      { selector: "__legacy_selector__" },
+      { ref: Number.MAX_SAFE_INTEGER },
+      { ref: Number.MAX_SAFE_INTEGER, snapshot_id: "__legacy_snapshot_id__" },
+    ].map((args) =>
+      legacyPattern(build, action, action === "type" ? { ...args, text: "__legacy_text__" } : args),
+    ),
   ),
 );
 
 function decodeLegacyBrowserAction(script) {
   if (typeof script === "string" && script.length <= 2_000_000) {
-    if (script === buildBrowserActionScript("snapshot")) {
+    if (
+      script === LEGACY_SNAPSHOT_JS ||
+      script === buildBrowserActionScriptForExecution("snapshot")
+    ) {
       return { action: "snapshot", params: {} };
     }
-    for (const { action, pattern } of patterns) {
+    for (const { build, action, pattern } of patterns) {
       const match = pattern.exec(script);
       if (!match) continue;
       const params = Object.fromEntries(
         Object.entries(match.groups).map(([key, value]) => [key, JSON.parse(value)]),
       );
       // Validate data limits and require the complete canonical template; never evaluate input.
-      if (buildBrowserActionScript(action, params) === script) return { action, params };
+      if (build(action, params) === script) return { action, params };
     }
   }
   throw new Error("Unsupported legacy browser action; update the server UI");

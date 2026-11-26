@@ -79,7 +79,7 @@ export function useComposerConfigCycleHotkeys(
           ? "efforts"
           : null;
       const choices = section ? latest.current[section] : undefined;
-      if (!choices?.length) return;
+      if (!section || !choices?.length) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
       const focused = document.activeElement;
@@ -95,7 +95,7 @@ export function useComposerConfigCycleHotkeys(
         event.preventDefault();
         event.stopPropagation();
         choice.onSelect();
-        setPreviewRequest({ section: section! });
+        setPreviewRequest({ section });
         return;
       }
     };

@@ -372,7 +372,12 @@ describe("useBrowserAgentRelay — session tabs", () => {
       browserExecute: vi.fn(async (_id: string, js: string) => ({
         ok: true,
         result: js.includes("__omni_snapshot_id__ =")
-          ? JSON.stringify({ snapshot_id: "snapshot-second", tree: "- button [ref=1]" })
+          ? JSON.stringify({
+              snapshot_id: "snapshot-second",
+              tree: "- button [ref=1]",
+              title: "Second page",
+              url: "https://example.com/second",
+            })
           : "ok",
       })),
     });
@@ -395,8 +400,8 @@ describe("useBrowserAgentRelay — session tabs", () => {
       tabs: [
         {
           tab_id: "tab-first",
-          title: "First page",
-          url: "https://example.com/first",
+          title: "",
+          url: "",
           selected: false,
         },
         {
@@ -407,10 +412,6 @@ describe("useBrowserAgentRelay — session tabs", () => {
         },
       ],
     });
-    expect([
-      ...new Set(bridge.browserHasView.mock.calls.map((call: unknown[]) => call[0])),
-    ]).toEqual([browserViewId(CONV, "tab-first"), browserViewId(CONV, "tab-second")]);
-
     expect(await sendClaimed("click", { selector: "button.save" }, 2)).toMatchObject({ ok: true });
     expect(bridge.browserExecute).toHaveBeenLastCalledWith(
       browserViewId(CONV, "tab-second"),
@@ -953,7 +954,7 @@ describe("useBrowserAgentRelay — session tabs", () => {
       data: {
         tab_id: "blank",
         tabs: [
-          { tab_id: "loaded", title: "Loaded", url: "https://example.com", selected: false },
+          { tab_id: "loaded", title: "", url: "", selected: false },
           { tab_id: "blank", title: "", url: "", selected: true },
         ],
       },

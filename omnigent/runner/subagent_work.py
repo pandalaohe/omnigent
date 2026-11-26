@@ -1865,6 +1865,7 @@ async def _deliver_subagent_wake_post(
     notice: str,
     *,
     created_by: str | None = None,
+    workflow_answer_id: str | None = None,
 ) -> bool:
     """
     POST a sub-agent wake notice with a bounded retry on transient failure.
@@ -1882,20 +1883,26 @@ async def _deliver_subagent_wake_post(
     :param notice: The ``[System: ...]`` notice text to inject.
     :param created_by: Human actor that dispatched the completed child
         turn, if known.
+    :param workflow_answer_id: Late workflow answer to identify and verify on retry.
     :returns: ``True`` if a 2xx was confirmed, ``False`` if every attempt
         failed (transport error, timeout, or non-2xx response).
     """
     attribution_created_by = created_by
+    message = {"role": "user", "content": [{"type": "input_text", "text": notice}]}
+    if workflow_answer_id is not None:
+        from omnigent.entities.workflow_questions import workflow_answer_input_id
+
+        message.update(
+            workflow_answer=workflow_answer_id,
+            stable_id=workflow_answer_input_id(workflow_answer_id),
+        )
     for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
         try:
             resp = await server_client.post(
                 f"/v1/sessions/{parent_id}/events",
                 json={
                     "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": notice}],
-                    },
+                    "data": message,
                     **(
                         {"created_by": attribution_created_by}
                         if attribution_created_by is not None
@@ -1917,6 +1924,17 @@ async def _deliver_subagent_wake_post(
             # Treat a non-2xx RESPONSE (e.g. a genuine 503 JSONResponse) as a
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
+            if workflow_answer_id is not None:
+                try:
+                    receipt = resp.json()
+                except ValueError:
+                    return False
+                return (
+                    isinstance(receipt, dict)
+                    and receipt.get("denied") is not True
+                    and receipt.get("forwarded") is not False
+                    and (receipt.get("forwarded") is True or receipt.get("queued") is True)
+                )
             return True
         except (TimeoutError, httpx.HTTPError) as exc:
             if (

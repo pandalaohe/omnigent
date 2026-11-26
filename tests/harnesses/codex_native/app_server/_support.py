@@ -22,6 +22,8 @@ _PLAIN_TOOL_APPROVALS = {
     "sys_standing_approval_read": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_handover": {"approval_mode": "approve"},
+    "sys_scheduled_task_create": {"approval_mode": "approve"},
+    "sys_scheduled_task_update": {"approval_mode": "approve"},
 }
 
 

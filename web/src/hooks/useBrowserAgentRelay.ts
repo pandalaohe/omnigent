@@ -9,7 +9,6 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { buildBrowserActionScriptForExecution } from "../../electron/src/browserActionScript.mjs";
 import {
   emitBrowserActionClaimed,
   onBrowserActionRequest,
@@ -26,11 +25,18 @@ import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { beginBrowserActivity } from "@/lib/browserActivity";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
+import { loadOnce } from "@/lib/loadOnce";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { navigatesAgentBrowser } from "@/components/BrowserPane/agentTools/actionKinds";
+import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
+import { agentActionDeadlineBeforeClaim } from "@/components/BrowserPane/agentTools/deadline";
+import { browserAgentToolsActive } from "@/components/BrowserPane/agentTools/preferences";
 import type { Host } from "@/hooks/useHosts";
 import {
   AGENT_BROWSER_TAB_ID,
+  agentBrowserTabId,
   browserViewId,
+  browserViewOwnerId,
   createBrowserTab,
   isBrowserTabClosing,
   openAgentBrowserTab,
@@ -69,6 +75,7 @@ interface BrowserDesktopBridge {
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserHasView?: (viewId: string) => Promise<{
     exists: boolean;
+    elsewhere?: boolean;
     hostIsThisMachine?: boolean;
     url?: string;
     title?: string;
@@ -103,6 +110,16 @@ function getBrowserDesktop(): BrowserDesktopBridge | null {
 
 /** The shape the relay POSTs back to the server as the action `result`. Normalized
  *  so the backend/tool layer can branch on `ok` alone. */
+// Loaded only where there's a browser to drive (the desktop app), so the web
+// app never downloads them. The relay starts loading the actions when it
+// registers, so the first action needn't wait.
+const loadRelayActions = loadOnce(() => import("@/components/BrowserPane/agentTools/relayActions"));
+const loadActionScript = loadOnce(() => import("../../electron/src/browserActionScript.mjs"));
+
+/** What the agent hears when the app can't load the code to run its action. */
+export const RELAY_LOAD_ERROR =
+  "the desktop app couldn't load its browser tools (it may have been updated); reload the window and try again";
+
 interface ActionResult {
   ok: boolean;
   error?: string;
@@ -153,19 +170,22 @@ function resolveBrowserTarget(
   } else if (newTab === true) {
     const tabId = crypto.randomUUID();
     target = { tabId, viewId: browserViewId(conversationId, tabId), kind: "new" };
-  } else if (state.selected) {
-    target = {
-      tabId: state.selected,
-      viewId: browserViewId(conversationId, state.selected),
-      kind: "open",
-    };
   } else {
-    // Older shells can still have a reserved session view without a saved soft tab.
-    target = {
-      tabId: AGENT_BROWSER_TAB_ID,
-      viewId: conversationId,
-      kind: action === "navigate" ? "reserved" : "legacy",
-    };
+    const selected = browserAgentToolsActive() ? agentBrowserTabId(conversationId) : state.selected;
+    if (selected && state.tabs.includes(selected)) {
+      target = {
+        tabId: selected,
+        viewId: browserViewId(conversationId, selected),
+        kind: "open",
+      };
+    } else {
+      // Older shells can still have a reserved session view without a saved soft tab.
+      target = {
+        tabId: AGENT_BROWSER_TAB_ID,
+        viewId: conversationId,
+        kind: action === "navigate" ? "reserved" : "legacy",
+      };
+    }
   }
   if (isBrowserTabClosing(conversationId, target.tabId)) {
     return { ok: false, error: "tab_id is closing in this session" };
@@ -173,31 +193,20 @@ function resolveBrowserTarget(
   return target;
 }
 
-async function tabMetadata(
+function snapshotTabs(
   conversationId: string,
-  desktop: BrowserDesktopBridge,
   target: BrowserTarget,
-  pageExists = false,
-): Promise<{ tab_id: string; title: string; url: string; selected: boolean }[]> {
+  page?: Record<string, unknown>,
+): { tab_id: string; title: string; url: string; selected: boolean }[] {
   const state = readBrowserTabsState(conversationId);
   const tabIds =
-    pageExists && !state.tabs.includes(target.tabId) ? [...state.tabs, target.tabId] : state.tabs;
-  return Promise.all(
-    tabIds.map(async (tabId) => {
-      let metadata: { exists: boolean; url?: string; title?: string } | undefined;
-      try {
-        metadata = await desktop.browserHasView?.(browserViewId(conversationId, tabId));
-      } catch {
-        // A metadata lookup must not discard an otherwise valid page snapshot.
-      }
-      return {
-        tab_id: tabId,
-        title: metadata?.exists ? (metadata.title ?? "") : "",
-        url: metadata?.exists ? (metadata.url ?? "") : "",
-        selected: state.selected === tabId || (state.selected === null && tabId === target.tabId),
-      };
-    }),
-  );
+    page && !state.tabs.includes(target.tabId) ? [...state.tabs, target.tabId] : state.tabs;
+  return tabIds.map((tabId) => ({
+    tab_id: tabId,
+    title: tabId === target.tabId && typeof page?.title === "string" ? page.title : "",
+    url: tabId === target.tabId && typeof page?.url === "string" ? page.url : "",
+    selected: state.selected === tabId || (state.selected === null && tabId === target.tabId),
+  }));
 }
 
 /** Use the main-owned typed action and the legacy typed decoder on older desktops. */
@@ -214,6 +223,7 @@ async function performAction(
       : desktop.browserPerformAction(viewId, action, args);
   }
   if (desktop.browserExecute) {
+    const { buildBrowserActionScriptForExecution } = await loadActionScript();
     const script = buildBrowserActionScriptForExecution(action, args);
     return opts
       ? desktop.browserExecute(viewId, script, opts)
@@ -321,12 +331,12 @@ async function dispatch(
         return await capture();
       }
       case "snapshot": {
-        const snapshotFailure = async (error: string): Promise<ActionResult> => ({
+        const snapshotFailure = (error: string): ActionResult => ({
           ok: false,
           error,
           data: {
             tab_id: target.tabId,
-            tabs: await tabMetadata(conversationId, desktop, target),
+            tabs: snapshotTabs(conversationId, target),
           },
         });
         const r = await performAction(
@@ -345,7 +355,7 @@ async function dispatch(
             data: {
               ...parsed,
               tab_id: target.tabId,
-              tabs: await tabMetadata(conversationId, desktop, target, true),
+              tabs: snapshotTabs(conversationId, target, parsed),
             },
           };
         } catch (e) {
@@ -454,24 +464,31 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
   useEffect(() => {
     if (!relayEnabled) return;
     if (!supportsBrowser()) return;
+    void loadRelayActions().catch(() => {}); // Retried, and reported, per action.
 
     let cancelled = false;
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
       if (!desktop) return; // no browser-capable shell — nothing to claim
-      // Saved soft tabs can be shared by windows; only the native view's window
-      // may claim an explicitly targeted action. A failed probe leaves it alone.
+      // A same-server window can route to another window's view through main.
+      // Only tab management can act on a confirmed blank tab.
       if (evt.args.tab_id !== undefined) {
         const tabId = evt.args.tab_id;
         if (typeof tabId !== "string" || !validBrowserTabId(tabId)) return;
         try {
           const view = await desktop.browserHasView?.(browserViewId(sourceConversationId, tabId));
-          if (cancelled || !view?.exists) return;
+          const tabManagement = evt.action === "tabs" && browserAgentToolsActive();
+          if (cancelled || !view || (!view.exists && !view.elsewhere && !tabManagement)) return;
         } catch {
           return;
         }
       }
+      // Usually loaded already. Before the deadline: the server's wait starts
+      // at the claim, so loading mustn't eat into the action's time.
+      const actions = await loadRelayActions().catch(() => null);
+      // The server's wait starts when it takes the claim, after this.
+      const deadlineAt = agentActionDeadlineBeforeClaim();
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
@@ -496,14 +513,33 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
         });
         return;
       }
+      if (evt.args.tab_id !== undefined && browserAgentToolsActive()) {
+        try {
+          await loadTabs(sourceConversationId);
+        } catch {
+          await postResult(sourceConversationId, evt.actionId, claimToken, {
+            ok: false,
+            error: "couldn't read this session's browser tabs",
+          });
+          return;
+        }
+      }
+      if (cancelled) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "browser relay context changed",
+        });
+        return;
+      }
       const target = resolveBrowserTarget(sourceConversationId, evt.action, evt.args);
       if ("ok" in target) {
         await postResult(sourceConversationId, evt.actionId, claimToken, target);
         return;
       }
-      const needsHostRevalidation = ["screenshot", "snapshot", "click", "type"].includes(
-        evt.action,
-      );
+      // browser_tabs can open a URL, so it establishes provenance too.
+      const navigates = navigatesAgentBrowser(evt.action);
+      // Every action but a navigation reads or drives the page already open.
+      const needsHostRevalidation = evt.action !== "navigate";
       let privilegedView = true;
       if (needsHostRevalidation && desktop.browserHasView) {
         try {
@@ -515,7 +551,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       }
       const revalidateHost = needsHostRevalidation && privilegedView;
       const sourceHostId =
-        evt.action === "navigate" || revalidateHost
+        navigates || revalidateHost
           ? await fetchSessionHostId(sourceConversationId, { queryClient })
           : null;
       const readHostOptions = revalidateHost
@@ -580,7 +616,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       }
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
-        evt.action === "navigate" && sourceHostId !== null
+        navigates && sourceHostId !== null
           ? queryClient
               .getQueriesData<Host[]>({ queryKey: ["hosts"] })
               .flatMap(([, rows]) => rows ?? [])
@@ -588,21 +624,64 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
                 (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
               )
           : false;
+      const dispatchForView = (
+        viewId: string,
+        action: string,
+        args: Record<string, unknown>,
+        bridge: BrowserDesktopBridge,
+        hostId: string | null,
+        rememberedHostId: string | null,
+        sourceIsManagedHost: boolean,
+        hostOptions?: BrowserHostOptions,
+      ) => {
+        if (browserViewOwnerId(viewId) !== sourceConversationId) {
+          return Promise.resolve({ ok: false, error: "tab_id is not in this session" });
+        }
+        const actualTarget: BrowserTarget =
+          viewId === target.viewId
+            ? target
+            : {
+                tabId:
+                  viewId === sourceConversationId
+                    ? AGENT_BROWSER_TAB_ID
+                    : viewId.slice(viewId.lastIndexOf(":") + 1),
+                viewId,
+                kind: "open",
+              };
+        if (isBrowserTabClosing(sourceConversationId, actualTarget.tabId)) {
+          return Promise.resolve({ ok: false, error: "tab_id is closing in this session" });
+        }
+        return dispatch(
+          sourceConversationId,
+          actualTarget,
+          action,
+          args,
+          bridge,
+          hostId,
+          rememberedHostId,
+          sourceIsManagedHost,
+          hostOptions,
+        );
+      };
+      const agentDispatch = (hostId: string | null, hostOptions?: BrowserHostOptions) =>
+        actions === null
+          ? Promise.resolve({ ok: false, error: RELAY_LOAD_ERROR })
+          : actions.dispatchAgentBrowserAction(
+              dispatchForView,
+              sourceConversationId,
+              evt.action,
+              evt.args,
+              desktop,
+              hostId,
+              rememberedArcaHostId,
+              sourceIsArcaHost,
+              { deadlineAt, readHostOptions: hostOptions, targetViewId: target.viewId },
+            );
       const finishActivity = beginBrowserActivity(target.viewId);
       try {
         let result = cancelled
           ? { ok: false, error: "browser relay context changed" }
-          : await dispatch(
-              sourceConversationId,
-              target,
-              evt.action,
-              evt.args,
-              desktop,
-              sourceHostId,
-              rememberedArcaHostId,
-              sourceIsArcaHost,
-              readHostOptions,
-            );
+          : await agentDispatch(sourceHostId, readHostOptions);
         if (
           !cancelled &&
           needsHostRevalidation &&
@@ -614,17 +693,10 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           const currentHostId = await fetchSessionHostId(sourceConversationId, { queryClient });
           result = cancelled
             ? { ok: false, error: "browser relay context changed" }
-            : await dispatch(
-                sourceConversationId,
-                target,
-                evt.action,
-                evt.args,
-                desktop,
-                currentHostId,
-                rememberedArcaHostId,
-                sourceIsArcaHost,
-                { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId: currentHostId },
-              );
+            : await agentDispatch(currentHostId, {
+                sessionHostProtocol: SESSION_HOST_PROTOCOL,
+                sourceHostId: currentHostId,
+              });
         }
         await postResult(sourceConversationId, evt.actionId, claimToken, result);
       } finally {

@@ -50,6 +50,7 @@ from omnigent.server.builtin_agent_prompts import (
 )
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.custom_agent_bundles import project_members
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_IDS
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -548,9 +549,10 @@ def create_builtin_agents_router(
         is the last row the server read, which may not be in ``data``.
 
         Packaged built-ins the deployment suppressed via
-        ``OMNIGENT_SEEDED_AGENTS`` are filtered out after the store page is
-        read, so ``first_id``, ``last_id`` and ``has_more`` describe the rows
-        read, not the rows returned. A page can hold fewer than ``limit`` rows,
+        ``OMNIGENT_SEEDED_AGENTS``, and the built-in proactive agent, are
+        filtered out after the store page is read, so ``first_id``,
+        ``last_id`` and ``has_more`` describe the rows read, not the rows
+        returned. A page can hold fewer than ``limit`` rows,
         or none; keep following ``last_id`` while ``has_more`` is true.
         Suppressing hides a row without deleting it, so a session already
         bound to one keeps working.
@@ -578,7 +580,8 @@ def create_builtin_agents_router(
                     data=[
                         _to_agent_object(a, agent_cache)
                         for a in page.data
-                        if a.name not in suppressed
+                        # The proactive agent runs only from its hidden tasks.
+                        if a.name not in suppressed and a.id not in PROACTIVE_AGENT_IDS
                     ],
                     first_id=page.first_id,
                     last_id=page.last_id,

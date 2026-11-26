@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlSessionJournalEntry
+from omnigent.entities.workflow_questions import workflow_answer_input_id, workflow_elicitation_id
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -95,6 +101,12 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
         ORCHESTRATION_SOURCE_HEADER: session_id,
         RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_TOKEN,
     }
+
+
+def _oversized_description() -> str:
+    """CJK noise within the 2,000-character limit whose stored form is over 2,000 bytes."""
+    noise = random.Random(0)
+    return "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
 
 
 def _write(kind: str, content: dict[str, object], key: str, **fields: object) -> dict[str, object]:
@@ -380,7 +392,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
     assert written[0]["content"]["version"] == 1
     assert written[0]["content"]["name"] == "Cut GET /orders p95 by 20%"
     assert written[0]["author"] == {"type": "agent"} and written[0]["step"] is None
-    assert written[2]["content"] == {"status": "done", "text": "p95 430 ms"}
+    assert written[2]["content"] == {
+        "status": "done",
+        "text": "p95 430 ms",
+        "graph_revision": written[0]["content"]["graph_revision"],
+    }
 
     retried = await client.post(
         url, json=_write("note", {"body": "again"}, "tool:4"), headers=_runner(session_id)
@@ -400,6 +416,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
         url, params={"order": "asc", "after": written[1]["id"]}, headers=_headers()
     )
     assert [entry["position"] for entry in caught_up.json()["data"]] == [2, 3]
+    # Newest first after an entry, one entry: the one just before it, which places it.
+    preceding = await client.get(
+        url, params={"order": "desc", "after": written[2]["id"], "limit": 1}, headers=_headers()
+    )
+    assert [entry["position"] for entry in preceding.json()["data"]] == [1]
     current = await client.get(
         url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers()
     )
@@ -562,12 +583,25 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
                 "k",
             ),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
         ),
         (
             _write("plan", {"steps": [{"id": "a", "name": "A"}]}, "k"),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
+        ),
+        (
+            _write(
+                "plan",
+                {
+                    "name": "A",
+                    "steps": [{"id": "a", "name": "A"}],
+                    "description": _oversized_description(),
+                },
+                "k",
+            ),
+            400,
+            "stored bytes; the limit is 2000",
         ),
         (_write("dispatch", {"dispatch_id": "x"}, "k"), 422, "kind"),
         (
@@ -585,6 +619,23 @@ async def test_invalid_entries_are_refused_without_writing(
     resp = await client.post(url, json=body, headers=_runner(session_id))
     assert resp.status_code == status, resp.text
     assert reason in resp.text
+    assert (await client.get(url, headers=_headers())).json()["data"] == []
+
+
+async def test_a_proposed_description_that_isnt_unicode_is_refused_without_writing(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    plan = {"name": "A", "steps": [{"id": "a", "name": "A"}], "description": "\ud800"}
+    # ASCII JSON can carry an escaped lone surrogate that no UTF-8 text holds.
+    resp = await client.post(
+        url,
+        content=json.dumps(_write("plan", plan, "k")).encode("ascii"),
+        headers={**_runner(session_id), "content-type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "description must be valid Unicode text" in resp.text
     assert (await client.get(url, headers=_headers())).json()["data"] == []
 
 
@@ -698,8 +749,11 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
             {"id": "nightly", "name": "Get the nightly build green", "depends_on": []},
             {"id": "ship", "name": "Ship", "depends_on": ["nightly"]},
         ],
+        # A workflow planning chat's proposal also carries the description Save plan stores.
+        "description": "Gets the nightly build green, then ships it.",
     }
     assert (await run("sys_journal_write_plan", replan))["version"] == 2
+    assert published[-1][1]["entry"]["content"]["description"] == replan["description"]
     early = await run("sys_journal_write_status", {"status": "started", "step": "ship"})
     assert early["error"].startswith("step_not_ready: ship waits on nightly, not done yet")
     await run(
@@ -767,6 +821,155 @@ _ONE_TASK_PLAN = {
     "name": "Ship it",
     "steps": [{"id": "deploy", "name": "Deploy to prod", "depends_on": []}],
 }
+
+
+async def test_late_workflow_answer_replay_after_runner_acceptance(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
+    session_id = _session(db_uri)
+    forwarded = _stub_late_runner_bind(monkeypatch)
+    answer_id = workflow_elicitation_id(session_id, "tool:test")
+    stable_id = workflow_answer_input_id(answer_id)
+    body = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "The user chose the first option."}],
+            "workflow_answer": answer_id,
+            "stable_id": stable_id,
+        },
+    }
+    events = f"/v1/sessions/{session_id}/events"
+    response = await client.post(events, json=body, headers=_runner(session_id))
+    assert response.status_code == 202, response.text
+    assert response.json()["forwarded"] is True
+    [(path, sent)] = forwarded["posts"]
+    assert path == f"/v1/sessions/{session_id}/events"
+    assert sent["input_admission_required"] is True
+    assert sent["input_id"] == stable_id
+
+    accepted = await client.post(
+        f"/v1/sessions/{session_id}/input-admission",
+        headers=_runner(session_id),
+        json={
+            "input_id": stable_id,
+            "turn_id": "workflow-answer-turn",
+            "workflow_answer_digest": sent["workflow_answer_digest"],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["state"] == "accepted", accepted.text
+
+    # The caller can lose the first acknowledgement and replay the same POST.
+    replay = await client.post(events, json=body, headers=_runner(session_id))
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == {"queued": True, "forwarded": True}
+    amended = {
+        **body,
+        "data": {
+            **body["data"],
+            "content": [{"type": "input_text", "text": "The user chose the second option."}],
+        },
+    }
+    different = await client.post(events, json=amended, headers=_runner(session_id))
+    assert different.status_code == 409, different.text
+    assert len(forwarded["posts"]) == 1
+    assert SqlAlchemyConversationStore(db_uri).get_item(session_id, stable_id) is not None
+
+
+async def test_late_workflow_answer_cannot_reuse_an_ordinary_admission(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    answer_id = workflow_elicitation_id(session_id, "tool:test")
+    stable_id = workflow_answer_input_id(answer_id)
+    headers = _runner(session_id)
+    accepted = await client.post(
+        f"/v1/sessions/{session_id}/input-admission",
+        headers=headers,
+        json={"input_id": stable_id, "turn_id": "ordinary-turn"},
+    )
+    assert accepted.status_code == 200 and accepted.json()["state"] == "accepted"
+    collision = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        headers=headers,
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "An answer."}],
+                "workflow_answer": answer_id,
+                "stable_id": stable_id,
+            },
+        },
+    )
+    assert collision.status_code == 409, collision.text
+
+
+async def test_replayed_workflow_answer_does_not_confirm_an_in_flight_native_forward(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.helpers import _NativeTerminalEnsureOutcome
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _session(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.update_conversation(session_id, harness_override="codex-native")
+    conversations.set_labels(
+        session_id, {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"}
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    answer_id = workflow_elicitation_id(session_id, "tool:test")
+    body = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "An answer."}],
+            "workflow_answer": answer_id,
+            "stable_id": workflow_answer_input_id(answer_id),
+        },
+    }
+
+    async def runner(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await release.wait()
+        return httpx.Response(503, json={"error": "not received"})
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        routes_events, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+    events = f"/v1/sessions/{session_id}/events"
+    headers = _runner(session_id)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as relay:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=relay))
+        monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=relay))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=relay),
+        )
+        first = asyncio.create_task(client.post(events, json=body, headers=headers))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            replay = await asyncio.wait_for(client.post(events, json=body, headers=headers), 3)
+            assert replay.status_code == 202, replay.text
+            assert replay.json()["forwarded"] is False
+        finally:
+            release.set()
+            refused = await asyncio.wait_for(first, timeout=5)
+    assert refused.status_code == 502, refused.text
+    assert not pending_inputs.has_pending(session_id)
 
 
 @pytest.mark.parametrize("origin", ["interactive", "automation_source", "interactive_worker"])
@@ -837,7 +1040,13 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     # The task waits for the user, its status the question.
     entry = published[-1]["entry"]
     assert entry["step"] == "deploy"
-    assert entry["content"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
+    plan = session_journal_store.SessionJournalStore(db_uri).current_plan(session_id)
+    assert plan is not None
+    assert entry["content"] == {
+        "status": "needs_input",
+        "text": "Approve the deploy to prod?",
+        "graph_revision": plan.content["graph_revision"],
+    }
 
     while not pending_approvals.resolve(
         event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
@@ -1276,6 +1485,44 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
         ("explore", "done")
     ]
 
+    # Old journals have no revision metadata, but still have plan chronology.
+    legacy_content = {
+        key: value for key, value in first_plan.content.items() if key != "graph_revision"
+    }
+    with sa.create_engine(db_uri).begin() as connection:
+        connection.execute(
+            sa.update(SqlSessionJournalEntry)
+            .where(SqlSessionJournalEntry.id == first_plan.id)
+            .values(content=SessionJournalStore(db_uri)._stored_contents([legacy_content])[0])
+        )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
+    SessionJournalStore(db_uri).append(
+        first,
+        "plan",
+        {**plan, "name": "Renamed triage"},
+        idempotency_key="legacy-save",
+        start_run=False,
+    )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
+
+    journal_url = f"/v1/sessions/{first}/journal"
+    latest = await client.get(
+        journal_url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers(ALICE)
+    )
+    assert latest.json()["data"][0]["content"]["graph_revision"] == first_plan.position
+    unchanged = await client.post(
+        journal_url,
+        json=_write("plan", plan, "legacy-post-save"),
+        headers=_runner(first),
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["content"]["graph_revision"] == first_plan.position
+    assert SessionJournalStore(db_uri).current_plan(first).content["graph_revision"] is None
+
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)
     for _ in range(60):
@@ -1325,14 +1572,40 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert bad.status_code == 400
 
     journal = SessionJournalStore(db_uri)
-    # Editing the current plan retains its run; another workflow supersedes it.
-    journal.append(first, "plan", plan, idempotency_key="replan")
+    # A replan can add work after the original final step is done.
+    journal.append(
+        first, "status", {"status": "done", "text": "Fixed"}, idempotency_key="fixed", step="fix"
+    )
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    journal.append(first, "plan", {**plan, "steps": expanded_steps}, idempotency_key="replan")
+    journal.append(
+        first, "status", {"status": "started"}, idempotency_key="publishing", step="publish"
+    )
     page = (await client.get(url, headers=_headers(ALICE))).json()
-    assert next(run for run in page["data"] if run["id"] == first_plan.id)["is_current"]
+    original = next(run for run in page["data"] if run["id"] == first_plan.id)
+    assert original["is_current"]
+    assert original["plan_graph_revision"] == journal.current_plan(first).content["graph_revision"]
+    assert [step["id"] for step in original["steps"]] == ["explore", "fix", "publish"]
+    assert original["progress"] == {
+        "total": 3,
+        "started": 1,
+        "done": 2,
+        "needs_input": 0,
+        "failed": 0,
+    }
+    assert [(s["step"], s["content"]["status"]) for s in original["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     journal.append(first, "plan", plan, idempotency_key="another-run", workflow_id=workflow_id)
     page = (await client.get(url, headers=_headers(ALICE))).json()
     first_runs = [run for run in page["data"] if run["session_id"] == first]
     assert [run["is_current"] for run in first_runs] == [True, False]
+    assert [step["id"] for step in first_runs[0]["steps"]] == ["explore", "fix"]
+    assert first_runs[0]["statuses"] == []
+    assert first_runs[1]["steps"] == original["steps"]
+    assert first_runs[1]["statuses"] == original["statuses"]
     journal.append(
         first, "plan", plan, idempotency_key="another-workflow", workflow_id=uuid.uuid4().hex
     )
@@ -1348,7 +1621,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
 @pytest.mark.parametrize(
     "supersede_at", ["before_dispatch", "runner_lookup", "sdk_routing", "native_dispatch"]
 )
-async def test_an_automations_runs_list_the_steps_of_their_first_plans(
+async def test_an_automations_runs_list_the_steps_of_their_latest_plans(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1452,10 +1725,27 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
         == run_ids[0]
     )
 
-    replan = _write("plan", {"name": "Triage", "steps": steps}, "tool:replan")
-    assert (await client.post(url, json=replan, headers=_runner(planned))).status_code == 200
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    for body in (
+        _write("status", {"status": "done", "text": "Fixed"}, "tool:fixed", step="fix"),
+        _write("plan", {"name": "Triage", "steps": expanded_steps}, "tool:replan"),
+        _write("status", {"status": "started"}, "tool:publishing", step="publish"),
+    ):
+        response = await client.post(url, json=body, headers=_runner(planned))
+        assert response.status_code == 200, response.text
     runs_url = f"/v1/scheduled-tasks/{task.id}/run-steps"
-    assert (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]["is_current"]
+    shown = (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]
+    assert shown["is_current"]
+    assert shown["plan_id"] == plan_id
+    latest_plan = session_journal_store.SessionJournalStore(db_uri).current_plan(planned)
+    assert latest_plan is not None
+    assert shown["plan_graph_revision"] == latest_plan.content["graph_revision"]
+    assert [step["id"] for step in shown["steps"]] == ["explore", "fix", "publish"]
+    assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     current = await client.post(events_url, json=action, headers=_headers(ALICE))
     assert current.status_code == 202, current.text
 
@@ -1525,6 +1815,6 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [(s["step"], s["content"]["status"]) for s in runs[0]["statuses"]] == [
         ("explore", "started")
     ]
-    assert [(s["step"], s["content"]["status"]) for s in runs[1]["statuses"]] == [
-        ("explore", "done")
-    ]
+    assert runs[1]["plan_id"] == plan_id
+    assert runs[1]["steps"] == shown["steps"]
+    assert runs[1]["statuses"] == shown["statuses"]

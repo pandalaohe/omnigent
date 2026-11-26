@@ -847,7 +847,9 @@ def register_artifact_routes(
     permission_store: PermissionStore | None,
     _authorize_browse_read: Callable[[str, Request | None, str], Awaitable[Conversation]],
     _authorize_absolute_browse: Callable[[Conversation, str], Awaitable[str]],
-    _stream_download_from_runner: Callable[[Request, str, Conversation, str], Awaitable[Response]],
+    _stream_download_from_runner: Callable[
+        [Request, str, Conversation, str, bool], Awaitable[Response]
+    ],
     _read_workspace_via_host: Callable[..., Awaitable[dict[str, Any] | None]],
     _runner_path_segment: Callable[..., str],
     comment_store: CommentStore | None = None,
@@ -1201,28 +1203,57 @@ def register_artifact_routes(
             serve the target (the caller falls back to the host).
         """
         runner_path = _artifact_runner_url(session_id, claims, relpath, sub_resource=sub_resource)
-        runner_response = await _stream_download_from_runner(
-            request, session_id, conv, runner_path
-        )
-        if not isinstance(runner_response, _RunnerStreamResponse):
-            # The download proxy forwards the runner's own error body. A
-            # missing file or directory target is a 404; every other runner
-            # failure (or a stale session binding) is a gateway fault.
-            if runner_response.status_code in (400, 404):
-                return _error_page(404, _NOT_FOUND_SENTENCE)
-            return _error_page(502, _LOAD_FAILED_SENTENCE)
-        upstream = runner_response.upstream
-        if sub_resource and upstream.headers.get("x-omnigent-within") != "enforced":
-            # An older runner ignores ``within`` and would serve unconfined.
+        panel = claims.view in ("p", "h")
+        untyped_range_error: Response | None = None
+        for honor_range in (True, False):
+            runner_response = await _stream_download_from_runner(
+                request, session_id, conv, runner_path, honor_range
+            )
+            if not isinstance(runner_response, _RunnerStreamResponse):
+                if runner_response.status_code in (400, 404):
+                    return _error_page(404, _NOT_FOUND_SENTENCE)
+                return _error_page(502, _LOAD_FAILED_SENTENCE)
+            upstream = runner_response.upstream
+            if sub_resource and upstream.headers.get("x-omnigent-within") != "enforced":
+                # An older runner ignores ``within`` and would serve unconfined.
+                await upstream.aclose()
+                return _error_page(502, _RUNNER_NEEDS_UPDATE_SENTENCE)
+            actual_type = upstream.headers.get("content-type")
+            content_type = actual_type or _guess_media_type(relpath)
+            render_document = panel and _is_html(content_type)
+            if untyped_range_error is not None and not render_document:
+                await upstream.aclose()
+                _apply_stream_headers(request, untyped_range_error, content_type)
+                return untyped_range_error
+            if (
+                honor_range
+                and upstream.status_code in (206, 416)
+                and (render_document or (panel and not actual_type))
+            ):
+                # Panel transforms require a whole document. Older runners
+                # may also omit the resolved file's type on a 416.
+                if upstream.status_code == 416 and not actual_type:
+                    untyped_range_error = Response(
+                        status_code=416, headers=dict(runner_response.headers)
+                    )
+                await upstream.aclose()
+                continue
+            break
+        if render_document and upstream.status_code != 200:
             await upstream.aclose()
-            return _error_page(502, _RUNNER_NEEDS_UPDATE_SENTENCE)
-        content_type = upstream.headers.get("content-type") or _guess_media_type(relpath)
+            return _error_page(502, _LOAD_FAILED_SENTENCE)
+        if upstream.status_code == 416:
+            _apply_stream_headers(request, runner_response, content_type)
+            return runner_response
         content_length = _content_length(upstream.headers.get("content-length"))
+        if upstream.status_code == 206 and content_length is None:
+            await upstream.aclose()
+            return _error_page(502, _LOAD_FAILED_SENTENCE)
         max_bytes = artifact_max_bytes()
         if content_length is not None and content_length > max_bytes:
             await upstream.aclose()
             return _too_large_page(max_bytes)
-        if content_length is None or (claims.view in ("p", "h") and _is_html(content_type)):
+        if content_length is None or render_document:
             try:
                 body = await _read_stream_bounded(upstream, max_bytes)
             except httpx.HTTPError:

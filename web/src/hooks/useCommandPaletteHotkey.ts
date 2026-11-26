@@ -19,7 +19,8 @@ import {
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Monaco: ⌘K and Ctrl+K are both chord prefixes, on every platform. */
 const CHORD_PREFIX_SURFACE = ".monaco-editor";
@@ -39,7 +40,7 @@ export function isCommandPaletteHotkey(
   // Match the letter, not a physical code — ⌘ doesn't remap "k" across layouts.
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("commandPalette")) return false;
   if (!hasCustomShortcutBindings("commandPalette")) {
-    return hasCommandModifier(e, isMac) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k";
+    return matchesShortcut(e, "palette.commands", { mac: isMac });
   }
   return eventMatchesShortcutAction(e, "commandPalette");
 }
@@ -55,7 +56,7 @@ export function isFindSessionHotkey(
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("findSession")) return false;
   if (!hasCustomShortcutBindings("findSession")) {
-    return hasCommandModifier(e, isMac) && e.altKey && !e.shiftKey && e.code === "KeyS";
+    return matchesShortcut(e, "palette.sessions", { mac: isMac });
   }
   return eventMatchesShortcutAction(e, "findSession");
 }

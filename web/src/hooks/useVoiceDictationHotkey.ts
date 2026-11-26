@@ -16,7 +16,8 @@ import {
 } from "@/lib/keyboardShortcutPreferences";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Glyphs for the chord `isVoiceDictationHotkey` matches; shown in control tooltips. */
 export const VOICE_DICTATION_KEYS = [MOD_KEY, ALT_KEY, "V"] as const;
@@ -36,8 +37,7 @@ export function isVoiceDictationHotkey(
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (!hasCustomShortcutBindings("voiceDictation")) {
     // Require the platform command modifier AND Alt and reject Shift.
-    if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
-    return e.code === "KeyV";
+    return matchesShortcut(e, "dictation.toggle", { mac: isMac });
   }
   return eventMatchesShortcutAction(e, "voiceDictation");
 }

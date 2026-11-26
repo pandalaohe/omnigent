@@ -13,6 +13,7 @@ from omnigent.runner.tool_dispatch import (
     build_native_relay_tool_schemas,
 )
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.manager import ToolManager
 
 _ALL_OFF = ToolGroupsConfig(
@@ -38,7 +39,12 @@ def _registered(spec: AgentSpec) -> set[str]:
 def _gated() -> frozenset[str]:
     """Tools the disabled groups control, derived from registration itself."""
     gated = frozenset(_registered(_spec(ToolGroupsConfig())) - _registered(_spec(_ALL_OFF)))
-    assert {"browser_fill_saved_login", "sys_reminder_set", *JOURNAL_TOOL_NAMES} <= gated
+    assert {
+        "browser_fill_saved_login",
+        "sys_reminder_set",
+        *JOURNAL_TOOL_NAMES,
+        *ADVANCED_BROWSER_TOOL_NAMES,
+    } <= gated
     return gated
 
 

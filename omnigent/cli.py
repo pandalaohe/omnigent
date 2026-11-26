@@ -4940,7 +4940,9 @@ def server(
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
@@ -5017,6 +5019,8 @@ def server(
     file_store = SqlAlchemyFileStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
+    inbox_item_store = SqlAlchemyInboxItemStore(db_uri)
+    proactive_agent_settings_store = ProactiveAgentSettingsStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     global_instructions_store = SqlAlchemyGlobalInstructionsStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
@@ -5218,6 +5222,8 @@ def server(
         file_store=file_store,
         conversation_store=conversation_store,
         comment_store=comment_store,
+        inbox_item_store=inbox_item_store,
+        proactive_agent_settings_store=proactive_agent_settings_store,
         policy_store=policy_store,
         global_instructions_store=global_instructions_store,
         artifact_store=artifact_store,

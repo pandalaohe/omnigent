@@ -21,6 +21,7 @@ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -616,7 +617,8 @@ class SysSessionListTool(Tool):
             "runner connectivity, creation-origin session id, project, workspace, "
             "last activity time and a last-message excerpt. Pass visibility 'shared' "
             "for sessions other users shared with you, or 'all' for both; those rows "
-            "carry owner. Inspect via sys_agent_get / sys_session_get_info; read "
+            "carry owner. Pass created_by_this_session=true to list the current session’s "
+            "independent workers. Inspect via sys_agent_get / sys_session_get_info; read "
             "transcripts via sys_session_get_history or drive via sys_session_send "
             "by session_id. Pass agent_name to filter the global list, and "
             "archived='include' or 'only' to include or select archived sessions. "
@@ -673,6 +675,15 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "created_by_this_session": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: list only sessions this session started "
+                                "(created_by_session_id is your session ID) in the "
+                                "global 'sessions' view, in one call where possible; "
+                                "sub_agents is then empty. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -1098,7 +1109,8 @@ class SysSessionCreateTool(Tool):
       / effort). An error when the project has no default for the host.
 
     An optional ``message`` starts the session's first user turn;
-    an optional ``title`` labels the session.
+    an optional ``title`` labels the session. With ``agent_id``, an optional
+    ``workflow_id`` starts the session as a run of a saved workflow.
 
     Returns a handle ``{conversation_id, agent_id, title, status, project_id}``. Independent
     sessions also include ``project_name``. The session runs asynchronously — use
@@ -1153,7 +1165,7 @@ class SysSessionCreateTool(Tool):
             "A project_name other than this session's project makes a standalone "
             "session there, not a nested agent. "
             "An independent worker's optional "
-            "first message must contain 1–8000 characters. "
+            f"first message must contain 1–{SESSION_MESSAGE_MAX_CHARS} characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
             "With the default child placement you can place the child anywhere: `host` picks a "
@@ -1437,6 +1449,17 @@ class SysSessionCreateTool(Tool):
                                 "Without 'workspace', the worktree is cut from "
                                 "or joined at your working directory. The "
                                 "worktree is never removed automatically."
+                            ),
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional ID of one of your saved workflows, from "
+                                "sys_workflow_list or sys_workflow_load (agent_id only). "
+                                "The session starts as a run of it, with the workflow's "
+                                "steps as its plan, and the workflow's page lists the run. "
+                                "Still give it a message asking it to run the workflow "
+                                "with the workflow skill."
                             ),
                         },
                     },

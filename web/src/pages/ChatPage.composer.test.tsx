@@ -2001,6 +2001,9 @@ describe("Composer slash-command menu", () => {
   it.each(["untouched", "typed", "sent", "erased-then-left", "edited-while-downloading"] as const)(
     "/rewind fills the new session's composer when the redirect lands first (%s)",
     async (edit) => {
+      const sourceId = `conv_rewind_source_${edit}`;
+      const destinationId = `conv_rewind_destination_${edit}`;
+      setComposerState({ conversationId: sourceId });
       onTestFinished(() => {
         clearSessionDrafts();
         useChatStore.setState({ rewindPrefill: null });
@@ -2028,15 +2031,15 @@ describe("Composer slash-command menu", () => {
       act(() =>
         handleSessionEvent({
           type: "session_superseded",
-          conversationId: "conv_test",
-          targetConversationId: "conv_new",
+          conversationId: sourceId,
+          targetConversationId: destinationId,
           reason: "rewind",
         }),
       );
-      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+      expect(useChatStore.getState().redirectToConversationId).toBe(destinationId);
       cleanup();
       act(() =>
-        useChatStore.setState({ conversationId: "conv_new", redirectToConversationId: null }),
+        useChatStore.setState({ conversationId: destinationId, redirectToConversationId: null }),
       );
       const destination = composerProps();
       render(
@@ -2055,7 +2058,7 @@ describe("Composer slash-command menu", () => {
 
       await act(async () =>
         respond({
-          sessionId: "conv_new",
+          sessionId: destinationId,
           prompt: "Write the parser",
           attachmentsIncomplete: false,
           attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
@@ -2071,11 +2074,12 @@ describe("Composer slash-command menu", () => {
       // The attachment arrives last, while the user may be in another chat.
       await act(async () => downloaded(diagram));
       if (edit === "erased-then-left")
-        act(() => useChatStore.setState({ conversationId: "conv_new" }));
+        act(() => useChatStore.setState({ conversationId: destinationId }));
 
       // A destination the user already touched gets neither the prompt nor its files.
       if (typedBeforeResponse) expect(download).not.toHaveBeenCalled();
-      else expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
+      else
+        expect(download).toHaveBeenCalledExactlyOnceWith(destinationId, "file_new", "diagram.png");
       await waitFor(() => expect(useChatStore.getState().rewindPrefill).toBeNull());
       const expected = {
         untouched: "Write the parser",
