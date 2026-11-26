@@ -1526,6 +1526,178 @@ def _pending_acp_permission(
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("title", "advertised", "kind", "arguments", "expected_name"),
+    [
+        (
+            "Run mcp_omnigent_sys_os_shell",
+            True,
+            "other",
+            {"command": "omni --version"},
+            "sys_os_shell",
+        ),
+        (
+            "mcp__omnigent__sys_os_shell",
+            True,
+            "execute",
+            {"command": "git status"},
+            "sys_os_shell",
+        ),
+        ("omnigent__sys_os_read", True, "read", {"path": "notes.txt"}, "sys_os_read"),
+        (
+            "mcp_omnigent_sys_os_write",
+            True,
+            "edit",
+            {"path": "note.txt", "content": "x"},
+            "sys_os_write",
+        ),
+        (
+            "mcp_omnigent_sys_os_edit",
+            True,
+            "other",
+            {"path": "note.txt", "oldText": "x", "newText": "y"},
+            "sys_os_edit",
+        ),
+        ("mcp_omnigent_sys_session_list", True, "other", {}, "sys_session_list"),
+        (
+            "mcp_omnigent_sys_session_update",
+            True,
+            "edit",
+            {"session_id": "s1"},
+            "sys_session_update",
+        ),
+        (
+            "Run mcp_omnigent_sys_session_get_startup_observation_v1",
+            True,
+            "read",
+            {},
+            "sys_session_get_startup_observation_v1",
+        ),
+        ("mcp_other_sys_os_shell", True, "other", {"command": "git status"}, "unknown"),
+        ("mcp_omnigent_sys_os_shell", False, "other", {"command": "git status"}, "unknown"),
+        (
+            "mcp_omnigent_sys_os_shell",
+            True,
+            "execute",
+            {"CommandLine": "git status"},
+            "run_command",
+        ),
+        ("mcp_omnigent_sys_os_read", True, "execute", {"path": "notes.txt"}, None),
+    ],
+)
+async def test_managed_agy_binds_advertised_omnigent_tools(
+    monkeypatch, title, advertised, kind, arguments, expected_name
+):
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True))
+    monkeypatch.setattr(
+        ex._mcp, "session_new_servers", lambda **_: [{"name": "omnigent"}] if advertised else []
+    )
+    ex._omnigent_tools = [
+        {"name": name}
+        for name in (
+            "sys_os_shell",
+            "sys_os_read",
+            "sys_os_write",
+            "sys_os_edit",
+            "sys_session_list",
+            "sys_session_update",
+            "sys_session_get_startup_observation_v1",
+        )
+    ]
+    ex._session_mcp_servers()
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    call = {"toolCallId": "t1", "title": title, "kind": kind, "rawInput": arguments}
+    ex._note_permission_update("s1", {"sessionUpdate": "tool_call", "status": "pending", **call})
+    bound = ex._bound_permission_call({"sessionId": "s1", "toolCall": call})
+    if expected_name is None:
+        assert bound is None
+    else:
+        assert bound == {
+            "call_id": "t1",
+            "name": expected_name,
+            "arguments": arguments,
+            **({"bridge_tool": True} if expected_name.startswith("sys_") else {}),
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier_verdict", "user_allows", "dispatches"),
+    [("allow", False, True), ("ask", False, False), ("ask", True, True), ("deny", True, False)],
+)
+async def test_managed_agy_relay_checks_each_actual_request(
+    monkeypatch, tier_verdict: str, user_allows: bool, dispatches: bool
+):
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True))
+    dispatch = AsyncMock(return_value={"stdout": "fixture"})
+    ex._tool_executor = dispatch
+    relay_setup = Mock(return_value=[{"name": "omnigent"}])
+    monkeypatch.setattr(ex._mcp, "session_new_servers", relay_setup)
+    ex._omnigent_tools = [{"name": "sys_os_shell"}, {"name": "sys_os_read"}]
+    ex._session_mcp_servers()
+    relay = relay_setup.call_args.kwargs["tool_executor"]
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_DENY" if tier_verdict == "deny" else "POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": tier_verdict},
+        )
+    )
+    ex._elicitation_handler = AsyncMock(return_value=user_allows)
+    ex._send = AsyncMock()
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    arguments = {"command": "omni --version" if tier_verdict == "allow" else "git reset --hard"}
+    call = {
+        "toolCallId": "t1",
+        "title": "Run mcp_omnigent_sys_os_shell",
+        "kind": "other",
+        "rawInput": arguments,
+    }
+    ex._note_permission_update("s1", {"sessionUpdate": "tool_call", "status": "pending", **call})
+    await ex._respond_to_agent_request(
+        {
+            "id": 2,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": call,
+                "options": [{"kind": "allow_once", "optionId": "once"}],
+            },
+        }
+    )
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    result = await relay("sys_os_shell", arguments)
+    if dispatches:
+        assert result == {"stdout": "fixture"}
+        dispatch.assert_awaited_once_with("sys_os_shell", arguments)
+    else:
+        assert "error" in result
+        dispatch.assert_not_awaited()
+    assert ex._elicitation_handler.await_count == (tier_verdict == "ask")
+    first = ex._policy_evaluator.await_args_list[-1].args[1]["_omnigent_acp_call"]
+    if tier_verdict == "ask":
+        ex._elicitation_handler.return_value = False
+        assert "error" in await relay("sys_os_shell", arguments)
+        assert dispatch.await_count == dispatches
+        assert ex._elicitation_handler.await_count == 2
+        second = ex._policy_evaluator.await_args_list[-1].args[1]["_omnigent_acp_call"]
+        assert first["call_id"] != second["call_id"]
+
+        async def change_arguments(_name, _input):
+            arguments["command"] = "git clean -fd"
+            return True
+
+        ex._elicitation_handler.side_effect = change_arguments
+        result = await relay("sys_os_shell", arguments)
+        assert "changed" in result["error"]
+        assert dispatch.await_count == dispatches
+
+
 @pytest.fixture
 def windows_acp_permission_executor():
     from omnigent.permission_tiers import (

@@ -7,12 +7,13 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, preflightFailure, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0", brokenImport=false, sdkPeers=false} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, preflightFailure, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0", brokenImport=false, sdkPeers=false, nestedCwd=false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
-  const workspace = path.join(root, "workspace");
+  const worktree = path.join(root, "workspace");
+  const workspace = nestedCwd ? path.join(worktree, "nested") : worktree;
   const packageRoot = path.join(root, "package");
-  fs.mkdirSync(workspace);
+  fs.mkdirSync(workspace,{recursive:true});
   fs.mkdirSync(packageRoot);
   const agentPath = path.join(root, "reader.md");
   const guard = path.join(root, "guard.cjs");
@@ -75,7 +76,7 @@ export async function resolveSubagentLaunchContract(input) {
     fs.writeFileSync(outside,"import 'fixture-peer';\n");
     await assert.rejects(import(pathToFileURL(outside).href),{code:"ERR_MODULE_NOT_FOUND"});
   }
-  const state = {tier,revision:3,status:"ready",workspace};
+  const state = {tier,revision:3,status:"ready",workspace:worktree,...(nestedCwd ? {cwd:workspace} : {})};
   let backendStarts = 0, policyCalls = 0;
   const facts = [], notices = [];
   let startupProof;
@@ -160,6 +161,15 @@ export async function resolveSubagentLaunchContract(input) {
   return {root,workspace,agentPath,guard,entry,packageRoot,scope,api,state,loader,actual,ctx,final,run,dispose,lifecycle,
     backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts,notices,startupProof};
 }
+
+test("native startup binds a worktree subdirectory", async t => {
+  const f=await fixture(t,{nestedCwd:true});
+  const event={toolCallId:"nested-read",toolName:"read",input:{path:"notes"}};
+  const proof=await support.classifyNativeCall(event,f.ctx,f.state);
+  assert.equal(proof.status,"attested_native",proof.reason);
+  const mismatched=await support.classifyNativeCall(event,{...f.ctx,cwd:f.state.workspace},f.state);
+  assert.equal(mismatched.status,"failed_native");
+});
 
 test("startup registrations with stock pi-subagents preserve base tools and deny helpers",async t=>{
   for (const packageVersion of ["0.80.0","0.87.0"]) await t.test(packageVersion,async t=>{

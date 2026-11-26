@@ -321,6 +321,7 @@ async function classifyNativeCall(event, ctx, state) {
       return failed(null, "Native bootstrap or origin is unavailable");
     bound = binding(record, event, state);
     if (!state || state.status !== "ready" || record.getState().revision !== state.revision || record.getState().tier !== state.tier ||
+        fs.realpathSync(state.cwd ?? state.workspace) !== record.realWorkspace ||
         (record.initialTier === "full" && state.tier !== "full") || ![record.workspace,record.lexicalWorkspace].includes(path.resolve(ctx.cwd)) || fs.realpathSync(ctx.cwd) !== record.realWorkspace)
       return failed(bound, "Native scope or live permission state changed");
     const current = record.session.resourceLoader.getExtensions().extensions;
@@ -447,7 +448,11 @@ function bindNativeSession(session, descriptor) {
   const lifecycle = descriptor.scope.origin === "child" && descriptor.api?.getNativeChildLifecycle?.(session.sessionManager);
   if (descriptor.scope.origin === "child" && (!lifecycle || lifecycle.state !== "open" || !lifecycle.closingSignal || typeof lifecycle.bindHost !== "function" || typeof descriptor.beforeClose !== "function"))
     throw new Error("Native child lifecycle and revocation acknowledgement are unavailable");
-  const context=inputContext(state.workspace,descriptor.bridgeDir);
+  const context=inputContext(state.cwd ?? state.workspace,descriptor.bridgeDir);
+  if (state.cwd != null) {
+    const worktree = path.resolve(state.workspace);
+    context.workspaces.push(worktree,fs.realpathSync(worktree));
+  }
   const workspace=context.workspace;
   if (descriptor.scope.canonical_cwd!==workspace) throw new Error("Native cwd differs from the runner's ready scope");
   const settingsPaths = new Set(descriptor.settingsPaths || []);

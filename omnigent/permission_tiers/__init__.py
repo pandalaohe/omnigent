@@ -122,6 +122,7 @@ class TrustedHostContext:
     local_execution: bool = True
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing"
     registry_tool_name: str | None = None
+    acp_bridge_tool_name: str | None = None
     readable_control_file: tuple[str, str] | None = None  # (owning control, resolved file)
 
 
@@ -282,6 +283,7 @@ _READ_NO_PATH = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_get_history",
+        "sys_session_get_startup_observation_v1",
         "sys_standing_approval_read",
         "sys_agent_list",
         "sys_agent_get",
@@ -990,8 +992,7 @@ def _adapt_unbound_call(
             context,
             status="unknown",
             detail="Unknown tool schema",
-            # Deferred/unclassified Omnigent sys_* framework tools stay denied in auto.
-            unseen_tool=not name.startswith("sys_"),
+            unseen_tool=not name.startswith("sys_") or name == context.acp_bridge_tool_name,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return ToolIntent(ToolKind.UNKNOWN, name, "", context, status="invalid", detail=str(exc))

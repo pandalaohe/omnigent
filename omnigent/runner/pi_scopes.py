@@ -190,7 +190,7 @@ class PiScopeRegistry:
             uuid4().hex,
             origin,
             installation_id,
-            str(Path(state.workspace).resolve()),
+            str(Path(state.cwd or state.workspace).resolve()),
             registry_generation,
         )
         directory = bridge_dir.resolve() / "pi-scopes" / principal.scope_id

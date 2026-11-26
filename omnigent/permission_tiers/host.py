@@ -17,8 +17,10 @@ from omnigent.permission_tiers import (
     NativeSupport,
     PermissionTier,
     TierDecision,
+    ToolKind,
     TrustedHostContext,
     Verdict,
+    _under,
     adapt_tool_call,
     decide_tier,
     load_rules,
@@ -38,11 +40,14 @@ class HostPermissionState:
     revision: int
     status: Literal["ready", "switching", "blocked"]
     transaction_id: str | None = None
+    cwd: str | None = None
 
     def __post_init__(self) -> None:
         for value in (self.session_id, self.host_id, self.workspace):
             if not isinstance(value, str) or not value:
                 raise ValueError("Incomplete trusted permission snapshot")
+        if self.cwd is not None and (not isinstance(self.cwd, str) or not self.cwd):
+            raise ValueError("Invalid permission working directory")
         normalize_permission_tier(self.tier, harness="pi", legacy=False)
         if type(self.revision) is not int or self.revision < 1:
             raise ValueError("Invalid permission revision")
@@ -102,15 +107,16 @@ def local_host_context(
         }
     )
     # The current drive's cwd is known; other drive-relative paths stay denied.
+    cwd = state.cwd or state.workspace
     drive_cwds = {}
     if platform == "windows":
         import ntpath
 
-        drive_cwds[ntpath.splitdrive(state.workspace)[0].upper()] = state.workspace
+        drive_cwds[ntpath.splitdrive(cwd)[0].upper()] = cwd
     return TrustedHostContext(
         host_id=state.host_id,
         platform=platform,
-        cwd=state.workspace,
+        cwd=cwd,
         workspace=state.workspace,
         home=str(Path.home()),
         shell=os.environ.get("COMSPEC", "cmd")
@@ -151,6 +157,8 @@ def evaluate_host_tool(
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing",
     registry_tool_name: str | None = None,
     readable_control_file: tuple[str, str] | None = None,
+    auto_approval_floor: bool = False,
+    acp_bridge_tool_name: str | None = None,
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
     try:
@@ -171,9 +179,27 @@ def evaluate_host_tool(
             local_execution=local_execution,
             agy_delegation_status=agy_delegation_status,
             registry_tool_name=registry_tool_name,
+            acp_bridge_tool_name=acp_bridge_tool_name,
             readable_control_file=readable_control_file,
         )
         intent = adapt_tool_call(name, arguments, context)
-        return decide_tier(state.tier, intent, load_rules())
+        decision = decide_tier(state.tier, intent, load_rules())
+        if state.tier != "auto" or not auto_approval_floor or decision.action != Verdict.ALLOW:
+            return decision
+        if (
+            intent.kind == ToolKind.EDIT
+            and intent.target is not None
+            and intent.workspace_path is not None
+            and not _under(
+                intent.target.path, intent.workspace_path.path, context.platform == "windows"
+            )
+        ):
+            return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
+        if intent.kind == ToolKind.EXEC and name in ("bash", "sys_os_shell"):
+            from omnigent.server.child_approvals import floor
+
+            if floor({"tool_name": name, "command": arguments.get("command")}) == "user_only":
+                return TierDecision(Verdict.ASK, "Command requires user approval")
+        return decision
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission
         return TierDecision(Verdict.DENY, f"Permission check unavailable: {type(exc).__name__}")
