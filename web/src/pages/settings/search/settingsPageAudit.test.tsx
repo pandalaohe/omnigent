@@ -8,7 +8,7 @@ import { writeRetentionDays } from "@/lib/retentionPreferences";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { writeThemePalette } from "@/lib/themePalette";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -1311,13 +1311,9 @@ async function auditScenario(
     }
     await waitUntilSettled({ client, routes });
     const agentOverview = sectionId === "agents" && path === `/settings/${section}`;
-    if (agentOverview) {
-      // Audit the agent rows that were visible before the table gained its fold.
-      const fold = screen.getByRole("button", { name: /^Not configured \(\d+\)$/ });
-      expect(fold).toHaveAttribute("aria-expanded", "false");
-      await userEvent.click(fold);
-    }
-    observeRendered(entries, observedRows, observedParts);
+    const fold = agentOverview
+      ? screen.getByRole("button", { name: /^Not configured \(\d+\)$/ })
+      : null;
     for (const [id, reason] of Object.entries(hides)) {
       if (document.querySelector(rowSelector(id))) {
         problems.push(`${where}: ${id} renders, though the scenario hides it (${reason})`);
@@ -1342,18 +1338,28 @@ async function auditScenario(
     if (agentOverview) {
       drivenStates.set(AGENT_CALLING_DEFAULTS_ENTRY.id, new Set(["unconfigured rows"]));
     }
+    let pageFindings = auditSettingsDomFindings({
+      roots: [document.body],
+      entries,
+      expected,
+      drivenStates,
+    });
+    if (fold) {
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const table = fold.closest("table")!;
+      // Expand the table to audit its legacy rows. Snapshot the surrounding page only once
+      // so any independent data arriving after the click doesn't change that snapshot.
+      pageFindings = pageFindings.filter(
+        (finding) => !finding.element || !table.contains(finding.element),
+      );
+      fireEvent.click(fold);
+      pageFindings.push(...auditSettingsDomFindings({ roots: [table], entries }));
+    }
+    observeRendered(entries, observedRows, observedParts);
     audits.push({
       section: sectionId,
       scenario,
-      findings: withoutBaselineControls(
-        section,
-        auditSettingsDomFindings({
-          roots: [document.body],
-          entries,
-          expected,
-          drivenStates,
-        }),
-      ),
+      findings: withoutBaselineControls(section, pageFindings),
     });
     const withStates = (
       more: Readonly<Record<string, readonly string[]>> = {},
