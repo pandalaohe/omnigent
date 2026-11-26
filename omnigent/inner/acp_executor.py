@@ -1521,6 +1521,7 @@ class AcpExecutor(Executor):
         self._workspace_dir_fd: int | None = None
         self._workspace_win_handle: int | None = None
         self._workspace_real_path: str | None = None
+        self._windows_reap_task: asyncio.Task[None] | None = None
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -1634,6 +1635,7 @@ class AcpExecutor(Executor):
             raise
         if IS_WINDOWS and isinstance(self._proc.pid, int):
             _proc.refresh_process_tree(self._proc)
+        self._windows_reap_task = None
         self._stdout_eof_event = _AsyncioEvent()
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -3898,7 +3900,11 @@ class AcpExecutor(Executor):
                                     and active_prompt_id is not None
                                     and raw_meta.get("prompt_id") == active_prompt_id
                                 )
-                                if direct_bound:
+                                deadline_open = (
+                                    self._post_prompt_deadline is None
+                                    or self._now() < self._post_prompt_deadline
+                                )
+                                if direct_bound and deadline_open:
                                     backfilled = _read_agy_file_body(
                                         self._cwd,
                                         backfill_args,
@@ -4013,7 +4019,11 @@ class AcpExecutor(Executor):
             return False
         if explicit_prompt_binding and self._turn_prompt_id != active_prompt_id:
             return False
-        effective_deadline = deadline if deadline is not None else self._post_prompt_deadline
+        effective_deadline = (
+            min(deadline, self._post_prompt_deadline)
+            if deadline is not None and self._post_prompt_deadline is not None
+            else (deadline if deadline is not None else self._post_prompt_deadline)
+        )
         if effective_deadline is not None and self._now() >= effective_deadline:
             return False
         if phase2:
@@ -4039,7 +4049,7 @@ class AcpExecutor(Executor):
         prompt_fut: asyncio.Future[_AcpJsonObject] | None,
         phase2: bool,
     ) -> bool:
-        """Bound a backfill policy check by turn lifetime, cancel, EOF, and Phase 2 deadline."""
+        """Bound a backfill policy check by turn lifetime, cancel, EOF, and deadline."""
         check_task: asyncio.Task[bool] = asyncio.create_task(
             self._is_agy_read_backfill_allowed(call_id, raw_name, spec)
         )
@@ -4061,7 +4071,9 @@ class AcpExecutor(Executor):
                 ):
                     break
                 effective_deadline = (
-                    deadline if deadline is not None else self._post_prompt_deadline
+                    min(deadline, self._post_prompt_deadline)
+                    if deadline is not None and self._post_prompt_deadline is not None
+                    else (deadline if deadline is not None else self._post_prompt_deadline)
                 )
                 remaining = self._poll_interval_s
                 if effective_deadline is not None:
@@ -4138,13 +4150,23 @@ class AcpExecutor(Executor):
         active_prompt_id: int | None = (
             turn_prompt_id if explicit_prompt_binding else self._active_turn_prompt_id
         )
+        # Ensure every turn backfill policy check has a finite bound even after buffered end_turn.
+        backfill_deadline = (
+            deadline
+            if deadline is not None
+            else (
+                self._post_prompt_deadline
+                if self._post_prompt_deadline is not None
+                else (self._now() + _PROMPT_TIMEOUT_SECONDS if prompt_fut is not None else None)
+            )
+        )
         if active_prompt_id is None or not self._can_backfill_read(
             expected_session_id=expected_session_id,
             update_session_id=update_session_id,
             active_prompt_id=active_prompt_id,
             explicit_prompt_binding=explicit_prompt_binding,
             phase2=phase2,
-            deadline=deadline,
+            deadline=backfill_deadline,
             cancel_event=cancel_event,
             prompt_fut=prompt_fut,
         ):
@@ -4180,7 +4202,7 @@ class AcpExecutor(Executor):
                 update_session_id=update_session_id,
                 active_prompt_id=active_prompt_id,
                 explicit_prompt_binding=explicit_prompt_binding,
-                deadline=deadline,
+                deadline=backfill_deadline,
                 cancel_event=cancel_event,
                 prompt_fut=prompt_fut,
                 phase2=phase2,
@@ -4192,7 +4214,7 @@ class AcpExecutor(Executor):
                 active_prompt_id=active_prompt_id,
                 explicit_prompt_binding=explicit_prompt_binding,
                 phase2=phase2,
-                deadline=deadline,
+                deadline=backfill_deadline,
                 cancel_event=cancel_event,
                 prompt_fut=prompt_fut,
             ):
@@ -5102,6 +5124,8 @@ class AcpExecutor(Executor):
                         break
                     if self._queue.empty():
                         if not live:
+                            if self._is_stdout_closed():
+                                break
                             if settle_deadline is None:
                                 settle_deadline = min(
                                     bg_deadline if bg_deadline is not None else now,
@@ -5109,7 +5133,7 @@ class AcpExecutor(Executor):
                                 )
                             if now >= settle_deadline:
                                 break
-                        if self._is_stdout_closed():
+                        elif self._is_stdout_closed():
                             self._reset_session_state()
                             yield ExecutorError(
                                 message=(
@@ -5221,6 +5245,10 @@ class AcpExecutor(Executor):
                             and not cancel_event.is_set()
                             and self._cancel_grace_deadline is None
                             and not _prompt_fut_is_terminal_abort(fut)
+                            and (
+                                self._post_prompt_deadline is None
+                                or self._now() < self._post_prompt_deadline
+                            )
                         ):
                             wire_prompt_id = req_id
                         else:
@@ -5417,15 +5445,26 @@ class AcpExecutor(Executor):
         if proc is not None:
             with contextlib.suppress(Exception):
                 proc.stdin.close()  # type: ignore[union-attr]
-            reap_task: asyncio.Task[None] | None = None
+            reap_task = self._windows_reap_task
+            if reap_task is not None and reap_task.done():
+                self._windows_reap_task = None
+                reap_task = None
 
             async def _reap_windows_once() -> None:
                 nonlocal reap_task
                 if reap_task is None:
                     reap_task = asyncio.create_task(asyncio.to_thread(_proc.kill_tree, proc))
+                    self._windows_reap_task = reap_task
                 await asyncio.shield(reap_task)
+                if self._windows_reap_task is reap_task and reap_task.done():
+                    self._windows_reap_task = None
 
             try:
+                if IS_WINDOWS and reap_task is not None:
+                    with contextlib.suppress(Exception):
+                        await _reap_windows_once()
+                    if reap_task.done():
+                        reap_task = None
                 if proc.returncode is None:
                     try:
                         # Tree-aware: the handle is the sandbox launcher, not the
@@ -5453,6 +5492,9 @@ class AcpExecutor(Executor):
                     with contextlib.suppress(Exception):
                         await _reap_windows_once()
             finally:
-                if not (IS_WINDOWS and _proc.has_unresolved_identities(proc)):
+                reap_in_flight = reap_task is not None and not reap_task.done()
+                if not (IS_WINDOWS and (reap_in_flight or _proc.has_unresolved_identities(proc))):
                     self._proc = None
+                    if self._windows_reap_task is not None and self._windows_reap_task.done():
+                        self._windows_reap_task = None
         self._cleanup_agy_runtime_temp_dir()
