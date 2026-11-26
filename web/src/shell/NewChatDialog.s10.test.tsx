@@ -477,13 +477,14 @@ describe("NewChatLandingScreen tokens", () => {
     expect(landingInput().className).not.toContain("text-transparent");
   });
 
-  it("T20 — a command plus a token mounts the backdrop and tints both", () => {
+  it("T20 — a command with an attachment tints only the attachment token", () => {
     renderLanding();
     attach([img()]);
     typeMessage("/review [image 1] ");
 
     const overlay = screen.getByTestId("composer-highlight-overlay");
-    expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("/review");
+    expect(overlay).toHaveTextContent("/review");
+    expect(overlay.querySelector(".text-brand-accent")).toBeNull();
     expect(overlay.querySelector(".text-primary")?.textContent).toBe("[image 1]");
     expect(landingInput()).toHaveClass("text-transparent");
   });

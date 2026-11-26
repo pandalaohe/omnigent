@@ -6937,8 +6937,8 @@ async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
             resume_cost_usd=resume_cost_usd,
         )
 
-    assert written is not None
-    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    assert written.path is not None and written.synthesized
+    records = [json.loads(line) for line in written.path.read_text(encoding="utf-8").splitlines()]
     cost_states = [record for record in records if record.get("type") == "cost-state"]
     if resume_cost_usd is None:
         assert cost_states == []
@@ -6986,7 +6986,7 @@ async def test_resolve_cold_resume_args_restores_the_session_cost(
     snapshot["native_usage_baseline"] = {"cumulative_cost_usd": 2.5}
     client = await _httpx_client_with_canned_response(snapshot, 200)
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolved = await claude_native._resolve_cold_resume_args(client, "conv_abc")
 
     assert args == ("--resume", "claude-uuid-abc")
     transcript = (
@@ -6994,6 +6994,7 @@ async def test_resolve_cold_resume_args_restores_the_session_cost(
         / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
         / "claude-uuid-abc.jsonl"
     )
+    assert resolved.path == transcript and resolved.synthesized
     last_record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
     assert last_record["type"] == "cost-state"
     assert last_record["totalCostUSD"] == 2.5

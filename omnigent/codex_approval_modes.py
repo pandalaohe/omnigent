@@ -163,7 +163,7 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
         return "full-access"
     if sandbox_type in _READ_ONLY_SANDBOX_TYPES or profile_id == ":read-only":
         return "read-only"
-    if reviewer == "auto_review":
+    if reviewer == "auto_review" and approval_policy == "on-request":
         return "approve-for-me"
     if approval_policy == "on-request":
         return "ask-for-approval"
@@ -456,11 +456,17 @@ def codex_permission_observation_from_thread_settings(
         ("sandboxPolicy", "sandbox_policy"),
         ("activePermissionProfile", "active_permission_profile"),
     )
-    if not any(key in settings for pair in pairs for key in pair):
+    if "sandbox" not in settings and not any(key in settings for pair in pairs for key in pair):
         return CodexPermissionObservation(origin=origin)
     fields = [_permission_setting(settings, *pair) for pair in pairs]
     (raw_approval, _), (raw_reviewer, _), (raw_sandbox, _), (raw_profile, _) = fields
     conflict = any(conflicted for _, conflicted in fields)
+    # thread/resume uses sandbox, while thread/settings/updated uses sandboxPolicy.
+    if "sandbox" in settings:
+        if "sandboxPolicy" in settings or "sandbox_policy" in settings:
+            conflict |= raw_sandbox != settings["sandbox"]
+        else:
+            raw_sandbox = settings["sandbox"]
     unsupported = False
     custom_access = False
     approval = (

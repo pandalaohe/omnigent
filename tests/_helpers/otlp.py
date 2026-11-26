@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.telemetry.environment import CI_ENV_VARS
 from tests._helpers.live_server import find_free_port
 from tests._helpers.polling import poll_until
 
@@ -55,10 +56,14 @@ class OtlpTraceCollector:
         """Base URL for ``OTEL_EXPORTER_OTLP_ENDPOINT``, e.g. ``"http://127.0.0.1:4318"``."""
         return f"http://127.0.0.1:{self._port}"
 
-    def exporter_env(self) -> dict[str, str]:
+    def exporter_env(self) -> dict[str, str | None]:
         """Environment for an Omnigent process that exports its traces here, per request."""
         return {
-            "OMNIGENT_TELEMETRY_ENABLED": "true",
+            # Opt in for this isolated server and confine every telemetry destination to loopback.
+            **dict.fromkeys(CI_ENV_VARS),
+            "OMNIGENT_DISABLE_TELEMETRY": None,
+            "OMNIGENT_ENABLE_TELEMETRY": "true",
+            "OMNIGENT_TELEMETRY_CONFIG_URL": self.endpoint,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
             "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
             "OTEL_METRICS_EXPORTER": "none",

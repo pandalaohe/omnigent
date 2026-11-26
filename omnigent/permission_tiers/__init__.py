@@ -317,6 +317,7 @@ _OPERATIONAL_TOOLS = frozenset(
         "sys_session_create",
         "sys_approval_answer",
         "sys_session_send",
+        "sys_session_message",
         "sys_session_open",
         "sys_session_rename",
         "sys_session_update",

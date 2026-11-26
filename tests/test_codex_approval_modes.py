@@ -295,6 +295,11 @@ def test_observation_never_does_not_remove_read_only_boundary() -> None:
         (_APPROVE_FOR_ME_SETTINGS, "approve-for-me", None),
         (_FULL_ACCESS_SETTINGS, "full-access", None),
         (
+            {**_FULL_ACCESS_SETTINGS, "sandbox": {"type": "readOnly"}},
+            "unknown",
+            "conflicting-fields",
+        ),
+        (
             {
                 "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",

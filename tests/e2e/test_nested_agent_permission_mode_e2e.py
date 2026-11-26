@@ -20,12 +20,14 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.codex_approval_modes import decode_codex_permission_observation
 from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.permission_tiers import (
     PERMISSION_PROTOCOL_HEADER,
     PERMISSION_PROTOCOL_VERSION,
 )
+from omnigent.stores.conversation_store import CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -76,7 +78,7 @@ _HARNESSES = {
         '"mcp__omnigent__sys_session_create"',
         "mcp__omnigent__sys_session_message",
     ),
-    # Pi has no permission modes and asks no one, so it is a control.
+    # Pi's Auto tier permits known orchestration calls and has no native mode label.
     "pi": _Harness(None, None, None, '"sys_session_create"', "sys_session_message"),
 }
 
@@ -264,10 +266,19 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 resend_until_tools_listed(run, probe, lambda: False)
                 if spec.mode_label is not None:
                     # The CLI itself reports the run's mode.
-                    poll_until(
-                        lambda: session(run)["labels"].get(spec.mode_label) == spec.run_mode,
-                        timeout_s=30,
-                    )
+                    try:
+                        poll_until(
+                            lambda: session(run)["labels"].get(spec.mode_label) == spec.run_mode,
+                            timeout_s=30,
+                        )
+                    except AssertionError as error:
+                        labels = session(run)["labels"]
+                        raw = labels.get(CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY)
+                        observed = decode_codex_permission_observation(raw) if raw else None
+                        error.add_note(
+                            f"{spec.mode_label}={labels.get(spec.mode_label)!r}; {observed=}"
+                        )
+                        raise
                 run_snapshot = session(run)
 
                 # The run hands a step to a nested agent of its own agent without a
@@ -352,4 +363,18 @@ def test_nested_agent_runs_unattended_like_its_creator(
                     "reported_mode": spec.run_mode,
                 }
                 # The worker's report reached the run.
-                poll_until(lambda: "NESTED_MODE_RUN_GOT_REPORT" in items(run), timeout_s=120)
+                try:
+                    poll_until(lambda: "NESTED_MODE_RUN_GOT_REPORT" in items(run), timeout_s=120)
+                except AssertionError as error:
+                    if harness == "pi":
+                        report_outputs = [
+                            block.get("content")
+                            for request in requests_mentioning('"report"')
+                            for message in request.get("messages", [])
+                            if isinstance(message.get("content"), list)
+                            for block in message["content"]
+                            if block.get("type") == "tool_result"
+                            and block.get("tool_use_id") == "report"
+                        ]
+                        error.add_note(f"Pi report tool outputs: {report_outputs!r}")
+                    raise
