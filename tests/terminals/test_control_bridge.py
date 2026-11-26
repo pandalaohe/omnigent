@@ -3040,3 +3040,38 @@ async def test_failed_takeover_preserves_prior_sizing_ownership(
     finally:
         for task in tasks:
             await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_answers_ping_without_marking_interaction() -> None:
+    """Liveness pings get a pong reply without counting as user interaction."""
+    sock, target = await _new_private_tmux("cat")
+    interactions = 0
+
+    def record_interaction() -> None:
+        nonlocal interactions
+        interactions += 1
+
+    ws = _LiveWebSocket(
+        {"type": "websocket.receive", "text": '{"type":"ping","id":""}'},
+        {"type": "websocket.receive", "text": '{"type":"ping","id":"probe-tmux"}'},
+    )
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            cast(WebSocket, ws),
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+            on_client_interaction=record_interaction,
+        )
+    )
+    try:
+        await poll_until_async(lambda: '{"type":"pong","id":"probe-tmux"}' in ws.sent_text)
+        assert not any('"id":""' in frame for frame in ws.sent_text)
+        # Attach + invalid-ping frame record interactions; the valid ping adds none.
+        assert interactions == 2
+    finally:
+        ws.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(task, timeout=10)
+        await _kill_tmux(sock)

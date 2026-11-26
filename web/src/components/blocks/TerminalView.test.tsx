@@ -105,6 +105,9 @@ const terminalSessionMock = vi.hoisted(() => ({
     onState: (state: ConnectionState) => void;
     onActivity?: () => void;
     dispose: ReturnType<typeof vi.fn>;
+    probeLiveness: ReturnType<
+      typeof vi.fn<(timeoutMs?: number) => Promise<TerminalSessionModule.LivenessProbeResult>>
+    >;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     setTouchSelection: ReturnType<
@@ -248,6 +251,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   ...(await importOriginal<typeof TerminalSessionModule>()),
   TerminalSession: class {
     dispose = vi.fn();
+    probeLiveness = vi
+      .fn<(timeoutMs?: number) => Promise<TerminalSessionModule.LivenessProbeResult>>()
+      .mockResolvedValue("alive");
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     setTouchSelection = vi.fn<(options: TerminalTouchSelectionOptions | null) => void>();
@@ -302,6 +308,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onState,
         onActivity,
         dispose: this.dispose,
+        probeLiveness: this.probeLiveness,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         setTouchSelection: this.setTouchSelection,
@@ -450,7 +457,14 @@ describe("control-mode terminal", () => {
   it("re-dials an attach refused during its launch once the create succeeds", async () => {
     vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
     setTerminalLaunching("terminal_zsh_u-retry1", "attach");
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-retry1" />);
+    const onStateChange = vi.fn();
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_zsh_u-retry1"
+        onStateChange={onStateChange}
+      />,
+    );
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
 
     // An older runner (or a launch past the server's wait) refuses the early attach.
@@ -458,6 +472,7 @@ describe("control-mode terminal", () => {
       terminalSessionMock.instances[0].onState({ kind: "closed", code: 4404, reason: "not found" }),
     );
     expect(screen.getByText("Starting shell…")).toBeTruthy();
+    expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting" });
 
     act(() => setTerminalLaunching("terminal_zsh_u-retry1", null));
 
@@ -1989,10 +2004,13 @@ describe("automatic reconnect", () => {
 
     closeNewest(1006);
     await elapse(60_000);
-    // Budget exhausted: the final close sticks as the dead-end overlay
-    // and no further sessions are constructed.
+    // Budget exhausted: the final close sticks as disconnected (with manual
+    // Reconnect) and no further automatic sessions are constructed.
     expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 1);
-    expect(screen.getByText("Bridge closed: code 1006")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-disconnected")).toHaveTextContent(
+      "Disconnected: code 1006",
+    );
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
   });
 
@@ -2106,6 +2124,317 @@ describe("automatic reconnect", () => {
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
+  });
+
+  it("shows distinct disconnected-reconnecting vs process-exited states and never auto-resurrects exited", async () => {
+    const visibility = { value: "hidden" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      closeNewest(1006);
+      expect(screen.getByTestId("terminal-reconnecting")).toHaveTextContent(
+        "Disconnected — reconnecting…",
+      );
+
+      // Re-dial transitions to connecting while keeping the reconnecting label.
+      await elapse(RECONNECT_BACKOFF_MS[0]);
+      expect(screen.getByTestId("terminal-reconnecting")).toHaveTextContent(
+        "Disconnected — reconnecting…",
+      );
+
+      // Process exits (4404): clearly labelled as exited, not disconnected, and no Reconnect button.
+      act(() => {
+        terminalSessionMock.instances.at(-1)!.onState({
+          kind: "closed",
+          reason: "terminal session ended",
+          code: 4404,
+        });
+      });
+      expect(screen.getByTestId("terminal-process-exited")).toHaveTextContent("Process exited");
+      expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
+      expect(screen.queryByTestId("terminal-disconnected")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+
+      const countBeforeReturn = terminalSessionMock.instances.length;
+      visibility.value = "visible";
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        const pageshow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(pageshow, "persisted", { value: true });
+        window.dispatchEvent(pageshow);
+        window.dispatchEvent(new Event("online"));
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(countBeforeReturn);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("probes a connected socket on foreground return, reconnecting only if dead", async () => {
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      const first = terminalSessionMock.instances[0];
+      act(() => first.onState({ kind: "connected" }));
+
+      // Healthy socket: probe resolves "alive" -> no reconnect or flicker.
+      visibility.value = "hidden";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(first.probeLiveness).toHaveBeenCalledTimes(1);
+      expect(terminalSessionMock.instances).toHaveLength(1);
+
+      // Deliberate close (4404) arriving mid-probe: probe must never redial it.
+      let settleProbe!: (result: TerminalSessionModule.LivenessProbeResult) => void;
+      first.probeLiveness.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            settleProbe = resolve;
+          }),
+      );
+      visibility.value = "hidden";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      act(() => {
+        first.onState({ kind: "closed", code: 4404, reason: "terminal session ended" });
+        // Even if a stale probe settled "dead", synchronous stateRef prevents redial.
+        settleProbe("dead");
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(1);
+      expect(screen.getByTestId("terminal-process-exited")).toHaveTextContent("Process exited");
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("reconnects immediately when a foreground liveness probe reports a half-open dead socket", async () => {
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    const onStateChange = vi.fn();
+    try {
+      render(
+        <TerminalView
+          sessionId="conv_abc"
+          terminalId="terminal_bash_s1"
+          onStateChange={onStateChange}
+        />,
+      );
+      await act(async () => {});
+      const first = terminalSessionMock.instances[0];
+      act(() => first.onState({ kind: "connected" }));
+
+      first.probeLiveness.mockResolvedValueOnce("dead");
+      visibility.value = "hidden";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(first.dispose).toHaveBeenCalled();
+      expect(screen.getByTestId("terminal-reconnecting")).toHaveTextContent(
+        "Disconnected — reconnecting…",
+      );
+      expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting", reconnecting: true });
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("coalesces visibilitychange, persisted pageshow, and online in one wake burst into a single redial", async () => {
+    const visibility = { value: "hidden" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      closeNewest(1006);
+      expect(terminalSessionMock.instances).toHaveLength(1);
+
+      visibility.value = "visible";
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        const pageshow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(pageshow, "persisted", { value: true });
+        window.dispatchEvent(pageshow);
+        window.dispatchEvent(new Event("online"));
+      });
+      await act(async () => {});
+      // All three wake events together produce exactly ONE replacement dial.
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("recovers an exhausted transport disconnect on visibilitychange, persisted pageshow, or manual Reconnect", async () => {
+    const visibility = { value: "hidden" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      const exhaust = async () => {
+        for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+          closeNewest(1006);
+          // oxlint-disable-next-line no-await-in-loop
+          await elapse(delay);
+        }
+        closeNewest(1006);
+        await elapse(60_000);
+      };
+
+      await exhaust();
+      const exhausted = terminalSessionMock.instances.length;
+      expect(screen.getByTestId("terminal-disconnected")).toBeInTheDocument();
+
+      // Returning to foreground restores the budget and redials immediately.
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+
+      // Persisted pageshow also recovers an exhausted transport disconnect.
+      await exhaust();
+      const exhaustedBeforePageShow = terminalSessionMock.instances.length;
+      act(() => {
+        const pageshow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(pageshow, "persisted", { value: true });
+        window.dispatchEvent(pageshow);
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(exhaustedBeforePageShow + 1);
+
+      // Manual Reconnect button also redials immediately.
+      await exhaust();
+      const exhaustedAgain = terminalSessionMock.instances.length;
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(exhaustedAgain + 1);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("restarts a stalled connecting dial on persisted pageshow or return from hidden, without replacing a fresh dial", async () => {
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      // Initial non-persisted pageshow must not disturb a fresh connecting dial.
+      act(() => {
+        const initialPageShow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(initialPageShow, "persisted", { value: false });
+        window.dispatchEvent(initialPageShow);
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(1);
+
+      // Going hidden then visible while still connecting restarts the stalled dial.
+      visibility.value = "hidden";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+
+      // An immediate persisted pageshow in the same wake burst does NOT replace the fresh dial.
+      act(() => {
+        const immediatePageShow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(immediatePageShow, "persisted", { value: true });
+        window.dispatchEvent(immediatePageShow);
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+
+      // Once that dial has actually stalled past the probe window, persisted pageshow restarts it.
+      await elapse(3_000);
+      act(() => {
+        const bfcachePageShow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(bfcachePageShow, "persisted", { value: true });
+        window.dispatchEvent(bfcachePageShow);
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(3);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("does not bypass backoff twice in one wake when the first wake dial closes quickly", async () => {
+    const visibility = { value: "hidden" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      closeNewest(1006);
+      expect(terminalSessionMock.instances).toHaveLength(1);
+
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+
+      // First wake dial fails quickly with 1013; trailing persisted pageshow 10ms later
+      // must NOT start a second immediate dial or reset backoff.
+      closeNewest(1013);
+      await elapse(10);
+      act(() => {
+        const pageshow = new Event("pageshow") as PageTransitionEvent;
+        Object.defineProperty(pageshow, "persisted", { value: true });
+        window.dispatchEvent(pageshow);
+      });
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
+
+  it("does not treat a backoff dial started after hide in the same millisecond as stalled", async () => {
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility.value,
+    });
+    try {
+      await renderAndAttach();
+      closeNewest(1006);
+      // Go hidden just before the backoff timer fires, then let backoff fire in the same ms.
+      visibility.value = "hidden";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await elapse(RECONNECT_BACKOFF_MS[0]);
+      expect(terminalSessionMock.instances).toHaveLength(2);
+
+      // Returning visible right after the new dial started must keep it, not replace it.
+      visibility.value = "visible";
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
   });
 });
 

@@ -249,6 +249,7 @@ class _WebSocket:
             self.incoming.put_nowait(message)
         self.frames = []
         self.code = None
+        self.reason = None
 
     async def receive(self):
         return await self.incoming.get()
@@ -256,11 +257,15 @@ class _WebSocket:
     async def send_json(self, frame):
         self.frames.append(frame)
 
+    async def send_text(self, frame):
+        self.frames.append(json.loads(frame))
+
     async def send_bytes(self, frame):
         self.frames.append(frame)
 
-    async def close(self, code=1000):
+    async def close(self, code=1000, reason=""):
         self.code = code
+        self.reason = reason
 
 
 @pytest.mark.asyncio
@@ -396,4 +401,26 @@ async def test_bridge_exit_or_backpressure_close(instance, monkeypatch, overflow
         instance._subscribers[0].offer(None)
     await asyncio.wait_for(task, 3)
     assert ws.code == (1013 if overflow else 4404)
+    assert ws.reason == ("" if overflow else "terminal process exited")
     assert not instance._subscribers
+
+
+@pytest.mark.asyncio
+async def test_conpty_bridge_replies_pong_to_ping_without_pty_input(instance):
+    """Valid ping frames receive a matching pong and never write to the PTY."""
+    process = _Process()
+    instance._process, instance.running = process, True
+    ws = _WebSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"ping","id":"probe-1"}'},
+            {"type": "websocket.receive", "text": '{"type":"ping","id":""}'},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    await asyncio.wait_for(bridge_conpty_to_websocket(ws, instance), 3)
+    assert {"type": "pong", "id": "probe-1"} in ws.frames
+    assert not any(
+        isinstance(frame, dict) and frame.get("type") == "pong" and frame.get("id") == ""
+        for frame in ws.frames
+    )
+    assert process.writes == []

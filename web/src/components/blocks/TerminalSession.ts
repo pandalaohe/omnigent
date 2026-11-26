@@ -61,6 +61,21 @@ import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
 import { attachImeHeuristic, type Detached } from "./imeAnchor";
 import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
+import {
+  type ConnectionState,
+  isTerminalProcessExitedClose,
+  isUnexpectedTerminalClose,
+  WS_CLOSE_TERMINAL_NOT_FOUND,
+  WS_CLOSE_WRONG_REPLICA,
+} from "@/lib/terminalCloseCodes";
+
+export {
+  type ConnectionState,
+  isTerminalProcessExitedClose,
+  isUnexpectedTerminalClose,
+  WS_CLOSE_TERMINAL_NOT_FOUND,
+  WS_CLOSE_WRONG_REPLICA,
+};
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 // Smallest grid the tmux bridge forwards (control_bridge.MIN_FORWARDED_COLS/ROWS).
@@ -99,11 +114,16 @@ function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
   };
 }
 
-// WebSocket close codes (RFC 6455 reserves 4xxx).
-// 4400 signals wrong-replica routing: the keyed request reached the wrong
-// replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
-// Mirrors ``ws_common.py`` ``WS_CLOSE_WRONG_REPLICA``.
-export const WS_CLOSE_WRONG_REPLICA = 4400;
+/** Default timeout waiting for a liveness ``pong`` after returning to foreground. */
+export const LIVENESS_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Outcome of {@link TerminalSession.probeLiveness}:
+ * - ``"alive"``: matching ``pong`` arrived (or legacy endpoint without ping support).
+ * - ``"dead"``: an OPEN socket timed out or failed to send — half-open drop, safe to redial.
+ * - ``"closed"``: the socket is closing/closed/disposed so its close event is authoritative.
+ */
+export type LivenessProbeResult = "alive" | "dead" | "closed";
 
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
@@ -235,66 +255,25 @@ function sameOriginSessionLink(uri: string): string | null {
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
-/**
- * Lifecycle state of the bridge, surfaced to React for the
- * connecting / closed / error overlays.
- *
- * The ``closed`` variant carries the WebSocket close code alongside
- * the human-readable reason so consumers can distinguish deliberate
- * server closes (the 4xxx app codes) from transport-level drops —
- * see {@link isUnexpectedTerminalClose}.
- */
-export type ConnectionState =
-  | { kind: "connecting" }
-  | { kind: "connected" }
-  | { kind: "closed"; reason: string; code: number }
-  | { kind: "error" };
-
-/**
- * Decide whether a WebSocket close code represents a transport-level
- * drop worth auto-reconnecting, rather than a deliberate close.
- *
- * Deliberate closes — normal closure (1000), auth/policy rejections
- * (1008), and the app's own 4xxx codes (4404 terminal-not-found,
- * 4405 terminal-detached, 4500 internal error; see
- * ``omnigent/terminals/ws_common.py``) — mean the server decided the
- * attach should end, so re-dialing would either loop on the same
- * answer or resurrect a terminal the user intentionally left.
- *
- * Transport-shaped closes happen *to* the connection rather than
- * being decided by either end's terminal logic:
- *
- * - 1005 / 1006: the browser's own "closed without a clean app code"
- *   sentinels — 1005 is "no status code" (a Close frame with an empty
- *   payload, e.g. a fronting proxy collapsing the close of a backend
- *   that went away), 1006 is "no close frame at all" (a dead TCP
- *   connection discovered on tab thaw). Neither is a code any endpoint
- *   sets deliberately, so both are always a transport drop. A server
- *   redeploy behind an ingress surfaces as 1005 here.
- * - 1001: "going away" — a server or proxy restarting.
- * - 1012 / 1013: service restart / try again later.
- * - 1011 / 1014: server internal error / bad gateway — the fronting
- *   proxy (e.g. Databricks Apps) emits these while the backend is
- *   mid-restart. The app's OWN internal error is the explicit 4500, so
- *   a raw 1011/1014 is infrastructure, not a deliberate terminal end.
- *
- * Pure helper — exported for direct unit testing.
- *
- * :param code: The WebSocket close code from the ``close`` event,
- *     e.g. ``1006``.
- * :returns: ``true`` when the close is transport-shaped and a
- *     reconnect attempt is appropriate.
- */
-export function isUnexpectedTerminalClose(code: number): boolean {
-  return (
-    code === 1001 ||
-    code === 1005 ||
-    code === 1006 ||
-    code === 1011 ||
-    code === 1012 ||
-    code === 1013 ||
-    code === 1014
-  );
+/** Parse a server/bridge liveness ``pong`` reply and return its ping id. */
+export function parseTerminalPongMessage(message: string): string | null {
+  if (!message.includes('"pong"')) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value as { type?: unknown }).type !== "pong" ||
+    typeof (value as { id?: unknown }).id !== "string" ||
+    (value as { id: string }).id.length === 0
+  ) {
+    return null;
+  }
+  return (value as { id: string }).id;
 }
 
 /** Listener for `ConnectionState` transitions. */
@@ -768,6 +747,14 @@ export class TerminalSession {
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
   private touchSelection: TerminalTouchSelection | null = null;
+  /** True for relay endpoints (server always answers ping) or once a pong arrives. */
+  private livenessSupported: boolean;
+  private livenessProbeSeq = 0;
+  private pendingLivenessProbe: {
+    id: string;
+    promise: Promise<LivenessProbeResult>;
+    finish: (result: LivenessProbeResult) => void;
+  } | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -800,9 +787,11 @@ export class TerminalSession {
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
     onClipboardAction?: TerminalClipboardAction,
+    assumeLivenessSupport = false,
   ) {
     this.container = container;
     this.onClipboardAction = onClipboardAction;
+    this.livenessSupported = assumeLivenessSupport;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -913,6 +902,7 @@ export class TerminalSession {
         // dimensions before the user sees the default 80×24 followed
         // by a reflow.
         this.sendResize();
+        this.sendLivenessInitPing();
         if (this.focusOnConnect) this.term.focus();
         onState({ kind: "connected" });
       },
@@ -934,6 +924,14 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
+          const pongId = parseTerminalPongMessage(ev.data);
+          if (pongId !== null) {
+            this.livenessSupported = true;
+            if (this.pendingLivenessProbe?.id === pongId) {
+              this.pendingLivenessProbe.finish("alive");
+            }
+            return;
+          }
           if (this.hostClipboard.receive(ev.data)) return;
           const windowsPty = parseWindowsPtyMessage(ev.data);
           if (windowsPty) {
@@ -963,6 +961,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.finishLivenessProbe("closed");
         this.touchSelection?.cancel();
         this.hostClipboard.close();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
@@ -973,6 +972,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "error",
       () => {
+        this.finishLivenessProbe("closed");
         this.touchSelection?.cancel();
         this.hostClipboard.close();
         onState({ kind: "error" });
@@ -1428,6 +1428,68 @@ export class TerminalSession {
   }
 
   /**
+   * Verify that an open WebSocket still reaches the server/bridge.
+   *
+   * Resolves ``"closed"`` whenever the socket is disposed or no longer OPEN so
+   * the close event's code remains authoritative (never racing a deliberate
+   * 4404/4405/4403/1000 close). Resolves ``"dead"`` only when an OPEN socket
+   * fails to send or times out waiting for a matching ``pong`` while still
+   * OPEN. Concurrent calls coalesce onto one probe. Older direct-attach
+   * runners that ignore ``ping`` leave ``livenessSupported`` false so healthy
+   * connections are never churned.
+   */
+  probeLiveness(timeoutMs = LIVENESS_PROBE_TIMEOUT_MS): Promise<LivenessProbeResult> {
+    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.resolve("closed");
+    }
+    if (!this.livenessSupported) {
+      return Promise.resolve("alive");
+    }
+    if (this.pendingLivenessProbe !== null) {
+      return this.pendingLivenessProbe.promise;
+    }
+    const id = `probe-${++this.livenessProbeSeq}`;
+    let finishProbe: (result: LivenessProbeResult) => void = () => {};
+    const promise = new Promise<LivenessProbeResult>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(
+        () =>
+          finishProbe(!this.disposed && this.ws.readyState === WebSocket.OPEN ? "dead" : "closed"),
+        timeoutMs,
+      );
+      finishProbe = (result: LivenessProbeResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.pendingLivenessProbe?.id === id) {
+          this.pendingLivenessProbe = null;
+        }
+        resolve(result);
+      };
+    });
+    this.pendingLivenessProbe = { id, promise, finish: finishProbe };
+    try {
+      this.ws.send(JSON.stringify({ type: "ping", id }));
+    } catch {
+      finishProbe(!this.disposed && this.ws.readyState === WebSocket.OPEN ? "dead" : "closed");
+    }
+    return promise;
+  }
+
+  private sendLivenessInitPing(): void {
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ type: "ping", id: "init" }));
+    } catch {
+      /* noop */
+    }
+  }
+
+  private finishLivenessProbe(result: LivenessProbeResult): void {
+    this.pendingLivenessProbe?.finish(result);
+  }
+
+  /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
    * event into the next mount.
@@ -1438,6 +1500,7 @@ export class TerminalSession {
    */
   dispose(): void {
     if (this.disposed) return;
+    this.finishLivenessProbe("closed");
     this.hostClipboard.close();
     this.disposed = true;
     this.touchSelection?.dispose();

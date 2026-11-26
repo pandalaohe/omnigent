@@ -2841,4 +2841,113 @@ describe("TerminalSession", () => {
       }
     });
   });
+
+  describe("liveness probe", () => {
+    it("sends an init ping on open, answers alive on matching pong, and coalesces concurrent probes", async () => {
+      vi.useFakeTimers();
+      const onActivity = vi.fn();
+      const onInput = vi.fn();
+      const { session, socket } = makeSession(onActivity, onInput);
+      try {
+        socket.open();
+        expect(socket.sent).toContain(JSON.stringify({ type: "ping", id: "init" }));
+        socket.sent = [];
+
+        // Endpoint proves liveness support by answering the init ping.
+        socket.emit("message", { data: JSON.stringify({ type: "pong", id: "init" }) });
+        expect(onActivity).not.toHaveBeenCalled();
+        expect(onInput).not.toHaveBeenCalled();
+
+        const p1 = session.probeLiveness(3000);
+        const p2 = session.probeLiveness(3000);
+        expect(p2).toBe(p1);
+        expect(socket.sent).toHaveLength(1);
+        const ping = JSON.parse(socket.sent[0] as string) as { type: string; id: string };
+        expect(ping.type).toBe("ping");
+
+        // Mismatched pong does not resolve the probe.
+        socket.emit("message", { data: JSON.stringify({ type: "pong", id: "other" }) });
+        socket.emit("message", { data: JSON.stringify({ type: "pong", id: ping.id }) });
+        await expect(p1).resolves.toBe("alive");
+        expect(onActivity).not.toHaveBeenCalled();
+        expect(onInput).not.toHaveBeenCalled();
+      } finally {
+        session.dispose();
+        vi.useRealTimers();
+      }
+    });
+
+    it("resolves dead only on open-socket timeout and closed when close/closing owns the socket", async () => {
+      vi.useFakeTimers();
+      const { session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.emit("message", { data: JSON.stringify({ type: "pong", id: "init" }) });
+        socket.sent = [];
+
+        const timedOut = session.probeLiveness(3000);
+        await vi.advanceTimersByTimeAsync(3000);
+        await expect(timedOut).resolves.toBe("dead");
+
+        // Closing or already-closed socket defers to the close event rather than racing it.
+        socket.readyState = 2; // WebSocket.CLOSING
+        await expect(session.probeLiveness(3000)).resolves.toBe("closed");
+
+        socket.readyState = 3; // WebSocket.CLOSED before close event delivery
+        await expect(session.probeLiveness(3000)).resolves.toBe("closed");
+
+        socket.readyState = 1; // WebSocket.OPEN
+        const closedDuringProbe = session.probeLiveness(3000);
+        socket.close();
+        socket.emit("close", { code: 4404, reason: "terminal session ended" });
+        await expect(closedDuringProbe).resolves.toBe("closed");
+
+        // Close already delivered -> still "closed" so the close code remains authoritative.
+        await expect(session.probeLiveness(3000)).resolves.toBe("closed");
+      } finally {
+        session.dispose();
+        vi.useRealTimers();
+      }
+    });
+
+    it("preserves open sockets on older endpoints that never answered a ping, while relay endpoints always probe", async () => {
+      vi.useFakeTimers();
+      const { session, socket } = makeSession();
+      const container = document.createElement("div");
+      const relaySession = new TerminalSession(
+        container,
+        "ws://example.test/v1/sessions/s1/resources/terminals/t1/attach",
+        () => {},
+        false,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        true,
+        false,
+        undefined,
+        undefined,
+        true,
+      );
+      const relaySocket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+      try {
+        socket.open();
+        socket.sent = [];
+        await expect(session.probeLiveness(3000)).resolves.toBe("alive");
+        expect(socket.sent).toEqual([]);
+
+        // Relay socket probes even if stalled before its init pong arrives.
+        relaySocket.open();
+        relaySocket.sent = [];
+        const probe = relaySession.probeLiveness(3000);
+        expect(relaySocket.sent).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(3000);
+        await expect(probe).resolves.toBe("dead");
+      } finally {
+        session.dispose();
+        relaySession.dispose();
+        vi.useRealTimers();
+      }
+    });
+  });
 });
