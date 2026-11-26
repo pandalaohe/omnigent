@@ -161,6 +161,11 @@ function readMaster(): Record<string, Record<string, unknown>> {
   return JSON.parse(localStorage.getItem(DEFAULTS_KEY) ?? "{}");
 }
 
+function showUnconfigured() {
+  const toggle = screen.queryByTestId("layered-fold-toggle");
+  if (toggle?.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
+}
+
 async function pickOption(triggerTestId: string, optionName: string) {
   fireEvent.click(screen.getByTestId(triggerTestId));
   fireEvent.click(await screen.findByRole("option", { name: optionName }));
@@ -201,6 +206,7 @@ describe("CallingDefaultsSection", () => {
     });
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    showUnconfigured();
     expect(screen.getByRole("link", { name: "Release assistant details" })).toHaveAttribute(
       "href",
       "/settings/agents/custom/agent-custom",
@@ -220,10 +226,12 @@ describe("CallingDefaultsSection", () => {
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("radio", { name: "Thinking" }));
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    showUnconfigured();
     fireEvent.click(screen.getByRole("link", { name: "Release assistant details" }));
     expect(screen.queryByRole("radio", { name: "Thinking" })).toBeNull();
     fireEvent.click(await screen.findByRole("link", { name: "Return to table" }));
     expect(screen.getByRole("radio", { name: "Thinking" })).toBeChecked();
+    showUnconfigured();
     expect(screen.getByRole("link", { name: "Release assistant details" })).toBeVisible();
     expect(screen.getByText("Page 2")).toBeVisible();
   });
@@ -235,6 +243,7 @@ describe("CallingDefaultsSection", () => {
     ];
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    showUnconfigured();
     expect(screen.getAllByRole("link", { name: /Claude.*details/ })).toHaveLength(1);
     expect(screen.queryByRole("link", { name: /^claude details$/i })).toBeNull();
     expect(screen.getByRole("link", { name: "ACP · example details" })).toHaveAttribute(
@@ -258,6 +267,7 @@ describe("CallingDefaultsSection", () => {
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("radio", { name: "Thinking" }));
+    showUnconfigured();
     fireEvent.click(screen.getByTestId("layered-cell-acp:neutral-host-a"));
     fireEvent.click(screen.getByRole("combobox", { name: "Thinking" }));
     expect(await screen.findByRole("option", { name: /deliberate/i })).toBeInTheDocument();
@@ -354,6 +364,7 @@ describe("CallingDefaultsSection", () => {
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     expect(screen.getByTestId("calling-defaults-host-host-a")).toHaveTextContent("offline");
     fireEvent.click(screen.getByRole("radio", { name: "Model" }));
+    showUnconfigured();
     fireEvent.click(screen.getByTestId("layered-cell-codex-native-host-a"));
     fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
     fireEvent.click(await screen.findByRole("option", { name: "GPT-6-Astra" }));
@@ -378,6 +389,7 @@ describe("CallingDefaultsSection", () => {
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
+    showUnconfigured();
     expect(screen.getByTestId("layered-cell-pi-native-host-a")).toHaveTextContent("Full access");
     fireEvent.click(screen.getByTestId("layered-cell-codex-host-a"));
     fireEvent.click(screen.getByRole("button", { name: "Use inherited" }));
@@ -443,6 +455,7 @@ it("adds a plugin declared setting and saves its mode", async () => {
   };
   render(<CallingDefaultsSection />);
   fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
+  showUnconfigured();
   fireEvent.click(screen.getByTestId("layered-cell-custom-host-a"));
   fireEvent.click(screen.getByRole("combobox", { name: "Permission" }));
   fireEvent.click(await screen.findByRole("option", { name: "Review" }));

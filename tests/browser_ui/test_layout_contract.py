@@ -308,6 +308,15 @@ def test_settings_layout(
     expect(main.get_by_text(marker, exact=True)).to_be_visible(timeout=5_000)
     if section == "agents":
         table = main.get_by_role("table", name="Model defaults")
+        # Both seeded agents use their defaults, so they start in the collapsed group.
+        fold = table.get_by_test_id("layered-fold-toggle")
+        expect(fold).to_have_text("Not configured (2)")
+        expect(fold).to_have_attribute("aria-expanded", "false")
+        expect(fold).to_be_in_viewport(ratio=1)
+        expect(table.get_by_text("Codex SDK", exact=True)).to_have_count(0)
+        assert_layout(main, "settings-agents-folded", Path(output_path))
+        fold.click()
+        expect(fold).to_have_attribute("aria-expanded", "true")
         native = table.get_by_text("Codex", exact=True)
         sdk = table.get_by_text("Codex SDK", exact=True)
         sdk_row = table.get_by_role("row").filter(has=page.get_by_text("Codex SDK", exact=True))

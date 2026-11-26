@@ -67,6 +67,15 @@ function ProviderValue({
   return account.kind === "none" ? "Not signed in" : "Not reported";
 }
 
+/** A gateway, a labelled provider, an API key or a subscription counts as a set provider. */
+function providerReported(harness: string, host: Host, capabilities: HarnessCapabilityMap) {
+  if (host.gateway_inference?.[harness] === true) return true;
+  const account =
+    host.harness_accounts?.[harnessAccountKey(agentProductHarness(harness, capabilities))];
+  if (account?.kind === "providers") return !!account.providers?.some((provider) => provider.label);
+  return ["api_key", "chatgpt", "subscription"].includes(account?.kind ?? "");
+}
+
 export function AgentContextTable({
   field,
   ...props
@@ -79,6 +88,7 @@ export function AgentContextTable({
   capabilities: HarnessCapabilityMap;
   detailRows?: LayeredTableProps["detailRows"];
   visibleHostId?: string;
+  foldUnconfigured?: boolean;
 }) {
   return field === "prompt" ? (
     <PromptTable {...props} />
@@ -124,6 +134,7 @@ function ContextTable({
   agentIds,
   capabilities,
   detailRows,
+  foldUnconfigured,
   layers,
   loading,
   catalogs,
@@ -174,6 +185,7 @@ function ContextTable({
         };
       })}
       detailRows={detailRows}
+      foldUnconfiguredBy={foldUnconfigured ? hosts.map((host) => host.host_id) : undefined}
       columns={hosts
         .filter((host) => !visibleHostId || host.host_id === visibleHostId)
         .map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
@@ -189,6 +201,7 @@ function ContextTable({
         if (field === "provider")
           return {
             content: <ProviderValue harness={harness} host={host} capabilities={capabilities} />,
+            configured: providerReported(harness, host, capabilities),
           };
         if (
           catalogs?.some(
@@ -204,6 +217,7 @@ function ContextTable({
             (route) => route.agent_key === agent.key && route.host_id === hostId,
           );
         return {
+          configured: !!agent,
           content: agent ? (
             <Link
               to={startupPromptsPath(agent.key, hostId)}

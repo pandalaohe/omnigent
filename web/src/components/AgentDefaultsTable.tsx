@@ -116,6 +116,7 @@ export interface AgentDefaultsTableProps {
   agentIds?: Readonly<Record<string, string | undefined>>;
   linkToDetails?: boolean;
   visibleHostId?: string;
+  foldUnconfigured?: boolean;
   onChange: (table: CallingDefaultsTable) => void;
   onLoadCatalog?: (host: string, harness: string) => void;
 }
@@ -348,6 +349,7 @@ export function AgentDefaultsTable({
   agentIds,
   linkToDetails = false,
   visibleHostId,
+  foldUnconfigured,
   onChange,
   onLoadCatalog,
 }: AgentDefaultsTableProps) {
@@ -698,6 +700,7 @@ export function AgentDefaultsTable({
           };
         })}
         detailRows={detailRows}
+        foldUnconfiguredBy={foldUnconfigured ? hostList.map((host) => host.host_id) : undefined}
         columns={hostList
           .filter((host) => !visibleHostId || host.host_id === visibleHostId)
           .map((host) => ({
