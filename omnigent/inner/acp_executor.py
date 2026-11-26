@@ -53,14 +53,20 @@ import logging
 import math
 import operator
 import os
+import re
 import secrets
 import shutil
+import stat
 import subprocess
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import unquote, urlparse
+
+if TYPE_CHECKING:
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 from omnigent._platform import IS_WINDOWS
 from omnigent._windows_launcher import (
@@ -137,6 +143,9 @@ _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]
 _ElicitationChoiceHandler: TypeAlias = Callable[
     [str, _AcpJsonObject, Sequence[str], str | None, bool], Awaitable[str | None]
 ]
+_FormElicitationHandler: TypeAlias = Callable[
+    [str, "ElicitationRequestParams"], Awaitable["ElicitationResult"]
+]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code an agent maps to a filesystem "not found" (ENOENT) when a
@@ -182,6 +191,43 @@ _AGY_ACP_READ_CONFLICT_FIELDS = (
     | _AGY_ACP_WRITE_FIELDS
     | {"Edits", "Target", "Replacement"}
 )
+_AGY_ACP_READ_FILE_FIELDS = {
+    "Path": str,
+    "StartLine": int,
+    "EndLine": int,
+    "ByteOffset": int,
+    "toolSummary": str,
+}
+_AGY_ACP_READ_PATH_CONFLICT_FIELDS = _AGY_ACP_READ_CONFLICT_FIELDS - {"Path"}
+
+_AGY_READ_FILE_MAX_BYTES = 64 * 1024
+_AGY_READ_FILE_MAX_SCAN_BYTES = 2 * 1024 * 1024
+_AGY_QUESTION_TEXT_LIMIT = 8_000
+_AGY_QUESTION_LABEL_LIMIT = 512
+_AGY_TOOL_NAME_MAP: Mapping[str, str] = {
+    "run_command": "shell",
+    "read_file": "read",
+    "view_file": "read",
+    "client_view_file": "read",
+    "write_file": "write",
+    "write_to_file": "write",
+    "edit_file": "edit",
+    "replace_file_content": "edit",
+    "multi_replace_file_content": "edit",
+    "list_dir": "list",
+    "list_directory": "list",
+    "grep_search": "grep",
+    "code_search": "grep",
+    "find_by_name": "glob",
+    "search_web": "web_search",
+    "read_url_content": "web_read",
+}
+_AGY_READ_TOOLS = frozenset({"read_file", "view_file", "client_view_file"})
+_AGY_NON_FILE_READ_TOOLS = frozenset(
+    {"list_dir", "list_directory", "grep_search", "code_search", "find_by_name"}
+)
+_AGY_TITLE_TOOL_RE = re.compile(r"^(?:Running|Run)\s+([A-Za-z0-9_]+)\??$")
+_AGY_WINDOWS_LEADING_SLASH_RE = re.compile(r"^/([A-Za-z]:[/\\].*)$")
 
 # session/update.update.sessionUpdate discriminator values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
@@ -363,6 +409,636 @@ def _same_json_value(left: object, right: object) -> bool:
             _same_json_value(a, b) for a, b in zip(left, right, strict=True)
         )
     return left == right
+
+
+def _bound_agy_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def _parse_agy_file_uri(value: str) -> str | None:
+    """Parse a local ``file://`` URI to a local path, or None if remote or malformed."""
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if parsed.netloc not in ("", "localhost"):
+        return None
+    decoded = unquote(parsed.path)
+    match = _AGY_WINDOWS_LEADING_SLASH_RE.match(decoded)
+    return match.group(1) if match else decoded
+
+
+def _normalize_agy_path(value: str) -> str:
+    """Normalize AG file:// URIs and Windows leading-slash drive paths to local paths."""
+    if value.lower().startswith("file://"):
+        parsed_path = _parse_agy_file_uri(value)
+        return parsed_path if parsed_path is not None else value
+    match = _AGY_WINDOWS_LEADING_SLASH_RE.match(value)
+    return match.group(1) if match else value
+
+
+def _extract_agy_location_path(locations: object) -> str | None:
+    if not isinstance(locations, list):
+        return None
+    for entry in locations:
+        if isinstance(entry, dict):
+            path = entry.get("path")
+            if isinstance(path, str) and path:
+                return _normalize_agy_path(path)
+    return None
+
+
+def _resolve_agy_tool_name(
+    update: _AcpJsonObject, raw_input: _AcpJsonObject, locations: object
+) -> tuple[str, str]:
+    """Resolve an AG ACP tool update to ``(canonical_name, raw_name)``."""
+    raw_name_val = update.get("name")
+    title_val = update.get("title")
+    raw_name = raw_name_val.strip() if isinstance(raw_name_val, str) else ""
+    if not raw_name and isinstance(title_val, str):
+        title_stripped = title_val.strip()
+        title_match = _AGY_TITLE_TOOL_RE.match(title_stripped)
+        if title_match:
+            raw_name = title_match.group(1)
+        elif title_stripped in _AGY_TOOL_NAME_MAP:
+            raw_name = title_stripped
+    if raw_name in _AGY_TOOL_NAME_MAP:
+        return _AGY_TOOL_NAME_MAP[raw_name], raw_name
+
+    kind = update.get("kind")
+    keys = raw_input.keys()
+    has_command = any(
+        isinstance(raw_input.get(k), str) and raw_input[k]
+        for k in ("CommandLine", "command_line", "commandLine", "command")
+    )
+    has_path = (
+        any(
+            isinstance(raw_input.get(k), str) and raw_input[k]
+            for k in (
+                "Path",
+                "AbsolutePath",
+                "absolute_path",
+                "TargetFile",
+                "file_path",
+                "path",
+            )
+        )
+        or _extract_agy_location_path(locations) is not None
+    )
+    if kind == "execute" or has_command:
+        return "shell", raw_name or "run_command"
+    if kind == "read" and has_path and raw_name not in _AGY_NON_FILE_READ_TOOLS:
+        return "read", raw_name or "read_file"
+    if kind == "edit":
+        if keys & {"TargetContent", "ReplacementContent", "Target", "Replacement", "Edits"}:
+            return "edit", raw_name or "edit_file"
+        if keys & {"Content", "CodeContent"}:
+            return "write", raw_name or "write_file"
+        if has_path:
+            return "edit", raw_name or "edit_file"
+
+    fallback = raw_name or str(update.get("title") or kind or "tool")
+    return fallback, raw_name
+
+
+def _normalize_agy_edits(raw_edits: object) -> list[_AcpJsonObject] | None:
+    if not isinstance(raw_edits, list):
+        return None
+    normalized: list[_AcpJsonObject] = []
+    for entry in raw_edits:
+        if not isinstance(entry, dict):
+            return None
+        old_text = entry.get("TargetContent")
+        if not isinstance(old_text, str):
+            old_text = entry.get("Target")
+        new_text = entry.get("ReplacementContent")
+        if not isinstance(new_text, str):
+            new_text = entry.get("Replacement")
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            return None
+        item: _AcpJsonObject = {"oldText": old_text, "newText": new_text}
+        if entry.get("ReplaceAll") is True or entry.get("replaceAll") is True:
+            item["replaceAll"] = True
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_agy_tool_args(
+    raw_input: _AcpJsonObject, locations: object, *, tool_name: str
+) -> _AcpJsonObject:
+    """Normalize AG PascalCase / vendor tool arguments to Omnigent's shared lowercase keys."""
+    out: _AcpJsonObject = dict(raw_input)
+
+    def _alias(
+        canonical: str,
+        aliases: tuple[str, ...],
+        *,
+        transform: Callable[[str], str] | None = None,
+        allow_empty: bool = False,
+    ) -> None:
+        if canonical in out:
+            if transform is not None and isinstance(out[canonical], str):
+                out[canonical] = transform(out[canonical])
+            return
+        for key in aliases:
+            value = out.get(key)
+            if isinstance(value, str) and (allow_empty or value):
+                out.pop(key, None)
+                out[canonical] = transform(value) if transform is not None else value
+                return
+
+    _alias("command", ("CommandLine", "command_line", "commandLine"))
+    _alias("cwd", ("Cwd", "WorkingDirectory", "working_dir", "workingDir"))
+    _alias(
+        "path",
+        (
+            "Path",
+            "AbsolutePath",
+            "absolute_path",
+            "TargetFile",
+            "file_path",
+            "DirectoryPath",
+            "SearchPath",
+            "SearchDirectory",
+        ),
+        transform=_normalize_agy_path,
+    )
+    if "path" not in out:
+        loc_path = _extract_agy_location_path(locations)
+        if loc_path is not None:
+            out["path"] = loc_path
+    _alias("content", ("Content", "CodeContent"), allow_empty=True)
+    _alias("oldText", ("TargetContent", "Target"), allow_empty=True)
+    _alias("newText", ("ReplacementContent", "Replacement"), allow_empty=True)
+    if "edits" not in out and "Edits" in out:
+        normalized_edits = _normalize_agy_edits(out["Edits"])
+        if normalized_edits is not None:
+            out.pop("Edits", None)
+            out["edits"] = normalized_edits
+    _alias("pattern", ("Pattern",))
+    if tool_name in ("grep", "glob"):
+        _alias("pattern", ("Query",))
+    else:
+        _alias("query", ("Query",))
+    _alias("url", ("Url",))
+    return out
+
+
+def _normalize_agy_tool_output(update: _AcpJsonObject, *, is_shell: bool) -> Any:  # type: ignore[explicit-any]
+    """Normalize AG ACP tool completion payload without altering structured ACP content."""
+    content = update.get("content")
+    if content:
+        return content
+    raw_output = update.get("rawOutput")
+    if isinstance(raw_output, dict):
+        text: str | None = None
+        for key in ("combinedOutput", "combined_output", "output"):
+            val = raw_output.get(key)
+            if isinstance(val, str):
+                text = val
+                break
+        exit_code: int | None = None
+        for key in ("exitCode", "exit_code"):
+            val = raw_output.get(key)
+            if type(val) is int:
+                exit_code = val
+                break
+        if is_shell and (text is not None or exit_code is not None):
+            body = text or ""
+            if exit_code is not None and exit_code != 0:
+                suffix = f"[exit code: {exit_code}]"
+                return f"{body.rstrip(chr(10))}\n{suffix}" if body else suffix
+            return body
+        cleaned = dict(raw_output)
+        combined = cleaned.get("combinedOutput")
+        if not isinstance(combined, str):
+            combined = cleaned.get("combined_output")
+        if isinstance(combined, str):
+            for dup_key in ("formatted_output", "formattedOutput"):
+                if cleaned.get(dup_key) == combined:
+                    cleaned.pop(dup_key, None)
+        if isinstance(cleaned.get("imagePath"), str):
+            cleaned["imagePath"] = _normalize_agy_path(cleaned["imagePath"])
+        return cleaned
+    return raw_output
+
+
+def _is_agy_file_read(raw_name: str, kind: object, raw_input: _AcpJsonObject) -> bool:
+    if raw_name in _AGY_READ_TOOLS:
+        return True
+    if raw_name in _AGY_NON_FILE_READ_TOOLS:
+        return False
+    if kind != "read":
+        return False
+    return any(
+        isinstance(raw_input.get(key), str) and raw_input[key]
+        for key in ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+    )
+
+
+def _decode_utf8_prefix(data: bytes, *, truncated: bool) -> str | None:
+    if b"\x00" in data:
+        return None
+    if not truncated:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    for trim in range(4):
+        end = len(data) - trim
+        if end < 0:
+            break
+        try:
+            return data[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _normalize_windows_kernel_path(resolved: str) -> str:
+    if resolved.startswith("\\\\?\\UNC\\"):
+        resolved = "\\\\" + resolved[8:]
+    elif resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+def _windows_final_handle_path_raw(handle: int) -> str | None:
+    """Query the kernel final path for an open Windows OS handle without re-resolving by name."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        get_final = windll.kernel32.GetFinalPathNameByHandleW
+        get_final.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+        get_final.restype = ctypes.c_uint32
+        buf_size = get_final(handle, None, 0, 0)
+        if buf_size == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(buf_size)
+        written = get_final(handle, buf, buf_size, 0)
+        if written == 0 or written >= buf_size:
+            return None
+        return _normalize_windows_kernel_path(buf.value)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _windows_final_handle_path(fd: int) -> str | None:
+    """Resolve the final kernel path of an open Windows fd without re-resolving by name."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import msvcrt
+
+        get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
+        if get_osfhandle is None:
+            return None
+        return _windows_final_handle_path_raw(get_osfhandle(fd))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _open_windows_workspace_handle(cwd: str) -> int | None:
+    """Open a shareable Windows directory handle for the workspace root, or None."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        create_file = windll.kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        invalid_handle = ctypes.c_void_p(-1).value
+        handle = create_file(cwd, 0, 7, None, 3, 0x02000000, None)
+        if not handle or handle == invalid_handle:
+            return None
+        return int(handle)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _close_windows_handle(handle: int) -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is not None:
+            windll.kernel32.CloseHandle(handle)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _windows_workspace_root_norm(cwd: str) -> str | None:
+    """Resolve the Windows workspace root directly via an open directory handle."""
+    handle = _open_windows_workspace_handle(cwd)
+    if handle is None:
+        return None
+    try:
+        return _windows_final_handle_path_raw(handle)
+    finally:
+        _close_windows_handle(handle)
+
+
+@dataclass(frozen=True)
+class _AgyReadSpec:
+    perm_name: str
+    norm_path: str
+    policy_args: _AcpJsonObject
+    start_line: int | None
+    end_line: int | None
+    byte_offset: int
+
+
+_AGY_READ_PATH_KEYS = ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+
+
+def _extract_agy_read_spec(raw_input: _AcpJsonObject, locations: object) -> _AgyReadSpec | None:
+    """Validate and extract one unambiguous read target and range for policy and disk backfill."""
+    present_path_keys = [
+        key for key in _AGY_READ_PATH_KEYS if key in raw_input and raw_input[key] is not None
+    ]
+    if len(present_path_keys) > 1:
+        return None
+
+    perm_name = "read_file"
+    raw_path: str | None = None
+    if len(present_path_keys) == 1:
+        key = present_path_keys[0]
+        val = raw_input[key]
+        if not isinstance(val, str) or not val:
+            return None
+        raw_path = val
+        if key == "AbsolutePath":
+            perm_name = "view_file"
+    else:
+        if isinstance(locations, list):
+            loc_paths = [
+                entry.get("path")
+                for entry in locations
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]
+            ]
+            if len(loc_paths) == 1:
+                raw_path = loc_paths[0]
+    if not raw_path or "\x00" in raw_path:
+        return None
+    if raw_path.lower().startswith("file://"):
+        norm_path = _parse_agy_file_uri(raw_path)
+        if not norm_path:
+            return None
+    else:
+        norm_path = _normalize_agy_path(raw_path)
+    if "\x00" in norm_path:
+        return None
+
+    start_line: int | None = None
+    end_line: int | None = None
+    byte_offset = 0
+    if "StartLine" in raw_input and raw_input["StartLine"] is not None:
+        val = raw_input["StartLine"]
+        if type(val) is not int or val < 1:
+            return None
+        start_line = val
+    if "EndLine" in raw_input and raw_input["EndLine"] is not None:
+        val = raw_input["EndLine"]
+        if type(val) is not int or val < 1:
+            return None
+        end_line = val
+    if start_line is not None and end_line is not None and end_line < start_line:
+        return None
+    if start_line is None and end_line is None:
+        if "line" in raw_input and raw_input["line"] is not None:
+            val = raw_input["line"]
+            if type(val) is not int or val < 1:
+                return None
+            start_line = val
+        if "limit" in raw_input and raw_input["limit"] is not None:
+            val = raw_input["limit"]
+            if type(val) is not int or val < 1:
+                return None
+            base = start_line if start_line is not None else 1
+            end_line = base + val - 1
+    if "ByteOffset" in raw_input and raw_input["ByteOffset"] is not None:
+        val = raw_input["ByteOffset"]
+        if type(val) is not int or val < 0:
+            return None
+        byte_offset = val
+
+    path_field = "AbsolutePath" if perm_name == "view_file" else "Path"
+    policy_args: _AcpJsonObject = {path_field: norm_path}
+    if start_line is not None:
+        policy_args["StartLine"] = start_line
+    if end_line is not None:
+        policy_args["EndLine"] = end_line
+    if byte_offset:
+        policy_args["ByteOffset"] = byte_offset
+    return _AgyReadSpec(
+        perm_name=perm_name,
+        norm_path=norm_path,
+        policy_args=policy_args,
+        start_line=start_line,
+        end_line=end_line,
+        byte_offset=byte_offset,
+    )
+
+
+def _open_workspace_regular_file(
+    cwd: str,
+    norm_path: str,
+    *,
+    workspace_fd: int | None = None,
+    workspace_win_handle: int | None = None,
+    workspace_real: str | None = None,
+    require_anchor: bool = False,
+) -> int | None:
+    """Open a workspace-contained regular file anchored to the workspace directory."""
+    if "\x00" in norm_path or "\x00" in cwd:
+        return None
+    try:
+        cwd_real = (
+            Path(workspace_real) if workspace_real is not None else Path(os.path.realpath(cwd))
+        )
+        candidate = Path(norm_path) if os.path.isabs(norm_path) else cwd_real / norm_path
+        target_real = Path(os.path.realpath(candidate))
+        if not target_real.is_relative_to(cwd_real):
+            return None
+        rel_parts = target_real.relative_to(cwd_real).parts
+        if not rel_parts:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    o_cloexec = getattr(os, "O_CLOEXEC", 0)
+    o_nonblock = getattr(os, "O_NONBLOCK", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_directory = getattr(os, "O_DIRECTORY", 0)
+
+    if o_nofollow and o_directory and os.open in os.supports_dir_fd:
+        if workspace_fd is None and require_anchor:
+            return None
+        own_root = workspace_fd is None
+        dir_fd = -1
+        try:
+            if workspace_fd is not None:
+                dir_fd = workspace_fd
+            else:
+                dir_fd = os.open(cwd_real, os.O_RDONLY | o_directory | o_cloexec)
+            for segment in rel_parts[:-1]:
+                next_fd = os.open(
+                    segment, os.O_RDONLY | o_directory | o_nofollow | o_cloexec, dir_fd=dir_fd
+                )
+                if dir_fd != workspace_fd:
+                    os.close(dir_fd)
+                dir_fd = next_fd
+            fd = os.open(
+                rel_parts[-1], os.O_RDONLY | o_nonblock | o_nofollow | o_cloexec, dir_fd=dir_fd
+            )
+        except (OSError, ValueError):
+            return None
+        finally:
+            if dir_fd != -1 and (own_root or dir_fd != workspace_fd):
+                with contextlib.suppress(OSError):
+                    os.close(dir_fd)
+    else:
+        if IS_WINDOWS and workspace_win_handle is None and require_anchor:
+            return None
+        try:
+            fd = os.open(target_real, os.O_RDONLY | o_nonblock | o_nofollow | o_cloexec)
+        except (OSError, ValueError):
+            return None
+        if IS_WINDOWS:
+            root_norm = (
+                _windows_final_handle_path_raw(workspace_win_handle)
+                if workspace_win_handle is not None
+                else _windows_workspace_root_norm(cwd)
+            )
+            final_norm = _windows_final_handle_path(fd)
+            if (
+                root_norm is None
+                or final_norm is None
+                or not final_norm.startswith(root_norm.rstrip("\\/") + os.sep)
+            ):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                return None
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return None
+    return fd
+
+
+def _read_agy_file_body(
+    cwd: str,
+    raw_input: _AcpJsonObject,
+    locations: object,
+    *,
+    spec: _AgyReadSpec | None = None,
+    workspace_fd: int | None = None,
+    workspace_win_handle: int | None = None,
+    workspace_real: str | None = None,
+    require_anchor: bool = False,
+) -> str | None:
+    """Safely read a workspace-contained UTF-8 text file for AG ACP read_file backfill."""
+    read_spec = spec if spec is not None else _extract_agy_read_spec(raw_input, locations)
+    if read_spec is None:
+        return None
+    start_line = read_spec.start_line
+    end_line = read_spec.end_line
+    byte_offset = read_spec.byte_offset
+
+    fd = _open_workspace_regular_file(
+        cwd,
+        read_spec.norm_path,
+        workspace_fd=workspace_fd,
+        workspace_win_handle=workspace_win_handle,
+        workspace_real=workspace_real,
+        require_anchor=require_anchor,
+    )
+    if fd is None:
+        return None
+
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            collected = bytearray()
+            scanned = 0
+            skipped_range_bytes = 0
+            truncated = False
+            first_line = start_line or 1
+            line_no = 0
+            at_line_start = True
+            while True:
+                raw_line = handle.readline(_AGY_READ_FILE_MAX_BYTES + 1)
+                if not raw_line:
+                    break
+                if b"\x00" in raw_line:
+                    return None
+                scanned += len(raw_line)
+                if scanned > _AGY_READ_FILE_MAX_SCAN_BYTES:
+                    truncated = True
+                    break
+                if at_line_start:
+                    line_no += 1
+                at_line_start = raw_line.endswith(b"\n")
+                if line_no < first_line:
+                    continue
+                if end_line is not None and line_no > end_line:
+                    break
+                chunk = raw_line
+                if skipped_range_bytes < byte_offset:
+                    remaining_skip = byte_offset - skipped_range_bytes
+                    if len(chunk) <= remaining_skip:
+                        skipped_range_bytes += len(chunk)
+                        continue
+                    chunk = chunk[remaining_skip:]
+                    skipped_range_bytes = byte_offset
+                remaining_budget = _AGY_READ_FILE_MAX_BYTES - len(collected)
+                if len(chunk) > remaining_budget:
+                    collected.extend(chunk[:remaining_budget])
+                    truncated = True
+                    break
+                collected.extend(chunk)
+                if len(collected) >= _AGY_READ_FILE_MAX_BYTES:
+                    if not at_line_start or end_line is None or line_no < end_line:
+                        if handle.read(1):
+                            truncated = True
+                    break
+    except OSError:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        return None
+
+    decoded = _decode_utf8_prefix(bytes(collected), truncated=truncated)
+    if decoded is None:
+        return None
+    return f"{decoded}\n...[truncated]" if truncated else decoded
 
 
 def _looks_like_missing_file(message: str) -> bool:
@@ -633,9 +1309,20 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        self._tool_raw_meta: dict[str, _AcpJsonObject] = {}
         self._permission_calls: dict[str, _AcpJsonObject] = {}
         self._answered_permission_calls: set[str] = set()
         self._terminal_permission_calls: set[str] = set()
+        self._denied_permission_calls: set[str] = set()
+        self._authorized_read_calls: dict[str, tuple[str, _AcpJsonObject]] = {}
+        self._pending_read_backfills: dict[
+            str, tuple[str, _AcpJsonObject, object, bool, object, int | None]
+        ] = {}
+        self._tainted_interaction_calls: set[str] = set()
+        self._observed_terminal_calls: set[str] = set()
+        self._workspace_dir_fd: int | None = None
+        self._workspace_win_handle: int | None = None
+        self._workspace_real_path: str | None = None
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -649,6 +1336,7 @@ class AcpExecutor(Executor):
         self._elicitation_handler: _ElicitationHandler | None = None
         self._policy_elicitation_handler: _ElicitationHandler | None = None
         self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
+        self._form_elicitation_handler: _FormElicitationHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
@@ -690,6 +1378,7 @@ class AcpExecutor(Executor):
         # fail early with a clear message if that directory was also deleted.
         if not os.path.isabs(self._cwd):
             _resolve_cwd(None, session_id=self._session_id)
+        self._anchor_workspace_fd()
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -923,6 +1612,8 @@ class AcpExecutor(Executor):
                             and isinstance(params, dict)
                         ):
                             self._note_permission_update(params.get("sessionId"), update)
+                        if self._is_agy_acp and isinstance(params, dict):
+                            self._note_agy_interaction_activity(params.get("sessionId"), update)
                         if update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION:
                             self._note_config_options(update.get("configOptions"))
                             continue
@@ -1342,15 +2033,21 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow, option_id = await self._decide_permission(params)
-                if allow is None or (
-                    self._config.host_permission_tier and self._active_prompt_request_id is None
-                ):
-                    result = {"outcome": {"outcome": "cancelled"}}
-                elif self._config.host_permission_tier and not allow and option_id is None:
-                    raise _AcpRequestError(-32000, "Omnigent did not authorize this tool call.")
+                if self._is_agy_acp and self._is_agy_interaction_shaped(params):
+                    result = await self._handle_agy_interaction_request(params)
                 else:
-                    result = self._permission_outcome(params, allow=allow, option_id=option_id)
+                    allow, option_id = await self._decide_permission(params)
+                    if allow is None or (
+                        self._config.host_permission_tier
+                        and self._active_prompt_request_id is None
+                    ):
+                        result = {"outcome": {"outcome": "cancelled"}}
+                    elif self._config.host_permission_tier and not allow and option_id is None:
+                        raise _AcpRequestError(
+                            -32000, "Omnigent did not authorize this tool call."
+                        )
+                    else:
+                        result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -1477,8 +2174,265 @@ class AcpExecutor(Executor):
         return self._config.permission_mode == "bypassPermissions"
 
     @property
+    def _is_agy_acp(self) -> bool:
+        return is_antigravity_acp_command(self._config.command)
+
+    @property
     def _managed_agy(self) -> bool:
         return self._config.host_permission_tier and Path(self._argv[0]).stem.lower() == "agy"
+
+    def _anchor_workspace_fd(self) -> None:
+        """Pin a trusted workspace directory descriptor (POSIX) or root handle (Windows)."""
+        self._close_workspace_fd()
+        if not self._is_agy_acp:
+            return
+        if IS_WINDOWS:
+            handle = _open_windows_workspace_handle(self._cwd)
+            if handle is None:
+                return
+            root_norm = _windows_final_handle_path_raw(handle)
+            if root_norm is None:
+                _close_windows_handle(handle)
+                return
+            self._workspace_win_handle = handle
+            self._workspace_real_path = root_norm
+            return
+        o_directory = getattr(os, "O_DIRECTORY", 0)
+        o_cloexec = getattr(os, "O_CLOEXEC", 0)
+        if not (o_directory and os.open in os.supports_dir_fd):
+            return
+        try:
+            cwd_real = os.path.realpath(self._cwd)
+            self._workspace_dir_fd = os.open(cwd_real, os.O_RDONLY | o_directory | o_cloexec)
+            self._workspace_real_path = cwd_real
+        except (OSError, ValueError):
+            self._workspace_dir_fd = None
+            self._workspace_real_path = None
+
+    def _close_workspace_fd(self) -> None:
+        fd = self._workspace_dir_fd
+        win_handle = self._workspace_win_handle
+        self._workspace_dir_fd = None
+        self._workspace_win_handle = None
+        self._workspace_real_path = None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if win_handle is not None:
+            _close_windows_handle(win_handle)
+
+    def _note_agy_interaction_activity(self, session_id: object, update: _AcpJsonObject) -> None:
+        """Track live updates on ``interaction_*`` ids while an elicitation card may be open."""
+        if self._session_id is not None and session_id != self._session_id:
+            return
+        if update.get("sessionUpdate") not in (_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE):
+            return
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id.startswith("interaction_"):
+            return
+        raw_input = update.get("rawInput")
+        if update.get("kind") not in (None, "other") or (
+            raw_input is not None and raw_input != {}
+        ):
+            self._tainted_interaction_calls.add(call_id)
+        if update.get("status") in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED, "cancelled"):
+            self._observed_terminal_calls.add(call_id)
+
+    @staticmethod
+    def _is_agy_interaction_shaped(params: _AcpJsonObject) -> bool:
+        """True when a permission request is question-shaped (never a tool approval)."""
+        tool_call = params.get("toolCall")
+        if not isinstance(tool_call, dict):
+            return False
+        call_id = tool_call.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id.startswith("interaction_"):
+            return False
+        if tool_call.get("kind") not in (None, "other"):
+            return False
+        raw_input = tool_call.get("rawInput")
+        return raw_input is None or raw_input == {}
+
+    def _is_agy_interaction_request(self, params: _AcpJsonObject) -> bool:
+        """True for a clean, non-tainted, non-terminal AG ACP ``interaction_*`` question."""
+        if not self._is_agy_interaction_shaped(params):
+            return False
+        tool_call = params.get("toolCall")
+        assert isinstance(tool_call, dict)
+        call_id = tool_call.get("toolCallId")
+        assert isinstance(call_id, str)
+        if (
+            call_id in self._tainted_interaction_calls
+            or call_id in self._observed_terminal_calls
+            or call_id in self._terminal_permission_calls
+        ):
+            return False
+        observed = self._permission_calls.get(call_id)
+        if observed is not None:
+            obs_input = observed.get("rawInput")
+            if observed.get("kind") not in (None, "other") or (
+                obs_input is not None and obs_input != {}
+            ):
+                return False
+        raw_meta = self._tool_raw_meta.get(call_id)
+        if raw_meta is not None:
+            meta_input = raw_meta.get("raw_input")
+            if raw_meta.get("kind") not in (None, "other") or (
+                meta_input is not None and meta_input != {}
+            ):
+                return False
+        cached_input = self._tool_inputs.get(call_id)
+        if cached_input is not None and cached_input != {}:
+            return False
+        return True
+
+    @staticmethod
+    def _build_agy_display_options(
+        parsed_options: list[tuple[str, str]],
+    ) -> list[tuple[str, str]] | None:
+        """Build strictly unique display labels for an AG question card, or None on collision."""
+
+        def _disambiguate(base: str, opt_id: str) -> str:
+            suffix = f" ({opt_id})"
+            if len(suffix) >= _AGY_QUESTION_LABEL_LIMIT:
+                return _bound_agy_text(opt_id, _AGY_QUESTION_LABEL_LIMIT)
+            max_base = _AGY_QUESTION_LABEL_LIMIT - len(suffix)
+            prefix = _bound_agy_text(base, max_base) if len(base) > max_base else base
+            return f"{prefix}{suffix}"
+
+        labels = [base for _, base in parsed_options]
+        for _ in range(2):
+            counts: dict[str, int] = {}
+            for lbl in labels:
+                counts[lbl] = counts.get(lbl, 0) + 1
+            if all(c == 1 for c in counts.values()):
+                return [
+                    (lbl, opt_id) for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)
+                ]
+            labels = [
+                _disambiguate(lbl, opt_id) if counts[lbl] > 1 else lbl
+                for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)
+            ]
+        if len(set(labels)) != len(labels):
+            return None
+        return [(lbl, opt_id) for lbl, (opt_id, _) in zip(labels, parsed_options, strict=True)]
+
+    async def _handle_agy_interaction_request(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Route an AG ACP ``interaction_*`` request to an Omnigent question card."""
+        cancelled: _AcpJsonObject = {"outcome": {"outcome": "cancelled"}}
+        if not self._is_agy_interaction_request(params):
+            return cancelled
+        tool_call = params.get("toolCall")
+        if not isinstance(tool_call, dict):
+            return cancelled
+        call_id = tool_call.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            return cancelled
+        req_session_id = params.get("sessionId")
+        if (
+            self._active_prompt_request_id is None
+            or self._session_id is None
+            or req_session_id != self._session_id
+            or call_id in self._answered_permission_calls
+            or call_id in self._terminal_permission_calls
+            or call_id in self._observed_terminal_calls
+            or call_id in self._tainted_interaction_calls
+        ):
+            return cancelled
+        self._answered_permission_calls.add(call_id)
+        self._permission_calls.pop(call_id, None)
+
+        options = self._permission_options(params)
+        if not options:
+            return cancelled
+        seen_ids: set[str] = set()
+        parsed_options: list[tuple[str, str]] = []
+        for opt in options:
+            option_id = opt.get("optionId")
+            if not isinstance(option_id, str) or not option_id.strip() or option_id in seen_ids:
+                return cancelled
+            seen_ids.add(option_id)
+            raw_name = opt.get("name")
+            base_label = (
+                raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else option_id
+            )
+            parsed_options.append(
+                (option_id, _bound_agy_text(base_label, _AGY_QUESTION_LABEL_LIMIT))
+            )
+
+        handler = self._form_elicitation_handler
+        if handler is None:
+            return cancelled
+
+        display_options = self._build_agy_display_options(parsed_options)
+        if display_options is None:
+            return cancelled
+        label_to_id = dict(display_options)
+        if len(label_to_id) != len(display_options):
+            return cancelled
+
+        raw_title = tool_call.get("title")
+        question_text = _bound_agy_text(
+            raw_title.strip()
+            if isinstance(raw_title, str) and raw_title.strip()
+            else "Choose an option.",
+            _AGY_QUESTION_TEXT_LIMIT,
+        )
+
+        from omnigent.server.schemas import ElicitationRequestParams
+
+        elicit_params = ElicitationRequestParams(
+            mode="form",
+            message="Antigravity needs your input",
+            requestedSchema=None,
+            url=None,
+            phase="agy_ask_question",
+            policy_name="agy_acp_ask_question",
+            ask_user_question={
+                "questions": [
+                    {
+                        "id": call_id,
+                        "header": "Question",
+                        "question": question_text,
+                        "options": [{"label": label} for label, _ in display_options],
+                        "multiSelect": False,
+                        "isOther": False,
+                    }
+                ]
+            },
+        )
+        orig_session_id = self._session_id
+        orig_prompt_id = self._active_prompt_request_id
+        result = await handler(f"elicit_acp_{secrets.token_hex(12)}", elicit_params)
+        if (
+            self._session_id != orig_session_id
+            or self._active_prompt_request_id != orig_prompt_id
+            or (self._config.host_permission_tier and self._active_prompt_request_id is None)
+            or call_id in self._terminal_permission_calls
+            or call_id in self._observed_terminal_calls
+            or not self._is_agy_interaction_request(params)
+        ):
+            return cancelled
+        if result is None or result.action != "accept" or not isinstance(result.content, dict):
+            return cancelled
+
+        raw_answer = result.content.get(call_id)
+        if raw_answer is None:
+            raw_answer = result.content.get(question_text)
+        if isinstance(raw_answer, list):
+            if len(raw_answer) != 1 or not isinstance(raw_answer[0], str):
+                return cancelled
+            answer = raw_answer[0]
+        elif isinstance(raw_answer, str):
+            answer = raw_answer
+        else:
+            return cancelled
+        if not answer:
+            return cancelled
+
+        matched_id = label_to_id.get(answer)
+        if matched_id is not None:
+            return {"outcome": {"outcome": "selected", "optionId": matched_id}}
+        return cancelled
 
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
@@ -1582,8 +2536,23 @@ class AcpExecutor(Executor):
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
         keys = arguments.keys()
-        if (kind == "read" or "AbsolutePath" in keys) and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
+        if "AbsolutePath" in keys and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
             return None
+        if kind == "read" and "AbsolutePath" not in keys:
+            if keys & _AGY_ACP_READ_PATH_CONFLICT_FIELDS:
+                return None
+            if "Path" in keys:
+                read_path = arguments.get("Path")
+                if (
+                    not isinstance(read_path, str)
+                    or not read_path
+                    or any(
+                        type(value) is not _AGY_ACP_READ_FILE_FIELDS.get(key)
+                        for key, value in arguments.items()
+                    )
+                ):
+                    return None
+                return "read_file", arguments
         if "CommandLine" in keys:
             command = arguments["CommandLine"]
             if (
@@ -1718,8 +2687,33 @@ class AcpExecutor(Executor):
         ) if allowed and self._config.host_permission_tier else None
 
     async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool | None, str | None]:
+        tool_call_obj = params.get("toolCall")
+        req_call_id = (
+            tool_call_obj.get("toolCallId")
+            if isinstance(tool_call_obj, dict) and isinstance(tool_call_obj.get("toolCallId"), str)
+            else None
+        )
         if not self._config.host_permission_tier:
-            return await self._evaluate_permission(params)
+            unmanaged_result = await self._evaluate_permission(params)
+            if req_call_id:
+                if unmanaged_result[0] is True:
+                    raw_args = (
+                        tool_call_obj.get("rawInput") if isinstance(tool_call_obj, dict) else None
+                    )
+                    if not isinstance(raw_args, dict):
+                        raw_args = self._tool_inputs.get(req_call_id)
+                    if isinstance(raw_args, dict) and any(
+                        isinstance(raw_args.get(k), str) and raw_args[k]
+                        for k in ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
+                    ):
+                        perm_name = "view_file" if "AbsolutePath" in raw_args else "read_file"
+                        self._authorized_read_calls[req_call_id] = (
+                            perm_name,
+                            copy.deepcopy(raw_args),
+                        )
+                else:
+                    self._denied_permission_calls.add(req_call_id)
+            return unmanaged_result
         bound_call = self._bound_permission_call(params)
         trace = _AcpPermissionTrace() if self._managed_agy else None
         binding = "unbound"
@@ -1737,12 +2731,25 @@ class AcpExecutor(Executor):
                 binding = "current"
                 self._permission_calls.pop(call_id)
                 result = decision
+        if req_call_id:
+            if (
+                result[0] is True
+                and bound_call is not None
+                and bound_call["name"] in ("read_file", "view_file")
+            ):
+                self._authorized_read_calls[req_call_id] = (
+                    bound_call["name"],
+                    copy.deepcopy(bound_call["arguments"]),
+                )
+            elif result[0] is not True:
+                self._denied_permission_calls.add(req_call_id)
         if trace is not None:
             tool_name = bound_call["name"] if bound_call is not None else "unbound"
             intent_kind = {
                 "unbound": "unbound",
                 "run_command": "execute",
                 "view_file": "read",
+                "read_file": "read",
                 "write_to_file": "edit",
             }.get(tool_name, "unknown")
             allowed, option_id = result
@@ -2146,12 +3153,20 @@ class AcpExecutor(Executor):
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
+        self._tool_raw_meta.clear()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         self._terminal_permission_calls.clear()
+        self._denied_permission_calls.clear()
+        self._authorized_read_calls.clear()
+        self._pending_read_backfills.clear()
+        self._tainted_interaction_calls.clear()
+        self._observed_terminal_calls.clear()
         self._bridge_tool_aliases = frozenset()
 
-    def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
+    def _handle_session_update(
+        self, update: _AcpJsonObject, *, update_session_id: object = None
+    ) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
         Returns the events to yield (usually 0 or 1). Side effects: records the
@@ -2203,19 +3218,48 @@ class AcpExecutor(Executor):
                 events.append(ReasoningChunk(delta=text, event_type="reasoning_text"))
         elif update_type == _UPDATE_TOOL_CALL:
             call_id = update.get("toolCallId")
-            name = update.get("title") or update.get("kind") or "tool"
+            raw_title_name = update.get("title") or update.get("kind") or "tool"
             raw_input = update.get("rawInput")
-            args = raw_input if isinstance(raw_input, dict) else {}
+            args: _AcpJsonObject = raw_input if isinstance(raw_input, dict) else {}
+            is_bridge = self._is_bridge_tool_call(str(raw_title_name), update)
+            if self._is_agy_acp and not is_bridge:
+                locations = update.get("locations")
+                name, raw_name = _resolve_agy_tool_name(update, args, locations)
+                norm_args = _normalize_agy_tool_args(args, locations, tool_name=name)
+            else:
+                name = str(raw_title_name)
+                raw_name = ""
+                norm_args = args
             if isinstance(call_id, str) and call_id:
-                self._tool_names[call_id] = str(name)
+                # Keep raw title/input for unmanaged _extract_tool_call policy fallback.
+                self._tool_names[call_id] = str(raw_title_name)
                 self._tool_inputs[call_id] = args
+                same_session = (
+                    self._session_id is None
+                    and self._active_prompt_request_id is None
+                    and update_session_id is None
+                ) or (self._session_id is not None and update_session_id == self._session_id)
+                if self._is_agy_acp and not is_bridge and same_session:
+                    self._tool_raw_meta[call_id] = {
+                        "display_name": str(name),
+                        "raw_name": raw_name,
+                        "kind": update.get("kind"),
+                        "raw_input": copy.deepcopy(args),
+                        "locations": copy.deepcopy(update.get("locations")),
+                        "session_id": update_session_id,
+                        "prompt_id": self._active_prompt_request_id,
+                    }
+                    if call_id.startswith("interaction_") and (
+                        update.get("kind") not in (None, "other") or args != {}
+                    ):
+                        self._tainted_interaction_calls.add(call_id)
                 metadata: _AcpJsonObject = {"call_id": call_id}
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
                 # queue would mis-pair the next bridge completion.
-                if not self._is_bridge_tool_call(str(name), update):
+                if not is_bridge:
                     metadata["internally_executed"] = True
-                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
+                events.append(ToolCallRequest(name=str(name), args=norm_args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -2223,8 +3267,74 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_COMPLETED,
                 _TOOL_STATUS_FAILED,
             ):
-                name = self._tool_names.pop(call_id, "tool")
+                self._observed_terminal_calls.add(call_id)
+                raw_fallback_name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
+                raw_meta = self._tool_raw_meta.pop(call_id, None)
+                authorized_read = self._authorized_read_calls.pop(call_id, None)
+                if self._is_agy_acp and isinstance(raw_meta, dict):
+                    display_name = raw_meta.get("display_name")
+                    name = (
+                        display_name
+                        if isinstance(display_name, str) and display_name
+                        else raw_fallback_name
+                    )
+                    result = _normalize_agy_tool_output(update, is_shell=(name == "shell"))
+                    if (
+                        status == _TOOL_STATUS_COMPLETED
+                        and result in (None, "", [], {})
+                        and not (self._os_env is not None and self._os_env.fork)
+                        and call_id not in self._denied_permission_calls
+                    ):
+                        if authorized_read is not None:
+                            backfill_tool, backfill_args = authorized_read
+                            backfill_locations: object = None
+                            eligible = True
+                        else:
+                            meta_args = raw_meta.get("raw_input")
+                            backfill_args = dict(meta_args) if isinstance(meta_args, dict) else {}
+                            backfill_locations = raw_meta.get("locations")
+                            backfill_tool = str(raw_meta.get("raw_name") or "")
+                            eligible = _is_agy_file_read(
+                                backfill_tool, raw_meta.get("kind"), backfill_args
+                            )
+                        if eligible:
+                            if self._policy_evaluator is None:
+                                direct_bound = (
+                                    self._session_id is None
+                                    and self._active_prompt_request_id is None
+                                    and update_session_id is None
+                                ) or (
+                                    self._session_id is not None
+                                    and update_session_id == self._session_id
+                                    and raw_meta.get("session_id") == self._session_id
+                                    and self._active_prompt_request_id is not None
+                                    and raw_meta.get("prompt_id") == self._active_prompt_request_id
+                                )
+                                if direct_bound:
+                                    backfilled = _read_agy_file_body(
+                                        self._cwd,
+                                        backfill_args,
+                                        backfill_locations,
+                                        workspace_fd=self._workspace_dir_fd,
+                                        workspace_win_handle=self._workspace_win_handle,
+                                        workspace_real=self._workspace_real_path,
+                                        require_anchor=(self._proc is not None),
+                                    )
+                                    if backfilled is not None:
+                                        result = backfilled
+                            else:
+                                self._pending_read_backfills[call_id] = (
+                                    backfill_tool,
+                                    backfill_args,
+                                    backfill_locations,
+                                    authorized_read is not None,
+                                    raw_meta.get("session_id"),
+                                    raw_meta.get("prompt_id"),
+                                )
+                else:
+                    name = raw_fallback_name
+                    result = update.get("content") or update.get("rawOutput")
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -2233,10 +3343,21 @@ class AcpExecutor(Executor):
                             if status == _TOOL_STATUS_COMPLETED
                             else ToolCallStatus.ERROR
                         ),
-                        result=update.get("content") or update.get("rawOutput"),
+                        result=result,
                         metadata={"call_id": call_id},
                     )
                 )
+            elif self._is_agy_acp and isinstance(call_id, str) and call_id:
+                if status == "cancelled":
+                    self._observed_terminal_calls.add(call_id)
+                    self._tool_raw_meta.pop(call_id, None)
+                    self._authorized_read_calls.pop(call_id, None)
+                elif call_id.startswith("interaction_"):
+                    upd_raw = update.get("rawInput")
+                    if update.get("kind") not in (None, "other") or (
+                        upd_raw is not None and upd_raw != {}
+                    ):
+                        self._tainted_interaction_calls.add(call_id)
         elif update_type == _UPDATE_USAGE:
             size = update.get("size")
             if isinstance(size, int) and size > 0:
@@ -2248,6 +3369,96 @@ class AcpExecutor(Executor):
             self._note_session_modes(update)
 
         return events
+
+    async def _is_agy_read_backfill_allowed(
+        self, call_id: str, raw_name: str, spec: _AgyReadSpec
+    ) -> bool:
+        """Verify policy + host tier allow the exact validated read target and range."""
+        policy_eval = self._policy_evaluator
+        if policy_eval is None:
+            return True
+        data: _AcpJsonObject = {"name": spec.perm_name, "arguments": dict(spec.policy_args)}
+        if self._config.host_permission_tier:
+            data["_omnigent_acp_call"] = {
+                "call_id": call_id,
+                "name": spec.perm_name,
+                "arguments": dict(spec.policy_args),
+            }
+        try:
+            verdict = await policy_eval("PHASE_TOOL_CALL", data)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("acp read_file backfill policy check failed (%s): %s", raw_name, exc)
+            return False
+        action = getattr(verdict, "action", None)
+        if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK"):
+            return False
+        if self._config.host_permission_tier:
+            verdict_data = getattr(verdict, "data", None)
+            tier = (
+                verdict_data.get("_omnigent_acp_tier") if isinstance(verdict_data, dict) else None
+            )
+            return (
+                action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") and tier == "allow"
+            )
+        return True
+
+    async def _resolve_agy_read_backfills(
+        self,
+        expected_session_id: str,
+        update_session_id: object,
+        events: list[ExecutorEvent],
+    ) -> None:
+        """Resolve queued AG read_file backfills asynchronously with policy authorization."""
+        pending = dict(self._pending_read_backfills)
+        self._pending_read_backfills.clear()
+        if update_session_id != expected_session_id:
+            return
+        if self._active_prompt_request_id is None:
+            return
+        for idx, event in enumerate(events):
+            if not isinstance(event, ToolCallComplete):
+                continue
+            call_id = event.metadata.get("call_id") if isinstance(event.metadata, dict) else None
+            if not isinstance(call_id, str) or call_id not in pending:
+                continue
+            (
+                raw_name,
+                raw_args,
+                locations,
+                already_authorized,
+                start_session_id,
+                start_prompt_id,
+            ) = pending[call_id]
+            if (
+                call_id in self._denied_permission_calls
+                or start_session_id != expected_session_id
+                or start_prompt_id != self._active_prompt_request_id
+            ):
+                continue
+            spec = _extract_agy_read_spec(raw_args, locations)
+            if spec is None:
+                continue
+            if not already_authorized and not await self._is_agy_read_backfill_allowed(
+                call_id, raw_name, spec
+            ):
+                continue
+            backfilled = _read_agy_file_body(
+                self._cwd,
+                raw_args,
+                locations,
+                spec=spec,
+                workspace_fd=self._workspace_dir_fd,
+                workspace_win_handle=self._workspace_win_handle,
+                workspace_real=self._workspace_real_path,
+                require_anchor=(self._proc is not None),
+            )
+            if backfilled is not None:
+                events[idx] = ToolCallComplete(
+                    name=event.name,
+                    status=event.status,
+                    result=backfilled,
+                    metadata=event.metadata,
+                )
 
     def _note_config_options(self, options: object, *, model_switch: bool = False) -> str | None:
         """Record which session config options the agent exposes, and their values.
@@ -2758,6 +3969,7 @@ class AcpExecutor(Executor):
         (agents often report their model right after ``session/new``) is noted
         rather than lost, so the model it names and its option id are current.
         """
+        self._active_prompt_request_id = None
         while not self._queue.empty():
             try:
                 stale = self._queue.get_nowait()
@@ -2965,9 +4177,15 @@ class AcpExecutor(Executor):
 
         # Drain stale items from a prior turn, plus anything the switch above queued.
         await self._drain_stale_queue()
+        self._tool_raw_meta.clear()
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         self._terminal_permission_calls.clear()
+        self._denied_permission_calls.clear()
+        self._authorized_read_calls.clear()
+        self._pending_read_backfills.clear()
+        self._tainted_interaction_calls.clear()
+        self._observed_terminal_calls.clear()
         reported_mode = self._active_mode
         if reported_mode:
             yield SessionModeChanged(
@@ -3039,6 +4257,7 @@ class AcpExecutor(Executor):
             remaining = max(deadline, max(running_tool_deadlines.values(), default=deadline))
             remaining -= loop.time()
             if remaining <= 0:
+                self._active_prompt_request_id = None
                 yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
                 return
 
@@ -3066,7 +4285,14 @@ class AcpExecutor(Executor):
                             )
                         elif status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED):
                             running_tool_deadlines.pop(call_id, None)
-                for event in self._handle_session_update(update):
+                events = self._handle_session_update(
+                    update, update_session_id=params.get("sessionId")
+                )
+                if self._pending_read_backfills:
+                    await self._resolve_agy_read_backfills(
+                        session_id, params.get("sessionId"), events
+                    )
+                for event in events:
                     if isinstance(event, TextChunk):
                         accumulated_text.append(event.text)
                     yield event
@@ -3144,6 +4370,7 @@ class AcpExecutor(Executor):
         self._cancel_grace_deadline = None
         self._active_prompt_request_id = None
         self._reset_session_state()
+        self._close_workspace_fd()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
