@@ -36,6 +36,7 @@ import base64
 import mimetypes
 import os
 import re
+import stat
 import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -205,6 +206,8 @@ class WorkspaceReader:
         raw: bool = False,
         max_bytes: int | None = None,
         within: str | None = None,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
 
@@ -222,6 +225,11 @@ class WorkspaceReader:
             workspace root) the file must resolve strictly inside, passing
             the bundle name rules; anything else is a 404. A directory
             cannot be confined and is refused.
+        :param include_etag: Include ``_etag`` (weak validator) on file
+            payloads for the server to forward as an HTTP ``ETag`` header.
+        :param if_none_match: Optional ``If-None-Match`` header value; when it
+            matches the file's weak ETag, returns a lightweight
+            ``not_modified`` payload without reading file bytes.
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
@@ -242,7 +250,12 @@ class WorkspaceReader:
             if not resolved_within(resolved, root):
                 raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
         payload = self._read_file(
-            path, resolved, byte_cap, force_base64=raw and max_bytes is not None
+            path,
+            resolved,
+            byte_cap,
+            force_base64=raw and max_bytes is not None,
+            include_etag=include_etag,
+            if_none_match=if_none_match,
         )
         if within is not None:
             payload["within_enforced"] = True
@@ -325,6 +338,8 @@ class WorkspaceReader:
         max_bytes: int,
         *,
         force_base64: bool = False,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
@@ -336,15 +351,31 @@ class WorkspaceReader:
         Reads at most ``max_bytes + 1`` from disk, bounding memory
         use before decoding oversized files.
         """
+        from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
+
+        etag: str | None = None
         try:
             with resolved.open("rb") as fh:
+                if include_etag or if_none_match is not None:
+                    st = os.fstat(fh.fileno())
+                    if stat.S_ISREG(st.st_mode):
+                        etag = workspace_file_etag(st)
+                    if etag is not None and if_none_match_matches(if_none_match, etag):
+                        return {
+                            "object": "session.environment.filesystem.not_modified",
+                            "path": rel,
+                            "etag": etag,
+                        }
                 # One extra byte lets us detect (and flag) truncation
                 # without loading the rest of a large file into memory.
                 capped = fh.read(max_bytes + 1)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, capped, max_bytes, force_base64=force_base64)
+        payload = self._file_content_payload(rel, capped, max_bytes, force_base64=force_base64)
+        if include_etag and etag is not None:
+            payload["_etag"] = etag
+        return payload
 
     def _file_content_payload(
         self,

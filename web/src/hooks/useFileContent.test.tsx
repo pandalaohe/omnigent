@@ -1285,3 +1285,228 @@ describe("useBinaryFilePreview", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Weak ETag / If-None-Match / 304 conditional polling
+// ---------------------------------------------------------------------------
+
+function jsonResponseWithHeaders(body: unknown, headers: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+function notModifiedResponse(headers: Record<string, string> = {}): Response {
+  return new Response(null, { status: 304, statusText: "Not Modified", headers });
+}
+
+function requestHeader(callIndex: number, name: string): string | null {
+  const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit | undefined;
+  return new Headers(init?.headers).get(name);
+}
+
+describe("weak ETag / 304 conditional polling", () => {
+  it("sends If-None-Match on 2s polls, keeps cached object on 304, and refreshes on change", async () => {
+    vi.useFakeTimers();
+    try {
+      onlineMock.mockReturnValue(true);
+      hostOnlineMock.mockReturnValue(true);
+      stubChatStore({ conversationId: "conv_etag", sessionStatus: "idle" });
+
+      fetchMock
+        .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("v1"), { ETag: 'W/"2-10-1"' }))
+        .mockResolvedValueOnce(notModifiedResponse({ ETag: 'W/"2-10-1"' }))
+        .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("v2"), { ETag: 'W/"2-20-1"' }))
+        .mockResolvedValueOnce(notModifiedResponse({ ETag: 'W/"2-20-1"' }));
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderHook(
+        () => useFileContent("conv_etag", "notes.md", { visible: true }),
+        { wrapper: stableWrap(qc) },
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(requestHeader(0, "if-none-match")).toBeNull();
+      const firstData = result.current.data;
+      expect(firstData?.content).toBe("v1");
+
+      // Poll 1: sends ETag, receives 304, preserves exact cached object reference.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestHeader(1, "if-none-match")).toBe('W/"2-10-1"');
+      expect(result.current.data).toBe(firstData);
+
+      // Poll 2: file changed on disk -> receives 200 with updated content and ETag.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(requestHeader(2, "if-none-match")).toBe('W/"2-10-1"');
+      expect(result.current.data?.content).toBe("v2");
+
+      // Poll 3: sends the new ETag and receives 304.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(requestHeader(3, "if-none-match")).toBe('W/"2-20-1"');
+      expect(result.current.data?.content).toBe("v2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("propagates a new ETag across identical-content touch refetches", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("same"), { ETag: 'W/"4-10-1"' }))
+      // `touch`: mtime changed -> 200 with same body but new ETag.
+      .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("same"), { ETag: 'W/"4-99-1"' }))
+      .mockResolvedValueOnce(notModifiedResponse({ ETag: 'W/"4-99-1"' }));
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useFileContent("conv_touch", "notes.md"), {
+      wrapper: stableWrap(qc),
+    });
+
+    await waitFor(() => expect(result.current.data?.content).toBe("same"));
+    const firstRef = result.current.data;
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["file-content", "conv_touch", "notes.md"] });
+    });
+    expect(requestHeader(1, "if-none-match")).toBe('W/"4-10-1"');
+    // Structural sharing keeps object identity, and must adopt the new ETag.
+    expect(result.current.data).toBe(firstRef);
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["file-content", "conv_touch", "notes.md"] });
+    });
+    expect(requestHeader(2, "if-none-match")).toBe('W/"4-99-1"');
+    expect(result.current.data).toBe(firstRef);
+  });
+
+  it("drops stale ETag on post-error recovery and optimistic saves", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("v1"), { ETag: 'W/"2-10-1"' }))
+      .mockResolvedValueOnce(new Response(null, { status: 404, statusText: "Not Found" }))
+      .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("reborn"), { ETag: 'W/"6-30-2"' }))
+      .mockResolvedValueOnce(jsonResponse({})) // PUT save
+      .mockResolvedValueOnce(jsonResponseWithHeaders(textFile("edited"), { ETag: 'W/"6-40-2"' }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const { result } = renderHook(
+      () => ({
+        read: useFileContent("conv_err", "notes.md"),
+        write: useWriteFileContent("conv_err"),
+      }),
+      { wrapper: stableWrap(qc) },
+    );
+
+    await waitFor(() => expect(result.current.read.data?.content).toBe("v1"));
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["file-content", "conv_err", "notes.md"] });
+    });
+    expect(requestHeader(1, "if-none-match")).toBe('W/"2-10-1"');
+    expect(qc.getQueryState(["file-content", "conv_err", "notes.md"])?.status).toBe("error");
+
+    // Recovery after an error omits stale If-None-Match.
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["file-content", "conv_err", "notes.md"] });
+    });
+    expect(requestHeader(2, "if-none-match")).toBeNull();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("reborn"));
+
+    // Optimistic save replaces the cached object, so the follow-up GET omits If-None-Match.
+    await act(async () => {
+      await result.current.write.mutateAsync({ path: "notes.md", content: "edited" });
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(requestHeader(4, "if-none-match")).toBeNull();
+    await waitFor(() => expect(result.current.read.data?.content).toBe("edited"));
+  });
+
+  it("sends If-None-Match on binary previews and keeps Blob identity on 304 (online & asleep fallback)", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    fetchMock
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3, 4])], {
+          "content-type": "application/pdf",
+          "content-length": "4",
+          etag: 'W/"4-100-7"',
+        }).response,
+      )
+      .mockResolvedValueOnce(notModifiedResponse({ ETag: 'W/"4-100-7"' }))
+      // Touch: same bytes, new ETag -> must keep Blob identity AND adopt new ETag.
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3, 4])], {
+          "content-type": "application/pdf",
+          "content-length": "4",
+          etag: 'W/"4-200-7"',
+        }).response,
+      )
+      // Runner goes asleep -> falls back to JSON endpoint with new ETag and honors 304.
+      .mockResolvedValueOnce(notModifiedResponse({ ETag: 'W/"4-200-7"' }));
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result, rerender } = renderHook(
+      () => useBinaryFilePreview("conv_bin_etag", "docs/report.pdf"),
+      { wrapper: stableWrap(qc) },
+    );
+
+    await waitFor(() => expect(result.current.data?.bytes).toBe(4));
+    const firstBlob = result.current.data?.blob;
+    expect(requestHeader(0, "if-none-match")).toBeNull();
+
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_bin_etag", "docs/report.pdf"],
+      });
+    });
+    expect(requestHeader(1, "if-none-match")).toBe('W/"4-100-7"');
+    expect(result.current.data?.blob).toBe(firstBlob);
+
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_bin_etag", "docs/report.pdf"],
+      });
+    });
+    expect(requestHeader(2, "if-none-match")).toBe('W/"4-100-7"');
+    expect(result.current.data?.blob).toBe(firstBlob);
+
+    onlineMock.mockReturnValue(false);
+    rerender();
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_bin_etag", "docs/report.pdf"],
+      });
+    });
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(
+      "/v1/sessions/conv_bin_etag/resources/environments/default/filesystem/docs/report.pdf",
+    );
+    expect(requestHeader(3, "if-none-match")).toBe('W/"4-200-7"');
+    expect(result.current.data?.blob).toBe(firstBlob);
+  });
+});

@@ -354,6 +354,72 @@ def test_read_with_within_confirms_enforcement(tmp_path: Path) -> None:
     assert "within_enforced" not in reader.list_or_read("bundle/notes.txt")
 
 
+def test_http_etag_weak_comparison_and_generation(tmp_path: Path) -> None:
+    """Weak ETags reflect stat metadata and match per RFC 9110 weak comparison."""
+    from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
+
+    target = tmp_path / "sample.txt"
+    target.write_text("v1")
+    st1 = target.stat()
+    etag1 = workspace_file_etag(st1)
+    assert etag1.startswith('W/"')
+    assert etag1.endswith('"')
+
+    assert if_none_match_matches(etag1, etag1)
+    assert if_none_match_matches(etag1.removeprefix("W/"), etag1)
+    assert if_none_match_matches(f'W/"other", {etag1}', etag1)
+    assert if_none_match_matches("*", etag1)
+    assert not if_none_match_matches(None, etag1)
+    assert not if_none_match_matches("", etag1)
+    assert not if_none_match_matches('W/"different"', etag1)
+    assert not if_none_match_matches("unquoted", "unquoted")
+
+    # Atomic replace with same length still yields a new inode/etag.
+    replacement = tmp_path / "sample.txt.tmp"
+    replacement.write_text("v2")
+    os.utime(replacement, ns=(st1.st_atime_ns, st1.st_mtime_ns))
+    replacement.replace(target)
+    etag2 = workspace_file_etag(target.stat())
+    assert etag2 != etag1
+
+
+def test_list_or_read_etag_and_not_modified_short_circuit(tmp_path: Path) -> None:
+    """Host fallback emits ``_etag`` when asked and short-circuits unchanged reads."""
+    target = tmp_path / "notes.md"
+    target.write_text("hello world")
+    reader = WorkspaceReader(tmp_path)
+
+    # Default callers see the exact legacy shape with no `_etag`.
+    legacy = reader.list_or_read("notes.md")
+    assert "_etag" not in legacy
+
+    first = reader.list_or_read("notes.md", include_etag=True)
+    etag = first["_etag"]
+    assert isinstance(etag, str)
+    assert etag.startswith('W/"')
+    assert first["content"] == "hello world"
+
+    unchanged = reader.list_or_read("notes.md", include_etag=True, if_none_match=etag)
+    assert unchanged == {
+        "object": "session.environment.filesystem.not_modified",
+        "path": "notes.md",
+        "etag": etag,
+    }
+
+    # Modified file invalidates the validator and returns fresh content.
+    target.write_text("hello updated")
+    updated = reader.list_or_read("notes.md", include_etag=True, if_none_match=etag)
+    assert updated["object"] == "session.environment.filesystem.file_content"
+    assert updated["content"] == "hello updated"
+    assert updated["_etag"] != etag
+
+    # Deleted file never returns not_modified even with a stale validator.
+    target.unlink()
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.list_or_read("notes.md", include_etag=True, if_none_match=str(updated["_etag"]))
+    assert excinfo.value.status == 404
+
+
 # ── search ────────────────────────────────────────────────────────────
 
 
