@@ -1133,6 +1133,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
 ];
 /** The theme color picker's popover controls, which the source guard's baseline already counts. */
 const COLOR_PICKER = "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker";
+const COLOR_SPECTRUM = "src/components/theme/ColorSpectrum.tsx › ColorSpectrum";
 /**
  * Those controls by section, tag and accessible name, each mapped to its baseline key. The picker's
  * trigger is owned under the Settings page, so only the popover's controls can be unowned here.
@@ -1140,8 +1141,8 @@ const COLOR_PICKER = "src/components/theme/ThemeColorPicker.tsx › ThemeColorPi
 const COLOR_PICKER_CONTROLS: Readonly<Record<string, string>> = Object.fromEntries(
   ["Accent", "Background tint"].flatMap((label) => [
     [`appearance › button › Randomize ${label.toLowerCase()}`, `${COLOR_PICKER} › button`],
-    [`appearance › div › ${label} saturation and brightness`, `${COLOR_PICKER} › div`],
-    [`appearance › input › ${label} hue`, `${COLOR_PICKER} › input`],
+    [`appearance › div › ${label} saturation and brightness`, `${COLOR_SPECTRUM} › div`],
+    [`appearance › input › ${label} hue`, `${COLOR_SPECTRUM} › input`],
     [`appearance › input › ${label} hex value`, `${COLOR_PICKER} › input`],
   ]),
 );
