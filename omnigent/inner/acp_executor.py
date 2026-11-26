@@ -56,6 +56,7 @@ import os
 import secrets
 import shlex
 import subprocess
+from asyncio import Event as _AsyncioEvent
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -89,8 +90,10 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
+    executor_turn_context,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.models.model_catalog_store import (
@@ -200,6 +203,17 @@ _AGENT_METHOD_SET_MODEL = "session/set_model"
 _TOOL_STATUS_IN_PROGRESS = "in_progress"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
+_TOOL_STATUS_CANCELLED = "cancelled"
+_TOOL_STATUS_PAUSED = "paused"
+_INACTIVE_TOOL_STATUSES = frozenset(
+    {
+        _TOOL_STATUS_COMPLETED,
+        _TOOL_STATUS_FAILED,
+        _TOOL_STATUS_CANCELLED,
+        _TOOL_STATUS_PAUSED,
+    }
+)
+_INACTIVE_SUBAGENT_STATES = frozenset({"idle", "completed", "failed", "cancelled"})
 
 # Idle (time-without-progress) timeout for a prompt turn, in seconds.
 # Some ACP agents stay silent while an external interaction is pending, so
@@ -216,6 +230,15 @@ if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
 
 # A running tool can be silent for the harness's normal one-hour idle window.
 _RUNNING_TOOL_TIMEOUT_SECONDS = 3600.0
+
+# Upper bound for keeping an Antigravity turn open after ``session/prompt``
+# returns while non-daemon background tools or subagents are still running.
+_AGY_BACKGROUND_WAIT_SECONDS = 30.0 * 60.0
+# Quiet settle window after Antigravity background work clears, so a follow-up
+# reply can arrive before the turn settles.
+_AGY_BACKGROUND_SETTLE_GRACE_SECONDS = 3.0
+# Upper bound for sending a best-effort abort reply to a cancelled agent request.
+_ABORT_REPLY_TIMEOUT_SECONDS = 1.0
 
 # Default deadline for each initial ACP handshake / session setup RPC.
 _INIT_TIMEOUT_SECONDS = 180.0
@@ -340,6 +363,149 @@ class _AcpRequestError(Exception):
 class _AcpPermissionTrace:
     tier_verdict: str = "unreported"
     once_offer: str = "unchecked"
+
+
+def _is_daemon_tool_input(raw_input: object) -> bool:
+    """True when an Antigravity tool input marks a long-lived daemon command."""
+    if not isinstance(raw_input, dict):
+        return False
+    flag = raw_input.get("IsDaemon")
+    return flag is True or (isinstance(flag, str) and flag.strip().lower() == "true")
+
+
+def _format_wait_bound(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{seconds:g}s"
+
+
+def _notify_turn_progress() -> None:
+    """Refresh the harness scaffold's idle watchdog on silent tool progress."""
+    ctx = executor_turn_context.get()
+    reset = getattr(ctx, "_reset_idle_watchdog", None)
+    if callable(reset):
+        reset()
+
+
+def _prompt_response_error_message(response: object) -> str | None:
+    """Return an error message when a JSON-RPC prompt response has an error or invalid shape."""
+    if not isinstance(response, dict):
+        return "Malformed ACP prompt response"
+    if "error" in response:
+        err = response["error"]
+        if isinstance(err, dict):
+            msg = err.get("message")
+            return str(msg) if msg else "Unknown ACP error"
+        return str(err) if err not in (None, "") else "Unknown ACP error"
+    return None
+
+
+class _AgyBackgroundWork:
+    """Track Antigravity non-daemon tools and subagents that outlive ``session/prompt``."""
+
+    def __init__(self, root_session_id: str) -> None:
+        self._root = root_session_id
+        self._live: dict[str, set[str]] = {}
+        self._children: dict[str, set[str]] = {}
+        self._daemon_tools: set[tuple[str, str]] = set()
+        self._denied_tools: set[tuple[str, str]] = set()
+
+    def is_known_session(self, session_id: object) -> bool:
+        if session_id is None:
+            return True
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        if session_id == self._root:
+            return True
+        seen: set[str] = set()
+        stack = [self._root]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            children = self._children.get(current, ())
+            if session_id in children:
+                return True
+            stack.extend(children)
+        return False
+
+    def observe(self, session_id: object, update: _AcpJsonObject) -> None:
+        """Update live background state from one ``session/update`` notification."""
+        if not self.is_known_session(session_id):
+            return
+        sid = self._root if session_id is None else str(session_id)
+        kind = update.get("sessionUpdate")
+        if kind == "subagent_update":
+            child_id = update.get("sessionId")
+            if isinstance(child_id, str) and child_id:
+                if child_id != sid:
+                    self._children.setdefault(sid, set()).add(child_id)
+                state = update.get("state")
+                if isinstance(state, dict) and isinstance(state.get("state"), str):
+                    active = state["state"] not in _INACTIVE_SUBAGENT_STATES
+                    self._set(sid, f"subagent:{child_id}", active)
+            return
+        if kind in (_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE):
+            call_id = update.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id:
+                return
+            key = (sid, call_id)
+            if _is_daemon_tool_input(update.get("rawInput")):
+                self._daemon_tools.add(key)
+                self._set(sid, f"tool:{call_id}", False)
+                return
+            if key in self._daemon_tools:
+                return
+            status = update.get("status")
+            if key in self._denied_tools:
+                if status == _TOOL_STATUS_IN_PROGRESS:
+                    self._denied_tools.discard(key)
+                else:
+                    return
+            if kind == _UPDATE_TOOL_CALL:
+                effective = status if isinstance(status, str) else "pending"
+                self._set(sid, f"tool:{call_id}", effective not in _INACTIVE_TOOL_STATUSES)
+            elif isinstance(status, str):
+                self._set(sid, f"tool:{call_id}", status not in _INACTIVE_TOOL_STATUSES)
+
+    def drop_tool(self, session_id: object, call_id: str) -> None:
+        """Remove a tool call that was denied or cancelled before running."""
+        sid = session_id if isinstance(session_id, str) and session_id else self._root
+        self._denied_tools.add((sid, call_id))
+        self._set(sid, f"tool:{call_id}", False)
+
+    def has_live(self, session_id: str | None = None, _seen: set[str] | None = None) -> bool:
+        sid = self._root if session_id is None else session_id
+        seen = set() if _seen is None else _seen
+        if sid in seen:
+            return False
+        seen.add(sid)
+        if self._live.get(sid):
+            return True
+        return any(self.has_live(child, seen) for child in self._children.get(sid, ()))
+
+    def live_keys(self, session_id: str | None = None, _seen: set[str] | None = None) -> list[str]:
+        sid = self._root if session_id is None else session_id
+        seen = set() if _seen is None else _seen
+        if sid in seen:
+            return []
+        seen.add(sid)
+        out = sorted(self._live.get(sid, ()))
+        for child in sorted(self._children.get(sid, ())):
+            out.extend(self.live_keys(child, seen))
+        return out
+
+    def _set(self, session_id: str, item: str, active: bool) -> None:
+        if active:
+            self._live.setdefault(session_id, set()).add(item)
+        else:
+            items = self._live.get(session_id)
+            if items is not None:
+                items.discard(item)
+                if not items:
+                    self._live.pop(session_id, None)
 
 
 def _same_json_value(left: object, right: object) -> bool:
@@ -524,6 +690,7 @@ class AcpExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         *,
         extension: AcpExtension = NO_ACP_EXTENSION,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """Initialize the generic ACP executor.
 
@@ -599,6 +766,15 @@ class AcpExecutor(Executor):
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
         self._active_prompt_request_id: int | None = None
         self._cancel_grace_deadline: float | None = None
+        self._clock: Callable[[], float] | None = clock
+        self._poll_interval_s: float = 2.0
+        self._post_prompt_wait_active: bool = False
+        self._post_prompt_deadline: float | None = None
+        self._reader_agy_bg_work: _AgyBackgroundWork | None = None
+        self._denied_turn_tools: set[str] = set()
+        self._turn_cancel_event: asyncio.Event | None = None
+        self._turn_wake_event: asyncio.Event | None = None
+        self._stdout_eof_event: asyncio.Event | None = None
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -716,8 +892,175 @@ class AcpExecutor(Executor):
             # and without a group boundary teardown reaches only the wrapper.
             **spawn_options,
         )
+        self._stdout_eof_event = _AsyncioEvent()
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    def _now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return asyncio.get_running_loop().time()
+
+    def _wake_turn(self) -> None:
+        if self._turn_wake_event is not None:
+            self._turn_wake_event.set()
+
+    def _is_stdout_closed(self) -> bool:
+        if self._stdout_eof_event is not None and self._stdout_eof_event.is_set():
+            return True
+        if self._reader_task is not None and self._reader_task.done():
+            return True
+        return self._proc is not None and self._proc.returncode is not None
+
+    @property
+    def _turn_accepts_permissions(self) -> bool:
+        if self._turn_cancel_event is not None and self._turn_cancel_event.is_set():
+            return False
+        if self._is_stdout_closed():
+            return False
+        if self._active_prompt_request_id is not None:
+            return True
+        if not self._post_prompt_wait_active:
+            return False
+        if self._post_prompt_deadline is not None and self._now() >= self._post_prompt_deadline:
+            return False
+        return True
+
+    async def _run_bounded_agent_request(
+        self,
+        notification: _AcpJsonObject,
+        *,
+        deadline: float | None,
+        cancel_event: asyncio.Event,
+        phase2: bool = True,
+    ) -> bool:
+        """Run an agent request bounded by active background-wait deadline, cancel, and EOF."""
+        req_task: asyncio.Task[None] = asyncio.create_task(
+            self._respond_to_agent_request(notification)
+        )
+        try:
+            while not req_task.done():
+                effective_deadline = (
+                    deadline if deadline is not None else self._post_prompt_deadline
+                )
+                enforce_bounds = phase2 or effective_deadline is not None
+                if enforce_bounds and (cancel_event.is_set() or self._is_stdout_closed()):
+                    break
+                remaining = self._poll_interval_s
+                if effective_deadline is not None:
+                    remaining = effective_deadline - self._now()
+                    if remaining <= 0:
+                        break
+                waiters: set[asyncio.Future[Any]] = {req_task}
+                extra_tasks: list[asyncio.Task[bool]] = []
+                if enforce_bounds:
+                    c_task = asyncio.create_task(cancel_event.wait())
+                    waiters.add(c_task)
+                    extra_tasks.append(c_task)
+                    if self._stdout_eof_event is not None:
+                        e_task = asyncio.create_task(self._stdout_eof_event.wait())
+                        waiters.add(e_task)
+                        extra_tasks.append(e_task)
+                if self._turn_wake_event is not None:
+                    self._turn_wake_event.clear()
+                    w_task = asyncio.create_task(self._turn_wake_event.wait())
+                    waiters.add(w_task)
+                    extra_tasks.append(w_task)
+                try:
+                    await asyncio.wait(
+                        waiters,
+                        timeout=max(0.0, min(remaining, self._poll_interval_s)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in extra_tasks:
+                        if not task.done():
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
+            if req_task.done():
+                await req_task
+                return True
+            req_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await req_task
+            if not self._is_stdout_closed() and notification.get("id") is not None:
+                if notification.get("method") == _AGENT_REQUEST_REQUEST_PERMISSION:
+                    abort_reply: _AcpJsonObject = {
+                        "jsonrpc": "2.0",
+                        "id": notification.get("id"),
+                        "result": {"outcome": {"outcome": "cancelled"}},
+                    }
+                else:
+                    abort_reply = {
+                        "jsonrpc": "2.0",
+                        "id": notification.get("id"),
+                        "error": {"code": -32000, "message": "ACP request cancelled"},
+                    }
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        self._send(abort_reply), timeout=_ABORT_REPLY_TIMEOUT_SECONDS
+                    )
+            return False
+        except BaseException:
+            if not req_task.done():
+                req_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await req_task
+            raise
+
+    async def _await_queue_item(
+        self,
+        *,
+        timeout: float,
+        prompt_fut: asyncio.Future[_AcpJsonObject] | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> _AcpJsonObject | None:
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if prompt_fut is not None and prompt_fut.done():
+            return None
+        if self._stdout_eof_event is not None and self._stdout_eof_event.is_set():
+            return None
+        queue_task: asyncio.Task[_AcpJsonObject] = asyncio.create_task(self._queue.get())
+        waiters: set[asyncio.Future[Any]] = {queue_task}
+        extra_tasks: list[asyncio.Task[bool]] = []
+        if prompt_fut is not None:
+            waiters.add(prompt_fut)
+        if cancel_event is not None:
+            task = asyncio.create_task(cancel_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        if self._stdout_eof_event is not None:
+            task = asyncio.create_task(self._stdout_eof_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        if self._turn_wake_event is not None:
+            self._turn_wake_event.clear()
+            task = asyncio.create_task(self._turn_wake_event.wait())
+            waiters.add(task)
+            extra_tasks.append(task)
+        try:
+            await asyncio.wait(
+                waiters,
+                timeout=max(0.0, min(timeout, self._poll_interval_s)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if queue_task.done() and not queue_task.cancelled():
+                return queue_task.result()
+            return None
+        finally:
+            if not queue_task.done():
+                queue_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await queue_task
+            for task in extra_tasks:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
     def _sandbox_launch(self, spawn_env_names: tuple[str, ...]) -> tuple[str, list[str]]:
         """Return ``(launch_path, argv)`` — sandbox launcher or the bare binary.
@@ -817,6 +1160,14 @@ class AcpExecutor(Executor):
         try:
             await self._read_stdout_unobserved()
         finally:
+            if self._stdout_eof_event is not None:
+                self._stdout_eof_event.set()
+            for pending_fut in list(self._pending.values()):
+                if not pending_fut.done():
+                    pending_fut.set_exception(EOFError("ACP subprocess closed stdout"))
+                    pending_fut.add_done_callback(
+                        lambda fut: fut.exception() if not fut.cancelled() else None
+                    )
             self._context_source.transport_ended(process, generation)
 
     async def _read_stdout_unobserved(self) -> None:
@@ -833,6 +1184,8 @@ class AcpExecutor(Executor):
                 if not raw_line:
                     # EOF — the subprocess exited. Wake in-flight futures so
                     # run_turn fails fast instead of blocking until idle timeout.
+                    if self._stdout_eof_event is not None:
+                        self._stdout_eof_event.set()
                     for fut in self._pending.values():
                         if not fut.done():
                             fut.set_exception(EOFError("ACP subprocess closed stdout"))
@@ -854,17 +1207,19 @@ class AcpExecutor(Executor):
                 # check prevents a colliding request from mis-resolving our future.
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
-                    if msg_id == self._active_prompt_request_id:
+                    was_active_prompt = msg_id == self._active_prompt_request_id
+                    if was_active_prompt:
                         self._active_prompt_request_id = None
                         # run_turn may already be cancelled when the response arrives.
-                        error = msg.get("error")
-                        if isinstance(error, dict):
+                        error_msg = _prompt_response_error_message(msg)
+                        if error_msg is not None:
+                            error = msg.get("error") if isinstance(msg, dict) else None
                             logger.debug(
                                 "acp[%s] session/prompt %s error code=%s message=%s",
                                 self._config.name,
                                 msg_id,
-                                error.get("code"),
-                                error.get("message"),
+                                error.get("code") if isinstance(error, dict) else None,
+                                error_msg,
                             )
                         else:
                             result = msg.get("result", {})
@@ -875,17 +1230,35 @@ class AcpExecutor(Executor):
                                 msg_id,
                                 reason,
                             )
+                            if (
+                                reason == "end_turn"
+                                and self._reader_agy_bg_work is not None
+                                and self._reader_agy_bg_work.has_live()
+                                and (
+                                    self._turn_cancel_event is None
+                                    or not self._turn_cancel_event.is_set()
+                                )
+                            ):
+                                self._post_prompt_deadline = (
+                                    self._now() + _AGY_BACKGROUND_WAIT_SECONDS
+                                )
+                                self._post_prompt_wait_active = True
+                                self._wake_turn()
                     if not fut.done():
                         fut.set_result(msg)
+                    if was_active_prompt:
+                        await self._queue.put({"_omnigent_prompt_done": msg_id})
                 else:
                     params = msg.get("params", {})
                     update = params.get("update", {}) if isinstance(params, dict) else {}
                     if msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(
                         update, dict
                     ):
+                        if self._reader_agy_bg_work is not None and isinstance(params, dict):
+                            self._reader_agy_bg_work.observe(params.get("sessionId"), update)
                         if (
                             self._config.host_permission_tier
-                            and self._active_prompt_request_id is not None
+                            and self._turn_accepts_permissions
                             and isinstance(params, dict)
                         ):
                             self._note_permission_update(params.get("sessionId"), update)
@@ -1261,8 +1634,22 @@ class AcpExecutor(Executor):
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
                 allow, option_id = await self._decide_permission(params)
-                if allow is None or (
-                    self._config.host_permission_tier and self._active_prompt_request_id is None
+                if allow is not True:
+                    tool_call = params.get("toolCall")
+                    denied_id = (
+                        tool_call.get("toolCallId") if isinstance(tool_call, dict) else None
+                    )
+                    if isinstance(denied_id, str) and denied_id:
+                        self._denied_turn_tools.add(denied_id)
+                if (
+                    allow is None
+                    or (self._config.host_permission_tier and not self._turn_accepts_permissions)
+                    or (self._turn_cancel_event is not None and self._turn_cancel_event.is_set())
+                    or (
+                        self._post_prompt_wait_active
+                        and self._post_prompt_deadline is not None
+                        and self._now() >= self._post_prompt_deadline
+                    )
                 ):
                     result = {"outcome": {"outcome": "cancelled"}}
                 elif self._config.host_permission_tier and not allow and option_id is None:
@@ -1454,7 +1841,7 @@ class AcpExecutor(Executor):
     def _bound_permission_call(self, params: _AcpJsonObject) -> _AcpJsonObject | None:
         """Bind a permission request to the pending tool event, never its display title."""
         if (
-            self._active_prompt_request_id is None
+            not self._turn_accepts_permissions
             or self._session_id is None
             or params.get("sessionId") != self._session_id
         ):
@@ -1647,7 +2034,7 @@ class AcpExecutor(Executor):
             pending = self._permission_calls[call_id]
             decision = await self._evaluate_permission(params, bound_call, trace)
             if (
-                self._active_prompt_request_id is None
+                not self._turn_accepts_permissions
                 or self._permission_calls.get(call_id) is not pending
             ):
                 binding = "changed"
@@ -2067,6 +2454,10 @@ class AcpExecutor(Executor):
         self._permission_calls.clear()
         self._answered_permission_calls.clear()
         self._terminal_permission_calls.clear()
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = None
+        self._denied_turn_tools.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -2894,107 +3285,352 @@ class AcpExecutor(Executor):
 
         self._rpc_id += 1
         req_id = self._rpc_id
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
         self._active_prompt_request_id = req_id
         self._cancel_grace_deadline = None
+        is_agy = is_antigravity_acp_command(self._config.command)
+        bg_work = _AgyBackgroundWork(session_id) if is_agy else None
+        reader_bg_work = _AgyBackgroundWork(session_id) if is_agy else None
+        self._denied_turn_tools.clear()
+        cancel_event = _AsyncioEvent()
+        wake_event = _AsyncioEvent()
+        self._turn_cancel_event = cancel_event
+        self._turn_wake_event = wake_event
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = reader_bg_work
 
-        await self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
-                },
-            }
-        )
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": _AGENT_METHOD_SESSION_PROMPT,
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": prompt_blocks,
+                        "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                    },
+                }
+            )
 
-        opening_settled()
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
-        running_tool_deadlines: dict[str, float] = {}
-        accumulated_text: list[str] = []
-        if mode_notice:
-            accumulated_text.append(mode_notice)
-            yield TextChunk(text=mode_notice)
-        target_model = self._model_override_target(requested_model)
-        if target_model and target_model != self._active_model:
-            notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
-            accumulated_text.append(notice)
-            yield TextChunk(text=notice)
+            opening_settled()
+            tool_window = max(_RUNNING_TOOL_TIMEOUT_SECONDS, _PROMPT_TIMEOUT_SECONDS)
+            deadline = self._now() + _PROMPT_TIMEOUT_SECONDS
+            running_tool_deadlines: dict[str, float] = {}
+            accumulated_text: list[str] = []
+            if mode_notice:
+                accumulated_text.append(mode_notice)
+                yield TextChunk(text=mode_notice)
+            target_model = self._model_override_target(requested_model)
+            if target_model and target_model != self._active_model:
+                notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
+                accumulated_text.append(notice)
+                yield TextChunk(text=notice)
 
-        while True:
-            # Complete only once the future is resolved AND the queue is drained,
-            # so trailing chunks aren't truncated.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:
-                    logger.exception("ACP process response retrieval failed")
-                    self._reset_session_state()
-                    yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
-                    return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    if "Session not found" in error_msg:
-                        self._reset_session_state()
-                    yield ExecutorError(message=error_msg, retryable=True)
-                    return
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
-                if self._active_mode and self._active_mode != reported_mode:
-                    yield SessionModeChanged(
-                        mode=self._active_mode,
-                        requested_mode=requested_mode,
-                        selection_id=mode_selection,
-                    )
-                yield TurnComplete(response="".join(accumulated_text), usage=usage)
-                return
+            prompt_result: _AcpJsonObject | None = None
+            bg_deadline: float | None = None
+            settle_deadline: float | None = None
+            post_work_reply_seen = False
+            reply_closed = False
+            prompt_marker_seen = False
+            prompt_wait_declined = False
 
-            remaining = max(deadline, max(running_tool_deadlines.values(), default=deadline))
-            remaining -= loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
-                return
-
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except TimeoutError:
-                continue
-
-            method = notification.get("method", "")
-            params = notification.get("params", {})
-
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                if params.get("sessionId") == session_id and update.get("sessionUpdate") in (
-                    _UPDATE_TOOL_CALL,
-                    _UPDATE_TOOL_CALL_UPDATE,
+            while True:
+                # Enter AG background wait in wire order at the prompt marker so burst
+                # post-prompt frames are not dropped; ordinary turns still drain the queue
+                # completely before emitting TurnComplete or ExecutorError.
+                if (
+                    prompt_result is None
+                    and fut.done()
+                    and (prompt_marker_seen or self._queue.empty())
                 ):
-                    call_id, status = update.get("toolCallId"), update.get("status")
-                    if isinstance(call_id, str) and call_id:
-                        if status == _TOOL_STATUS_IN_PROGRESS:
-                            running_tool_deadlines.setdefault(
-                                call_id, loop.time() + _RUNNING_TOOL_TIMEOUT_SECONDS
-                            )
-                        elif status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED):
-                            running_tool_deadlines.pop(call_id, None)
-                for event in self._handle_session_update(update):
-                    if isinstance(event, TextChunk):
-                        accumulated_text.append(event.text)
-                    yield event
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (session/request_permission / fs/*):
-                # routes through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
+                    marker_triggered = prompt_marker_seen
+                    prompt_marker_seen = False
+                    if self._active_prompt_request_id == req_id:
+                        self._active_prompt_request_id = None
+                    try:
+                        response = fut.result()
+                    except Exception as exc:
+                        if marker_triggered and not self._queue.empty():
+                            prompt_wait_declined = True
+                            continue
+                        logger.exception("ACP process response retrieval failed")
+                        self._reset_session_state()
+                        yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
+                        return
+                    error_msg = _prompt_response_error_message(response)
+                    if error_msg is not None:
+                        self._post_prompt_wait_active = False
+                        self._post_prompt_deadline = None
+                        if marker_triggered and not self._queue.empty():
+                            prompt_wait_declined = True
+                            continue
+                        if "Session not found" in error_msg:
+                            self._reset_session_state()
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+                    if (
+                        not prompt_wait_declined
+                        and bg_work is not None
+                        and stop_reason == "end_turn"
+                        and not cancel_event.is_set()
+                        and bg_work.has_live()
+                    ):
+                        prompt_result = result if isinstance(result, dict) else {}
+                        if self._post_prompt_deadline is None:
+                            self._post_prompt_deadline = self._now() + _AGY_BACKGROUND_WAIT_SECONDS
+                        bg_deadline = self._post_prompt_deadline
+                        self._post_prompt_wait_active = True
+                        _notify_turn_progress()
+                        settle_deadline = None
+                        post_work_reply_seen = False
+                        reply_closed = False
+                        continue
+                    self._post_prompt_wait_active = False
+                    self._post_prompt_deadline = None
+                    if marker_triggered and not self._queue.empty():
+                        prompt_wait_declined = True
+                        continue
+                    usage = (
+                        self._usage_with_active_model(result) if isinstance(result, dict) else None
+                    )
+                    if self._active_mode and self._active_mode != reported_mode:
+                        yield SessionModeChanged(
+                            mode=self._active_mode,
+                            requested_mode=requested_mode,
+                            selection_id=mode_selection,
+                        )
+                    yield TurnComplete(response="".join(accumulated_text), usage=usage)
+                    return
 
-            # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+                if prompt_result is not None:
+                    if cancel_event.is_set():
+                        yield TurnCancelled(reason="user_cancelled", phase="tool")
+                        return
+                    now = self._now()
+                    live = bg_work is not None and bg_work.has_live()
+                    if bg_deadline is not None and now >= bg_deadline:
+                        if live:
+                            bound_text = _format_wait_bound(_AGY_BACKGROUND_WAIT_SECONDS)
+                            active_items = bg_work.live_keys() if bg_work is not None else []
+                            logger.warning(
+                                "acp[%s] background wait reached %s bound with active work: %s",
+                                self._config.name,
+                                bound_text,
+                                ", ".join(active_items) or "unknown",
+                            )
+                            prefix = (
+                                "\n\n"
+                                if accumulated_text and not accumulated_text[-1].endswith("\n\n")
+                                else ""
+                            )
+                            label = (
+                                f"{prefix}[Antigravity background work still running after "
+                                f"{bound_text}; turn settled at the {bound_text} wait limit.]"
+                            )
+                            accumulated_text.append(label)
+                            yield TextChunk(text=label)
+                        break
+                    if self._queue.empty():
+                        if not live:
+                            if reply_closed:
+                                break
+                            if settle_deadline is None:
+                                settle_deadline = min(
+                                    bg_deadline if bg_deadline is not None else now,
+                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                                )
+                            if now >= settle_deadline:
+                                break
+                        if self._is_stdout_closed():
+                            self._reset_session_state()
+                            yield ExecutorError(
+                                message=(
+                                    "ACP subprocess closed stdout while waiting for "
+                                    "background work"
+                                ),
+                                retryable=True,
+                            )
+                            return
+                    target_deadline = (
+                        bg_deadline
+                        if live or settle_deadline is None
+                        else min(bg_deadline, settle_deadline)
+                        if bg_deadline is not None
+                        else settle_deadline
+                    )
+                    remaining = (target_deadline - now) if target_deadline is not None else 0.0
+                    notification = await self._await_queue_item(
+                        timeout=remaining,
+                        cancel_event=cancel_event,
+                    )
+                    if notification is None:
+                        continue
+                else:
+                    if not self._queue.empty():
+                        notification = self._queue.get_nowait()
+                    else:
+                        if self._is_stdout_closed() and not fut.done():
+                            self._reset_session_state()
+                            yield ExecutorError(
+                                message="ACP subprocess closed stdout", retryable=True
+                            )
+                            return
+                        now = self._now()
+                        effective_deadline = (
+                            max(deadline, max(running_tool_deadlines.values()))
+                            if running_tool_deadlines
+                            else deadline
+                        )
+                        remaining = effective_deadline - now
+                        if remaining <= 0:
+                            yield ExecutorError(
+                                message="Timeout waiting for ACP response", retryable=True
+                            )
+                            return
+                        notification = await self._await_queue_item(
+                            timeout=remaining,
+                            prompt_fut=fut,
+                        )
+                        if notification is None:
+                            continue
+
+                if notification.get("_omnigent_prompt_done") == req_id:
+                    prompt_marker_seen = True
+                    continue
+
+                if notification.get("type") == "error":
+                    yield ExecutorError(
+                        message=str(notification.get("message") or "ACP reader error"),
+                        retryable=True,
+                    )
+                    return
+
+                method = notification.get("method", "")
+                params = notification.get("params", {})
+
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(params, dict):
+                    update = params.get("update", {})
+                    if isinstance(update, dict):
+                        notif_session_id = params.get("sessionId")
+                        if bg_work is not None:
+                            bg_work.observe(notif_session_id, update)
+                        update_type = update.get("sessionUpdate")
+                        if notif_session_id == session_id and update_type in (
+                            _UPDATE_TOOL_CALL,
+                            _UPDATE_TOOL_CALL_UPDATE,
+                        ):
+                            call_id, status = update.get("toolCallId"), update.get("status")
+                            if isinstance(call_id, str) and call_id:
+                                if status == _TOOL_STATUS_IN_PROGRESS or (
+                                    status is None and call_id in running_tool_deadlines
+                                ):
+                                    running_tool_deadlines[call_id] = self._now() + tool_window
+                                    _notify_turn_progress()
+                                elif status in _INACTIVE_TOOL_STATUSES:
+                                    running_tool_deadlines.pop(call_id, None)
+                        elif (
+                            bg_work is not None
+                            and bg_work.is_known_session(notif_session_id)
+                            and update_type == "subagent_update"
+                            and isinstance(update.get("sessionId"), str)
+                            and update["sessionId"]
+                        ):
+                            state = update.get("state")
+                            if isinstance(state, dict) and isinstance(state.get("state"), str):
+                                sub_key = f"subagent:{update['sessionId']}"
+                                if state["state"] in _INACTIVE_SUBAGENT_STATES:
+                                    running_tool_deadlines.pop(sub_key, None)
+                                else:
+                                    running_tool_deadlines[sub_key] = self._now() + tool_window
+                                    _notify_turn_progress()
+                        for event in self._handle_session_update(update):
+                            if isinstance(event, TextChunk):
+                                accumulated_text.append(event.text)
+                            yield event
+                        if prompt_result is not None:
+                            if bg_work is not None and bg_work.has_live():
+                                settle_deadline = None
+                                post_work_reply_seen = False
+                                reply_closed = False
+                            elif update_type in (
+                                _UPDATE_AGENT_MESSAGE_CHUNK,
+                                _UPDATE_AGENT_THOUGHT_CHUNK,
+                            ):
+                                post_work_reply_seen = True
+                                reply_closed = False
+                                now = self._now()
+                                settle_deadline = min(
+                                    bg_deadline if bg_deadline is not None else now,
+                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                                )
+                            elif update_type == _UPDATE_USAGE and post_work_reply_seen:
+                                reply_closed = True
+                            elif settle_deadline is not None:
+                                now = self._now()
+                                settle_deadline = min(
+                                    bg_deadline if bg_deadline is not None else now,
+                                    now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                                )
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (session/request_permission / fs/*):
+                    # routes through policy + elicitation. Bounded once post-prompt wait starts.
+                    completed = await self._run_bounded_agent_request(
+                        notification,
+                        deadline=bg_deadline,
+                        cancel_event=cancel_event,
+                        phase2=prompt_result is not None,
+                    )
+                    if not completed:
+                        continue
+                    now = self._now()
+                    if self._denied_turn_tools:
+                        req_session_id = (
+                            params.get("sessionId") if isinstance(params, dict) else None
+                        )
+                        for denied_id in self._denied_turn_tools:
+                            running_tool_deadlines.pop(denied_id, None)
+                            if bg_work is not None:
+                                bg_work.drop_tool(req_session_id, denied_id)
+                            if reader_bg_work is not None:
+                                reader_bg_work.drop_tool(req_session_id, denied_id)
+                        self._denied_turn_tools.clear()
+                    if running_tool_deadlines:
+                        refreshed = now + tool_window
+                        for call_id in running_tool_deadlines:
+                            running_tool_deadlines[call_id] = refreshed
+                        _notify_turn_progress()
+                    if prompt_result is not None and settle_deadline is not None:
+                        settle_deadline = min(
+                            bg_deadline if bg_deadline is not None else now,
+                            now + _AGY_BACKGROUND_SETTLE_GRACE_SECONDS,
+                        )
+
+                # Inbound message = progress; reset the idle deadline.
+                deadline = self._now() + _PROMPT_TIMEOUT_SECONDS
+
+            usage = self._usage_with_active_model(prompt_result)
+            if self._active_mode and self._active_mode != reported_mode:
+                yield SessionModeChanged(
+                    mode=self._active_mode,
+                    requested_mode=requested_mode,
+                    selection_id=mode_selection,
+                )
+            yield TurnComplete(response="".join(accumulated_text), usage=usage)
+        finally:
+            self._post_prompt_wait_active = False
+            self._post_prompt_deadline = None
+            self._reader_agy_bg_work = None
+            self._denied_turn_tools.clear()
+            if self._turn_cancel_event is cancel_event:
+                self._turn_cancel_event = None
+            if self._turn_wake_event is wake_event:
+                self._turn_wake_event = None
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
@@ -3005,6 +3641,8 @@ class AcpExecutor(Executor):
         """
         if self._proc is None or self._proc.returncode is not None or self._session_id is None:
             return False
+        if self._turn_cancel_event is not None:
+            self._turn_cancel_event.set()
         try:
             await self._send(
                 {
@@ -3061,6 +3699,11 @@ class AcpExecutor(Executor):
                     )
         self._cancel_grace_deadline = None
         self._active_prompt_request_id = None
+        self._post_prompt_wait_active = False
+        self._post_prompt_deadline = None
+        self._reader_agy_bg_work = None
+        if self._turn_cancel_event is not None:
+            self._turn_cancel_event.set()
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):

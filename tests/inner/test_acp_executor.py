@@ -50,6 +50,7 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
 )
@@ -4294,3 +4295,1526 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# ACP tool-active idle pause & Antigravity 30-minute background wrapup
+# ---------------------------------------------------------------------------
+
+
+class _FakeAcpClock:
+    """Deterministic virtual clock for ACP timeout and background-wait tests."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self._executor: AcpExecutor | None = None
+
+    def __call__(self) -> float:
+        return self.now
+
+    def bind(self, executor: AcpExecutor) -> None:
+        self._executor = executor
+
+    async def settle(self) -> None:
+        for _ in range(8):
+            await asyncio.sleep(0)
+
+    async def advance(self, seconds: float) -> None:
+        # Process items queued before this tick at the prior timestamp first.
+        await self.settle()
+        self.now += seconds
+        if self._executor is not None:
+            self._executor._wake_turn()
+        await self.settle()
+
+
+def _acp_update_frame(session_id: str, update: dict[str, object]) -> dict[str, object]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"sessionId": session_id, "update": update},
+    }
+
+
+@pytest.mark.asyncio
+async def test_acp_idle_timer_pauses_and_refreshes_during_long_tool_run() -> None:
+    """Active tools pause the 300s idle timer and refresh their window on progress."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "build"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make all"},
+            },
+        )
+    )
+    await clock.advance(600.0)  # Well past 300s prompt idle timeout.
+    assert not task.done()
+
+    # Streaming progress on the active tool refreshes the 3600s silent-tool cap.
+    await clock.advance(2900.0)  # 3500s total.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-1",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "still going"}}
+                ],
+            },
+        )
+    )
+    await clock.advance(700.0)  # 4200s total (> 3600s from start), still alive.
+    assert not task.done()
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-1",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        )
+    )
+    await clock.advance(250.0)  # Under 300s post-tool idle window.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Build complete."},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.status is ToolCallStatus.SUCCESS for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Build complete."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["cancelled-tool", "slow-approval"])
+async def test_acp_idle_timer_cancelled_tool_and_slow_approval(scenario: str) -> None:
+    """Cancelled tools release the pause; slow human approvals do not burn the tool window."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    async def slow_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        await clock.advance(4000.0)  # Human takes >1h to click Allow.
+        return True
+
+    ex._send = send  # type: ignore[assignment]
+    ex._elicitation_handler = slow_elicit  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    await clock.advance(10.0)
+
+    if scenario == "cancelled-tool":
+        ex._queue.put_nowait(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "cmd-1",
+                    "status": "cancelled",
+                },
+            )
+        )
+        await clock.advance(301.0)
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], ExecutorError)
+        assert events[-1].message == "Timeout waiting for ACP response"
+        return
+
+    ex._queue.put_nowait(
+        {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "cmd-1", "title": "run_command"},
+                "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+            },
+        }
+    )
+    await clock.advance(1000.0)  # Still within fresh 3600s window after approval.
+    assert not task.done()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {"sessionUpdate": "tool_call_update", "toolCallId": "cmd-1", "status": "completed"},
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_background_work_reports_before_turn_settles() -> None:
+    """After agy's prompt returns, active background work reports before TurnComplete."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "start build"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-cmd",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "pytest -q", "IsDaemon": False},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Running in background.\n"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result(
+        {"result": {"stopReason": "end_turn", "usage": {"totalTokens": 12}}}
+    )
+
+    # 20 minutes pass while the background command is still running — turn stays open.
+    await clock.advance(1200.0)
+    assert not task.done()
+    assert not any(isinstance(ev, TurnComplete) for ev in events)
+
+    # Background command completes and agy streams its follow-up summary + usage_update.
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bg-cmd",
+                "status": "completed",
+                "rawOutput": "42 passed",
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Background build passed: 42 tests."},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame("s1", {"sessionUpdate": "usage_update", "size": 128000})
+    )
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert any(
+        isinstance(ev, ToolCallComplete)
+        and ev.metadata == {"call_id": "bg-cmd"}
+        and ev.status is ToolCallStatus.SUCCESS
+        for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Running in background.\nBackground build passed: 42 tests."
+    assert events[-1].usage == {"total_tokens": 12}
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_background_work_settles_labelled_at_30_min_bound() -> None:
+    """An agy turn whose background work never finishes settles labelled at 30 minutes."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "long job"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-long",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "sleep 3600"},
+            },
+        )
+    )
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Job started."},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+
+    await clock.advance(1799.0)
+    assert not task.done()
+    await clock.advance(1.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert not any(isinstance(ev, ExecutorError) for ev in events)
+    assert isinstance(events[-1], TurnComplete)
+    assert "30 minutes" in (events[-1].response or "")
+    assert "still running" in (events[-1].response or "")
+    assert any(isinstance(ev, TextChunk) and "30 minutes" in ev.text for ev in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["daemon", "denied", "non-agy", "cancelled-stop"])
+async def test_agy_post_prompt_wait_skips_daemons_denied_non_agy_and_cancelled(case: str) -> None:
+    """Daemons, denied tools, non-AG agents, and non-end_turn stops settle immediately."""
+    clock = _FakeAcpClock()
+    command = "gemini --experimental-acp" if case == "non-agy" else "agy acp"
+    ex = AcpExecutor(AcpAgentConfig(command=command, omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._elicitation_handler = AsyncMock(return_value=False)
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") != "session/prompt":
+            return
+        raw_input: dict[str, object] = {"CommandLine": "npm run dev"}
+        if case == "daemon":
+            raw_input["IsDaemon"] = True
+        ex._queue.put_nowait(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "pending" if case == "denied" else "in_progress",
+                    "rawInput": raw_input,
+                },
+            )
+        )
+        if case == "denied":
+            ex._queue.put_nowait(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "s1",
+                        "toolCall": {"toolCallId": "bg-1", "title": "run_command"},
+                        "options": [
+                            {"optionId": "once", "kind": "allow_once", "name": "Allow"},
+                            {"optionId": "no", "kind": "reject_once", "name": "Deny"},
+                        ],
+                    },
+                }
+            )
+        stop = "cancelled" if case == "cancelled-stop" else "end_turn"
+        ex._pending[message["id"]].set_result({"result": {"stopReason": stop}})  # type: ignore[index]
+
+    ex._send = send  # type: ignore[assignment]
+    events = await asyncio.wait_for(
+        _collect_events(ex.run_turn([{"role": "user", "content": "go"}], [], "")),
+        timeout=2.0,
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert "still running" not in (events[-1].response or "")
+
+
+async def _collect_events(stream) -> list[ExecutorEvent]:
+    return [ev async for ev in stream]
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_subagent_and_managed_permission_binding() -> None:
+    """Post-prompt subagent work keeps the turn open and binds managed host-tier permissions."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    perm_replied = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+        elif message.get("id") == 201:
+            perm_replied.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+    reply_seen = asyncio.Event()
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "delegate"}], [], ""):
+            events.append(ev)
+            if isinstance(ev, TextChunk) and "Subagent finished." in ev.text:
+                reply_seen.set()
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child-1",
+                    "state": {"state": "running"},
+                },
+            )
+        )
+        feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}})
+        await clock.advance(600.0)
+        assert not task.done()
+
+        # Post-prompt permission request in the still-open AG turn binds cleanly.
+        cmd_input = {"CommandLine": "omni --version"}
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "post-cmd",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 201,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "post-cmd", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(perm_replied.wait(), timeout=2.0)
+        await clock.advance(5.0)
+        perm_replies = [m for m in sent if m.get("id") == 201]
+        assert perm_replies == [
+            {
+                "jsonrpc": "2.0",
+                "id": 201,
+                "result": {"outcome": {"outcome": "selected", "optionId": "once"}},
+            }
+        ]
+
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "post-cmd",
+                    "status": "completed",
+                },
+            )
+        )
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child-1",
+                    "state": {"state": "idle"},
+                },
+            )
+        )
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Subagent finished."},
+                },
+            )
+        )
+        # No usage_update: settles after the 3s quiet settle grace on virtual clock.
+        await asyncio.wait_for(reply_seen.wait(), timeout=2.0)
+        await clock.advance(2.0)
+        assert not task.done()
+        await clock.advance(2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Subagent finished."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["interrupt", "eof"])
+async def test_agy_post_prompt_interrupt_and_eof_exit_promptly(exit_mode: str) -> None:
+    """User Stop or subprocess EOF during AG background wait exits immediately."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "sleep 600"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(10.0)
+    assert not task.done()
+
+    if exit_mode == "interrupt":
+        assert await ex.interrupt_session("s1") is True
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnCancelled)
+    else:
+        ex._stdout_eof_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], ExecutorError)
+        assert "closed stdout" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_agy_fake_acp_subprocess_background_wrapup_end_to_end(tmp_path: Path) -> None:
+    """Fake-agy ACP subprocess over stdio reports post-prompt background work before settling."""
+    script = tmp_path / "fake_agy.py"
+    script.write_text(
+        """
+import json, sys, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"protocolVersion": 1, "agentCapabilities": {}},
+        })
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "agy-e2e"}})
+    elif method == "session/prompt":
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-e2e",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "echo hi"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Started.\\n"},
+                },
+            },
+        })
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
+        time.sleep(0.05)
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bg-e2e",
+                    "status": "completed",
+                    "rawOutput": "hi",
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Finished: hi"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-e2e",
+                "update": {"sessionUpdate": "usage_update", "size": 64000},
+            },
+        })
+""".lstrip(),
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command=f"{shlex.quote(str(wrapper))} acp", name="Fake AG", omnigent_mcp=False
+        ),
+        cwd=str(tmp_path),
+    )
+    try:
+        events = await asyncio.wait_for(
+            _collect_events(ex.run_turn([{"role": "user", "content": "run bg"}], [], "")),
+            timeout=10.0,
+        )
+    finally:
+        await ex.close()
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "bg-e2e"} for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Started.\nFinished: hi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["rpc-error", "cancelled-stop", "interrupted-inflight"])
+async def test_agy_managed_permission_rejected_after_failed_cancelled_or_interrupted_prompt(
+    case: str,
+) -> None:
+    """Host-tier permissions never bind or grant after prompt error, cancel stop, or Stop."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    policy_entered = asyncio.Event()
+    release_policy = asyncio.Event()
+
+    async def evaluate_policy(*_args, **_kwargs) -> PolicyVerdictPayload:
+        policy_entered.set()
+        if case == "interrupted-inflight":
+            await release_policy.wait()
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+
+    ex._policy_evaluator = evaluate_policy  # type: ignore[assignment]
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        cmd_input = {"CommandLine": "omni --version"}
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cmd-perm",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 301,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "cmd-perm", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        if case == "rpc-error":
+            feed(
+                {
+                    "jsonrpc": "2.0",
+                    "id": prompt_id[0],
+                    "error": {"code": -32000, "message": "prompt failed"},
+                }
+            )
+        elif case == "cancelled-stop":
+            feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "cancelled"}})
+        else:
+            await asyncio.wait_for(policy_entered.wait(), timeout=2.0)
+            assert await ex.interrupt_session("s1") is True
+            release_policy.set()
+            feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "cancelled"}})
+
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        release_policy.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    perm_replies = [m for m in sent if m.get("id") == 301]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 301,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+    if case == "rpc-error":
+        assert isinstance(events[-1], ExecutorError)
+    else:
+        assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_agy_post_prompt_burst_completion_behind_prompt_response_not_dropped() -> None:
+    """Fast background completion queued right behind end_turn is delivered before TurnComplete."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "burst"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        burst = [
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-burst",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "echo fast"},
+                },
+            ),
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bg-burst",
+                    "status": "completed",
+                    "rawOutput": "fast",
+                },
+            ),
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Burst done."},
+                },
+            ),
+            _acp_update_frame("s1", {"sessionUpdate": "usage_update", "size": 32000}),
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert any(
+        isinstance(ev, ToolCallComplete) and ev.metadata == {"call_id": "bg-burst"}
+        for ev in events
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "Burst done."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_mode", ["deadline", "interrupt"])
+async def test_agy_post_prompt_bounded_request_aborts_on_deadline_and_interrupt(
+    abort_mode: str,
+) -> None:
+    """An unanswered post-prompt permission request never exceeds the 30m bound or delays Stop."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    elicit_started = asyncio.Event()
+    never_answered = asyncio.Event()
+
+    async def hanging_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        elicit_started.set()
+        await never_answered.wait()
+        return True
+
+    ex._elicitation_handler = hanging_elicit  # type: ignore[assignment]
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await prompt_sent.wait()
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-1",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(60.0)
+    assert not task.done()
+
+    ex._queue.put_nowait(
+        {
+            "jsonrpc": "2.0",
+            "id": 401,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "bg-perm", "title": "run_command"},
+                "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+            },
+        }
+    )
+    await asyncio.wait_for(elicit_started.wait(), timeout=2.0)
+
+    if abort_mode == "deadline":
+        await clock.advance(1740.0)  # Reaches exact 1800s post-prompt bound.
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnComplete)
+        assert "30 minutes" in (events[-1].response or "")
+        assert "still running" in (events[-1].response or "")
+    else:
+        assert await ex.interrupt_session("s1") is True
+        await asyncio.wait_for(task, timeout=2.0)
+        assert isinstance(events[-1], TurnCancelled)
+
+    perm_replies = [m for m in sent if m.get("id") == 401]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 401,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acp_close_during_foreground_prompt_exits_without_spinning() -> None:
+    """Closing the executor during a foreground prompt fails fast instead of spinning."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="example-agent", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    proc = Mock(spec=asyncio.subprocess.Process, returncode=None, stdout=stdout)
+    proc.stdin = Mock()
+    proc.stdin.close = Mock()
+    proc.wait = AsyncMock(return_value=0)
+    ex._proc = proc
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    prompt_sent = asyncio.Event()
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+    await clock.settle()
+    assert not task.done()
+
+    await ex.close()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(events[-1], ExecutorError)
+    assert "closed stdout" in events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_acp_tool_progress_resets_harness_idle_watchdog_through_adapter() -> None:
+    """Statusless tool_call_update refreshes TurnContext's idle watchdog via ExecutorAdapter."""
+    from omnigent.db.utils import generate_task_id
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    adapter = ExecutorAdapter(lambda: ex, session_key="stub")
+    watchdog_resets = 0
+
+    def reset_watchdog() -> None:
+        nonlocal watchdog_resets
+        watchdog_resets += 1
+
+    ctx = TurnContext(
+        response_id=generate_task_id(),
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    ctx._reset_idle_watchdog = reset_watchdog
+    adapter._in_flight[ctx.response_id] = ctx
+
+    task = asyncio.create_task(
+        adapter.run_turn(CreateResponseRequest(model="agent", input="build"), ctx)
+    )
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "cmd-long",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make all"},
+            },
+        )
+    )
+    await clock.settle()
+    resets_before_progress = watchdog_resets
+    queue_size_before = ctx._event_queue.qsize()
+
+    # Statusless progress emits no SSE event, yet must still refresh the harness watchdog.
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-long",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "compiling..."}}
+                ],
+            },
+        )
+    )
+    await clock.settle()
+    assert ctx._event_queue.qsize() == queue_size_before
+    assert watchdog_resets > resets_before_progress
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "cmd-long",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        )
+    )
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_agy_foreground_request_and_blocked_abort_send_respect_30m_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight Phase 1 requests and backpressured abort sends still obey the 30m bound."""
+    monkeypatch.setattr(acp_executor_module, "_ABORT_REPLY_TIMEOUT_SECONDS", 0.05)
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+
+    elicit_started = asyncio.Event()
+    never_answered = asyncio.Event()
+    abort_attempted = asyncio.Event()
+
+    async def hanging_elicit(_tool: str, _args: dict[str, object]) -> bool:
+        elicit_started.set()
+        await never_answered.wait()
+        return True
+
+    ex._elicitation_handler = hanging_elicit  # type: ignore[assignment]
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+            return
+        if message.get("id") == 450:
+            abort_attempted.set()
+            await never_answered.wait()  # Simulate stdin backpressure on abort delivery.
+
+    ex._send = send  # type: ignore[assignment]
+
+    def feed(frame: dict[str, object]) -> None:
+        stdout.feed_data((json.dumps(frame) + "\n").encode("utf-8"))
+
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        feed(
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "make"},
+                },
+            )
+        )
+        feed(
+            {
+                "jsonrpc": "2.0",
+                "id": 450,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "fg-perm", "title": "run_command"},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            }
+        )
+        await asyncio.wait_for(elicit_started.wait(), timeout=2.0)
+
+        # Prompt ends while the Phase 1 permission request is still awaiting.
+        feed({"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}})
+        await clock.advance(1800.0)
+        await asyncio.wait_for(abort_attempted.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        never_answered.set()
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert "30 minutes" in (events[-1].response or "")
+    assert "still running" in (events[-1].response or "")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_acp_turn_drains_trailing_text_after_prompt_response() -> None:
+    """Ordinary ACP turns still drain trailing queued chunks after the prompt response arrives."""
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="example-agent", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        burst = [
+            {"jsonrpc": "2.0", "id": prompt_id[0], "result": {"stopReason": "end_turn"}},
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "trailing text"},
+                },
+            ),
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "trailing text"
+
+
+@pytest.mark.asyncio
+async def test_agy_entering_background_wait_refreshes_harness_idle_watchdog() -> None:
+    """Transitioning into AG post-prompt background wait refreshes the harness idle watchdog."""
+    from omnigent.db.utils import generate_task_id
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp", omnigent_mcp=False), clock=clock)
+    clock.bind(ex)
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._session_id = "s1"
+
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+
+    adapter = ExecutorAdapter(lambda: ex, session_key="stub")
+    watchdog_resets = 0
+
+    def reset_watchdog() -> None:
+        nonlocal watchdog_resets
+        watchdog_resets += 1
+
+    ctx = TurnContext(
+        response_id=generate_task_id(),
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    ctx._reset_idle_watchdog = reset_watchdog
+    adapter._in_flight[ctx.response_id] = ctx
+
+    task = asyncio.create_task(
+        adapter.run_turn(CreateResponseRequest(model="agent", input="bg"), ctx)
+    )
+    await asyncio.wait_for(prompt_sent.wait(), timeout=2.0)
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bg-watchdog",
+                "title": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "make"},
+            },
+        )
+    )
+    await clock.settle()
+    resets_before_end_turn = watchdog_resets
+
+    ex._pending[prompt_id[0]].set_result({"result": {"stopReason": "end_turn"}})
+    await clock.advance(1.0)
+    assert not task.done()
+    assert watchdog_resets > resets_before_end_turn
+
+    ex._queue.put_nowait(
+        _acp_update_frame(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bg-watchdog",
+                "status": "completed",
+            },
+        )
+    )
+    await clock.advance(5.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_agy_malformed_error_prompt_response_never_reopens_managed_permissions() -> None:
+    """A malformed response with non-dict error and end_turn fails closed on permissions."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    clock = _FakeAcpClock()
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True, omnigent_mcp=False),
+        clock=clock,
+    )
+    clock.bind(ex)
+    stdout = asyncio.StreamReader()
+    ex._proc = Mock(returncode=None, stdout=stdout)
+    ex._stdout_eof_event = asyncio.Event()
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._active_mode = "default"
+    ex._reader_task = asyncio.create_task(ex._read_stdout())
+    ex._policy_evaluator = AsyncMock(
+        return_value=PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+    )
+
+    sent: list[dict[str, object]] = []
+    prompt_sent = asyncio.Event()
+    prompt_id: list[int] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message.get("method") == "session/prompt":
+            prompt_id.append(int(message["id"]))  # type: ignore[arg-type]
+            prompt_sent.set()
+
+    ex._send = send  # type: ignore[assignment]
+    events: list[ExecutorEvent] = []
+
+    async def run() -> None:
+        async for ev in ex.run_turn([{"role": "user", "content": "run"}], [], ""):
+            events.append(ev)
+
+    task = asyncio.create_task(run())
+    try:
+        await prompt_sent.wait()
+        cmd_input = {"CommandLine": "omni --version"}
+        burst = [
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bg-1",
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "sleep 60"},
+                },
+            ),
+            {
+                "jsonrpc": "2.0",
+                "id": prompt_id[0],
+                "error": "malformed error string",
+                "result": {"stopReason": "end_turn"},
+            },
+            _acp_update_frame(
+                "s1",
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cmd-after-malformed",
+                    "kind": "execute",
+                    "title": "run_command",
+                    "status": "pending",
+                    "rawInput": cmd_input,
+                },
+            ),
+            {
+                "jsonrpc": "2.0",
+                "id": 501,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "cmd-after-malformed", "rawInput": cmd_input},
+                    "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow once"}],
+                },
+            },
+        ]
+        stdout.feed_data(b"".join((json.dumps(f) + "\n").encode("utf-8") for f in burst))
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        stdout.feed_eof()
+        if ex._reader_task is not None:
+            await ex._reader_task
+
+    perm_replies = [m for m in sent if m.get("id") == 501]
+    assert perm_replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": 501,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        }
+    ]
+    assert isinstance(events[-1], ExecutorError)
+    assert "malformed error string" in events[-1].message
