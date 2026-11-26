@@ -25,6 +25,7 @@ from typing import Literal, TypeAlias
 from urllib.parse import urlsplit
 
 PermissionTier: TypeAlias = Literal["ask", "plan", "accept-edits", "auto", "full"]
+DenialSource: TypeAlias = Literal["policy", "permission mode", "sandbox", "rule"]
 PERMISSION_TIERS: tuple[PermissionTier, ...] = ("ask", "plan", "accept-edits", "auto", "full")
 NON_FULL_TIERS: tuple[PermissionTier, ...] = PERMISSION_TIERS[:-1]
 DEFAULT_PERMISSION_TIER: PermissionTier = "auto"
@@ -147,6 +148,7 @@ class ToolIntent:
     command_read_only: bool = False
     unbound_write: bool = False
     native_status: NativeSupportStatus | None = None
+    unseen_tool: bool = False
 
 
 @dataclass(frozen=True)
@@ -982,7 +984,14 @@ def _adapt_unbound_call(
         if name in _CONTROL_TOOLS:
             return ToolIntent(ToolKind.OTHER, name, digest, context, detail="framework-control")
         return ToolIntent(
-            ToolKind.UNKNOWN, name, digest, context, status="unknown", detail="Unknown tool schema"
+            ToolKind.UNKNOWN,
+            name,
+            digest,
+            context,
+            status="unknown",
+            detail="Unknown tool schema",
+            # Deferred/unclassified Omnigent sys_* framework tools stay denied in auto.
+            unseen_tool=not name.startswith("sys_"),
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return ToolIntent(ToolKind.UNKNOWN, name, "", context, status="invalid", detail=str(exc))
@@ -3296,7 +3305,7 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 Verdict.DENY, "Plan tier permits only known reads and user questions"
             )
         if intent.status == "unknown" or intent.kind == ToolKind.UNKNOWN:
-            if tier == "auto":
+            if tier == "auto" and not intent.unseen_tool:
                 return TierDecision(
                     Verdict.DENY, intent.detail or "This tool cannot yet be checked"
                 )
@@ -3319,6 +3328,38 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         return TierDecision(Verdict.DENY, f"Permission check failed: {type(exc).__name__}")
 
 
+def format_denial_reason(
+    source: DenialSource,
+    reason: str = "",
+    *,
+    detail: str | None = None,
+) -> str:
+    """Prefix a denial message with the layer that denied it."""
+    text = reason.strip()
+    if source == "rule" and detail:
+        label = f"rule [{detail}]"
+    elif detail:
+        label = f"{source} ({detail})"
+    else:
+        label = source
+    exact_prefix = f"Denied by {label}:"
+    exact_empty = f"Denied by {label}."
+    if text == exact_empty or text.startswith(exact_prefix):
+        return text
+    return f"{exact_prefix} {text}" if text else exact_empty
+
+
+def format_tier_denial(
+    decision: TierDecision,
+    *,
+    tier: PermissionTier | None = None,
+) -> str:
+    """Format a permission-tier denial with its rule or permission-mode source."""
+    if decision.rule_id:
+        return format_denial_reason("rule", decision.reason, detail=decision.rule_id)
+    return format_denial_reason("permission mode", decision.reason, detail=tier)
+
+
 __all__ = [
     "AGY_PERMISSION_TIER_LABEL_KEY",
     "DEFAULT_PERMISSION_TIER",
@@ -3326,6 +3367,7 @@ __all__ = [
     "PERMISSION_TIERS",
     "PERMISSION_TIERS_CAPABILITY",
     "PI_PERMISSION_TIER_LABEL_KEY",
+    "DenialSource",
     "NativeCallBinding",
     "NativeInputSnapshot",
     "NativeSupport",
@@ -3340,6 +3382,8 @@ __all__ = [
     "Verdict",
     "adapt_tool_call",
     "decide_tier",
+    "format_denial_reason",
+    "format_tier_denial",
     "load_rules",
     "normalize_permission_tier",
     "plan_visible_tool_names",

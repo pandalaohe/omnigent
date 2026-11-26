@@ -22,6 +22,7 @@ from omnigent.permission_tiers import (
     Verdict,
     adapt_tool_call,
     decide_tier,
+    format_tier_denial,
     load_rules,
     normalize_permission_tier,
     resolve_local_path,
@@ -53,11 +54,16 @@ def _error(exc: Exception) -> dict[str, str]:
         return {
             "decision": "deny",
             "reason": (
-                "Permission state unavailable; retry the permission check "
+                "Permission state unavailable (permission mode); retry the permission check "
                 "before running this tool."
             ),
         }
-    return {"decision": "deny", "reason": f"Permission check unavailable: {type(exc).__name__}"}
+    return {
+        "decision": "deny",
+        "reason": (
+            f"Permission check unavailable: permission mode check failed ({type(exc).__name__})"
+        ),
+    }
 
 
 def decide(
@@ -77,11 +83,16 @@ def decide(
         decision = decide_tier(canonical, intent, rules)
         if decision.action == Verdict.ALLOW:
             return {"decision": "ask"}
+        if decision.action == Verdict.DENY:
+            return {
+                "decision": "deny",
+                "reason": format_tier_denial(decision, tier=canonical),
+            }
         reason = decision.reason
         if decision.rule_id:
             reason = f"[{decision.rule_id}] {reason}"
         return {
-            "decision": "force_ask" if decision.action == Verdict.ASK else "deny",
+            "decision": "force_ask",
             "reason": reason,
         }
     except Exception as exc:
@@ -232,7 +243,11 @@ def _lease_native_call(
         reason = verdict.get("reason")
         return {
             "decision": "deny",
-            "reason": reason if isinstance(reason, str) and reason else "Omnigent policy denied",
+            "reason": (
+                reason
+                if isinstance(reason, str) and reason
+                else "Denied by policy: Omnigent policy denied"
+            ),
         }
     if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
         raise ValueError("Native policy did not confirm permission")

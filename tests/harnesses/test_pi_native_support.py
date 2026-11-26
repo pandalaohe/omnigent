@@ -372,7 +372,13 @@ def test_positive_outside_native_support_keeps_unknown_tool_policy(tier, kind):
         ),
     )
     result = decision(tier, "subagent", arguments, host)
-    assert result.action == decision(tier, "unknown_vendor_tool", {}).action
+    expected = {
+        "ask": Verdict.ASK,
+        "accept-edits": Verdict.ASK,
+        "plan": Verdict.DENY,
+        "auto": Verdict.DENY,
+    }[tier]
+    assert result.action == expected
     assert result.rule_id != "native-proof"
 
 
@@ -425,4 +431,7 @@ def test_remote_bridge_checks_actual_native_binding_before_unknown_policy(tier, 
         assert result.action == Verdict.DENY
         assert result.rule_id == "native-proof"
     else:
-        assert result.action == decision(tier, "unknown_remote_tool", {}).action
+        assert (
+            result.action
+            == decision(tier, "unknown_remote_tool", {}, posix_host(local_execution=False)).action
+        )

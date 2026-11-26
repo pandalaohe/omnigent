@@ -70,6 +70,17 @@ def _deny_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
+def _ask_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
+    """Policy that requests approval for Bash tool calls."""
+    if event.get("type") != "tool_call":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    tool = data.get("name", "") if isinstance(data, dict) else ""
+    if tool == "Bash":
+        return {"result": "ASK", "reason": "Bash requires approval."}
+    return {"result": "ALLOW"}
+
+
 def _deny_bash_tool_result(event: dict[str, Any]) -> dict[str, Any]:
     """
     Policy that denies tool RESULTS from Bash, scoped by tool name.
@@ -1867,3 +1878,248 @@ async def test_session_restrictions_preserve_malformed_json_response(
     )
     assert response.status_code == 400, response.text
     assert "Invalid JSON" in response.text
+
+
+async def test_tiered_pi_denials_name_layer_and_unseen_tool_opens_approval_card(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi auto tier opens an approval card for unseen tools and names every denying layer."""
+    from omnigent.permission_tiers.host import HostPermissionState, evaluate_host_tool
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        BoundToolCall,
+        ConfirmedPermissionState,
+    )
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ElicitationResult
+
+    workspace = tmp_path / "workspace"
+    bridge = tmp_path / "bridge"
+    workspace.mkdir()
+    bridge.mkdir()
+
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[deny_bash_policy],
+        ),
+    )
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    host_id = "11111111111111111111111111111111"
+    current_tier: list[str] = ["auto"]
+    store.set_host_id(session_id, host_id, workspace=str(workspace))
+    store.update_conversation(session_id, harness_override="pi")
+    store.set_labels(
+        session_id,
+        {
+            **ConfirmedPermissionState("auto", 1, "ready").labels("pi"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+
+    def runner_response(request: httpx.Request) -> httpx.Response:
+        data = json.loads(request.content)
+        if data.get("type") == "interrupt":
+            return httpx.Response(204)
+        common = {
+            "session_id": session_id,
+            "host_id": host_id,
+            "call_id": data["call_id"],
+            "tier_revision": 1,
+            "permission_tiers_capability": PERMISSION_CAPABILITY_VALUE,
+        }
+        if data["type"] == "permission_tier_authorize":
+            return httpx.Response(200, json={**common, "authorized": True})
+        assert data["type"] == "permission_tier_inspect"
+        state = HostPermissionState(
+            session_id,
+            host_id,
+            str(workspace),
+            current_tier[0],
+            1,
+            "ready",  # type: ignore[arg-type]
+        )
+        binding = BoundToolCall.bind(
+            session_id=session_id,
+            host_id=host_id,
+            call_id=data["call_id"],
+            name=data["name"],
+            arguments=data["arguments"],
+            tier_revision=1,
+        )
+        decision = evaluate_host_tool(
+            state, data["name"], data["arguments"], control_paths=(str(bridge),)
+        )
+        return httpx.Response(
+            200,
+            json={
+                **common,
+                "name": data["name"],
+                "arguments_digest": binding.arguments_digest,
+                "verdict": decision.action,
+                "reason": decision.reason,
+                "rule_id": decision.rule_id,
+            },
+        )
+
+    cards: list[dict[str, Any]] = []
+    next_card_action: list[str] = ["accept"]
+
+    async def fake_elicit(*_args: Any, **kwargs: Any) -> ElicitationResult:
+        cards.append(kwargs)
+        return ElicitationResult(action=next_card_action[0])  # type: ignore[arg-type]
+
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", fake_elicit)
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(runner_response)
+    ) as runner:
+
+        async def get_runner(*_: Any, **__: Any) -> httpx.AsyncClient:
+            return runner
+
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.helpers._get_runner_client", get_runner
+        )
+
+        # 1a. Unseen tool in Pi auto tier produces an approval card instead of silent deny.
+        unseen = _tool_call_request("third_party_tool", {"item": "x"})
+        unseen["event"]["data"]["call_id"] = "call-unseen"
+        resp_unseen = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=unseen
+        )
+        assert resp_unseen.status_code == 200, resp_unseen.text
+        assert resp_unseen.json()["result"] == "POLICY_ACTION_ALLOW"
+        assert len(cards) == 1
+        assert cards[0]["params"].phase == "permission_tier"
+        assert cards[0]["params"].tool_name == "third_party_tool"
+
+        # 1b. Declining the approval card denies with permission-mode attribution.
+        next_card_action[0] = "decline"
+        unseen_decline = _tool_call_request("third_party_tool", {"item": "y"})
+        unseen_decline["event"]["data"]["call_id"] = "call-unseen-decline"
+        resp_decline = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=unseen_decline
+        )
+        assert resp_decline.status_code == 200, resp_decline.text
+        assert resp_decline.json()["result"] == "POLICY_ACTION_DENY"
+        assert resp_decline.json()["reason"].startswith("Denied by permission mode (auto):")
+        assert len(cards) == 2
+        next_card_action[0] = "accept"
+
+        # 2. Rule denial names the rule layer and rule id.
+        rule_req = _tool_call_request("write", {"path": "/etc/hosts", "content": "x"})
+        rule_req["event"]["data"]["call_id"] = "call-rule"
+        resp_rule = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=rule_req
+        )
+        assert resp_rule.status_code == 200, resp_rule.text
+        assert resp_rule.json()["result"] == "POLICY_ACTION_DENY"
+        assert resp_rule.json()["reason"].startswith("Denied by rule [protected-path]:")
+
+        # 3. Independent policy denial on a tiered session names the policy layer and policy name.
+        policy_req = _tool_call_request("Bash", {"command": "echo hi"})
+        policy_req["event"]["data"]["call_id"] = "call-policy"
+        resp_policy = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=policy_req
+        )
+        assert resp_policy.status_code == 200, resp_policy.text
+        assert resp_policy.json()["result"] == "POLICY_ACTION_DENY"
+        assert resp_policy.json()["reason"] == (
+            "Denied by policy (admin__deny_bash): Bash is blocked by admin policy."
+        )
+
+        # 4. Permission-mode denial names the permission mode and tier.
+        current_tier[0] = "plan"
+        store.set_labels(
+            session_id,
+            {
+                **ConfirmedPermissionState("plan", 1, "ready").labels("pi"),
+                PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            },
+        )
+        plan_req = _tool_call_request("write", {"path": str(workspace / "a.txt"), "content": "x"})
+        plan_req["event"]["data"]["call_id"] = "call-plan"
+        resp_plan = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=plan_req
+        )
+        assert resp_plan.status_code == 200, resp_plan.text
+        assert resp_plan.json()["result"] == "POLICY_ACTION_DENY"
+        assert resp_plan.json()["reason"].startswith("Denied by permission mode (plan):")
+
+        # 5. Function-call policy route on a tiered session also carries deciding_policy.
+        current_tier[0] = "auto"
+        store.set_labels(
+            session_id,
+            {
+                **ConfirmedPermissionState("auto", 1, "ready").labels("pi"),
+                PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            },
+        )
+        fc_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "function_call",
+                "data": {
+                    "agent": "pi",
+                    "name": "Bash",
+                    "arguments": json.dumps({"command": "echo hi"}),
+                    "call_id": "call-fc-policy",
+                    "evaluate_policy": True,
+                },
+            },
+        )
+        assert fc_resp.status_code == 202, fc_resp.text
+        fc_body = fc_resp.json()
+        assert fc_body["verdict"] == "deny"
+        assert fc_body["reason"] == (
+            "Denied by policy (admin__deny_bash): Bash is blocked by admin policy."
+        )
+
+        # 6. Explicit policy-ASK decline on a tiered session names the deciding policy.
+        from omnigent.server.routes._sessions.orchestration import ElicitationDeclinedError
+
+        ask_policy = FunctionPolicySpec(
+            name="admin__ask_bash",
+            on=None,
+            function=FunctionRef(path=f"{__name__}._ask_bash_tool"),
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.get_caps",
+            lambda: RuntimeCaps(
+                execution_timeout=original_caps.execution_timeout,
+                default_policies=[ask_policy],
+            ),
+        )
+
+        async def decline_ask(*_a: Any, **_kw: Any) -> bool:
+            raise ElicitationDeclinedError("User declined bash")
+
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_hooks._hold_native_ask_gate",
+            decline_ask,
+        )
+        ask_decline_req = _tool_call_request("Bash", {"command": "echo hi"})
+        ask_decline_req["event"]["data"]["call_id"] = "call-ask-decline"
+        resp_ask_decline = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=ask_decline_req
+        )
+        assert resp_ask_decline.status_code == 200, resp_ask_decline.text
+        assert resp_ask_decline.json()["result"] == "POLICY_ACTION_DENY"
+        assert resp_ask_decline.json()["reason"] == (
+            "Denied by policy (admin__ask_bash): User declined bash"
+        )

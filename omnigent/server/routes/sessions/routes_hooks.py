@@ -2322,13 +2322,17 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
-        from omnigent.permission_tiers import Verdict
+        from omnigent.permission_tiers import (
+            Verdict,
+            format_denial_reason,
+            format_tier_denial,
+        )
         from omnigent.server.permission_gate import (
             authorize_permission_call,
             finish_permission_call,
             inspect_permission_call,
         )
-        from omnigent.server.permission_tiers import TIER_HARNESSES
+        from omnigent.server.permission_tiers import TIER_HARNESSES, read_permission_state
         from omnigent.server.routes import sessions as _sf
 
         user_id = _sf._get_user_id(request, auth_provider)
@@ -2387,12 +2391,21 @@ def register_hooks_routes(
         ):
             return Response(
                 content=json.dumps(
-                    {"result": "POLICY_ACTION_DENY", "reason": "Permission harness unavailable"}
+                    {
+                        "result": "POLICY_ACTION_DENY",
+                        "reason": format_denial_reason(
+                            "permission mode", "Permission harness unavailable"
+                        ),
+                    }
                 ),
                 media_type="application/json",
             )
-        if harness not in TIER_HARNESSES:
+        if harness is None or harness not in TIER_HARNESSES:
             return await independent_policy()
+        try:
+            session_tier = read_permission_state(conv.labels, harness=harness).tier
+        except (ValueError, TypeError):
+            session_tier = None
         payload = await request.json()
         event = payload.get("event") if isinstance(payload, dict) else None
         if isinstance(event, dict) and event.get("type") == "PHASE_TOOL_RESULT":
@@ -2443,7 +2456,12 @@ def register_hooks_routes(
         if not isinstance(name, str) or not name or not isinstance(arguments, dict):
             return Response(
                 content=json.dumps(
-                    {"result": "POLICY_ACTION_DENY", "reason": "Malformed tool call"}
+                    {
+                        "result": "POLICY_ACTION_DENY",
+                        "reason": format_denial_reason(
+                            "permission mode", "Malformed tool call", detail=session_tier
+                        ),
+                    }
                 ),
                 media_type="application/json",
             )
@@ -2476,16 +2494,40 @@ def register_hooks_routes(
             )
 
         if inspection.decision.action == Verdict.DENY:
-            return tier_response(inspection.decision.reason)
+            return tier_response(format_tier_denial(inspection.decision, tier=session_tier))
         independent = await independent_policy()
         try:
             verdict = json.loads(bytes(independent.body))
         except (TypeError, ValueError):
-            return tier_response("Independent policy confirmation is unavailable")
+            return tier_response(
+                format_denial_reason("policy", "Independent policy confirmation is unavailable")
+            )
         if independent.status_code >= 400 or verdict.get("result") not in (
             "POLICY_ACTION_ALLOW",
             "POLICY_ACTION_UNSPECIFIED",
         ):
+            if (
+                independent.status_code < 400
+                and isinstance(verdict, dict)
+                and verdict.get("result") == "POLICY_ACTION_DENY"
+            ):
+                policy_name = verdict.get("deciding_policy")
+                raw_reason = verdict.get("reason")
+                verdict = {
+                    **verdict,
+                    "reason": format_denial_reason(
+                        "policy",
+                        raw_reason if isinstance(raw_reason, str) else "",
+                        detail=(
+                            policy_name if isinstance(policy_name, str) and policy_name else None
+                        ),
+                    ),
+                }
+                return Response(
+                    content=json.dumps(verdict),
+                    status_code=independent.status_code,
+                    media_type="application/json",
+                )
             return independent
         can_approve = permission_store is None or await asyncio.to_thread(
             check_session_access,
@@ -2506,7 +2548,7 @@ def register_hooks_routes(
             can_approve=can_approve,
         )
         if decision.action != Verdict.ALLOW:
-            return tier_response(decision.reason)
+            return tier_response(format_tier_denial(decision, tier=session_tier))
         if inspection.origin_receipt is not None:
             verdict["permission_tier_binding"] = inspection.execution_binding()
             return Response(
@@ -2973,10 +3015,14 @@ def register_hooks_routes(
                                 get_server_runner_router(),
                                 {"type": "interrupt"},
                             )
-                            decline_body = {
+                            decline_body: dict[str, Any] = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
+                            if result.deciding_policy is not None:
+                                decline_body["deciding_policy"] = getattr(
+                                    result.deciding_policy, "name", None
+                                ) or str(result.deciding_policy)
                             add_audit_attrs(
                                 policy_verdict="POLICY_ACTION_DENY",
                                 policy_phase=phase.value,
@@ -2994,6 +3040,16 @@ def register_hooks_routes(
                             else {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": result.reason or "Approval was not granted.",
+                                **(
+                                    {
+                                        "deciding_policy": getattr(
+                                            result.deciding_policy, "name", None
+                                        )
+                                        or str(result.deciding_policy)
+                                    }
+                                    if result.deciding_policy is not None
+                                    else {}
+                                ),
                             }
                         )
                         add_audit_attrs(
@@ -3020,6 +3076,10 @@ def register_hooks_routes(
         }
         if result.reason:
             resp_body["reason"] = result.reason
+        if result.action == PolicyAction.DENY and result.deciding_policy is not None:
+            resp_body["deciding_policy"] = getattr(result.deciding_policy, "name", None) or str(
+                result.deciding_policy
+            )
         if result.data is not None:
             resp_body["data"] = result.data
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable

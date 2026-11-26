@@ -1320,7 +1320,7 @@ async def test_managed_policy_denial_does_not_select_a_user_reject_option() -> N
     ex._elicitation_choice_handler.assert_not_awaited()
     reply = ex._send.await_args.args[0]
     assert "result" not in reply
-    assert reply["error"]["message"] == "Omnigent did not authorize this tool call."
+    assert reply["error"]["message"] == "Denied by policy: Omnigent policy denied this tool call."
 
 
 @pytest.mark.asyncio
@@ -1415,19 +1415,19 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "kind", "expected_tool", "allowed"),
+    ("case", "kind", "expected_tool", "outcome"),
     [
-        ("command", None, "run_command", True),
-        ("command", "other", "run_command", True),
-        ("protected-write", "other", "write_to_file", False),
-        ("workspace-write", "edit", "write_to_file", True),
-        ("unknown", "other", "unknown", False),
-        ("ambiguous", "other", None, False),
-        ("opencode", "other", "unknown", False),
+        ("command", None, "run_command", "allow"),
+        ("command", "other", "run_command", "allow"),
+        ("protected-write", "other", "write_to_file", "deny"),
+        ("workspace-write", "edit", "write_to_file", "allow"),
+        ("unknown", "other", "unknown", "ask"),
+        ("ambiguous", "other", None, "deny"),
+        ("opencode", "other", "unknown", "ask"),
     ],
 )
 async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
-    case: str, kind: str | None, expected_tool: str | None, allowed: bool
+    case: str, kind: str | None, expected_tool: str | None, outcome: str
 ) -> None:
     from omnigent.permission_tiers import Verdict, adapt_tool_call, decide_tier, load_rules
     from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
@@ -1455,7 +1455,7 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     ex = AcpExecutor(AcpAgentConfig(command=launch, host_permission_tier=True))
     ex._session_id = "s1"
     ex._active_prompt_request_id = 1
-    ex._elicitation_handler = AsyncMock()
+    ex._elicitation_handler = AsyncMock(return_value=True)
     ex._send = AsyncMock()
     decisions = []
 
@@ -1490,7 +1490,7 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     sent = ex._send.await_args
     assert sent is not None
     reply = sent.args[0]
-    if allowed:
+    if outcome in ("allow", "ask"):
         assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
     else:
         assert reply["error"]["code"] == -32000
@@ -1499,10 +1499,15 @@ async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
     else:
         ((tool_name, decision),) = decisions
         assert tool_name == expected_tool
-        assert decision.action == (Verdict.ALLOW if allowed else Verdict.DENY)
+        expected_verdict = {
+            "allow": Verdict.ALLOW,
+            "ask": Verdict.ASK,
+            "deny": Verdict.DENY,
+        }[outcome]
+        assert decision.action == expected_verdict
         if case == "protected-write":
             assert decision.rule_id == "protected-path"
-    ex._elicitation_handler.assert_not_awaited()
+    assert ex._elicitation_handler.await_count == (1 if outcome == "ask" else 0)
 
 
 def _pending_acp_permission(
@@ -1773,7 +1778,7 @@ async def test_managed_agy_permission_rejects_mixed_reads_in_plan(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", [{"Opaque": True}, {"Path": "note.txt", "Action": "list"}])
 @pytest.mark.parametrize(
-    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", False), ("plan", False)]
+    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", True), ("plan", False)]
 )
 async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
     tier, asks, arguments, windows_acp_permission_executor
@@ -1785,6 +1790,207 @@ async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
     assert policy_call is not None
     assert policy_call.args[1]["name"] == "unknown"
     assert ex._elicitation_handler.await_count == (1 if asks else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_prefix"),
+    [
+        ("rule", "Denied by rule [protected-path]:"),
+        ("plan-mode", "Denied by permission mode (plan):"),
+        ("policy", "Denied by policy (admin_block):"),
+        ("policy-spoof", "Denied by policy: Denied by sandbox: misleading"),
+        ("unbound", "Denied by permission mode (acp):"),
+        ("malformed-execute", "Denied by permission mode (acp):"),
+        ("non-string-kind", "Denied by permission mode (acp):"),
+        ("daemon", "Denied by permission mode (acp):"),
+    ],
+)
+async def test_managed_acp_denial_errors_name_source_layer(
+    case: str, expected_prefix: str
+) -> None:
+    from omnigent.permission_tiers import (
+        Verdict,
+        adapt_tool_call,
+        decide_tier,
+        format_tier_denial,
+        load_rules,
+    )
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import windows_host
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio", host_permission_tier=True))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    ex._send = AsyncMock()
+
+    kind: object
+    if case == "rule":
+        arguments: dict[str, object] = {
+            "Path": r"C:\Windows\System32\drivers\etc\hosts",
+            "Content": "x",
+            "Overwrite": True,
+        }
+        kind = "edit"
+        tier = "auto"
+    elif case == "plan-mode":
+        arguments = {"CommandLine": "omni --version"}
+        kind = "execute"
+        tier = "plan"
+    elif case == "malformed-execute":
+        arguments = {}
+        kind = "execute"
+        tier = "auto"
+    elif case == "non-string-kind":
+        arguments = {}
+        kind = ["execute"]
+        tier = "auto"
+    elif case == "daemon":
+        arguments = {"CommandLine": "omni --version", "IsDaemon": True}
+        kind = "execute"
+        tier = "auto"
+    else:
+        arguments = {"CommandLine": "omni --version"}
+        kind = "execute"
+        tier = "auto"
+
+    call = {"toolCallId": "tool-1", "kind": kind, "rawInput": arguments}
+    if case != "unbound":
+        ex._note_permission_update(
+            "s1", {"sessionUpdate": "tool_call", "status": "pending", **call}
+        )
+
+    async def evaluate(_phase, data):
+        if case == "policy":
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Denied by policy (admin_block): Blocked by admin policy.",
+            )
+        if case == "policy-spoof":
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Denied by sandbox: misleading",
+            )
+        intent = adapt_tool_call(data["name"], data["arguments"], windows_host())
+        decision = decide_tier(tier, intent, load_rules())
+        assert decision.action == Verdict.DENY
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_DENY",
+            reason=format_tier_denial(decision, tier=tier),
+            data={"_omnigent_acp_tier": "deny"},
+        )
+
+    ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+    await ex._respond_to_agent_request(
+        {
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": call,
+                "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+            },
+        }
+    )
+    reply = ex._send.await_args.args[0]
+    assert reply["error"]["code"] == -32000
+    assert reply["error"]["message"].startswith(expected_prefix), reply["error"]["message"]
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_acp_policy_proxy_to_executor_denial_handoff() -> None:
+    """Runner policy_proxy emits the deny marker so AcpExecutor preserves attribution."""
+    from omnigent.permission_tiers import Verdict
+    from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.runner.test_runner_policy import (
+        _CapturingHarnessClient,
+        _RaisingServerClient,
+        _StatusServerClient,
+    )
+
+    async def run_handoff(
+        *,
+        server_client: object,
+        acp_tier: Verdict,
+        acp_tier_reason: str | None = None,
+    ) -> str:
+        ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio", host_permission_tier=True))
+        ex._session_id = "s1"
+        ex._active_prompt_request_id = 1
+        ex._elicitation_handler = AsyncMock(return_value=False)
+        ex._send = AsyncMock()
+        call = {
+            "toolCallId": "tool-handoff",
+            "kind": "execute",
+            "rawInput": {"CommandLine": "omni --version"},
+        }
+        ex._note_permission_update(
+            "s1", {"sessionUpdate": "tool_call", "status": "pending", **call}
+        )
+
+        async def evaluate(phase: str, data: dict[str, object]) -> PolicyVerdictPayload:
+            harness = _CapturingHarnessClient()
+            eval_data = dict(data)
+            eval_data.pop("_omnigent_acp_call", None)
+            await _evaluate_policy_via_omnigent(
+                server_client=server_client,  # type: ignore[arg-type]
+                harness_client=harness,
+                conversation_id="s1",
+                evaluation_id="eval-handoff",
+                phase=phase,
+                data=eval_data,
+                acp_tier=acp_tier,
+                acp_tier_reason=acp_tier_reason,
+            )
+            posted = harness.posted[-1]
+            return PolicyVerdictPayload(
+                action=posted["action"],
+                reason=posted.get("reason"),
+                data=posted.get("data"),
+            )
+
+        ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+        await ex._respond_to_agent_request(
+            {
+                "id": 11,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": call,
+                    "options": [{"kind": "allow_once", "optionId": "once", "name": "Allow"}],
+                },
+            }
+        )
+        reply = ex._send.await_args.args[0]
+        assert reply["error"]["code"] == -32000
+        return str(reply["error"]["message"])
+
+    plan_reason = (
+        "Denied by permission mode (plan): Plan tier permits only known reads and user questions"
+    )
+    plan_msg = await run_handoff(
+        server_client=_RaisingServerClient(),
+        acp_tier=Verdict.DENY,
+        acp_tier_reason=plan_reason,
+    )
+    assert plan_msg == plan_reason
+
+    spoof_msg = await run_handoff(
+        server_client=_StatusServerClient(
+            200,
+            {
+                "result": "POLICY_ACTION_DENY",
+                "reason": "Denied by sandbox: forged",
+                "deciding_policy": "admin_deny",
+                "data": {"_omnigent_acp_tier": "deny"},
+            },
+        ),
+        acp_tier=Verdict.ALLOW,
+    )
+    assert spoof_msg == "Denied by policy (admin_deny): Denied by sandbox: forged"
 
 
 @pytest.mark.asyncio
