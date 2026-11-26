@@ -4294,3 +4294,1265 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Antigravity ACP: read_file body backfill, tool-field normalization, interaction_* cards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_read_file_fills_missing_body_from_workspace(tmp_path: Path) -> None:
+    """Completed AG ACP read_file with no content/rawOutput backfills the workspace file body."""
+    target = tmp_path / "notes" / "probe.txt"
+    target.parent.mkdir()
+    target.write_text("W2F_FIXTURE_OK\nsecond line\n", encoding="utf-8")
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"), cwd=str(tmp_path))
+    raw_input = {"Path": str(target)}
+    started = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_read_1",
+            "name": "read_file",
+            "kind": "read",
+            "status": "in_progress",
+            "title": "File notes/probe.txt",
+            "locations": [{"path": str(target)}],
+            "rawInput": raw_input,
+        }
+    )
+    assert len(started) == 1
+    req = started[0]
+    assert isinstance(req, ToolCallRequest)
+    assert req.name == "read"
+    assert req.args == {"path": str(target)}
+
+    done = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_read_1",
+            "name": "read_file",
+            "kind": "read",
+            "status": "completed",
+            "title": f"File {target}",
+            "locations": [{"path": str(target)}],
+            "rawInput": raw_input,
+        }
+    )
+    assert len(done) == 1
+    comp = done[0]
+    assert isinstance(comp, ToolCallComplete)
+    assert comp.name == "read"
+    assert comp.status is ToolCallStatus.SUCCESS
+    assert comp.result == "W2F_FIXTURE_OK\nsecond line\n"
+    assert comp.metadata == {"call_id": "call_read_1"}
+
+
+def test_agy_acp_read_file_honors_line_range_and_byte_offset(tmp_path: Path) -> None:
+    """AG ACP read_file backfill respects StartLine, EndLine, and ByteOffset."""
+    target = tmp_path / "sample.txt"
+    target.write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"), cwd=str(tmp_path))
+
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r1",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "sample.txt", "StartLine": 2, "EndLine": 4},
+        }
+    )
+    done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r1", "status": "completed"}
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].result == "line2\nline3\nline4\n"
+
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r2",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "sample.txt", "StartLine": 2, "EndLine": 3, "ByteOffset": 6},
+        }
+    )
+    done_offset = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r2", "status": "completed"}
+    )
+    assert isinstance(done_offset[0], ToolCallComplete)
+    assert done_offset[0].result == "line3\n"
+
+    # Inverted range and boolean line numbers fail closed (no backfill).
+    for idx, bad_args in enumerate(
+        [
+            {"Path": "sample.txt", "StartLine": 4, "EndLine": 2},
+            {"Path": "sample.txt", "StartLine": True},
+        ]
+    ):
+        cid = f"bad_{idx}"
+        ex._handle_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": cid,
+                "name": "read_file",
+                "kind": "read",
+                "rawInput": bad_args,
+            }
+        )
+        bad_done = ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "completed"}
+        )
+        assert isinstance(bad_done[0], ToolCallComplete)
+        assert bad_done[0].result is None
+
+
+def test_agy_acp_read_file_backfill_guards(tmp_path: Path) -> None:
+    """Backfill preserves output and blocks outside, symlink, binary, failed, and non-AG reads."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("SECRET_OUTSIDE\n", encoding="utf-8")
+    inside = workspace / "inside.txt"
+    inside.write_text("INSIDE_BODY\n", encoding="utf-8")
+    binary = workspace / "blob.bin"
+    binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    large = workspace / "large.txt"
+    large.write_text("a" * 80_000, encoding="utf-8")
+    escape_link = workspace / "escape.txt"
+    escape_link.symlink_to(outside)
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"), cwd=str(workspace))
+
+    def _run_read(
+        executor: AcpExecutor,
+        cid: str,
+        path: str,
+        *,
+        status: str = "completed",
+        content: object = None,
+        raw_output: object = None,
+    ) -> ToolCallComplete:
+        executor._handle_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": cid,
+                "name": "read_file",
+                "kind": "read",
+                "rawInput": {"Path": path},
+            }
+        )
+        update: dict[str, object] = {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": cid,
+            "status": status,
+        }
+        if content is not None:
+            update["content"] = content
+        if raw_output is not None:
+            update["rawOutput"] = raw_output
+        events = executor._handle_session_update(update)
+        assert len(events) == 1 and isinstance(events[0], ToolCallComplete)
+        return events[0]
+
+    # Agent-provided content is preserved untouched.
+    agent_content = [{"type": "content", "content": {"type": "text", "text": "FROM_AGENT"}}]
+    assert _run_read(ex, "c_agent", str(inside), content=agent_content).result == agent_content
+    # Failed read does not backfill.
+    assert _run_read(ex, "c_fail", str(inside), status="failed").result is None
+    # Outside workspace and symlink escape are refused.
+    assert _run_read(ex, "c_out", str(outside)).result is None
+    assert _run_read(ex, "c_sym", str(escape_link)).result is None
+    # Binary file returns None.
+    assert _run_read(ex, "c_bin", str(binary)).result is None
+    # Embedded NUL and malformed file:// URI fail closed cleanly (never raise ValueError).
+    assert _run_read(ex, "c_nul", str(inside) + "\x00.txt").result is None
+    assert _run_read(ex, "c_bad_uri", "file://[").result is None
+
+    # Dual path fields (AbsolutePath + Path) are rejected unambiguously before policy or disk read.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_dual",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"AbsolutePath": str(inside), "Path": str(inside)},
+        }
+    )
+    dual_done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c_dual", "status": "completed"}
+    )[0]
+    assert isinstance(dual_done, ToolCallComplete) and dual_done.result is None
+
+    # POSIX FIFO does not block and fails closed (not a regular file).
+    if hasattr(os, "mkfifo"):
+        fifo_path = workspace / "pipe.fifo"
+        os.mkfifo(fifo_path)
+        assert _run_read(ex, "c_fifo", str(fifo_path)).result is None
+
+    # Exact 64 KiB boundary splitting a 3-byte UTF-8 character decodes cleanly without error.
+    utf8_edge = workspace / "utf8_edge.txt"
+    utf8_edge.write_bytes(b"a" * (64 * 1024 - 1) + "中".encode() + b"tail")
+    utf8_res = _run_read(ex, "c_utf8", str(utf8_edge)).result
+    assert isinstance(utf8_res, str)
+    assert utf8_res == ("a" * (64 * 1024 - 1)) + "\n...[truncated]"
+
+    # Completion cannot supply or swap paths; orphan and bridge completions never backfill.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_swap",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(workspace / "missing.txt")},
+        }
+    )
+    swapped = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c_swap",
+            "status": "completed",
+            "rawInput": {"Path": str(inside)},
+            "locations": [{"path": str(inside)}],
+        }
+    )[0]
+    assert isinstance(swapped, ToolCallComplete) and swapped.result is None
+
+    orphan = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c_orphan",
+            "name": "read_file",
+            "kind": "read",
+            "status": "completed",
+            "rawInput": {"Path": str(inside)},
+        }
+    )[0]
+    assert isinstance(orphan, ToolCallComplete) and orphan.result is None
+
+    ex._bridge_tool_aliases = frozenset({"read_file"})
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c_bridge",
+            "title": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(inside)},
+        }
+    )
+    bridge_done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c_bridge", "status": "completed"}
+    )[0]
+    assert isinstance(bridge_done, ToolCallComplete) and bridge_done.result is None
+    ex._bridge_tool_aliases = frozenset()
+
+    # Large file is capped cleanly.
+    large_res = _run_read(ex, "c_large", str(large)).result
+    assert isinstance(large_res, str)
+    assert large_res.endswith("\n...[truncated]")
+    assert len(large_res) < 70_000
+
+    # Forked os_env skips direct disk read.
+    forked_ex = AcpExecutor(
+        AcpAgentConfig(command="agy acp"),
+        cwd=str(workspace),
+        os_env=OSEnvSpec(type="caller_process", fork=True),
+    )
+    assert _run_read(forked_ex, "c_fork", str(inside)).result is None
+
+    # Non-AG ACP agent never backfills from disk.
+    non_ag = AcpExecutor(AcpAgentConfig(command="opencode acp"), cwd=str(workspace))
+    assert _run_read(non_ag, "c_non_ag", str(inside)).result is None
+
+
+@pytest.mark.asyncio
+async def test_managed_agy_permission_binds_read_file_path_and_rejects_mixed(
+    windows_acp_permission_executor,
+) -> None:
+    """Managed AG ACP binds read_file(Path) and still rejects mixed or malformed shapes."""
+    for tier in ("auto", "plan"):
+        ex = windows_acp_permission_executor(tier)
+        params = _pending_acp_permission(
+            ex, {"Path": r"tmp\probe.txt", "StartLine": 1, "EndLine": 10}, "read"
+        )
+        assert await ex._decide_permission(params) == (True, "once")
+        policy_call = ex._policy_evaluator.await_args
+        assert policy_call is not None
+        assert policy_call.args[1]["name"] == "read_file"
+        assert policy_call.args[1]["arguments"]["Path"] == r"tmp\probe.txt"
+
+    for denied_args in (
+        {"Path": r"C:\work\control\policy.json"},
+        {"AbsolutePath": r"C:\work\control\policy.json"},
+    ):
+        ex_denied = windows_acp_permission_executor("auto")
+        params_denied = _pending_acp_permission(ex_denied, denied_args, "read")
+        assert await ex_denied._decide_permission(params_denied) == (False, None)
+        ex_denied._policy_evaluator.assert_awaited_once()
+        ex_denied._elicitation_handler.assert_not_awaited()
+
+    for bad_args in (
+        {"Path": ""},
+        {"Path": r"tmp\probe.txt", "StartLine": True},
+        {"Path": r"tmp\probe.txt", "Content": "injected"},
+        {"Path": r"tmp\probe.txt", "CommandLine": "whoami"},
+        {"Path": r"tmp\probe.txt", "AbsolutePath": r"tmp\other.txt"},
+        {"Path": r"tmp\probe.txt", "UnknownKey": 1},
+    ):
+        ex_bad = windows_acp_permission_executor("auto")
+        params_bad = _pending_acp_permission(ex_bad, bad_args, "read")
+        assert await ex_bad._decide_permission(params_bad) == (False, None)
+        ex_bad._policy_evaluator.assert_not_awaited()
+
+
+def test_agy_acp_normalizes_tool_fields_and_preserves_bridge_and_non_ag() -> None:
+    """AG ACP tool calls normalize names, args, and shell rawOutput to Omnigent's shared shape."""
+    ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio"))
+
+    # Shell command with PascalCase inputs and dict rawOutput.
+    shell_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh1",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "cat probe.txt",
+            "rawInput": {"CommandLine": "cat probe.txt", "Cwd": "/opt/work/project"},
+        }
+    )
+    assert isinstance(shell_start[0], ToolCallRequest)
+    assert shell_start[0].name == "shell"
+    assert shell_start[0].args == {"command": "cat probe.txt", "cwd": "/opt/work/project"}
+
+    shell_done = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sh1",
+            "status": "completed",
+            "rawOutput": {
+                "commandLine": "cat probe.txt",
+                "workingDir": "/opt/work/project",
+                "exitCode": 0,
+                "exit_code": 0,
+                "combinedOutput": "after\n",
+                "formatted_output": "after\n",
+            },
+        }
+    )
+    assert isinstance(shell_done[0], ToolCallComplete)
+    assert shell_done[0].name == "shell"
+    assert shell_done[0].result == "after\n"
+
+    # Non-zero exit code is preserved as `[exit code: N]`.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh2",
+            "kind": "execute",
+            "title": "Run command",
+            "rawInput": {"command_line": "test -f missing.txt", "working_dir": "/opt/work"},
+        }
+    )
+    shell_nz = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sh2",
+            "status": "completed",
+            "rawOutput": {"combined_output": "", "exit_code": 1},
+        }
+    )
+    assert isinstance(shell_nz[0], ToolCallComplete)
+    assert shell_nz[0].result == "[exit code: 1]"
+
+    # Edit with TargetFile / TargetContent / ReplacementContent and Edits list.
+    edit_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "ed1",
+            "kind": "edit",
+            "title": "Run edit_file?",
+            "rawInput": {
+                "TargetFile": "file:///opt/work/app.py",
+                "TargetContent": "old = 1",
+                "ReplacementContent": "new = 2",
+            },
+        }
+    )
+    assert isinstance(edit_start[0], ToolCallRequest)
+    assert edit_start[0].name == "edit"
+    assert edit_start[0].args == {
+        "path": "/opt/work/app.py",
+        "oldText": "old = 1",
+        "newText": "new = 2",
+    }
+
+    # Write with Path + Content + Overwrite.
+    write_start = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "wr1",
+            "name": "write_to_file",
+            "kind": "edit",
+            "title": "File notes.txt",
+            "rawInput": {"Path": "/D:/work/notes.txt", "Content": "hello\n", "Overwrite": True},
+        }
+    )
+    assert isinstance(write_start[0], ToolCallRequest)
+    assert write_start[0].name == "write"
+    assert write_start[0].args == {
+        "path": "D:/work/notes.txt",
+        "content": "hello\n",
+        "Overwrite": True,
+    }
+
+    # Multi-edit list, search, list, and web tools.
+    multi_edit = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "ed2",
+            "name": "edit_file",
+            "kind": "edit",
+            "rawInput": {
+                "Path": "/opt/work/a.py",
+                "Edits": [{"Target": "x", "Replacement": "y"}],
+            },
+        }
+    )
+    assert isinstance(multi_edit[0], ToolCallRequest)
+    assert multi_edit[0].name == "edit"
+    assert multi_edit[0].args == {
+        "path": "/opt/work/a.py",
+        "edits": [{"oldText": "x", "newText": "y"}],
+    }
+
+    search_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "s1",
+            "name": "grep_search",
+            "rawInput": {"Query": "needle", "SearchPath": "/opt/work"},
+        }
+    )[0]
+    assert isinstance(search_req, ToolCallRequest)
+    assert search_req.name == "grep"
+    assert search_req.args == {"pattern": "needle", "path": "/opt/work"}
+
+    web_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "w1",
+            "name": "search_web",
+            "rawInput": {"Query": "acp protocol"},
+        }
+    )[0]
+    assert isinstance(web_req, ToolCallRequest)
+    assert web_req.name == "web_search"
+    assert web_req.args == {"query": "acp protocol"}
+
+    # Empty write content and empty edit replacement are preserved as empty strings.
+    empty_write = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "w_empty",
+            "name": "write_file",
+            "kind": "edit",
+            "rawInput": {"Path": "/opt/work/empty.txt", "Content": ""},
+        }
+    )[0]
+    assert isinstance(empty_write, ToolCallRequest)
+    assert empty_write.name == "write"
+    assert empty_write.args == {"path": "/opt/work/empty.txt", "content": ""}
+
+    delete_edit = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "e_empty",
+            "name": "edit_file",
+            "kind": "edit",
+            "rawInput": {
+                "Path": "/opt/work/a.py",
+                "TargetContent": "remove me",
+                "ReplacementContent": "",
+            },
+        }
+    )[0]
+    assert isinstance(delete_edit, ToolCallRequest)
+    assert delete_edit.name == "edit"
+    assert delete_edit.args == {
+        "path": "/opt/work/a.py",
+        "oldText": "remove me",
+        "newText": "",
+    }
+
+    # Unmanaged bare permission fallback keeps original raw title and rawInput for policy rules.
+    raw_shell = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sh_fallback",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "Run dangerous",
+            "rawInput": {"CommandLine": "rm -rf /tmp/x"},
+        }
+    )[0]
+    assert isinstance(raw_shell, ToolCallRequest) and raw_shell.name == "shell"
+    assert ex._extract_tool_call({"toolCall": {"toolCallId": "sh_fallback"}}) == (
+        "Run dangerous",
+        {"CommandLine": "rm -rf /tmp/x"},
+    )
+
+    # Bridged Omnigent MCP tool stays untouched so dispatch correlation keeps working.
+    ex._bridge_tool_aliases = frozenset(
+        {"sys_session_get_info", "mcp_omnigent_sys_session_get_info"}
+    )
+    bridge_req = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "mcp1",
+            "title": "sys_session_get_info",
+            "rawInput": {"Path": "keep-raw"},
+        }
+    )[0]
+    assert isinstance(bridge_req, ToolCallRequest)
+    assert bridge_req.name == "sys_session_get_info"
+    assert bridge_req.args == {"Path": "keep-raw"}
+    assert "internally_executed" not in bridge_req.metadata
+
+    # Non-AG ACP agent keeps its original tool name and rawInput unchanged.
+    other = AcpExecutor(AcpAgentConfig(command="opencode acp"))
+    other_req = other._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "o1",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "Custom Shell",
+            "rawInput": {"CommandLine": "ls"},
+        }
+    )[0]
+    assert isinstance(other_req, ToolCallRequest)
+    assert other_req.name == "Custom Shell"
+    assert other_req.args == {"CommandLine": "ls"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_tier", [False, True], ids=["unmanaged", "managed"])
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+async def test_agy_acp_interaction_routes_to_question_card(
+    host_tier: bool, permission_mode: str
+) -> None:
+    """AG ACP interaction_* requests route to ask_user_question cards and never auto-approve."""
+    from omnigent.server.schemas import ElicitationResult
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agy acp --stdio",
+            host_permission_tier=host_tier,
+            permission_mode=permission_mode,
+        )
+    )
+    ex._session_id = "session-1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    ex._policy_evaluator = AsyncMock()
+    ex._elicitation_handler = AsyncMock()
+    ex._elicitation_choice_handler = AsyncMock()
+
+    captured_params = []
+
+    async def fake_form(elicit_id: str, params) -> ElicitationResult:
+        captured_params.append((elicit_id, params))
+        return ElicitationResult(action="accept", content={"interaction_9960062f": "Needs review"})
+
+    ex._form_elicitation_handler = fake_form
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "interaction_9960062f",
+                "status": "pending",
+                "title": "Which result label should be used for the verification?",
+                "rawInput": {},
+            },
+            "options": [
+                {"optionId": "1", "name": "Verified", "kind": "allow_once"},
+                {"optionId": "2", "name": "Needs review", "kind": "allow_once"},
+            ],
+        },
+    }
+    await ex._respond_to_agent_request(request)
+
+    assert len(captured_params) == 1
+    _elicit_id, params = captured_params[0]
+    assert params.phase == "agy_ask_question"
+    assert params.policy_name == "agy_acp_ask_question"
+    assert params.model_extra["ask_user_question"] == {
+        "questions": [
+            {
+                "id": "interaction_9960062f",
+                "header": "Question",
+                "question": "Which result label should be used for the verification?",
+                "options": [{"label": "Verified"}, {"label": "Needs review"}],
+                "multiSelect": False,
+                "isOther": False,
+            }
+        ]
+    }
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+    reply = ex._send.await_args.args[0]
+    assert reply == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {"outcome": {"outcome": "selected", "optionId": "2"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_interaction_edge_cases_and_anti_spoofing(
+    windows_acp_permission_executor,
+) -> None:
+    """Verify reject_once selection, duplicate labels, dismiss, missing handler, and spoofing."""
+    from omnigent.server.schemas import ElicitationResult
+
+    def _make_req(
+        call_id: str, options: list[dict[str, object]], **tool_extra: object
+    ) -> dict[str, object]:
+        return {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {
+                    "toolCallId": call_id,
+                    "status": "pending",
+                    "title": "Pick one",
+                    "rawInput": {},
+                    **tool_extra,
+                },
+                "options": options,
+            },
+        }
+
+    # 1. Selecting a reject_once option still returns selected (not cancelled).
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp"))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(
+            action="accept", content={"interaction_reject": "Do not trust"}
+        )
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_reject",
+            [{"optionId": "deny", "name": "Do not trust", "kind": "reject_once"}],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "deny"}
+    }
+
+    # 2. Duplicate labels disambiguate; ambiguous raw label fails closed to cancelled.
+    seen_labels: list[list[str]] = []
+
+    async def pick_second(_eid: str, params) -> ElicitationResult:
+        opts = [
+            o["label"] for o in params.model_extra["ask_user_question"]["questions"][0]["options"]
+        ]
+        seen_labels.append(opts)
+        return ElicitationResult(action="accept", content={"interaction_dup": opts[1]})
+
+    ex._form_elicitation_handler = pick_second
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_dup",
+            [
+                {"optionId": "1", "name": "Same", "kind": "allow_once"},
+                {"optionId": "2", "name": "Same", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert seen_labels == [["Same (1)", "Same (2)"]]
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "2"}
+    }
+
+    # 2b. Label equal to another option's optionId resolves strictly by label, never raw ID.
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(
+            action="accept", content={"interaction_collide": "opt_allow"}
+        )
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_collide",
+            [
+                {"optionId": "opt_allow", "name": "Approve", "kind": "allow_once"},
+                {"optionId": "opt_deny", "name": "opt_allow", "kind": "reject_once"},
+            ],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "opt_deny"}
+    }
+
+    # 2c. Generated label colliding with a third option's label is disambiguated again.
+    seen_triple: list[list[str]] = []
+
+    async def pick_third(_eid: str, params) -> ElicitationResult:
+        opts = [
+            o["label"] for o in params.model_extra["ask_user_question"]["questions"][0]["options"]
+        ]
+        seen_triple.append(opts)
+        return ElicitationResult(action="accept", content={"interaction_triple": opts[2]})
+
+    ex._form_elicitation_handler = pick_third
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_triple",
+            [
+                {"optionId": "1", "name": "Same", "kind": "allow_once"},
+                {"optionId": "2", "name": "Same", "kind": "allow_once"},
+                {"optionId": "3", "name": "Same (1)", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert len(seen_triple) == 1 and len(set(seen_triple[0])) == 3
+    assert ex._send.await_args.args[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "3"}
+    }
+
+    # 2d. Call acquiring tool rawInput or going terminal while card is open cancels on reply.
+    async def mutate_while_open(_eid: str, _params) -> ElicitationResult:
+        ex._note_agy_interaction_activity(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "interaction_mutated",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "whoami"},
+            },
+        )
+        return ElicitationResult(action="accept", content={"interaction_mutated": "Yes"})
+
+    ex._form_elicitation_handler = mutate_while_open
+    await ex._respond_to_agent_request(
+        _make_req("interaction_mutated", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    async def finish_while_open(_eid: str, _params) -> ElicitationResult:
+        ex._note_agy_interaction_activity(
+            "s1",
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "interaction_gone",
+                "status": "completed",
+            },
+        )
+        return ElicitationResult(action="accept", content={"interaction_gone": "Yes"})
+
+    ex._form_elicitation_handler = finish_while_open
+    await ex._respond_to_agent_request(
+        _make_req("interaction_gone", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # 2e. Already-tainted or stale question-shaped request under bypassPermissions cancels
+    # (never falls through to ordinary permission auto-approval).
+    bypass_ex = AcpExecutor(AcpAgentConfig(command="agy acp", permission_mode="bypassPermissions"))
+    bypass_ex._session_id = "s1"
+    bypass_ex._active_prompt_request_id = 1
+    bypass_ex._send = AsyncMock()
+    bypass_ex._form_elicitation_handler = AsyncMock()
+    bypass_ex._tainted_interaction_calls.add("interaction_tainted")
+    await bypass_ex._respond_to_agent_request(
+        _make_req("interaction_tainted", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # Without an active prompt, or during stale-queue drain even after a prior timeout left
+    # _active_prompt_request_id populated, unmanaged questions cancel without opening a card.
+    bypass_ex._active_prompt_request_id = None
+    await bypass_ex._respond_to_agent_request(
+        _make_req("interaction_stale", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    bypass_ex._active_prompt_request_id = 42
+    await bypass_ex._queue.put(
+        _make_req("interaction_drain", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    await bypass_ex._drain_stale_queue()
+    bypass_ex._form_elicitation_handler.assert_not_awaited()
+    assert bypass_ex._active_prompt_request_id is None
+    assert bypass_ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    # 3. Decline / no handler / duplicate optionId fail closed to cancelled.
+    ex._form_elicitation_handler = AsyncMock(return_value=ElicitationResult(action="decline"))
+    await ex._respond_to_agent_request(
+        _make_req("interaction_decline", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    ex._form_elicitation_handler = None
+    await ex._respond_to_agent_request(
+        _make_req("interaction_headless", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+    ex._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(action="accept", content={"interaction_bad": "1"})
+    )
+    await ex._respond_to_agent_request(
+        _make_req(
+            "interaction_bad",
+            [
+                {"optionId": "1", "name": "A", "kind": "allow_once"},
+                {"optionId": "1", "name": "B", "kind": "allow_once"},
+            ],
+        )
+    )
+    assert ex._send.await_args.args[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+    ex._form_elicitation_handler.assert_not_awaited()
+
+    # 4. Spoofed interaction_* with command rawInput or execute kind must not open a question card.
+    managed = windows_acp_permission_executor("auto")
+    managed._session_id = "s1"
+    managed._active_prompt_request_id = 1
+    managed._send = AsyncMock()
+    managed._form_elicitation_handler = AsyncMock(
+        return_value=ElicitationResult(action="accept", content={"interaction_spoof": "Allow"})
+    )
+    await managed._respond_to_agent_request(
+        _make_req(
+            "interaction_spoof",
+            [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+            kind="execute",
+            rawInput={"CommandLine": "rm -rf /"},
+        )
+    )
+    managed._form_elicitation_handler.assert_not_awaited()
+    assert managed._send.await_args.args[0]["error"]["code"] == -32000
+
+    # 5. Non-AG ACP agent with interaction_* keeps regular permission path.
+    non_ag = AcpExecutor(AcpAgentConfig(command="opencode acp"))
+    non_ag._session_id = "s1"
+    non_ag._send = AsyncMock()
+    non_ag._form_elicitation_handler = AsyncMock()
+    non_ag._elicitation_handler = AsyncMock(return_value=True)
+    await non_ag._respond_to_agent_request(
+        _make_req("interaction_other", [{"optionId": "1", "name": "Yes", "kind": "allow_once"}])
+    )
+    non_ag._form_elicitation_handler.assert_not_awaited()
+    non_ag._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable wrapper script")
+@pytest.mark.asyncio
+async def test_agy_acp_fake_agent_e2e_read_file_and_interaction_card(tmp_path: Path) -> None:
+    """Fake AG ACP subprocess proves read_file body, normalized fields, and interaction_* cards."""
+    from omnigent.server.schemas import ElicitationResult
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe = workspace / "probe.txt"
+    probe.write_text("FAKE_AG_BODY_LINE\n", encoding="utf-8")
+
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"probe_path = {str(probe)!r}\n"
+        "def send(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "def upd(u):\n"
+        "    send({'jsonrpc': '2.0', 'method': 'session/update',\n"
+        "          'params': {'sessionId': 'ag-s1', 'update': u}})\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "              'result': {'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'sessionId': 'ag-s1'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        prompt_id = msg['id']\n"
+        "        upd({'sessionUpdate': 'tool_call', 'toolCallId': 'call_r',\n"
+        "             'name': 'read_file', 'kind': 'read', 'status': 'in_progress',\n"
+        "             'title': 'File probe.txt', 'rawInput': {'Path': probe_path}})\n"
+        "        upd({'sessionUpdate': 'tool_call_update', 'toolCallId': 'call_r',\n"
+        "             'name': 'read_file', 'kind': 'read', 'status': 'completed',\n"
+        "             'title': 'File probe.txt', 'rawInput': {'Path': probe_path}})\n"
+        "        send({\n"
+        "            'jsonrpc': '2.0', 'id': 99, 'method': 'session/request_permission',\n"
+        "            'params': {\n"
+        "                'sessionId': 'ag-s1',\n"
+        "                'toolCall': {\n"
+        "                    'toolCallId': 'interaction_e2e', 'status': 'pending',\n"
+        "                    'title': 'Pick label?', 'rawInput': {},\n"
+        "                },\n"
+        "                'options': [\n"
+        "                    {'optionId': 'opt_a', 'name': 'Alpha', 'kind': 'allow_once'},\n"
+        "                    {'optionId': 'opt_b', 'name': 'Beta', 'kind': 'allow_once'},\n"
+        "                ],\n"
+        "            },\n"
+        "        })\n"
+        "        reply = json.loads(sys.stdin.readline())\n"
+        "        chosen = reply.get('result', {}).get('outcome', {}).get('optionId')\n"
+        "        upd({'sessionUpdate': 'agent_message_chunk',\n"
+        "             'content': {'type': 'text', 'text': f'chosen={chosen}'}})\n"
+        "        send({'jsonrpc': '2.0', 'id': prompt_id,\n"
+        "              'result': {'stopReason': 'end_turn'}})\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([str(fake_agy), "acp"]), omnigent_mcp=False),
+        cwd=str(workspace),
+    )
+    seen_cards = []
+
+    async def fake_form(elicit_id: str, params) -> ElicitationResult:
+        seen_cards.append((elicit_id, params))
+        return ElicitationResult(action="accept", content={"interaction_e2e": "Beta"})
+
+    ex._form_elicitation_handler = fake_form
+    events: list[ExecutorEvent] = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "check"}], [], ""):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    comps = [e for e in events if isinstance(e, ToolCallComplete)]
+    texts = "".join(e.text for e in events if isinstance(e, TextChunk))
+    assert len(reqs) == 1 and reqs[0].name == "read" and reqs[0].args == {"path": str(probe)}
+    assert len(comps) == 1 and comps[0].name == "read" and comps[0].result == "FAKE_AG_BODY_LINE\n"
+    assert len(seen_cards) == 1 and seen_cards[0][1].phase == "agy_ask_question"
+    assert texts == "chosen=opt_b"
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_read_file_backfill_respects_policy_denial_and_authorization(
+    tmp_path: Path,
+) -> None:
+    """Policy/tier denials block disk backfill; authorized reads backfill only the bound path."""
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    allowed_file = tmp_path / "ok.txt"
+    allowed_file.write_text("ALLOWED_CONTENT\n", encoding="utf-8")
+    secret_file = tmp_path / "control.json"
+    secret_file.write_text("BLOCKED_CONTENT\n", encoding="utf-8")
+
+    def _make_managed(verdict_fn):
+        ex = AcpExecutor(
+            AcpAgentConfig(command="agy acp --stdio", host_permission_tier=True),
+            cwd=str(tmp_path),
+        )
+        ex._session_id = "s1"
+        ex._active_prompt_request_id = 1
+        ex._policy_evaluator = AsyncMock(side_effect=verdict_fn)
+        return ex
+
+    async def _eval(_phase: str, data: dict[str, object]) -> PolicyVerdictPayload:
+        path = str(data.get("arguments", {}).get("Path", ""))
+        if path.endswith("control.json"):
+            return PolicyVerdictPayload(action="POLICY_ACTION_DENY")
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": "allow"},
+        )
+
+    ex = _make_managed(_eval)
+
+    # Policy-denied file inside workspace is never backfilled.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_denied",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(secret_file)},
+        },
+        update_session_id="s1",
+    )
+    events_denied = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_denied", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_denied)
+    assert isinstance(events_denied[0], ToolCallComplete) and events_denied[0].result is None
+
+    # Policy-allowed file inside workspace is backfilled for the active session.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_ok",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_ok = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_ok", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_ok)
+    assert isinstance(events_ok[0], ToolCallComplete)
+    assert events_ok[0].result == "ALLOWED_CONTENT\n"
+
+    # Missing sessionId on start fails closed when a session is active (policy & direct paths).
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_no_sess",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        }
+    )
+    events_no_sess = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_no_sess", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_no_sess)
+    assert isinstance(events_no_sess[0], ToolCallComplete) and events_no_sess[0].result is None
+
+    direct_ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"), cwd=str(tmp_path))
+    direct_ex._session_id = "s1"
+    direct_ex._active_prompt_request_id = 1
+    direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_direct_mismatch",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    direct_done = direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_direct_mismatch",
+            "status": "completed",
+        },
+        update_session_id="s_other",
+    )
+    assert isinstance(direct_done[0], ToolCallComplete) and direct_done[0].result is None
+
+    # Live subprocess without a startup workspace anchor fails closed instead of reopening by path.
+    direct_ex._proc = Mock(returncode=None)
+    direct_ex._workspace_dir_fd = None
+    direct_ex._workspace_win_handle = None
+    direct_ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_unanchored",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    unanchored_done = direct_ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_unanchored", "status": "completed"},
+        update_session_id="s1",
+    )
+    assert isinstance(unanchored_done[0], ToolCallComplete) and unanchored_done[0].result is None
+
+    # Cross-session update never backfills.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_wrong_sess",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_wrong = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_wrong_sess", "status": "completed"},
+        update_session_id="s_other",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s_other", events_wrong)
+    assert isinstance(events_wrong[0], ToolCallComplete) and events_wrong[0].result is None
+
+    # Explicit permission denial prevents backfill even if a completion later arrives.
+    ex._denied_permission_calls.add("r_perm_denied")
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_perm_denied",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_perm_denied = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_perm_denied",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_perm_denied)
+    assert isinstance(events_perm_denied[0], ToolCallComplete)
+    assert events_perm_denied[0].result is None
+
+    # Foreign-session tool_call start is not cached for backfill in the active session.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_foreign_start",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s_foreign",
+    )
+    events_foreign = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_foreign_start",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_foreign)
+    assert isinstance(events_foreign[0], ToolCallComplete) and events_foreign[0].result is None
+
+    # Dual path fields (AbsolutePath + Path) never allow policy/reader mismatch.
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_dual_policy",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"AbsolutePath": str(allowed_file), "Path": str(secret_file)},
+        },
+        update_session_id="s1",
+    )
+    events_dual = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "r_dual_policy",
+            "status": "completed",
+        },
+        update_session_id="s1",
+    )
+    await ex._resolve_agy_read_backfills("s1", "s1", events_dual)
+    assert isinstance(events_dual[0], ToolCallComplete) and events_dual[0].result is None
+
+    # ASK verdict from policy also blocks silent backfill.
+    async def _ask_only(_phase: str, _data: dict[str, object]) -> PolicyVerdictPayload:
+        return PolicyVerdictPayload(action="POLICY_ACTION_ASK")
+
+    ex_ask = _make_managed(_ask_only)
+    ex_ask._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "r_ask",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": str(allowed_file)},
+        },
+        update_session_id="s1",
+    )
+    events_ask = ex_ask._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "r_ask", "status": "completed"},
+        update_session_id="s1",
+    )
+    await ex_ask._resolve_agy_read_backfills("s1", "s1", events_ask)
+    assert isinstance(events_ask[0], ToolCallComplete) and events_ask[0].result is None
+    ex_ask._policy_evaluator.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agy_acp_executor_adapter_wires_form_elicitation_round_trip() -> None:
+    """ExecutorAdapter.run_turn auto-wires _form_elicitation_handler for AG interaction_* cards."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, ElicitationResult
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy acp --stdio"))
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    adapter = ExecutorAdapter(executor_factory=lambda: ex)
+
+    seen_params = []
+
+    class _FakeFormCtx(_RecordingCtx):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_id = "sess_1"
+            self.cancelled = asyncio.Event()
+            self.completed = False
+
+        async def elicit(self, elicitation_id: str, params) -> ElicitationResult:
+            seen_params.append((elicitation_id, params))
+            return ElicitationResult(action="accept", content={"interaction_adp": "Verified"})
+
+        def complete(self) -> None:
+            self.completed = True
+
+    async def fake_run_turn(*_args: object, **_kwargs: object):
+        assert ex._form_elicitation_handler == adapter._stable_form_elicitation_handler
+        await ex._respond_to_agent_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {
+                        "toolCallId": "interaction_adp",
+                        "status": "pending",
+                        "title": "Confirm label?",
+                        "rawInput": {},
+                    },
+                    "options": [
+                        {"optionId": "v1", "name": "Verified", "kind": "allow_once"},
+                        {"optionId": "v2", "name": "Retry", "kind": "reject_once"},
+                    ],
+                },
+            }
+        )
+        yield TurnComplete(response="ok")
+
+    ex.run_turn = fake_run_turn  # type: ignore[method-assign]
+    ctx = _FakeFormCtx()
+    request = CreateResponseRequest(model="agy", input=[{"role": "user", "content": "hi"}])
+    await adapter.run_turn(request, ctx)  # type: ignore[arg-type]
+
+    assert len(seen_params) == 1
+    assert seen_params[0][1].phase == "agy_ask_question"
+    assert ex._send.await_args.args[0] == {
+        "jsonrpc": "2.0",
+        "id": 15,
+        "result": {"outcome": {"outcome": "selected", "optionId": "v1"}},
+    }
