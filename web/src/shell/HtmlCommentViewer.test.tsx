@@ -847,7 +847,22 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       return res ? res.clone() : new Response("missing", { status: 404 });
     });
 
-    const { onFrameChange, onSetActiveSelection } = renderViewer();
+    const previousPageComment = {
+      ...elementComment("previous-page-comment", ENTRY_PATH, 0),
+      start_index: 0,
+      end_index: 0,
+      anchor_content: encodeRenderedTextAnchor({
+        v: 1,
+        kind: "html",
+        text: "page two",
+        occ: 1,
+        prefix: "",
+        suffix: "",
+      }),
+    };
+    const { onFrameChange, onSetActiveSelection } = renderViewer({
+      comments: [previousPageComment],
+    });
     const { postMessage } = await openFrame();
     await waitFor(() =>
       expect(onFrameChange).toHaveBeenLastCalledWith({

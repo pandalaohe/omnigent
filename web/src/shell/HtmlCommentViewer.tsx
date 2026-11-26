@@ -634,6 +634,9 @@ export function HtmlCommentViewer({
       );
     };
 
+    const commentsForFrame = () =>
+      commentsRef.current.filter((comment) => comment.path === (displayedPathRef.current ?? path));
+
     const handleInbound = (raw: unknown) => {
       const msg = parseBridgeMessage(raw, nonce);
       if (!msg) return;
@@ -660,7 +663,7 @@ export function HtmlCommentViewer({
         // scrolls the panel to its card) rather than offering to add a new one.
         const existing =
           !msg.reflow &&
-          commentsRef.current.find(
+          commentsForFrame().find(
             (c) => c.status === "draft" && c.anchor_content === anchorContent,
           );
         if (existing) {
@@ -686,7 +689,7 @@ export function HtmlCommentViewer({
         setFloating((current) => (msg.reflow && !current ? null : anchor));
       } else if (msg.type === BRIDGE_MSG.commentClick) {
         if (sourcePendingRef.current) return;
-        const c = commentsRef.current.find((x) => x.id === msg.id);
+        const c = commentsForFrame().find((x) => x.id === msg.id);
         if (c) {
           onSetActiveSelectionRef.current({
             start_index: c.start_index,
@@ -721,7 +724,9 @@ export function HtmlCommentViewer({
         else showToast(`Can't open ${msg.href}`);
       } else if (msg.type === BRIDGE_MSG.orphans) {
         const textIds = new Set(
-          commentsRef.current.filter((c) => commentPayload(sourceRef.current, c)).map((c) => c.id),
+          commentsForFrame()
+            .filter((c) => commentPayload(sourceRef.current, c))
+            .map((c) => c.id),
         );
         setRenderedOrphans(new Set(msg.ids.filter((id) => textIds.has(id))));
       }
@@ -736,7 +741,7 @@ export function HtmlCommentViewer({
         source: BRIDGE_SOURCE,
         nonce,
         type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current
+        comments: commentsForFrame()
           .map((c) => commentPayload(sourceRef.current, c))
           .filter((c) => c !== null),
       });
@@ -816,9 +821,12 @@ export function HtmlCommentViewer({
       source: BRIDGE_SOURCE,
       nonce,
       type: BRIDGE_MSG.setComments,
-      comments: comments.map((c) => commentPayload(activeSource, c)).filter((c) => c !== null),
+      comments: comments
+        .filter((comment) => comment.path === (page?.path ?? path))
+        .map((c) => commentPayload(activeSource, c))
+        .filter((c) => c !== null),
     });
-  }, [comments, activeSource, nonce]);
+  }, [comments, activeSource, nonce, page?.path, path]);
 
   // Push active-selection changes into the frame (drives the active highlight).
   useEffect(() => {
