@@ -118,6 +118,7 @@ from omnigent.models.model_catalog_store import (
 )
 from omnigent.onboarding.acp_auth import classify_permission_options
 from omnigent.process_logging import current_process_log_path, display_log_path
+from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
 from omnigent.startup_evidence import claim_startup_boundary, opening_settled
 from omnigent.startup_protocol import ContextEvidenceV2
 
@@ -133,6 +134,7 @@ logger = logging.getLogger(__name__)
 ACP_CANCEL_GRACE_SECONDS = 1.0
 _ACP_TERMINATION_TIMEOUT_SECONDS = 5.0
 _ACP_CLEANUP_HEADROOM_SECONDS = 1.0
+_ACP_RELAY_APPROVAL_TIMEOUT_SECONDS = 24 * 60 * 60
 ACP_REAP_TIMEOUT_SECONDS = (
     ACP_CANCEL_GRACE_SECONDS + _ACP_TERMINATION_TIMEOUT_SECONDS + _ACP_CLEANUP_HEADROOM_SECONDS
 )
@@ -194,6 +196,13 @@ _AGY_ACP_COMMAND_FIELDS = {
 _AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
 _AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
 _ACP_KNOWN_TOOL_KINDS = frozenset({"execute", "read", "edit"})
+_ACP_OMNIGENT_OS_KINDS = {
+    "sys_os_shell": "execute",
+    "sys_os_read": "read",
+    "sys_os_write": "edit",
+    "sys_os_edit": "edit",
+}
+_ACP_OMNIGENT_PREFIXES = ("mcp__omnigent__", "mcp_omnigent_", "omnigent__")
 # toolSummary is display metadata shared by agy tools.
 _AGY_ACP_SHELL_FIELDS = (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"}) | {"Cwd"}
 _AGY_ACP_READ_CONFLICT_FIELDS = (
@@ -2427,7 +2436,11 @@ class AcpExecutor(Executor):
         if self._config.omnigent_mcp:
             mcp_servers = self._mcp.session_new_servers(
                 tools=self._omnigent_tools,
-                tool_executor=getattr(self, "_tool_executor", None),
+                tool_executor=(
+                    self._dispatch_bridge_tool
+                    if self._managed_agy and self._tool_executor is not None
+                    else self._tool_executor
+                ),
                 loop=asyncio.get_event_loop(),
                 enabled=True,
             )
@@ -2448,6 +2461,51 @@ class AcpExecutor(Executor):
                 )
         self._bridge_tool_aliases = frozenset(aliases)
         return mcp_servers
+
+    async def _dispatch_bridge_tool(self, name: str, arguments: _AcpJsonObject) -> _AcpJsonObject:
+        """Review and execute the same advertised MCP request."""
+        executor = self._tool_executor
+        session_id, prompt_id = self._session_id, self._active_turn_prompt_id
+        if (
+            executor is None
+            or session_id is None
+            or prompt_id is None
+            or not self._turn_accepts_permissions
+        ):
+            return {"error": "No active ACP turn for Omnigent tool dispatch."}
+        if not name.startswith("sys_"):
+            return await executor(name, arguments)
+
+        reviewed_arguments = copy.deepcopy(arguments)
+        bound_call = {
+            "call_id": f"mcp:{secrets.token_hex(16)}",
+            "name": name,
+            "arguments": reviewed_arguments,
+            "bridge_tool": True,
+        }
+        params = {
+            "options": [
+                {"kind": "allow_once", "optionId": "allow", "name": "Allow once"},
+                {"kind": "reject_once", "optionId": "decline", "name": "Reject"},
+            ]
+        }
+        timeout = _ACP_RELAY_APPROVAL_TIMEOUT_SECONDS
+        try:
+            with pause_tool_call_deadline(timeout):
+                async with asyncio.timeout(timeout):
+                    allowed, _, reason = await self._evaluate_permission(params, bound_call)
+        except TimeoutError:
+            return {"error": "Denied by permission mode (acp): Tool approval timed out."}
+        if allowed is not True:
+            return {"error": reason or "Denied by permission mode (acp): Tool approval declined."}
+        if (
+            not self._turn_accepts_permissions
+            or self._session_id != session_id
+            or self._active_turn_prompt_id != prompt_id
+            or not _same_json_value(reviewed_arguments, arguments)
+        ):
+            return {"error": "Denied by permission mode (acp): Tool request or turn changed."}
+        return await executor(name, reviewed_arguments)
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -2990,8 +3048,28 @@ class AcpExecutor(Executor):
         kind = observed.get("kind")
         if kind is not None and not isinstance(kind, str):
             return None
+        bridge_tool = None
         if is_agy:
             agy_tool = self._validate_agy_permission_tool(kind, arguments)
+            if self._managed_agy and (agy_tool is None or agy_tool[0] == "unknown"):
+                bridge_tool = self._bound_omnigent_tool(observed)
+                if bridge_tool is not None:
+                    if bridge_tool in _ACP_OMNIGENT_OS_KINDS:
+                        from omnigent.tools.builtins.os_env import OS_ENV_TOOL_TYPES
+
+                        if (
+                            kind in _ACP_KNOWN_TOOL_KINDS
+                            and _ACP_OMNIGENT_OS_KINDS[bridge_tool] != kind
+                        ):
+                            return None
+                        schema = next(
+                            tool.get_schema()["function"]["parameters"]
+                            for tool in OS_ENV_TOOL_TYPES
+                            if tool.name() == bridge_tool
+                        )
+                        if arguments.keys() - schema["properties"].keys():
+                            return None
+                    agy_tool = bridge_tool, arguments
             if agy_tool is None:
                 return None
             name, arguments = agy_tool
@@ -3010,7 +3088,35 @@ class AcpExecutor(Executor):
             name = "write_to_file"
         else:
             name = "unknown"
-        return {"call_id": call_id, "name": name, "arguments": arguments}
+        return {
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            **({"bridge_tool": True} if bridge_tool is not None else {}),
+        }
+
+    def _bound_omnigent_tool(self, observed: _AcpJsonObject) -> str | None:
+        """Resolve a pending identity against the bridge advertised for this session."""
+        name = observed.get("name")
+        title = observed.get("title")
+        alias = (
+            name
+            if name is not None
+            else title.removeprefix("Run ")
+            if isinstance(title, str)
+            else None
+        )
+        if not isinstance(alias, str) or alias not in self._bridge_tool_aliases:
+            return None
+        for prefix in _ACP_OMNIGENT_PREFIXES:
+            if alias.startswith(prefix):
+                tool = alias.removeprefix(prefix)
+                return tool if tool.startswith("sys_") else None
+        # An explicit machine name may be unqualified. Display text alone
+        # must exactly match a qualified bridge alias.
+        if name is not None and alias.startswith("sys_"):
+            return alias
+        return None
 
     @staticmethod
     def _validate_agy_permission_tool(
@@ -3217,7 +3323,25 @@ class AcpExecutor(Executor):
         if bound_call is not None:
             call_id = bound_call["call_id"]
             pending = self._permission_calls[call_id]
-            decision = await self._evaluate_permission(params, bound_call, trace, pending=pending)
+            if bound_call.get("bridge_tool") is True:
+                # The relay reviews the actual MCP request before dispatch.
+                option = self._allow_once_id(params)
+                decision = (
+                    (True, option, None)
+                    if option is not None
+                    else (
+                        False,
+                        None,
+                        "Denied by permission mode (acp): No one-time allow option was offered.",
+                    )
+                )
+                if trace is not None:
+                    trace.tier_verdict = "relay"
+                    trace.once_offer = "valid" if option is not None else "missing"
+            else:
+                decision = await self._evaluate_permission(
+                    params, bound_call, trace, pending=pending
+                )
             if (
                 not self._turn_accepts_permissions
                 or self._permission_calls.get(call_id) is not pending
@@ -3252,6 +3376,7 @@ class AcpExecutor(Executor):
                 "view_file": "read",
                 "read_file": "read",
                 "write_to_file": "edit",
+                **_ACP_OMNIGENT_OS_KINDS,
             }.get(tool_name, "unknown")
             allowed, option_id, _reason = result
             option_kind = "none"
@@ -3698,6 +3823,8 @@ class AcpExecutor(Executor):
         """
         if not self._bridge_tool_aliases:
             return False
+        if self._managed_agy and self._bound_omnigent_tool(update) is not None:
+            return True
         raw = update.get("rawInput")
         raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
         # Goose reports the machine name under ``_meta.goose.toolCall.toolName``;

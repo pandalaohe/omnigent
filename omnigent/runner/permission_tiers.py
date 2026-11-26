@@ -126,6 +126,7 @@ class PermissionTierRuntime:
         workspace = self._workspace(snapshot)
         if not host_id or not workspace:
             raise ValueError("Incomplete permission host snapshot")
+        cwd = snapshot.workspace if snapshot.workspace != workspace else None
         if PERMISSION_STATE_LABEL_KEY not in snapshot.labels:
             raise ValueError("Permission-tier session requires controlled migration")
         confirmed = read_permission_state(snapshot.labels, harness=harness)
@@ -148,6 +149,7 @@ class PermissionTierRuntime:
                 previous.session_id,
                 previous.host_id,
                 previous.workspace,
+                previous.cwd,
                 previous.tier,
                 previous.revision,
                 previous.status,
@@ -156,6 +158,7 @@ class PermissionTierRuntime:
                 envelope.session_id,
                 host_id,
                 workspace,
+                cwd,
                 confirmed.tier,
                 confirmed.revision,
                 "ready",
@@ -180,6 +183,7 @@ class PermissionTierRuntime:
             session_id=envelope.session_id,
             host_id=host_id,
             workspace=workspace,
+            cwd=cwd,
             tier=confirmed.tier,
             revision=confirmed.revision,
             status="blocked",
@@ -212,6 +216,7 @@ class PermissionTierRuntime:
         workspace = self._workspace(snapshot)
         if not host_id or not workspace:
             raise ValueError("Permission-tier session is missing host or workspace")
+        cwd = snapshot.workspace if snapshot.workspace != workspace else None
         if PERMISSION_STATE_LABEL_KEY not in snapshot.labels:
             raise ValueError("Permission-tier session requires controlled migration")
         confirmed = read_permission_state(snapshot.labels, harness=harness)
@@ -223,6 +228,7 @@ class PermissionTierRuntime:
             session_id=envelope.session_id,
             host_id=host_id,
             workspace=workspace,
+            cwd=cwd,
             tier=confirmed.tier,
             revision=confirmed.revision,
             status="ready" if confirmed.status == "blocked" else confirmed.status,
@@ -248,12 +254,14 @@ class PermissionTierRuntime:
             previous.session_id,
             previous.host_id,
             previous.workspace,
+            previous.cwd,
             previous.tier,
             previous.revision,
         ) != (
             state.session_id,
             state.host_id,
             state.workspace,
+            state.cwd,
             state.tier,
             state.revision,
         ):
@@ -740,7 +748,14 @@ class PermissionTierRuntime:
             or not call_id
         ):
             return TierDecision(Verdict.DENY, "Malformed ACP tool call"), tier
-        decision = self._evaluate(session_id, state, name, arguments, local_execution=True)
+        decision = self._evaluate(
+            session_id,
+            state,
+            name,
+            arguments,
+            local_execution=True,
+            acp_bridge_tool_name=name if call.get("bridge_tool") is True else None,
+        )
         if decision.action == Verdict.ALLOW and name == "run_command":
             from omnigent.server.child_approvals import floor
 
@@ -762,17 +777,19 @@ class PermissionTierRuntime:
         native: tuple[NativeCallBinding, NativeSupport] | None = None,
         *,
         registry_tool: bool = False,
+        acp_bridge_tool_name: str | None = None,
     ) -> TierDecision:
         if pi_scope:
-            state = replace(state, workspace=pi_scope.admission.principal.canonical_cwd)
+            state = replace(state, cwd=pi_scope.admission.principal.canonical_cwd)
         control_paths = self._control_paths(session_id, state)
+        harness = self._harnesses.get(session_id)
         extensions = {}
         native_tools = {}
         eval_local_execution = local_execution
         if (
             state.tier != "full"
             and (local_execution or pi_scope is not None)
-            and self._harnesses.get(session_id) in ("pi", "pi-native")
+            and harness in ("pi", "pi-native")
         ):
             from omnigent.permission_tiers import _READ_PATH
             from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
@@ -823,7 +840,7 @@ class PermissionTierRuntime:
                     eval_local_execution = True
         agy_delegation: Literal["proven", "missing", "failed"] = "missing"
         readable_control_file = None
-        if state.tier != "full" and self._harnesses.get(session_id) == "antigravity-native":
+        if state.tier != "full" and harness == "antigravity-native":
             bridge_dir = self._paths[session_id].parent
             if name == "invoke_subagent":
                 from omnigent.harnesses.antigravity_native.delegation_proof import (
@@ -848,6 +865,9 @@ class PermissionTierRuntime:
             agy_delegation_status=agy_delegation,
             registry_tool_name=name if registry_tool else None,
             readable_control_file=readable_control_file,
+            auto_approval_floor=harness in ("pi", "pi-native")
+            or is_acp_permission_harness(harness),
+            acp_bridge_tool_name=acp_bridge_tool_name,
         )
 
     def inspect(
@@ -1175,12 +1195,8 @@ class PermissionTierRuntime:
             or not self.idle(session_id)
         ):
             raise ValueError("Permission state is busy or stale")
-        switching = HostPermissionState(
-            session_id=state.session_id,
-            host_id=state.host_id,
-            workspace=state.workspace,
-            tier=state.tier,
-            revision=state.revision,
+        switching = replace(
+            state,
             status="switching",
             transaction_id=transaction_id,
         )
@@ -1203,10 +1219,8 @@ class PermissionTierRuntime:
             raise ValueError("Permission transaction is stale")
         if status not in {"ready", "blocked"}:
             raise ValueError("Invalid permission settle status")
-        settled = HostPermissionState(
-            session_id=state.session_id,
-            host_id=state.host_id,
-            workspace=state.workspace,
+        settled = replace(
+            state,
             tier=tier,
             revision=revision,
             status=status,
@@ -1224,12 +1238,8 @@ class PermissionTierRuntime:
         path = self._paths.get(session_id)
         if state is None or path is None:
             return
-        blocked = HostPermissionState(
-            session_id=state.session_id,
-            host_id=state.host_id,
-            workspace=state.workspace,
-            tier=state.tier,
-            revision=state.revision,
+        blocked = replace(
+            state,
             status="blocked",
             transaction_id=transaction_id,
         )

@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -203,6 +204,17 @@ def _runtime(
         ("auto", "run_command", {"CommandLine": "omni --version"}, Verdict.ALLOW),
         ("accept-edits", "run_command", {"CommandLine": "git status"}, Verdict.ASK),
         ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
+        ("auto", "run_command", {"CommandLine": "git reset --hard"}, Verdict.ASK),
+        ("auto", "sys_os_shell", {"command": "omni --version"}, Verdict.ALLOW),
+        ("auto", "sys_os_shell", {"command": "git reset --hard"}, Verdict.ASK),
+        ("auto", "sys_os_shell", {"command": "rm -rf /"}, Verdict.DENY),
+        (
+            "auto",
+            "sys_os_write",
+            {"path": "../outside.txt", "content": "fixture"},
+            Verdict.ASK,
+        ),
+        ("auto", "sys_os_write", {"path": "note.txt", "content": "fixture"}, Verdict.ALLOW),
         ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ASK),
         ("auto", "unknown", {}, Verdict.ASK),
         ("plan", "unknown", {}, Verdict.DENY),
@@ -2903,6 +2915,60 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         assert manager.get_client_calls[-1][2]["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
     state = app.state.permission_tiers.state(body["session_id"])
     assert (state.tier if state else None) == tier
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "local", "expected"),
+    [
+        ("bash", {"command": "omni --version"}, True, Verdict.ALLOW),
+        ("bash", {"command": "git reset --hard"}, True, Verdict.ASK),
+        ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ASK),
+        ("sys_os_shell", {"command": "omni --version"}, False, Verdict.ALLOW),
+        ("sys_os_shell", {"command": "git reset --hard"}, False, Verdict.ASK),
+        ("sys_os_shell", {"command": "rm -rf /"}, False, Verdict.DENY),
+        ("sys_os_write", {"path": "../../outside.txt", "content": "fixture"}, False, Verdict.ASK),
+        ("sys_os_write", {"path": "../note.txt", "content": "fixture"}, False, Verdict.ALLOW),
+    ],
+)
+def test_scoped_pi_auto_classifies_native_and_bridged_calls(
+    tmp_path: Path, name: str, arguments: dict[str, object], local: bool, expected: Verdict
+):
+    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    state = runtime.state("session-a")
+    assert state is not None
+    cwd = Path(state.workspace) / "nested"
+    cwd.mkdir()
+    state = replace(state, cwd=str(cwd))
+    runtime._states["session-a"] = state
+    write_host_permission_state(runtime.path("session-a"), state)
+    parent = runtime.begin_pi_scope_launch("session-a")
+    _publish_scope(runtime, parent, registry["tools"])
+    child = runtime.open_pi_child_scope("session-a")
+    assert child.principal.canonical_cwd == str(cwd.resolve())
+    source = (
+        {"source": "builtin", "path": f"builtin:{name}"}
+        if local
+        else {"source": "inline", "path": "<inline:omnigent-permission>"}
+    )
+    _publish_scope(runtime, child, [{"name": name, "sourceInfo": source}])
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        child.credential,
+        call_id="call",
+        name=name,
+        arguments=arguments,
+        local_execution=local,
+    )
+    _, decision = runtime.inspect(
+        "session-a",
+        call_id=receipt.binding.call_id,
+        name=name,
+        arguments=arguments,
+        expected_revision=3,
+        local_execution=local,
+        origin_receipt=receipt.token,
+    )
+    assert decision.action == expected, decision.reason
 
 
 def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
