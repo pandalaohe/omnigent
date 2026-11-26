@@ -54,10 +54,12 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
         home / ".npm-global" / "bin",
     ]
     if IS_WINDOWS:
-        appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
-        dirs.insert(0, appdata / "npm")
-        if program_files := os.environ.get("PROGRAMFILES"):
-            dirs.insert(1, Path(program_files) / "nodejs")
+        from omnigent._windows_launcher import windows_known_cli_dirs
+
+        known = windows_known_cli_dirs(home=home)
+        existing = {str(d).lower() for d in known}
+        tail = [d for d in dirs if str(d).lower() not in existing]
+        dirs = [*known, *tail]
     # nvm keeps global bins per Node version; newest first so a current install
     # wins over a stale one. Sort by parsed numeric version (so v10 > v9, not
     # the lexicographic order in which "v10" < "v9").
@@ -112,6 +114,14 @@ def resolve_cli_binary(
             resolved = which(override)
             if resolved:
                 return resolved
+            if IS_WINDOWS:
+                from omnigent._windows_launcher import probe_windows_binary_in_dir
+
+                override_path = Path(override)
+                if override_path.parent != Path(".") or os.path.isabs(override):
+                    probed = probe_windows_binary_in_dir(override_path.parent, override_path.name)
+                    if probed:
+                        return probed
             if os.access(override, os.X_OK) and os.path.isfile(override):
                 return override
             # A set-but-unresolvable override (typo, moved/non-executable
@@ -126,15 +136,32 @@ def resolve_cli_binary(
     on_path = which(name)
     if on_path is not None:
         return on_path
-    for directory in _cli_fallback_dirs():
-        candidate = directory / name
-        if IS_WINDOWS:
-            # npm also writes an extensionless POSIX shim; prefer PATHEXT's
-            # executable sibling (.cmd) even when the directory is off PATH.
+    if IS_WINDOWS:
+        from omnigent._windows_launcher import (
+            probe_windows_binary_in_dir,
+            windows_registry_path_dirs,
+        )
+
+        # Probe Machine + User registry PATH when fallback discovery is not
+        # overridden, so tools installed after host startup resolve too.
+        if os.environ.get(CLI_FALLBACK_DIRS_ENV_VAR) is None:
+            for directory in windows_registry_path_dirs():
+                probed = probe_windows_binary_in_dir(directory, name)
+                if probed:
+                    return probed
+        for directory in _cli_fallback_dirs():
+            probed = probe_windows_binary_in_dir(directory, name)
+            if probed:
+                return probed
+            candidate = directory / name
+            # Keep shutil.which fallback for tests that stub shutil.which on a virtual path.
             resolved = shutil.which(str(candidate))
             if resolved:
                 return resolved
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        return None
+    for directory in _cli_fallback_dirs():
+        candidate = directory / name
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
 

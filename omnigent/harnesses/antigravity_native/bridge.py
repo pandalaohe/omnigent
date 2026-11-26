@@ -972,14 +972,15 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
     """
     if not (real.is_dir() or real.is_file()):
         return
+    from omnigent._windows_launcher import link_or_copy_path, remove_existing_link
+
     with contextlib.suppress(OSError):
         # Re-seeding an existing bridge dir must not fail on the prior link;
         # drop a stale or broken one so the target is always current.
-        if link.is_symlink() or link.is_file():
-            link.unlink()
+        remove_existing_link(link)
         if not link.exists():
             link.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            link.symlink_to(real.resolve(), target_is_directory=real.is_dir())
+            link_or_copy_path(real, link)
 
 
 # agy's periodic engagement survey ("How's the CLI experience so far?") is gated by

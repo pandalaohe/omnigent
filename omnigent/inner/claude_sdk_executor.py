@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from claude_agent_sdk import SessionKey, SessionStoreEntry
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._windows_launcher import resolve_claude_windows_executable
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -1518,7 +1519,10 @@ def _find_system_claude() -> str | None:
     beta flags the Databricks gateway doesn't support. Returns the absolute
     path, or ``None`` if not found.
     """
-    return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+    resolved = resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+    if resolved is None:
+        return None
+    return resolve_claude_windows_executable(resolved)
 
 
 # DATABRICKS-PATCH(claude-sdk-live-model-discovery)

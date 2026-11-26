@@ -248,12 +248,21 @@ def parse_agy_models_output(text: str) -> list[dict[str, object]]:
 
 def list_agy_model_options(*, timeout_s: float = 15.0) -> list[dict[str, object]]:
     """Read the account's catalog from its real Gemini directory."""
+    from omnigent._windows_launcher import merge_shim_env, windows_launch_spec
+
+    cmd_argv, shim_env = windows_launch_spec(agy_binary_path())
+    probe_env = merge_shim_env(None, shim_env)
     completed = subprocess.run(
-        [agy_binary_path(), f"--gemini_dir={Path.home() / '.gemini'}", "models"],
+        [
+            *cmd_argv,
+            f"--gemini_dir={Path.home() / '.gemini'}",
+            "models",
+        ],
         capture_output=True,
         text=True,
         check=False,
         timeout=timeout_s,
+        env=probe_env,
     )
     if completed.returncode != 0:
         raise RuntimeError(f"agy models failed (exit {completed.returncode})")
@@ -1215,7 +1224,14 @@ async def _launch_and_record(
         launch_env={**os.environ, **env_overrides},
     )
     # Lead the args so the flag is never swallowed by a later positional.
-    argv = [command, f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
+    from omnigent._windows_launcher import merge_shim_env, windows_launch_spec
+
+    cmd_argv, shim_env = windows_launch_spec(command)
+    if shim_env:
+        merged_overrides = merge_shim_env(env_overrides, shim_env)
+        if merged_overrides is not None:
+            env_overrides = merged_overrides
+    argv = [*cmd_argv, f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *launch.argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
     argv = wrap_agy_gateway_launch(argv, env_overrides)

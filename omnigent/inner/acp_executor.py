@@ -54,7 +54,7 @@ import math
 import operator
 import os
 import secrets
-import shlex
+import shutil
 import subprocess
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -63,6 +63,14 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
+from omnigent._windows_launcher import (
+    merge_shim_env,
+    merged_windows_path,
+    resolve_windows_command_argv,
+    split_command_argv,
+    windows_short_path,
+    windows_short_temp_dir,
+)
 from omnigent.acp_cli_harnesses import is_antigravity_acp_command
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
@@ -577,9 +585,12 @@ class AcpExecutor(Executor):
         self._model_switch_supported: bool = True
 
         # Parsed argv; the first token is the binary we resolve / sandbox.
-        self._argv: list[str] = shlex.split(config.command)
+        self._argv: list[str] = split_command_argv(config.command, is_windows=IS_WINDOWS)
         if not self._argv:
             raise ValueError("AcpAgentConfig.command is empty")
+        # Short per-instance TEMP/TMP dir created on Windows for Antigravity
+        # to keep unpacked runtime archive paths under Windows' 260-char MAX_PATH.
+        self._agy_runtime_temp_dir: Path | None = None
 
         self._proc: asyncio.subprocess.Process | None = None
         self._context_source = AcpProcessContextSource("acp", lambda: self._proc)
@@ -695,31 +706,53 @@ class AcpExecutor(Executor):
         self._model_selection_pending = False
         self._model_options = []
         env = self._build_spawn_env()
-        launch_path, argv = self._sandbox_launch(tuple(env.keys()))
-        _STREAM_LIMIT = 16 * 1024 * 1024
-        # Keep the process group for teardown without opening a Windows console.
-        spawn_options = _proc.spawn_kwargs()
-        if IS_WINDOWS:
-            spawn_options["creationflags"] = spawn_options.get("creationflags", 0) | int(
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            resolved_argv: list[str] | None = None
+            if IS_WINDOWS:
+                resolved_argv, shim_env = resolve_windows_command_argv(
+                    self._argv, env=env, is_windows=True
+                )
+                if shim_env:
+                    merged_env = merge_shim_env(
+                        env, shim_env, deny_exact=getattr(self._config, "env_unset", ())
+                    )
+                    if merged_env is not None:
+                        env = merged_env
+            launch_path, argv = self._sandbox_launch(
+                tuple(env.keys()), resolved_argv=resolved_argv
             )
-        self._proc = await asyncio.create_subprocess_exec(
-            launch_path,
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=self._cwd,
-            limit=_STREAM_LIMIT,
-            # Own session/group: the sandbox launcher forks the real agent,
-            # and without a group boundary teardown reaches only the wrapper.
-            **spawn_options,
-        )
+            _STREAM_LIMIT = 16 * 1024 * 1024
+            # Keep the process group for teardown without opening a Windows console.
+            spawn_options = _proc.spawn_kwargs()
+            if IS_WINDOWS:
+                spawn_options["creationflags"] = spawn_options.get("creationflags", 0) | int(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+            self._proc = await asyncio.create_subprocess_exec(
+                launch_path,
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self._cwd,
+                limit=_STREAM_LIMIT,
+                # Own session/group: the sandbox launcher forks the real agent,
+                # and without a group boundary teardown reaches only the wrapper.
+                **spawn_options,
+            )
+        except BaseException:
+            self._cleanup_agy_runtime_temp_dir()
+            raise
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
 
-    def _sandbox_launch(self, spawn_env_names: tuple[str, ...]) -> tuple[str, list[str]]:
+    def _sandbox_launch(
+        self,
+        spawn_env_names: tuple[str, ...],
+        *,
+        resolved_argv: Sequence[str] | None = None,
+    ) -> tuple[str, list[str]]:
         """Return ``(launch_path, argv)`` — sandbox launcher or the bare binary.
 
         When ``os_env.sandbox`` requests confinement, wraps the agent binary in
@@ -733,8 +766,9 @@ class AcpExecutor(Executor):
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
         """
-        binary = self._argv[0]
-        rest = self._argv[1:]
+        effective_argv = list(self._argv) if resolved_argv is None else list(resolved_argv)
+        binary = effective_argv[0]
+        rest = effective_argv[1:]
         os_env = self._os_env
         if os_env is None:
             return binary, rest
@@ -953,6 +987,25 @@ class AcpExecutor(Executor):
     # ACP handshake
     # ------------------------------------------------------------------
 
+    def _is_agy_command(self) -> bool:
+        config = getattr(self, "_config", None)
+        command = getattr(config, "command", "")
+        if isinstance(command, str) and command and is_antigravity_acp_command(command):
+            return True
+        argv = getattr(self, "_argv", ())
+        if not argv:
+            return False
+        from pathlib import PureWindowsPath
+
+        return PureWindowsPath(argv[0]).stem.lower() == "agy"
+
+    def _cleanup_agy_runtime_temp_dir(self) -> None:
+        agy_temp_dir = getattr(self, "_agy_runtime_temp_dir", None)
+        if agy_temp_dir is not None:
+            self._agy_runtime_temp_dir = None
+            with contextlib.suppress(OSError):
+                shutil.rmtree(agy_temp_dir, ignore_errors=True)
+
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
@@ -968,14 +1021,43 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
+        deny_exact = tuple(getattr(config, "env_unset", ()))
+        env = clean_agent_env(
             allow_prefixes=(),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
-            deny_exact=getattr(config, "env_unset", ()),
+            deny_exact=deny_exact,
         )
+        if IS_WINDOWS:
+            denied_upper = {name.upper() for name in deny_exact}
+            # Enforce case-insensitive Windows denies on inherited keys too.
+            for key in [k for k in env if k.upper() in denied_upper]:
+                env.pop(key, None)
+            if "PATH" not in denied_upper:
+                merged_path = merged_windows_path(env, is_windows=True)
+                if merged_path:
+                    for key in [k for k in env if k.upper() == "PATH"]:
+                        env.pop(key, None)
+                    env["PATH"] = merged_path
+            if self._is_agy_command() and not ({"TEMP", "TMP"} <= denied_upper):
+                existing_temp = getattr(self, "_agy_runtime_temp_dir", None)
+                if existing_temp is None or not existing_temp.is_dir():
+                    temp_path, short_temp = windows_short_temp_dir(
+                        "og-ag",
+                        env=env,
+                        is_windows=True,
+                    )
+                    self._agy_runtime_temp_dir = temp_path
+                else:
+                    short_temp = windows_short_path(existing_temp, is_windows=True)
+                for target_var in ("TEMP", "TMP"):
+                    if target_var not in denied_upper:
+                        for key in [k for k in env if k.upper() == target_var]:
+                            env.pop(key, None)
+                        env[target_var] = short_temp
+        return env
 
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
@@ -3092,3 +3174,4 @@ class AcpExecutor(Executor):
                     _proc.kill_tree(self._proc)
             finally:
                 self._proc = None
+        self._cleanup_agy_runtime_temp_dir()

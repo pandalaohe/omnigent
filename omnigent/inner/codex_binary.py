@@ -16,32 +16,13 @@ from pathlib import Path
 import psutil
 from filelock import FileLock
 
+from omnigent._windows_launcher import unwrap_windows_cmd_shim
 from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
 _MARKER = ".omnigent-snapshot.json"
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 CODEX_RUNTIME_BIN_ENV = "OMNIGENT_CODEX_RUNTIME_BIN"
-_NPM_CMD_SHIM = r"""@ECHO off
-GOTO start
-:find_dp0
-SET dp0=%~dp0
-EXIT /b
-:start
-SETLOCAL
-CALL :find_dp0
-
-IF EXIST "%dp0%\node.exe" (
-  SET "_prog=%dp0%\node.exe"
-) ELSE (
-  SET "_prog=node"
-)
-
-""" + (
-    r"endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "
-    r'set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  '
-    r'"%dp0%\node_modules\@openai\codex\bin\codex.js" %*'
-)
 _NATIVE_HEADERS = {
     b"\x7fELF",
     b"MZ",
@@ -67,14 +48,21 @@ def _native(path: Path) -> bool:
 
 
 def _resolve_vendor_binary(path: Path) -> Path | None:
-    """Recognize native packages and the official npm shim, never unwrap custom scripts."""
+    """Recognize native packages and pure npm/pnpm shims, never unwrap custom scripts."""
     path = path.resolve(strict=True)
     if _native(path):
         return path
-    if path.name.lower() == "codex.cmd":
-        if path.read_text(encoding="utf-8-sig").strip() != _NPM_CMD_SHIM:
+    if platform.system() == "Windows" and path.suffix.lower() in {".cmd", ".bat"}:
+        unwrapped = unwrap_windows_cmd_shim(path)
+        if unwrapped is None:
             return None
-        path = path.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        if unwrapped.kind == "native":
+            return (
+                unwrapped.target.resolve(strict=True)
+                if unwrapped.target.is_file() and _native(unwrapped.target)
+                else None
+            )
+        path = unwrapped.target
     if path.name != "codex.js" or path.parent.name != "bin":
         return None
     package = path.parent.parent
