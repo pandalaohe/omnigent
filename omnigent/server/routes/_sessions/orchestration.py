@@ -14146,13 +14146,28 @@ async def _evaluate_tool_call_policy(
         key in conv.labels
         for key in ("omnigent.pi.permission_tier", "omnigent.antigravity_native.permission_tier")
     ):
-        return {"verdict": "deny", "reason": "Permission harness unavailable"}
-    if harness in TIER_HARNESSES:
-        from omnigent.permission_tiers import Verdict
+        from omnigent.permission_tiers import format_denial_reason
+
+        return {
+            "verdict": "deny",
+            "reason": format_denial_reason("permission mode", "Permission harness unavailable"),
+        }
+    if harness is not None and harness in TIER_HARNESSES:
+        from omnigent.permission_tiers import (
+            Verdict,
+            format_denial_reason,
+            format_tier_denial,
+        )
         from omnigent.server.permission_gate import (
             authorize_permission_call,
             inspect_permission_call,
         )
+        from omnigent.server.permission_tiers import read_permission_state
+
+        try:
+            session_tier = read_permission_state(conv.labels, harness=harness).tier
+        except (ValueError, TypeError):
+            session_tier = None
 
         name = body.data.get("name")
         arguments = body.data.get("arguments")
@@ -14162,7 +14177,12 @@ async def _evaluate_tool_call_policy(
             except ValueError:
                 arguments = None
         if not isinstance(name, str) or not isinstance(arguments, dict):
-            return {"verdict": "deny", "reason": "Malformed tool call"}
+            return {
+                "verdict": "deny",
+                "reason": format_denial_reason(
+                    "permission mode", "Malformed tool call", detail=session_tier
+                ),
+            }
         inspection = await inspect_permission_call(
             conv,
             harness=harness,
@@ -14172,7 +14192,10 @@ async def _evaluate_tool_call_policy(
             runner_router=_runner_router,
         )
         if inspection.decision.action == Verdict.DENY:
-            return {"verdict": "deny", "reason": inspection.decision.reason}
+            return {
+                "verdict": "deny",
+                "reason": format_tier_denial(inspection.decision, tier=session_tier),
+            }
         independent = await _evaluate_independent_tool_call_policy(
             session_id,
             conv,
@@ -14184,6 +14207,18 @@ async def _evaluate_tool_call_policy(
             blocking=True,
         )
         if independent is not None:
+            if independent.get("verdict") == "deny":
+                policy_name = independent.get("deciding_policy")
+                return {
+                    **independent,
+                    "reason": format_denial_reason(
+                        "policy",
+                        str(independent.get("reason") or "Policy denied this tool call."),
+                        detail=policy_name
+                        if isinstance(policy_name, str) and policy_name
+                        else None,
+                    ),
+                }
             return independent
         decision = await authorize_permission_call(
             inspection,
@@ -14194,7 +14229,7 @@ async def _evaluate_tool_call_policy(
             runner_router=_runner_router,
         )
         if decision.action != Verdict.ALLOW:
-            return {"verdict": "deny", "reason": decision.reason}
+            return {"verdict": "deny", "reason": format_tier_denial(decision, tier=session_tier)}
         return None
     return await _evaluate_independent_tool_call_policy(
         session_id, conv, body, conversation_store, agent_store, _runner_router, actor=actor
@@ -14270,10 +14305,15 @@ async def _evaluate_independent_tool_call_policy(
     if result.action == PolicyAction.DENY:
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
-        return {
+        deny_body: dict[str, Any] = {
             "verdict": "deny",
             "reason": result.reason or "Denied by policy",
         }
+        if result.deciding_policy is not None:
+            deny_body["deciding_policy"] = getattr(result.deciding_policy, "name", None) or str(
+                result.deciding_policy
+            )
+        return deny_body
 
     if blocking:
         params = ElicitationRequestParams(
@@ -14296,10 +14336,15 @@ async def _evaluate_independent_tool_call_policy(
         )
         if approval is None or approval.action != "accept":
             reason = (approval.content or {}).get("reason") if approval is not None else None
-            return {
+            ask_deny_body: dict[str, Any] = {
                 "verdict": "deny",
                 "reason": reason or result.reason or "Approval was not granted",
             }
+            if result.deciding_policy is not None:
+                ask_deny_body["deciding_policy"] = getattr(
+                    result.deciding_policy, "name", None
+                ) or str(result.deciding_policy)
+            return ask_deny_body
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
         if result.state_updates:

@@ -717,16 +717,20 @@ class PermissionTierRuntime:
             raise ValueError("Unknown permission harness")
         return trusted_permission_control_paths(state_path, installed_paths=tuple(installed))
 
-    def evaluate_acp_call(self, session_id: str, call: object) -> Verdict:
-        """Classify the tool bound by the ACP executor using current host state."""
+    def evaluate_acp_call_decision(
+        self, session_id: str, call: object
+    ) -> tuple[TierDecision, PermissionTier | None]:
+        """Classify the bound ACP tool call and return the full tier decision."""
         state = self.state(session_id)
+        tier = state.tier if state is not None else None
         if (
             not is_acp_permission_harness(self._harnesses.get(session_id))
             or state is None
             or state.status != "ready"
-            or not isinstance(call, dict)
         ):
-            return Verdict.DENY
+            return TierDecision(Verdict.DENY, "Permission state is unavailable or not ready"), tier
+        if not isinstance(call, dict):
+            return TierDecision(Verdict.DENY, "Malformed ACP tool call"), tier
         name, arguments = call.get("name"), call.get("arguments")
         call_id = call.get("call_id")
         if (
@@ -735,7 +739,7 @@ class PermissionTierRuntime:
             or not isinstance(call_id, str)
             or not call_id
         ):
-            return Verdict.DENY
+            return TierDecision(Verdict.DENY, "Malformed ACP tool call"), tier
         decision = self._evaluate(session_id, state, name, arguments, local_execution=True)
         if decision.action == Verdict.ALLOW and name == "run_command":
             from omnigent.server.child_approvals import floor
@@ -744,8 +748,8 @@ class PermissionTierRuntime:
                 floor({"phase": "acp_permission", "command": arguments.get("CommandLine")})
                 == "user_only"
             ):
-                return Verdict.ASK
-        return decision.action
+                return TierDecision(Verdict.ASK, "Command requires user approval"), tier
+        return decision, tier
 
     def _evaluate(
         self,

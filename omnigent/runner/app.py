@@ -11817,42 +11817,60 @@ def create_runner_app(
                                     _eval_phase = event.get("phase", "")
                                     _eval_data = event.get("data") or {}
                                     acp_tier = None
+                                    acp_tier_reason: str | None = None
                                     if (
                                         acp_host_tier
                                         and _eval_phase == "PHASE_TOOL_CALL"
                                         and "_omnigent_acp_call" in _eval_data
                                     ):
-                                        _eval_data = dict(_eval_data)
-                                        acp_tier = permission_tiers.evaluate_acp_call(
-                                            conv_id, _eval_data.pop("_omnigent_acp_call", None)
+                                        from omnigent.permission_tiers import (
+                                            Verdict,
+                                            format_tier_denial,
                                         )
-                                    _track_dispatch_task(
-                                        _asyncio.create_task(
-                                            _evaluate_policy_via_omnigent(
-                                                server_client=server_client,
-                                                harness_client=client,
-                                                conversation_id=conv_id,
-                                                evaluation_id=_eval_id,
-                                                phase=_eval_phase,
-                                                data=_eval_data,
-                                                **(
-                                                    {"acp_tier": acp_tier}
-                                                    if acp_tier is not None
-                                                    else {}
-                                                ),
-                                                # A dead verdict-delivery channel
-                                                # parks the harness turn forever;
-                                                # route it to the recovery entry,
-                                                # binding THIS turn's response id
-                                                # so a delayed failure can't cancel
-                                                # a newer turn (ownership gate).
-                                                on_delivery_failure=functools.partial(
-                                                    _resync_turn_state_on_delivery_failure,
-                                                    response_id=_response_id,
-                                                ),
+
+                                        _eval_data = dict(_eval_data)
+                                        acp_decision, acp_tier_name = (
+                                            permission_tiers.evaluate_acp_call_decision(
+                                                conv_id, _eval_data.pop("_omnigent_acp_call", None)
                                             )
                                         )
+                                        acp_tier = acp_decision.action
+                                        if acp_tier == Verdict.DENY:
+                                            acp_tier_reason = format_tier_denial(
+                                                acp_decision, tier=acp_tier_name
+                                            )
+                                    _on_policy_failure = functools.partial(
+                                        _resync_turn_state_on_delivery_failure,
+                                        response_id=_response_id,
                                     )
+                                    # A dead verdict-delivery channel parks the harness turn
+                                    # forever; route it to the recovery entry, binding THIS
+                                    # turn's response id so a delayed failure can't cancel a
+                                    # newer turn (ownership gate).
+                                    _policy_coro = (
+                                        _evaluate_policy_via_omnigent(
+                                            server_client=server_client,
+                                            harness_client=client,
+                                            conversation_id=conv_id,
+                                            evaluation_id=_eval_id,
+                                            phase=_eval_phase,
+                                            data=_eval_data,
+                                            acp_tier=acp_tier,
+                                            acp_tier_reason=acp_tier_reason,
+                                            on_delivery_failure=_on_policy_failure,
+                                        )
+                                        if acp_tier is not None
+                                        else _evaluate_policy_via_omnigent(
+                                            server_client=server_client,
+                                            harness_client=client,
+                                            conversation_id=conv_id,
+                                            evaluation_id=_eval_id,
+                                            phase=_eval_phase,
+                                            data=_eval_data,
+                                            on_delivery_failure=_on_policy_failure,
+                                        )
+                                    )
+                                    _track_dispatch_task(_asyncio.create_task(_policy_coro))
                                     continue
 
                                 if _evt_type == "subagent.started":

@@ -203,21 +203,57 @@ def _runtime(
         ("accept-edits", "run_command", {"CommandLine": "git status"}, Verdict.ASK),
         ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
         ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ASK),
-        ("auto", "unknown", {}, Verdict.DENY),
+        ("auto", "unknown", {}, Verdict.ASK),
+        ("plan", "unknown", {}, Verdict.DENY),
     ],
 )
 def test_acp_host_permission_uses_shared_deny_rules(tmp_path, tier, name, arguments, expected):
     runtime = _runtime(tmp_path, tier)
     runtime._harnesses["session-a"] = "acp"
     assert (
-        runtime.evaluate_acp_call(
+        runtime.evaluate_acp_call_decision(
             "session-a", {"call_id": "tool-1", "name": name, "arguments": arguments}
-        )
+        )[0].action
         == expected
     )
     assert (
-        runtime.evaluate_acp_call("session-a", {"name": name, "arguments": arguments})
+        runtime.evaluate_acp_call_decision("session-a", {"name": name, "arguments": arguments})[
+            0
+        ].action
         == Verdict.DENY
+    )
+
+
+def test_acp_host_permission_decision_carries_rule_and_mode_metadata(tmp_path):
+    from omnigent.permission_tiers import format_tier_denial
+
+    auto_dir = tmp_path / "auto"
+    auto_dir.mkdir()
+    runtime = _runtime(auto_dir, "auto")
+    runtime._harnesses["session-a"] = "acp"
+    rule_decision, rule_tier = runtime.evaluate_acp_call_decision(
+        "session-a",
+        {"call_id": "tool-1", "name": "run_command", "arguments": {"CommandLine": "rm -rf /"}},
+    )
+    assert rule_decision.action == Verdict.DENY
+    assert rule_decision.rule_id == "critical-delete"
+    assert rule_tier == "auto"
+    assert format_tier_denial(rule_decision, tier=rule_tier).startswith(
+        "Denied by rule [critical-delete]:"
+    )
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    plan_runtime = _runtime(plan_dir, "plan")
+    plan_runtime._harnesses["session-a"] = "acp"
+    plan_decision, plan_tier = plan_runtime.evaluate_acp_call_decision(
+        "session-a", {"call_id": "tool-2", "name": "unknown", "arguments": {}}
+    )
+    assert plan_decision.action == Verdict.DENY
+    assert plan_decision.rule_id is None
+    assert plan_tier == "plan"
+    assert format_tier_denial(plan_decision, tier=plan_tier).startswith(
+        "Denied by permission mode (plan):"
     )
 
 
@@ -2043,7 +2079,7 @@ def test_cli_permission_fence_uses_authenticated_runner_binding(tmp_path, monkey
     [
         ("sys_read_inbox", True, "ALLOW"),
         ("sys_read_inbox", False, "DENY"),
-        ("unknown_control", True, "DENY"),
+        ("unknown_control", True, "ASK"),
     ],
 )
 def test_framework_inbox_requires_local_execution(
@@ -2900,10 +2936,10 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         )
         assert decision.action.value == "ALLOW", (name, decision.reason)
 
-    for call_id, name, arguments in (
-        ("calc-call", "calculate", {"expression": "19 * 23"}),
-        ("terminal-call", "sys_terminal_launch", {"command": "sh"}),
-        ("unlisted-call", "unlisted_bridge_tool", {"x": 1}),
+    for call_id, name, arguments, expected_action in (
+        ("calc-call", "calculate", {"expression": "19 * 23"}, "ASK"),
+        ("terminal-call", "sys_terminal_launch", {"command": "sh"}, "DENY"),
+        ("unlisted-call", "unlisted_bridge_tool", {"x": 1}, "ASK"),
     ):
         receipt = runtime.pi_origin_receipt(
             "session-a",
@@ -2922,7 +2958,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
             local_execution=False,
             origin_receipt=receipt.token,
         )
-        assert decision.action.value == "DENY", (name, decision.reason)
+        assert decision.action.value == expected_action, (name, decision.reason)
         assert decision.reason == "Unknown tool schema"
 
 
@@ -3034,7 +3070,7 @@ def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, ac
     for local_execution, registry_tool, expected in (
         (False, True, action),
         (False, False, "DENY" if tier == "auto" else action),
-        (True, True, "DENY" if tier == "auto" else action),
+        (True, True, "ASK" if tier == "auto" else action),
     ):
         _, decision = runtime.inspect(
             "session-a",
@@ -3051,7 +3087,7 @@ def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, ac
 @pytest.mark.parametrize(
     "tier,action,reason",
     [
-        ("auto", "DENY", "Unknown tool schema"),
+        ("auto", "ASK", "Unknown tool schema"),
         ("plan", "DENY", "Plan tier permits only known reads and user questions"),
         ("ask", "ASK", "Unknown tool schema"),
     ],

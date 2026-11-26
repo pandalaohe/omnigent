@@ -166,6 +166,7 @@ _AGY_ACP_COMMAND_FIELDS = {
 }
 _AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
 _AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
+_ACP_KNOWN_TOOL_KINDS = frozenset({"execute", "read", "edit"})
 # toolSummary is display metadata shared by agy tools.
 _AGY_ACP_SHELL_FIELDS = (_AGY_ACP_COMMAND_FIELDS.keys() - {"toolSummary"}) | {"Cwd"}
 _AGY_ACP_READ_CONFLICT_FIELDS = (
@@ -1260,13 +1261,17 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow, option_id = await self._decide_permission(params)
+                allow, option_id, denial_reason = await self._decide_permission_detail(params)
                 if allow is None or (
                     self._config.host_permission_tier and self._active_prompt_request_id is None
                 ):
                     result = {"outcome": {"outcome": "cancelled"}}
                 elif self._config.host_permission_tier and not allow and option_id is None:
-                    raise _AcpRequestError(-32000, "Omnigent did not authorize this tool call.")
+                    raise _AcpRequestError(
+                        -32000,
+                        denial_reason
+                        or "Denied by permission mode: Omnigent did not authorize this tool call.",
+                    )
                 else:
                     result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
@@ -1478,16 +1483,24 @@ class AcpExecutor(Executor):
         if not isinstance(arguments, dict):
             return None
         kind = observed.get("kind")
+        if kind is not None and not isinstance(kind, str):
+            return None
         if is_agy:
             agy_tool = self._validate_agy_permission_tool(kind, arguments)
             if agy_tool is None:
                 return None
             name, arguments = agy_tool
-        elif kind == "execute" and isinstance(arguments.get("CommandLine"), str):
+        elif kind == "execute":
+            if not isinstance(arguments.get("CommandLine"), str):
+                return None
             name = "run_command"
-        elif kind == "read" and isinstance(arguments.get("AbsolutePath"), str):
+        elif kind == "read":
+            if not isinstance(arguments.get("AbsolutePath"), str):
+                return None
             name = "view_file"
-        elif kind == "edit" and isinstance(arguments.get("TargetFile"), str):
+        elif kind == "edit":
+            if not isinstance(arguments.get("TargetFile"), str):
+                return None
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
         else:
@@ -1499,6 +1512,8 @@ class AcpExecutor(Executor):
         kind: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
+        if kind is not None and not isinstance(kind, str):
+            return None
         keys = arguments.keys()
         if (kind == "read" or "AbsolutePath" in keys) and keys & _AGY_ACP_READ_CONFLICT_FIELDS:
             return None
@@ -1536,6 +1551,8 @@ class AcpExecutor(Executor):
         path = arguments.get("AbsolutePath")
         if kind == "read" and isinstance(path, str):
             return ("view_file", arguments) if path else None
+        if kind in _ACP_KNOWN_TOOL_KINDS:
+            return None
         return "unknown", arguments
 
     def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
@@ -1636,21 +1653,36 @@ class AcpExecutor(Executor):
         ) if allowed and self._config.host_permission_tier else None
 
     async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool | None, str | None]:
+        allow, option_id, _reason = await self._decide_permission_detail(params)
+        return allow, option_id
+
+    async def _decide_permission_detail(
+        self, params: _AcpJsonObject
+    ) -> tuple[bool | None, str | None, str | None]:
         if not self._config.host_permission_tier:
             return await self._evaluate_permission(params)
         bound_call = self._bound_permission_call(params)
         trace = _AcpPermissionTrace() if self._managed_agy else None
         binding = "unbound"
-        result: tuple[bool | None, str | None] = False, None
+        result: tuple[bool | None, str | None, str | None] = (
+            False,
+            None,
+            "Denied by permission mode (acp): Unbound or malformed ACP tool call.",
+        )
         if bound_call is not None:
             call_id = bound_call["call_id"]
             pending = self._permission_calls[call_id]
-            decision = await self._evaluate_permission(params, bound_call, trace)
+            decision = await self._evaluate_permission(params, bound_call, trace, pending=pending)
             if (
                 self._active_prompt_request_id is None
                 or self._permission_calls.get(call_id) is not pending
             ):
                 binding = "changed"
+                result = (
+                    False,
+                    None,
+                    "Denied by permission mode (acp): Tool call changed during permission check.",
+                )
             else:
                 binding = "current"
                 self._permission_calls.pop(call_id)
@@ -1663,7 +1695,7 @@ class AcpExecutor(Executor):
                 "view_file": "read",
                 "write_to_file": "edit",
             }.get(tool_name, "unknown")
-            allowed, option_id = result
+            allowed, option_id, _reason = result
             option_kind = "none"
             if option_id is not None:
                 option_kind = "allow_once" if allowed else "reject_once"
@@ -1684,7 +1716,9 @@ class AcpExecutor(Executor):
         params: _AcpJsonObject,
         bound_call: _AcpJsonObject | None = None,
         trace: _AcpPermissionTrace | None = None,
-    ) -> tuple[bool | None, str | None]:
+        *,
+        pending: _AcpJsonObject | None = None,
+    ) -> tuple[bool | None, str | None, str | None]:
         """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
@@ -1702,10 +1736,12 @@ class AcpExecutor(Executor):
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
 
-        :returns: ``(allowed, option_id)``. ``allowed=None`` cancels a managed
-            request without selecting a user rejection. An option id names a
-            specific one-time grant or rejection.
+        :returns: ``(allowed, option_id, denial_reason)``. ``allowed=None``
+            cancels a managed request without selecting a user rejection. An
+            option id names a specific one-time grant or rejection.
         """
+        from omnigent.permission_tiers import format_denial_reason
+
         if bound_call is not None:
             tool_name, tool_input = bound_call["name"], bound_call["arguments"]
             if (
@@ -1714,12 +1750,26 @@ class AcpExecutor(Executor):
                 and is_antigravity_acp_command(self._config.command)
             ):
                 # The agent does not attest to the daemon's working directory.
-                return False, None
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        "Background daemon working directory cannot be confirmed.",
+                        detail="acp",
+                    ),
+                )
         else:
             tool_name, tool_input = self._extract_tool_call(params)
+        card_tool_name = tool_name
+        if bound_call is not None and tool_name == "unknown" and isinstance(pending, dict):
+            observed_label = pending.get("title") or pending.get("name") or pending.get("kind")
+            if isinstance(observed_label, str) and observed_label.strip():
+                card_tool_name = observed_label.strip()
         policy_eval = getattr(self, "_policy_evaluator", None)
         action: str | None = None
         tier: str | None = None
+        verdict_reason: str | None = None
         # Either bridge can carry the question to the user.
         can_ask = (
             self._elicitation_handler is not None or self._elicitation_choice_handler is not None
@@ -1732,6 +1782,9 @@ class AcpExecutor(Executor):
                     data["_omnigent_acp_call"] = bound_call
                 verdict = await policy_eval("PHASE_TOOL_CALL", data)
                 action = getattr(verdict, "action", None)
+                raw_reason = getattr(verdict, "reason", None)
+                if isinstance(raw_reason, str) and raw_reason.strip():
+                    verdict_reason = raw_reason.strip()
                 verdict_data = getattr(verdict, "data", None)
                 if bound_call is not None and isinstance(verdict_data, dict):
                     tier = verdict_data.get("_omnigent_acp_tier")
@@ -1742,45 +1795,106 @@ class AcpExecutor(Executor):
                 trace.tier_verdict = tier
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
-                return False, None
+                if verdict_reason is not None and (
+                    tier == "deny"
+                    or verdict_reason.startswith(("Denied by policy:", "Denied by policy ("))
+                ):
+                    denial_reason = verdict_reason
+                else:
+                    denial_reason = format_denial_reason(
+                        "policy",
+                        verdict_reason or "Omnigent policy denied this tool call.",
+                    )
+                return False, None, denial_reason
             if action == "POLICY_ACTION_ASK":
                 if not can_ask:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
                         tool_name,
                     )
-                    return False, None
-                return await self._ask_user(tool_name, tool_input, params, policy_ask=True)
+                    return (
+                        False,
+                        None,
+                        format_denial_reason(
+                            "policy",
+                            "Approval required but no approval handler is available.",
+                        ),
+                    )
+                allow, option_id = await self._ask_user(
+                    card_tool_name, tool_input, params, policy_ask=True
+                )
+                reason = (
+                    format_denial_reason(
+                        "permission mode",
+                        "Agent did not offer a one-time allow option.",
+                        detail="acp",
+                    )
+                    if allow is False and option_id is None
+                    else None
+                )
+                return allow, option_id, reason
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if bound_call is not None:
-            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED") or tier not in (
-                "allow",
-                "ask",
-            ):
-                return False, None
+            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "policy",
+                        verdict_reason or "Omnigent policy evaluation unavailable.",
+                    ),
+                )
+            if tier not in ("allow", "ask"):
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        verdict_reason or "Host permission tier did not authorize this tool call.",
+                    ),
+                )
             if tier == "allow":
                 option_id = self._allow_once_id(params)
                 if trace is not None:
                     trace.once_offer = "valid" if option_id is not None else "missing"
                 if option_id is not None:
-                    return True, option_id
-            return (
-                await self._ask_user(tool_name, tool_input, params) if can_ask else (False, None)
+                    return True, option_id, None
+            if not can_ask:
+                return (
+                    False,
+                    None,
+                    format_denial_reason(
+                        "permission mode",
+                        "Approval required but no approval handler is available.",
+                        detail="acp",
+                    ),
+                )
+            allow, option_id = await self._ask_user(card_tool_name, tool_input, params)
+            reason = (
+                format_denial_reason(
+                    "permission mode",
+                    "Agent did not offer a one-time allow option.",
+                    detail="acp",
+                )
+                if allow is False and option_id is None
+                else None
             )
+            return allow, option_id, reason
 
         if can_ask and not self._bypass_permissions:
-            return await self._ask_user(tool_name, tool_input, params)
+            allow, option_id = await self._ask_user(tool_name, tool_input, params)
+            return allow, option_id, None
         if can_ask:
             # bypassPermissions: no policy had an opinion and the user asked not
             # to be prompted. Logged at info so the audit trail still names what
             # ran unreviewed. Answered per-request (never the agent's own bypass
             # option) so every later call stays visible to policy.
             logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
-            return True, None
+            return True, None, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
-        return True, None
+        return True, None, None
 
     def _allow_once_id(self, params: _AcpJsonObject) -> str | None:
         options = self._permission_options(params)
