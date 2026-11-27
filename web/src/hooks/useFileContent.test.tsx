@@ -27,16 +27,21 @@ import { isDatabricksWorkspace } from "@/lib/host";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
+  BINARY_PREVIEW_MAX_BYTES,
   canDownloadImage,
   downloadImage,
   downloadWorkspaceFile,
   FILE_CONTENT_FAILING_POLL_MS,
   FILE_CONTENT_POLL_MAX_BYTES,
   FILE_CONTENT_POLL_MS,
+  FilePreviewTooLargeError,
+  fetchWorkspaceBinaryPreview,
   fetchWorkspaceVideoBlob,
   fileContentPollInterval,
   fileContentToBlob,
+  readBoundedBinaryPreviewResponse,
   triggerBrowserDownload,
+  useBinaryFilePreview,
   useFileContent,
 } from "./useFileContent";
 import type { FileContentResponse } from "./useFileContent";
@@ -1049,5 +1054,362 @@ describe("useFileContent and this tab's writes", () => {
       await saving;
     });
     expect(qc.getQueryData<FileContentResponse>(KEY)?.content).toBe("saved");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchWorkspaceBinaryPreview / useBinaryFilePreview
+// ---------------------------------------------------------------------------
+
+function streamResponse(
+  chunks: Uint8Array[],
+  headers: Record<string, string> = {},
+): { response: Response; cancelSpy: ReturnType<typeof vi.fn> } {
+  const cancelSpy = vi.fn(() => Promise.resolve());
+  let idx = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (idx < chunks.length) {
+        controller.enqueue(chunks[idx++]);
+      } else {
+        controller.close();
+      }
+    },
+    cancel() {
+      return cancelSpy();
+    },
+  });
+  const response = new Response(body, { status: 200, headers });
+  return { response, cancelSpy };
+}
+
+describe("fetchWorkspaceBinaryPreview", () => {
+  it("streams raw bytes from ?download=true without calling atob", async () => {
+    const atobSpy = vi.spyOn(globalThis, "atob");
+    const partA = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const partB = new Uint8Array([0x0d, 0x0a, 0x1a, 0x0a]);
+    const { response } = streamResponse([partA, partB], {
+      "content-type": "image/png",
+      "content-length": "8",
+    });
+    fetchMock.mockResolvedValueOnce(response);
+
+    const result = await fetchWorkspaceBinaryPreview("sess_raw", "assets/photo.png");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_raw/resources/environments/default/filesystem/assets/photo.png?download=true&wake=false",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(result.contentType).toBe("image/png");
+    expect(result.bytes).toBe(8);
+    expect(new Uint8Array(await result.blob.arrayBuffer())).toEqual(
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+    expect(atobSpy).not.toHaveBeenCalled();
+  });
+
+  it("carries base=host for host-absolute paths and maps SVG octet-stream to image/svg+xml", async () => {
+    const svgBytes = new TextEncoder().encode("<svg/>");
+    const { response } = streamResponse([svgBytes], {
+      "content-type": "application/octet-stream",
+    });
+    fetchMock.mockResolvedValueOnce(response);
+
+    const result = await fetchWorkspaceBinaryPreview("sess_raw", "/opt/work/icon.svg");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_raw/resources/environments/default/filesystem/opt/work/icon.svg?download=true&wake=false&base=host",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(result.contentType).toBe("image/svg+xml");
+    expect(result.blob.type).toBe("image/svg+xml");
+  });
+
+  it("rejects immediately and cancels the stream when Content-Length exceeds maxBytes", async () => {
+    const { response, cancelSpy } = streamResponse([new Uint8Array(16)], {
+      "content-type": "application/pdf",
+      "content-length": String(BINARY_PREVIEW_MAX_BYTES + 1),
+    });
+
+    await expect(readBoundedBinaryPreviewResponse(response, "big.pdf")).rejects.toBeInstanceOf(
+      FilePreviewTooLargeError,
+    );
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects and cancels the stream when streamed chunks exceed maxBytes without Content-Length", async () => {
+    const { response, cancelSpy } = streamResponse([new Uint8Array(60), new Uint8Array(60)], {
+      "content-type": "model/stl",
+    });
+
+    await expect(
+      readBoundedBinaryPreviewResponse(response, "part.stl", { maxBytes: 100 }),
+    ).rejects.toBeInstanceOf(FilePreviewTooLargeError);
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the stream when the caller aborts", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { response, cancelSpy } = streamResponse([new Uint8Array(8)], {
+      "content-type": "image/png",
+    });
+
+    await expect(
+      readBoundedBinaryPreviewResponse(response, "photo.png", { signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useBinaryFilePreview", () => {
+  it("loads raw bytes via ?download=true when the runner is online", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+    const { response } = streamResponse([new Uint8Array([1, 2, 3, 4])], {
+      "content-type": "application/pdf",
+      "content-length": "4",
+    });
+    fetchMock.mockResolvedValueOnce(response);
+
+    const { result } = renderHook(() => useBinaryFilePreview("conv_live", "docs/report.pdf"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data?.bytes).toBe(4));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/conv_live/resources/environments/default/filesystem/docs/report.pdf?download=true&wake=false",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(result.current.data?.contentType).toBe("application/pdf");
+  });
+
+  it("falls back once to host-backed JSON when ?download=true&wake=false answers 503 runner_unavailable", async () => {
+    // Cold deep link or stale health: runner is actually asleep (or legacy without downloads).
+    onlineMock.mockReturnValue(undefined);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: "runner_unavailable", message: "runner offline" } }),
+          { status: 503, statusText: "Service Unavailable" },
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "session.environment.filesystem.file_content",
+          path: "assets/pic.png",
+          content_type: "image/png",
+          encoding: "base64",
+          content: "YWJj",
+          bytes: 3,
+          truncated: false,
+        }),
+      );
+
+    const { result } = renderHook(() => useBinaryFilePreview("conv_cold", "assets/pic.png"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data?.bytes).toBe(3));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/v1/sessions/conv_cold/resources/environments/default/filesystem/assets/pic.png?download=true&wake=false",
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/v1/sessions/conv_cold/resources/environments/default/filesystem/assets/pic.png",
+    );
+  });
+
+  it("preserves Blob identity across chunk-varied unchanged refetches and replaces it when bytes change", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+    fetchMock
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])], {
+          "content-type": "application/pdf",
+          "content-length": "8",
+        }).response,
+      )
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7, 8])], {
+          "content-type": "application/pdf",
+          "content-length": "8",
+        }).response,
+      )
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3, 4]), new Uint8Array([5, 6, 7, 8])], {
+          "content-type": "application/pdf",
+          "content-length": "8",
+        }).response,
+      )
+      .mockResolvedValueOnce(
+        streamResponse([new Uint8Array([1, 2, 3, 4, 5, 6, 7, 9])], {
+          "content-type": "application/pdf",
+          "content-length": "8",
+        }).response,
+      );
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useBinaryFilePreview("conv_same", "docs/report.pdf"), {
+      wrapper: stableWrap(qc),
+    });
+
+    await waitFor(() => expect(result.current.data?.bytes).toBe(8));
+    const firstBlob = result.current.data?.blob;
+
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_same", "docs/report.pdf"],
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    expect(result.current.data?.blob).toBe(firstBlob);
+
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_same", "docs/report.pdf"],
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    expect(result.current.data?.blob).toBe(firstBlob);
+
+    await act(async () => {
+      await qc.refetchQueries({
+        queryKey: ["file-binary-preview", "conv_same", "docs/report.pdf"],
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    await waitFor(() => expect(result.current.data?.blob).not.toBe(firstBlob));
+    expect(new Uint8Array(await result.current.data!.blob.arrayBuffer())).toEqual(
+      new Uint8Array([1, 2, 3, 4, 5, 6, 7, 9]),
+    );
+  });
+
+  it("polls visible small UTF-8 SVG previews for live updates but does not poll binary PNGs", async () => {
+    vi.useFakeTimers();
+    try {
+      onlineMock.mockReturnValue(true);
+      hostOnlineMock.mockReturnValue(true);
+      stubChatStore();
+      const v1 = new TextEncoder().encode("<svg><circle r='1'/></svg>");
+      const v2 = new TextEncoder().encode("<svg><circle r='2'/></svg>");
+      fetchMock
+        .mockResolvedValueOnce(
+          streamResponse([v1], {
+            "content-type": "text/plain; charset=utf-8",
+            "content-length": String(v1.byteLength),
+          }).response,
+        )
+        .mockResolvedValueOnce(
+          streamResponse([v2], {
+            "content-type": "image/svg+xml",
+            "content-length": String(v2.byteLength),
+          }).response,
+        );
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result, unmount } = renderHook(
+        () => useBinaryFilePreview("conv_svg_poll", "icons/logo.svg", { visible: true }),
+        { wrapper: stableWrap(qc) },
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.current.data?.contentType).toBe("image/svg+xml");
+      expect(result.current.data?.pollable).toBe(true);
+      const firstSvgBlob = result.current.data?.blob;
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data?.blob).not.toBe(firstSvgBlob);
+      expect(await result.current.data!.blob.text()).toBe("<svg><circle r='2'/></svg>");
+      unmount();
+
+      // Binary PNG stays non-pollable while visible.
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValueOnce(
+        streamResponse([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00])], {
+          "content-type": "image/png",
+          "content-length": "5",
+        }).response,
+      );
+      const { result: pngResult } = renderHook(
+        () => useBinaryFilePreview("conv_png_nopoll", "assets/pic.png", { visible: true }),
+        { wrapper: stableWrap(qc) },
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(pngResult.current.data?.pollable).toBe(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_CONTENT_POLL_MS * 3);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to host-backed JSON without waking an asleep runner", async () => {
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        object: "session.environment.filesystem.file_content",
+        path: "assets/pic.png",
+        content_type: "image/png",
+        encoding: "base64",
+        content: "YWJj",
+        bytes: 3,
+        truncated: false,
+      }),
+    );
+
+    const { result } = renderHook(() => useBinaryFilePreview("conv_asleep", "assets/pic.png"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data?.bytes).toBe(3));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/conv_asleep/resources/environments/default/filesystem/assets/pic.png",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(result.current.data?.contentType).toBe("image/png");
+  });
+
+  it("surfaces FilePreviewTooLargeError without retrying when over limit", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+    const { response } = streamResponse([new Uint8Array(16)], {
+      "content-type": "application/pdf",
+      "content-length": String(BINARY_PREVIEW_MAX_BYTES + 1),
+    });
+    fetchMock.mockResolvedValue(response);
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: 2, retryDelay: 1 } },
+    });
+    const { result } = renderHook(() => useBinaryFilePreview("conv_big", "huge.pdf"), {
+      wrapper: stableWrap(qc),
+    });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error).toBeInstanceOf(FilePreviewTooLargeError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

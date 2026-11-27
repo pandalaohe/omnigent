@@ -220,9 +220,21 @@ function teardownScene(res: SceneResources): void {
   }
 }
 
-export function ModelViewer({ data, path }: { data: FileContentResponse; path: string }) {
+export function ModelViewer({
+  blob,
+  contentType,
+  data,
+  path,
+}: {
+  blob?: Blob;
+  contentType?: string | null;
+  data?: FileContentResponse;
+  path: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [errored, setErrored] = useState(false);
+  const truncated = data?.truncated ?? false;
+  const effectiveContentType = contentType ?? data?.content_type ?? null;
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -252,14 +264,15 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
 
     // A truncated model is a partial byte stream that won't parse into a valid
     // mesh — skip the scene and go straight to the error UI.
-    if (data.truncated) {
+    if (truncated) {
       setErrored(true);
       return;
     }
     // Same resolver used for dispatch, so a MIME-matched file with an unknown
     // extension still selects the right loader here.
-    const format = getModelFormat(path, data.content_type);
-    if (!format) {
+    const format = getModelFormat(path, effectiveContentType);
+    const sourceBlob = blob ?? (data ? fileContentToBlob(data) : null);
+    if (!format || !sourceBlob) {
       setErrored(true);
       return;
     }
@@ -293,10 +306,10 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
       if (!disposed) setErrored(true);
     };
 
-    // fileContentToBlob handles both base64 (binary STL/3MF) and utf-8 (ASCII
-    // OBJ/STL); read it back as an ArrayBuffer for the loaders. This is async,
-    // so guard every step against the effect having been cleaned up.
-    fileContentToBlob(data)
+    // Raw preview blobs arrive directly from `?download=true`; fallback JSON
+    // responses decode through `fileContentToBlob`. Guard every async step
+    // against effect cleanup.
+    sourceBlob
       .arrayBuffer()
       .then((buffer) => {
         if (disposed) return;
@@ -368,10 +381,10 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
     };
-  }, [data, path]);
+  }, [blob, data, effectiveContentType, path, truncated]);
 
   const filename = path.split("/").pop() ?? path;
-  const errorMessage = data.truncated
+  const errorMessage = truncated
     ? "Model is too large to preview (truncated by the server)."
     : "Unable to render 3D model.";
 
@@ -394,7 +407,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     </div>
   );
 
-  if (!data.truncated) return <div className="flex h-full flex-col">{content}</div>;
+  if (!truncated) return <div className="flex h-full flex-col">{content}</div>;
   return (
     <div className="flex h-full flex-col">
       <TruncatedBanner />

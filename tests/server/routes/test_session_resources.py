@@ -5420,6 +5420,59 @@ async def test_filesystem_download_streams_runner_attachment(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_download_with_gzip_header_stays_uncompressed(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """``?download=true&wake=false`` streams raw bytes uncompressed even with gzip accepted."""
+    payload = bytes(range(256)) * 32
+    (tmp_path / "photo.png").write_bytes(payload)
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> FileResponse:
+        del session_id, environment_id, relative_path
+        return FileResponse(tmp_path / "photo.png", filename="photo.png", media_type="image/png")
+
+    async with _runner_app_client(runner):
+        resp = await client.get(
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+            "/filesystem/photo.png?download=true&wake=false",
+            headers={"Accept-Encoding": "gzip, deflate, br"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_wake_false_does_not_reconnect_asleep_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passive preview downloads (``wake=false``) return 503 without waking an asleep runner."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    class _AsleepRouter(_FakeRunnerRouter):
+        def client_for_session_resources(
+            self, session_id: str, *, conversation: Conversation | None = None
+        ) -> _RoutedRunner:
+            del session_id, conversation
+            raise OmnigentError("runner disconnected", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    set_runner_router(_AsleepRouter(None))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_DOWNLOAD_URL}&wake=false")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+    wake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_filesystem_download_rejects_runner_without_download_support(
     client: httpx.AsyncClient,
 ) -> None:

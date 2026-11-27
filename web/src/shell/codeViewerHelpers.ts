@@ -177,6 +177,7 @@ const IMAGE_EXTENSIONS = new Set([
   "png",
   "jpg",
   "jpeg",
+  "jpe",
   "gif",
   "bmp",
   "ico",
@@ -217,11 +218,12 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
 export type ModelFormat = "stl" | "3mf" | "obj";
 
 // Model file extensions → the loader format they select.
-const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
-  stl: "stl",
-  "3mf": "3mf",
-  obj: "obj",
-};
+// Maps prevent inherited Object.prototype keys (e.g. `.constructor`) from matching.
+const MODEL_EXTENSION_FORMATS: ReadonlyMap<string, ModelFormat> = new Map([
+  ["stl", "stl"],
+  ["3mf", "3mf"],
+  ["obj", "obj"],
+]);
 
 // MIME types servers commonly report for these formats → the loader format.
 // Extension-driven `guess_type` and some toolchains disagree on the canonical
@@ -229,14 +231,14 @@ const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
 // explicit set rather than a `model/` prefix — `model/gltf+json` etc. are NOT
 // in scope. Generic types (`application/octet-stream`, `text/plain`) are
 // deliberately absent so they fall through to the extension.
-const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
-  "model/stl": "stl",
-  "application/sla": "stl",
-  "application/vnd.ms-pki.stl": "stl",
-  "model/3mf": "3mf",
-  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml": "3mf",
-  "model/obj": "obj",
-};
+const MODEL_CONTENT_TYPE_FORMATS: ReadonlyMap<string, ModelFormat> = new Map([
+  ["model/stl", "stl"],
+  ["application/sla", "stl"],
+  ["application/vnd.ms-pki.stl", "stl"],
+  ["model/3mf", "3mf"],
+  ["application/vnd.ms-package.3dmanufacturing-3dmodel+xml", "3mf"],
+  ["model/obj", "obj"],
+]);
 
 /**
  * Resolve the 3D-model loader format for `path` / `contentType`, or `null` if
@@ -255,11 +257,11 @@ const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
 export function getModelFormat(path: string, contentType?: string | null): ModelFormat | null {
   if (contentType) {
     const type = contentType.split(";")[0].trim().toLowerCase();
-    const byMime = MODEL_CONTENT_TYPE_FORMATS[type];
+    const byMime = MODEL_CONTENT_TYPE_FORMATS.get(type);
     if (byMime) return byMime;
   }
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  return MODEL_EXTENSION_FORMATS[ext] ?? null;
+  return MODEL_EXTENSION_FORMATS.get(ext) ?? null;
 }
 
 /**
@@ -270,6 +272,80 @@ export function getModelFormat(path: string, contentType?: string | null): Model
  */
 export function isModelFile(path: string, contentType?: string | null): boolean {
   return getModelFormat(path, contentType) !== null;
+}
+
+export type BinaryPreviewKind = "image" | "pdf" | "model";
+
+/**
+ * Resolve which binary preview surface should render `path` / `contentType`.
+ *
+ * MIME-first across all three binary preview families (so a `.png` symlink
+ * served as `application/pdf` opens in the PDF viewer rather than ImageViewer),
+ * falling back to extension when the server returned a generic/unrecognized MIME.
+ */
+export function resolveBinaryPreviewKind(
+  path: string,
+  contentType?: string | null,
+): BinaryPreviewKind | null {
+  if (contentType) {
+    if (isImageFile(path, contentType)) return "image";
+    if (isPdfFile(path, contentType)) return "pdf";
+    const normalized = contentType.split(";")[0].trim().toLowerCase();
+    if (MODEL_CONTENT_TYPE_FORMATS.has(normalized)) return "model";
+  }
+  if (isImageFile(path)) return "image";
+  if (isPdfFile(path)) return "pdf";
+  if (isModelFile(path)) return "model";
+  return null;
+}
+
+/**
+ * Return true if `path` names a known image, PDF, or 3D model whose preview
+ * should stream raw bytes via `?download=true` instead of JSON+base64.
+ */
+export function isRawBinaryPreviewPath(path: string): boolean {
+  return resolveBinaryPreviewKind(path) !== null;
+}
+
+const BINARY_PREVIEW_MIME_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
+  ["png", "image/png"],
+  ["jpg", "image/jpeg"],
+  ["jpeg", "image/jpeg"],
+  ["jpe", "image/jpeg"],
+  ["gif", "image/gif"],
+  ["bmp", "image/bmp"],
+  ["ico", "image/x-icon"],
+  ["webp", "image/webp"],
+  ["avif", "image/avif"],
+  ["svg", "image/svg+xml"],
+  ["pdf", "application/pdf"],
+  ["stl", "model/stl"],
+  ["3mf", "model/3mf"],
+  ["obj", "model/obj"],
+]);
+
+/**
+ * Resolve a concrete MIME type for a raw binary preview response.
+ *
+ * Keeps any recognized preview MIME (`image/*`, `application/pdf`, or a
+ * supported 3D model type) authoritative; otherwise maps a known preview
+ * extension to its concrete MIME (so e.g. an `.svg` symlink targeting a
+ * `.txt` file served as `text/plain` still gets `image/svg+xml` for `<img>`).
+ */
+export function previewMimeTypeForPath(path: string, contentType?: string | null): string {
+  const normalized = contentType?.split(";")[0].trim().toLowerCase() ?? "";
+  if (
+    normalized &&
+    (normalized.startsWith("image/") ||
+      normalized === "application/pdf" ||
+      MODEL_CONTENT_TYPE_FORMATS.has(normalized))
+  ) {
+    return normalized;
+  }
+  const name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+  const dot = name.lastIndexOf(".");
+  const ext = dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+  return BINARY_PREVIEW_MIME_BY_EXTENSION.get(ext) ?? (normalized || "application/octet-stream");
 }
 
 /**

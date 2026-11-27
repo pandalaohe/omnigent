@@ -3,7 +3,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useMemo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { useFileContent } from "@/hooks/useFileContent";
+import {
+  BINARY_PREVIEW_MAX_BYTES,
+  FilePreviewTooLargeError,
+  type useBinaryFilePreview,
+  type useFileContent,
+} from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
 import type * as rehypeSlugModule from "rehype-slug";
 import type { Comment } from "@/hooks/useComments";
@@ -74,16 +79,24 @@ vi.mock("./MonacoCodeEditor", () => ({
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
 vi.mock("./PdfViewer", () => ({
-  PdfViewer: ({ comments }: { comments: Comment[] }) => (
-    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+  PdfViewer: ({ comments, blob }: { comments: Comment[]; blob?: Blob }) => (
+    <div
+      data-testid="pdf-viewer-stub"
+      data-comment-ids={comments.map((c) => c.id).join(",")}
+      data-has-blob={String(blob instanceof Blob)}
+    />
   ),
 }));
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
 // was routed to the 3D preview instead of the binary-rejection placeholder.
 vi.mock("./ModelViewer", () => ({
-  ModelViewer: ({ path }: { path: string }) => (
-    <div data-testid="model-viewer-stub" data-path={path} />
+  ModelViewer: ({ path, blob }: { path: string; blob?: Blob }) => (
+    <div
+      data-testid="model-viewer-stub"
+      data-path={path}
+      data-has-blob={String(blob instanceof Blob)}
+    />
   ),
 }));
 
@@ -1343,6 +1356,153 @@ describe("CodeViewer 3D model routing", () => {
     renderModel("download", "base64", "model/3mf");
     expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
     expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
+});
+
+describe("CodeViewer raw binary preview path", () => {
+  const emptyFileQuery = {
+    data: undefined,
+    isLoading: false,
+    isLoadingError: false,
+    isError: false,
+    isSuccess: false,
+    error: null,
+  } as unknown as ReturnType<typeof useFileContent>;
+
+  function renderRawBinary(path: string, binaryQuery: ReturnType<typeof useBinaryFilePreview>) {
+    return render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path={path}
+        fileQuery={emptyFileQuery}
+        binaryQuery={binaryQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen={true}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("renders a raw image Blob without calling atob", async () => {
+    let createdBlob: Blob | null = null;
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn((blob: Blob) => {
+        createdBlob = blob;
+        return "blob:raw-image";
+      }),
+      revokeObjectURL: vi.fn(),
+    });
+    const atobSpy = vi.spyOn(globalThis, "atob");
+    const rawBlob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+
+    renderRawBinary("assets/photo.png", {
+      data: {
+        blob: rawBlob,
+        contentType: "image/png",
+        bytes: 4,
+        fingerprint: "4:image/png:1:2",
+        pollable: false,
+      },
+      isLoading: false,
+      isLoadingError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+
+    const img = (await screen.findByAltText("photo.png")) as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("blob:raw-image");
+    expect(createdBlob).toBe(rawBlob);
+    expect(atobSpy).not.toHaveBeenCalled();
+
+    atobSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("passes the raw Blob directly to PdfViewer and ModelViewer", async () => {
+    const pdfBlob = new Blob([new Uint8Array([0x25, 0x50, 0x44, 0x46])], {
+      type: "application/pdf",
+    });
+    renderRawBinary("docs/report.pdf", {
+      data: {
+        blob: pdfBlob,
+        contentType: "application/pdf",
+        bytes: 4,
+        fingerprint: "4:application/pdf:1:2",
+        pollable: false,
+      },
+      isLoading: false,
+      isLoadingError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute("data-has-blob", "true");
+
+    cleanup();
+    const stlBlob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: "model/stl" });
+    renderRawBinary("cad/part.stl", {
+      data: {
+        blob: stlBlob,
+        contentType: "model/stl",
+        bytes: 4,
+        fingerprint: "4:model/stl:1:2",
+        pollable: false,
+      },
+      isLoading: false,
+      isLoadingError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+    expect(await screen.findByTestId("model-viewer-stub")).toHaveAttribute("data-has-blob", "true");
+  });
+
+  it("prefers server MIME over extension on the raw binary path", async () => {
+    const pdfBlob = new Blob([new Uint8Array([0x25, 0x50, 0x44, 0x46])], {
+      type: "application/pdf",
+    });
+    renderRawBinary("links/report.png", {
+      data: {
+        blob: pdfBlob,
+        contentType: "application/pdf",
+        bytes: 4,
+        fingerprint: "4:application/pdf:1:2",
+        pollable: false,
+      },
+      isLoading: false,
+      isLoadingError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute("data-has-blob", "true");
+  });
+
+  it.each([
+    [
+      "assets/huge.png",
+      "Image is too large to preview (64 MiB limit). Download it to view locally.",
+    ],
+    ["docs/huge.pdf", "PDF is too large to preview (64 MiB limit). Download it to view locally."],
+    ["cad/huge.stl", "Model is too large to preview (64 MiB limit). Download it to view locally."],
+  ])("shows the stated preview size limit for %s", (path, expected) => {
+    renderRawBinary(path, {
+      data: undefined,
+      isLoading: false,
+      isLoadingError: true,
+      error: new FilePreviewTooLargeError(BINARY_PREVIEW_MAX_BYTES),
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+    expect(screen.getByText(expected)).toBeDefined();
+  });
+
+  it("renders nothing instead of the binary placeholder while an offline binaryQuery is idle", () => {
+    renderRawBinary("assets/photo.png", {
+      data: undefined,
+      isLoading: false,
+      isLoadingError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useBinaryFilePreview>);
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
 });
 

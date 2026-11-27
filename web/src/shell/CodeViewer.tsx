@@ -55,7 +55,9 @@ import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
+  FilePreviewTooLargeError,
   fileContentToBlob,
+  type useBinaryFilePreview,
   type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -76,6 +78,7 @@ import {
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
+  resolveBinaryPreviewKind,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
 import { DataTablePreview } from "./DataTablePreview";
@@ -484,10 +487,19 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
   backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0",
 };
 
-function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
+function ImageViewer({
+  blob,
+  data,
+  path,
+}: {
+  blob?: Blob;
+  data?: FileContentResponse;
+  path: string;
+}) {
   const [url, setUrl] = useState<string | null>(null);
   const [errored, setErrored] = useState(false);
   const { open } = useLightbox();
+  const truncated = data?.truncated ?? false;
 
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
@@ -495,22 +507,28 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
     // A truncated image is a partial (corrupt) byte stream — mounting it would
     // flash a broken-image icon before onError fires. Skip the blob and go
     // straight to the error/banner UI.
-    if (data.truncated) {
+    if (truncated) {
+      setUrl(null);
+      setErrored(true);
+      return;
+    }
+    const sourceBlob = blob ?? (data ? fileContentToBlob(data) : null);
+    if (!sourceBlob) {
       setUrl(null);
       setErrored(true);
       return;
     }
     setErrored(false);
-    const objectUrl = URL.createObjectURL(fileContentToBlob(data));
+    const objectUrl = URL.createObjectURL(sourceBlob);
     setUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
-  }, [data]);
+  }, [blob, data, truncated]);
 
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
     <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-      {data.truncated
+      {truncated
         ? "Image is too large to preview (truncated by the server)."
         : "Unable to render image."}
     </div>
@@ -530,7 +548,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
     </div>
   );
 
-  if (!data.truncated) return body;
+  if (!truncated) return body;
   return (
     <div className="flex h-full flex-col">
       <TruncatedBanner />
@@ -548,6 +566,7 @@ export interface CodeViewerProps {
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
+  binaryQuery?: ReturnType<typeof useBinaryFilePreview>;
   comments: Comment[];
   /** Addressed comments are available for temporarily revealing a selected anchor. */
   addressedComments?: Comment[];
@@ -626,6 +645,7 @@ export function CodeViewer({
   conversationId,
   path,
   fileQuery,
+  binaryQuery,
   comments,
   addressedComments = EMPTY_COMMENTS,
   activeSelection,
@@ -1004,6 +1024,77 @@ export function CodeViewer({
         />
       </div>
     );
+  }
+  if (binaryQuery) {
+    if (binaryQuery.isLoading) {
+      return (
+        <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+          Loading…
+        </div>
+      );
+    }
+    if (binaryQuery.isLoadingError) {
+      if (binaryQuery.error instanceof FilePreviewTooLargeError) {
+        const kind = isPdfFile(path) ? "PDF" : isModelFile(path) ? "Model" : "Image";
+        const limitMiB = Math.round(binaryQuery.error.limitBytes / (1024 * 1024));
+        return (
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+            {`${kind} is too large to preview (${limitMiB} MiB limit). Download it to view locally.`}
+          </div>
+        );
+      }
+      return (
+        <div className="p-8 text-destructive text-ui">
+          Error loading file:{" "}
+          {binaryQuery.error instanceof Error
+            ? binaryQuery.error.message
+            : String(binaryQuery.error)}
+        </div>
+      );
+    }
+    if (binaryQuery.data) {
+      const kind = resolveBinaryPreviewKind(path, binaryQuery.data.contentType);
+      if (kind === "image") {
+        return <ImageViewer blob={binaryQuery.data.blob} path={path} />;
+      }
+      if (kind === "pdf") {
+        return (
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                Loading…
+              </div>
+            }
+          >
+            <PdfViewer
+              blob={binaryQuery.data.blob}
+              conversationId={conversationId}
+              comments={previewComments}
+              activeSelection={activeSelection}
+              onSetActiveSelection={onSetActiveSelection}
+            />
+          </Suspense>
+        );
+      }
+      if (kind === "model") {
+        return (
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                Loading 3D preview…
+              </div>
+            }
+          >
+            <ModelViewer
+              blob={binaryQuery.data.blob}
+              contentType={binaryQuery.data.contentType}
+              path={path}
+            />
+          </Suspense>
+        );
+      }
+    }
+    return null;
   }
   if (fileQuery.isLoading) {
     return (

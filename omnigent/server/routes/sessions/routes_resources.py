@@ -719,6 +719,8 @@ def register_resources_routes(
         conversation: Conversation,
         runner_path: str,
         honor_range: bool = True,
+        *,
+        wake: bool = True,
     ) -> Response:
         """Resume an idle runner if needed and stream a file without buffering it.
 
@@ -732,11 +734,13 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
         :param honor_range: Forward the client's range for consumers serving raw bytes.
+        :param wake: When ``False`` (passive preview reads), fail fast with
+            ``runner_unavailable`` instead of waking an asleep runner.
         :returns: The attachment, streamed as the runner sends it, or the
             runner's own error body and status for a missing file, a
             directory, or an out-of-grant path.
-        :raises OmnigentError: ``runner_unavailable`` when the runner
-            predates downloads.
+        :raises OmnigentError: ``runner_unavailable`` when the runner is
+            offline with ``wake=False`` or predates downloads.
         :raises HTTPException: 502 when no runner can be reached.
         """
         try:
@@ -745,7 +749,7 @@ def register_resources_routes(
                 conversation=conversation,
             )
         except OmnigentError as exc:
-            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE or not wake:
                 raise
             # Restarting a runner needs edit access, even when its files are
             # shared with read-only viewers. Live downloads keep the read gate.
@@ -4056,6 +4060,7 @@ def register_resources_routes(
         # function directly, and a ``Query`` object is truthy.
         download: bool = False,
         scope: Literal["workspace"] | None = None,
+        wake: bool = True,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -4074,6 +4079,8 @@ def register_resources_routes(
             attachment with no size cap instead of the capped JSON
             envelope. A directory rejects it with 400.
         :param scope: ``workspace`` also confines owner reads, including symlinks.
+        :param wake: When ``False`` alongside ``download=True``, fail fast with
+            ``runner_unavailable`` instead of waking an asleep runner.
         :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
@@ -4108,6 +4115,7 @@ def register_resources_routes(
                 f"/v1/sessions/{session_id}/resources/environments"
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **scope_params}),
+                wake=wake,
             )
             if scope == "workspace" and download_response.status_code in (200, 206):
                 download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)

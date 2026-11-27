@@ -727,17 +727,42 @@ async def test_workspace_reads_allow_view_only_when_shared(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("email", "routing_error", "status", "error_code"),
+    ("cid", "email", "wake", "routing_error", "status", "error_code"),
     [
-        ("viewer@example.com", None, 200, None),
-        ("viewer@example.com", ErrorCode.RUNNER_UNAVAILABLE, 403, ErrorCode.FORBIDDEN),
-        ("owner@example.com", ErrorCode.WRONG_REPLICA, 400, ErrorCode.WRONG_REPLICA),
+        ("conv_open", "viewer@example.com", "true", None, 200, None),
+        (
+            "conv_open",
+            "viewer@example.com",
+            "true",
+            ErrorCode.RUNNER_UNAVAILABLE,
+            403,
+            ErrorCode.FORBIDDEN,
+        ),
+        (
+            "conv_open",
+            "viewer@example.com",
+            "false",
+            ErrorCode.RUNNER_UNAVAILABLE,
+            503,
+            ErrorCode.RUNNER_UNAVAILABLE,
+        ),
+        ("conv_share", "viewer@example.com", "false", None, 403, ErrorCode.FORBIDDEN),
+        (
+            "conv_open",
+            "owner@example.com",
+            "true",
+            ErrorCode.WRONG_REPLICA,
+            400,
+            ErrorCode.WRONG_REPLICA,
+        ),
     ],
 )
 async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_replica(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    cid: str,
     email: str,
+    wake: str,
     routing_error: str | None,
     status: int,
     error_code: str | None,
@@ -755,16 +780,16 @@ async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_rep
             headers={"Content-Disposition": 'attachment; filename="report.txt"'},
         )
     )
-    wake = AsyncMock()
-    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    wake_runner = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake_runner)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner:
         lookup = AsyncMock(return_value=runner)
         if routing_error is not None:
             lookup.side_effect = OmnigentError("runner unavailable here", code=routing_error)
         monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", lookup)
         response = await client.get(
-            "/v1/sessions/conv_open/resources/environments/default/filesystem/report.txt",
-            params={"download": "true"},
+            f"/v1/sessions/{cid}/resources/environments/default/filesystem/report.txt",
+            params={"download": "true", "wake": wake},
             headers={"X-Forwarded-Email": email},
         )
     assert response.status_code == status, response.text
@@ -772,7 +797,9 @@ async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_rep
         assert response.content == payload
     else:
         assert response.json()["error"]["code"] == error_code
-    wake.assert_not_awaited()
+    if cid == "conv_share":
+        lookup.assert_not_awaited()
+    wake_runner.assert_not_awaited()
 
 
 @pytest.mark.asyncio

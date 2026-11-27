@@ -98,7 +98,12 @@ import {
   MOD_KEY,
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { downloadWorkspaceFile, fetchFileContent, useFileContent } from "@/hooks/useFileContent";
+import {
+  downloadWorkspaceFile,
+  fetchFileContent,
+  useBinaryFilePreview,
+  useFileContent,
+} from "@/hooks/useFileContent";
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -148,6 +153,7 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isRawBinaryPreviewPath,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -569,15 +575,26 @@ function FileViewerBody({
     workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
   const sessionHostId = useSessionHostId(conversationId);
   const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
-  // Video playback reads the complete binary on demand, never the capped JSON preview.
+  // Video playback and known image/PDF/3D previews read raw bytes via
+  // ?download=true instead of the capped JSON+base64 preview envelope.
+  const isRawBinaryPreview = isRawBinaryPreviewPath(path);
   const fileQuery = useFileContent(
     conversationId,
-    isVideoFile(path) || isDeletedFile ? null : path,
+    isVideoFile(path) || isRawBinaryPreview || isDeletedFile ? null : path,
     {
       visible: onScreen,
       ...(sshTarget ? { sshTarget } : {}),
     },
   );
+  const binaryQuery = useBinaryFilePreview(
+    conversationId,
+    isRawBinaryPreview && !isDeletedFile ? path : null,
+    {
+      visible: onScreen,
+    },
+  );
+  const activeFileQuery = isRawBinaryPreview ? binaryQuery : fileQuery;
+  const hasFileData = fileQuery.data !== undefined || binaryQuery.data !== undefined;
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
@@ -983,12 +1000,12 @@ function FileViewerBody({
   };
 
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
-  // Waits for fileQuery.data so classifyAndRemapComments has run with real content,
+  // Waits for file data so classifyAndRemapComments has run with real content,
   // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
-    if (!commentId || fileQuery.data === undefined) return;
+    if (!commentId || !hasFileData) return;
     const comment = openComments.find((c) => c.id === commentId);
     if (!comment) return;
     linkedCommentAppliedRef.current = true;
@@ -1000,7 +1017,7 @@ function FileViewerBody({
       anchor_content: comment.anchor_content ?? "",
       comment_id: comment.id,
     });
-  }, [openComments]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [openComments, hasFileData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Find-in-file state lifted here so the toolbar button can open it.
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1119,13 +1136,14 @@ function FileViewerBody({
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
-  const isImage = isImageFile(path, fileQuery.data?.content_type);
-  const isPdf = isPdfFile(path, fileQuery.data?.content_type);
-  const isVideo = isVideoFile(path, fileQuery.data?.content_type);
+  const fileContentType = binaryQuery.data?.contentType ?? fileQuery.data?.content_type;
+  const isImage = isImageFile(path, fileContentType);
+  const isPdf = isPdfFile(path, fileContentType);
+  const isVideo = isVideoFile(path, fileContentType);
   // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
-  const isModel = isModelFile(path, fileQuery.data?.content_type);
+  const isModel = isModelFile(path, fileContentType);
   // Excel and Parquet open only on the table: no source, diff or line view.
   const isSpreadsheet = isSpreadsheetPath(path);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
@@ -1465,7 +1483,7 @@ function FileViewerBody({
   const handleContentScroll = useScrollRestore(
     contentAreaRef,
     contentScrollKey,
-    fileQuery.data !== undefined,
+    hasFileData,
     !isFilePositionPending(filePosition),
   );
   // Measure the content area so the split toggle can hide when there isn't
@@ -1778,7 +1796,7 @@ function FileViewerBody({
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (!isDeletedFile && (fileQuery.data || isVideo)) {
+  if (!isDeletedFile && (hasFileData || isVideo || isRawBinaryPreview)) {
     settingsMenu.push({
       key: "download",
       label: "Download file",
@@ -2287,7 +2305,7 @@ function FileViewerBody({
         </div>
       </div>
 
-      {fileQuery.isRefetchError && !isDeletedFile && (
+      {activeFileQuery.isRefetchError && !isDeletedFile && (
         <div
           role="status"
           className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
@@ -2295,7 +2313,9 @@ function FileViewerBody({
           <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
           <span>
             Couldn&apos;t refresh this file (
-            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            {activeFileQuery.error instanceof Error
+              ? activeFileQuery.error.message
+              : String(activeFileQuery.error)}
             ). Showing the last loaded version.
           </span>
         </div>
@@ -2394,6 +2414,7 @@ function FileViewerBody({
                 conversationId={conversationId}
                 path={path}
                 fileQuery={fileQuery}
+                binaryQuery={isRawBinaryPreview ? binaryQuery : undefined}
                 onDirtyChange={handleDirtyChange}
                 onSaveStatusChange={setSaveStatus}
                 comments={openComments}
