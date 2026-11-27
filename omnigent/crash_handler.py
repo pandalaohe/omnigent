@@ -44,6 +44,11 @@ from typing import BinaryIO, TextIO, TypedDict
 from omnigent.crash_ui import real_stderr, render_crash_screen
 from omnigent.private_file import write_private_text
 from omnigent.process_logging import data_dir
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VALUE,
+    OMNIGENT_SESSION_ENV_VAR,
+    RUNNER_ID_ENV_VAR,
+)
 
 # Saved at install time so we can defer to the originals for
 # KeyboardInterrupt / SystemExit and as a last-resort fallback if our
@@ -279,15 +284,63 @@ def handle_crash(
         _HANDLING.on = False
 
 
-def _is_interactive(stream: TextIO) -> bool:
-    """Interactive only when BOTH stderr and stdin are real TTYs.
+def _in_managed_session() -> bool:
+    """Return True when running inside an Omnigent-managed session."""
+    return bool(
+        os.environ.get(RUNNER_ID_ENV_VAR, "").strip()
+        or os.environ.get("OMNIGENT_SESSION_ID", "").strip()
+        or os.environ.get(OMNIGENT_SESSION_ENV_VAR, "").strip() == OMNIGENT_SESSION_ENV_VALUE
+    )
 
-    This avoids hanging in scripts/CI where stderr happens to be a TTY
-    but stdin is closed or piped.
+
+def _is_windows_console(stream: TextIO) -> bool:
+    """Return True only when *stream* backs a real Windows console handle.
+
+    Windows' CRT ``_isatty()`` returns True for any character device,
+    including ``NUL``. Checking ``GetConsoleMode`` rejects ``NUL`` and
+    other non-console handles.
     """
-    stderr_tty = bool(getattr(stream, "isatty", lambda: False)())
-    stdin_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
-    return stderr_tty and stdin_tty
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(stream.fileno())  # type: ignore[attr-defined]
+        if handle == -1:
+            return False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        get_console_mode = kernel32.GetConsoleMode
+        get_console_mode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        get_console_mode.restype = ctypes.c_int
+        mode = ctypes.c_uint32()
+        return bool(get_console_mode(ctypes.c_void_p(handle), ctypes.byref(mode)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_real_tty(stream: TextIO | None) -> bool:
+    if stream is None:
+        return False
+    try:
+        if not bool(getattr(stream, "isatty", lambda: False)()):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    if sys.platform == "win32":
+        return _is_windows_console(stream)
+    return True
+
+
+def _is_interactive(stream: TextIO) -> bool:
+    """Interactive only when stderr and stdin are real TTYs outside a managed session.
+
+    Avoids hanging or opening a browser in scripts, CI, Omnigent-managed
+    agent sessions, or Windows processes attached to ``NUL``.
+    """
+    if _in_managed_session():
+        return False
+    return _is_real_tty(stream) and _is_real_tty(sys.stdin)
 
 
 # --------------------------------------------------------------------------- #
@@ -594,14 +647,19 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
 
 
 def _prompt_yes_no(prompt: str, stream: TextIO) -> bool:
-    """Ask a yes/no question; default Yes on empty Enter. Never raises."""
+    """Ask a yes/no question; default Yes on empty Enter, No on EOF. Never raises."""
     try:
         stream.write(prompt)
         stream.flush()
-        line = sys.stdin.readline().strip().lower()
+        raw = sys.stdin.readline()
     except Exception:  # noqa: BLE001  pragma: no cover  (EOF / closed stdin)
         return False
-    return line in ("", "y", "yes")
+    if not raw:
+        return False
+    answer = raw.strip().lower()
+    if not answer:
+        return raw.endswith(("\n", "\r"))
+    return answer in ("y", "yes")
 
 
 def _print(stream: TextIO, text: str) -> None:

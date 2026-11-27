@@ -435,6 +435,208 @@ def test_interactive_default_enter_is_yes(data_dir: Path, monkeypatch: pytest.Mo
     assert "copied" in calls
 
 
+@pytest.mark.parametrize(
+    ("raw_input", "expected"),
+    [
+        ("", False),
+        ("   ", False),
+        ("\n", True),
+        ("\r\n", True),
+        ("   \n", True),
+        ("y\n", True),
+        ("Y\n", True),
+        ("yes\n", True),
+        ("n\n", False),
+        ("no\n", False),
+    ],
+    ids=[
+        "eof",
+        "whitespace-eof",
+        "empty-enter",
+        "crlf-enter",
+        "spaces-enter",
+        "y",
+        "upper-y",
+        "yes",
+        "n",
+        "no",
+    ],
+)
+def test_prompt_yes_no_distinguishes_eof_from_enter(
+    monkeypatch: pytest.MonkeyPatch, raw_input: str, expected: bool
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw_input))
+    assert ch._prompt_yes_no("file? [Y/n] ", io.StringIO()) is expected
+
+
+def test_interactive_eof_does_not_open_browser(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    called: list[str] = []
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda _text: called.append("copy") or True)
+    monkeypatch.setattr(ch, "_open_browser", lambda _url: called.append("browser") or True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # immediate EOF
+    ch.handle_crash(_make_exc("eof-branch"), interactive=True, source="test")
+    assert called == []
+    assert "Report saved here:" in _strip_ansi(stream.getvalue())
+
+
+class _FakeFdTTY(FakeTTY):
+    def __init__(self, fd: int) -> None:
+        super().__init__()
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+
+def _clear_managed_session_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in ("OMNIGENT", "OMNIGENT_RUNNER_ID", "OMNIGENT_SESSION_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("console_handles", "expected"),
+    [
+        ({100, 200}, True),
+        ({200}, False),  # stdin is NUL (isatty True, GetConsoleMode fails)
+        ({100}, False),  # stderr is NUL
+        (set(), False),
+    ],
+    ids=["real-console", "stdin-nul", "stderr-nul", "both-nul"],
+)
+def test_is_interactive_windows_requires_real_console(
+    monkeypatch: pytest.MonkeyPatch, console_handles: set[int], expected: bool
+) -> None:
+    import ctypes
+    import types
+
+    _clear_managed_session_env(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "win32")
+    fd_to_handle = {0: 100, 2: 200}
+    fake_msvcrt = types.SimpleNamespace(get_osfhandle=lambda fd: fd_to_handle[fd])
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    class _FakeGetConsoleMode:
+        argtypes: list[object] = []
+        restype: object = None
+
+        def __call__(self, handle: ctypes.c_void_p, _mode_ptr: object) -> int:
+            return 1 if handle.value in console_handles else 0
+
+    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_FakeGetConsoleMode())
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
+    stdin_stream = _FakeFdTTY(0)
+    stderr_stream = _FakeFdTTY(2)
+    monkeypatch.setattr(sys, "stdin", stdin_stream)
+    assert ch._is_interactive(stderr_stream) is expected
+
+
+def test_is_interactive_windows_rejects_invalid_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import types
+
+    _clear_managed_session_env(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda _fd: -1))
+    monkeypatch.setattr(sys, "stdin", _FakeFdTTY(0))
+    assert ch._is_interactive(_FakeFdTTY(2)) is False
+
+
+def test_windows_nul_eof_einval_never_prompts_or_opens_browser(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows NUL stdin/stderr (isatty True, non-console, EOF) + EINVAL saves without browser."""
+    import ctypes
+    import errno
+    import types
+
+    _clear_managed_session_env(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "win32")
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", enable_faulthandler=False)
+
+    monkeypatch.setitem(
+        sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: 100 + fd)
+    )
+
+    class _FakeGetConsoleMode:
+        argtypes: list[object] = []
+        restype: object = None
+
+        def __call__(self, _handle: ctypes.c_void_p, _mode_ptr: object) -> int:
+            return 0
+
+    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_FakeGetConsoleMode())
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
+
+    stdin_stream = _FakeFdTTY(0)  # empty buffer -> EOF on readline(), isatty() True
+    stderr_stream = _FakeFdTTY(2)
+    monkeypatch.setattr(sys, "stdin", stdin_stream)
+    monkeypatch.setattr(ch, "real_stderr", lambda: stderr_stream)
+
+    called: list[str] = []
+    monkeypatch.setattr(ch, "_prompt_yes_no", lambda *_a: called.append("prompt") or True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda _t: called.append("copy") or True)
+    monkeypatch.setattr(ch, "_open_browser", lambda _u: called.append("browser") or True)
+
+    ch.handle_crash(OSError(errno.EINVAL, "Invalid argument"), source="uncaught")
+
+    assert called == []
+    reports = list((data_dir / "crashes").glob("crash-*.md"))
+    assert len(reports) == 1
+    out = _strip_ansi(stderr_stream.getvalue())
+    assert str(reports[0]) in out
+    assert "A crash report was saved to:" in out
+
+
+@pytest.mark.parametrize(
+    ("env_var", "env_value"),
+    [
+        ("OMNIGENT_RUNNER_ID", "runner_test_123"),
+        ("OMNIGENT_SESSION_ID", "session_test_123"),
+        ("OMNIGENT", "1"),
+    ],
+    ids=["runner-id", "session-id", "omnigent-marker"],
+)
+def test_managed_session_is_noninteractive_and_saves_report_without_browser(
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_var: str,
+    env_value: str,
+) -> None:
+    _clear_managed_session_env(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "linux")
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+
+    stderr_stream = FakeTTY()
+    stdin_stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stderr_stream)
+    monkeypatch.setattr(sys, "stdin", stdin_stream)
+
+    assert ch._is_interactive(stderr_stream) is True
+
+    monkeypatch.setenv(env_var, env_value)
+    assert ch._is_interactive(stderr_stream) is False
+
+    called: list[str] = []
+    monkeypatch.setattr(ch, "_prompt_yes_no", lambda *_a: called.append("prompt") or True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda _t: called.append("copy") or True)
+    monkeypatch.setattr(ch, "_open_browser", lambda _u: called.append("browser") or True)
+
+    ch.handle_crash(_make_exc("agent-shell-crash"), source="test")
+
+    assert called == []
+    reports = list((data_dir / "crashes").glob("crash-*.md"))
+    assert len(reports) == 1
+    out = _strip_ansi(stderr_stream.getvalue())
+    assert str(reports[0]) in out
+    assert "A crash report was saved to:" in out
+
+
 def test_noninteractive_falls_back_to_link(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
