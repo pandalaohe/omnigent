@@ -1,22 +1,19 @@
 """The host load CLI reads only its local file and always emits schema 1."""
 
-import ctypes
 import errno
-import io
 import json
+import os
+import subprocess
 import sys
-import threading
+import textwrap
 import time
-import types
 from pathlib import Path
 
 import click
 import pytest
 from click.testing import CliRunner
 
-from omnigent import cli_diagnostics
-from omnigent import crash_handler as ch
-from omnigent.cli import cli, main
+from omnigent.cli import cli
 from omnigent.host.load_level import utc_iso
 from omnigent.util.atomic_json import atomic_write_json
 
@@ -144,63 +141,113 @@ def test_host_load_unrelated_oserror_propagates(
     assert result.exception.errno == errno.EIO
 
 
-def test_host_load_main_windows_nul_eof_einval_exits_quietly_without_browser(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _clean_subprocess_env(data_dir: Path) -> dict[str, str]:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"OMNIGENT", "OMNIGENT_RUNNER_ID", "OMNIGENT_SESSION_ID"}
+    }
+    env["OMNIGENT_DATA_DIR"] = str(data_dir)
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
+    return env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX closed-pipe SIGPIPE/EPIPE probe")
+def test_host_load_closed_pipe_exits_quietly_through_shutdown(tmp_path: Path) -> None:
+    """Real closed stdout pipe exits 1 with empty stderr and no crash report."""
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from omnigent.cli import main; "
+                "sys.argv = ['omnigent', 'host', 'load', '--json']; main()",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_clean_subprocess_env(tmp_path),
+            timeout=30,
+        )
+    finally:
+        os.close(write_fd)
+
+    assert proc.returncode == 1
+    assert proc.stderr == ""
+    assert not list((tmp_path / "crashes").glob("crash-*.md"))
+
+
+def test_host_load_windows_nul_eof_einval_exits_quietly_through_shutdown(
+    tmp_path: Path,
 ) -> None:
-    """Windows DEVNULL stdin/stderr (isatty True, non-console, EOF) + EINVAL exits quietly."""
+    """Real main() + click.echo flush raising EINVAL under Windows NUL/EOF exits quietly."""
+    marker = tmp_path / "browser-opened"
+    script = textwrap.dedent(
+        f"""
+        import ctypes, errno, io, sys, types, webbrowser
+        from pathlib import Path
+        from omnigent.cli import main
 
-    class _FakeNulStream(io.StringIO):
-        def __init__(self, fd: int) -> None:
-            super().__init__("")
-            self._fd = fd
+        class _FailingRaw(io.RawIOBase):
+            def writable(self) -> bool:
+                return True
 
-        def isatty(self) -> bool:
-            return True
+            def write(self, _b: object) -> int:
+                raise OSError(errno.EINVAL, "Invalid argument")
 
-        def fileno(self) -> int:
-            return self._fd
+        class _FakeNulStdin(io.StringIO):
+            def isatty(self) -> bool:
+                return True
 
-    class _FakeGetConsoleMode:
-        argtypes: list[object] = []
-        restype: object = None
+            def fileno(self) -> int:
+                return 0
 
-        def __call__(self, _handle: ctypes.c_void_p, _mode_ptr: object) -> int:
-            return 0
+        class _FakeNulStderr:
+            def __init__(self, wrapped: object) -> None:
+                self._wrapped = wrapped
 
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_NO_UPDATE_CHECK", "1")
-    for var in ("OMNIGENT", "OMNIGENT_RUNNER_ID", "OMNIGENT_SESSION_ID"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(sys, "argv", ["omnigent", "host", "load", "--json"])
-    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
-    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    fake_stdin = _FakeNulStream(0)
-    fake_stderr = _FakeNulStream(2)
-    monkeypatch.setattr(sys, "stdin", fake_stdin)
-    monkeypatch.setattr(sys, "stderr", fake_stderr)
-    monkeypatch.setitem(
-        sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: 100 + fd)
-    )
-    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_FakeGetConsoleMode())
-    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
-    monkeypatch.setattr(ch, "_enable_faulthandler", lambda: None)
-    monkeypatch.setattr(cli_diagnostics, "setup_cli_logging", lambda _argv: None)
+            def isatty(self) -> bool:
+                return True
 
-    called: list[str] = []
-    monkeypatch.setattr(ch, "handle_crash", lambda *_a, **_k: called.append("handle_crash"))
-    monkeypatch.setattr(ch, "_prompt_yes_no", lambda *_a: called.append("prompt") or True)
-    monkeypatch.setattr(ch, "_open_browser", lambda _url: called.append("browser") or True)
+            def fileno(self) -> int:
+                return 2
 
-    def fail_echo(*_args: object, **_kwargs: object) -> None:
-        raise OSError(errno.EINVAL, "Invalid argument")
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._wrapped, name)
 
-    monkeypatch.setattr(click, "echo", fail_echo)
+        class _FakeGetConsoleMode:
+            argtypes: list[object] = []
+            restype: object = None
 
-    with pytest.raises(SystemExit) as exc_info:
+            def __call__(self, _handle: ctypes.c_void_p, _mode_ptr: object) -> int:
+                return 0
+
+        sys.platform = "win32"
+        sys.modules["msvcrt"] = types.SimpleNamespace(get_osfhandle=lambda fd: 100 + fd)
+        ctypes.WinDLL = lambda *_a, **_k: types.SimpleNamespace(
+            GetConsoleMode=_FakeGetConsoleMode()
+        )
+        webbrowser.open = lambda *_a, **_k: Path({str(marker)!r}).write_text("opened") or True
+        sys.stdin = _FakeNulStdin("")
+        sys.stderr = _FakeNulStderr(sys.stderr)
+        sys.stdout = io.TextIOWrapper(io.BufferedWriter(_FailingRaw()), encoding="utf-8")
+        sys.argv = ["omnigent", "host", "load", "--json"]
         main()
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=_clean_subprocess_env(tmp_path),
+        timeout=30,
+    )
 
-    assert exc_info.value.code == 1
-    assert called == []
-    assert fake_stderr.getvalue() == ""
+    assert proc.returncode == 1
+    assert proc.stderr == ""
+    assert not marker.exists()
     assert not list((tmp_path / "crashes").glob("crash-*.md"))

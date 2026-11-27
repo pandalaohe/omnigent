@@ -12404,6 +12404,23 @@ def host_disable() -> None:
     click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
+def _silence_broken_stdout() -> None:
+    """Prevent Python shutdown flush from failing noisily on a broken stdout."""
+    import io
+
+    stream = sys.stdout
+    if stream is None:
+        return
+    orig = sys.__stdout__
+    if orig is not None and stream is orig:
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            fd = orig.fileno()
+            with open(os.devnull, "w") as sink:
+                os.dup2(sink.fileno(), fd)
+            return
+    sys.stdout = io.StringIO()
+
+
 @host.command("load")
 @click.option("--json", "json_output", is_flag=True, help="Emit the local load contract as JSON.")
 def host_load(json_output: bool) -> None:
@@ -12426,9 +12443,11 @@ def host_load(json_output: bool) -> None:
             )
             click.echo(f"path: {payload['path']}")
     except BrokenPipeError:
+        _silence_broken_stdout()
         raise SystemExit(1) from None
     except OSError as exc:
         if exc.errno in (errno.EINVAL, errno.EPIPE):
+            _silence_broken_stdout()
             raise SystemExit(1) from None
         raise
     if not fresh:
