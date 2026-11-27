@@ -112,7 +112,7 @@ async def _read_codex_native_permission_observation(
             response = await client.request(
                 "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
             )
-    except (OSError, RuntimeError, WebSocketException) as exc:
+    except (OSError, RuntimeError, WebSocketException, json.JSONDecodeError) as exc:
         # Codex cannot resume a fresh thread until its first rollout is written.
         _logger.debug("Codex permission readback unavailable (%s)", type(exc).__name__)
         return None

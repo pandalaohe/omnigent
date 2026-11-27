@@ -5523,6 +5523,7 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
+                runner_router,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:

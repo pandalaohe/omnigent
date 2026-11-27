@@ -384,7 +384,6 @@ from omnigent.server.session_orchestration import (
     require_orchestration_source,
 )
 from omnigent.session_default_modes import (
-    CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
     SPEED_TIER_LABEL_KEY,
     SPEED_TIER_REQUESTED_LABEL_KEY,
     valid_speed_tier,
@@ -8528,27 +8527,21 @@ def register_core_routes(
                             {CODEX_SDK_APPROVAL_MODE_LABEL_KEY: requested_codex_approval_mode},
                         )
                     else:
-                        from omnigent.server.routes._sessions.helpers import (
-                            _merge_codex_permission_launch_args,
-                        )
-
-                        await asyncio.to_thread(
-                            conversation_store.update_conversation,
-                            session_id,
-                            terminal_launch_args=_merge_codex_permission_launch_args(
-                                updated.terminal_launch_args,
-                                CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[
-                                    requested_codex_approval_mode
-                                ],
-                            ),
-                        )
-                        await _persist_web_codex_permission_observation(
+                        saved = await _persist_web_codex_permission_observation(
                             session_id,
                             updated,
                             requested_codex_approval_mode,
                             codex_permission_application_receipt(requested_codex_approval_mode),
                             conversation_store,
+                            runner_router,
+                            save_launch_args=True,
                         )
+                        if not saved:
+                            raise OmnigentError(
+                                "The session's runner changed before the restriction could be "
+                                "confirmed. Retry the mode change.",
+                                code=ErrorCode.CONFLICT,
+                            )
                     return JSONResponse(status_code=409, content=approval_payload)
             _require_codex_approval_mode_forward(
                 session_id,
@@ -8579,6 +8572,7 @@ def register_core_routes(
                     requested_codex_approval_mode,
                     observed,
                     conversation_store,
+                    runner_router,
                 )
         if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
             labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode

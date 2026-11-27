@@ -18,7 +18,7 @@ import math
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -582,7 +582,8 @@ def _route_to_runner(monkeypatch: pytest.MonkeyPatch, runner: httpx.AsyncClient)
 
 @asynccontextmanager
 async def _runtime_runner(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]],
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Scope a legacy fixed runner and close its transport even when a test fails."""
     from omnigent.runtime import get_runner_client, set_runner_client
@@ -18208,6 +18209,223 @@ async def test_native_permission_runner_binding_and_readback_context_are_separat
     )
 
 
+@pytest.mark.parametrize(
+    ("readback_failures", "hang_first_read"),
+    [(0, False), (1, False), (2, False), pytest.param(1, True, id="transport-times-out")],
+)
+async def test_native_permission_report_crossing_web_write_reads_current_settings(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    readback_failures: int,
+    hang_first_read: bool,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    url = f"/v1/sessions/{session['id']}"
+    loose = codex_permissions.codex_permission_observation_from_thread_settings(
+        {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}},
+        origin="resume",
+    )
+    tight = codex_permissions.codex_permission_observation_from_thread_settings(
+        {
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {"type": "workspaceWrite"},
+        },
+        origin="settings-updated",
+    )
+    switched, report_authorized, write_report = (asyncio.Event() for _ in range(3))
+    forwarded: list[str] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    persist = routes_events._persist_external_codex_approval_mode_change
+
+    async def delay_report(*args: Any) -> None:
+        report_authorized.set()
+        await asyncio.wait_for(write_report.wait(), 5)
+        await persist(*args)
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(204)
+        event_type = json.loads(request.content)["type"]
+        forwarded.append(event_type)
+        if event_type == "codex_approval_mode_change":
+            switched.set()
+            await asyncio.wait_for(report_authorized.wait(), 5)
+            return httpx.Response(200, json={"permission_observation": loose.to_payload()})
+        assert event_type == "codex_permission_readback"
+        if hang_first_read and forwarded.count(event_type) == 1:
+            await asyncio.Event().wait()
+        if forwarded.count(event_type) <= readback_failures:
+            return httpx.Response(204)
+        return httpx.Response(
+            200, json={"permission_observation": replace(tight, origin="resume").to_payload()}
+        )
+
+    monkeypatch.setattr(
+        routes_events, "_persist_external_codex_approval_mode_change", delay_report
+    )
+    if hang_first_read:
+        monkeypatch.setattr(helpers, "_CODEX_PERMISSION_RECONCILE_TIMEOUT_S", 0.05)
+    async with _runtime_runner(handle) as runner, asyncio.TaskGroup() as tasks:
+        _route_to_runner(monkeypatch, runner)
+        web = tasks.create_task(client.patch(url, json={"approval_mode": "full-access"}))
+        await asyncio.wait_for(switched.wait(), 5)
+        terminal = tasks.create_task(
+            client.post(
+                f"{url}/events",
+                json={
+                    "type": "external_codex_approval_mode_change",
+                    "data": {
+                        "approval_mode": tight.mode,
+                        "permission_observation": tight.to_payload(),
+                    },
+                },
+            )
+        )
+        try:
+            response = await asyncio.wait_for(web, 5)
+            assert response.status_code == 200, response.text
+            assert response.json()["permission_mode"] == "full-access"
+        finally:
+            write_report.set()
+        await asyncio.wait_for(terminal, 5)
+
+    assert terminal.result().status_code == 202, terminal.result().text
+    snapshot = (await client.get(url)).json()
+    expected = "unknown" if readback_failures == 2 else "ask-for-approval"
+    assert snapshot["permission_mode"] == expected
+    assert [
+        event["approval_mode"]
+        for _, event in published
+        if event["type"] == "session.codex_approval_mode"
+    ] == ["full-access", expected]
+    assert forwarded == ["codex_approval_mode_change"] + ["codex_permission_readback"] * min(
+        2, readback_failures + 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "after_save"),
+    [
+        ("terminal", False),
+        ("web", False),
+        ("helper-stop", False),
+        ("terminal", True),
+        ("web", True),
+    ],
+)
+async def test_native_permission_write_cannot_cross_runner_rebind(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    after_save: bool,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    launch_args = ["--sandbox", "workspace-write"]
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+        terminal_launch_args=launch_args,
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner-old")
+    packet = await _native_permission_packet(session_id, tmp_path)
+    key = "omnigent.codex_native.permission_observation"
+    previous_observation = codex_permissions.encode_codex_permission_observation(
+        codex_permissions.codex_permission_observation_with_metadata(
+            codex_permissions.codex_permission_observation_from_payload(
+                packet["data"]["permission_observation"]
+            ),
+            runner_id="runner-old",
+            received_at=1,
+        )
+    )
+    store.set_labels(session_id, {key: previous_observation})
+    observation_labels = helpers._codex_permission_observation_labels
+    save = SqlAlchemyConversationStore.save_runner_permission_readback
+    published: list[str] = []
+
+    def rebind_before_save(*args: Any) -> Any:
+        labels = observation_labels(*args)
+        store.replace_runner_id(session_id, "runner-new")
+        return labels
+
+    def rebind_after_save(*args: Any, **kwargs: Any) -> Any:
+        result = save(*args, **kwargs)
+        assert result == "saved"
+        store.replace_runner_id(session_id, "runner-new")
+        return result
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(204)
+        if source == "helper-stop":
+            return httpx.Response(
+                409,
+                json={
+                    "error": "codex_helper_stop_pending",
+                    "detail": "Mode saved for the next turn; some helper stops are unconfirmed.",
+                },
+            )
+        return httpx.Response(200, json={"approval_mode": "read-only"})
+
+    def publish(_session_id: str, event: dict[str, Any]) -> None:
+        if event["type"] == "session.codex_approval_mode":
+            published.append(event["approval_mode"])
+
+    if after_save:
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore, "save_runner_permission_readback", rebind_after_save
+        )
+    else:
+        monkeypatch.setattr(helpers, "_codex_permission_observation_labels", rebind_before_save)
+    monkeypatch.setattr(helpers.session_stream, "publish", publish)
+    url = f"/v1/sessions/{session_id}"
+    async with _runtime_runner(handle):
+        if source == "terminal":
+            response = await client.post(f"{url}/events", json=packet)
+        else:
+            response = await client.patch(url, json={"approval_mode": "read-only"})
+
+    assert response.status_code == {"terminal": 202, "web": 200, "helper-stop": 409}[source]
+    if source == "helper-stop":
+        assert "runner changed" in response.text
+        assert "Mode saved" not in response.text
+    snapshot = (await client.get(url)).json()
+    assert snapshot["runner_id"] == "runner-new"
+    assert snapshot["permission_mode"] == "unknown"
+    assert snapshot["terminal_launch_args"] == launch_args
+    if not after_save:
+        assert snapshot["labels"][key] == previous_observation
+    assert published == []
+
+    monkeypatch.setattr(helpers, "_codex_permission_observation_labels", observation_labels)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "save_runner_permission_readback", save)
+    assert (await client.post(f"{url}/events", json=packet)).status_code == 202
+    snapshot = (await client.get(url)).json()
+    assert snapshot["permission_mode"] == "full-access"
+    assert published == ["full-access"]
+
+
 @pytest.mark.parametrize("matched_binding", [False, True])
 async def test_native_permission_editor_requires_matching_bound_runner_token(
     auth_client: httpx.AsyncClient,
@@ -18263,20 +18481,18 @@ async def test_native_permission_store_failure_does_not_publish_or_change_contro
     packet = await _native_permission_packet(session["id"], tmp_path)
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
-    original = SqlAlchemyConversationStore.set_labels
+    original = SqlAlchemyConversationStore.save_runner_permission_readback
 
-    def fail(self: Any, session_id: str, labels: dict[str, str]) -> None:
-        if "omnigent.codex_native.permission_observation" in labels:
-            raise RuntimeError("test persistence failure")
-        original(self, session_id, labels)
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("test persistence failure")
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", fail)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "save_runner_permission_readback", fail)
     with pytest.raises(RuntimeError, match="test persistence failure"):
         await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
     row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
     assert row is not None and row.terminal_launch_args == saved_args
     assert "omnigent.codex_native.permission_observation" not in row.labels and published == []
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", original)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "save_runner_permission_readback", original)
     assert (
         await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
     ).status_code == 202
@@ -18318,9 +18534,10 @@ async def test_native_permission_retry_republishes_persisted_observation_after_p
     )
 
 
-@pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.parametrize("status", [200, 409, 503])
 async def test_native_permission_control_pending_report_and_saved_args_are_independent(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db_uri: str,
     status: int,
@@ -18333,23 +18550,48 @@ async def test_native_permission_control_pending_report_and_saved_args_are_indep
         session["id"], {"omnigent.wrapper": "codex-native-ui", "omnigent.ui": "terminal"}
     )
     packet = await _native_permission_packet(session["id"], tmp_path)
+    report = codex_permissions.codex_permission_observation_from_thread_settings(
+        {
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {"type": "workspaceWrite" if status == 409 else "readOnly"},
+        },
+        origin="settings-updated",
+    )
+    packet["data"] = {"approval_mode": report.mode, "permission_observation": report.to_payload()}
     entered, release = asyncio.Event(), asyncio.Event()
+    requested = "read-only" if status == 409 else "full-access"
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
+            if json.loads(request.content)["type"] == "codex_permission_readback":
+                if status == 409:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "permission_observation": replace(report, origin="resume").to_payload()
+                        },
+                    )
+                return httpx.Response(204)
             entered.set()
             await release.wait()
-        return httpx.Response(status, json={"approval_mode": "full-access"})
+        payload = (
+            {"error": "codex_helper_stop_pending"}
+            if status == 409
+            else {"approval_mode": requested}
+        )
+        return httpx.Response(status, json=payload)
 
-    async with _runtime_runner(handle):
+    async with _runtime_runner(handle) as runner:
+        _route_to_runner(monkeypatch, runner)
         pending = asyncio.create_task(
-            client.patch(f"/v1/sessions/{session['id']}", json={"approval_mode": "full-access"})
+            client.patch(f"/v1/sessions/{session['id']}", json={"approval_mode": requested})
         )
         await asyncio.wait_for(entered.wait(), 2)
         try:
             before = (await client.get(f"/v1/sessions/{session['id']}")).json()
             assert "omnigent.codex_native.permission_observation" not in before["labels"]
-            saved_args = ["--sandbox", "read-only", "-a", "on-request"]
+            saved_args = ["--no-alt-screen", "--sandbox", "read-only", "-a", "on-request"]
             saved = await client.patch(
                 f"/v1/sessions/{session['id']}",
                 json={"terminal_launch_args": saved_args, "silent": True},
@@ -18364,13 +18606,19 @@ async def test_native_permission_control_pending_report_and_saved_args_are_indep
         finally:
             release.set()
         response = await pending
-    assert response.status_code == (200 if status == 200 else 503), response.text
+    assert response.status_code == status, response.text
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["terminal_launch_args"] == saved_args
+    assert snapshot["terminal_launch_args"] == (
+        ["--no-alt-screen", "--sandbox", "read-only", "--ask-for-approval", "on-request"]
+        if status == 409
+        else saved_args
+    )
     encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
     observed = codex_permissions.decode_codex_permission_observation(encoded)
     if status == 200:
         assert observed.source == "application-receipt" and observed.mode == "unknown"
+    elif status == 409:
+        assert observed.origin == "resume" and observed.mode == "ask-for-approval"
     else:
         assert encoded == reported and observed.source == "native-settings"
 

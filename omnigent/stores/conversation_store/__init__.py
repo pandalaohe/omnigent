@@ -2281,6 +2281,22 @@ class ConversationStore(ABC):
         """
         ...
 
+    def save_runner_permission_readback(
+        self,
+        expected: Conversation,
+        labels: dict[str, str],
+        *,
+        update_launch_args: Callable[[list[str] | None], list[str]] | None = None,
+    ) -> Literal["saved", "binding-changed", "observation-changed"]:
+        """Save a readback if its binding and previous stored observation still match."""
+        raise NotImplementedError
+
+    def publish_runner_permission_readback(
+        self, expected: Conversation, encoded: str, publish: Callable[[], None]
+    ) -> bool:
+        """Enqueue a committed readback if still current and report whether binding matches."""
+        raise NotImplementedError
+
     @abstractmethod
     def mutate_label_group(
         self,

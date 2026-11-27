@@ -73,6 +73,73 @@ def _grant_search_access(db_uri: str, *conversation_ids: str) -> None:
 
 
 @pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_runner_permission_readback_is_fenced_by_binding(
+    request: pytest.FixtureRequest, store_fixture: str
+) -> None:
+    store = request.getfixturevalue(store_fixture)
+    conv = store.create_conversation(terminal_launch_args=["--no-alt-screen"])
+    assert store.set_runner_id(conv.id, "runner-old")
+    old = store.get_conversation(conv.id)
+    store.replace_runner_id(conv.id, "runner-new")
+    current = store.get_conversation(conv.id)
+    assert old is not None and current is not None
+
+    def add_sandbox(args: list[str] | None) -> list[str]:
+        return [*(args or []), "--sandbox", "read-only"]
+
+    labels = {"omnigent.codex_native.permission_observation": "test-observation"}
+    assert (
+        store.save_runner_permission_readback(old, labels, update_launch_args=add_sandbox)
+        == "binding-changed"
+    )
+    assert store.get_conversation(conv.id) == current
+    assert (
+        store.save_runner_permission_readback(current, labels, update_launch_args=add_sandbox)
+        == "saved"
+    )
+    saved = store.get_conversation(conv.id)
+    assert saved is not None and saved.labels == labels
+    assert saved.terminal_launch_args == ["--no-alt-screen", "--sandbox", "read-only"]
+    assert (
+        store.save_runner_permission_readback(current, labels, update_launch_args=add_sandbox)
+        == "observation-changed"
+    )
+    assert store.get_conversation(conv.id) == saved
+
+
+def test_runner_permission_readback_split_db_does_not_expose_uncommitted_argv(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    store = split_db_conversation_store
+    conv = store.create_conversation(terminal_launch_args=["--no-alt-screen"])
+    observation_key = "omnigent.codex_native.permission_observation"
+    labels = {observation_key: "test-observation"}
+
+    def fail_metadata_commit(_connection: Any) -> None:
+        raise RuntimeError("test metadata commit failure")
+
+    def update_launch_args(args: list[str] | None) -> list[str]:
+        return [*(args or []), "--sandbox", "read-only"]
+
+    event.listen(store._engine, "commit", fail_metadata_commit)
+    try:
+        with pytest.raises(RuntimeError, match="test metadata commit failure"):
+            store.save_runner_permission_readback(
+                conv, labels, update_launch_args=update_launch_args
+            )
+    finally:
+        event.remove(store._engine, "commit", fail_metadata_commit)
+
+    after_failure = store.get_conversation(conv.id)
+    assert after_failure is not None and observation_key not in after_failure.labels
+    assert after_failure.terminal_launch_args == conv.terminal_launch_args
+    assert (
+        store.save_runner_permission_readback(conv, labels, update_launch_args=update_launch_args)
+        == "saved"
+    )
+
+
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
 def test_mutate_label_group_preserves_siblings_and_literal_prefix(
     request: pytest.FixtureRequest, store_fixture: str
 ) -> None:

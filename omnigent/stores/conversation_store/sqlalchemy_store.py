@@ -162,6 +162,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     COMPACTION_COUNT_CAP,
     CREATED_BY_SESSION_LABEL_KEY,
     FAMILY_PIN_LABEL_PREFIX,
@@ -2869,6 +2870,87 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         else:
             run_write_transaction(self._conv_session_immediate, "set_labels", write)
+
+    def _lock_permission_readback_binding(
+        self, session: Session, expected: Conversation
+    ) -> SqlConversationMetadata | None:
+        meta = session.get(
+            SqlConversationMetadata,
+            (current_workspace_id(), expected.id),
+            with_for_update=self._meta_supports_for_update,
+        )
+        if meta is None or (meta.host_id, meta.runner_id) != (
+            expected.host_id,
+            expected.runner_id,
+        ):
+            return None
+        return meta
+
+    def save_runner_permission_readback(
+        self,
+        expected: Conversation,
+        labels: dict[str, str],
+        *,
+        update_launch_args: Callable[[list[str] | None], list[str]] | None = None,
+    ) -> Literal["saved", "binding-changed", "observation-changed"]:
+        """Fence both settings writes with the metadata row used for runner binding."""
+        operation = "save_runner_permission_readback"
+        key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
+
+        def write(
+            session: Session, *, save_args: bool, save_labels: bool
+        ) -> Literal["saved", "binding-changed", "observation-changed"]:
+            meta = self._lock_permission_readback_binding(session, expected)
+            if meta is None:
+                return "binding-changed"
+            with self._profile_label_session(
+                session, read_only=not save_labels, operation=operation
+            ) as labels_session:
+                saved = _fetch_labels(labels_session, expected.id, keys=(key,))
+                if saved.get(key) != expected.labels.get(key):
+                    return "observation-changed"
+                if save_args and update_launch_args is not None:
+                    args = (
+                        json.loads(meta.terminal_launch_args)
+                        if meta.terminal_launch_args is not None
+                        else None
+                    )
+                    meta.terminal_launch_args = json.dumps(update_launch_args(args))
+                if save_labels:
+                    _upsert_labels(labels_session, expected.id, labels, now_epoch())
+            return "saved"
+
+        split_args = update_launch_args is not None and self._conv_engine is not self._engine
+        if split_args:
+            # Commit metadata before exposing the observation on the other engine.
+            result = run_write_transaction(
+                self._session_immediate,
+                operation,
+                lambda session: write(session, save_args=True, save_labels=False),
+            )
+            if result != "saved":
+                return result
+        return run_write_transaction(
+            self._session_immediate,
+            operation,
+            lambda session: write(session, save_args=not split_args, save_labels=True),
+        )
+
+    def publish_runner_permission_readback(
+        self, expected: Conversation, encoded: str, publish: Callable[[], None]
+    ) -> bool:
+        operation = "publish_runner_permission_readback"
+        key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
+        # Publishing schedules a stream frame synchronously. Do not retry that side effect.
+        with self._session_immediate(operation) as session:
+            if self._lock_permission_readback_binding(session, expected) is None:
+                return False
+            with self._profile_label_session(
+                session, read_only=True, operation=operation
+            ) as labels_session:
+                if _fetch_labels(labels_session, expected.id, keys=(key,)).get(key) == encoded:
+                    publish()
+            return True
 
     def mutate_label_group(
         self,
