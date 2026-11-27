@@ -39,7 +39,7 @@ from omnigent.server.session_choice_external import ExternalAdmission, ExternalA
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
-    from omnigent.usage.contract import UsageAccountView
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
 
 CHOICE_LABEL = "omnigent.session_choice"
 SLOT_LABEL = "omnigent.startup.session_choice"
@@ -955,7 +955,7 @@ def tile_line(
     floor_off: FloorOff | None,
     now: float,
 ) -> TileLine:
-    """Evaluate fresh window and balance sections without retaining enforcement state."""
+    """Evaluate fresh window and balance sections, retaining reserve state until reset."""
     reserve = limits.reserve
     health = (reading.mark or {}).get("provider_refusal") if reading is not None else None
     if reading is not None and reading.state == "stopped" and isinstance(health, dict):
@@ -976,53 +976,113 @@ def tile_line(
         if reading
         else None,
     )
-    if reading is None or (
+    if reading is None:
+        return result
+
+    def usable_window(candidate: UsageWindowView | None) -> bool:
+        return bool(
+            reserve
+            and candidate
+            and not candidate.past_reset
+            and candidate.remaining_pct is not None
+            and (candidate.resets_at is None or candidate.resets_at > now)
+            and (
+                reserve.mode == "total"
+                or (candidate.resets_at is not None and (candidate.window_minutes or 0) >= 1440)
+            )
+        )
+
+    def evaluate_reserve(
+        candidate: UsageWindowView,
+        base: TileLine,
+        *,
+        released_flag: bool,
+        stale_reason: str | None = None,
+    ) -> TileLine:
+        assert reserve is not None and candidate.remaining_pct is not None
+        warn_line = (
+            reserve_now(reserve.mode, reserve.pct, candidate.resets_at or now, now)
+            if reserve.pct is not None
+            else None
+        )
+        stop_line = (
+            reserve_now(reserve.mode, reserve.stop_pct, candidate.resets_at or now, now)
+            if reserve.stop_pct is not None
+            else None
+        )
+        enriched = replace(
+            base,
+            remaining_pct=candidate.remaining_pct,
+            resets_at=candidate.resets_at,
+            warn_line_pct=warn_line,
+            stop_line_pct=stop_line,
+            reason=stale_reason if stale_reason is not None else base.reason,
+        )
+
+        def reached(state: Literal["stop", "warn"], pct: float) -> TileLine:
+            assert candidate.remaining_pct is not None and reserve is not None
+            clears = candidate.resets_at
+            if clears is not None and reserve.mode == "daily" and pct > 0:
+                clears = min(
+                    clears,
+                    max(now, clears - (math.ceil(candidate.remaining_pct / pct) - 1) * 86400),
+                )
+            return replace(enriched, state=state, clears_at=clears)
+
+        if not released_flag and stop_line is not None and candidate.remaining_pct <= stop_line:
+            assert reserve.stop_pct is not None
+            return reached("stop", reserve.stop_pct)
+        if not released_flag and warn_line is not None and candidate.remaining_pct <= warn_line:
+            assert reserve.pct is not None
+            return reached("warn", reserve.pct)
+        return replace(enriched, released=released_flag)
+
+    released = floor_off is not None and floor_off_active(floor_off, reading, now)
+    window = next((w for w in reading.windows if reserve and w.id == reserve.window), None)
+    usable = usable_window(window)
+    retained = reading._retained_windows.get(reserve.window) if reserve is not None else None
+    window_reset = window is not None and (
+        window.past_reset or (window.resets_at is not None and window.resets_at <= now)
+    )
+    retained_usable = (
+        retained
+        if retained is not None
+        and usable_window(retained[0])
+        and (not window_reset or retained[0].resets_at is not None)
+        else None
+    )
+    is_stale = (
         reading.freshness != "fresh"
         if reading.windows
         else reading.balance_freshness != "fresh" or not reading.balances
-    ):
-        return result
-    window = next((w for w in reading.windows if reserve and w.id == reserve.window), None)
-    usable = bool(
-        reserve
-        and window
-        and not window.past_reset
-        and window.remaining_pct is not None
-        and (window.resets_at is None or window.resets_at > now)
-        and (
-            reserve.mode == "total"
-            or (window.resets_at is not None and (window.window_minutes or 0) >= 1440)
-        )
     )
-    released = floor_off is not None and floor_off_active(floor_off, reading, now)
-    if usable:
-        assert reserve is not None and window is not None
-        result = replace(
-            result,
-            remaining_pct=window.remaining_pct,
-            resets_at=window.resets_at,
-            warn_line_pct=reserve_now(reserve.mode, reserve.pct, window.resets_at or now, now)
-            if reserve.pct is not None
-            else None,
-            stop_line_pct=reserve_now(reserve.mode, reserve.stop_pct, window.resets_at or now, now)
-            if reserve.stop_pct is not None
-            else None,
+
+    effective_line: TileLine | None = None
+    if usable and not is_stale:
+        assert window is not None
+        effective_line = evaluate_reserve(window, result, released_flag=released)
+    elif usable:
+        assert window is not None
+        effective_line = evaluate_reserve(
+            window,
+            replace(result, read_at=reading.read_at),
+            released_flag=released,
+            stale_reason=reading.reason or "stale_report",
+        )
+    elif retained_usable is not None:
+        effective_line = evaluate_reserve(
+            retained_usable[0],
+            replace(result, read_at=retained_usable[1]),
+            released_flag=released,
+            stale_reason=reading.reason or "stale_report",
         )
 
-    def reached(state: Literal["stop", "warn"], pct: float) -> TileLine:
-        assert window is not None and window.remaining_pct is not None and reserve is not None
-        clears = window.resets_at
-        if clears is not None and reserve.mode == "daily" and pct > 0:
-            clears = min(
-                clears, max(now, clears - (math.ceil(window.remaining_pct / pct) - 1) * 86400)
-            )
-        return replace(result, state=state, clears_at=clears)
+    if is_stale:
+        return effective_line if effective_line is not None else result
 
-    if usable and not released and result.stop_line_pct is not None:
-        assert window is not None and window.remaining_pct is not None and reserve is not None
-        if window.remaining_pct <= result.stop_line_pct:
-            assert reserve.stop_pct is not None
-            return reached("stop", reserve.stop_pct)
+    if effective_line is not None and effective_line.state == "stop":
+        return effective_line
+
     live_balance = reading.balance_freshness == "fresh" and any(
         b.remaining > 0 and (b.expires_at is None or b.expires_at > now) for b in reading.balances
     )
@@ -1035,21 +1095,29 @@ def tile_line(
         and w.remaining_pct <= 0
     ]
     if not live_balance and (full or not reading.windows):
+        base = effective_line if usable and effective_line is not None else result
         return replace(
-            result,
+            base,
             state="exhausted",
             clears_at=max((w.resets_at for w in full if w.resets_at is not None), default=None),
         )
     if not usable:
-        return replace(result, state="ok")
-    if released:
-        return replace(result, state="ok", released=True)
-    if result.warn_line_pct is not None:
-        assert window is not None and window.remaining_pct is not None and reserve is not None
-        if window.remaining_pct <= result.warn_line_pct:
-            assert reserve.pct is not None
-            return reached("warn", reserve.pct)
-    return replace(result, state="ok")
+        if effective_line is not None:
+            return effective_line
+        if reserve is None:
+            return replace(result, state="ok")
+        if (
+            reserve.mode == "daily"
+            and window is not None
+            and not window_reset
+            and window.remaining_pct is not None
+        ):
+            return replace(result, state="ok")
+        return replace(result, state="unknown")
+    assert effective_line is not None
+    if effective_line.state == "warn":
+        return effective_line
+    return replace(effective_line, state="ok", released=released)
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -122,6 +123,163 @@ def _fresh(snapshot: dict[str, Any], now: float) -> bool:
         and not isinstance(fresh_until, bool)
         and now <= fresh_until
     )
+
+
+_MAX_RETAINED_WINDOWS = 16
+
+
+def _bound_last_windows(retained: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Keep durable retained reserve history bounded well below the snapshot decode limit."""
+    if len(retained) <= _MAX_RETAINED_WINDOWS:
+        return retained
+    newest = sorted(
+        retained.items(),
+        key=lambda item: float(item[1].get("read_at") or 0),
+        reverse=True,
+    )
+    return dict(newest[:_MAX_RETAINED_WINDOWS])
+
+
+def _record_last_windows(
+    record: dict[str, Any],
+    windows: list[UsageWindow],
+    observed: float,
+    now: float,
+) -> None:
+    """Retain the newest unexpired reading per window id for reserve continuity."""
+    retained: dict[str, dict[str, Any]] = {}
+    for wid, entry in (record.get("last_windows") or {}).items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("window"), dict):
+            continue
+        reset = entry["window"].get("resets_at")
+        if reset is not None and float(reset) <= now:
+            continue
+        retained[wid] = deepcopy(entry)
+    for window in windows:
+        if window.percent_used is None and (
+            window.used_value is None or window.limit_value is None or window.limit_value <= 0
+        ):
+            continue
+        if window.resets_at is not None and float(window.resets_at) <= now:
+            continue
+        previous = retained.get(window.id)
+        if previous is None or observed >= float(previous.get("read_at") or 0):
+            retained[window.id] = {
+                "window": window.model_dump(mode="json", exclude_none=True),
+                "read_at": observed,
+            }
+    if retained:
+        record["last_windows"] = _bound_last_windows(retained)
+    else:
+        record.pop("last_windows", None)
+
+
+def _seed_last_windows_from_stored(
+    record: dict[str, Any],
+    raw_report: dict[str, Any] | None,
+    read_at: object,
+    now: float,
+) -> None:
+    """Seed retained windows from a pre-upgrade stored report before overwriting it."""
+    if record.get("last_windows") or not isinstance(raw_report, dict):
+        return
+    if not isinstance(read_at, (int, float)) or isinstance(read_at, bool):
+        return
+    try:
+        previous = parse_usage_report(raw_report)
+    except ValidationError:
+        return
+    if previous.windows:
+        _record_last_windows(record, previous.windows, float(read_at), now)
+
+
+def _is_weekly_window(window: UsageWindow) -> bool:
+    if window.kind == "weekly_model":
+        return False
+    return window.kind == "weekly" or window.window_minutes == 10080 or window.label == "7d"
+
+
+def _board_weekly_id(report: UsageReport | UsageReportV2 | None) -> str:
+    if report is not None:
+        if any(window.id == "7d" for window in report.windows):
+            return "7d"
+        for window in report.windows:
+            if _is_weekly_window(window):
+                return window.id
+    return "7d"
+
+
+def _map_native_weekly_window(
+    windows: list[UsageWindow],
+    product: str,
+    target_id: str = "7d",
+) -> list[UsageWindow]:
+    """Map a native probe's primary weekly window to the board account's reserve window id."""
+    if any(window.id == target_id for window in windows):
+        return windows
+    weekly = [index for index, window in enumerate(windows) if _is_weekly_window(window)]
+    if not weekly:
+        return windows
+    prefix = f"{product}-"
+    product_weekly = [
+        index
+        for index in weekly
+        if windows[index].id == "7d" or windows[index].id.startswith(prefix)
+    ]
+    candidates = product_weekly or (weekly if len(weekly) == 1 else [])
+    if not candidates:
+        return windows
+    chosen = next(
+        (index for index in candidates if windows[index].kind == "weekly"),
+        candidates[0],
+    )
+    mapped = list(windows)
+    mapped[chosen] = mapped[chosen].model_copy(update={"id": target_id, "kind": "weekly"})
+    return mapped
+
+
+def _translated_native_last_windows(
+    native_record: dict[str, Any],
+    product: str,
+    target_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Project a native record's retained (or pre-upgrade snapshot) windows into board IDs."""
+    source_map = native_record.get("last_windows")
+    entries: list[tuple[UsageWindow, float]] = []
+    if isinstance(source_map, dict) and source_map:
+        for entry in source_map.values():
+            if not isinstance(entry, dict):
+                continue
+            raw_window = entry.get("window")
+            entry_read_at = entry.get("read_at")
+            if not isinstance(raw_window, dict) or not isinstance(entry_read_at, (int, float)):
+                continue
+            try:
+                parsed = UsageWindow.model_validate(raw_window)
+            except ValidationError:
+                continue
+            entries.append((parsed, float(entry_read_at)))
+    else:
+        read_at = native_record.get("read_at")
+        snapshot = native_record.get("snapshot")
+        if (
+            isinstance(snapshot, dict)
+            and isinstance(read_at, (int, float))
+            and not isinstance(read_at, bool)
+        ):
+            entries = [(window, float(read_at)) for window in _native_windows(snapshot, product)]
+    if not entries:
+        return {}
+    mapped_windows = _map_native_weekly_window([w for w, _ in entries], product, target_id)
+    translated: dict[str, dict[str, Any]] = {}
+    for mapped, (_, entry_read_at) in zip(mapped_windows, entries, strict=True):
+        prev = translated.get(mapped.id)
+        if prev is None or entry_read_at >= float(prev.get("read_at") or 0):
+            translated[mapped.id] = {
+                "window": mapped.model_dump(mode="json", exclude_none=True),
+                "read_at": entry_read_at,
+            }
+    return translated
 
 
 def _source_rejection_text(rejection: dict[str, Any]) -> str:
@@ -434,6 +592,21 @@ class AgentQuotaService:
                     "reset_marks": marks,
                     "report_log": list((previous or {}).get("report_log") or []),
                 }
+                if previous is not None and isinstance(previous.get("last_windows"), dict):
+                    record["last_windows"] = deepcopy(previous["last_windows"])
+                elif (
+                    previous is not None
+                    and isinstance(previous.get("snapshot"), dict)
+                    and isinstance(previous.get("read_at"), (int, float))
+                    and not isinstance(previous.get("read_at"), bool)
+                ):
+                    prev_native = _map_native_weekly_window(
+                        _native_windows(previous["snapshot"], product), product, "7d"
+                    )
+                    _record_last_windows(record, prev_native, float(previous["read_at"]), now)
+                _record_last_windows(
+                    record, _map_native_weekly_window(windows, product, "7d"), captured, now
+                )
             else:
                 record = deepcopy(previous) or {
                     "schema_version": 1,
@@ -789,6 +962,7 @@ class AgentQuotaService:
             },
         )
         windows_changed = False
+        windows_retracted = False
         for name in ("windows", "balances"):
             if name not in reading_sections:
                 continue
@@ -798,8 +972,20 @@ class AgentQuotaService:
                 continue
             section.update(last_attempt_at=observed, last_attempt_status=report.status)
             if report.status == "available":
-                stored[name] = data[name]
-                section.update(read_at=observed, fresh_until=report.fresh_until)
+                if name == "windows" and not data[name] and stored.get("windows"):
+                    # Keep the last known windows (with their read_at) across an empty refresh.
+                    section["last_attempt_status"] = "unavailable"
+                    windows_retracted = True
+                else:
+                    if name == "windows":
+                        _seed_last_windows_from_stored(
+                            record,
+                            (previous or {}).get("report"),
+                            section.get("read_at"),
+                            now,
+                        )
+                    stored[name] = data[name]
+                    section.update(read_at=observed, fresh_until=report.fresh_until)
             else:
                 self._append_log(
                     owner, record, "read_failed", observed, section=name, session=session
@@ -869,11 +1055,13 @@ class AgentQuotaService:
             record["activity_writer"] = "report"
             record["activity_schema_version"] = 2
         marks = dict(record.get("reset_marks") or {})
-        if windows_changed and report.status == "available":
+        if windows_changed and report.status == "available" and not windows_retracted:
             for window in merged.windows:
                 span = window_start(window, now)
                 if span is not None:
                     marks[window.id] = next_mark(marks.get(window.id), *span)
+            if merged.windows:
+                _record_last_windows(record, merged.windows, observed, now)
         record["reset_marks"] = marks
         record["report"] = merged.stored()
         if event:
@@ -900,7 +1088,7 @@ class AgentQuotaService:
                     }
                     for window in merged.windows
                 ]
-                if report.status == "available"
+                if report.status == "available" and not windows_retracted
                 else [],
             }
             record["routing_snapshot"] = deepcopy(snapshot)
@@ -978,6 +1166,7 @@ class AgentQuotaService:
             record["last_attempt_at"] = observed
             record["last_report_at"] = observed
             record["last_attempt_status"] = report.status
+            windows_retracted = False
             if report.status == "available":
                 if report.activity is not None and self.hours_store is not None:
                     record["has_activity"] = True
@@ -985,17 +1174,35 @@ class AgentQuotaService:
                     record["activity_writer"] = "report"
                 if report.pinned_window is not None:
                     record["pinned_window"] = report.pinned_window
-                record["report"] = report.stored()
-                record["read_at"] = observed
-                record["fresh_until"] = report.fresh_until
-                _clear_source_rejection(record, report, now)
-                marks = dict(record.get("reset_marks") or {})
-                for window in report.windows:
-                    span = window_start(window, now)
-                    if span is not None:
-                        start, length = span
-                        marks[window.id] = next_mark(marks.get(window.id), start, length)
-                record["reset_marks"] = marks
+                previous_windows = ((previous or {}).get("report") or {}).get("windows") or []
+                if not report.windows and previous_windows:
+                    # Keep stored windows and their read_at across an empty refresh, while
+                    # still applying incoming report metadata (e.g. display_name).
+                    updated_report = report.stored()
+                    updated_report["windows"] = deepcopy(previous_windows)
+                    record["report"] = updated_report
+                    record["last_attempt_status"] = "unavailable"
+                    windows_retracted = True
+                else:
+                    _seed_last_windows_from_stored(
+                        record,
+                        (previous or {}).get("report"),
+                        (previous or {}).get("read_at"),
+                        now,
+                    )
+                    record["report"] = report.stored()
+                    record["read_at"] = observed
+                    record["fresh_until"] = report.fresh_until
+                    _clear_source_rejection(record, report, now)
+                    marks = dict(record.get("reset_marks") or {})
+                    for window in report.windows:
+                        span = window_start(window, now)
+                        if span is not None:
+                            start, length = span
+                            marks[window.id] = next_mark(marks.get(window.id), start, length)
+                    record["reset_marks"] = marks
+                    if report.windows:
+                        _record_last_windows(record, report.windows, observed, now)
             else:
                 self._append_log(owner, record, "read_failed", observed)
             record["sections"] = {
@@ -1012,7 +1219,9 @@ class AgentQuotaService:
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
             if product is not None:
-                windows = [] if report.status == "unavailable" else report.windows
+                windows = (
+                    [] if report.status == "unavailable" or windows_retracted else report.windows
+                )
                 snapshot = {
                     "provider": report.display_name or account_id,
                     "captured_at": observed,
@@ -2186,6 +2395,8 @@ class AgentQuotaService:
             native_records, key=lambda item: item[2].get("read_at") or 0, default=None
         )
         base_record = record
+        target_weekly = _board_weekly_id(report)
+        product_name = str(record["product"]) if record.get("product") is not None else ""
         if report is not None and (
             latest_native is None
             or (record.get("read_at") or 0) >= (latest_native[2].get("read_at") or 0)
@@ -2193,11 +2404,35 @@ class AgentQuotaService:
             windows = report.windows
         elif latest_native is not None:
             base_record = latest_native[2]
-            windows = _native_windows(
-                latest_native[2].get("snapshot") or {}, str(record["product"])
+            windows = _map_native_weekly_window(
+                _native_windows(latest_native[2].get("snapshot") or {}, product_name),
+                product_name,
+                target_weekly,
             )
         else:
             windows = []
+        extra_retained: list[dict[str, Any]] = []
+        if base_record is not record and isinstance(record.get("last_windows"), dict):
+            extra_retained.append(record["last_windows"])
+        elif base_record is not record and report is not None and report.windows:
+            rec_read_at = record.get("read_at")
+            if isinstance(rec_read_at, (int, float)) and not isinstance(rec_read_at, bool):
+                extra_retained.append(
+                    {
+                        w.id: {
+                            "window": w.model_dump(mode="json", exclude_none=True),
+                            "read_at": float(rec_read_at),
+                        }
+                        for w in report.windows
+                    }
+                )
+        if product_name:
+            for _, _, native_rec in native_records:
+                translated = _translated_native_last_windows(
+                    native_rec, product_name, target_weekly
+                )
+                if translated:
+                    extra_retained.append(translated)
         view = self._account_view(
             account_id=account_id,
             kind="account",
@@ -2208,6 +2443,7 @@ class AgentQuotaService:
             now=now,
             product=record.get("product"),
             display_name=(report.display_name if report else None) or account_id,
+            extra_last_windows=extra_retained or None,
         )
         if report is not None:
             view.plan = report.plan
@@ -2266,6 +2502,7 @@ class AgentQuotaService:
         now: float,
         product: str | None,
         display_name: str,
+        extra_last_windows: list[dict[str, Any]] | None = None,
     ) -> UsageAccountView:
         freshness = self._freshness(record, now)
         fresh = freshness == "fresh"
@@ -2303,7 +2540,7 @@ class AgentQuotaService:
                     start = float(mark["start"])
             period_view = UsagePeriodView(start=start, days=period.days, moved_from=moved_from)
         read_at = record.get("read_at")
-        return UsageAccountView(
+        view = UsageAccountView(
             id=account_id,
             kind=kind,
             display_name=display_name,
@@ -2319,6 +2556,45 @@ class AgentQuotaService:
             windows=window_views,
             models=(record.get("report") or {}).get("models") or [],
         )
+        merged_last: dict[str, dict[str, Any]] = {}
+        sources: list[Any] = [record.get("last_windows")]
+        if extra_last_windows:
+            sources.extend(extra_last_windows)
+        for source_map in sources:
+            if not isinstance(source_map, dict):
+                continue
+            for wid, entry in source_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                prev = merged_last.get(wid)
+                if prev is None or float(entry.get("read_at") or 0) >= float(
+                    prev.get("read_at") or 0
+                ):
+                    merged_last[wid] = entry
+        if merged_last:
+            present = {
+                item.id
+                for item in window_views
+                if item.remaining_pct is not None and not item.past_reset
+            }
+            retained: dict[str, tuple[UsageWindowView, float]] = {}
+            for wid, entry in merged_last.items():
+                if wid in present:
+                    continue
+                raw_window = entry.get("window")
+                entry_read_at = entry.get("read_at")
+                if not isinstance(raw_window, dict) or not isinstance(entry_read_at, (int, float)):
+                    continue
+                try:
+                    parsed = UsageWindow.model_validate(raw_window)
+                except ValidationError:
+                    continue
+                views, _ = self._window_views([parsed], False, now, tiers, None)
+                if views and not views[0].past_reset and views[0].remaining_pct is not None:
+                    retained[wid] = (views[0], float(entry_read_at))
+            if retained:
+                view._retained_windows = retained
+        return view
 
     @staticmethod
     def _freshness(record: dict[str, Any], now: float) -> Literal["fresh", "old", "none"]:
@@ -2447,6 +2723,19 @@ class AgentQuotaService:
         ):
             for field in good_fields:
                 merged[field] = deepcopy(stored.get(field))
+        stored_last = stored.get("last_windows")
+        if isinstance(stored_last, dict):
+            merged_last = deepcopy(merged.get("last_windows") or {})
+            for wid, entry in stored_last.items():
+                if not isinstance(entry, dict):
+                    continue
+                prev = merged_last.get(wid)
+                if prev is None or float(entry.get("read_at") or 0) >= float(
+                    prev.get("read_at") or 0
+                ):
+                    merged_last[wid] = deepcopy(entry)
+            if merged_last:
+                merged["last_windows"] = _bound_last_windows(merged_last)
         return merged
 
     def _hydrate(self, owner: str, *, required: bool = False) -> bool:

@@ -2098,8 +2098,17 @@ def test_tile_lines(mode, pct, stop, used, days, state, warn, cut):
     assert tile_line(limits, quota, FloorOff(until="manual"), NOW).state == (
         "exhausted" if used == 100 else "ok"
     )
+    stale_line = tile_line(limits, quota.model_copy(update={"freshness": "old"}), None, NOW)
+    assert stale_line.state == (state if state in {"warn", "stop"} else "unknown")
+    assert stale_line.remaining_pct == pytest.approx(100 - used)
+    assert stale_line.read_at == quota.read_at
     assert (
-        tile_line(limits, quota.model_copy(update={"freshness": "old"}), None, NOW).state
+        tile_line(
+            limits,
+            quota.model_copy(update={"freshness": "old"}),
+            None,
+            NOW + days * 86400,
+        ).state
         == "unknown"
     )
     quota.windows[0].window_minutes = 300
@@ -2768,3 +2777,76 @@ def test_link_permission_tier_schema_roundtrip_and_tool_docs():
     schema = SysSessionChoiceUpdateTool().get_schema()["function"]
     assert "members" in schema["description"]
     assert "permissionTier" in schema["description"]
+
+
+def test_stale_unavailable_and_null_readings_enforce_retained_reserve_until_reset():
+    from omnigent.server.session_choice import TileLimits, tile_line
+    from omnigent.usage.contract import UsageBalance, UsageWindowView
+
+    limits = TileLimits.model_validate(
+        {"reserve": {"mode": "total", "window": "7d", "pct": 4, "stopPct": 2}}
+    )
+    settings = table(
+        limits={"pool-0": {"reserve": {"mode": "total", "window": "7d", "pct": 4, "stopPct": 2}}}
+    )
+
+    # Stale reading below warn line enforces reserve and keeps its age/value.
+    stale_warn = reading(used=96, freshness="old")
+    warn_line = tile_line(limits, stale_warn, None, NOW)
+    assert warn_line.state == "warn"
+    assert warn_line.remaining_pct == pytest.approx(4.0)
+    assert warn_line.read_at == stale_warn.read_at
+    assert warn_line.reason == "stale_report"
+    picked = pick(settings, readings={"pool-0": stale_warn})
+    assert picked.pool == "pool-1" and picked.skipped[0].why == "reserve"
+
+    # Stale reading below stop line enforces stop even when exempt/user-named.
+    stale_stop = reading(used=98, freshness="old")
+    stop_line = tile_line(limits, stale_stop, None, NOW)
+    assert stop_line.state == "stop"
+    assert stop_line.remaining_pct == pytest.approx(2.0)
+    assert stop_line.read_at == stale_stop.read_at
+
+    # Stale reading above reserve stays unknown (admits) while keeping remaining_pct and age.
+    stale_above = reading(used=80, freshness="old")
+    above_line = tile_line(limits, stale_above, None, NOW)
+    assert above_line.state == "unknown"
+    assert above_line.remaining_pct == pytest.approx(20.0)
+    assert above_line.read_at == stale_above.read_at
+    assert pick(settings, readings={"pool-0": stale_above}).pool == "pool-0"
+
+    # Past resets_at expires the retained reading so it never blocks into the next cycle.
+    expired_line = tile_line(limits, stale_warn, None, NOW + 4 * 86400)
+    assert expired_line.state == "unknown"
+    assert expired_line.remaining_pct is None
+
+    # Fresh credits balance with missing reserve window never fails open as ok.
+    balance_only = reading(used=96).model_copy(
+        update={
+            "windows": [],
+            "freshness": "none",
+            "balances": [UsageBalance(id="credits", remaining=100.0, unit="credits")],
+            "balance_freshness": "fresh",
+            "balance_read_at": NOW,
+        }
+    )
+    missing_line = tile_line(limits, balance_only, None, NOW)
+    assert missing_line.state == "unknown"
+    assert missing_line.remaining_pct is None
+
+    # Fresh balance + null/missing window with retained window enforces reserve.
+    retained_win = UsageWindowView(
+        id="7d",
+        kind="weekly",
+        percent_used=96.0,
+        remaining_pct=4.0,
+        window_minutes=10080,
+        resets_at=NOW + 4 * 86400,
+        state="stale",
+    )
+    balance_only._retained_windows = {"7d": (retained_win, NOW - 600)}
+    retained_line = tile_line(limits, balance_only, None, NOW)
+    assert retained_line.state == "warn"
+    assert retained_line.remaining_pct == pytest.approx(4.0)
+    assert retained_line.read_at == NOW - 600
+    assert pick(settings, readings={"pool-0": balance_only}).pool == "pool-1"
