@@ -4438,7 +4438,7 @@
               }
             ],
             "default": null,
-            "description": "`True` when a native terminal holds the claimed input this turn delivered, with evidence of its submit; omitted otherwise.",
+            "description": "`True` when the native harness confirmed handoff of this turn's input; omitted otherwise.",
             "title": "Input Received"
           },
           "response": {
@@ -13150,6 +13150,7 @@
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
+            "session.input.dismissed": "#/components/schemas/SessionInputDismissedEvent",
             "session.input.sending": "#/components/schemas/SessionInputSendingEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
@@ -13241,6 +13242,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionInputSendingEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputDismissedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInterruptedEvent"
@@ -15596,9 +15600,47 @@
         "title": "SessionInputConsumedPayload",
         "type": "object"
       },
+      "SessionInputDismissedEvent": {
+        "description": "A handed-off pending input was removed from chat display.",
+        "properties": {
+          "pending_id": {
+            "title": "Pending Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.input.dismissed",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pending_id"
+        ],
+        "title": "SessionInputDismissedEvent",
+        "type": "object"
+      },
       "SessionInputSendingEvent": {
         "description": "The runner is delivering a pending input, or has queued it (null).\n\n`received` is true once the native agent accepted the input; a running\nturn may still hold it queued until its next step. `stable_id` is the\nclient's id for that input, for a sender that has no pending id yet.",
         "properties": {
+          "can_dismiss": {
+            "default": false,
+            "title": "Can Dismiss",
+            "type": "boolean"
+          },
           "pending_id": {
             "title": "Pending Id",
             "type": "string"
@@ -46393,6 +46435,17 @@
                 }
               ],
               "title": "Scope"
+            }
+          },
+          {
+            "description": "When `False` alongside `download=True`, fail fast with `runner_unavailable` instead of waking an asleep runner.",
+            "in": "query",
+            "name": "wake",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Wake",
+              "type": "boolean"
             }
           }
         ],
