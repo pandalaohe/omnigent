@@ -1177,23 +1177,18 @@ async def test_runtime_notice_settlement_emits_no_unconfirmed_card_while_user_in
                 async with _stream_runner([dict(failure), dict(failure)]) as client:
                     await orchestration._relay_runner_stream_once(conv.id, client, store)
             elif case == "input-only-failure":
-                # Match the exact runner wire shape from _prompt_wait_expired_failure.
-                event = {
-                    "type": "response.failed",
-                    "input_only": True,
-                    "response": {
-                        "id": "resp_" + "1" * 32,
-                        "error": {
-                            "code": "native_prompt_wait_expired",
-                            "message": "The terminal prompt went unanswered.",
-                            "undelivered": True,
-                        },
-                    },
-                    "input_stable_id": stable_id,
-                    "pending_id": pending_id,
-                    "delivery_attempt_id": attempt_id,
-                    "input_content": [{"type": "input_text", "text": text}],
-                }
+                # Build with the runner's real _prompt_wait_expired_failure constructor.
+                from omnigent.runner.app import _prompt_wait_expired_failure
+
+                event = _prompt_wait_expired_failure(
+                    {
+                        "type": "message",
+                        "content": [{"type": "input_text", "text": text}],
+                        "stable_id": stable_id,
+                        "pending_id": pending_id,
+                        "delivery_attempt_id": attempt_id,
+                    }
+                )
                 async with _stream_runner([dict(event), dict(event)]) as client:
                     await orchestration._relay_runner_stream_once(conv.id, client, store)
 
@@ -1217,6 +1212,11 @@ async def test_runtime_notice_settlement_emits_no_unconfirmed_card_while_user_in
                         and call.args[1]["response"].get("error") is not None
                     )
                 )
+            )
+            or (
+                call.args[1].get("type") == "response.output_item.done"
+                and isinstance(call.args[1].get("item"), dict)
+                and call.args[1]["item"].get("type") == "error"
             )
         ]
         if is_user:
@@ -1427,11 +1427,13 @@ async def test_retired_runtime_notice_stable_id_does_not_suppress_new_user_attem
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Reusing a retired notice's stable_id on a new user attempt still warns on failure."""
+    from omnigent.runner.app import _prompt_wait_expired_failure
     from omnigent.server.routes._sessions import orchestration
 
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Native", harness_override="claude-native")
-    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
 
     notice_pid = pending_inputs.record(
         conv.id,
@@ -1452,22 +1454,15 @@ async def test_retired_runtime_notice_stable_id_does_not_suppress_new_user_attem
     user_attempt = str(
         pending_inputs.delivery_attributes_for(conv.id, user_pid)["delivery_attempt_id"]
     )
-    event = {
-        "type": "response.failed",
-        "input_only": True,
-        "response": {
-            "id": "resp_" + "2" * 32,
-            "error": {
-                "code": "native_prompt_wait_expired",
-                "message": "The terminal prompt went unanswered.",
-                "undelivered": True,
-            },
-        },
-        "input_stable_id": _WEB_ID,
-        "pending_id": user_pid,
-        "delivery_attempt_id": user_attempt,
-        "input_content": [{"type": "input_text", "text": "real user message"}],
-    }
+    event = _prompt_wait_expired_failure(
+        {
+            "type": "message",
+            "content": [{"type": "input_text", "text": "real user message"}],
+            "stable_id": _WEB_ID,
+            "pending_id": user_pid,
+            "delivery_attempt_id": user_attempt,
+        }
+    )
     body = (
         'data: {"type": "session.heartbeat"}\n\n'
         + f"data: {json.dumps(event)}\n\n"
@@ -1486,6 +1481,95 @@ async def test_retired_runtime_notice_stable_id_does_not_suppress_new_user_attem
 
         errors = store.list_items(conv.id, type="error").data
         assert [err.data.model_dump()["code"] for err in errors] == ["native_prompt_wait_expired"]
+        assert any(
+            call.args[1].get("type") == "response.output_item.done"
+            and isinstance(call.args[1].get("item"), dict)
+            and call.args[1]["item"].get("type") == "error"
+            for call in publish.call_args_list
+        )
+    finally:
+        pending_inputs.resolve(conv.id, user_pid)
+
+
+@pytest.mark.asyncio
+async def test_old_retired_notice_replay_does_not_settle_new_user_input_with_same_stable_id(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replaying a retired notice's failure leaves a newer same-stable_id user send queued."""
+    from omnigent.runner.app import _prompt_wait_expired_failure
+    from omnigent.server.routes._sessions import orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+
+    notice_pid = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "[System: Clear accepted. Handover.]"}],
+        stable_id=_WEB_ID,
+        runner_managed=True,
+        runtime_notice=True,
+    )
+    notice_attempt = str(
+        pending_inputs.delivery_attributes_for(conv.id, notice_pid)["delivery_attempt_id"]
+    )
+    assert await _settle_lost_runner_input(store, conv.id, notice_pid, "native_input_runner_lost")
+    assert store.list_items(conv.id, type="error").data == []
+
+    # A new live user input reuses the same stable_id under a fresh delivery_attempt_id.
+    user_pid = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "live user send"}],
+        stable_id=_WEB_ID,
+    )
+    user_attempt = str(
+        pending_inputs.delivery_attributes_for(conv.id, user_pid)["delivery_attempt_id"]
+    )
+    assert user_attempt != notice_attempt
+    replayed_notice_failure = _prompt_wait_expired_failure(
+        {
+            "type": "message",
+            "content": [{"type": "input_text", "text": "[System: Clear accepted. Handover.]"}],
+            "stable_id": _WEB_ID,
+            "pending_id": notice_pid,
+            "delivery_attempt_id": notice_attempt,
+        }
+    )
+    body = (
+        'data: {"type": "session.heartbeat"}\n\n'
+        + f"data: {json.dumps(replayed_notice_failure)}\n\n"
+        + "data: [DONE]\n\n"
+    )
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _req: httpx.Response(
+                    200, text=body, headers={"content-type": "text/event-stream"}
+                )
+            ),
+        ) as client:
+            await orchestration._relay_runner_stream_once(conv.id, client, store)
+
+        # The newer user input stays queued untouched and no error card is emitted.
+        [still_pending] = pending_inputs.snapshot_for(conv.id)
+        assert still_pending["pending_id"] == user_pid
+        assert (
+            pending_inputs.delivery_attributes_for(conv.id, user_pid)["delivery_attempt_id"]
+            == user_attempt
+        )
+        assert store.list_items(conv.id, type="error").data == []
+        assert store.list_items(conv.id, type="message").data == []
+        assert not any(
+            call.args[1].get("type") == "response.error"
+            or (
+                call.args[1].get("type") == "response.output_item.done"
+                and isinstance(call.args[1].get("item"), dict)
+                and call.args[1]["item"].get("type") == "error"
+            )
+            for call in publish.call_args_list
+        )
     finally:
         pending_inputs.resolve(conv.id, user_pid)
 

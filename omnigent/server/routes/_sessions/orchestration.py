@@ -6818,6 +6818,13 @@ async def _settle_undelivered_native_input(
     }
     if input_attributes(identity) != identity:
         return False
+    if pending_inputs.was_retired_runtime_notice(
+        session_id,
+        pending_id=reported_pending_id,
+        attempt_id=reported_attempt_id,
+        stable_id=input_stable_id,
+    ):
+        return False
 
     async def defer_annotation(stable_id: str | None) -> bool:
         if stable_id is None or not isinstance(conversation_store, SqlAlchemyConversationStore):
@@ -6866,13 +6873,6 @@ async def _settle_undelivered_native_input(
         await restore_pending_inputs(conversation_store, session_id)
         matched_pending_id = mark_rejected_input()
     if matched_pending_id is None:
-        if pending_inputs.was_retired_runtime_notice(
-            session_id,
-            pending_id=reported_pending_id,
-            attempt_id=reported_attempt_id,
-            stable_id=input_stable_id,
-        ):
-            return False
         if fallback_content is not None and delivery_error is None and not uncertain:
             await _commit_undelivered_input_content(
                 conversation_store,
