@@ -195,7 +195,7 @@
     if (raw === null) return "";
     var parsed;
     try {
-      parsed = new NativeURL(raw, location.href);
+      parsed = new NativeURL(raw, document.baseURI);
     } catch {
       return "";
     }

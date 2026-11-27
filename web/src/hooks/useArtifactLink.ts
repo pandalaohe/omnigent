@@ -66,8 +66,7 @@ export async function mintArtifactLink(
   };
 }
 
-/** GET one panel-view artifact file's stripped source; throws on non-2xx. */
-export async function fetchArtifactSource(url: string, nonce: string): Promise<string> {
+async function fetchArtifact(url: string): Promise<Response> {
   // oxlint-disable-next-line no-restricted-globals -- an artifact URL is token-authorized; identity/embed headers must not be attached.
   const res = await fetch(withBasePath(url));
   if (!res.ok) {
@@ -77,13 +76,19 @@ export async function fetchArtifactSource(url: string, nonce: string): Promise<s
       Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : undefined,
     );
   }
-  return stripInjectedScripts(await res.text(), nonce);
+  return res;
+}
+
+/** GET one panel-view artifact file's stripped source; throws on non-2xx. */
+export async function fetchArtifactSource(url: string, nonce: string): Promise<string> {
+  return stripInjectedScripts(await (await fetchArtifact(url)).text(), nonce);
 }
 
 export interface ArtifactEntry {
   url: string;
   nonce: string;
   source: string;
+  document: string | null;
   expires_at: number | null;
 }
 
@@ -99,15 +104,23 @@ export async function fetchArtifactEntry(
   path: string,
 ): Promise<ArtifactEntry> {
   let link = await mintArtifactLink(conversationId, { path, view: "panel" });
-  let source: string;
+  let response: Response;
   try {
-    source = await fetchArtifactSource(link.url, link.nonce);
+    response = await fetchArtifact(link.url);
   } catch (err) {
     if (!(err instanceof ArtifactLinkError) || err.status !== 410) throw err;
     link = await mintArtifactLink(conversationId, { path, view: "panel" });
-    source = await fetchArtifactSource(link.url, link.nonce);
+    response = await fetchArtifact(link.url);
   }
-  return { url: link.url, nonce: link.nonce, source, expires_at: link.expires_at };
+  const html = await response.text();
+  const isHtml = /^text\/html(?:;|$)/i.test(response.headers.get("content-type") ?? "");
+  return {
+    url: link.url,
+    nonce: link.nonce,
+    source: stripInjectedScripts(html, link.nonce),
+    document: isHtml ? html : null,
+    expires_at: link.expires_at,
+  };
 }
 
 /** Map a failed entry load to the panel's one-line message. */

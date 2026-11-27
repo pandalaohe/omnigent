@@ -213,6 +213,22 @@ describe("omni-html-capture.js", () => {
     ]);
   });
 
+  it("resolves failed relative requests against the document's base URL", async () => {
+    const win = spawnWindow('<base href="https://example.test/reports/index.html">');
+    stubFetch(win, async () => ({ ok: false, status: 404 }));
+    const ns = capture(win);
+
+    await win.fetch("data.json");
+    expect(ns.snapshot().network).toEqual([
+      {
+        method: "GET",
+        url: "https://example.test/reports/data.json",
+        status: 404,
+        ts: expect.any(Number),
+      },
+    ]);
+  });
+
   it("records nothing for a successful fetch", async () => {
     const win = spawnWindow();
     stubFetch(win, async () => ({ ok: true, status: 200 }));

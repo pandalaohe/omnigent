@@ -569,18 +569,56 @@ function FileViewerBody({
     comparisonListing?.headIsWorkingCopy === true
       ? comparisonListing.deleted
       : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
+  const changedFile = comparisonListing
+    ? comparisonListing.changed
+    : (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const serverInfo = useServerInfo();
   // The host's SSH alias lets the desktop read a host on another machine directly.
   const directReads =
     workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
   const sessionHostId = useSessionHostId(conversationId);
   const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
+  const lang = detectLang(path);
+  // Read the global preferences once. Explicit diff links override the saved mode.
+  const persistedPrefsRef = useRef(readFileViewPreferences());
+  const [diffActive, setDiffActive] = useState(
+    () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
+  );
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
+  const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
+    () => persistedPrefsRef.current.previewableViewMode,
+  );
+  const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
+  const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
+  const appliedPosition =
+    appliedNavigation.conversationId === conversationId && appliedNavigation.path === path
+      ? appliedNavigation.position
+      : undefined;
+  const filePosition =
+    appliedPosition !== dismissedPosition && !isFilePositionDismissed(appliedPosition)
+      ? appliedPosition
+      : undefined;
+  const previewRequested = searchParams.get("preview") === "1" || previewOverridePath === path;
+  const positionRequested =
+    position !== undefined && position !== dismissedPosition && !isFilePositionDismissed(position);
+  const artifactPreview =
+    !isEmbed &&
+    lang === "html" &&
+    !isDeletedFile &&
+    (previewRequested ||
+      (!filePosition &&
+        !positionRequested &&
+        !(effectiveDiffActive && changedFile) &&
+        previewableViewMode !== "source"));
   // Video playback and known image/PDF/3D previews read raw bytes via
-  // ?download=true instead of the capped JSON+base64 preview envelope.
+  // ?download=true instead of the capped JSON+base64 preview envelope;
+  // standalone HTML previews read their own artifact resource on demand.
   const isRawBinaryPreview = isRawBinaryPreviewPath(path);
   const fileQuery = useFileContent(
     conversationId,
-    isVideoFile(path) || isRawBinaryPreview || isDeletedFile ? null : path,
+    isVideoFile(path) || isRawBinaryPreview || isDeletedFile || artifactPreview ? null : path,
     {
       visible: onScreen,
       ...(sshTarget ? { sshTarget } : {}),
@@ -617,6 +655,7 @@ function FileViewerBody({
   // an in-frame navigation shows a sibling bundle file, which has its own
   // comment thread — and fall back to the opened file when no frame is up.
   const [frame, setFrame] = useState<{ path: string; source: string } | null>(null);
+  const openedFileSourceReady = hasFileData || (artifactPreview && frame?.path === path);
   const commentPath = frame?.path ?? path;
   // Ids of this page's element annotations the frame could not re-find.
   const [orphanIds, setOrphanIds] = useState<ReadonlySet<string>>(EMPTY_ORPHANS);
@@ -1000,24 +1039,32 @@ function FileViewerBody({
   };
 
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
-  // Waits for file data so classifyAndRemapComments has run with real content,
+  // Waits for file data or the opened HTML frame so classifyAndRemapComments has run with real content,
   // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
-    if (!commentId || !hasFileData) return;
+    if (!commentId || (!artifactPreview && !openedFileSourceReady)) return;
     const comment = openComments.find((c) => c.id === commentId);
     if (!comment) return;
-    linkedCommentAppliedRef.current = true;
     commentsInitializedRef.current = true;
     setCommentsOpen(true);
+    const anchor = comment.anchor_content;
+    if (
+      anchor &&
+      !isElementAnchor(anchor) &&
+      !isRenderedTextAnchor(anchor) &&
+      !openedFileSourceReady
+    )
+      return;
+    linkedCommentAppliedRef.current = true;
     handleSetActiveSelection({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
       comment_id: comment.id,
     });
-  }, [openComments, hasFileData]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [openComments, openedFileSourceReady, artifactPreview]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Find-in-file state lifted here so the toolbar button can open it.
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1087,7 +1134,6 @@ function FileViewerBody({
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
-  const lang = detectLang(path);
   const [markdownRouting, setMarkdownRouting] = useState<{
     conversationId: string;
     path: string;
@@ -1151,35 +1197,10 @@ function FileViewerBody({
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage &&
-    !isPdf &&
-    !isVideo &&
-    !isModel &&
-    !isSpreadsheet &&
-    (comparisonListing
-      ? comparisonListing.changed
-      : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
+    !isImage && !isPdf && !isVideo && !isModel && !isSpreadsheet && changedFile;
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
-  // Diff is a global toggle — turning it on/off on any file carries over as you
-  // navigate to the next file. Source ↔ preview is also shared across previewable
-  // files (markdown/html/notebooks), while non-previewable files always render
-  // as source.
-  // These are app-global *preferences*, persisted to localStorage so they also
-  // survive a page refresh (and seed a brand-new conversation). Seed precedence:
-  //   1. an explicit ?diff=1 link (shareable override, diff only),
-  //   2. the persisted preference,
-  //   3. the hardcoded default.
-  // Read once on mount so our own writes (and within-tab file navigation) don't
-  // re-run the initializers.
-  const persistedPrefsRef = useRef(readFileViewPreferences());
-  const [diffActive, setDiffActive] = useState(
-    () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
-  );
-  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
-  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
-  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -1209,9 +1230,6 @@ function FileViewerBody({
     () => persistedPrefsRef.current.hideWhitespace,
   );
   const [wrapLines, setWrapLines] = useState(() => persistedPrefsRef.current.wrapLines);
-  const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
-    () => persistedPrefsRef.current.previewableViewMode,
-  );
   // Consume a preview request when this viewer owns the URL: record the override
   // for the path it opened, leave diff mode, and strip the param so the request
   // can't leak into a copied link, a neighbour tab, or a later plain open.
@@ -1302,29 +1320,18 @@ function FileViewerBody({
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
-  const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
-  const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
   const lastNavigationRef = useRef(appliedNavigation);
-  const appliedPosition =
-    appliedNavigation.conversationId === conversationId && appliedNavigation.path === path
-      ? appliedNavigation.position
-      : undefined;
-  const filePosition =
-    appliedPosition !== dismissedPosition && !isFilePositionDismissed(appliedPosition)
-      ? appliedPosition
-      : undefined;
   // Citations preserve diff mode; previewable files need source to expose line
   // numbers. A one-shot preview request (the agent's open_in_panel) outranks both:
   // the unconsumed ?preview=1 covers the first render, the override the rest.
-  const previewRequested = searchParams.get("preview") === "1";
-  const previewActive = isPreviewable && (previewRequested || previewOverridePath === path);
+  const previewActive = isPreviewable && previewRequested;
   const viewMode: "editor" | "preview" | "source" | "diff" = previewActive
     ? "preview"
     : effectiveDiffActive && isDiffAvailable
       ? "diff"
       : isSpreadsheet
         ? "preview"
-        : filePosition
+        : filePosition || (lang === "html" && positionRequested)
           ? "source"
           : fileViewMode;
   const diffViewActive = viewMode === "diff";
@@ -1716,7 +1723,11 @@ function FileViewerBody({
   // HTML artifacts can be popped out into their own browser tab for full-window
   // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
   // as the in-app preview (isolated from the host app) — just full-screen.
-  if (lang === "html" && fileQuery.data && viewMode !== "diff") {
+  if (
+    lang === "html" &&
+    (openedFileSourceReady || (artifactPreview && frame)) &&
+    viewMode !== "diff"
+  ) {
     toolbarActions.push({
       key: "open-new-tab",
       label: "Open in new tab",
@@ -1796,7 +1807,10 @@ function FileViewerBody({
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (!isDeletedFile && (hasFileData || isVideo || isRawBinaryPreview)) {
+  if (
+    !isDeletedFile &&
+    (hasFileData || (artifactPreview && frame) || isVideo || isRawBinaryPreview)
+  ) {
     settingsMenu.push({
       key: "download",
       label: "Download file",

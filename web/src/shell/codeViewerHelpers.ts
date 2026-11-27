@@ -2,6 +2,7 @@
 // No React imports — these are plain functions, easy to unit-test in isolation.
 
 import type { BundledLanguage } from "shiki";
+import { escapeHtmlAttr } from "@/lib/html";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";
 import { isVideoFile } from "@/lib/video";
 
@@ -589,6 +590,32 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
 
 /** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
 export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
+
+/** Make a panel response navigable as srcdoc while preserving its artifact-relative URLs. */
+export function prepareArtifactSrcdoc(
+  html: string,
+  source: string,
+  nonce: string,
+  url: string,
+): string | null {
+  // Srcdoc always uses standards mode. Authored links, a custom base and
+  // navigation-sensitive scripts keep the native document and URL.
+  if (
+    !/^[\t\n\f\r ]*<!doctype[\t\n\f\r ]+html[\t\n\f\r ]*>/i.test(source) ||
+    /<(?:a|area|base)[\t\n\f\r />]|<script\b[^>]*\bsrc\s*=|stop(?:Immediate)?Propagation|cancelBubble/i.test(
+      source,
+    )
+  ) {
+    return null;
+  }
+  const injection = html.indexOf(`<script data-omni-nonce="${nonce}">`);
+  if (injection === -1) return null;
+  const head =
+    '<meta name="referrer" content="no-referrer">' +
+    `<base data-omni-artifact href="${escapeHtmlAttr(url)}">` +
+    SAME_PAGE_ANCHOR_SCRIPT;
+  return html.slice(0, injection) + head + html.slice(injection);
+}
 
 /** Whitespace as the HTML tokenizer defines it. */
 const TOKENIZER_SPACE = " \t\n\f\r";

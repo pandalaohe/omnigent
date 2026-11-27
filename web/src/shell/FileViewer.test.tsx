@@ -1244,6 +1244,22 @@ describe("FileViewer URL sync — diff param", () => {
 });
 
 describe("FileViewer URL sync — comment param", () => {
+  it("opens an HTML comment deep link before artifact source is available", () => {
+    const previousFileQuery = vi.mocked(useFileContent).getMockImplementation();
+    vi.mocked(useFileContent).mockReturnValue({ data: undefined } as ReturnType<
+      typeof useFileContent
+    >);
+    try {
+      useCommentsMock.mockReturnValue(
+        makeCommentsQuery([{ ...makeComment("c1"), path: "report.html", anchor_content: null }]),
+      );
+      renderViewer({ open: true, path: "report.html", initialSearch: "comment=c1" });
+      expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
+    } finally {
+      if (previousFileQuery) vi.mocked(useFileContent).mockImplementation(previousFileQuery);
+    }
+  });
+
   it("opens the comments panel when ?comment= matches a loaded comment", () => {
     const comment = makeComment("c1");
     useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
@@ -2664,6 +2680,7 @@ describe("FileViewer agent preview request", () => {
       viewerTree({ open: true, path: "report.html", initialSearch: "file=report.html&preview=1" }),
     );
     expect(viewModeOf()).toBe("preview");
+    expect(useFileContent).toHaveBeenLastCalledWith("conv_1", null, { visible: true });
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("preview");
 
     // Closing report.html activates its neighbour README: the stored Source
@@ -2676,6 +2693,7 @@ describe("FileViewer agent preview request", () => {
     // re-apply the request — it named one open.
     view.rerender(viewerTree({ open: true, path: "report.html" }));
     expect(viewModeOf()).toBe("source");
+    expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "report.html", { visible: true });
   });
 
   it("a same-file line citation after an agent preview open lands on source", () => {
@@ -4053,6 +4071,22 @@ describe("file position navigation", () => {
     for (const [props] of codeViewerRenders.mock.calls) {
       expect(props).toMatchObject({ path: "file2.md", position: undefined });
     }
+  });
+
+  it("requests source from the first render of a different HTML file's line citation", () => {
+    const { rerender } = renderViewer({ open: true, path: "other.txt" });
+    vi.mocked(useFileContent).mockClear();
+    codeViewerRenders.mockClear();
+    rerender(viewerTree({ open: true, path: "report.html", position: { line: 12 } }));
+    expect(useFileContent).toHaveBeenCalled();
+    for (const [, requestedPath] of vi.mocked(useFileContent).mock.calls) {
+      expect(requestedPath).toBe("report.html");
+    }
+    const modes = codeViewerRenders.mock.calls
+      .map(([props]) => props)
+      .filter((props) => props.path === "report.html")
+      .map((props) => props.viewMode);
+    expect(new Set(modes)).toEqual(new Set(["source"]));
   });
 
   it("keeps a manually selected preview when the viewer remounts with the old citation", () => {

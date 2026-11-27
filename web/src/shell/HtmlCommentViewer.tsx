@@ -9,10 +9,9 @@
 // iframe via the injected bridge, relayed over a private MessageChannel. See
 // htmlCommentBridge.ts for the protocol and trust model.
 //
-// Standalone the frame loads the artifact URL as `src`, so relative resources
-// and in-bundle links resolve inside the bundle and the server inlines the
-// bridge into every panel page. Embed mode (a host fetcher is configured, which
-// cannot carry an iframe `src`) keeps the client-injected srcdoc.
+// In standalone panel previews the artifact response supplies the frame and
+// comment source. Its artifact URL remains the base for relative links.
+// Embed mode uses the client-injected srcdoc from workspace content.
 // Embedded hosts may supply their own isolated frame.
 
 import { createPortal } from "react-dom";
@@ -38,6 +37,7 @@ import {
   type ActiveSelection,
   HTML_PANEL_SANDBOX,
   HTML_PREVIEW_SANDBOX,
+  prepareArtifactSrcdoc,
 } from "./codeViewerHelpers";
 import { useFileViewer, useWorkspacePaths } from "./FileViewerContext";
 import {
@@ -382,6 +382,18 @@ export function HtmlCommentViewer({
   const [refreshError, setRefreshError] = useState<{ key: string; message: string } | null>(null);
   const refreshedEntry = refreshed?.key === loadKey ? refreshed.entry : null;
   const entry = refreshedEntry ?? (load?.status === "ready" ? load.entry : null);
+  const entrySrcdoc = useMemo(
+    () =>
+      entry?.document
+        ? prepareArtifactSrcdoc(
+            entry.document,
+            entry.source,
+            entry.nonce,
+            new URL(withBasePath(entry.url), window.location.origin).href,
+          )
+        : null,
+    [entry],
+  );
   const refreshErrorMessage = refreshError?.key === loadKey ? refreshError.message : null;
   const errorMessage = refreshErrorMessage ?? (load?.status === "error" ? load.message : null);
   const nonce = embedDoc?.nonce ?? entry?.nonce ?? null;
@@ -533,7 +545,10 @@ export function HtmlCommentViewer({
           const prefix = artifactUrlPrefix(fresh.url);
           setRefreshed({
             key: loadKey,
-            entry: prefix && tail ? { ...fresh, url: prefix + tail } : fresh,
+            entry:
+              prefix && tail && tail !== artifactTail(fresh.url)
+                ? { ...fresh, url: prefix + tail, document: null }
+                : fresh,
           });
         },
         (err: unknown) => {
@@ -634,6 +649,9 @@ export function HtmlCommentViewer({
       );
     };
 
+    const commentsForFrame = () =>
+      commentsRef.current.filter((comment) => comment.path === (displayedPathRef.current ?? path));
+
     const handleInbound = (raw: unknown) => {
       const msg = parseBridgeMessage(raw, nonce);
       if (!msg) return;
@@ -660,7 +678,7 @@ export function HtmlCommentViewer({
         // scrolls the panel to its card) rather than offering to add a new one.
         const existing =
           !msg.reflow &&
-          commentsRef.current.find(
+          commentsForFrame().find(
             (c) => c.status === "draft" && c.anchor_content === anchorContent,
           );
         if (existing) {
@@ -686,7 +704,7 @@ export function HtmlCommentViewer({
         setFloating((current) => (msg.reflow && !current ? null : anchor));
       } else if (msg.type === BRIDGE_MSG.commentClick) {
         if (sourcePendingRef.current) return;
-        const c = commentsRef.current.find((x) => x.id === msg.id);
+        const c = commentsForFrame().find((x) => x.id === msg.id);
         if (c) {
           onSetActiveSelectionRef.current({
             start_index: c.start_index,
@@ -721,7 +739,9 @@ export function HtmlCommentViewer({
         else showToast(`Can't open ${msg.href}`);
       } else if (msg.type === BRIDGE_MSG.orphans) {
         const textIds = new Set(
-          commentsRef.current.filter((c) => commentPayload(sourceRef.current, c)).map((c) => c.id),
+          commentsForFrame()
+            .filter((c) => commentPayload(sourceRef.current, c))
+            .map((c) => c.id),
         );
         setRenderedOrphans(new Set(msg.ids.filter((id) => textIds.has(id))));
       }
@@ -736,7 +756,7 @@ export function HtmlCommentViewer({
         source: BRIDGE_SOURCE,
         nonce,
         type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current
+        comments: commentsForFrame()
           .map((c) => commentPayload(sourceRef.current, c))
           .filter((c) => c !== null),
       });
@@ -816,9 +836,12 @@ export function HtmlCommentViewer({
       source: BRIDGE_SOURCE,
       nonce,
       type: BRIDGE_MSG.setComments,
-      comments: comments.map((c) => commentPayload(activeSource, c)).filter((c) => c !== null),
+      comments: comments
+        .filter((comment) => comment.path === (page?.path ?? path))
+        .map((c) => commentPayload(activeSource, c))
+        .filter((c) => c !== null),
     });
-  }, [comments, activeSource, nonce]);
+  }, [comments, activeSource, nonce, page?.path, path]);
 
   // Push active-selection changes into the frame (drives the active highlight).
   useEffect(() => {
@@ -889,7 +912,9 @@ export function HtmlCommentViewer({
       <iframe
         ref={setIframeNode}
         onLoad={handlePreviewLoad}
-        src={withBasePath(entry.url)}
+        src={entrySrcdoc === null ? withBasePath(entry.url) : undefined}
+        srcDoc={entrySrcdoc ?? undefined}
+        referrerPolicy="no-referrer"
         sandbox={HTML_PANEL_SANDBOX}
         title="HTML preview"
         className="w-full h-full border-0"

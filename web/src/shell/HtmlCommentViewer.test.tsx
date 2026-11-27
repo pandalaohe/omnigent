@@ -435,6 +435,54 @@ describe("HtmlCommentViewer embedded host frame", () => {
 });
 
 describe("HtmlCommentViewer standalone (artifact URL)", () => {
+  const standardReport = "<!doctype html>";
+
+  it("uses one HTML response for the sandboxed document and the original comment source", async () => {
+    artifactResponses.set(
+      ENTRY_URL,
+      new Response(standardReport + ENTRY_BODY, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      }),
+    );
+    const { onFrameChange } = renderViewer();
+    const { iframe, postMessage } = await openFrame();
+    expect(iframe.getAttribute("src")).toBeNull();
+    expect(iframe.getAttribute("srcdoc")).toContain(
+      `data-omni-artifact href="${location.origin}${ENTRY_URL}"`,
+    );
+    expect(iframe.getAttribute("srcdoc")).toContain("<p>entry</p>");
+    expect(iframe.getAttribute("srcdoc")).toContain(`<script data-omni-nonce="${NONCE}">`);
+    expect(iframe.getAttribute("sandbox")).toBe(HTML_PANEL_SANDBOX);
+    expect(iframe.getAttribute("referrerpolicy")).toBe("no-referrer");
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: ENTRY_URL });
+    expect(onFrameChange).toHaveBeenLastCalledWith({
+      path: ENTRY_PATH,
+      source: standardReport + ENTRY_SOURCE,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ENTRY_BODY,
+    "<!doctype html\u00a0>" + ENTRY_BODY,
+    standardReport + ENTRY_BODY.replace("<body>", "<head><base href='./out/'></head><body>"),
+    standardReport + ENTRY_BODY.replace("<p>entry</p>", '<a href="./index.html#chapter">Go</a>'),
+    standardReport +
+      ENTRY_BODY.replace(
+        "<p>entry</p>",
+        '<a href="#chapter" onclick="event.stopPropagation()">Go</a>',
+      ),
+  ])("uses the native frame for a document with location-sensitive markup", async (html) => {
+    artifactResponses.set(
+      ENTRY_URL,
+      new Response(html, { headers: { "Content-Type": "text/html" } }),
+    );
+    renderViewer();
+    const { iframe } = await openFrame();
+    expect(iframe.getAttribute("src")).toBe(ENTRY_URL);
+    expect(iframe.getAttribute("srcdoc")).toBeNull();
+  });
+
   it("reloads typed anchors in the frame and leaves legacy 0–0 text unresolved", async () => {
     const typed = encodeRenderedTextAnchor({
       v: 1,
@@ -847,7 +895,22 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       return res ? res.clone() : new Response("missing", { status: 404 });
     });
 
-    const { onFrameChange, onSetActiveSelection } = renderViewer();
+    const previousPageComment = {
+      ...elementComment("previous-page-comment", ENTRY_PATH, 0),
+      start_index: 0,
+      end_index: 0,
+      anchor_content: encodeRenderedTextAnchor({
+        v: 1,
+        kind: "html",
+        text: "page two",
+        occ: 1,
+        prefix: "",
+        suffix: "",
+      }),
+    };
+    const { onFrameChange, onSetActiveSelection } = renderViewer({
+      comments: [previousPageComment],
+    });
     const { postMessage } = await openFrame();
     await waitFor(() =>
       expect(onFrameChange).toHaveBeenLastCalledWith({
