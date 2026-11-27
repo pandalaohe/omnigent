@@ -274,7 +274,9 @@ class _WebSocket:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_only", [False, True])
-async def test_bridge_metadata_input_resize_and_detach(instance, read_only):
+async def test_bridge_metadata_input_resize_and_detach(instance, monkeypatch, read_only):
+    windows_build = 12345
+    monkeypatch.setattr(ConPtyTerminalInstance, "windows_build", property(lambda _: windows_build))
     process = _Process()
     instance._process, instance.running = process, True
     ws = _WebSocket(
@@ -286,7 +288,10 @@ async def test_bridge_metadata_input_resize_and_detach(instance, read_only):
         ]
     )
     await asyncio.wait_for(bridge_conpty_to_websocket(ws, instance, read_only=read_only), 3)
-    assert ws.frames[0] == {"type": "pty_info", "windows_pty": {"backend": "conpty", "build": 0}}
+    assert ws.frames[0] == {
+        "type": "pty_info",
+        "windows_pty": {"backend": "conpty", "build": windows_build},
+    }
     assert process.writes == ([] if read_only else ["中文".encode()])
     assert ((100, 30) in process.sizes) is not read_only
     assert len(instance._subscribers) == 0 and not process.closed

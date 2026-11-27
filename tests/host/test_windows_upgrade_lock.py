@@ -7,6 +7,7 @@ import sys
 import time
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from omnigent.host import windows_upgrade_lock as locks
@@ -15,13 +16,13 @@ from omnigent.host import windows_upgrade_lock as locks
 @pytest.mark.parametrize("contents", ["{", "[]", '{"pid": "bad"}', "\ufffd"])
 def test_old_damaged_owner_recovers_under_guard(monkeypatch, tmp_path, contents):
     path = tmp_path / "upgrade.lock"
-    path.write_text(contents)
+    path.write_text(contents, encoding="utf-8")
     old = time.time() - 1801
     os.utime(path, (old, old))
     monkeypatch.setattr(locks.psutil, "process_iter", lambda: iter([]))
     owner = locks.acquire_lock(path)
     assert owner["pid"] == os.getpid()
-    assert json.loads(path.read_text()) == owner
+    assert json.loads(path.read_text(encoding="utf-8")) == owner
     assert path.with_suffix(".lock.guard").exists()
     locks.release_lock(path, owner)
 
@@ -51,7 +52,7 @@ def test_competing_stale_takeover_is_serialized(tmp_path):
     path = tmp_path / "upgrade.lock"
     path.write_text(json.dumps({"pid": 12345, "create_time": -1}))
     script = """
-import contextlib, sys
+import contextlib, os, sys
 from pathlib import Path
 from omnigent.host import windows_upgrade_lock as locks
 path, role = Path(sys.argv[1]), sys.argv[2]
@@ -76,7 +77,7 @@ try:
 except RuntimeError:
     print('refused', flush=True)
 else:
-    print('won', flush=True)
+    print(f'won {os.getpid()}', flush=True)
     sys.stdin.readline()
 """
     processes = []
@@ -103,10 +104,15 @@ else:
         assert second.stdout.readline().strip() == "attempting"
         first.stdin.write("continue\n")
         first.stdin.flush()
-        assert first.stdout.readline().strip() == "won"
+        result, _, winner_pid_text = first.stdout.readline().strip().partition(" ")
+        assert result == "won"
+        winner_pid = int(winner_pid_text)
         assert second.stdout.readline().strip() == "refused"
         assert second.wait(timeout=10) == 0
-        assert json.loads(path.read_text())["pid"] == first.pid
+        assert json.loads(path.read_text(encoding="utf-8")) == {
+            "pid": winner_pid,
+            "create_time": psutil.Process(winner_pid).create_time(),
+        }
         first.stdin.write("exit\n")
         first.stdin.flush()
         assert first.wait(timeout=10) == 0
