@@ -60,6 +60,58 @@ def test_narrow_comment_card_footer_stays_inside_card(
         assert box["y"] >= time["y"] + time["height"] or box["x"] >= time["x"] + time["width"]
 
 
+@pytest.mark.parametrize("width,height", [(1280, 800), (390, 844)])
+def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
+    page: Page,
+    seeded_session: BrowserSession,
+    request: pytest.FixtureRequest,
+    width: int,
+    height: int,
+) -> None:
+    """A page's own top-right control stays uncovered; the toggle lives in the panel toolbar."""
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    _html_viewer(
+        page,
+        seeded_session,
+        '<div style="display:flex;justify-content:flex-end">'
+        '<button id="page-menu">Menu</button></div><p>Review this page</p>',
+    )
+    page.set_viewport_size({"width": width, "height": height})
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    preview = viewer.locator('iframe[title="HTML preview"]')
+    page_menu = preview.content_frame.locator("#page-menu")
+    expect(page_menu).to_be_visible()
+    toggle = viewer.get_by_role("button", name="Annotate", exact=True)
+    more = viewer.get_by_role("button", name="More actions", exact=True)
+    expect(toggle.or_(more)).to_be_visible(timeout=15_000)
+    frame_box = preview.bounding_box()
+    assert frame_box
+    # Nothing the viewer draws may sit over the frame's top-right corner.
+    covering = page.evaluate(
+        "([x, y]) => document.elementFromPoint(x, y)?.tagName",
+        [frame_box["x"] + frame_box["width"] - 12, frame_box["y"] + 12],
+    )
+    assert covering == "IFRAME"
+    page_menu.click()
+    if toggle.is_visible():
+        box = toggle.bounding_box()
+        assert box and box["y"] + box["height"] <= frame_box["y"]
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        page.screenshot(path=output / f"annotate-toolbar-{width}-on.png")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+    else:
+        more.click()
+        row = page.get_by_role("menuitem", name="Annotate", exact=True)
+        expect(row).to_be_visible()
+        page.screenshot(path=output / f"annotate-toolbar-{width}-menu.png")
+        page.keyboard.press("Escape")
+    page.screenshot(path=output / f"annotate-toolbar-{width}.png")
+
+
 def test_table_multiline_selection_can_be_saved_and_reloaded(
     page: Page, seeded_session: BrowserSession, tmp_path: Path
 ) -> None:

@@ -25,6 +25,7 @@ import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
 const codeViewerComments = vi.hoisted(() => vi.fn());
+const annotateToggle = vi.hoisted(() => vi.fn());
 const addCommentMutateAsync = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
@@ -48,6 +49,7 @@ vi.mock("./CodeViewer", () => ({
     onDirtyChange,
     onSetActiveSelection,
     onFrameChange,
+    onAnnotateControlChange,
     comments,
     previewKey,
   }: {
@@ -64,6 +66,7 @@ vi.mock("./CodeViewer", () => ({
       anchor_content: string;
     }) => void;
     onFrameChange?: (frame: { path: string; source: string } | null) => void;
+    onAnnotateControlChange?: (control: { on: boolean; toggle: () => void } | null) => void;
     comments?: Comment[];
     previewKey?: number;
   }) => {
@@ -99,6 +102,21 @@ vi.mock("./CodeViewer", () => ({
           onClick={() =>
             onSetActiveSelection?.({ start_index: 10, end_index: 14, anchor_content: "other" })
           }
+        />
+        <button
+          type="button"
+          aria-label="report annotate off"
+          onClick={() => onAnnotateControlChange?.({ on: false, toggle: annotateToggle })}
+        />
+        <button
+          type="button"
+          aria-label="report annotate on"
+          onClick={() => onAnnotateControlChange?.({ on: true, toggle: annotateToggle })}
+        />
+        <button
+          type="button"
+          aria-label="withdraw annotate"
+          onClick={() => onAnnotateControlChange?.(null)}
         />
         {viewMode === "editor" && (
           <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
@@ -669,6 +687,30 @@ describe("FileViewer mobile keyboard inset", () => {
     renderViewer({ open: true });
 
     expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
+  });
+});
+
+describe("FileViewer annotate toolbar button", () => {
+  it("shows the preview's annotate toggle in the toolbar with its pressed state", () => {
+    annotateToggle.mockClear();
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "page.html" });
+    expect(screen.queryByRole("button", { name: "Annotate" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "report annotate off" }));
+    const toggle = screen.getByRole("button", { name: "Annotate" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(toggle);
+    expect(annotateToggle).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "report annotate on" }));
+    expect(screen.getByRole("button", { name: "Annotate" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "withdraw annotate" }));
+    expect(screen.queryByRole("button", { name: "Annotate" })).toBeNull();
   });
 });
 

@@ -1,7 +1,7 @@
 """E2E: element annotation in the rendered HTML preview (pick → store → send).
 
 An ``.html`` file opens in the sandboxed preview iframe (opaque origin, no
-``allow-same-origin``). ``HtmlCommentViewer`` overlays an "Annotate" toggle
+``allow-same-origin``). The file panel toolbar shows an "Annotate" toggle
 (``aria-label="Annotate"``, ``aria-pressed`` mirrors the mode); turning it on
 loads a pick runtime into the frame that outlines hovered elements, keeps a
 selected outline on the picked element, and reports the pick to the parent
