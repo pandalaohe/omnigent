@@ -186,3 +186,88 @@ async def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypat
         state, "run_command", {"CommandLine": command}, control_paths=(r"C:\control",)
     )
     assert native.action == Verdict.DENY
+
+
+@pytest.mark.parametrize("tool_name", ["bash", "sys_os_shell"])
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # Ordinary shell syntax stays ALLOW under Pi auto with the floor enabled.
+        ("echo $HOME", Verdict.ALLOW),
+        ("start=$(date +%s); sleep 1", Verdict.ALLOW),
+        ("for h in a b; do echo hi; done", Verdict.ALLOW),
+        ("cd src && ls", Verdict.ALLOW),
+        ("cat a > b.txt", Verdict.ALLOW),
+        ("ls *.py", Verdict.ALLOW),
+        ('python3 -c "print(1)"', Verdict.ALLOW),
+        ("rm -rf build", Verdict.ALLOW),
+        ("git status", Verdict.ALLOW),
+        ("uv run pytest", Verdict.ALLOW),
+        ('printf x > "~/scratch"', Verdict.ALLOW),
+        ("cat <<'EOF' > out.txt\n$(sudo ls)\nEOF", Verdict.ALLOW),
+        ("cat <<EOF > out.txt\n\\$(sudo ls)\nEOF", Verdict.ALLOW),
+        ("echo (unbalanced", Verdict.ALLOW),
+        # Narrow floor elevates destructive classes / critical redirects to ASK.
+        ("git reset --hard", Verdict.ASK),
+        ("git clean -fdx", Verdict.ASK),
+        ("sudo ls", Verdict.ASK),
+        ("find . -delete", Verdict.ASK),
+        ("echo x > ~/.bashrc", Verdict.ASK),
+        ("cat <<EOF > out.txt\n$(sudo ls)\nEOF", Verdict.ASK),
+        ("cat <<EOF > out.txt\n$(( $(sudo ls) ))\nEOF", Verdict.ASK),
+        ('env -S "git" reset --hard', Verdict.ASK),
+        ('find . -type f "$ACTION"', Verdict.ASK),
+        # Hard-denied destructive or malformed commands keep decide_tier's DENY.
+        ("rm -rf ~", Verdict.DENY),
+        ('rm -rf "$HOME"', Verdict.DENY),
+        ("rm -rf /", Verdict.DENY),
+        ("diskutil eraseDisk JHFS+ X disk2", Verdict.DENY),
+        ('echo "unclosed', Verdict.DENY),
+    ],
+)
+def test_pi_auto_approval_floor_allows_ordinary_shell_and_stops_destructive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    command: str,
+    expected: Verdict,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    state = snapshot(workspace)
+    controls = (str(tmp_path / "control"),)
+    result = host.evaluate_host_tool(
+        state,
+        tool_name,
+        {"command": command},
+        control_paths=controls,
+        auto_approval_floor="narrow",
+    )
+    assert result.action == expected, result.reason
+
+
+def test_pi_auto_approval_floor_keeps_outside_workspace_edit_and_strict_acp_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    state = snapshot(workspace)
+    controls = (str(tmp_path / "control"),)
+    outside = host.evaluate_host_tool(
+        state,
+        "write",
+        {"path": str(tmp_path / "outside.txt"), "content": "fixture"},
+        control_paths=controls,
+        auto_approval_floor="narrow",
+    )
+    assert outside.action == Verdict.ASK
+    strict_acp = host.evaluate_host_tool(
+        state,
+        "sys_os_shell",
+        {"command": "echo $HOME"},
+        control_paths=controls,
+        auto_approval_floor=True,
+    )
+    assert strict_acp.action == Verdict.ASK

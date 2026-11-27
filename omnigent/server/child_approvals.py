@@ -23,7 +23,12 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation, ErrorData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.pi_extension_ui import parse_approval_declaration
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import (
+    _ENV_SPLIT_STRING_FLAGS,
+    _FLAG_WRAPPERS,
+    SHELL_TOOLS,
+    _skip_flag_wrapper_args,
+)
 from omnigent.policies.builtins.orchestration import (
     _RM_CRITICAL_DIRS,
     _RM_SYSTEM_PARENTS,
@@ -253,47 +258,49 @@ def _critical_target(path: str) -> bool:
     )
 
 
-def _write_user_only(name: str, args: list[str], _piped: bool) -> bool:
-    if name == "rm":
-        severity = _rm_severity([name, *(_normal_path(arg) for arg in args)])
-        return severity == "DENY" or (
-            severity is not None and any(arg.startswith("~") for arg in args)
-        )
+def _write_target_paths(name: str, args: list[str]) -> tuple[bool, list[str]]:
     if name == "dd":
-        targets = [arg.removeprefix("of=") for arg in args if arg.startswith("of=")]
-    elif name in {"curl", "wget"}:
+        return False, [arg.removeprefix("of=") for arg in args if arg.startswith("of=")]
+    if name in {"curl", "wget"}:
         output_options = (
             {"-o", "--output", "--output-dir"}
             if name == "curl"
             else {"-O", "--output-document", "-P", "--directory-prefix"}
         )
         _, values = _split_command_options(args, output_options)
-        targets = [value for paths in values.values() for value in paths]
+        return False, [value for paths in values.values() for value in paths]
+    value_options = {"-t", "--target-directory", "-S", "--suffix"}
+    if name == "install":
+        value_options |= {"-m", "--mode", "-o", "--owner", "-g", "--group"}
+    elif name == "truncate":
+        value_options = {"-s", "--size", "-r", "--reference"}
+    elif name in {"chmod", "chown"}:
+        value_options = {"--reference"}
+    elif name == "rsync":
+        _, execution = _split_command_options(args, {"-e", "--rsh", "--rsync-path"})
+        if execution or any(arg.startswith("--delete") for arg in args):
+            return True, []
+    operands, values = _split_command_options(args, value_options, preserve_modes=name == "chmod")
+    if name in {"tee", "truncate", "mv"} or (
+        name == "install" and any(arg in {"-d", "--directory"} for arg in args)
+    ):
+        targets = operands
+    elif name in {"chmod", "chown"}:
+        targets = operands if "--reference" in values else operands[1:]
     else:
-        value_options = {"-t", "--target-directory", "-S", "--suffix"}
-        if name == "install":
-            value_options |= {"-m", "--mode", "-o", "--owner", "-g", "--group"}
-        elif name == "truncate":
-            value_options = {"-s", "--size", "-r", "--reference"}
-        elif name in {"chmod", "chown"}:
-            value_options = {"--reference"}
-        elif name == "rsync":
-            _, execution = _split_command_options(args, {"-e", "--rsh", "--rsync-path"})
-            if execution or any(arg.startswith("--delete") for arg in args):
-                return True
-        operands, values = _split_command_options(
-            args, value_options, preserve_modes=name == "chmod"
+        targets = operands[-1:]
+    targets += values.get("-t", []) + values.get("--target-directory", [])
+    return False, targets
+
+
+def _write_user_only(name: str, args: list[str], _piped: bool) -> bool:
+    if name == "rm":
+        severity = _rm_severity([name, *(_normal_path(arg) for arg in args)])
+        return severity == "DENY" or (
+            severity is not None and any(arg.startswith("~") for arg in args)
         )
-        if name in {"tee", "truncate", "mv"} or (
-            name == "install" and any(arg in {"-d", "--directory"} for arg in args)
-        ):
-            targets = operands
-        elif name in {"chmod", "chown"}:
-            targets = operands if "--reference" in values else operands[1:]
-        else:
-            targets = operands[-1:]
-        targets += values.get("-t", []) + values.get("--target-directory", [])
-    return any(_critical_target(target) for target in targets)
+    forced, targets = _write_target_paths(name, args)
+    return forced or any(_critical_target(target) for target in targets)
 
 
 def _git_user_only(_name: str, args: list[str], _piped: bool) -> bool:
@@ -536,6 +543,486 @@ def floor(params: Mapping[str, Any]) -> Literal["clear", "user_only"]:
     if params.get("phase") == "acp_permission" and re.search(r"\[[\w.]+\]::", command):
         return "user_only"
     return "user_only" if _command_is_user_only(command) else "clear"
+
+
+_AUTO_FLOOR_CLASSES = (
+    "critical path deletion and writes",
+    "disk and host tools",
+    "git config injection and discards",
+    "find actions",
+)
+_AUTO_PRIVILEGE_WRAPPERS = frozenset(
+    {"sudo", "doas", "su", "runuser", "ssh", "chroot", "nsenter", "systemd-run"}
+)
+_AUTO_CONTROL_PREFIXES = frozenset(
+    {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
+)
+_AUTO_HARMLESS_REDIRECTS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+
+
+@dataclass(frozen=True)
+class _ShellToken:
+    text: str
+    unknown_expansion: bool = False
+    tilde_expanded: bool = False
+
+
+def _scan_delimited(text: str, start: int, close_char: str) -> int:
+    """Find the matching `)` or backtick without raising on unbalanced input."""
+    index = start
+    length = len(text)
+    depth = 1
+    quote = ""
+    while index < length:
+        char = text[index]
+        if close_char == "`":
+            if char == "\\":
+                index += 2
+                continue
+            if char == "`":
+                return index
+            index += 1
+        elif quote == "'":
+            if char == "'":
+                quote = ""
+            index += 1
+        elif quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = ""
+            index += 1
+        elif char == "\\":
+            index += 2
+        elif char in {"'", '"'}:
+            quote = char
+            index += 1
+        elif char == "`":
+            end = _scan_delimited(text, index + 1, "`")
+            index = end + 1 if end != -1 else index + 1
+        elif char == "(":
+            depth += 1
+            index += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+            index += 1
+        else:
+            index += 1
+    return -1
+
+
+def _extract_heredoc_substitutions(body: str, embedded: list[str]) -> None:
+    """Collect `$(...)` and backtick substitutions inside an unquoted heredoc body."""
+    body = body.replace("\\\n", "")
+    index = 0
+    length = len(body)
+    while index < length:
+        char = body[index]
+        if char == "\\" and index + 1 < length:
+            index += 2
+        elif body.startswith("$(", index) and not body.startswith("$((", index):
+            end = _scan_delimited(body, index + 2, ")")
+            if end != -1:
+                embedded.append(body[index + 2 : end])
+                index = end + 1
+            else:
+                index += 2
+        elif char == "`":
+            end = _scan_delimited(body, index + 1, "`")
+            if end != -1:
+                embedded.append(body[index + 1 : end])
+                index = end + 1
+            else:
+                index += 1
+        else:
+            index += 1
+
+
+def _read_shell_word(text: str, start: int, embedded: list[str]) -> tuple[_ShellToken, int]:
+    buf: list[str] = []
+    unknown = False
+    quote = ""
+    index = start
+    length = len(text)
+    tilde_expanded = start < length and text[start] == "~"
+    while index < length:
+        char = text[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            else:
+                buf.append(char)
+            index += 1
+            continue
+        if not quote and char in " \t\r\n;|&()<>":
+            break
+        if not quote and char in {"'", '"'}:
+            quote = char
+            index += 1
+        elif quote == '"' and char == '"':
+            quote = ""
+            index += 1
+        elif char == "\\" and index + 1 < length:
+            nxt = text[index + 1]
+            if quote == '"':
+                if nxt in {'"', "\\", "$", "`"}:
+                    buf.append(nxt)
+                elif nxt != "\n":
+                    buf.extend((char, nxt))
+            elif nxt != "\n":
+                buf.append(nxt)
+            index += 2
+        elif char == "$":
+            unknown = True
+            if not quote and text.startswith("$((", index):
+                end = _scan_delimited(text, index + 2, ")")
+                if end != -1:
+                    _extract_heredoc_substitutions(text[index + 3 : end], embedded)
+                    buf.append(text[index : end + 1])
+                    index = end + 1
+                    continue
+            elif text.startswith("$(", index) and not text.startswith("$((", index):
+                end = _scan_delimited(text, index + 2, ")")
+                if end != -1:
+                    embedded.append(text[index + 2 : end])
+                    buf.append(text[index : end + 1])
+                    index = end + 1
+                    continue
+            buf.append(char)
+            index += 1
+        elif char == "`":
+            unknown = True
+            end = _scan_delimited(text, index + 1, "`")
+            if end != -1:
+                embedded.append(text[index + 1 : end])
+                buf.append(text[index : end + 1])
+                index = end + 1
+                continue
+            buf.append(char)
+            index += 1
+        else:
+            if not quote and char in "*?[":
+                unknown = True
+            buf.append(char)
+            index += 1
+    return _ShellToken("".join(buf), unknown, tilde_expanded), index
+
+
+def _scan_lenient_statements(
+    source: str, embedded: list[str]
+) -> list[tuple[list[_ShellToken], list[_ShellToken], bool]]:
+    """Split shell statements and write redirects leniently without raising on syntax."""
+    statements: list[tuple[list[_ShellToken], list[_ShellToken], bool]] = []
+    tokens: list[_ShellToken] = []
+    write_redirects: list[_ShellToken] = []
+    piped = False
+    pending_heredocs: list[tuple[str, bool, bool]] = []
+    index = 0
+    length = len(source)
+
+    def flush(next_piped: bool) -> None:
+        nonlocal tokens, write_redirects, piped
+        if tokens or write_redirects:
+            statements.append((tokens, write_redirects, piped))
+        tokens, write_redirects, piped = [], [], next_piped
+
+    def read_redirect_word(pos: int) -> tuple[_ShellToken | None, int]:
+        while pos < length and source[pos] in " \t\r":
+            pos += 1
+        if pos >= length or source[pos] in "\n;|&()<>":
+            return None, pos
+        return _read_shell_word(source, pos, embedded)
+
+    while index < length:
+        char = source[index]
+        if char in " \t\r":
+            index += 1
+        elif char == "\n":
+            flush(False)
+            index += 1
+            while pending_heredocs and index < length:
+                delimiter, strip_tabs, quoted = pending_heredocs.pop(0)
+                body_start = body_end = index
+                while index < length:
+                    nl = source.find("\n", index)
+                    end = length if nl == -1 else nl
+                    line = source[index:end].rstrip("\r")
+                    next_index = length if nl == -1 else nl + 1
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        body_end = index
+                        index = next_index
+                        break
+                    index = next_index
+                    body_end = index
+                if not quoted:
+                    _extract_heredoc_substitutions(source[body_start:body_end], embedded)
+        elif char == "#":
+            nl = source.find("\n", index)
+            index = length if nl == -1 else nl
+        elif source.startswith(("&>>", "&>"), index):
+            target, index = read_redirect_word(
+                index + (3 if source.startswith("&>>", index) else 2)
+            )
+            if target is not None:
+                write_redirects.append(target)
+        elif char in ";&|()":
+            next_piped = (
+                char == "|"
+                and (index == 0 or source[index - 1] != "|")
+                and (index + 1 == length or source[index + 1] not in "|&")
+            )
+            flush(next_piped)
+            index += 1
+        else:
+            fd_end = index
+            while fd_end < length and source[fd_end].isdigit():
+                fd_end += 1
+            if fd_end < length and source[fd_end] in "<>":
+                index = fd_end
+                if source.startswith(("<(", ">("), index):
+                    end = _scan_delimited(source, index + 2, ")")
+                    if end != -1:
+                        embedded.append(source[index + 2 : end])
+                        index = end + 1
+                    else:
+                        index += 2
+                elif source.startswith("<<", index) and not source.startswith("<<<", index):
+                    index += 2
+                    strip_tabs = index < length and source[index] == "-"
+                    index += int(strip_tabs)
+                    raw_start = index
+                    delim, index = read_redirect_word(index)
+                    if delim is not None and delim.text:
+                        quoted = any(ch in source[raw_start:index] for ch in "'\"\\")
+                        pending_heredocs.append((delim.text, strip_tabs, quoted))
+                elif source.startswith(("<<<", "<&"), index):
+                    _, index = read_redirect_word(
+                        index + (3 if source.startswith("<<<", index) else 2)
+                    )
+                elif source.startswith(("<>", ">>", ">|"), index):
+                    target, index = read_redirect_word(index + 2)
+                    if target is not None:
+                        write_redirects.append(target)
+                elif source.startswith(">&", index):
+                    target, index = read_redirect_word(index + 2)
+                    if target is not None and target.text != "-" and not target.text.isdigit():
+                        write_redirects.append(target)
+                elif source[index] == "<":
+                    _, index = read_redirect_word(index + 1)
+                else:
+                    target, index = read_redirect_word(index + 1)
+                    if target is not None:
+                        write_redirects.append(target)
+            else:
+                token, index = _read_shell_word(source, index, embedded)
+                tokens.append(token)
+    flush(False)
+    return statements
+
+
+def _unwrap_auto_prefixes(tokens: list[_ShellToken], embedded: list[str]) -> list[_ShellToken]:
+    texts = [tok.text for tok in tokens]
+    index = 0
+    split_depth = 0
+    while index < len(tokens):
+        index = _skip_shell_assignments(texts, index)
+        if index >= len(tokens):
+            return []
+        raw = texts[index]
+        if raw in _AUTO_CONTROL_PREFIXES:
+            index += 1
+            continue
+        name = (PurePosixPath(raw).name or raw).removesuffix(".exe")
+        if name == "nohup":
+            index += 1
+            if index < len(tokens) and texts[index] == "--":
+                index += 1
+            continue
+        if name not in {"time", "command", "exec", "env"}:
+            break
+        if name == "command":
+            cursor = index + 1
+            while cursor < len(tokens) and texts[cursor].startswith("-") and texts[cursor] != "-":
+                flag = texts[cursor]
+                if flag == "--":
+                    break
+                if "v" in flag[1:] or "V" in flag[1:]:
+                    return tokens[index:]
+                cursor += 1
+        next_index, split_string = _skip_flag_wrapper_args(
+            texts,
+            index + 1,
+            value_flags=_FLAG_WRAPPERS[name],
+            has_duration=False,
+            capture_flags=_ENV_SPLIT_STRING_FLAGS if name == "env" else frozenset(),
+        )
+        if split_string is not None:
+            split_depth += 1
+            if split_depth > 8:
+                return tokens[index:]
+            split_stmts = _scan_lenient_statements(split_string, embedded)
+            prefix_tokens = [tok for stmt_tokens, _, _ in split_stmts for tok in stmt_tokens]
+            tokens = [*prefix_tokens, *tokens[next_index:]]
+            texts = [tok.text for tok in tokens]
+            index = 0
+            continue
+        index = next_index
+    return tokens[index:]
+
+
+def _redirect_target_is_critical(target: _ShellToken) -> bool:
+    path = target.text
+    if not path or _normal_path(path) in _AUTO_HARMLESS_REDIRECTS:
+        return False
+    if target.tilde_expanded:
+        return True
+    if target.unknown_expansion and (
+        path in {"$HOME", "${HOME}"} or path.startswith(("$HOME/", "${HOME}/"))
+    ):
+        return True
+    return not path.startswith("~") and _critical_target(path)
+
+
+def _write_has_unknown_target(name: str, arg_tokens: list[_ShellToken]) -> bool:
+    unknown_tokens = [tok for tok in arg_tokens if tok.unknown_expansion]
+    if not unknown_tokens:
+        return False
+    if name == "dd":
+        return any(tok.text.startswith("of=") or "=" not in tok.text for tok in unknown_tokens)
+    args = [tok.text for tok in arg_tokens]
+    if name == "rm":
+        targets, _ = _split_command_options(args, set())
+    else:
+        _, targets = _write_target_paths(name, args)
+        if name in {"chmod", "chown"} and not targets:
+            return any(not tok.text.startswith("-") for tok in unknown_tokens)
+    return any(
+        target == tok.text or (tok.text.startswith("-") and tok.text.endswith(target))
+        for target in targets
+        for tok in unknown_tokens
+    )
+
+
+def _git_has_unknown_subcommand(arg_tokens: list[_ShellToken]) -> bool:
+    index = 0
+    while index < len(arg_tokens) and arg_tokens[index].text.startswith("-"):
+        if arg_tokens[index].unknown_expansion:
+            return True
+        arg = arg_tokens[index].text
+        index += 2 if arg in {"-C", "--git-dir", "--work-tree", "--namespace"} else 1
+    return index < len(arg_tokens) and arg_tokens[index].unknown_expansion
+
+
+_FIND_VALUE_PREDICATES = frozenset(
+    {
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-regex",
+        "-iregex",
+        "-lname",
+        "-ilname",
+        "-type",
+        "-xtype",
+        "-maxdepth",
+        "-mindepth",
+        "-size",
+        "-mtime",
+        "-mmin",
+        "-ctime",
+        "-cmin",
+        "-atime",
+        "-amin",
+        "-newer",
+        "-anewer",
+        "-cnewer",
+        "-perm",
+        "-user",
+        "-group",
+        "-uid",
+        "-gid",
+        "-links",
+        "-inum",
+        "-fstype",
+        "-printf",
+        "-regextype",
+    }
+)
+
+
+def _find_has_unknown_action(arg_tokens: list[_ShellToken]) -> bool:
+    in_expr = False
+    index = 0
+    while index < len(arg_tokens):
+        tok = arg_tokens[index]
+        text = tok.text
+        if not in_expr:
+            if text in {"-H", "-L", "-P"} or text.startswith("-O"):
+                index += 1
+                continue
+            if text == "-D":
+                index += 2
+                continue
+            if text.startswith("-") or text in {"!", "("}:
+                in_expr = True
+            else:
+                index += 1
+                continue
+        if text in _FIND_VALUE_PREDICATES:
+            index += 2
+            continue
+        if tok.unknown_expansion:
+            return True
+        index += 1
+    return False
+
+
+def auto_floor_asks(command: str) -> bool:
+    """Narrow auto-tier command floor: ASK only for destructive classes or critical redirects."""
+    if not command.strip():
+        return False
+    pending = [command]
+    while pending:
+        source = pending.pop()
+        embedded: list[str] = []
+        for raw_tokens, write_redirects, piped in _scan_lenient_statements(source, embedded):
+            if any(_redirect_target_is_critical(tok) for tok in write_redirects):
+                return True
+            tokens = _unwrap_auto_prefixes(raw_tokens, embedded)
+            if not tokens:
+                continue
+            name = (PurePosixPath(tokens[0].text).name or tokens[0].text).removesuffix(".exe")
+            if name in _AUTO_PRIVILEGE_WRAPPERS:
+                return True
+            arg_tokens = tokens[1:]
+            args = [tok.text for tok in arg_tokens]
+            for key in _AUTO_FLOOR_CLASSES:
+                names, prefixes, check = _FLOOR_CLASSES[key]
+                if name not in names and not (prefixes and name.startswith(prefixes)):
+                    continue
+                try:
+                    if check(name, args, piped):
+                        return True
+                    if key == "critical path deletion and writes" and _write_has_unknown_target(
+                        name, arg_tokens
+                    ):
+                        return True
+                    if key == "git config injection and discards" and _git_has_unknown_subcommand(
+                        arg_tokens
+                    ):
+                        return True
+                    if key == "find actions" and _find_has_unknown_action(arg_tokens):
+                        return True
+                except ValueError:
+                    return True
+        pending.extend(embedded)
+    return False
 
 
 _BINARY_SOURCES = frozenset(

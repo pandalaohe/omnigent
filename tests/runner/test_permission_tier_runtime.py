@@ -206,6 +206,7 @@ def _runtime(
         ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
         ("auto", "run_command", {"CommandLine": "git reset --hard"}, Verdict.ASK),
         ("auto", "sys_os_shell", {"command": "omni --version"}, Verdict.ALLOW),
+        ("auto", "sys_os_shell", {"command": "echo $HOME"}, Verdict.ASK),
         ("auto", "sys_os_shell", {"command": "git reset --hard"}, Verdict.ASK),
         ("auto", "sys_os_shell", {"command": "rm -rf /"}, Verdict.DENY),
         (
@@ -2948,9 +2949,13 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
     ("name", "arguments", "local", "expected"),
     [
         ("bash", {"command": "omni --version"}, True, Verdict.ALLOW),
+        ("bash", {"command": "echo $HOME"}, True, Verdict.ALLOW),
+        ("bash", {"command": "cd src && ls"}, True, Verdict.ALLOW),
         ("bash", {"command": "git reset --hard"}, True, Verdict.ASK),
+        ("bash", {"command": "echo x > ~/.bashrc"}, True, Verdict.ASK),
         ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ASK),
         ("sys_os_shell", {"command": "omni --version"}, False, Verdict.ALLOW),
+        ("sys_os_shell", {"command": "echo $HOME"}, False, Verdict.ALLOW),
         ("sys_os_shell", {"command": "git reset --hard"}, False, Verdict.ASK),
         ("sys_os_shell", {"command": "rm -rf /"}, False, Verdict.DENY),
         ("sys_os_write", {"path": "../../outside.txt", "content": "fixture"}, False, Verdict.ASK),
