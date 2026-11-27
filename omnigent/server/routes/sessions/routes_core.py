@@ -3135,10 +3135,7 @@ def register_core_routes(
                 if isinstance(payload, dict)
                 and (
                     payload.get("project_id") is not None
-                    or (
-                        request.headers.get("x-omnigent-session-choice") == "1"
-                        and ORCHESTRATION_SOURCE_HEADER in request.headers
-                    )
+                    or ORCHESTRATION_SOURCE_HEADER in request.headers
                     or (
                         payload.get("parent_session_id") is not None
                         and payload.get("agent_id") is None
@@ -9565,6 +9562,35 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
+        if switching_agent and fork_project_id is not None and project_store is not None:
+            fork_project = await asyncio.to_thread(
+                project_store.get, fork_project_id, user_id=user_id
+            )
+            if fork_project is not None:
+                from omnigent.native.native_coding_agents import public_agent_name
+                from omnigent.project_agent_blocks import assert_agent_allowed
+
+                fork_host_id = (
+                    effective_host_id(conversation_store, source) if body.side_chat else None
+                )
+                fork_host_store = getattr(request.app.state, "host_store", None)
+                fork_host_row = (
+                    await asyncio.to_thread(fork_host_store.get_host, fork_host_id)
+                    if fork_host_id is not None and fork_host_store is not None
+                    else None
+                )
+                assert_agent_allowed(
+                    project=fork_project,
+                    host_id=fork_host_id,
+                    agent_id=base_agent.id,
+                    agent_label=public_agent_name(base_agent.name) or base_agent.name,
+                    host_label=(
+                        fork_host_row.name
+                        if fork_host_row is not None and fork_host_row.name
+                        else fork_host_id
+                    ),
+                )
+
         if validate_only:
             return None
         # Copied last, after every validation above; the copy row itself is
@@ -9589,6 +9615,19 @@ def register_core_routes(
                     _delete_stored_session_bundle_after_failure, artifact_store, clone_location
                 )
 
+        from omnigent.project_agent_blocks import FORK_SAME_AGENT_LABEL_KEY
+
+        fork_extra_labels = (
+            {**(extra_labels or {}), FORK_SAME_AGENT_LABEL_KEY: "1"}
+            if not switching_agent
+            else extra_labels
+        )
+        fork_dropped_label_keys = (
+            {*(dropped_label_keys or ()), FORK_SAME_AGENT_LABEL_KEY}
+            if switching_agent
+            else dropped_label_keys
+        )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -9610,8 +9649,8 @@ def register_core_routes(
                 override_reasoning_effort_set=effort_set,
                 override_terminal_launch_args=override_launch_args,
                 override_terminal_launch_args_set=launch_args_set,
-                dropped_label_keys=dropped_label_keys,
-                extra_labels=extra_labels,
+                dropped_label_keys=frozenset(fork_dropped_label_keys),
+                extra_labels=fork_extra_labels,
                 # Launch flags are CLI-specific. On an agent switch the fork may
                 # bind a different CLI (e.g. claude-code → pi), whose flag set
                 # differs — Claude Code's ``--permission-mode`` makes pi exit at

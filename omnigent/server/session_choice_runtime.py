@@ -968,9 +968,9 @@ async def context_request(
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
     from omnigent.server.routes.calling_defaults import _sync_pair
 
+    options["project_config"] = project_config
     if settings.schema_version == 2:
         options["master"] = await load_master(owner, app.state.user_preferences_store)
-        options["project_config"] = project_config
 
     request = await asyncio.to_thread(
         _context_request, app, owner, host, settings, caller, **options
@@ -1055,6 +1055,8 @@ def _context_request(
     independent: bool = False,
     master: dict | None = None,
     project_config: dict | None = None,
+    block_host: str | None = None,
+    use_block_host: bool = False,
     additional_agents: tuple[str, ...] = (),
     catalog_harness_override: str | None = None,
     catalog_override_agent: str | None = None,
@@ -1176,6 +1178,8 @@ def _context_request(
                 _resolve_harness_impl(target, agent_store=agents, agent_cache=cache)
             )
             differ_family = model_family(model or product or "")
+    from omnigent.project_agent_blocks import blocked_agents
+
     request = ChoiceRequest(
         owner,
         host,
@@ -1195,6 +1199,7 @@ def _context_request(
         quota_tiers=quota_tiers,
         quota_periods=quota_periods,
         provider_groups=groups,
+        blocked=blocked_agents(project_config, block_host if use_block_host else host),
     )
     return replace(
         request, link_exclusions=external_link_exclusions(app, settings, request, time.time())
@@ -1357,6 +1362,13 @@ def limit_receipt(app, settings, revision, link, request, running, now, *, inclu
     }
 
 
+@dataclass(frozen=True)
+class _AdmitBodyOverride:
+    """Forwards a modified request body to create without recording a session choice."""
+
+    body: Any
+
+
 @dataclass
 class CreateChoice:
     body: Any
@@ -1503,7 +1515,8 @@ async def admit_create(
     body: Any,
     caller: Conversation | None,
     user_id: str | None,
-) -> AsyncIterator[CreateChoice | None]:
+) -> AsyncIterator[CreateChoice | _AdmitBodyOverride | None]:
+    from omnigent.calling_defaults import default_agent_for_host_or_legacy
     from omnigent.runner.routing import routing_host_id
     from omnigent.server.auth import LEVEL_READ
     from omnigent.server.routes._auth_helpers import require_access
@@ -1521,7 +1534,7 @@ async def admit_create(
     if not host:
         yield None
         return
-    project_id = body.project_id or caller.project_id
+    project_id = body.project_id if "project_id" in body.model_fields_set else caller.project_id
     projects = getattr(app.state, "project_store", None)
     project = projects.get(project_id, user_id=user_id) if projects and project_id else None
     override = (
@@ -1532,16 +1545,28 @@ async def admit_create(
         return
     pin = override.get("pin") if isinstance(override, dict) else None
     named = bool(body.agent_id and (body.user_named or body.choice_reason))
+    j1_applies = (
+        body.parent_session_id is None
+        and not named
+        and project is not None
+        and default_agent_for_host_or_legacy(project.config, body.host_id) is not None
+    )
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(app.state.child_cap_locks.hold(f"owner:{owner}"))
         state = state_for(app)
         settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)
-        if (
-            active_on(settings, host)
-            and not named
-            and pin is None
-            and owner in state.pending_drain_closures
-        ):
+        if not active_on(settings, host):
+            yield None
+            return
+        if j1_applies:
+            j1_body = body
+            if "agent_id" in body.model_fields_set:
+                j1_body = body.model_copy(update={"agent_id": None})
+                j1_body.model_fields_set.discard("agent_id")
+            await stack.aclose()
+            yield _AdmitBodyOverride(body=j1_body)
+            return
+        if not named and pin is None and owner in state.pending_drain_closures:
             if not await _flush_drain_closures(app, owner):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
             settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)
@@ -1557,6 +1582,7 @@ async def admit_create(
             catalog_harness = None
         if catalog_harness and not is_acp_permission_harness(catalog_harness):
             catalog_harness = canonicalize_harness(catalog_harness) or catalog_harness
+        block_host = None if body.host_type == "managed" else host
         request = await context_request(
             app,
             owner,
@@ -1565,6 +1591,8 @@ async def admit_create(
             caller,
             user_id=user_id,
             project_config=project.config if project else None,
+            block_host=block_host,
+            use_block_host=True,
             additional_agents=(body.agent_id,)
             if body.agent_id and (body.user_named or body.choice_reason)
             else (),
@@ -1616,6 +1644,46 @@ async def admit_create(
             if drops and not await _close_drain_locks(app, owner, drops=drops):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
         if named:
+            if body.agent_id and project is not None:
+                from omnigent.errors import ErrorCode, OmnigentError
+                from omnigent.native.native_coding_agents import public_agent_name
+                from omnigent.project_agent_blocks import assert_agent_allowed
+                from omnigent.server.routes._session_create_validation import (
+                    validate_session_agent,
+                )
+
+                named_agent_store = getattr(app.state, "agent_store", None)
+                named_agent = None
+                if named_agent_store is not None:
+                    try:
+                        named_agent = await validate_session_agent(
+                            user_id=user_id,
+                            agent_id=body.agent_id,
+                            agent_store=named_agent_store,
+                            permission_store=getattr(app.state, "permission_store", None),
+                            conversation_store=conversations,
+                        )
+                    except OmnigentError as exc:
+                        if exc.code not in {ErrorCode.NOT_FOUND, ErrorCode.FORBIDDEN}:
+                            raise
+                if named_agent is not None:
+                    named_host_store = getattr(app.state, "host_store", None)
+                    named_host = (
+                        await asyncio.to_thread(named_host_store.get_host, block_host)
+                        if block_host is not None and named_host_store is not None
+                        else None
+                    )
+                    assert_agent_allowed(
+                        project=project,
+                        host_id=block_host,
+                        agent_id=body.agent_id,
+                        agent_label=public_agent_name(named_agent.name) or named_agent.name,
+                        host_label=(
+                            named_host.name
+                            if named_host is not None and named_host.name
+                            else block_host
+                        ),
+                    )
             work, _ = resolve_work_type(settings, body.work_type)
             if body.model_override is None:
                 link = resolved_link(

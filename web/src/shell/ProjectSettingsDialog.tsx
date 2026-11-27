@@ -3,15 +3,23 @@
 // apply on Save; repository actions save immediately. Label-only folders are
 // promoted to projects on Save. Unset fields inherit their existing defaults.
 
-import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  MoreHorizontalIcon,
+  PencilIcon,
+  RotateCcwIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { BlockedAgentsSection } from "@/components/BlockedAgentsSection";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
-import { ProjectOrchestrationView } from "@/components/ProjectOrchestrationView";
 import {
-  ProjectSessionChoiceField,
-  type ProjectChoiceOverride,
-} from "@/pages/settings/sessionChoice/ProjectSessionChoiceField";
+  normalizeOrchestrationDraft,
+  ProjectOrchestrationView,
+  seedOrchestrationDraft,
+  type ProjectOrchestrationDraft,
+} from "@/components/ProjectOrchestrationView";
 import { PickerShell } from "@/components/PickerShell";
 import { SelectionList, type PickerItem } from "@/components/SelectionList";
 import { resolveMulti, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
@@ -22,7 +30,12 @@ import {
   type HarnessCapabilityMap,
 } from "@/lib/sessionDefaultModes";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentNameTag, nonNativeAgentKind } from "@/components/AgentNameTag";
+import {
+  ALL_HOSTS_BLOCK_KEY,
+  normalizeBlockedAgents,
+  projectBlockedAgents,
+} from "@/lib/projectAgentBlocks";
 import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
@@ -59,7 +72,6 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isSdkAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
-  callingDefaultHarnesses,
   callingDefaultParent,
   callingHarnessLabel,
   resolveProjectInheritedField,
@@ -112,21 +124,34 @@ const NONE = "__none__";
 /** List-row id for the legacy all-hosts fallback row (never a real host id). */
 const ALL_HOSTS = "__all_hosts__";
 
-const DEFAULT_LABELS = {
-  agent: "Default agent",
-  reset: "Reset to defaults",
-  resetHelp: "About resetting defaults",
-  more: "More…",
-  apply: "Apply to other projects",
-  save: "Set as agent defaults",
-  confirm: "Save host defaults",
-} as const;
+function ResetDefaultsHelp({
+  harness,
+  capabilities,
+}: {
+  harness: string;
+  capabilities?: HarnessCapabilityMap;
+}) {
+  if (callingDefaultParent(harness, capabilities)) {
+    return (
+      <>
+        Clears this row; model first tries All hosts for the same agent, then all values use this
+        host&apos;s Settings defaults, then Native host defaults, then the agent&apos;s own default.
+      </>
+    );
+  }
+  return (
+    <>
+      Clears this row; model first tries All hosts for the same agent, then all values use this
+      host&apos;s Settings defaults, then the agent&apos;s own default.
+    </>
+  );
+}
 
-function resetDefaultsHelp(harness: string, capabilities?: HarnessCapabilityMap): string {
-  const native = callingDefaultParent(harness, capabilities)
-    ? ", then Native project and host defaults"
-    : "";
-  return `Clears this row; model first tries All hosts for the same agent, then all values use this host's Settings defaults${native}, then the agent's own default.`;
+function CallingFieldLabel({ field }: { field: CallingDefaultField }) {
+  if (field === "model") return <>Model</>;
+  if (field === "effort") return <>Effort</>;
+  if (field === "speed") return <>Speed</>;
+  return <>Permission</>;
 }
 
 /** A labeled row: label + optional hint on the left, the control on the right. */
@@ -186,8 +211,8 @@ interface HarnessSetDraft {
 /** One host's draft: its directory entry plus `config.calling_defaults[host]`. */
 interface HostRowDraft extends DirectoryRow {
   agentId: string | null;
-  /** Every harness entry, keyed by canonical harness id. The selected agent's
-   *  harness is "the set"; every other key shows under "Other harness models". */
+  /** Per-harness overrides; only the effective default agent's harness is
+   *  rendered and persisted on Save. */
   harnesses: Record<string, HarnessSetDraft>;
 }
 
@@ -198,7 +223,6 @@ interface CopySelection {
   targets: Project[];
   selection: MultiValue;
   fields: Record<CallingDefaultField, boolean>;
-  agent: boolean;
   targetEntries: Record<string, ProjectHostEntry[] | null>;
   entryErrors: Record<string, string>;
 }
@@ -292,17 +316,37 @@ function seedHostRows(entries: ProjectHostEntry[], config: ProjectConfig): HostR
       rows.push({ hostId, path: "", ...parsed });
     }
   }
+  const blocked = isRecord(config.blocked_agents) ? config.blocked_agents : {};
+  for (const hostId of Object.keys(blocked)) {
+    if (hostId === "" || hostId === ALL_HOSTS_BLOCK_KEY) continue;
+    if (!rows.some((row) => row.hostId === hostId)) {
+      rows.push({ hostId, path: "", agentId: null, harnesses: {} });
+    }
+  }
   return rows;
 }
 
-/** Build the server-shaped `config.calling_defaults`, omitting empty entries. */
-function buildCallingDefaults(rows: readonly HostRowDraft[]): ProjectConfig["calling_defaults"] {
+/** Build the server-shaped `config.calling_defaults`, keeping only each host's
+ *  effective default agent's harness row when agents are resolved. */
+function buildCallingDefaults(
+  rows: readonly HostRowDraft[],
+  agents?: readonly AvailableAgent[],
+  projectAgentId?: string | null,
+): ProjectConfig["calling_defaults"] {
   const defaults: NonNullable<ProjectConfig["calling_defaults"]> = {};
   for (const row of rows) {
     const entry: NonNullable<ProjectConfig["calling_defaults"]>[string] = {};
     if (row.agentId) entry.agent_id = row.agentId;
+    const effectiveAgentId = row.agentId ?? projectAgentId ?? null;
+    const resolvedAgent =
+      agents && effectiveAgentId ? (agents.find((a) => a.id === effectiveAgentId) ?? null) : null;
+    const keepOnlyHarness =
+      agents && (effectiveAgentId === null || resolvedAgent !== null)
+        ? selectedHarnessFor(resolvedAgent)
+        : undefined;
     const harnesses: NonNullable<typeof entry.harnesses> = {};
     for (const [harness, set] of Object.entries(row.harnesses)) {
+      if (keepOnlyHarness !== undefined && harness !== keepOnlyHarness) continue;
       const clean: { model?: string; effort?: string; speed?: string; permission?: string } = {};
       if (set.model) clean.model = set.model;
       if (set.effort) clean.effort = set.effort;
@@ -704,7 +748,11 @@ export function ProjectSettingsDialog({
   // Draft fields. Seeded from the stored config + entries each time the dialog
   // opens (or the fetches arrive); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
-  const [sessionChoice, setSessionChoice] = useState<ProjectChoiceOverride>();
+  const [orchestrationDraft, setOrchestrationDraft] = useState<
+    ProjectOrchestrationDraft | undefined
+  >();
+  const [blockedByHost, setBlockedByHost] = useState<Record<string, string[]>>({});
+  const [runningEntrySetupFor, setRunningEntrySetupFor] = useState<string | null>(null);
   // One row per host: its directory entry plus its `calling_defaults` draft.
   // The Host field above is the default host; the rows are independent of it.
   const [hostRows, setHostRows] = useState<HostRowDraft[]>([]);
@@ -714,8 +762,6 @@ export function ProjectSettingsDialog({
   const [selectedRowId, setSelectedRowId] = useState<string | null>(ALL_HOSTS);
   // Which row's filesystem browser is expanded (host id), if any.
   const [openRow, setOpenRow] = useState<string | null>(null);
-  // Which row's "Other harness models" list is expanded, if any.
-  const [otherHarnessOpenFor, setOtherHarnessOpenFor] = useState<string | null>(null);
   // The first entry write to fail on Save: its server message renders on that
   // row, the sequence stops, and no config is written.
   const [entriesError, setEntriesError] = useState<{ hostId: string; message: string } | null>(
@@ -725,6 +771,7 @@ export function ProjectSettingsDialog({
   // the same alert as `updateConfig.error`.
   const [saveError, setSaveError] = useState<string | null>(null);
   const [initializationNotice, setInitializationNotice] = useState<string | null>(null);
+  const [blockedTemplateNotice, setBlockedTemplateNotice] = useState(false);
   const [saving, setSaving] = useState(false);
   // Post-bind outcome per host from the last Save, so the row can show a
   // warning under its path.
@@ -872,7 +919,8 @@ export function ProjectSettingsDialog({
     seededKeyRef.current = seedKey;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
-    setSessionChoice(c.orchestration?.session_choice);
+    setOrchestrationDraft(seedOrchestrationDraft(c.orchestration));
+    setBlockedByHost(normalizeBlockedAgents(c.blocked_agents) ?? {});
     const rows = seedHostRows(entries, c);
     if (
       c.host_id &&
@@ -892,10 +940,10 @@ export function ProjectSettingsDialog({
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
     setOpenRow(null);
-    setOtherHarnessOpenFor(null);
     setEntriesError(null);
     setSaveError(null);
     setInitializationNotice(null);
+    setBlockedTemplateNotice(false);
   }, [open, projectId, stored, isLoading, loadFailed, entriesLoadFailed, entriesLoading, entries]);
 
   // Entry sync derived from the persisted baseline + draft rows: PUTs for
@@ -924,7 +972,6 @@ export function ProjectSettingsDialog({
         ? rows
         : [...rows, { hostId: rowHostId, path: "", agentId: null, harnesses: {} }],
     );
-    setOtherHarnessOpenFor(null);
     setSelectedRowId(rowHostId);
   };
 
@@ -933,8 +980,13 @@ export function ProjectSettingsDialog({
     const neighbour = hostRows[index + 1] ?? hostRows[index - 1];
     setEntriesError(null);
     setOpenRow((current) => (current === rowHostId ? null : current));
-    setOtherHarnessOpenFor((current) => (current === rowHostId ? null : current));
     setHostRows((rows) => rows.filter((row) => row.hostId !== rowHostId));
+    setBlockedByHost((current) => {
+      if (!(rowHostId in current)) return current;
+      const next = { ...current };
+      Reflect.deleteProperty(next, rowHostId);
+      return next;
+    });
     setSelectedRowId((current) =>
       current === rowHostId ? (neighbour?.hostId ?? ALL_HOSTS) : current,
     );
@@ -943,7 +995,6 @@ export function ProjectSettingsDialog({
   // Below md a row tap toggles the single-open accordion; at >= md it only
   // moves the highlight (the detail pane is always visible).
   const selectRow = (rowId: string) => {
-    setOtherHarnessOpenFor(null);
     setSelectedRowId((current) => (isCompact && current === rowId ? null : rowId));
   };
 
@@ -956,6 +1007,47 @@ export function ProjectSettingsDialog({
     setHostRows((rows) =>
       rows.map((row) => (row.hostId === rowHostId ? { ...row, agentId: nextAgentId } : row)),
     );
+  };
+
+  const addBlockedAgent = (hostKey: string, targetAgentId: string) => {
+    setBlockedByHost((current) => {
+      const existing = current[hostKey] ?? [];
+      if (existing.includes(targetAgentId)) return current;
+      return { ...current, [hostKey]: [...existing, targetAgentId] };
+    });
+  };
+
+  const removeBlockedAgent = (hostKey: string, targetAgentId: string) => {
+    setBlockedByHost((current) => {
+      const existing = current[hostKey];
+      if (!existing) return current;
+      const remaining = existing.filter((id) => id !== targetAgentId);
+      if (remaining.length > 0) return { ...current, [hostKey]: remaining };
+      const next = { ...current };
+      Reflect.deleteProperty(next, hostKey);
+      return next;
+    });
+  };
+
+  const runEntrySetupAgain = async (rowHostId: string, workspace: string) => {
+    if (!projectId || runningEntrySetupFor !== null) return;
+    setRunningEntrySetupFor(rowHostId);
+    setEntriesError(null);
+    try {
+      const written = await putProjectEntry(projectId, rowHostId, workspace);
+      const postBind = written.post_bind;
+      setEntryHookOutcomes((current) => {
+        const next = new Map(current);
+        if (postBind) next.set(rowHostId, postBind);
+        else next.delete(rowHostId);
+        return next;
+      });
+      void queryClient.invalidateQueries({ queryKey: ["project-collaboration", projectId] });
+    } catch (error) {
+      setEntriesError({ hostId: rowHostId, message: errorMessage(error) });
+    } finally {
+      setRunningEntrySetupFor(null);
+    }
   };
 
   const setHarnessField = (
@@ -987,29 +1079,6 @@ export function ProjectSettingsDialog({
     );
   };
 
-  const addOtherHarness = (rowHostId: string, harness: string) => {
-    setHostRows((rows) =>
-      rows.map((row) => {
-        if (row.hostId !== rowHostId || harness in row.harnesses) return row;
-        const set: HarnessSetDraft = { model: null, effort: null };
-        for (const field of CALLING_FIELDS) set[field] = inheritedFor(row, harness, field).value;
-        return { ...row, harnesses: { ...row.harnesses, [harness]: set } };
-      }),
-    );
-    ensureCatalog(rowHostId, harness);
-  };
-
-  const removeOtherHarness = (rowHostId: string, harness: string) => {
-    setHostRows((rows) =>
-      rows.map((row) => {
-        if (row.hostId !== rowHostId) return row;
-        const next = { ...row.harnesses };
-        Reflect.deleteProperty(next, harness);
-        return { ...row, harnesses: next };
-      }),
-    );
-  };
-
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
@@ -1018,11 +1087,12 @@ export function ProjectSettingsDialog({
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
-    const orchestration = { ...config.orchestration };
-    if (sessionChoice === undefined) delete orchestration.session_choice;
-    else orchestration.session_choice = sessionChoice;
-    if (Object.keys(orchestration).length) config.orchestration = orchestration;
+    const normalizedOrchestration = normalizeOrchestrationDraft(orchestrationDraft);
+    if (normalizedOrchestration) config.orchestration = normalizedOrchestration;
     else delete config.orchestration;
+    const normalizedBlocked = normalizeBlockedAgents(blockedByHost);
+    if (normalizedBlocked) config.blocked_agents = normalizedBlocked;
+    else delete config.blocked_agents;
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
     // The single-host mirror follows the same draft that the entry writes use.
@@ -1047,16 +1117,20 @@ export function ProjectSettingsDialog({
     const agentUnresolved = agentId != null && selectedAgent === null;
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
-    // Per-host sets are rebuilt from the drafts: a deleted row drops its key,
-    // and cleared fields / empty harness groups are omitted entirely (never a
-    // "default" / clear word).
-    const callingDefaults = buildCallingDefaults(hostRows);
+    // Per-host sets are rebuilt from the drafts: only the default agent's own
+    // harness row is written so inert other-harness rows drop on save.
+    const callingDefaults = buildCallingDefaults(
+      hostRows,
+      agents !== undefined ? agentList : undefined,
+      agentId,
+    );
     if (callingDefaults) config.calling_defaults = callingDefaults;
     else delete config.calling_defaults;
 
     setEntriesError(null);
     setSaveError(null);
     setInitializationNotice(null);
+    setBlockedTemplateNotice(false);
     setSaving(true);
     let id = projectId;
     // Whether any entry PUT / DELETE committed this run: the finally block
@@ -1106,12 +1180,19 @@ export function ProjectSettingsDialog({
           !row.agentId &&
           !agentId
         ) {
-          config.calling_defaults ??= {};
-          config.calling_defaults[row.hostId] = {
-            ...config.calling_defaults[row.hostId],
-            agent_id: written.host_agent_id,
-          };
-          setRowAgent(row.hostId, written.host_agent_id);
+          const draftBlocked = projectBlockedAgents(config, row.hostId);
+          if (draftBlocked.has(written.host_agent_id)) {
+            setBlockedTemplateNotice(true);
+            setSelectedRowId(row.hostId);
+            hookWarningSeen = true;
+          } else {
+            config.calling_defaults ??= {};
+            config.calling_defaults[row.hostId] = {
+              ...config.calling_defaults[row.hostId],
+              agent_id: written.host_agent_id,
+            };
+            setRowAgent(row.hostId, written.host_agent_id);
+          }
         }
         if (written.initialization_notice) {
           setInitializationNotice(written.initialization_notice);
@@ -1258,7 +1339,13 @@ export function ProjectSettingsDialog({
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
   const draftConfig: ProjectConfig = {
     ...(stored ?? {}),
-    calling_defaults: buildCallingDefaults(hostRows),
+    calling_defaults: buildCallingDefaults(
+      hostRows,
+      agents !== undefined ? agentList : undefined,
+      agentId,
+    ),
+    blocked_agents: normalizeBlockedAgents(blockedByHost),
+    orchestration: normalizeOrchestrationDraft(orchestrationDraft),
     agent_id: agentId ?? undefined,
     model: model === NONE ? undefined : model,
   };
@@ -1274,10 +1361,21 @@ export function ProjectSettingsDialog({
     model === (stored?.model ?? NONE) &&
     worktreeOverride === stored?.use_worktree &&
     baseBranch === (stored?.base_branch ?? "") &&
-    JSON.stringify(sessionChoice) === JSON.stringify(stored?.orchestration?.session_choice) &&
     sameDefaults(
-      buildCallingDefaults(hostRows) ?? {},
-      buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {},
+      normalizeOrchestrationDraft(orchestrationDraft) ?? {},
+      seedOrchestrationDraft(stored?.orchestration) ?? {},
+    ) &&
+    sameDefaults(
+      normalizeBlockedAgents(blockedByHost) ?? {},
+      normalizeBlockedAgents(stored?.blocked_agents) ?? {},
+    ) &&
+    sameDefaults(
+      buildCallingDefaults(hostRows, agents !== undefined ? agentList : undefined, agentId) ?? {},
+      buildCallingDefaults(
+        seedHostRows([], stored ?? {}),
+        agents !== undefined ? agentList : undefined,
+        stored?.agent_id ?? null,
+      ) ?? {},
     );
 
   const inheritedFor = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
@@ -1352,8 +1450,18 @@ export function ProjectSettingsDialog({
     const targetSet = target.config?.calling_defaults?.[sourceHost]?.harnesses?.[harness] ?? {};
     const catalog = catalogFor(catalogs, sourceHost, harness);
     const options = catalog?.models ?? [];
-    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
-    let copyAgent = selection.agent;
+    const sourceAgent =
+      source.config?.calling_defaults?.[sourceHost]?.agent_id ?? source.config?.agent_id ?? null;
+    if (sourceAgent && projectBlockedAgents(target.config, sourceHost).has(sourceAgent)) {
+      const blockedReason = { label: "default agent is blocked on this host" }.label;
+      return {
+        fields,
+        skipped,
+        copyAgent: false,
+        blocked: blockedReason,
+      };
+    }
+    const copyAgent = sourceAgent !== null;
     if (copyAgent && sourceAgent) {
       const selected = agentList.find((agent) => agent.id === sourceAgent);
       if (
@@ -1361,8 +1469,13 @@ export function ProjectSettingsDialog({
         selectedHarnessFor(selected) !== harness ||
         !agentUsableOnHost(selected, targetHost)
       ) {
-        copyAgent = false;
-        skipped.push("Agent unavailable");
+        const unavailableReason = { label: "Agent unavailable" }.label;
+        return {
+          fields: {},
+          skipped: [unavailableReason],
+          copyAgent: false,
+          blocked: unavailableReason,
+        };
       }
     }
     const targetAgent = copyAgent
@@ -1457,8 +1570,14 @@ export function ProjectSettingsDialog({
       if (
         !source.config_revision ||
         !sameDefaults(
-          buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
-          buildCallingDefaults([row])?.[row.hostId] ?? {},
+          buildCallingDefaults(
+            seedHostRows([], source.config ?? {}),
+            agents !== undefined ? agentList : undefined,
+            source.config?.agent_id ?? null,
+          )?.[row.hostId] ?? {},
+          buildCallingDefaults([row], agents !== undefined ? agentList : undefined, agentId)?.[
+            row.hostId
+          ] ?? {},
         )
       ) {
         setCopyMessage("The source project changed. Reopen its settings before applying defaults.");
@@ -1482,7 +1601,6 @@ export function ProjectSettingsDialog({
         targets,
         selection: { mode: "except", ids: [] },
         fields: { model: true, effort: true, speed: true, permission: true },
-        agent: false,
         targetEntries,
         entryErrors,
       });
@@ -1515,7 +1633,8 @@ export function ProjectSettingsDialog({
       setCopyBusy(false);
       return;
     }
-    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
+    const sourceAgent =
+      source.config?.calling_defaults?.[sourceHost]?.agent_id ?? source.config?.agent_id ?? null;
     const selectedIds = new Set(
       resolveMulti(copySelection.selection, copyPickerItems(copySelection)),
     );
@@ -1578,8 +1697,14 @@ export function ProjectSettingsDialog({
       if (
         !source.config_revision ||
         !sameDefaults(
-          buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
-          buildCallingDefaults([row])?.[row.hostId] ?? {},
+          buildCallingDefaults(
+            seedHostRows([], source.config ?? {}),
+            agents !== undefined ? agentList : undefined,
+            source.config?.agent_id ?? null,
+          )?.[row.hostId] ?? {},
+          buildCallingDefaults([row], agents !== undefined ? agentList : undefined, agentId)?.[
+            row.hostId
+          ] ?? {},
         ) ||
         source.config?.agent_id !== stored?.agent_id ||
         source.config?.model !== stored?.model
@@ -1602,13 +1727,12 @@ export function ProjectSettingsDialog({
     }
   };
 
-  const allHostsSummary =
-    [
-      selectedAgent?.display_name ?? agentId,
-      model !== NONE ? (modelOptions.find((o) => o.id === model)?.label ?? model) : undefined,
-    ]
-      .filter(Boolean)
-      .join(" · ") || "Not set";
+  const allHostsSummaryText = [
+    selectedAgent?.display_name ?? agentId,
+    model !== NONE ? (modelOptions.find((o) => o.id === model)?.label ?? model) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   const renderDirectoryField = (row: HostRowDraft) => {
     const rowHost = hostsById.get(row.hostId);
@@ -1673,8 +1797,15 @@ export function ProjectSettingsDialog({
   const renderEntryOutcome = (row: HostRowDraft) => {
     const rowOutcome = entryHookOutcomes.get(row.hostId);
     const rowOutcomeWarning = rowOutcome ? WARNING_HOOK_STATUSES.has(rowOutcome.status) : false;
+    const savedPath = savedEntries.get(row.hostId);
+    const canRerun =
+      rowOutcomeWarning &&
+      projectId !== null &&
+      savedPath !== undefined &&
+      savedPath === row.path.trim() &&
+      hostsById.get(row.hostId)?.status === "online";
     const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
-    if (!rowOutcomeWarning && !rowError) return null;
+    if (!rowOutcomeWarning && !rowError && !canRerun) return null;
     return (
       <>
         {rowOutcomeWarning && rowOutcome && (
@@ -1689,6 +1820,25 @@ export function ProjectSettingsDialog({
             {rowOutcome.output ? (
               <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.output}</pre>
             ) : null}
+          </div>
+        )}
+        {canRerun && savedPath && rowOutcome && (
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+            data-testid={`project-settings-entry-setup-${row.hostId}`}
+          >
+            <span>Host setup command: {hookStatusLabel(rowOutcome.status)}</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7"
+              disabled={saving || runningEntrySetupFor !== null}
+              onClick={() => void runEntrySetupAgain(row.hostId, savedPath)}
+              data-testid={`project-settings-entry-rerun-${row.hostId}`}
+            >
+              Run again
+            </Button>
           </div>
         )}
         {rowError && (
@@ -1706,16 +1856,27 @@ export function ProjectSettingsDialog({
 
   const renderAgentSelect = (row: HostRowDraft) => {
     const rowHost = hostsById.get(row.hostId);
+    const blockedForRow = projectBlockedAgents(draftConfig, row.hostId);
     const candidates = agentList.filter(
-      (agent) => agentUsableOnHost(agent, rowHost) || agent.id === row.agentId,
+      (agent) =>
+        !blockedForRow.has(agent.id) &&
+        (agentUsableOnHost(agent, rowHost) || agent.id === row.agentId),
     );
     const sdkAgents = candidates.filter(isSdkAgent);
     const otherAgents = candidates.filter((agent) => !isSdkAgent(agent));
-    const storedMissing = row.agentId !== null && !agentList.some((a) => a.id === row.agentId);
+    const storedMissing =
+      row.agentId !== null &&
+      !blockedForRow.has(row.agentId) &&
+      !agentList.some((a) => a.id === row.agentId);
     const renderItem = (agent: AvailableAgent) => (
       <SelectItem key={agent.id} value={agent.id}>
         <span className="block min-w-0 truncate" title={agent.display_name}>
-          <AgentNameTag agentId={agent.id} name={agent.display_name} harness={agent.harness} />
+          <AgentNameTag
+            agentId={agent.id}
+            name={agent.display_name}
+            harness={agent.harness}
+            kindTag={nonNativeAgentKind(agent.harness)}
+          />
         </span>
       </SelectItem>
     );
@@ -1765,18 +1926,23 @@ export function ProjectSettingsDialog({
     const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
     const effectiveModel = set.model ?? inheritedFor(row, harness, "model").value;
     const levels = effortLevelsForSet(harness, models, { ...set, model: effectiveModel });
-    const resetField = (field: CallingDefaultField) => (
+    const resetFieldButton = (field: "model" | "speed" | "permission") => (
       <Button
         type="button"
         variant="ghost"
-        size="sm"
-        className="h-8 shrink-0"
+        size="icon-sm"
+        className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
         onClick={() => setHarnessField(row.hostId, harness, field, null)}
         disabled={isLoading || saving || !set[field]}
         data-testid={`project-settings-host-reset-${field}-${row.hostId}`}
-        aria-label={`Reset ${field} to defaults`}
+        aria-label={
+          field === "model" ? "Reset model" : field === "speed" ? "Reset speed" : "Reset permission"
+        }
+        title={
+          field === "model" ? "Reset model" : field === "speed" ? "Reset speed" : "Reset permission"
+        }
       >
-        Reset {field}
+        <RotateCcwIcon className="size-3.5" aria-hidden="true" />
       </Button>
     );
     return (
@@ -1793,7 +1959,7 @@ export function ProjectSettingsDialog({
               onOpenChange={onDropdownOpenChange}
               onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
             />
-            {resetField("model")}
+            {resetFieldButton("model")}
           </div>
         </Field>
         <Field label="Effort" hint="Default thinking effort for new sessions on this host">
@@ -1833,7 +1999,7 @@ export function ProjectSettingsDialog({
                   onOpenChange={onDropdownOpenChange}
                   onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
                 />
-                {resetField(field)}
+                {resetFieldButton(field)}
               </div>
             </Field>
           ) : null,
@@ -1854,10 +2020,10 @@ export function ProjectSettingsDialog({
             onClick={() => resetHarnessRow(row.hostId, harness)}
             data-testid={`project-settings-host-reset-row-${row.hostId}-${harness}`}
           >
-            {DEFAULT_LABELS.reset}
+            Reset to defaults
           </Button>
-          <HelpTip label={DEFAULT_LABELS.resetHelp}>
-            {resetDefaultsHelp(harness, capabilities)}
+          <HelpTip label="About resetting defaults">
+            <ResetDefaultsHelp harness={harness} capabilities={capabilities} />
           </HelpTip>
         </div>
         <DropdownMenu
@@ -1871,11 +2037,13 @@ export function ProjectSettingsDialog({
             <Button
               type="button"
               variant="outline"
-              size="sm"
+              size="icon-sm"
               disabled={saving || copyBusy}
+              aria-label="More actions"
+              title="More actions"
               data-testid={`project-settings-host-more-${row.hostId}-${harness}`}
             >
-              {DEFAULT_LABELS.more}
+              <MoreHorizontalIcon className="size-4" aria-hidden="true" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="max-w-[calc(100vw-2rem)] whitespace-normal">
@@ -1885,7 +2053,7 @@ export function ProjectSettingsDialog({
               onSelect={() => void openCopy(row, harness)}
               data-testid={`project-settings-host-copy-${row.hostId}-${harness}`}
             >
-              {DEFAULT_LABELS.apply}
+              Apply to other projects
             </DropdownMenuItem>
             <DropdownMenuItem
               className="whitespace-normal"
@@ -1898,7 +2066,7 @@ export function ProjectSettingsDialog({
               }}
               data-testid={`project-settings-host-master-${row.hostId}-${harness}`}
             >
-              {DEFAULT_LABELS.save}
+              Set as agent defaults
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -1909,46 +2077,48 @@ export function ProjectSettingsDialog({
           className="flex min-w-0 flex-col gap-2 rounded-md border p-3"
           data-testid="project-settings-copy-panel"
         >
-          <p className="text-ui font-medium">Apply saved {callingHarnessLabel(harness)} defaults</p>
+          <p className="text-ui font-medium">
+            Apply saved {callingHarnessLabel(harness, capabilities)} defaults
+          </p>
           <p className="text-xs text-muted-foreground">
-            Applies on {hostsById.get(row.hostId)?.name ?? row.hostId} for this harness; default
-            fields clear the target's changes, and entry folders stay the same.
+            Copies the default agent and selected fields on{" "}
+            {hostsById.get(row.hostId)?.name ?? row.hostId}; default fields clear the target&apos;s
+            changes, and entry folders stay the same.
           </p>
           {!sourceSaved && (
             <p className="text-xs text-muted-foreground">Save this project first.</p>
           )}
           <div className="flex flex-wrap gap-3">
-            {CALLING_FIELDS.map((field) => (
-              <label key={field} className="flex items-center gap-1 text-ui">
-                <Switch
-                  aria-label={`Copy ${field}`}
-                  checked={copySelection.fields[field]}
-                  onCheckedChange={(checked) =>
-                    setCopySelection((current) =>
-                      current
-                        ? {
-                            ...current,
-                            fields: { ...current.fields, [field]: checked },
-                          }
-                        : null,
-                    )
-                  }
-                  data-testid={`project-settings-copy-field-${field}`}
-                />
-                {field}
-              </label>
-            ))}
-            <label className="flex items-center gap-1 text-ui">
-              <Switch
-                aria-label="Copy project default agent"
-                checked={copySelection.agent}
-                onCheckedChange={(checked) =>
-                  setCopySelection((current) => (current ? { ...current, agent: checked } : null))
-                }
-                data-testid="project-settings-copy-field-agent"
-              />
-              Project default agent
-            </label>
+            {CALLING_FIELDS.map((field) => {
+              const ariaLabel =
+                field === "model"
+                  ? "Copy model"
+                  : field === "effort"
+                    ? "Copy effort"
+                    : field === "speed"
+                      ? "Copy speed"
+                      : "Copy permission";
+              return (
+                <label key={field} className="flex items-center gap-1 text-ui">
+                  <Switch
+                    aria-label={ariaLabel}
+                    checked={copySelection.fields[field]}
+                    onCheckedChange={(checked) =>
+                      setCopySelection((current) =>
+                        current
+                          ? {
+                              ...current,
+                              fields: { ...current.fields, [field]: checked },
+                            }
+                          : null,
+                      )
+                    }
+                    data-testid={`project-settings-copy-field-${field}`}
+                  />
+                  <CallingFieldLabel field={field} />
+                </label>
+              );
+            })}
           </div>
           <div
             className="flex min-w-0 flex-wrap items-center gap-2 text-sm"
@@ -2052,7 +2222,7 @@ export function ProjectSettingsDialog({
           data-testid="project-settings-master-panel"
         >
           <p className="text-ui font-medium">
-            Defaults for {callingHarnessLabel(harness)} on{" "}
+            Defaults for {callingHarnessLabel(harness, capabilities)} on{" "}
             {hostsById.get(row.hostId)?.name ?? row.hostId}
           </p>
           <p className="text-xs text-muted-foreground">
@@ -2064,7 +2234,7 @@ export function ProjectSettingsDialog({
               row.harnesses[harness]?.[field] ?? inheritedFor(row, harness, field).value;
             return (
               <p key={field} className="text-ui">
-                {field}: {value ?? "automatic"}
+                <CallingFieldLabel field={field} />: {value ?? "automatic"}
               </p>
             );
           })}
@@ -2077,7 +2247,7 @@ export function ProjectSettingsDialog({
               onClick={() => void applyMaster(row, harness)}
               disabled={copyBusy || !sourceSaved}
             >
-              {DEFAULT_LABELS.confirm}
+              Save host defaults
             </Button>
           </div>
         </div>
@@ -2097,151 +2267,32 @@ export function ProjectSettingsDialog({
     </div>
   );
 
-  const renderOtherHarnessSection = (row: HostRowDraft, selectedHarness: string | null) => {
-    const otherRows = Object.entries(row.harnesses).filter(
-      ([harness]) => harness !== selectedHarness,
-    );
-    const candidates = callingDefaultHarnesses(capabilities).filter(
-      (harness) => harness !== selectedHarness && !(harness in row.harnesses),
-    );
-    if (otherRows.length === 0 && candidates.length === 0) return null;
-    const expanded = otherHarnessOpenFor === row.hostId;
-    const disabled = isLoading || saving;
-    return (
-      <div className="flex min-w-0 flex-col gap-1.5">
-        <button
-          type="button"
-          className="flex min-w-0 items-center gap-1 self-start text-sm text-muted-foreground hover:text-foreground"
-          aria-expanded={expanded}
-          onClick={() => setOtherHarnessOpenFor(expanded ? null : row.hostId)}
-          data-testid={`project-settings-host-other-toggle-${row.hostId}`}
-        >
-          <ChevronDownIcon
-            className={cn("size-4 shrink-0 transition-transform", expanded && "rotate-180")}
-          />
-          <span className="min-w-0 truncate">
-            Other harness settings{otherRows.length > 0 ? ` (${otherRows.length})` : ""}
-          </span>
-        </button>
-        {expanded && (
-          <div className="flex min-w-0 flex-col gap-2">
-            {otherRows.map(([harness, set]) => {
-              const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
-              const effectiveModel = set.model ?? inheritedFor(row, harness, "model").value;
-              const levels = effortLevelsForSet(harness, models, { ...set, model: effectiveModel });
-              return (
-                <div
-                  key={harness}
-                  className="flex min-w-0 flex-col gap-1.5 rounded-md border p-2"
-                  data-testid={`project-settings-host-other-${row.hostId}-${harness}`}
-                >
-                  <div className="flex min-w-0 items-center justify-between gap-2">
-                    <span
-                      className="min-w-0 truncate text-ui font-medium"
-                      title={callingHarnessLabel(harness)}
-                    >
-                      {callingHarnessLabel(harness)}
-                    </span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="shrink-0 text-muted-foreground hover:text-destructive"
-                      aria-label={`Delete ${callingHarnessLabel(harness)} setting`}
-                      onClick={() => removeOtherHarness(row.hostId, harness)}
-                      disabled={disabled}
-                      data-testid={`project-settings-host-other-remove-${row.hostId}-${harness}`}
-                    >
-                      <Trash2Icon />
-                    </Button>
-                  </div>
-                  <div className="grid min-w-0 grid-cols-1 gap-1.5 sm:grid-cols-2">
-                    <HostModelSelect
-                      value={set.model}
-                      models={models}
-                      inheritLabel={inheritedFieldLabel(row, harness, "model")}
-                      testId={`project-settings-host-other-model-${row.hostId}-${harness}`}
-                      disabled={disabled}
-                      onOpen={() => ensureCatalog(row.hostId, harness)}
-                      onOpenChange={onDropdownOpenChange}
-                      onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
-                    />
-                    <HostEffortMeter
-                      value={set.effort}
-                      levels={levels}
-                      inherited={inheritedEffortForSet(
-                        inheritedFor(row, harness, "effort").value,
-                        models,
-                        effectiveModel,
-                      )}
-                      testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
-                      disabled={disabled}
-                      onOpen={() => ensureCatalog(row.hostId, harness)}
-                      onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
-                    />
-                    {(["speed", "permission"] as const).map((field) => (
-                      <SessionDefaultModeSelect
-                        key={field}
-                        harness={harness}
-                        field={field}
-                        value={set[field]}
-                        models={models}
-                        model={effectiveModel}
-                        inheritLabel={inheritedFieldLabel(row, harness, field)}
-                        label={field === "speed" ? "Speed" : "Permission"}
-                        testId={`project-settings-host-other-${field}-${row.hostId}-${harness}`}
-                        disabled={disabled}
-                        onOpenChange={onDropdownOpenChange}
-                        onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
-                      />
-                    ))}
-                  </div>
-                  {renderHarnessActions(row, harness)}
-                </div>
-              );
-            })}
-            {candidates.length > 0 && (
-              <Select
-                value={NONE}
-                onValueChange={(harness) => {
-                  if (harness !== NONE) addOtherHarness(row.hostId, harness);
-                }}
-                onOpenChange={onDropdownOpenChange}
-                disabled={disabled}
-              >
-                <SelectTrigger
-                  className="w-full min-w-0"
-                  data-testid={`project-settings-host-other-add-${row.hostId}`}
-                >
-                  <SelectValue placeholder="Add harness settings" />
-                </SelectTrigger>
-                <SelectContent
-                  position="popper"
-                  align="start"
-                  className="w-(--radix-select-trigger-width)"
-                >
-                  <SelectItem value={NONE}>Add harness settings</SelectItem>
-                  {candidates.map((harness) => (
-                    <SelectItem key={harness} value={harness}>
-                      {callingHarnessLabel(harness)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  };
-
   const renderHostDetail = (row: HostRowDraft) => {
+    const rowHost = hostsById.get(row.hostId);
     const effectiveAgentId = row.agentId ?? agentId;
     const agent = effectiveAgentId
       ? (agentList.find((a) => a.id === effectiveAgentId) ?? null)
       : null;
     const harness = selectedHarnessFor(agent);
     const joint = agent !== null && isJointAgent(agent);
+    const inheritedBlocked = blockedByHost[ALL_HOSTS_BLOCK_KEY] ?? [];
+    const ownBlocked = blockedByHost[row.hostId] ?? [];
+    const blockedForRow = projectBlockedAgents(draftConfig, row.hostId);
+    const hostOnline = rowHost?.status === "online";
+    const addDisabledReason = !rowHost
+      ? ("host-unreported" as const)
+      : !hostOnline
+        ? ("host-offline" as const)
+        : null;
+    const addCandidates = hostOnline
+      ? agentList.filter(
+          (candidate) =>
+            !isJointAgent(candidate) &&
+            agentUsableOnHost(candidate, rowHost) &&
+            candidate.id !== effectiveAgentId &&
+            !blockedForRow.has(candidate.id),
+        )
+      : [];
     return (
       <div
         className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
@@ -2254,7 +2305,7 @@ export function ProjectSettingsDialog({
           {renderDirectoryField(row)}
         </Field>
         <Field
-          label={DEFAULT_LABELS.agent}
+          label="Default agent"
           hint={`For this project on ${hostsById.get(row.hostId)?.name ?? row.hostId}.`}
         >
           {renderAgentSelect(row)}
@@ -2274,9 +2325,59 @@ export function ProjectSettingsDialog({
             {renderHarnessActions(row, harness)}
           </>
         ) : null}
-        {renderOtherHarnessSection(row, harness)}
+        <BlockedAgentsSection
+          hostKey={row.hostId}
+          ownBlocked={ownBlocked}
+          inheritedBlocked={inheritedBlocked}
+          allAgents={agentList}
+          addCandidates={addCandidates}
+          isAgentInstalled={(candidate) => agentUsableOnHost(candidate, rowHost)}
+          addDisabledReason={addDisabledReason}
+          disabled={isLoading || saving}
+          onAdd={(targetId) => addBlockedAgent(row.hostId, targetId)}
+          onRemove={(targetId) => removeBlockedAgent(row.hostId, targetId)}
+          onDropdownOpenChange={onDropdownOpenChange}
+        />
         {renderEntryOutcome(row)}
       </div>
+    );
+  };
+
+  const renderHostRowSummaryContent = (row: HostRowDraft) => {
+    const effectiveAgentId = row.agentId ?? agentId;
+    const agent = effectiveAgentId
+      ? (agentList.find((a) => a.id === effectiveAgentId) ?? null)
+      : null;
+    if (agent === null && effectiveAgentId) {
+      return effectiveAgentId;
+    }
+    if (!agent) {
+      return <span>Agent not set</span>;
+    }
+    const agentPart = row.agentId ? (
+      agent.display_name
+    ) : (
+      <span>Project agent · {agent.display_name}</span>
+    );
+    if (isJointAgent(agent)) {
+      return (
+        <>
+          {agentPart} · <span>Set by members</span>
+        </>
+      );
+    }
+    const harness = selectedHarnessFor(agent);
+    const set = harness ? row.harnesses[harness] : undefined;
+    const modelLabel = harness
+      ? catalogModelLabel(catalogs, row.hostId, harness, set?.model ?? null)
+      : null;
+    const effortLabel = set?.effort ? normalizeEffortLabel(set.effort) : null;
+    return (
+      <>
+        {agentPart}
+        {modelLabel ? ` · ${modelLabel}` : ""}
+        {effortLabel ? ` · ${effortLabel}` : ""}
+      </>
     );
   };
 
@@ -2284,6 +2385,7 @@ export function ProjectSettingsDialog({
     const rowHost = hostsById.get(row.hostId);
     const name = rowHost?.name ?? row.hostId;
     const summary = hostRowSummary(row, agentList, catalogs, agentId);
+    const blockedCount = projectBlockedAgents(draftConfig, row.hostId).size;
     const selected = selectedRowId === row.hostId;
     return (
       <div
@@ -2350,19 +2452,30 @@ export function ProjectSettingsDialog({
             {row.path || "No directory"}
           </span>
         }
-        <span
-          className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-          title={summary}
-          data-testid={`project-settings-host-summary-${row.hostId}`}
-        >
-          {summary}
-        </span>
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <span
+            className="min-w-0 max-w-full truncate rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+            title={summary}
+            data-testid={`project-settings-host-summary-${row.hostId}`}
+          >
+            {renderHostRowSummaryContent(row)}
+          </span>
+          {blockedCount > 0 && (
+            <span
+              className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              data-testid={`project-settings-host-blocked-count-${row.hostId}`}
+            >
+              Blocked {blockedCount}
+            </span>
+          )}
+        </div>
       </div>
     );
   };
 
   const renderAllHostsRow = () => {
     const selected = selectedRowId === ALL_HOSTS;
+    const allBlockedCount = (blockedByHost[ALL_HOSTS_BLOCK_KEY] ?? []).length;
     return (
       <div
         role="button"
@@ -2398,108 +2511,162 @@ export function ProjectSettingsDialog({
             <PencilIcon />
           </Button>
         </div>
-        <span
-          className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-          title={allHostsSummary}
-          data-testid="project-settings-all-hosts-summary"
-        >
-          {allHostsSummary}
-        </span>
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <span
+            className="min-w-0 max-w-full truncate rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+            title={allHostsSummaryText || undefined}
+            data-testid="project-settings-all-hosts-summary"
+          >
+            {allHostsSummaryText || "Not set"}
+          </span>
+          {allBlockedCount > 0 && (
+            <span
+              className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              data-testid="project-settings-all-hosts-blocked-count"
+            >
+              Blocked {allBlockedCount}
+            </span>
+          )}
+        </div>
       </div>
     );
   };
 
-  const renderAllHostsDetail = () => (
-    <div
-      className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
-      data-testid="project-settings-all-hosts-detail"
-    >
-      <HelpTip label="About all-host defaults">Used for hosts without their own defaults.</HelpTip>
-      <Field label="Agent" hint="Default agent / harness for new sessions">
-        <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
-          <AgentHarnessPicker
-            agentEntries={agentEntries}
-            harnessEntries={harnessEntries}
-            effectiveAgentId={agentId}
-            agentLabel={agentLabel}
-            hasAgents={agentList.length > 0}
-            host={warningHost}
-            onSelectAgent={(a) => {
-              // A model default belongs to the picked harness's vocab —
-              // don't carry an alias onto a different agent.
-              if (a.id !== agentId) setModel(NONE);
-              setAgentId(a.id);
-            }}
-            pendingAgent={null}
-            pendingAgentId="__unused_pending_agent__"
-            onSelectPending={() => {}}
-            // No interactive create flow here, so hide the "Create custom
-            // agent" action and leave the handler inert.
-            onCreateCustomAgent={() => {}}
-            allowCreateCustomAgent={false}
-            sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
-            // Modal so the menu establishes its own scroll context and can
-            // scroll inside the Dialog's scroll-lock (a non-modal dropdown
-            // portals outside that lock and can't scroll). The dismiss
-            // guard on DialogContent keeps this modal dropdown's own close
-            // from bubbling up and closing the settings dialog.
-            dropdownModal
-            onOpenChange={onDropdownOpenChange}
-            // Bound the menu height so it scrolls inside the modal instead
-            // of running off the bottom; fixed width matches the composer.
-            contentClassName="max-h-80 w-80"
-            contentAlign="end"
-            // Fill the field column and match the sibling <Select> triggers
-            // (full width, bordered, h-8) so the control right-aligns with
-            // the host / effort dropdowns instead of floating mid-row.
-            triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-            triggerLabelClassName="max-w-none text-ui"
-          />
-          {agentId && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-              onClick={() => {
-                setAgentId(null);
-                setModel(NONE);
+  const renderAllHostsDetail = () => {
+    const allHostsBlocked = blockedByHost[ALL_HOSTS_BLOCK_KEY] ?? [];
+    const allHostsBlockedSet = new Set(allHostsBlocked);
+    const inheritedBlockedOnAnyRow = new Set<string>(allHostsBlocked);
+    for (const row of hostRows) {
+      if (row.agentId === null) {
+        for (const id of blockedByHost[row.hostId] ?? []) inheritedBlockedOnAnyRow.add(id);
+      }
+    }
+    const selectableAllHostsAgents = agentEntries.filter(
+      (agent) => !inheritedBlockedOnAnyRow.has(agent.id),
+    );
+    const selectableAllHostsHarnesses = harnessEntries.filter(
+      (agent) => !inheritedBlockedOnAnyRow.has(agent.id),
+    );
+    const hostDefaultIds = new Set<string>(
+      [agentId, ...hostRows.map((row) => row.agentId)].filter(
+        (value): value is string => value !== null,
+      ),
+    );
+    const allHostsAddCandidates =
+      onlineHosts.length > 0
+        ? agentList.filter(
+            (candidate) =>
+              !isJointAgent(candidate) &&
+              onlineHosts.some((host) => agentUsableOnHost(candidate, host)) &&
+              !hostDefaultIds.has(candidate.id) &&
+              !allHostsBlockedSet.has(candidate.id),
+          )
+        : [];
+    return (
+      <div
+        className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
+        data-testid="project-settings-all-hosts-detail"
+      >
+        <HelpTip label="About all-host defaults">
+          Used for hosts without their own defaults.
+        </HelpTip>
+        <Field label="Agent" hint="Default agent / harness for new sessions">
+          <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
+            <AgentHarnessPicker
+              agentEntries={selectableAllHostsAgents}
+              harnessEntries={selectableAllHostsHarnesses}
+              effectiveAgentId={agentId}
+              agentLabel={agentLabel}
+              hasAgents={agentList.length > 0}
+              host={warningHost}
+              onSelectAgent={(a) => {
+                // A model default belongs to the picked harness's vocab —
+                // don't carry an alias onto a different agent.
+                if (a.id !== agentId) setModel(NONE);
+                setAgentId(a.id);
               }}
-            >
-              Clear agent and model
-            </Button>
-          )}
-        </div>
-      </Field>
-      {supportsModelDefault && (
-        <Field label="Model" hint={modelHint}>
-          <Select
-            value={model}
-            onValueChange={setModel}
-            onOpenChange={onDropdownOpenChange}
-            disabled={isLoading || modelPickerEmpty}
-          >
-            <SelectTrigger className="w-full" data-testid="project-settings-model">
-              <SelectValue placeholder="No default" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={NONE}>No default</SelectItem>
-              {modelOptions.map((m) => (
-                <SelectItem key={m.id} value={m.id}>
-                  {m.label}
-                </SelectItem>
-              ))}
-              {storedModelMissing && (
-                <SelectItem value={model}>
-                  {storedModelNotOffered ? `${model} (not offered by every host)` : model}
-                </SelectItem>
-              )}
-            </SelectContent>
-          </Select>
+              pendingAgent={null}
+              pendingAgentId="__unused_pending_agent__"
+              onSelectPending={() => {}}
+              // No interactive create flow here, so hide the "Create custom
+              // agent" action and leave the handler inert.
+              onCreateCustomAgent={() => {}}
+              allowCreateCustomAgent={false}
+              sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
+              // Modal so the menu establishes its own scroll context and can
+              // scroll inside the Dialog's scroll-lock (a non-modal dropdown
+              // portals outside that lock and can't scroll). The dismiss
+              // guard on DialogContent keeps this modal dropdown's own close
+              // from bubbling up and closing the settings dialog.
+              dropdownModal
+              onOpenChange={onDropdownOpenChange}
+              // Bound the menu height so it scrolls inside the modal instead
+              // of running off the bottom; fixed width matches the composer.
+              contentClassName="max-h-80 w-80"
+              contentAlign="end"
+              // Fill the field column and match the sibling <Select> triggers
+              // (full width, bordered, h-8) so the control right-aligns with
+              // the host / effort dropdowns instead of floating mid-row.
+              triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
+              triggerLabelClassName="max-w-none text-ui"
+            />
+            {agentId && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
+                onClick={() => {
+                  setAgentId(null);
+                  setModel(NONE);
+                }}
+              >
+                Clear agent and model
+              </Button>
+            )}
+          </div>
         </Field>
-      )}
-    </div>
-  );
+        {supportsModelDefault && (
+          <Field label="Model" hint={modelHint}>
+            <Select
+              value={model}
+              onValueChange={setModel}
+              onOpenChange={onDropdownOpenChange}
+              disabled={isLoading || modelPickerEmpty}
+            >
+              <SelectTrigger className="w-full" data-testid="project-settings-model">
+                <SelectValue placeholder="No default" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>No default</SelectItem>
+                {modelOptions.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+                {storedModelMissing && (
+                  <SelectItem value={model}>
+                    {storedModelNotOffered ? `${model} (not offered by every host)` : model}
+                  </SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+          </Field>
+        )}
+        <BlockedAgentsSection
+          hostKey={ALL_HOSTS_BLOCK_KEY}
+          ownBlocked={allHostsBlocked}
+          allAgents={agentList}
+          addCandidates={allHostsAddCandidates}
+          addDisabledReason={onlineHosts.length === 0 ? "no-online-hosts" : null}
+          disabled={isLoading || saving}
+          onAdd={(targetId) => addBlockedAgent(ALL_HOSTS_BLOCK_KEY, targetId)}
+          onRemove={(targetId) => removeBlockedAgent(ALL_HOSTS_BLOCK_KEY, targetId)}
+          onDropdownOpenChange={onDropdownOpenChange}
+        />
+      </div>
+    );
+  };
 
   const selectedRow = hostRows.find((row) => row.hostId === selectedRowId) ?? null;
 
@@ -2508,7 +2675,7 @@ export function ProjectSettingsDialog({
       <Field
         switchRow
         label="Random worktree"
-        hint="Sessions opened from New Chat start in a separate Git checkout of the project, with a random branch name. They branch from the base branch below, the code repository's default branch, Settings › Git's base branch, or the checkout's current HEAD, in that order. Sessions opened by agents or tools keep following their parent's folder unless a folder or worktree is specified. Overrides the default in Settings › Git."
+        hint="New Chat sessions start in a separate Git worktree with a random branch name, overriding Settings › Git."
       >
         <div className="flex justify-end">
           <Switch
@@ -2722,10 +2889,9 @@ export function ProjectSettingsDialog({
           {!isRealProject && worktreeFields}
           {isRealProject && !isLoading && !loadFailed && (
             <ProjectOrchestrationView
-              orchestration={stored?.orchestration}
-              choiceControl={
-                <ProjectSessionChoiceField value={sessionChoice} onChange={setSessionChoice} />
-              }
+              value={orchestrationDraft}
+              onChange={setOrchestrationDraft}
+              disabled={isLoading || saving}
             />
           )}
         </form>
@@ -2747,6 +2913,7 @@ export function ProjectSettingsDialog({
         {(loadFailed ||
           entriesLoadFailed ||
           saveError ||
+          blockedTemplateNotice ||
           initializationNotice ||
           updateConfig.isError) && (
           <div className="px-5 py-2 sm:px-6">
@@ -2768,6 +2935,12 @@ export function ProjectSettingsDialog({
               >
                 Couldn't load this project's directories. Close and reopen to try again — saving is
                 disabled so they aren't overwritten.
+              </p>
+            )}
+            {blockedTemplateNotice && (
+              <p className="text-muted-foreground text-ui" role="alert">
+                New project agent unavailable on this host. Using the project's existing agent
+                selection rules.
               </p>
             )}
             {initializationNotice && (

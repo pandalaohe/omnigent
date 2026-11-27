@@ -3716,3 +3716,446 @@ async def test_link_permission_tier_create_source_precedence_and_validation(
         assert selection.permission_tier_source == "host_default"
         assert selection.choice.permission_tier is None
         assert selection.choice.permission_tier_source == "host_default"
+
+
+@pytest.fixture
+async def project_choice_env(runtime_init, db_uri, tmp_path, mock_llm, monkeypatch):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.routes import sessions
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from tests.server.conftest import _app_client
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(HOST, "sample-host", RESERVED_USER_LOCAL)
+    project_store = SqlAlchemyProjectStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        project_store=project_store,
+        user_preferences_store=prefs,
+    )
+    app.state.host_store = host_store
+    app.state.host_registry = None
+    app.state.startup_admission = None
+    from omnigent.server.routes import _session_create_validation, _workspace_validation
+    from omnigent.server.routes._sessions import helpers as helpers_mod
+    from omnigent.server.routes._sessions import orchestration as orch_mod
+
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        _session_create_validation,
+        "_authorize_host_for_workspace",
+        AsyncMock(return_value="sample-host"),
+    )
+    monkeypatch.setattr(
+        orch_mod,
+        "_authorize_host_for_workspace",
+        AsyncMock(return_value="sample-host"),
+    )
+    monkeypatch.setattr(
+        _workspace_validation,
+        "validate_workspace",
+        AsyncMock(side_effect=lambda **kw: kw["workspace"]),
+    )
+    monkeypatch.setattr(
+        orch_mod,
+        "validate_workspace",
+        AsyncMock(side_effect=lambda **kw: kw["workspace"]),
+    )
+    monkeypatch.setattr(
+        _session_create_validation,
+        "validate_existing_host_workspace",
+        AsyncMock(side_effect=lambda **kw: kw["workspace"]),
+    )
+    monkeypatch.setattr(
+        helpers_mod,
+        "validate_existing_host_workspace",
+        AsyncMock(side_effect=lambda **kw: kw["workspace"]),
+    )
+    async with _app_client(app, mock_llm, tmp_path) as client:
+        agents = [await create_test_agent(client, name=f"choice-{index}") for index in range(2)]
+        store = app.state.conversation_store
+        parent = store.create_conversation(
+            agent_id=agents[0]["id"], host_id=HOST, workspace="/opt/work/project"
+        )
+        links = [
+            {"agent": agent["id"], "model": "test-model", "meter": f"pool-{index}"}
+            for index, agent in enumerate(agents)
+        ]
+        settings = {
+            "enabled": True,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "presets": [
+                {"id": f"p{index}", "name": f"Choice {index}", "links": [link]}
+                for index, link in enumerate(links)
+            ],
+            "hosts": {
+                HOST: {
+                    "work": [
+                        [{"preset": "p0", "links": [links[0]], "weight": 1}],
+                        [{"preset": "p1", "links": [links[1]], "weight": 1}],
+                    ]
+                }
+            },
+            "limits": {"pool-0": {"maxRunning": 1}},
+        }
+        prefs.replace_session_choice(
+            RESERVED_USER_LOCAL, settings, prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+        )
+        yield SimpleNamespace(
+            app=app,
+            client=client,
+            store=store,
+            prefs=prefs,
+            projects=project_store,
+            parent=parent,
+            agents=agents,
+            settings=settings,
+        )
+
+
+@pytest.mark.asyncio
+async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_subagent(
+    project_choice_env, monkeypatch
+):
+    """Scenarios 1-6, 30: funnel, '*', other host, host None, choice, Smart Routing, sub-agent."""
+    env = project_choice_env
+    projects = env.projects
+    agent_a = env.agents[0]["id"]
+    agent_b = env.agents[1]["id"]
+    other_host = "2" * 32
+    env.app.state.host_store.upsert_on_connect(other_host, "other-host", RESERVED_USER_LOCAL)
+
+    # Create project blocking agent_a on HOST only
+    proj = projects.create(
+        "a" * 32,
+        "Alpha",
+        None,
+        config={"blocked_agents": {HOST: [agent_a]}},
+    )
+    proj_id = proj.id
+
+    # Scenario 1: direct POST /v1/sessions with blocked agent on HOST → 409 naming P, A, H
+    r1 = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+        },
+    )
+    assert r1.status_code == 409, r1.text
+    err1 = r1.json()["error"]
+    assert err1["code"] == "agent_blocked_for_project"
+    assert "Alpha" in err1["message"]
+    assert "sample-host" in err1["message"]
+
+    # Scenario 3: other host unaffected
+    r3 = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": other_host,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+        },
+    )
+    assert r3.status_code == 201, r3.text
+
+    # Scenario 4: host None allowed when blocked only on HOST; blocked when '*' includes agent_a
+    r4_ok = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_a, "project_id": proj_id},
+    )
+    assert r4_ok.status_code == 201, r4_ok.text
+
+    # Scenario 5: session choice auto skips agent_a (blocked_for_project) and picks agent_b
+    r5 = await create(env, project_id=proj_id, host_id=HOST, workspace="/opt/work/project")
+    assert r5.status_code == 201, r5.text
+    assert r5.json()["agent_id"] == agent_b
+    rec = choice_record(env.store.get_conversation(r5.json()["id"]))
+    assert rec is not None
+    assert any(
+        s["link"]["agent"] == agent_a and s["why"] == "blocked_for_project"
+        for s in rec.get("skipped", [])
+    )
+
+    # Scenario 6: session choice named pick with blocked agent → 409
+    r6 = await create(
+        env,
+        project_id=proj_id,
+        host_id=HOST,
+        workspace="/opt/work/project",
+        agent_id=agent_a,
+        user_named=True,
+    )
+    assert r6.status_code == 409, r6.text
+    assert r6.json()["error"]["code"] == "agent_blocked_for_project"
+
+    # Scenario 30 (sub-agent): runner sub-agent of a running session is exempt after blocking;
+    # blank sub_agent_name is rejected (400) and mismatched parent agent is still blocked (409).
+    r30_blank = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "sub_agent_name": "   ",
+        },
+    )
+    assert r30_blank.status_code == 400, r30_blank.text
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.routes._sessions import orchestration as orch_mod
+
+    monkeypatch.setattr(orch_mod, "_require_declared_subagent", lambda **_kw: None)
+
+    parent_b = env.store.create_conversation(
+        agent_id=agent_b, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
+    )
+    r30_spoof = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "parent_session_id": parent_b.id,
+            "sub_agent_name": "helper-worker",
+        },
+    )
+    assert r30_spoof.status_code == 409, r30_spoof.text
+    assert r30_spoof.json()["error"]["code"] == "agent_blocked_for_project"
+
+    parent_a = env.store.create_conversation(
+        agent_id=agent_a, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
+    )
+    # Without runner authentication, sub_agent_name does NOT bypass the project blocklist.
+    r30_unauth_sub = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "parent_session_id": parent_a.id,
+            "sub_agent_name": "helper-worker",
+        },
+    )
+    assert r30_unauth_sub.status_code == 409, r30_unauth_sub.text
+
+    monkeypatch.setattr(
+        env.app.state, "runner_tunnel_tokens", frozenset({"tok-sub"}), raising=False
+    )
+    r30_sub = await env.client.post(
+        "/v1/sessions",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "tok-sub"},
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "parent_session_id": parent_a.id,
+            "sub_agent_name": "helper-worker",
+        },
+    )
+    assert r30_sub.status_code == 201, r30_sub.text
+
+    # Scenario 30 (Smart Routing): harness_override=auto rebinding to blocked agent → 409
+    from omnigent.server.routes._sessions import orchestration as orch_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(env.app.state, "startup_admission", None)
+        mp.setattr(
+            orch_mod,
+            "native_coding_agent_for_agent_name",
+            lambda name: "claude-native" if name == "choice-1" else None,
+        )
+        mp.setattr(
+            orch_mod,
+            "_resolve_native_smart_routing",
+            AsyncMock(return_value=("choice-0", None, None, None)),
+        )
+        mp.setattr(
+            env.app.state.agent_store,
+            "get_by_name",
+            lambda name: env.app.state.agent_store.get(agent_a) if name == "choice-0" else None,
+        )
+        r30_sr = await env.client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_b,
+                "harness_override": "auto",
+                "host_id": HOST,
+                "workspace": "/opt/work/project",
+                "project_id": proj_id,
+            },
+        )
+    assert r30_sr.status_code == 409, r30_sr.text
+    assert r30_sr.json()["error"]["code"] == "agent_blocked_for_project"
+
+    # Scenarios 2 & 4 ('*'): all-hosts block refuses both other_host and host=None
+    projects.update(proj_id, user_id=None, config={"blocked_agents": {"*": [agent_a]}})
+    r2 = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": other_host,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+        },
+    )
+    assert r2.status_code == 409
+    r4_star = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_a, "project_id": proj_id},
+    )
+    assert r4_star.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_j1_independent_opens_use_project_host_default_and_respect_boundaries(
+    project_choice_env, monkeypatch
+):
+    """Scenarios 19, 20, 21, 23: J1 with/without session choice, naming, and boundaries."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+    from omnigent.server import session_families
+    from omnigent.server.routes.sessions import routes_core
+
+    env = project_choice_env
+    monkeypatch.setattr(
+        routes_core, "require_orchestration_source", lambda *_args, **_kwargs: env.parent
+    )
+    monkeypatch.setattr(
+        session_families, "authorize_sibling_source", lambda *_args, **_kwargs: env.parent
+    )
+    projects = env.projects
+    agent_a = env.agents[0]["id"]
+    agent_b = env.agents[1]["id"]
+    # Project P: default agent on HOST is agent_b with model "opus-default"
+    proj = projects.create(
+        "b" * 32,
+        "J1Project",
+        None,
+        config={
+            "calling_defaults": {
+                HOST: {
+                    "agent_id": agent_b,
+                    "harnesses": {"claude-sdk": {"model": "opus-default"}},
+                }
+            },
+            "orchestration": {"session_choice": {"pin": "p0"}},
+        },
+    )
+    proj_id = proj.id
+    # File parent in proj_id so opener's project is proj_id
+    env.store.set_conversation_project(env.parent.id, proj_id)
+    env.parent = env.store.get_conversation(env.parent.id)
+
+    from omnigent.server.schemas import ProjectSessionCreateRequest
+    from omnigent.server.session_choice_runtime import _AdmitBodyOverride, admit_create
+
+    # Scenario 19: independent create with session choice active, no agent → J1 override
+    body_19 = ProjectSessionCreateRequest(
+        host_id=HOST, workspace="/opt/work/project", work_type="work"
+    )
+    async with admit_create(env.app, body_19, env.parent, None) as sel_19:
+        assert isinstance(sel_19, _AdmitBodyOverride)
+        assert "agent_id" not in sel_19.body.model_fields_set
+
+    # Scenario 20a: reasonless agent_id=agent_a with session choice active → J1 strips it → agent_b
+    body_20a = ProjectSessionCreateRequest(
+        agent_id=agent_a, host_id=HOST, workspace="/opt/work/project", work_type="work"
+    )
+    async with admit_create(env.app, body_20a, env.parent, None) as sel_20a:
+        assert isinstance(sel_20a, _AdmitBodyOverride)
+        assert "agent_id" not in sel_20a.body.model_fields_set
+
+    # Scenario 20b: user_named=True agent_id=agent_a → named, NOT overridden by J1
+    body_20b = ProjectSessionCreateRequest(
+        agent_id=agent_a,
+        user_named=True,
+        host_id=HOST,
+        workspace="/opt/work/project",
+        work_type="work",
+    )
+    async with admit_create(env.app, body_20b, env.parent, None) as sel_20b:
+        assert sel_20b is not None
+        assert not isinstance(sel_20b, _AdmitBodyOverride)
+        assert sel_20b.body.agent_id == agent_a
+
+    # Scenario 23b: independent create with explicit project_id=None → unfiled, J1 does NOT fire
+    body_23_null = ProjectSessionCreateRequest(
+        project_id=None, host_id=HOST, workspace="/opt/work/project", work_type="work"
+    )
+    async with admit_create(env.app, body_23_null, env.parent, None) as sel_23_null:
+        assert sel_23_null is not None
+        assert not isinstance(sel_23_null, _AdmitBodyOverride)
+        assert sel_23_null.body.agent_id == agent_a
+
+    # Scenario 23a: child create in P keeps session choice pin ("p0" -> agent_a), NOT J1
+    r23_child = await create(env, project_id=proj_id, host_id=HOST, workspace="/opt/work/project")
+    assert r23_child.status_code == 201, r23_child.text
+    assert r23_child.json()["agent_id"] == agent_a
+    assert choice_record(env.store.get_conversation(r23_child.json()["id"])) is not None
+
+    # Scenario 21: project session_choice="off", independent orchestrated create without agent_id
+    # gets project default agent_b, while explicit agent_id=agent_a keeps agent_a
+    projects.update(
+        proj_id,
+        user_id=None,
+        config={
+            "calling_defaults": {
+                HOST: {
+                    "agent_id": agent_b,
+                    "harnesses": {"claude-sdk": {"model": "opus-default"}},
+                }
+            },
+            "orchestration": {"session_choice": "off"},
+        },
+    )
+
+    # Scenario 21: omit both project_id and agent_id without choice header → J1 fills default
+    r21_no_choice_hdr = await env.client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: env.parent.id},
+        json={"host_id": HOST, "workspace": "/opt/work/project"},
+    )
+    assert r21_no_choice_hdr.status_code == 201, r21_no_choice_hdr.text
+    assert r21_no_choice_hdr.json()["agent_id"] == agent_b
+
+    r21_default = await env.client.post(
+        "/v1/sessions/orchestrated",
+        headers={**HEADERS, ORCHESTRATION_SOURCE_HEADER: env.parent.id},
+        json={"host_id": HOST, "workspace": "/opt/work/project", "project_id": proj_id},
+    )
+    assert r21_default.status_code == 201, r21_default.text
+    assert r21_default.json()["agent_id"] == agent_b
+    assert choice_record(env.store.get_conversation(r21_default.json()["id"])) is None
+
+    r21_named = await env.client.post(
+        "/v1/sessions/orchestrated",
+        headers={**HEADERS, ORCHESTRATION_SOURCE_HEADER: env.parent.id},
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+        },
+    )
+    assert r21_named.status_code == 201, r21_named.text
+    assert r21_named.json()["agent_id"] == agent_a

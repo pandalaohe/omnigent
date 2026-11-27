@@ -2850,3 +2850,52 @@ def test_stale_unavailable_and_null_readings_enforce_retained_reserve_until_rese
     assert retained_line.remaining_pct == pytest.approx(4.0)
     assert retained_line.read_at == NOW - 600
     assert pick(settings, readings={"pool-0": balance_only}).pool == "pool-1"
+
+
+def test_select_skips_project_blocked_agent_before_unavailable() -> None:
+    """Scenario 5: project-blocked agents are skipped with reason blocked_for_project."""
+    doc = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "impl", "label": "Implementation"}],
+            "presets": [
+                {
+                    "id": "p1",
+                    "name": "P1",
+                    "links": [
+                        {"agent": "ag_blocked", "model": "m1"},
+                        {"agent": "ag_codex", "model": "m2"},
+                    ],
+                }
+            ],
+            "hosts": {
+                "host-a": {
+                    "impl": [
+                        [
+                            {
+                                "preset": "p1",
+                                "links": [
+                                    {"agent": "ag_blocked", "model": "m1"},
+                                    {"agent": "ag_codex", "model": "m2"},
+                                ],
+                                "weight": 1,
+                            }
+                        ]
+                    ]
+                }
+            },
+        }
+    )
+    req = ChoiceRequest(
+        owner=OWNER,
+        host="host-a",
+        blocked=frozenset({"ag_blocked"}),
+        unavailable=frozenset({"ag_blocked"}),
+    )
+    outcome = choose(doc, "impl", req, {}, {}, {}, {}, {}, now=NOW)
+    assert outcome.link is not None
+    assert outcome.link.agent_id == "ag_codex"
+    assert any(
+        skip.link.agent_id == "ag_blocked" and skip.why == "blocked_for_project"
+        for skip in outcome.skipped
+    )

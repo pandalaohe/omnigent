@@ -1919,6 +1919,73 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
+  it("hides project-blocked agents, falls back from a carried-over blocked agent, and shows the count line (Scenario 17)", async () => {
+    const AG_PI = "ag_pi_native";
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        {
+          id: AG_CODEX,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+          description: null,
+          skills: [],
+        },
+        {
+          id: AG_CLAUDE,
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+          description: null,
+          skills: [],
+        },
+        {
+          id: AG_PI,
+          name: "pi-native-ui",
+          display_name: "Pi",
+          harness: "pi-native",
+          description: null,
+          skills: [],
+        },
+      ],
+      isLoading: false,
+      isError: false,
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({
+      host_id: HOST_WORKSTATION,
+      workspace: REPO,
+      calling_defaults: { [HOST_WORKSTATION]: { agent_id: AG_CODEX } },
+      blocked_agents: { "*": [AG_PI], [HOST_WORKSTATION]: [AG_CLAUDE] },
+    });
+    localStorage.setItem(
+      "omnigent:calling-last",
+      JSON.stringify({
+        enabled: true,
+        "p:proj_alpha": {
+          [HOST_WORKSTATION]: {
+            last_agent_id: AG_CLAUDE,
+            agents: {
+              [AG_CLAUDE]: { harness: "claude-native", model: "opus-5-5", effort: "high", at: 1 },
+            },
+          },
+        },
+      }),
+    );
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId(`new-chat-landing-agent-${AG_CLAUDE}`)).toBeNull();
+    expect(screen.queryByTestId(`new-chat-landing-agent-${AG_PI}`)).toBeNull();
+    expect(screen.getByTestId(`new-chat-landing-agent-${AG_CODEX}`)).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-project-blocked-note")).toHaveTextContent(
+      "2 agents blocked for this project on this host",
+    );
+  });
+
   it("sends explicit nulls for a model and effort cleared on a project visit", async () => {
     // Codex effort options derive from the model rows' supportedReasoningEfforts;
     // give the seeded models one so the effort control has something to clear.

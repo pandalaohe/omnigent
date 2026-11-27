@@ -17,7 +17,9 @@ import {
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
 import {
+  lazy,
   type ReactNode,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -400,6 +402,7 @@ import {
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
+import { projectBlockedAgents } from "@/lib/projectAgentBlocks";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -524,6 +527,10 @@ import {
   newSessionLocation,
   peekNewSessionHandoff,
 } from "@/lib/newSessionHandoff";
+
+const LazyProjectSettingsDialog = lazy(() =>
+  import("./ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
+);
 
 // Re-exported for the composer and settings, whose import paths predate the
 // leaf module extraction.
@@ -1345,6 +1352,8 @@ export function AgentHarnessPicker({
   onPrefetchEntries,
   curatedEntries,
   entriesFailed = false,
+  projectBlockedCount = 0,
+  onOpenProjectSettings,
 }: {
   appearance?: "composer" | "header";
   agentEntries: AvailableAgent[];
@@ -1452,6 +1461,10 @@ export function AgentHarnessPicker({
   /** Whether the roster could not be loaded, so an empty curated list is a
    *  failed fetch rather than the deployment's doing. */
   entriesFailed?: boolean;
+  /** Number of catalog agents hidden because the active project blocks them on this host. */
+  projectBlockedCount?: number;
+  /** Opens project settings when the user clicks the blocked-agents footer line. */
+  onOpenProjectSettings?: () => void;
 }) {
   // Controlled so picking a row can close the menu.
   const [internalOpen, setInternalOpen] = useState(false);
@@ -2361,6 +2374,19 @@ export function AgentHarnessPicker({
                 </HarnessPickerSubContent>
               </DropdownMenuSub>
             ))}
+        </>
+      )}
+      {!showConfig && !showMore && !showCustom && projectBlockedCount > 0 && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            data-testid="new-chat-landing-project-blocked-note"
+            onSelect={() => onOpenProjectSettings?.()}
+            disabled={!onOpenProjectSettings}
+            className="whitespace-normal break-words text-xs text-muted-foreground"
+          >
+            {projectBlockedCount} agents blocked for this project on this host
+          </DropdownMenuItem>
         </>
       )}
     </HarnessPicker>
@@ -3438,12 +3464,54 @@ function NewChatLandingContent({
   // Pre-filled from the `?project=` param so the sidebar's per-project
   // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
   // re-run — sync the selection to the param whenever it changes.
   useEffect(() => {
     setSelectedProject(projectParam);
   }, [projectParam]);
+  const activeProjectRecord = useMemo(
+    () =>
+      selectedProject !== ""
+        ? ((projectList ?? []).find((p) => p.name === selectedProject) ?? null)
+        : null,
+    [projectList, selectedProject],
+  );
+  const { data: selectedProjectConfig } = useProjectConfig(
+    activeProjectRecord?.id && activeProjectRecord.id !== configProjectId
+      ? activeProjectRecord.id
+      : null,
+  );
+  const activeProjectConfig =
+    activeProjectRecord?.id === configProjectId ? storedProjectConfig : selectedProjectConfig;
+  const projectBlockHostId = sandboxSelected ? null : selectedHostId;
+  const projectBlockedIds = useMemo(
+    () => projectBlockedAgents(activeProjectConfig, projectBlockHostId),
+    [activeProjectConfig, projectBlockHostId],
+  );
+  const visibleAgentList = useMemo(
+    () =>
+      projectBlockedIds.size === 0
+        ? agentList
+        : agentList.filter((agent) => !projectBlockedIds.has(agent.id)),
+    [agentList, projectBlockedIds],
+  );
+  const visibleHarnessEntries = useMemo(
+    () =>
+      projectBlockedIds.size === 0
+        ? harnessEntries
+        : harnessEntries.filter((agent) => !projectBlockedIds.has(agent.id)),
+    [harnessEntries, projectBlockedIds],
+  );
+  const visibleAgentEntries = useMemo(
+    () =>
+      projectBlockedIds.size === 0
+        ? agentEntries
+        : agentEntries.filter((agent) => !projectBlockedIds.has(agent.id)),
+    [agentEntries, projectBlockedIds],
+  );
+  const projectBlockedCount = agentList.length - visibleAgentList.length;
   // Claude Code permission mode, selected from the composer permissions menu.
   const [permissionMode, setPermissionMode] = useState<string>(
     () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
@@ -4164,18 +4232,18 @@ function NewChatLandingContent({
   // Readiness is meaningful only for a connected host; managed sandboxes
   // provision their own tooling and should not drive fallback warnings.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
-  const rememberedNativeAgent = harnessEntries.find((agent) => agent.id === pickedAgentId);
+  const rememberedNativeAgent = visibleHarnessEntries.find((agent) => agent.id === pickedAgentId);
   const rememberedHarnessResolution = useMemo(
     () =>
       resolveHarnessPreference(
-        harnessEntries.map((agent) => ({
+        visibleHarnessEntries.map((agent) => ({
           harness: nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? "",
           readiness: harnessReadinessOnHost(agent.harness, harnessWarningHost),
           value: agent,
         })),
         rememberedNativeAgent?.harness,
       ),
-    [harnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
+    [visibleHarnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
   );
   const automaticHarnessFallback =
     projectParam === "" &&
@@ -4186,25 +4254,41 @@ function NewChatLandingContent({
       ? rememberedHarnessResolution
       : null;
   const pendingAgentAllowedOnTarget = !sandboxSelected || bundleWorkspacesSupported;
+  const projectDefaultAgentId =
+    (projectBlockHostId
+      ? activeProjectConfig?.calling_defaults?.[projectBlockHostId]?.agent_id
+      : undefined) ??
+    activeProjectConfig?.agent_id ??
+    null;
+  const projectDefaultFallbackId =
+    projectDefaultAgentId && visibleAgentList.some((a) => a.id === projectDefaultAgentId)
+      ? projectDefaultAgentId
+      : null;
   const defaultEffectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgent !== null && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
-      : agentList.some((a) => a.id === pickedAgentId)
+      : visibleAgentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
-        : configuredAgentUnavailable ||
-            pickUnresolvedOnPlaceholder ||
-            // A library agent that left the catalog (deleted, or not visible on
-            // this target) resolves to nothing rather than silently falling
-            // through to whatever happens to sit first in the list.
-            pickedAgentId?.startsWith("ca_")
-          ? null
-          : (agentsLoading || prefillConfig === undefined) &&
-              agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
-            ? cachedPickerOptions!.agent.id
-            : // No remembered pick: use the configured default, else the first agent.
-              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
-              agentList[0]?.id ??
-              null);
+        : pickedAgentId !== null && projectBlockedIds.has(pickedAgentId)
+          ? (projectDefaultFallbackId ??
+            visibleAgentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+            visibleAgentList[0]?.id ??
+            null)
+          : configuredAgentUnavailable ||
+              pickUnresolvedOnPlaceholder ||
+              // A library agent that left the catalog (deleted, or not visible on
+              // this target) resolves to nothing rather than silently falling
+              // through to whatever happens to sit first in the list.
+              pickedAgentId?.startsWith("ca_")
+            ? null
+            : (agentsLoading || prefillConfig === undefined) &&
+                visibleAgentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
+              ? cachedPickerOptions!.agent.id
+              : // No remembered pick: use the project default, configured default, else the first agent.
+                (projectDefaultFallbackId ??
+                visibleAgentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+                visibleAgentList[0]?.id ??
+                null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
   // The remembered agent is not one this deployment offers, so the configured
   // default runs in its place. Drives the harness re-seed below: an override
@@ -4216,6 +4300,10 @@ function NewChatLandingContent({
     pickedAgentId !== null &&
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((agent) => agent.id === pickedAgentId);
+  const blocklistRejectedTheRememberedPick =
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    projectBlockedIds.has(pickedAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -6172,6 +6260,18 @@ function NewChatLandingContent({
     setPickedHarness(inherited);
     _setCostControlMode(isAutoHarness(inherited) ? "on" : null);
   }, [curationRejectedTheRememberedPick, effectiveAgentId]);
+  // Project blocklist replaced the remembered agent: clear stale overrides so
+  // the fallback agent does not inherit a blocked agent's harness or model.
+  useEffect(() => {
+    if (!blocklistRejectedTheRememberedPick) return;
+    setPickedAgentId(effectiveAgentId);
+    const remembered = effectiveAgentId !== null ? readLastHarness(effectiveAgentId) : null;
+    const inherited = remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered;
+    setPickedHarness(inherited);
+    _setPickedModel("");
+    setPickedEffort("");
+    setPickedSpeed("");
+  }, [blocklistRejectedTheRememberedPick, effectiveAgentId]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -6411,6 +6511,10 @@ function NewChatLandingContent({
     sandboxProviderRows,
   ]);
 
+  const projectBlockedKey = useMemo(
+    () => [...projectBlockedIds].sort().join(","),
+    [projectBlockedIds],
+  );
   // Calling-defaults seed (K8): once project + host are known, resolve the
   // agent / model / effort through the server chain and seed the untouched
   // pickers. A touched pick survives a host switch only while the new host
@@ -6424,7 +6528,7 @@ function NewChatLandingContent({
     if (seedHostId === null && !sandboxSelected) return;
     const seedProjectId = configProjectId ?? "";
     if (!seedProjectId && effectiveAgentId === null) return;
-    const seedKey = `${seedProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}`;
+    const seedKey = `${seedProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}|${projectBlockedKey}`;
     if (callingSeedAppliedRef.current === seedKey) return;
     // Claim the key before the fetch: a failure leaves today's generic
     // defaults in place instead of retrying on every render.
@@ -6478,6 +6582,7 @@ function NewChatLandingContent({
       carryEnabled,
       carry,
       isAgentUsable: (agentId) => {
+        if (projectBlockedIds.has(agentId)) return false;
         const entry = agentList.find((candidate) => candidate.id === agentId);
         if (!entry) return false;
         const harness = nativeCodingAgentForAvailableAgent(entry)?.harness ?? entry.harness ?? null;
@@ -6545,7 +6650,14 @@ function NewChatLandingContent({
     // Reads the live picks at resolve time; only host / project / agent picks
     // start a new seed (the applied key guards the rest).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectParam, configProjectId, selectedHostId, sandboxSelected, effectiveAgentId]);
+  }, [
+    projectParam,
+    configProjectId,
+    selectedHostId,
+    sandboxSelected,
+    effectiveAgentId,
+    projectBlockedKey,
+  ]);
 
   // While a project's config is still loading, the last cached picker snapshot
   // (this user × project) previews its model so the composer doesn't flash
@@ -8052,12 +8164,14 @@ function NewChatLandingContent({
           // on a project visit a knob the user touched and cleared must ride
           // as an explicit null, or the server refills it from the project's
           // defaults.
-          model_override:
-            normalizedModelOverride ??
-            (createProjectId !== null && modelTouchedRef.current ? null : undefined),
-          reasoning_effort:
-            normalizedReasoningEffort ??
-            (createProjectId !== null && effortTouchedRef.current ? null : undefined),
+          model_override: blocklistRejectedTheRememberedPick
+            ? undefined
+            : (normalizedModelOverride ??
+              (createProjectId !== null && modelTouchedRef.current ? null : undefined)),
+          reasoning_effort: blocklistRejectedTheRememberedPick
+            ? undefined
+            : (normalizedReasoningEffort ??
+              (createProjectId !== null && effortTouchedRef.current ? null : undefined)),
           ...(hasGenericPermissionMode &&
           acpHarness !== null &&
           permissionMode.startsWith("host-tier:")
@@ -8076,9 +8190,11 @@ function NewChatLandingContent({
           // with the row, so there is no first message to wait for). The
           // message text rides along for routing only — the client still
           // delivers the real message after navigation.
-          harness_override: smartRoutingHarnessSelected
-            ? AUTO_HARNESS_ID
-            : (pickedHarness ?? undefined),
+          harness_override: blocklistRejectedTheRememberedPick
+            ? undefined
+            : smartRoutingHarnessSelected
+              ? AUTO_HARNESS_ID
+              : (pickedHarness ?? undefined),
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           session_prompt: sessionPrompt || undefined,
@@ -9669,15 +9785,19 @@ function NewChatLandingContent({
                                 : undefined
                           }
                           onDismissCyclePreview={dismissPreview}
-                          agentEntries={agentEntries}
-                          harnessEntries={harnessEntries}
+                          agentEntries={visibleAgentEntries}
+                          harnessEntries={visibleHarnessEntries}
                           blockedReasons={sandboxSelected ? sandboxBlockedReasons : undefined}
                           onPrefetchEntries={prefetchSandboxPreviews}
                           effectiveAgentId={effectiveAgentId}
                           agentLabel={agentLabel}
-                          hasAgents={agentList.length > 0}
+                          hasAgents={visibleAgentList.length > 0 || projectBlockedCount > 0}
                           curatedEntries={
-                            curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                            curation.restrictToAgentNames.size > 0 ? visibleAgentList : undefined
+                          }
+                          projectBlockedCount={projectBlockedCount}
+                          onOpenProjectSettings={
+                            selectedProject !== "" ? () => setProjectSettingsOpen(true) : undefined
                           }
                           entriesFailed={agentsError}
                           loading={pickerLoading}
@@ -10196,6 +10316,17 @@ function NewChatLandingContent({
           onClose={() => setViewingBuiltinAgent(null)}
           onDuplicated={handleDuplicatedBuiltin}
         />
+      )}
+
+      {selectedProject !== "" && projectSettingsOpen && (
+        <Suspense fallback={null}>
+          <LazyProjectSettingsDialog
+            open={projectSettingsOpen}
+            onOpenChange={setProjectSettingsOpen}
+            projectId={activeProjectRecord?.id ?? null}
+            projectName={selectedProject}
+          />
+        </Suspense>
       )}
     </div>
   );

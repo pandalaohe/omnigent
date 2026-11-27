@@ -17085,7 +17085,11 @@ async def _create_session_from_existing_agent(
     request: Request,
     **kwargs: Any,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
-    from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER, admit_create
+    from omnigent.server.session_choice_runtime import (
+        CHOICE_PROTOCOL_HEADER,
+        CreateChoice,
+        admit_create,
+    )
 
     if request.headers.get(CHOICE_PROTOCOL_HEADER) != "1":
         return await _create_session_from_existing_agent_impl(
@@ -17104,7 +17108,7 @@ async def _create_session_from_existing_agent(
             runner_router,
             selection.body if selection else body,
             request,
-            choice_admission=selection,
+            choice_admission=selection if isinstance(selection, CreateChoice) else None,
             **kwargs,
         )
 
@@ -17330,6 +17334,21 @@ async def _create_session_from_existing_agent_impl(
                                 body.workspace,
                                 exc_info=True,
                             )
+    source_project: Project | None = None
+    if (
+        created_by_project_id is not None
+        and "project_id" not in request_fields_set
+        and project_store is not None
+    ):
+        source_project = await asyncio.to_thread(
+            project_store.get, created_by_project_id, user_id=user_id
+        )
+    independent_j1_default = (
+        created_by_session_id is not None
+        and body.parent_session_id is None
+        and body.sub_agent_name is None
+        and "agent_id" not in request_fields_set
+    )
     calling_warnings: list[str] = []
     project_resolution = await resolve_project_session_create(
         body=body,
@@ -17344,8 +17363,16 @@ async def _create_session_from_existing_agent_impl(
         # model / effort from the runner's own member resolution; filling them
         # here would pin a model the worker's spec deliberately left unset.
         apply_calling_defaults=body.sub_agent_name is None,
-        apply_project_calling_defaults=created_by_session_id is None,
+        apply_project_calling_defaults=(created_by_session_id is None or independent_j1_default),
+        apply_project_placement_defaults=created_by_session_id is None,
         parent_project=parent_project,
+        calling_project=(
+            source_project
+            if independent_j1_default
+            and source_project is not None
+            and source_project.archived_at is None
+            else None
+        ),
         parent_host_id=parent_host_id,
         calling_path_label=calling_path_label,
         warnings=calling_warnings,
@@ -17357,16 +17384,12 @@ async def _create_session_from_existing_agent_impl(
         project_id is None
         and created_by_project_id is not None
         and "project_id" not in request_fields_set
-        and project_store is not None
+        and source_project is not None
     ):
-        # Only the filing carries over, not the project's agent or workspace
+        # Only the filing carries over, not the project's workspace placement
         # defaults: the worker keeps the placement its source asked for. A
         # project deleted since leaves the worker unfiled.
-        source_project = await asyncio.to_thread(
-            project_store.get, created_by_project_id, user_id=user_id
-        )
-        if source_project is not None:
-            project_id = created_by_project_id
+        project_id = created_by_project_id
     creation_metadata(
         parent_session_id=body.parent_session_id,
         host_type=body.host_type,
@@ -17505,7 +17528,12 @@ async def _create_session_from_existing_agent_impl(
     # a parent clone for the session's whole life, off a request that was
     # wrong when it arrived. Reject it while the caller is still here to be
     # told, and leave the parent-fallback to the cases it fits.
-    if body.sub_agent_name:
+    if body.sub_agent_name is not None:
+        if not body.sub_agent_name.strip():
+            raise OmnigentError(
+                "sub_agent_name must be a non-empty string",
+                code=ErrorCode.INVALID_INPUT,
+            )
         await asyncio.to_thread(
             _require_declared_subagent,
             agent=agent,
@@ -17977,6 +18005,67 @@ async def _create_session_from_existing_agent_impl(
             "permission_tier is only supported by Pi and Antigravity sessions",
             code=ErrorCode.INVALID_INPUT,
         )
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+
+    runner_bound_for_parent = _parent_for_routing is not None and (
+        _runner_authorized_for_sender(
+            request,
+            _parent_for_routing,
+            getattr(request.app.state, "runner_tunnel_tokens", None),
+        )
+        if RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        else getattr(request.state, "auth_purpose", None) == "runner"
+    )
+    is_runner_subagent = bool(
+        body.sub_agent_name
+        and body.sub_agent_name.strip()
+        and body.parent_session_id is not None
+        and _parent_for_routing is not None
+        and _parent_for_routing.agent_id == agent.id
+        and runner_bound_for_parent
+    )
+    if not is_runner_subagent:
+        effective_project_id = project_id or child_project_id
+        if effective_project_id is not None and project_store is not None:
+            if parent_project is not None and parent_project.id == effective_project_id:
+                block_project = parent_project
+            elif source_project is not None and source_project.id == effective_project_id:
+                block_project = source_project
+            else:
+                block_project = await asyncio.to_thread(
+                    project_store.get, effective_project_id, user_id=user_id
+                )
+            if block_project is not None:
+                from omnigent.native.native_coding_agents import public_agent_name
+                from omnigent.project_agent_blocks import assert_agent_allowed
+                from omnigent.runner.routing import routing_host_id
+
+                if body.host_type == "managed":
+                    block_host_id = None
+                else:
+                    block_host_id = body.host_id or parent_host_id
+                    if block_host_id is None and _parent_for_routing is not None:
+                        block_host_id = await asyncio.to_thread(
+                            routing_host_id, _parent_for_routing, conversation_store
+                        )
+                block_host_store = getattr(request.app.state, "host_store", None)
+                block_host_row = (
+                    await asyncio.to_thread(block_host_store.get_host, block_host_id)
+                    if block_host_id is not None and block_host_store is not None
+                    else None
+                )
+                assert_agent_allowed(
+                    project=block_project,
+                    host_id=block_host_id,
+                    agent_id=agent.id,
+                    agent_label=public_agent_name(agent.name) or agent.name,
+                    host_label=(
+                        block_host_row.name
+                        if block_host_row is not None and block_host_row.name
+                        else block_host_id
+                    ),
+                )
     await validate_create_harness_readiness(
         harness=selected_harness,
         host_id=body.host_id,

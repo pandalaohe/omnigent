@@ -486,7 +486,9 @@ async def resolve_project_session_create(
     request: Request | None = None,
     apply_calling_defaults: bool = False,
     apply_project_calling_defaults: bool = True,
+    apply_project_placement_defaults: bool | None = None,
     parent_project: Project | None = None,
+    calling_project: Project | None = None,
     parent_host_id: str | None = None,
     calling_path_label: str = "POST /v1/sessions",
     warnings: list[str] | None = None,
@@ -527,14 +529,21 @@ async def resolve_project_session_create(
 
     if parent_project is not None and parent_project.archived_at is not None:
         parent_project = None
+    if calling_project is not None and calling_project.archived_at is not None:
+        calling_project = None
 
+    placement_defaults = (
+        apply_project_calling_defaults
+        if apply_project_placement_defaults is None
+        else apply_project_placement_defaults
+    )
     updates: dict[str, Any] = {}
     bindings: Any = []
     entries: Any = []
     if project is not None:
         config = {} if getattr(body, "sibling_source_id", None) else project.config
         managed_target = (
-            apply_project_calling_defaults
+            placement_defaults
             and getattr(body, "host_type", None) == "managed"
             and getattr(body, "parent_session_id", None) is None
         )
@@ -603,7 +612,11 @@ async def resolve_project_session_create(
 
     speed = permission = None
     if apply_calling_defaults:
-        calling_project = project if project is not None else parent_project
+        resolved_calling_project = (
+            project
+            if project is not None
+            else (parent_project if parent_project is not None else calling_project)
+        )
         calling_host_id = updates.get("host_id", getattr(body, "host_id", None)) or parent_host_id
         explicit = body.model_dump()
         labels = getattr(body, "labels", None)
@@ -613,7 +626,7 @@ async def resolve_project_session_create(
         resolution = await resolve_create_calling(
             request=request,
             user_id=user_id,
-            project=calling_project if apply_project_calling_defaults else None,
+            project=resolved_calling_project if apply_project_calling_defaults else None,
             host_id=calling_host_id,
             explicit=explicit,
             explicit_fields=explicit_fields,

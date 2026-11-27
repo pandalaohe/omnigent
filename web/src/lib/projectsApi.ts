@@ -84,6 +84,8 @@ export interface ProjectConfig {
    * falls through the resolution chain to the user's master table.
    */
   calling_defaults?: Record<string, ProjectCallingDefaultsHost>;
+  /** Per-host (and `"*"` all-hosts) blocked catalog agent ids. */
+  blocked_agents?: Record<string, string[]>;
   orchestration?: {
     child_cap?: number | "none";
     session_choice?: "off" | { pin: string };

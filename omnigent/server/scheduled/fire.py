@@ -966,6 +966,11 @@ async def _run_fire_for_task(
             # earlier session's workspace, waking or relaunching it the way a
             # user message would, instead of provisioning a second sandbox.
             effective = replace(effective, host_id=joined[0], workspace=joined[1])
+            try:
+                await _assert_fire_agent_allowed(deps, effective)
+            except OmnigentError as exc:
+                await recorder.finish("failed", error=exc.message, error_code=exc.code)
+                return
             dispatch = fire_dispatch.reuse or _make_reuse_dispatch(deps)
             hand_off = False
 
@@ -2223,6 +2228,39 @@ async def _task_project(deps: FireDeps, task: ScheduledTask) -> Project | None:
     return project
 
 
+async def _assert_fire_agent_allowed(deps: FireDeps, task: ScheduledTask) -> None:
+    """Enforce project blocked_agents for *task* on its resolved host."""
+    if _is_library_agent_task(deps, task):
+        return
+    project = await _task_project(deps, task)
+    if project is None:
+        return
+    from omnigent.native.native_coding_agents import public_agent_name
+    from omnigent.project_agent_blocks import assert_agent_allowed
+
+    fire_agent = (
+        await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        if deps.agent_store is not None
+        else None
+    )
+    fire_host = (
+        await asyncio.to_thread(deps.host_store.get_host, task.host_id)
+        if task.host_id is not None and deps.host_store is not None
+        else None
+    )
+    assert_agent_allowed(
+        project=project,
+        host_id=task.host_id,
+        agent_id=task.agent_id,
+        agent_label=(
+            (public_agent_name(fire_agent.name) or fire_agent.name)
+            if fire_agent is not None
+            else task.agent_id
+        ),
+        host_label=(fire_host.name if fire_host is not None and fire_host.name else task.host_id),
+    )
+
+
 async def _resolve_fire_calling(
     deps: FireDeps, task: ScheduledTask, *, notes: list[dict[str, str]] | None = None
 ) -> ScheduledTask:
@@ -2245,6 +2283,7 @@ async def _resolve_fire_calling(
     """
     if _is_library_agent_task(deps, task):
         return task
+    await _assert_fire_agent_allowed(deps, task)
     project = await _task_project(deps, task)
     explicit: dict[str, Any] = {
         "agent_id": task.agent_id,

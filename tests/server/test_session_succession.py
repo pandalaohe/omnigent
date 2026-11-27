@@ -2866,3 +2866,34 @@ async def test_deferred_recovery_scans_past_offline_backlog(
         assert len(runners.for_runner(RUNNER_ID_B).posts) == 2
     finally:
         engine.dispose()
+
+
+async def test_successor_allowed_after_agent_blocked_on_project(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Scenario 8: rotating a running session succeeds even after its agent is blocked."""
+    blocked_agent = "a" * 32
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        "d" * 32,
+        "RotateProj",
+        None,
+        config={"blocked_agents": {"*": [blocked_agent]}},
+    )
+    old = store.create_conversation(
+        agent_id=blocked_agent,
+        project_id=project.id,
+        runner_id=RUNNER_ID,
+        harness_override="claude-native",
+    ).id
+    note = await client.post(
+        f"/v1/sessions/{old}/handover",
+        json={"handover": "Continue after block.", "rotate": True},
+    )
+    assert note.status_code == 200, note.text
+    created = await client.post(f"/v1/sessions/{old}/successor")
+    assert created.status_code == 200, created.text
+    successor = store.get_conversation(created.json()["id"])
+    assert successor is not None and successor.agent_id == blocked_agent

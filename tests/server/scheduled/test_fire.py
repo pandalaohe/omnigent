@@ -1694,7 +1694,8 @@ async def test_fire_uses_the_tasks_project_defaults() -> None:
             {
                 "calling_defaults": {
                     "host_1": {
-                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}}
+                        "agent_id": "ag_1",
+                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}},
                     }
                 }
             }
@@ -1841,7 +1842,8 @@ async def test_explicit_null_effort_skips_the_project_default() -> None:
             {
                 "calling_defaults": {
                     "host_1": {
-                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}}
+                        "agent_id": "ag_1",
+                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}},
                     }
                 }
             }
@@ -1916,7 +1918,10 @@ async def test_fire_attempts_an_unlisted_default_with_a_visible_resolution_note(
         project_store=_project(
             {
                 "calling_defaults": {
-                    "host_1": {"harnesses": {"claude-native": {"model": "gpt-6-sol"}}}
+                    "host_1": {
+                        "agent_id": "ag_1",
+                        "harnesses": {"claude-native": {"model": "gpt-6-sol"}},
+                    }
                 }
             }
         ),
@@ -6394,3 +6399,88 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_fire_refuses_blocked_agent_before_worktree_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 9: blocked agent fails fire with agent_blocked_for_project, no worktree."""
+    from omnigent.server.routes import _host_worktree
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                user_id="alice@example.com",
+                project_id="proj_1",
+                base_branch="main",
+            )
+        }
+    )
+    worktree_calls: list[Any] = []
+
+    async def _fail_worktree(*args: Any, **kwargs: Any) -> Any:
+        worktree_calls.append((args, kwargs))
+        raise AssertionError("worktree must not be requested for a blocked agent")
+
+    monkeypatch.setattr(_host_worktree, "create_worktree_on_host", _fail_worktree)
+    deps = _chain_deps(
+        store,
+        conv_store,
+        project_store=_project({"blocked_agents": {"host_1": ["ag_1"]}}),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert worktree_calls == []
+    assert conv_store.created == []
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "agent_blocked_for_project"
+    assert "blocked" in (store.runs[0]["error"] or "").lower()
+
+
+async def test_fire_refuses_blocked_agent_on_continued_sandbox_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed-continue sandbox reuse enforces project blocked_agents on the joined host."""
+    from omnigent.server.routes import sessions
+
+    task = _sandbox_continue_task(
+        user_id="alice@example.com",
+        last_run_conversation_id="conv_prev",
+        project_id="proj_1",
+        agent_id="ag_1",
+    )
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    conv_store = _ExistingConversationStore(
+        _continued_session(host_id=own, workspace="/sandbox/ws")
+    )
+    managed_launch = AsyncMock()
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="agent_sandbox")})
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        host_store=hosts,
+        sandbox_config=_FakeSandboxConfig(),
+        project_store=_project({"blocked_agents": {own: ["ag_1"]}}),
+    )
+
+    async def _launch(conv: Any, task_arg: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    managed_launch.assert_not_awaited()
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "agent_blocked_for_project"

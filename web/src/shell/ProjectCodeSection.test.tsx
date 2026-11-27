@@ -337,9 +337,8 @@ describe("ProjectCodeSection", () => {
     getFactsMock.mockResolvedValue({ state: "offline" });
     renderSection();
 
-    await waitFor(() => expect(screen.getAllByText("host offline")).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByText("host offline")).toHaveLength(1));
     expect(screen.getByText("/opt/work/omnigent/fork/web")).toBeInTheDocument();
-    expect(screen.getByText("/opt/work/omnigent")).toBeInTheDocument();
   });
 
   it("shows the no-code note until a code repository exists", async () => {
@@ -358,14 +357,13 @@ describe("ProjectCodeSection", () => {
     expect(screen.queryByTestId("project-code-no-code-repo")).not.toBeInTheDocument();
   });
 
-  it("keeps entry folders read-only on the details page", async () => {
+  it("does not render a separate entry-folder block on the Code tab", async () => {
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent/fork/wt")]);
     renderSection();
-    await screen.findByTestId("project-code-entry-h1");
+    await screen.findByTestId("project-code-section");
+    expect(screen.queryByTestId("project-code-entry-h1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("project-code-entry-browse-h1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("project-code-entry-path-h1")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "About the entry folder on Laptop" }));
-    expect(screen.getByText(/Set or change it on the Session defaults page/)).toBeInTheDocument();
     expect(putEntryMock).not.toHaveBeenCalled();
   });
 
@@ -423,19 +421,13 @@ describe("ProjectCodeSection", () => {
     renderSection();
 
     await waitFor(() =>
-      expect(screen.getByTestId("project-code-entry-facts-h1")).toHaveTextContent("folder missing"),
+      expect(screen.getByTestId("project-code-binding-facts-h1-web")).toHaveTextContent(
+        "not a git repository",
+      ),
     );
-    expect(screen.getByTestId("project-code-binding-facts-h1-web")).toHaveTextContent(
-      "not a git repository",
-    );
-    expect(screen.getByTestId("project-code-entry-facts-h2")).toHaveTextContent("host offline");
     expect(screen.getByTestId("project-code-binding-facts-h2-web")).toHaveTextContent(
       "host needs an update",
     );
-    const dirty = screen.getByTestId("project-code-entry-facts-h3");
-    expect(dirty).toHaveTextContent("dev");
-    expect(dirty).toHaveTextContent("HEAD fedcba9");
-    expect(dirty).toHaveTextContent("uncommitted changes");
   });
 
   it("warns when no folder remote URL matches the repository URL", async () => {
@@ -488,41 +480,24 @@ describe("ProjectCodeSection", () => {
     });
     renderSection();
 
-    fireEvent.click(await screen.findByRole("button", { name: "About session folders on Laptop" }));
-    await screen.findByTestId("project-code-root-h1");
-    expect(screen.getByTestId("project-code-root-h1")).toHaveTextContent(
-      "New sessions open in: /opt/work/omnigent",
-    );
-    expect(screen.getByTestId("project-code-root-h1")).toHaveTextContent(
-      "New worktrees come from: /opt/work/omnigent/fork/web",
-    );
     expect(screen.queryByTestId("project-code-refused-h1")).not.toBeInTheDocument();
 
     await screen.findByTestId("project-code-refused-h2");
     expect(screen.getByTestId("project-code-refused-h2")).toHaveTextContent(
-      "Sessions here are refused — set a project folder",
+      "Sessions on this host are refused: set an entry folder first",
     );
+    expect(screen.queryByTestId("project-code-root-h1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("project-code-root-h2")).not.toBeInTheDocument();
-
-    fireEvent.keyDown(screen.getByTestId("project-code-root-h1"), {
-      key: "Escape",
-      code: "Escape",
-    });
-    fireEvent.click(screen.getByRole("button", { name: "About session folders on Tower" }));
-    await screen.findByTestId("project-code-root-h3");
-    expect(screen.getByTestId("project-code-root-h3")).toHaveTextContent(
-      "New sessions open in: /opt/work/omnigent/legacy (from the project's single-folder setting)",
-    );
-    expect(screen.getByTestId("project-code-root-h3")).toHaveTextContent(
-      "New worktrees come from: /opt/work/omnigent/legacy",
-    );
   });
 
   it("shows the setup block only when the host reports a setup command, with the outcome time", async () => {
     getMock.mockResolvedValue(
       collaboration({
         repositories: [repo()],
-        bindings: [binding()],
+        bindings: [
+          binding(),
+          binding({ id: "b_web_2", host_id: "h2", workspace: "/opt/work/omnigent/fork/other" }),
+        ],
         setup_outcomes: [
           {
             host_id: "h1",
@@ -546,15 +521,13 @@ describe("ProjectCodeSection", () => {
 
     await screen.findByTestId("project-code-binding-facts-h1-web-setup");
     expect(screen.getByTestId("project-code-binding-facts-h1-web-setup")).toHaveTextContent(
-      "Configured on host",
+      "Host setup command",
     );
     const outcome = screen.getByTestId("project-code-binding-facts-h1-web-setup-outcome");
     expect(outcome).toHaveTextContent("Last run: ok");
     expect(outcome).toHaveTextContent("2026-10-09 12:34 UTC");
     expect(screen.getByTestId("project-code-binding-facts-h1-web-run-again")).toBeInTheDocument();
-    expect(screen.getByTestId("project-code-entry-facts-h1-setup")).toHaveTextContent(
-      "Not configured",
-    );
+    expect(screen.queryByTestId("project-code-binding-facts-h2-web-setup")).not.toBeInTheDocument();
   });
 
   it("shows the agent preview with the delivered notes", async () => {
@@ -763,7 +736,7 @@ describe("ProjectCodeSection", () => {
     putBindingMock.mockResolvedValue(binding({ checked: false }));
     renderSection();
 
-    await screen.findByTestId("project-code-entry-h1");
+    await screen.findByTestId("project-code-binding-path-h1-web");
     expect(screen.queryByTestId("project-code-entry-path-h1")).not.toBeInTheDocument();
 
     const bindingInput = screen.getByTestId("project-code-binding-path-h1-web");
@@ -850,13 +823,13 @@ describe("ProjectCodeSection", () => {
     });
     renderSection();
 
-    await screen.findByTestId("project-code-entry-facts-h1-setup-outcome");
-    expect(screen.getByTestId("project-code-entry-facts-h1-setup-outcome")).toHaveTextContent(
-      "Last run: ok",
-    );
+    await screen.findByTestId("project-code-binding-facts-h1-web-setup-outcome");
     expect(screen.getByTestId("project-code-binding-facts-h1-web-setup-outcome")).toHaveTextContent(
       "Last run: failed",
     );
+    expect(
+      screen.queryByTestId("project-code-entry-facts-h1-setup-outcome"),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the chosen remote and branch after the first name edit", async () => {
@@ -964,8 +937,13 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-add-branch")).toHaveValue("second");
   });
 
-  it("keeps repository explanations behind keyboard-accessible help", async () => {
-    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+  it("keeps repository explanations behind keyboard-accessible help when multiple repos exist", async () => {
+    getMock.mockResolvedValue(
+      collaboration({
+        repositories: [repo(), repo({ id: "r_docs", name: "docs", role: "related" })],
+        bindings: [binding()],
+      }),
+    );
     renderSection();
     const trigger = await screen.findByRole("button", { name: "About the role of web" });
     expect(screen.queryByText(/Code we change: on hosts/)).not.toBeInTheDocument();
@@ -998,7 +976,7 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-add-submit")).toBeEnabled();
   });
 
-  it("shows a repository folder that equals the project folder only once", async () => {
+  it("marks a repository folder that equals the entry folder without repeating the path", async () => {
     getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent/fork/web")]);
     renderSection();
@@ -1007,7 +985,28 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-binding-same-h1-web")).toHaveTextContent(
       "Same as entry folder",
     );
-    expect(screen.getAllByText("/opt/work/omnigent/fork/web")).toHaveLength(1);
+    expect(screen.queryByText("/opt/work/omnigent/fork/web")).not.toBeInTheDocument();
+  });
+
+  it("nests hosts inside the single repository card and uses separate host cards for multiple repositories (Scenario 32)", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    renderSection();
+    const singleRepoCard = await screen.findByTestId("project-code-repo-web");
+    expect(singleRepoCard).toContainElement(screen.getByTestId("project-code-host-h1"));
+    expect(screen.queryByTestId("project-code-repo-role-web")).not.toBeInTheDocument();
+
+    cleanup();
+    getMock.mockResolvedValue(
+      collaboration({
+        repositories: [repo(), repo({ id: "r_docs", name: "docs", role: "related" })],
+        bindings: [binding()],
+      }),
+    );
+    renderSection();
+    const multiRepoCard = await screen.findByTestId("project-code-repo-web");
+    const hostCard = await screen.findByTestId("project-code-host-h1");
+    expect(multiRepoCard).not.toContainElement(hostCard);
+    expect(screen.getByTestId("project-code-repo-role-web")).toBeInTheDocument();
   });
 
   it("lets a folder with several remotes pick which one to use", async () => {

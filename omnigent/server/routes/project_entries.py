@@ -10,14 +10,20 @@ gated.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 
+from omnigent.calling_defaults import default_agent_for_host_or_legacy
 from omnigent.entities import ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.project_agent_blocks import (
+    blocked_agents,
+    check_default_agents_not_blocked,
+)
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.routes._auth_helpers import require_user
@@ -29,7 +35,8 @@ from omnigent.server.routes.project_collaboration import (
     run_post_bind_request,
 )
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
-from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.project_store import ProjectStore, project_config_revision
+from omnigent.util.uuid import normalize_uuid
 
 _SANDBOX_HOST_ID = "__sandbox__"
 
@@ -163,6 +170,20 @@ def create_project_entries_router(
         if "project_agent_id" in body.model_fields_set:
             config["agent_id"] = body.project_agent_id
             has_project_agent = bool(body.project_agent_id)
+        if body.agent_id or "project_agent_id" in body.model_fields_set:
+            projected = deepcopy(project.config or {})
+            if "project_agent_id" in body.model_fields_set:
+                if body.project_agent_id is None:
+                    projected.pop("agent_id", None)
+                else:
+                    projected["agent_id"] = body.project_agent_id
+            if body.agent_id:
+                defaults = dict(projected.get("calling_defaults") or {})
+                host_entry = dict(defaults.get(host_id) or {})
+                host_entry["agent_id"] = body.agent_id
+                defaults[host_id] = host_entry
+                projected["calling_defaults"] = defaults
+            check_default_agents_not_blocked(projected)
         initial_agent_id = None
         notice = None
         if not body.agent_id:
@@ -178,12 +199,69 @@ def create_project_entries_router(
             project_id,
             host_id,
             workspace,
-            initial_agent_id=initial_agent_id,
+            initial_agent_id=None,
             project_has_agent=has_project_agent,
         )
+        applied_host_agent_id: str | None = entry.host_agent_id
+        if initial_agent_id is not None and not has_project_agent:
+            template_blocked = False
+            template_applied = False
+            template_id = initial_agent_id
+            norm_template = (
+                template_id
+                if template_id.startswith("ca_")
+                else (normalize_uuid(template_id) or template_id)
+            )
+            current_project = project
+            for _attempt in range(2):
+                expected_rev = project_config_revision(current_project.config)
+
+                def _apply_template(live_config: dict[str, Any]) -> dict[str, Any]:
+                    nonlocal template_blocked, template_applied
+                    if default_agent_for_host_or_legacy(live_config, host_id) is not None:
+                        return live_config
+                    if not template_id.startswith("ca_") and norm_template in blocked_agents(
+                        live_config, host_id
+                    ):
+                        template_blocked = True
+                        return live_config
+                    defaults = dict(live_config.get("calling_defaults") or {})
+                    host_entry = dict(defaults.get(host_id) or {})
+                    host_entry["agent_id"] = template_id
+                    defaults[host_id] = host_entry
+                    live_config["calling_defaults"] = defaults
+                    template_applied = True
+                    return live_config
+
+                try:
+                    await asyncio.to_thread(
+                        project_store.transform_config,
+                        project_id,
+                        user_id=user_id,
+                        expected_revision=expected_rev,
+                        transform=_apply_template,
+                    )
+                    break
+                except OmnigentError as exc:
+                    if exc.code != ErrorCode.CONFLICT or _attempt == 1:
+                        raise
+                    refreshed = await asyncio.to_thread(
+                        project_store.get, project_id, user_id=user_id
+                    )
+                    if refreshed is None:
+                        break
+                    current_project = refreshed
+            if template_applied:
+                applied_host_agent_id = template_id
+            elif template_blocked:
+                applied_host_agent_id = None
+                notice = (
+                    "New project agent unavailable on this host. "
+                    "Using the project's existing agent selection rules."
+                )
         response = {**_entry_to_response(entry), "checked": checked}
-        if entry.host_agent_id:
-            response["host_agent_id"] = entry.host_agent_id
+        if applied_host_agent_id:
+            response["host_agent_id"] = applied_host_agent_id
         if notice:
             response["initialization_notice"] = notice
         if not checked:

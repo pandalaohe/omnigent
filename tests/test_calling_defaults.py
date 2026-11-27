@@ -147,10 +147,13 @@ def _catalog(
 
 
 def test_explicit_values_win_per_field() -> None:
-    """Scenario 3: an explicit model keeps the project's effort."""
+    """Scenario 3: an explicit model keeps the project's effort for the default agent."""
     project = {
         "calling_defaults": {
-            "workstation": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+            "workstation": {
+                "agent_id": "codex-sdk",
+                "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+            }
         }
     }
     result = _resolve(
@@ -175,7 +178,10 @@ def test_explicit_none_is_kept() -> None:
     """Scenario 4: an explicit null effort stays unset despite a project default."""
     project = {
         "calling_defaults": {
-            "workstation": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+            "workstation": {
+                "agent_id": "codex-sdk",
+                "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+            }
         }
     }
     result = _resolve(
@@ -203,13 +209,21 @@ def test_explicit_speed_wins_over_project_default(speed: str | None) -> None:
 
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
 def test_full_project_permission_resolves_before_master(harness: str) -> None:
-    result = _resolve(
+    agent_id = f"agent-{harness}"
+    result = resolve_calling(
         explicit={"harness_override": harness},
         explicit_fields={"harness_override"},
         project_config={
-            "calling_defaults": {"workstation": {"harnesses": {harness: {"permission": "full"}}}}
+            "calling_defaults": {
+                "workstation": {
+                    "agent_id": agent_id,
+                    "harnesses": {harness: {"permission": "full"}},
+                }
+            }
         },
         master={"workstation": {harness: {"permission": "ask"}}},
+        host_id="workstation",
+        agent_harness=lambda aid: harness if aid == agent_id else None,
     )
     assert result.permission == "full"
     assert result.sources["permission"] == "project_host"
@@ -248,11 +262,14 @@ def test_master_sdk_entry_beats_project_native_fallback() -> None:
     assert result.sources["model"] == "master"
 
 
-def test_project_native_entry_beats_master_native() -> None:
-    """The project native fallback sits above the master native fallback."""
+def test_project_native_entry_does_not_apply_to_sdk_agent_under_d6() -> None:
+    """D6: project native rows do not fall back onto an SDK agent; master native still applies."""
     project = {
         "calling_defaults": {
-            "workstation": {"harnesses": {"codex-native": {"model": "project-native"}}}
+            "workstation": {
+                "agent_id": "codex-sdk",
+                "harnesses": {"codex-native": {"model": "project-native"}},
+            }
         }
     }
     master = {"workstation": {"codex-native": {"model": "master-native"}}}
@@ -262,8 +279,8 @@ def test_project_native_entry_beats_master_native() -> None:
         project_config=project,
         master=master,
     )
-    assert result.model == "project-native"
-    assert result.sources["model"] == "project_host_native"
+    assert result.model == "master-native"
+    assert result.sources["model"] == "master_native"
 
 
 def test_no_defaults_anywhere() -> None:
@@ -300,7 +317,14 @@ def test_projectless_uses_master_layers_only() -> None:
 
 def test_fields_resolve_independently() -> None:
     """A project effort and a master model resolve in one pass."""
-    project = {"calling_defaults": {"workstation": {"harnesses": {"codex": {"effort": "high"}}}}}
+    project = {
+        "calling_defaults": {
+            "workstation": {
+                "agent_id": "codex-sdk",
+                "harnesses": {"codex": {"effort": "high"}},
+            }
+        }
+    }
     master = {"workstation": {"codex": {"model": "gpt-5.5"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
@@ -645,9 +669,7 @@ async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str)
 
 
 @pytest.mark.parametrize("field,value", [("speed", "fast"), ("permission", "approve-for-me")])
-@pytest.mark.parametrize(
-    "layer", ["project_host", "master", "project_host_native", "master_native"]
-)
+@pytest.mark.parametrize("layer", ["project_host", "master", "master_native"])
 def test_session_modes_follow_harness_chain(field: str, value: str, layer: str) -> None:
     project_harnesses = {"codex": {field: "invalid!"}, "codex-native": {field: "invalid!"}}
     master_harnesses = {"codex": {field: "invalid!"}, "codex-native": {field: "invalid!"}}
@@ -657,7 +679,11 @@ def test_session_modes_follow_harness_chain(field: str, value: str, layer: str) 
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
-        project_config={"calling_defaults": {"workstation": {"harnesses": project_harnesses}}},
+        project_config={
+            "calling_defaults": {
+                "workstation": {"agent_id": "codex-sdk", "harnesses": project_harnesses}
+            }
+        },
         master={"workstation": master_harnesses},
     )
     assert getattr(result, field) == value
@@ -669,7 +695,12 @@ def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> 
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
         project_config={
-            "calling_defaults": {"workstation": {"harnesses": {"codex": {"speed": "standard"}}}}
+            "calling_defaults": {
+                "workstation": {
+                    "agent_id": "codex-sdk",
+                    "harnesses": {"codex": {"speed": "standard"}},
+                }
+            }
         },
         master={"workstation": {"codex": {"speed": "fast", "permission": "read-only"}}},
     )

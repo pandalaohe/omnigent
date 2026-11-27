@@ -7248,7 +7248,12 @@ async def _execute_session_create_impl(
             resp.status_code == 409
             and not any(
                 code in resp.text
-                for code in ("session_choice_ask", "agent_busy", "agent_exhausted")
+                for code in (
+                    "session_choice_ask",
+                    "agent_busy",
+                    "agent_exhausted",
+                    "agent_blocked_for_project",
+                )
             )
         ):
             return json.dumps(unconfirmed_creation)
@@ -7268,13 +7273,21 @@ async def _execute_session_create_impl(
     if resp.status_code == 409 and (cap_error := _child_cap_error(resp)) is not None:
         return cap_error
     if resp.status_code == 409:
-        detail = resp.json().get("detail")
-        if isinstance(detail, dict) and detail.get("code") in {
-            "session_choice_ask",
-            "agent_busy",
-            "agent_exhausted",
-        }:
-            return json.dumps({"error": detail["code"], **detail})
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict) and err.get("code") == "agent_blocked_for_project":
+                return json.dumps({"error": err["code"], "message": err.get("message", "")})
+            detail = payload.get("detail")
+            if isinstance(detail, dict) and detail.get("code") in {
+                "session_choice_ask",
+                "agent_busy",
+                "agent_exhausted",
+            }:
+                return json.dumps({"error": detail["code"], **detail})
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
