@@ -1412,6 +1412,7 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     if rpc_reply is None:
+        assert events[0].input_received is True
         assert attrs["native_turn_id"] == ("turn_steered" if active_turn_id else "turn_1")
         assert attrs["outcome"] == "rpc_accepted"
         assert state.active_turn_id == attrs["native_turn_id"]
@@ -1423,6 +1424,7 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
             response_id=f"codex_{attrs['native_turn_id']}",
         )
     else:
+        assert events[0].input_received is False
         assert attrs["native_turn_id"] is None
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id

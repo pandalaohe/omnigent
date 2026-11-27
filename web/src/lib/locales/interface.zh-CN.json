@@ -42,5 +42,8 @@
   "quoteOpen": "「",
   "quoteClose": "」",
   "browserApprovalUnavailable": "需要已登录的浏览器会话。请使用账号登录或 OIDC。",
+  "dismissPendingInput": "移除",
+  "dismissPendingInputHint": "仅从聊天里移除。原生智能体已接管这条输入。",
+  "dismissPendingInputFailed": "没能移除这条排队消息。请重试。",
   "artifactSharingSingleMachineHint": "复制的链接可在本机打开。与他人分享需要账号登录。将无需登录的单用户服务对外暴露，会让任何人获得完整控制权。"
 }

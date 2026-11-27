@@ -554,6 +554,31 @@ describe("UserBubble awaiting-agent marker", () => {
   });
 });
 
+it("offers Remove only after native handoff and sends it to the bubble's session", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const onEdit = vi.fn();
+  const editableBubble = (bubble: Bubble) => (
+    <ConversationScopeContext.Provider value="conv_native_remove">
+      <EditSentMessageContext.Provider value={onEdit}>
+        <BubbleView bubble={bubble} />
+      </EditSentMessageContext.Provider>
+    </ConversationScopeContext.Provider>
+  );
+  const draft = userBubble("queued", { pending: true, awaitingAgent: true });
+  const { rerender } = render(editableBubble(draft));
+  expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+
+  rerender(editableBubble({ ...draft, dismissiblePendingId: "pending_received" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+  await waitFor(() => expect(screen.getByRole("button", { name: "Remove" })).toBeEnabled());
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/v1/sessions/conv_native_remove/pending-inputs/pending_received",
+    expect.objectContaining({ method: "DELETE" }),
+  );
+});
+
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

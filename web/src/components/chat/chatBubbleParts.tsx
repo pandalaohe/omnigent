@@ -110,10 +110,12 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { isCommandListed } from "@/store/paletteCommands";
 import { forkFromResponseAvailability, userMessageLinkId } from "./messageActions";
 import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
+import { interfaceText } from "@/lib/interfaceText";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import {
+  dismissNativePendingInput,
   retryFailedAttachmentSend,
   useChatStore,
   withoutFailedInputs,
@@ -397,6 +399,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      ...(p.canDismiss ? { dismissiblePendingId: p.pendingId ?? p.tempId } : {}),
       ...((p.sentMidTurn && p.posted === true && sendingSinceMs === undefined) || p.received
         ? { awaitingAgent: true }
         : {}),
@@ -1250,6 +1253,8 @@ function UserBubble({
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   const editSentMessage = useContext(EditSentMessageContext);
+  const [dismissing, setDismissing] = useState(false);
+  const dismissibleId = bubble.pending && editSentMessage !== null && bubble.dismissiblePendingId;
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -1564,6 +1569,29 @@ function UserBubble({
             >
               The agent will read this after its current step
             </span>
+          )}
+          {dismissibleId && sessionId && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              className="shrink-0 text-muted-foreground"
+              title={interfaceText("dismissPendingInputHint")}
+              disabled={dismissing}
+              onClick={async (event) => {
+                event.stopPropagation();
+                setDismissing(true);
+                try {
+                  await dismissNativePendingInput(sessionId, dismissibleId);
+                } catch {
+                  showToast(interfaceText("dismissPendingInputFailed"));
+                } finally {
+                  setDismissing(false);
+                }
+              }}
+            >
+              {interfaceText("dismissPendingInput")}
+            </Button>
           )}
           <div
             id={actionsId}

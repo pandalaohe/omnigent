@@ -91,6 +91,7 @@ import {
   approve as approveElicitation,
   bindOnlyOnlineRunner,
   createSession,
+  dismissPendingInput,
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
@@ -765,6 +766,7 @@ export interface PendingUserMessage {
   sendingSinceMs?: number;
   /** The native agent accepted this input; a running turn may still hold it queued. */
   received?: boolean;
+  canDismiss?: boolean;
   /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
   replayed?: boolean;
   /**
@@ -5377,6 +5379,22 @@ function setterFor(conversationId: string | null): Setter {
   return entrySetter(entry);
 }
 
+function removeDismissedInput(conversationId: string, pendingId: string): void {
+  setterFor(conversationId)((state) => ({
+    pendingUserMessages: state.pendingUserMessages.filter(
+      (message) => (message.pendingId ?? message.tempId) !== pendingId,
+    ),
+  }));
+}
+
+export async function dismissNativePendingInput(
+  conversationId: string,
+  pendingId: string,
+): Promise<void> {
+  await dismissPendingInput(conversationId, pendingId);
+  removeDismissedInput(conversationId, pendingId);
+}
+
 /** An observed disconnect/context change cannot be undone by showing the old report again. */
 export function invalidateCodexPermissionReadback(
   conversationId: string,
@@ -6544,6 +6562,7 @@ async function bindStream(
         ...(p.stableId === undefined ? {} : { stableId: p.stableId }),
         ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
         ...(p.received ? { received: true } : {}),
+        ...(p.canDismiss ? { canDismiss: true } : {}),
         replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
@@ -10309,8 +10328,16 @@ function syncPendingSendTimes(
     const input = inputs.get(message.pendingId ?? message.tempId);
     if (!input) return message;
     const received = message.received || input.received;
-    return input.sendingSinceMs !== message.sendingSinceMs || received !== message.received
-      ? { ...message, sendingSinceMs: input.sendingSinceMs, ...(received ? { received } : {}) }
+    const canDismiss = message.canDismiss || input.canDismiss;
+    return input.sendingSinceMs !== message.sendingSinceMs ||
+      received !== message.received ||
+      canDismiss !== message.canDismiss
+      ? {
+          ...message,
+          sendingSinceMs: input.sendingSinceMs,
+          ...(received ? { received } : {}),
+          ...(canDismiss ? { canDismiss } : {}),
+        }
       : message;
   });
 }
@@ -11297,20 +11324,30 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_sending": {
       if (sourceConversationId === null) break;
-      // A frame that beats its send's POST names no bubble yet and is ignored.
       setterFor(sourceConversationId)((s) => ({
         pendingUserMessages: s.pendingUserMessages.map((p) =>
-          (p.pendingId ?? p.tempId) === event.pendingId &&
+          ((p.pendingId ?? p.tempId) === event.pendingId ||
+            (event.canDismiss &&
+              !p.pendingId &&
+              event.stableId &&
+              p.stableId === event.stableId)) &&
           (p.sendingSinceMs !== (event.sinceMs ?? undefined) ||
-            (event.received === true && !p.received))
+            (event.received === true && !p.received) ||
+            (event.canDismiss === true && !p.canDismiss))
             ? {
                 ...p,
                 sendingSinceMs: event.sinceMs ?? undefined,
                 ...(event.received === true ? { received: true } : {}),
+                ...(event.canDismiss ? { canDismiss: true, pendingId: event.pendingId } : {}),
               }
             : p,
         ),
       }));
+      break;
+    }
+    case "session_input_dismissed": {
+      if (sourceConversationId !== null)
+        removeDismissedInput(sourceConversationId, event.pendingId);
       break;
     }
     case "session_input_consumed": {

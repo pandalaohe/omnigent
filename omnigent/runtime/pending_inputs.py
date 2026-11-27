@@ -275,6 +275,10 @@ class DrainedInput:
     runtime_notice: bool = False
     # The persisted mirror is a runtime notice (``MessageData.runtime_notice``).
     notice_item: bool = False
+    native_harness: str | None = None
+    native_handoff_completed: bool = False
+    dismissed: bool = False
+    agent_received: bool = False
 
 
 @dataclass
@@ -365,6 +369,9 @@ class _Entry:
     notice_item: bool = False
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
+    native_harness: str | None = None
+    native_handoff_completed: bool = False
+    dismissed: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -450,6 +457,7 @@ def record(
     injected_prefix: str | None = None,
     auto_retry: AutoRetryMetadata | None = None,
     runner_managed: bool = False,
+    native_harness: str | None = None,
     peer_message_id: str | None = None,
     runtime_notice: bool = False,
     notice_item: bool = False,
@@ -508,6 +516,7 @@ def record(
             injected_prefix=injected_prefix,
             auto_retry=auto_retry,
             last_runner_renewal=_now() if runner_managed else None,
+            native_harness=native_harness,
             peer_message_id=peer_message_id,
             runtime_notice=runtime_notice,
             notice_item=notice_item,
@@ -593,6 +602,37 @@ def agent_received(conversation_id: str, pending_id: str) -> DrainedInput | None
     with _lock:
         entry = _pending.get(conversation_id, {}).get(pending_id)
         return _drained_input(entry) if entry is not None and _agent_received(entry) else None
+
+
+def _can_dismiss(entry: _Entry) -> bool:
+    return (
+        (entry.agent_received or entry.native_handoff_completed)
+        and not entry.interrupted
+        and not entry.dismissed
+        and not entry.runtime_notice
+        and entry.auto_retry is None
+        and entry.peer_message_id is None
+    )
+
+
+def dismissible_input(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None and _can_dismiss(entry) else None
+
+
+def dismiss_from_chat(
+    conversation_id: str, pending_id: str
+) -> Literal["dismissed", "absent", "waiting"]:
+    """Hide a handed-off bubble while retaining its metadata for the native mirror."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None or entry.dismissed:
+            return "absent"
+        if not _can_dismiss(entry):
+            return "waiting"
+        entry.dismissed = True
+        return "dismissed"
 
 
 def holds_peer_message(conversation_id: str, peer_message_id: str) -> bool:
@@ -826,8 +866,8 @@ def mark_lifecycle(
     """
     Attach one identity-linked runner lifecycle edge to a queued input.
 
-    ``input_received`` records that the claiming attempt's terminal holds the
-    input; it needs that attempt's id and a live claim.
+    ``input_received`` records a native handoff for the named delivery attempt.
+    Claude's paste receipt also requires a live claim.
     """
     identity = {
         key: value
@@ -883,6 +923,13 @@ def mark_lifecycle(
                 and _now() - entry.last_runner_renewal < _CLAIMED_INPUT_TIMEOUT_S
             ):
                 entry.agent_received = True
+            if (
+                stage == "native_turn_completed"
+                and input_received
+                and delivery_attempt_id is not None
+                and entry.native_harness not in (None, "claude-native")
+            ):
+                entry.native_handoff_completed = True
             return entry.pending_id
     return None
 
@@ -1074,6 +1121,7 @@ def resolve_oldest_for_mirrored_text(
                 for pid, entry in entries.items()
                 if not entry.held
                 and not entry.interrupted
+                and not entry.dismissed
                 and entry.auto_retry is None
                 and entry.last_runner_renewal is None
             ),
@@ -1187,6 +1235,10 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         peer_message_id=drained.peer_message_id,
         runtime_notice=drained.runtime_notice,
         notice_item=drained.notice_item,
+        native_harness=drained.native_harness,
+        native_handoff_completed=drained.native_handoff_completed,
+        dismissed=drained.dismissed,
+        agent_received=drained.agent_received,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1502,7 +1554,7 @@ def resolve_matching_text(
             else [
                 (pid, entry)
                 for pid, entry in ordered[:match_index]
-                if entry.runner_claim_id is None
+                if entry.runner_claim_id is None and not entry.dismissed
             ][:_MAX_ENTRIES_PER_CONVERSATION]
         )
         matched_id, matched_entry = ordered[match_index]
@@ -1619,6 +1671,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                     else {}
                 ),
                 **({"received": True} if _agent_received(entry) else {}),
+                **({"can_dismiss": True} if _can_dismiss(entry) else {}),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
                 **(
                     {"auto_retry": entry.auto_retry.model_dump(mode="json")}
@@ -1627,7 +1680,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 ),
             }
             for entry in entries.values()
-            if not entry.interrupted
+            if not entry.interrupted and not entry.dismissed
         ]
 
 
@@ -1637,6 +1690,10 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         last_runner_renewal=entry.last_runner_renewal,
         runner_claim_id=entry.runner_claim_id,
         sending_since_ms=entry.sending_since_ms,
+        native_harness=entry.native_harness,
+        native_handoff_completed=entry.native_handoff_completed,
+        dismissed=entry.dismissed,
+        agent_received=entry.agent_received,
         pending_id=entry.pending_id,
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,

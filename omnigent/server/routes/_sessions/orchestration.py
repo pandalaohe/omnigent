@@ -6731,7 +6731,7 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "rejected_before_handoff"
     elif event_type in {"response.cancelled", "response.incomplete"}:
         cause_class = "interrupted_or_lifecycle"
-    # Only the claiming attempt's own submit evidence marks the input received.
+    # A completed delivery turn can report the harness's own handoff evidence.
     input_received = event_type == "response.completed" and event.get("input_received") is True
     matched = pending_inputs.mark_lifecycle(
         session_id,
@@ -6753,16 +6753,22 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         if input_received and matched is not None
         else None
     )
-    if received is not None:
+    dismissible = (
+        pending_inputs.dismissible_input(session_id, matched)
+        if event_type == "response.completed" and matched is not None
+        else None
+    )
+    if (queued := received or dismissible) is not None:
         session_stream.publish(
             session_id,
             {
                 "type": "session.input.sending",
-                "pending_id": received.pending_id,
-                "since_ms": received.sending_since_ms,
-                "received": True,
+                "pending_id": queued.pending_id,
+                "since_ms": queued.sending_since_ms,
+                **({"received": True} if received is not None else {}),
+                **({"can_dismiss": True} if dismissible is not None else {}),
                 # The sender's bubble may not know its pending id before the POST returns.
-                **({"stable_id": received.stable_id} if received.stable_id is not None else {}),
+                **({"stable_id": queued.stable_id} if queued.stable_id is not None else {}),
             },
         )
 
@@ -6917,6 +6923,9 @@ async def _settle_undelivered_native_input(
             ),
         )
         pending_inputs.release(session_id, drained, delivery_confirmed=True)
+        return True
+    if drained.dismissed:
+        pending_inputs.release(session_id, drained)
         return True
     # A restored automatic retry keeps its completed transcript row and retry marker.
     restored_auto_retry = (
@@ -12827,7 +12836,8 @@ async def _dispatch_session_event_to_runner_impl(
         # A Claude /btw answers in a TUI overlay that never enters the transcript, so nothing
         # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
         # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
-        claude_native = await _native_pane_harness(conv) == "claude-native"
+        native_harness = await _native_pane_harness(conv)
+        claude_native = native_harness == "claude-native"
         is_btw = (
             claude_native
             and isinstance(content, list)
@@ -12904,6 +12914,7 @@ async def _dispatch_session_event_to_runner_impl(
                     content,
                     created_by=created_by,
                     stable_id=web_stable_id,
+                    native_harness=native_harness,
                     runtime_notice=body.data.get("_runtime_notice") is True,
                     notice_item=body.data.get("runtime_notice") is True,
                     background_titles_enabled=background_titles_enabled,

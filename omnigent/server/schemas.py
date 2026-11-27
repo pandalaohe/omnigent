@@ -5680,6 +5680,14 @@ class SessionInputSendingEvent(_SSEEventBase):
     since_ms: int | None
     received: bool = False
     stable_id: str | None = None
+    can_dismiss: bool = Field(default=False, exclude_if=lambda value: not value)
+
+
+class SessionInputDismissedEvent(_SSEEventBase):
+    """A handed-off pending input was removed from chat display."""
+
+    type: Literal["session.input.dismissed"]
+    pending_id: str
 
 
 class SessionInputConsumedPayload(BaseModel):
@@ -6535,8 +6543,8 @@ class CompletedEvent(_SSEEventBase):
     :param type: Always ``"response.completed"``.
     :param response: The final response object with
         ``status="completed"``.
-    :param input_received: ``True`` when a native terminal holds the claimed
-        input this turn delivered, with evidence of its submit; omitted otherwise.
+    :param input_received: ``True`` when the native harness confirmed handoff
+        of this turn's input; omitted otherwise.
     """
 
     type: Literal["response.completed"]
@@ -7004,6 +7012,7 @@ ServerStreamEvent = Annotated[
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInputSendingEvent
+    | SessionInputDismissedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent

@@ -42,5 +42,8 @@
   "quoteOpen": "“",
   "quoteClose": "”",
   "browserApprovalUnavailable": "Needs a signed-in browser. Use accounts sign-in or OIDC.",
+  "dismissPendingInput": "Remove",
+  "dismissPendingInputHint": "Remove from chat only. The native agent already has this input.",
+  "dismissPendingInputFailed": "Couldn't remove the pending message. Try again.",
   "artifactSharingSingleMachineHint": "Copied links open on this machine. Sharing with others requires accounts sign-in. Exposing a single-user server without sign-in gives anyone full control."
 }

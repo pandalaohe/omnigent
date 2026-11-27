@@ -7165,6 +7165,25 @@ def register_events_routes(
             pending_inputs.unclaim_runner_input(session_id, pending_id, claim_id)
         return {"claimed": marked}
 
+    @event_router.delete(
+        "/sessions/{session_id}/pending-inputs/{pending_id}",
+        include_in_schema=False,
+        status_code=204,
+    )
+    async def dismiss_pending_native_input(
+        request: Request, session_id: str, pending_id: str
+    ) -> Response:
+        _, conv = await _authorized_conversation(request, session_id)
+        await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
+        outcome = pending_inputs.dismiss_from_chat(session_id, pending_id)
+        if outcome == "waiting":
+            raise HTTPException(409, "The native input has not been handed off")
+        if outcome == "dismissed":
+            session_stream.publish(
+                session_id, {"type": "session.input.dismissed", "pending_id": pending_id}
+            )
+        return Response(status_code=204)
+
     @event_router.get("/sessions/{session_id}/input-controls", include_in_schema=False)
     async def pending_input_controls(request: Request, session_id: str):
         service = await _control_receiver(request, session_id)
